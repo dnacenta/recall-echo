@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>recall-echo — Persistent memory for AI coding agents</title>
+  <meta name="description" content="Three-layer memory system for Claude Code. Gives AI agents long-term recall across sessions. Open source.">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0a0a0b;
+      --bg-raised: #111113;
+      --bg-card: #161618;
+      --border: #222225;
+      --text: #e0e0e0;
+      --text-dim: #888;
+      --text-muted: #555;
+      --green: #3ddc84;
+      --green-dim: #2a9d5e;
+      --green-glow: rgba(61, 220, 132, 0.08);
+      --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--green); text-decoration: none; transition: opacity 0.2s; }
+    a:hover { opacity: 0.8; }
+
+    code, .mono { font-family: var(--mono); }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Nav */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: rgba(10, 10, 11, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    nav .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 56px;
+    }
+
+    nav .logo {
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+
+    nav .logo span { color: var(--green); }
+
+    nav .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+    }
+
+    nav .nav-links a {
+      color: var(--text-dim);
+      font-size: 13px;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    nav .nav-links a:hover { color: var(--text); opacity: 1; }
+
+    .gh-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text) !important;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .gh-btn:hover { border-color: var(--text-muted); background: var(--bg-raised); opacity: 1; }
+
+    .gh-btn svg { width: 16px; height: 16px; fill: var(--text); }
+
+    /* Hero */
+    .hero {
+      padding: 160px 0 100px;
+      text-align: center;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 14px;
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--text-dim);
+      margin-bottom: 32px;
+    }
+
+    .hero-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+    }
+
+    .hero h1 {
+      font-family: var(--mono);
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      margin-bottom: 20px;
+    }
+
+    .hero h1 span { color: var(--green); }
+
+    .hero .tagline {
+      font-size: clamp(18px, 2.5vw, 22px);
+      color: var(--text-dim);
+      margin-bottom: 20px;
+      font-weight: 400;
+    }
+
+    .hero-badges {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+
+    .hero-badges img { height: 20px; }
+
+    .hero .desc {
+      font-size: 15px;
+      color: var(--text-muted);
+      max-width: 520px;
+      margin: 0 auto 40px;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 24px;
+      background: var(--green);
+      color: #0a0a0b !important;
+      font-weight: 600;
+      font-size: 14px;
+      border-radius: 8px;
+      transition: opacity 0.2s;
+    }
+
+    .btn-primary:hover { opacity: 0.85; }
+
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 24px;
+      border: 1px solid var(--border);
+      color: var(--text) !important;
+      font-weight: 500;
+      font-size: 14px;
+      border-radius: 8px;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .btn-secondary:hover { border-color: var(--text-muted); background: var(--bg-raised); opacity: 1; }
+
+    .hero-stats {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      margin-top: 48px;
+      flex-wrap: wrap;
+    }
+
+    .hero-stats .stat {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .hero-stats .stat strong {
+      color: var(--text-dim);
+      font-weight: 600;
+    }
+
+    /* Section shared */
+    section { padding: 80px 0; }
+
+    .section-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--green);
+      margin-bottom: 12px;
+    }
+
+    .section-title {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+    }
+
+    .section-desc {
+      font-size: 15px;
+      color: var(--text-dim);
+      max-width: 560px;
+      line-height: 1.7;
+      margin-bottom: 48px;
+    }
+
+    /* Architecture */
+    .arch-section { border-top: 1px solid var(--border); }
+
+    .arch-diagram {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.8;
+      color: var(--text-dim);
+      overflow-x: auto;
+      white-space: pre;
+      max-width: 700px;
+    }
+
+    .arch-diagram .highlight { color: var(--green); }
+    .arch-diagram .dim { color: var(--text-muted); }
+
+    /* Features */
+    .features-section { border-top: 1px solid var(--border); }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+
+    .feature-card {
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--bg-raised);
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--green-dim);
+      background: var(--green-glow);
+    }
+
+    .feature-card .feature-icon {
+      font-size: 18px;
+      margin-bottom: 14px;
+    }
+
+    .feature-card h3 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      letter-spacing: -0.01em;
+    }
+
+    .feature-card p {
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    .feature-card .feature-tag {
+      display: inline-block;
+      margin-top: 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--green-dim);
+      padding: 2px 8px;
+      border: 1px solid rgba(61, 220, 132, 0.15);
+      border-radius: 4px;
+      background: rgba(61, 220, 132, 0.05);
+    }
+
+    /* Quick start */
+    .quickstart-section { border-top: 1px solid var(--border); }
+
+    .quickstart-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .qs-step {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+
+    .qs-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--green);
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .qs-content { flex: 1; }
+
+    .qs-content .qs-label {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .code-block {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--text-dim);
+      overflow-x: auto;
+      position: relative;
+    }
+
+    .code-block .comment { color: var(--text-muted); }
+    .code-block .cmd { color: var(--text); }
+    .code-block .flag { color: var(--green-dim); }
+
+    /* Lifecycle */
+    .lifecycle-section { border-top: 1px solid var(--border); }
+
+    .lifecycle-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+    }
+
+    .lifecycle-step {
+      padding: 20px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg-raised);
+    }
+
+    .lifecycle-step .step-num {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--green-dim);
+      margin-bottom: 8px;
+    }
+
+    .lifecycle-step h4 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .lifecycle-step p {
+      font-size: 12px;
+      color: var(--text-dim);
+      line-height: 1.5;
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 40px 0;
+    }
+
+    .footer-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    .footer-left {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .footer-left a { color: var(--text-dim); }
+
+    .footer-links {
+      display: flex;
+      gap: 20px;
+    }
+
+    .footer-links a {
+      font-size: 13px;
+      color: var(--text-muted);
+      transition: color 0.2s;
+    }
+
+    .footer-links a:hover { color: var(--text); }
+
+    /* Responsive */
+    @media (max-width: 640px) {
+      .hero { padding: 120px 0 60px; }
+      section { padding: 60px 0; }
+      .hero-stats { gap: 20px; }
+
+      nav .nav-links a.nav-text { display: none; }
+
+      .features-grid { grid-template-columns: 1fr; }
+      .lifecycle-grid { grid-template-columns: 1fr; }
+
+      .footer-inner {
+        flex-direction: column;
+        text-align: center;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <div class="container">
+      <a href="#" class="logo">recall<span>-</span>echo</a>
+      <div class="nav-links">
+        <a href="#architecture" class="nav-text">Architecture</a>
+        <a href="#features" class="nav-text">Features</a>
+        <a href="#quickstart" class="nav-text">Install</a>
+        <a href="https://github.com/dnacenta/recall-echo" class="gh-btn" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <div class="container">
+      <div class="hero-badge">
+        <span class="dot"></span>
+        open source
+      </div>
+      <h1>recall<span>-</span>echo</h1>
+      <p class="tagline">Persistent memory for AI coding agents.</p>
+      <div class="hero-badges">
+        <a href="https://github.com/dnacenta/recall-echo/blob/main/LICENSE" target="_blank" rel="noopener"><img src="https://img.shields.io/github/license/dnacenta/recall-echo" alt="License"></a>
+        <a href="https://github.com/dnacenta/recall-echo/tags" target="_blank" rel="noopener"><img src="https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green" alt="Version"></a>
+        <img src="https://img.shields.io/badge/node-18%2B-blue" alt="Node">
+      </div>
+      <p class="desc">
+        Three-layer memory system that gives Claude Code long-term recall across sessions.
+        Curated facts, session continuity, and searchable history &mdash; all in plain markdown.
+        No patches, no forks. Just a rules file.
+      </p>
+      <div class="hero-actions">
+        <a href="https://github.com/dnacenta/recall-echo" class="btn-primary" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          View on GitHub
+        </a>
+        <a href="#quickstart" class="btn-secondary">Install</a>
+      </div>
+      <div class="hero-stats">
+        <div class="stat"><strong>Zero</strong> config</div>
+        <div class="stat"><strong>Plain</strong> markdown</div>
+        <div class="stat"><strong>Open</strong> source</div>
+        <div class="stat"><strong>Idempotent</strong> install</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="arch-section" id="architecture">
+    <div class="container">
+      <p class="section-label">Architecture</p>
+      <h2 class="section-title">Three layers of memory</h2>
+      <p class="section-desc">
+        Each layer serves a different purpose. Together they give the agent full continuity without bloating context.
+      </p>
+      <div class="arch-diagram"><span class="dim">~/.claude/</span>
+<span class="dim">  |</span>
+<span class="dim">  |-- rules/</span>
+<span class="dim">  |     |</span>
+<span class="dim">  |     \--</span> <span class="highlight">recall-echo.md</span>        <span class="dim">protocol (auto-loaded)</span>
+<span class="dim">  |</span>
+<span class="dim">  |-- memory/</span>
+<span class="dim">  |     |</span>
+<span class="dim">  |     \--</span> <span class="highlight">MEMORY.md</span>              <span class="dim">layer 1: curated facts</span>
+<span class="dim">  |</span>
+<span class="dim">  |-- memories/</span>
+<span class="dim">  |     |</span>
+<span class="dim">  |     |--</span> <span class="highlight">archive-log-001.md</span>    <span class="dim">layer 3: checkpoint</span>
+<span class="dim">  |     |--</span> <span class="highlight">archive-log-002.md</span>    <span class="dim">layer 3: checkpoint</span>
+<span class="dim">  |     \-- ...</span>
+<span class="dim">  |</span>
+<span class="dim">  |--</span> <span class="highlight">EPHEMERAL.md</span>               <span class="dim">layer 2: session bridge</span>
+<span class="dim">  \--</span> <span class="highlight">ARCHIVE.md</span>                 <span class="dim">layer 3: index</span></div>
+    </div>
+  </section>
+
+  <section class="features-section" id="features">
+    <div class="container">
+      <p class="section-label">Features</p>
+      <h2 class="section-title">Memory that works like memory</h2>
+      <p class="section-desc">
+        Not a flat file. A structured system with lifecycle management, automatic archival, and searchable history.
+      </p>
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon">&#129504;</div>
+          <h3>Curated Memory</h3>
+          <p>Layer 1: MEMORY.md holds stable facts, user preferences, and project patterns. Always in context. Agent maintains it proactively.</p>
+          <span class="feature-tag">MEMORY.md</span>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">&#128260;</div>
+          <h3>Session Bridge</h3>
+          <p>Layer 2: EPHEMERAL.md carries context between sessions. Read on start, cleared after consumption, rewritten at session end.</p>
+          <span class="feature-tag">EPHEMERAL.md</span>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">&#128218;</div>
+          <h3>Searchable Archive</h3>
+          <p>Layer 3: Sequentially numbered archive logs. Not loaded into context. Searchable on demand with Grep.</p>
+          <span class="feature-tag">archive-log-XXX.md</span>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">&#9888;</div>
+          <h3>PreCompact Hook</h3>
+          <p>When Claude Code is about to compress context, the hook fires and the agent saves a checkpoint before anything is lost.</p>
+          <span class="feature-tag">settings.json</span>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">&#128736;</div>
+          <h3>Zero Config</h3>
+          <p>One command to install. Uses Claude Code's auto-loaded rules system. No patches, no forks, no environment variables.</p>
+          <span class="feature-tag">~/.claude/rules/</span>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">&#128196;</div>
+          <h3>Plain Markdown</h3>
+          <p>Everything is human-readable markdown. No databases, no binary formats. Read, edit, or version control your agent's memory.</p>
+          <span class="feature-tag">*.md</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="lifecycle-section" id="lifecycle">
+    <div class="container">
+      <p class="section-label">Lifecycle</p>
+      <h2 class="section-title">How sessions flow</h2>
+      <p class="section-desc">
+        The agent manages its own memory autonomously. You don't need to tell it to remember &mdash; the protocol is in its rules.
+      </p>
+      <div class="lifecycle-grid">
+        <div class="lifecycle-step">
+          <div class="step-num">01</div>
+          <h4>Session Start</h4>
+          <p>Reads EPHEMERAL.md for last session context. MEMORY.md is already in context via auto-load. Clears EPHEMERAL.md.</p>
+        </div>
+        <div class="lifecycle-step">
+          <div class="step-num">02</div>
+          <h4>During Session</h4>
+          <p>Updates MEMORY.md with stable facts as they're confirmed. Searches archive logs when historical context is needed.</p>
+        </div>
+        <div class="lifecycle-step">
+          <div class="step-num">03</div>
+          <h4>On Compaction</h4>
+          <p>PreCompact hook fires. Agent creates an archive checkpoint before context is compressed. Nothing is lost.</p>
+        </div>
+        <div class="lifecycle-step">
+          <div class="step-num">04</div>
+          <h4>Session End</h4>
+          <p>Writes EPHEMERAL.md summary and a final archive log. Next session picks up right where this one left off.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="quickstart-section" id="quickstart">
+    <div class="container">
+      <p class="section-label">Install</p>
+      <h2 class="section-title">One command</h2>
+      <p class="section-desc">
+        Works with any existing Claude Code setup. The installer is idempotent &mdash; run it again to update the protocol without losing your memory.
+      </p>
+      <div class="quickstart-steps">
+        <div class="qs-step">
+          <div class="qs-num">1</div>
+          <div class="qs-content">
+            <p class="qs-label">Install</p>
+            <div class="code-block"><span class="comment"># Quick install (bash)</span>
+<span class="cmd">curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.sh | bash</span>
+
+<span class="comment"># Or via npx</span>
+<span class="cmd">npx recall-echo init</span></div>
+          </div>
+        </div>
+        <div class="qs-step">
+          <div class="qs-num">2</div>
+          <div class="qs-content">
+            <p class="qs-label">Start a new Claude Code session</p>
+            <div class="code-block"><span class="comment"># The memory protocol is auto-loaded.</span>
+<span class="comment"># Your agent now has persistent memory.</span>
+<span class="cmd">claude</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="container footer-inner">
+      <div class="footer-left">
+        <a href="https://github.com/dnacenta/recall-echo" target="_blank" rel="noopener">recall-echo</a>
+        &middot; MIT
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/dnacenta/recall-echo" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/dnacenta/recall-echo/blob/development/README.md" target="_blank" rel="noopener">Docs</a>
+        <a href="https://github.com/dnacenta/recall-echo/blob/development/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>
