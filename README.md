@@ -15,30 +15,73 @@ Claude Code's built-in memory (`MEMORY.md`) is a single flat file. It works for 
 recall-echo adds a structured memory protocol via Claude Code's auto-loaded rules system (`~/.claude/rules/`). No patches, no forks — just a rules file that teaches the agent how to manage its own memory.
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  recall-echo                     │
-│                                                  │
-│  Layer 1: MEMORY.md        ← always in context   │
-│  Curated facts, preferences, stable patterns     │
-│                                                  │
-│  Layer 2: EPHEMERAL.md     ← session bridge      │
-│  Last session summary, read on start, cleared    │
-│                                                  │
-│  Layer 3: archive logs     ← searchable history  │
-│  ~/.claude/memories/archive-log-001.md ...       │
-│  Checkpointed on compaction and session end      │
-│                                                  │
-│  ARCHIVE.md                ← lightweight index   │
-│  Log number, date, key topics per entry          │
-└─────────────────────────────────────────────────┘
+                         ┌──────────────────────────┐
+                         │      Claude Code agent    │
+                         │    (reads / writes all    │
+                         │     layers via protocol)  │
+                         └────┬─────────┬───────┬───┘
+                              │         │       │
+                    read+write│   read+ │       │ search
+                              │   clear │       │ on demand
+                              ▼         ▼       ▼
+┌─────────────────┐  ┌──────────────┐  ┌─────────────────────┐
+│   Layer 1       │  │   Layer 2    │  │      Layer 3        │
+│   MEMORY.md     │  │ EPHEMERAL.md │  │   Archive Logs      │
+│                 │  │              │  │                     │
+│ Curated facts,  │  │ Last session │  │ archive-log-001.md  │
+│ preferences,    │  │ summary +    │  │ archive-log-002.md  │
+│ stable patterns │  │ inner notes  │  │ ...                 │
+│                 │  │              │  │                     │
+│ Always in       │  │ Read on      │  │ YAML frontmatter    │
+│ context         │  │ start, then  │  │ + section templates │
+│ (auto-loaded)   │  │ cleared      │  │                     │
+└─────────────────┘  └──────────────┘  │ Created by CLI:     │
+                                       │ recall-echo         │
+                                       │   checkpoint        │
+                                       │                     │
+                                       │ Indexed in          │
+                                       │ ARCHIVE.md          │
+                                       └─────────────────────┘
 ```
 
 ### Session Lifecycle
 
-1. **Session start** — Agent reads `EPHEMERAL.md` for last session context, then clears it.
-2. **During session** — Agent updates `MEMORY.md` with stable facts as they're confirmed.
-3. **On compaction** — `PreCompact` hook runs `recall-echo checkpoint`, creating a scaffolded archive log for the agent to fill in.
-4. **Session end** — Agent runs `recall-echo checkpoint --trigger session-end`, writes a fresh `EPHEMERAL.md` summary, and fills in the archive log.
+```
+ Session Start          During Session           On Compaction            Session End
+ ─────────────          ──────────────           ──────────────           ───────────
+
+ ┌─────────────┐        ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
+ │ Read        │        │ Update      │         │ PreCompact  │         │ Agent runs   │
+ │ EPHEMERAL.md│───────▶│ MEMORY.md   │────────▶│ hook fires  │────────▶│ recall-echo  │
+ │ for context │        │ with stable │         │             │         │ checkpoint   │
+ └──────┬──────┘        │ facts       │         └──────┬──────┘         │ --trigger    │
+        │               └─────────────┘                │                │ session-end  │
+        ▼                                              ▼                └──────┬───────┘
+ ┌─────────────┐                              ┌──────────────┐                │
+ │ Clear       │                              │ recall-echo  │                ▼
+ │ EPHEMERAL.md│                              │ checkpoint   │         ┌──────────────┐
+ │ (consumed)  │                              │ --trigger    │         │ Fill in log  │
+ └─────────────┘                              │ precompact   │         │ sections     │
+                                              └──────┬───────┘         └──────┬───────┘
+                                                     │                        │
+                                                     ▼                        ▼
+                                              ┌──────────────┐         ┌──────────────┐
+                                              │ CLI creates  │         │ Write fresh  │
+                                              │ scaffolded   │         │ EPHEMERAL.md │
+                                              │ archive log  │         │ summary      │
+                                              │ + updates    │         └──────────────┘
+                                              │ ARCHIVE.md   │
+                                              └──────┬───────┘
+                                                     │
+                                                     ▼
+                                              ┌──────────────┐
+                                              │ Agent fills  │
+                                              │ in Summary,  │
+                                              │ Key Details, │
+                                              │ Action Items,│
+                                              │ Unresolved   │
+                                              └──────────────┘
+```
 
 The CLI handles all mechanical bookkeeping — numbering, file creation, timestamps, index updates. The agent only does what only it can do: write summaries.
 
@@ -100,6 +143,20 @@ recall-echo checkpoint --trigger session-end         # session end trigger
 recall-echo checkpoint --trigger precompact --context "working on auth system"
 ```
 
+```
+  recall-echo checkpoint --trigger precompact
+        │
+        ├──▶ Scan ~/.claude/memories/ for highest archive-log-XXX.md
+        │
+        ├──▶ Create archive-log-{next}.md with YAML frontmatter
+        │    + empty Summary / Key Details / Action Items / Unresolved
+        │
+        ├──▶ Append entry to ARCHIVE.md index
+        │
+        └──▶ Print path + instructions for the agent
+             "RECALL-ECHO checkpoint: ~/.claude/memories/archive-log-005.md"
+```
+
 ### `recall-echo status`
 
 Memory system health check. Shows MEMORY.md line count, EPHEMERAL.md state, archive log count, protocol status, and hook configuration. Warns about approaching limits or legacy hooks.
@@ -120,15 +177,21 @@ recall-echo — memory system status
 
 ```
 ~/.claude/
+│
 ├── rules/
-│   └── recall-echo.md       # Memory protocol (auto-loaded by Claude Code)
+│   └── recall-echo.md ·········· Protocol rules (auto-loaded into every session)
+│
 ├── memory/
-│   └── MEMORY.md             # Layer 1: curated facts
+│   └── MEMORY.md ················ Layer 1 — curated facts (≤200 lines)
+│
 ├── memories/
-│   └── archive-log-001.md    # Layer 3: archive logs (created by checkpoint)
-├── EPHEMERAL.md              # Layer 2: session bridge
-├── ARCHIVE.md                # Archive index
-└── settings.json             # PreCompact hook merged in
+│   ├── archive-log-001.md ······· Layer 3 — checkpoint (YAML frontmatter)
+│   ├── archive-log-002.md
+│   └── ...
+│
+├── EPHEMERAL.md ·················· Layer 2 — session bridge (read → clear → rewrite)
+├── ARCHIVE.md ···················· Index — log number, date, trigger per entry
+└── settings.json ················· PreCompact hook: recall-echo checkpoint
 ```
 
 ## Archive Log Format
