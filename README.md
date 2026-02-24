@@ -34,8 +34,8 @@ recall-echo adds a structured memory protocol via Claude Code's auto-loaded rule
 │                 │  │              │  │                     │
 │ Always in       │  │ Written at   │  │ YAML frontmatter    │
 │ context         │  │ session end, │  │ + content body      │
-│ (auto-loaded)   │  │ promoted at  │  │                     │
-└─────────────────┘  │ next start   │  │ Created by CLI:     │
+│ (auto-loaded)   │  │ promoted     │  │                     │
+└─────────────────┘  │ automatically│  │ Created by CLI:     │
                      └──────────────┘  │ recall-echo         │
                                        │   promote/checkpoint│
                                        │                     │
@@ -53,23 +53,23 @@ recall-echo adds a structured memory protocol via Claude Code's auto-loaded rule
  ┌─────────────┐        ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
  │ recall-echo │        │ Update      │         │ PreCompact  │         │ Write        │
  │ promote     │───────▶│ MEMORY.md   │────────▶│ hook fires  │────────▶│ EPHEMERAL.md │
- │             │        │ with stable │         │             │         │ with session │
- │ Archives    │        │ facts       │         └──────┬──────┘         │ summary      │
- │ EPHEMERAL → │        └─────────────┘                │                └──────────────┘
- │ archive log │                                       ▼                 (that's it —
- │ + clears it │                              ┌──────────────┐          promoted next
- └─────────────┘                              │ recall-echo  │          session)
-                                              │ checkpoint   │
-                                              │ --trigger    │
-                                              │ precompact   │
-                                              └──────┬───────┘
-                                                     │
-                                                     ▼
-                                              ┌──────────────┐
-                                              │ CLI creates  │
-                                              │ scaffolded   │
-                                              │ archive log  │
-                                              │ + updates    │
+ │ (safety net │        │ with stable │         │             │         │ with session │
+ │  — no-op if │        │ facts       │         └──────┬──────┘         │ summary      │
+ │  already    │        └─────────────┘                │                └──────┬───────┘
+ │  promoted)  │                                       ▼                       │
+ └─────────────┘                              ┌──────────────┐                 ▼
+                                              │ recall-echo  │         ┌──────────────┐
+                                              │ checkpoint   │         │ SessionEnd   │
+                                              │ --trigger    │         │ hook fires   │
+                                              │ precompact   │         │              │
+                                              └──────┬───────┘         │ recall-echo  │
+                                                     │                 │ promote      │
+                                                     ▼                 │              │
+                                              ┌──────────────┐         │ Archives     │
+                                              │ CLI creates  │         │ EPHEMERAL →  │
+                                              │ scaffolded   │         │ archive log  │
+                                              │ archive log  │         │ + clears it  │
+                                              │ + updates    │         └──────────────┘
                                               │ ARCHIVE.md   │
                                               └──────┬───────┘
                                                      │
@@ -83,7 +83,7 @@ recall-echo adds a structured memory protocol via Claude Code's auto-loaded rule
                                               └──────────────┘
 ```
 
-The CLI handles all mechanical bookkeeping — numbering, file creation, timestamps, index updates. The agent writes one summary to EPHEMERAL.md at session end, and the CLI promotes it at the next session start.
+The CLI handles all mechanical bookkeeping — numbering, file creation, timestamps, index updates. The agent writes one summary to EPHEMERAL.md at session end. The SessionEnd hook automatically promotes it to an archive log on exit. The session-start promote is a safety net in case the hook didn't fire.
 
 ## Installation
 
@@ -131,7 +131,7 @@ cargo build --release
 
 ### `recall-echo init`
 
-Initialize or upgrade the memory system. Creates directories, writes protocol rules, and configures the PreCompact hook. Idempotent — running it again won't overwrite existing memory files. Upgrades legacy echo hooks to the new checkpoint hook.
+Initialize or upgrade the memory system. Creates directories, writes protocol rules, and configures hooks (PreCompact for checkpointing, SessionEnd for automatic promotion). Idempotent — running it again won't overwrite existing memory files. Upgrades legacy echo hooks to the new checkpoint hook.
 
 ### `recall-echo checkpoint`
 
@@ -194,7 +194,7 @@ recall-echo — memory system status
   EPHEMERAL.md: has content (pending promotion)
   Archive logs: 23 logs, latest: 2026-02-24
   Protocol:     installed
-  Hook:         checkpoint (active)
+  Hooks:        PreCompact ✓  SessionEnd ✓
 
   No issues detected.
 ```
@@ -217,7 +217,7 @@ recall-echo — memory system status
 │
 ├── EPHEMERAL.md ·················· Layer 2 — session summary staging area
 ├── ARCHIVE.md ···················· Index — log number, date, trigger per entry
-└── settings.json ················· PreCompact hook: recall-echo checkpoint
+└── settings.json ················· Hooks: PreCompact + SessionEnd
 ```
 
 ## Archive Log Format
@@ -254,13 +254,17 @@ Old logs without frontmatter continue to work — numbering is by filename, not 
 
 recall-echo requires no configuration. It works out of the box with Claude Code's existing infrastructure.
 
-The only thing it touches in `settings.json` is adding a `PreCompact` hook that runs `recall-echo checkpoint` before context compaction. If you already have hooks configured, they're preserved. If upgrading from v0.2.0, the legacy echo hook is automatically replaced.
+It adds two hooks to `settings.json`:
+- **PreCompact** — runs `recall-echo checkpoint` before context compaction, creating a scaffolded archive log
+- **SessionEnd** — runs `recall-echo promote` on exit, archiving EPHEMERAL.md automatically
+
+If you already have hooks configured, they're preserved. If upgrading from v0.2.0, the legacy echo hook is automatically replaced.
 
 ## How the Agent Uses It
 
 Once installed, the agent follows the protocol automatically:
 
-- **Runs `recall-echo promote`** at session start to archive the previous session's EPHEMERAL.md
+- **Runs `recall-echo promote`** at session start as a safety net (usually already promoted by the SessionEnd hook)
 - **Updates `MEMORY.md`** when it learns stable facts (never speculative or session-specific info)
 - **Writes `EPHEMERAL.md`** at session end with a rich session summary
 - **Fills in archive log sections** when a precompact checkpoint fires
@@ -285,7 +289,7 @@ rm ~/.claude/rules/recall-echo.md
 rm -rf ~/.claude/memory ~/.claude/memories ~/.claude/EPHEMERAL.md ~/.claude/ARCHIVE.md
 ```
 
-You may also want to remove the `PreCompact` hook from `~/.claude/settings.json`.
+You may also want to remove the `PreCompact` and `SessionEnd` hooks from `~/.claude/settings.json`.
 
 ## Contributing
 
