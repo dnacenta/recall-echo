@@ -49,7 +49,9 @@ current conversation.
 When the conversation is wrapping up (user says goodbye, task is complete, or you sense the session is ending):
 1. Write EPHEMERAL.md with a rich session summary.
    Include: what was discussed, key decisions, code changes, action items, unresolved threads.
-2. That's it. The next session will promote it to an archive log automatically.
+2. That's it. The SessionEnd hook runs `recall-echo promote` automatically on exit,
+   archiving EPHEMERAL.md into an archive log and clearing it.
+   (The session-start promote is a safety net in case the hook didn't fire.)
 
 ## Archive Log Format
 
@@ -77,7 +79,7 @@ Old logs without frontmatter continue to work — numbering is by filename, not 
 
 ## Commands
 
-- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo init` — Initialize or upgrade the memory system (installs PreCompact + SessionEnd hooks)
 - `recall-echo checkpoint --trigger precompact [--context "..."]` — Create a precompact archive checkpoint
 - `recall-echo promote [--context "..."]` — Promote EPHEMERAL.md into an archive log
 - `recall-echo status` — Check memory system health

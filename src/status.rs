@@ -10,6 +10,7 @@ const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
 const CHECKPOINT_COMMAND: &str = "recall-echo checkpoint --trigger precompact";
+const PROMOTE_COMMAND: &str = "recall-echo promote";
 
 fn run_with_base(base: &Path) -> Result<(), String> {
     if !base.exists() {
@@ -80,20 +81,32 @@ fn run_with_base(base: &Path) -> Result<(), String> {
         println!("  Protocol:     {YELLOW}not found{RESET} — run recall-echo init");
     }
 
-    // Hook
+    // Hooks
     if settings_path.exists() {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
-        if content.contains(CHECKPOINT_COMMAND) {
-            println!("  Hook:         {GREEN}checkpoint (active){RESET}");
-        } else if content.contains("RECALL-ECHO") {
+        let precompact_ok = content.contains(CHECKPOINT_COMMAND);
+        let session_end_ok = content.contains(PROMOTE_COMMAND);
+        let has_legacy = content.contains("RECALL-ECHO") && !precompact_ok;
+
+        if has_legacy {
             println!(
-                "  Hook:         {YELLOW}echo (legacy){RESET} ⚠ run recall-echo init to upgrade"
+                "  Hooks:        {YELLOW}echo (legacy){RESET} ⚠ run recall-echo init to upgrade"
             );
         } else {
-            println!("  Hook:         {YELLOW}not configured{RESET} — run recall-echo init");
+            let pc = if precompact_ok {
+                format!("{GREEN}✓{RESET}")
+            } else {
+                format!("{YELLOW}⚠{RESET}")
+            };
+            let se = if session_end_ok {
+                format!("{GREEN}✓{RESET}")
+            } else {
+                format!("{YELLOW}⚠{RESET}")
+            };
+            println!("  Hooks:        PreCompact {pc}  SessionEnd {se}");
         }
     } else {
-        println!("  Hook:         {YELLOW}no settings.json{RESET} — run recall-echo init");
+        println!("  Hooks:        {YELLOW}no settings.json{RESET} — run recall-echo init");
     }
 
     // Issues summary
@@ -108,6 +121,9 @@ fn run_with_base(base: &Path) -> Result<(), String> {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
         if content.contains("RECALL-ECHO") && !content.contains(CHECKPOINT_COMMAND) {
             issues.push("legacy hook needs upgrade");
+        }
+        if !content.contains(PROMOTE_COMMAND) {
+            issues.push("SessionEnd hook missing — run recall-echo init");
         }
     }
 
@@ -179,7 +195,7 @@ mod tests {
         fs::write(rules_dir.join("recall-echo.md"), "protocol").unwrap();
         fs::write(
             tmp.path().join("settings.json"),
-            r#"{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"recall-echo checkpoint --trigger precompact"}]}]}}"#,
+            r#"{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"recall-echo checkpoint --trigger precompact"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"recall-echo promote"}]}]}}"#,
         )
         .unwrap();
 
