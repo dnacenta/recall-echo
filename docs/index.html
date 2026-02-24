@@ -565,7 +565,7 @@
         <div class="feature-card">
           <div class="feature-icon">&#128260;</div>
           <h3>Session Bridge</h3>
-          <p>Layer 2: EPHEMERAL.md carries context between sessions. Read on start, cleared after consumption, rewritten at session end.</p>
+          <p>Layer 2: EPHEMERAL.md carries context between sessions. Written at session end, automatically promoted to an archive log on exit.</p>
           <span class="feature-tag">EPHEMERAL.md</span>
         </div>
         <div class="feature-card">
@@ -577,8 +577,14 @@
         <div class="feature-card">
           <div class="feature-icon">&#9888;</div>
           <h3>Enforced Archiving</h3>
-          <p>PreCompact hook runs <code>recall-echo checkpoint</code> automatically. The CLI creates scaffolded logs &mdash; the agent just fills in content.</p>
+          <p>Two hooks, zero effort. PreCompact creates checkpoints on compaction. SessionEnd promotes EPHEMERAL.md on exit. Nothing falls through the cracks.</p>
           <span class="feature-tag">checkpoint</span>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">&#128640;</div>
+          <h3>Auto Promotion</h3>
+          <p>SessionEnd hook runs <code>recall-echo promote</code> on exit. Session summaries are archived immediately &mdash; no waiting for the next session.</p>
+          <span class="feature-tag">promote</span>
         </div>
         <div class="feature-card">
           <div class="feature-icon">&#128736;</div>
@@ -607,7 +613,7 @@
         <div class="lifecycle-step">
           <div class="step-num">01</div>
           <h4>Session Start</h4>
-          <p>Reads EPHEMERAL.md for last session context. MEMORY.md is already in context via auto-load. Clears EPHEMERAL.md.</p>
+          <p>Runs <code>recall-echo promote</code> as a safety net. MEMORY.md is already in context via auto-load. Reads latest archive log if needed.</p>
         </div>
         <div class="lifecycle-step">
           <div class="step-num">02</div>
@@ -622,7 +628,7 @@
         <div class="lifecycle-step">
           <div class="step-num">04</div>
           <h4>Session End</h4>
-          <p>Agent runs <code>recall-echo checkpoint --trigger session-end</code>, writes EPHEMERAL.md. Next session picks up where this left off.</p>
+          <p>Agent writes EPHEMERAL.md with a session summary. SessionEnd hook runs <code>recall-echo promote</code>, archiving it automatically on exit.</p>
         </div>
       </div>
     </div>
@@ -675,8 +681,8 @@
       </div>
       <div class="footer-links">
         <a href="https://github.com/dnacenta/recall-echo" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/dnacenta/recall-echo/blob/development/README.md" target="_blank" rel="noopener">Docs</a>
-        <a href="https://github.com/dnacenta/recall-echo/blob/development/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+        <a href="https://github.com/dnacenta/recall-echo/blob/main/README.md" target="_blank" rel="noopener">Docs</a>
+        <a href="https://github.com/dnacenta/recall-echo/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
       </div>
     </div>
   </footer>
