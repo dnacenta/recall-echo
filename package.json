@@ -1,6 +1,6 @@
 {
   "name": "recall-echo",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Persistent three-layer memory system for AI coding agents",
   "main": "dist/index.js",
   "bin": {
