@@ -497,7 +497,7 @@
       <div class="hero-badges">
         <a href="https://github.com/dnacenta/recall-echo/blob/main/LICENSE" target="_blank" rel="noopener"><img src="https://img.shields.io/github/license/dnacenta/recall-echo" alt="License"></a>
         <a href="https://github.com/dnacenta/recall-echo/tags" target="_blank" rel="noopener"><img src="https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green" alt="Version"></a>
-        <img src="https://img.shields.io/badge/node-18%2B-blue" alt="Node">
+        <a href="https://crates.io/crates/recall-echo" target="_blank" rel="noopener"><img src="https://img.shields.io/crates/v/recall-echo" alt="Crates.io"></a>
       </div>
       <p class="desc">
         Three-layer memory system that gives Claude Code long-term recall across sessions.
@@ -512,10 +512,10 @@
         <a href="#quickstart" class="btn-secondary">Install</a>
       </div>
       <div class="hero-stats">
+        <div class="stat"><strong>Rust</strong> binary</div>
         <div class="stat"><strong>Zero</strong> config</div>
         <div class="stat"><strong>Plain</strong> markdown</div>
         <div class="stat"><strong>Open</strong> source</div>
-        <div class="stat"><strong>Idempotent</strong> install</div>
       </div>
     </div>
   </section>
@@ -640,15 +640,22 @@
           <div class="qs-num">1</div>
           <div class="qs-content">
             <p class="qs-label">Install</p>
-            <div class="code-block"><span class="comment"># Quick install (bash)</span>
-<span class="cmd">curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.sh | bash</span>
+            <div class="code-block"><span class="comment"># With cargo</span>
+<span class="cmd">cargo install recall-echo</span>
 
-<span class="comment"># Or via npx</span>
-<span class="cmd">npx recall-echo init</span></div>
+<span class="comment"># Or install script (downloads prebuilt binary)</span>
+<span class="cmd">curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.sh | bash</span></div>
           </div>
         </div>
         <div class="qs-step">
           <div class="qs-num">2</div>
+          <div class="qs-content">
+            <p class="qs-label">Initialize</p>
+            <div class="code-block"><span class="cmd">recall-echo init</span></div>
+          </div>
+        </div>
+        <div class="qs-step">
+          <div class="qs-num">3</div>
           <div class="qs-content">
             <p class="qs-label">Start a new Claude Code session</p>
             <div class="code-block"><span class="comment"># The memory protocol is auto-loaded.</span>

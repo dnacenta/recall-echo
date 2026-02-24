@@ -4,7 +4,100 @@ set -euo pipefail
 # recall-echo — Persistent memory for AI coding agents
 # https://github.com/dnacenta/recall-echo
 
+REPO="dnacenta/recall-echo"
 CLAUDE_DIR="${HOME}/.claude"
+INSTALL_DIR="${HOME}/.local/bin"
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+info() { echo -e "  ${GREEN}✓${NC} $1"; }
+warn() { echo -e "  ${YELLOW}~${NC} $1"; }
+fail() { echo -e "  ${RED}✗${NC} $1"; }
+
+detect_target() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$os" in
+    Linux)  os="unknown-linux-gnu" ;;
+    Darwin) os="apple-darwin" ;;
+    *)      echo ""; return ;;
+  esac
+
+  case "$arch" in
+    x86_64)  arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *)       echo ""; return ;;
+  esac
+
+  echo "${arch}-${os}"
+}
+
+download_binary() {
+  local target="$1"
+  local tag url tmpdir
+
+  # Get latest release tag
+  tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep '"tag_name"' | head -1 | cut -d'"' -f4)" || return 1
+
+  [ -z "$tag" ] && return 1
+
+  url="https://github.com/${REPO}/releases/download/${tag}/recall-echo-${target}.tar.gz"
+
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  if curl -fsSL "$url" -o "${tmpdir}/recall-echo.tar.gz" 2>/dev/null; then
+    tar xzf "${tmpdir}/recall-echo.tar.gz" -C "$tmpdir"
+    mkdir -p "$INSTALL_DIR"
+    mv "${tmpdir}/recall-echo" "${INSTALL_DIR}/recall-echo"
+    chmod +x "${INSTALL_DIR}/recall-echo"
+    return 0
+  fi
+
+  return 1
+}
+
+echo ""
+echo -e "${BOLD}recall-echo${NC} — installer"
+echo ""
+
+# Try to download prebuilt binary
+TARGET="$(detect_target)"
+BINARY=""
+
+if [ -n "$TARGET" ]; then
+  echo "  Detected platform: ${TARGET}"
+  if download_binary "$TARGET"; then
+    BINARY="${INSTALL_DIR}/recall-echo"
+    info "Downloaded binary to ${BINARY}"
+
+    # Check if ~/.local/bin is in PATH
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+      warn "${INSTALL_DIR} is not in your PATH — add it to your shell profile"
+    fi
+  else
+    warn "Could not download prebuilt binary — falling back to bash installer"
+  fi
+else
+  warn "Could not detect platform — falling back to bash installer"
+fi
+
+# Run init: prefer binary if downloaded, otherwise inline bash
+if [ -n "$BINARY" ]; then
+  "$BINARY" init
+  exit 0
+fi
+
+# ─── Bash fallback ─────────────────────────────────────────────────────
+
 RULES_DIR="${CLAUDE_DIR}/rules"
 MEMORY_DIR="${CLAUDE_DIR}/memory"
 MEMORIES_DIR="${CLAUDE_DIR}/memories"
@@ -13,17 +106,6 @@ ARCHIVE_FILE="${CLAUDE_DIR}/ARCHIVE.md"
 MEMORY_FILE="${MEMORY_DIR}/MEMORY.md"
 RULES_FILE="${RULES_DIR}/recall-echo.md"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
-
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
-BOLD='\033[1m'
-
-info() { echo -e "  ${GREEN}✓${NC} $1"; }
-warn() { echo -e "  ${YELLOW}~${NC} $1"; }
-fail() { echo -e "  ${RED}✗${NC} $1"; }
 
 echo ""
 echo -e "${BOLD}recall-echo${NC} — initializing memory system"
@@ -202,7 +284,6 @@ if [ -f "$SETTINGS_FILE" ]; then
     # Use a temp file to safely merge
     TEMP_FILE=$(mktemp)
 
-    # Check if hooks.PreCompact already exists
     if python3 -c "
 import json, sys
 with open('$SETTINGS_FILE') as f:
