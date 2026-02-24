@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green)](https://github.com/dnacenta/recall-echo/tags)
-[![Node](https://img.shields.io/badge/node-18%2B-blue)](https://nodejs.org/)
+[![Crates.io](https://img.shields.io/crates/v/recall-echo)](https://crates.io/crates/recall-echo)
 
 Persistent three-layer memory system for AI coding agents. Gives Claude Code (and similar tools) long-term recall across sessions.
 
@@ -44,26 +44,44 @@ The agent manages all of this autonomously. You don't need to tell it to remembe
 
 ## Installation
 
-### Quick install (bash)
+### cargo install (recommended)
+
+```bash
+cargo install recall-echo
+recall-echo init
+```
+
+### Install script
+
+Downloads a prebuilt binary for your platform. Falls back to a bash-only installer if no binary is available.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.sh | bash
 ```
 
-### npx (requires Node 18+)
+### Prebuilt binaries
+
+Download from [GitHub Releases](https://github.com/dnacenta/recall-echo/releases/latest) for:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin` (Apple Silicon)
+
+Extract and run:
 
 ```bash
-npx recall-echo init
+tar xzf recall-echo-<target>.tar.gz
+./recall-echo init
 ```
 
-### Manual
-
-Clone the repo and run the install script directly:
+### Manual (from source)
 
 ```bash
 git clone https://github.com/dnacenta/recall-echo.git
 cd recall-echo
-./install.sh
+cargo build --release
+./target/release/recall-echo init
 ```
 
 ## What It Creates
