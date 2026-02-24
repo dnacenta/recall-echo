@@ -501,8 +501,8 @@
       </div>
       <p class="desc">
         Three-layer memory system that gives Claude Code long-term recall across sessions.
-        Curated facts, session continuity, and searchable history &mdash; all in plain markdown.
-        No patches, no forks. Just a rules file.
+        CLI-enforced archiving &mdash; the tool handles numbering, timestamps, and indexing.
+        The agent only writes summaries. No patches, no forks.
       </p>
       <div class="hero-actions">
         <a href="https://github.com/dnacenta/recall-echo" class="btn-primary" target="_blank" rel="noopener">
@@ -512,9 +512,9 @@
         <a href="#quickstart" class="btn-secondary">Install</a>
       </div>
       <div class="hero-stats">
-        <div class="stat"><strong>Rust</strong> binary</div>
+        <div class="stat"><strong>Rust</strong> CLI</div>
         <div class="stat"><strong>Zero</strong> config</div>
-        <div class="stat"><strong>Plain</strong> markdown</div>
+        <div class="stat"><strong>Enforced</strong> archiving</div>
         <div class="stat"><strong>Open</strong> source</div>
       </div>
     </div>
@@ -576,21 +576,21 @@
         </div>
         <div class="feature-card">
           <div class="feature-icon">&#9888;</div>
-          <h3>PreCompact Hook</h3>
-          <p>When Claude Code is about to compress context, the hook fires and the agent saves a checkpoint before anything is lost.</p>
-          <span class="feature-tag">settings.json</span>
+          <h3>Enforced Archiving</h3>
+          <p>PreCompact hook runs <code>recall-echo checkpoint</code> automatically. The CLI creates scaffolded logs &mdash; the agent just fills in content.</p>
+          <span class="feature-tag">checkpoint</span>
         </div>
         <div class="feature-card">
           <div class="feature-icon">&#128736;</div>
-          <h3>Zero Config</h3>
-          <p>One command to install. Uses Claude Code's auto-loaded rules system. No patches, no forks, no environment variables.</p>
-          <span class="feature-tag">~/.claude/rules/</span>
+          <h3>Health Check</h3>
+          <p>Run <code>recall-echo status</code> to see MEMORY.md line count, archive log count, hook configuration, and warnings at a glance.</p>
+          <span class="feature-tag">status</span>
         </div>
         <div class="feature-card">
           <div class="feature-icon">&#128196;</div>
-          <h3>Plain Markdown</h3>
-          <p>Everything is human-readable markdown. No databases, no binary formats. Read, edit, or version control your agent's memory.</p>
-          <span class="feature-tag">*.md</span>
+          <h3>Structured Metadata</h3>
+          <p>Archive logs include YAML frontmatter: sequence number, timestamp, trigger type, and topics. Plain markdown you can build tooling on.</p>
+          <span class="feature-tag">frontmatter</span>
         </div>
       </div>
     </div>
@@ -617,12 +617,12 @@
         <div class="lifecycle-step">
           <div class="step-num">03</div>
           <h4>On Compaction</h4>
-          <p>PreCompact hook fires. Agent creates an archive checkpoint before context is compressed. Nothing is lost.</p>
+          <p>PreCompact hook runs <code>recall-echo checkpoint</code>. CLI creates the log file, the agent fills in the sections. Nothing is lost.</p>
         </div>
         <div class="lifecycle-step">
           <div class="step-num">04</div>
           <h4>Session End</h4>
-          <p>Writes EPHEMERAL.md summary and a final archive log. Next session picks up right where this one left off.</p>
+          <p>Agent runs <code>recall-echo checkpoint --trigger session-end</code>, writes EPHEMERAL.md. Next session picks up where this left off.</p>
         </div>
       </div>
     </div>
