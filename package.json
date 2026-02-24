@@ -1,0 +1,39 @@
+{
+  "name": "recall-echo",
+  "version": "1.0.0",
+  "description": "Persistent three-layer memory system for AI coding agents",
+  "main": "dist/index.js",
+  "bin": {
+    "recall-echo": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "test": "node --test dist/**/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "ai",
+    "memory",
+    "persistence",
+    "llm",
+    "agent"
+  ],
+  "author": "dnacenta",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ]
+}
