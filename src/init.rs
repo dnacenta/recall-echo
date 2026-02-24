@@ -2,6 +2,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use crate::paths;
+
 const PROTOCOL_TEMPLATE: &str = include_str!("../templates/recall-echo.md");
 
 const MEMORY_TEMPLATE: &str = "# Memory\n\n\
@@ -12,7 +14,9 @@ const ARCHIVE_TEMPLATE: &str = "# Archive Index\n\n\
 <!-- recall-echo: Lightweight index of archive logs. -->\n\
 <!-- Format: | log number | date | key topics | -->\n";
 
-const PRECOMPACT_COMMAND: &str = "echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'";
+const CHECKPOINT_COMMAND: &str = "recall-echo checkpoint --trigger precompact";
+
+const LEGACY_MARKER: &str = "RECALL-ECHO";
 
 // ANSI color helpers
 const GREEN: &str = "\x1b[32m";
@@ -33,11 +37,6 @@ fn print_status(status: Status, msg: &str) {
         Status::Exists => println!("  {YELLOW}~{RESET} {msg}"),
         Status::Error => println!("  {RED}✗{RESET} {msg}"),
     }
-}
-
-fn claude_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    Ok(home.join(".claude"))
 }
 
 fn confirm(question: &str) -> bool {
@@ -119,7 +118,10 @@ fn merge_precompact_hook(settings_path: &PathBuf) {
         serde_json::json!({})
     };
 
-    // Check if RECALL-ECHO hook already exists
+    // Check existing hooks for recall-echo entries
+    let mut has_checkpoint = false;
+    let mut has_legacy = false;
+
     if let Some(hooks) = settings.get("hooks") {
         if let Some(precompact) = hooks.get("PreCompact") {
             if let Some(arr) = precompact.as_array() {
@@ -129,12 +131,10 @@ fn merge_precompact_hook(settings_path: &PathBuf) {
                             for hook in inner_arr {
                                 if let Some(cmd) = hook.get("command") {
                                     if let Some(s) = cmd.as_str() {
-                                        if s.contains("RECALL-ECHO") {
-                                            print_status(
-                                                Status::Exists,
-                                                "PreCompact hook already configured",
-                                            );
-                                            return;
+                                        if s.contains(CHECKPOINT_COMMAND) {
+                                            has_checkpoint = true;
+                                        } else if s.contains(LEGACY_MARKER) {
+                                            has_legacy = true;
                                         }
                                     }
                                 }
@@ -146,15 +146,77 @@ fn merge_precompact_hook(settings_path: &PathBuf) {
         }
     }
 
-    // Build the hook entry
+    if has_checkpoint {
+        print_status(Status::Exists, "PreCompact hook already up to date");
+        return;
+    }
+
+    if has_legacy {
+        // Migrate: remove legacy hook entries, add new checkpoint hook
+        if let Some(hooks) = settings.get_mut("hooks") {
+            if let Some(precompact) = hooks.get_mut("PreCompact") {
+                if let Some(arr) = precompact.as_array_mut() {
+                    // Remove entries containing the legacy RECALL-ECHO marker
+                    arr.retain(|entry| {
+                        if let Some(inner_hooks) = entry.get("hooks") {
+                            if let Some(inner_arr) = inner_hooks.as_array() {
+                                for hook in inner_arr {
+                                    if let Some(cmd) = hook.get("command") {
+                                        if let Some(s) = cmd.as_str() {
+                                            if s.contains(LEGACY_MARKER) {
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        true
+                    });
+                }
+            }
+        }
+
+        // Add new checkpoint hook
+        let hook_entry = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": CHECKPOINT_COMMAND
+            }]
+        });
+
+        settings["hooks"]["PreCompact"]
+            .as_array_mut()
+            .unwrap()
+            .push(hook_entry);
+
+        match serde_json::to_string_pretty(&settings) {
+            Ok(json) => match fs::write(settings_path, format!("{json}\n")) {
+                Ok(()) => print_status(
+                    Status::Created,
+                    "Migrated PreCompact hook: echo → checkpoint",
+                ),
+                Err(e) => print_status(
+                    Status::Error,
+                    &format!("Failed to write settings.json: {e}"),
+                ),
+            },
+            Err(e) => print_status(
+                Status::Error,
+                &format!("Failed to serialize settings.json: {e}"),
+            ),
+        }
+        return;
+    }
+
+    // No recall-echo hook at all — add fresh
     let hook_entry = serde_json::json!({
         "hooks": [{
             "type": "command",
-            "command": PRECOMPACT_COMMAND
+            "command": CHECKPOINT_COMMAND
         }]
     });
 
-    // Merge into settings
     let hooks = settings
         .as_object_mut()
         .unwrap()
@@ -167,7 +229,6 @@ fn merge_precompact_hook(settings_path: &PathBuf) {
         .or_insert_with(|| serde_json::json!([]));
     precompact.as_array_mut().unwrap().push(hook_entry);
 
-    // Write back
     match serde_json::to_string_pretty(&settings) {
         Ok(json) => match fs::write(settings_path, format!("{json}\n")) {
             Ok(()) => print_status(Status::Created, "Added PreCompact hook to settings.json"),
@@ -184,7 +245,7 @@ fn merge_precompact_hook(settings_path: &PathBuf) {
 }
 
 pub fn run() -> Result<(), String> {
-    let claude = claude_dir()?;
+    let claude = paths::claude_dir()?;
 
     // Pre-flight check
     if !claude.exists() {
@@ -198,27 +259,27 @@ pub fn run() -> Result<(), String> {
     println!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");
 
     // Create directories
-    let rules_dir = claude.join("rules");
+    let rules_dir = paths::rules_dir()?;
     let memory_dir = claude.join("memory");
-    let memories_dir = claude.join("memories");
+    let memories_dir = paths::memories_dir()?;
     ensure_dir(&rules_dir);
     ensure_dir(&memory_dir);
     ensure_dir(&memories_dir);
 
     // Write protocol rules file
-    write_protocol(&rules_dir.join("recall-echo.md"));
+    write_protocol(&paths::protocol_file()?);
 
     // Write MEMORY.md (never overwrite)
-    write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
+    write_if_not_exists(&paths::memory_file()?, MEMORY_TEMPLATE, "MEMORY.md");
 
     // Write EPHEMERAL.md (never overwrite)
-    write_if_not_exists(&claude.join("EPHEMERAL.md"), "", "EPHEMERAL.md");
+    write_if_not_exists(&paths::ephemeral_file()?, "", "EPHEMERAL.md");
 
     // Write ARCHIVE.md (never overwrite)
-    write_if_not_exists(&claude.join("ARCHIVE.md"), ARCHIVE_TEMPLATE, "ARCHIVE.md");
+    write_if_not_exists(&paths::archive_index()?, ARCHIVE_TEMPLATE, "ARCHIVE.md");
 
     // Merge PreCompact hook
-    merge_precompact_hook(&claude.join("settings.json"));
+    merge_precompact_hook(&paths::settings_file()?);
 
     // Summary
     println!(
