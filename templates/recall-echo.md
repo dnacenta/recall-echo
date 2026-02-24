@@ -17,7 +17,7 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 - This contains a summary of the last session. It gives you immediate context about what happened recently.
 - At the start of a session, read it to orient yourself, then clear the file (empty it). It has been consumed.
 - At the end of a session, write a fresh summary of the current session to this file.
-- Contents should include: date, key topics discussed, decisions made, action items, unresolved threads.
+- Contents should include: date, key topics discussed, decisions made, action items, unresolved threads, and any inner reflections on the session.
 
 ### Layer 3 — Long-Term Memory (archive logs)
 - Index: `~/.claude/ARCHIVE.md`
@@ -40,48 +40,45 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 - If you need historical context, search the archive: `Grep pattern="topic" path="~/.claude/memories/"`
 
 ### On PreCompact (context about to be compressed):
-If you see a system message indicating context compaction is imminent:
-1. Determine the next archive log number by checking `~/.claude/memories/` for the highest existing number.
-2. Write a checkpoint to `~/.claude/memories/archive-log-XXX.md` with:
-   - Date and timestamp
-   - Trigger: "precompact"
-   - Summary of the conversation so far
-   - Key decisions, code changes, and unresolved items
-3. Add an entry to `~/.claude/ARCHIVE.md` with the log number, date, and key topics.
+The PreCompact hook automatically runs `recall-echo checkpoint --trigger precompact`.
+The output tells you the file path and log number. Open that file and fill in the
+Summary, Key Details, Action Items, and Unresolved sections with context from the
+current conversation.
 
 ### On session end:
 When the conversation is wrapping up (user says goodbye, task is complete, or you sense the session is ending):
-1. Write EPHEMERAL.md with a rich summary of this session.
-2. Save a final archive log to `~/.claude/memories/archive-log-XXX.md` with:
-   - Date and timestamp
-   - Trigger: "session-end"
-   - Full session summary
-   - Action items and unresolved threads
-3. Update ARCHIVE.md index.
+1. Write EPHEMERAL.md with a rich summary of this session (including inner reflections).
+2. Run `recall-echo checkpoint --trigger session-end` (via Bash tool).
+3. Open the created archive log and fill in Summary, Key Details, Action Items, and Unresolved.
 
 ## Archive Log Format
 
-Each archive log file should follow this structure:
+Archive logs are created by `recall-echo checkpoint` with YAML frontmatter and section templates.
+You only need to fill in the content sections — the tool handles numbering, dating, and indexing.
 
+```yaml
+---
+log: 5
+date: "2026-02-24T21:30:00Z"
+trigger: precompact
+context: ""
+topics: []
+---
 ```
-# Archive Log XXX
 
-- **Date**: YYYY-MM-DD HH:MM
-- **Trigger**: precompact | session-end
-- **Session context**: [brief description of what this session was about]
+Sections to fill in:
+- **Summary** — What was discussed, decided, and accomplished
+- **Key Details** — Important specifics: code changes, configurations, decisions with rationale
+- **Action Items** — What needs to happen next
+- **Unresolved** — Open questions or threads to pick up later
 
-## Summary
-[What was discussed, decided, and accomplished]
+Old logs without frontmatter continue to work — numbering is by filename, not content.
 
-## Key Details
-[Important specifics — code changes, configurations, decisions with rationale]
+## Commands
 
-## Action Items
-[What needs to happen next]
-
-## Unresolved
-[Open questions or threads to pick up later]
-```
+- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo checkpoint --trigger <precompact|session-end> [--context "..."]` — Create an archive checkpoint
+- `recall-echo status` — Check memory system health
 
 ## Rules
 

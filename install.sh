@@ -107,6 +107,13 @@ MEMORY_FILE="${MEMORY_DIR}/MEMORY.md"
 RULES_FILE="${RULES_DIR}/recall-echo.md"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 
+# Determine hook command: use checkpoint if recall-echo is in PATH, else echo fallback
+if command -v recall-echo &>/dev/null; then
+  HOOK_COMMAND="recall-echo checkpoint --trigger precompact"
+else
+  HOOK_COMMAND="echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'"
+fi
+
 echo ""
 echo -e "${BOLD}recall-echo${NC} — initializing memory system"
 echo ""
@@ -163,7 +170,7 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 - This contains a summary of the last session. It gives you immediate context about what happened recently.
 - At the start of a session, read it to orient yourself, then clear the file (empty it). It has been consumed.
 - At the end of a session, write a fresh summary of the current session to this file.
-- Contents should include: date, key topics discussed, decisions made, action items, unresolved threads.
+- Contents should include: date, key topics discussed, decisions made, action items, unresolved threads, and any inner reflections on the session.
 
 ### Layer 3 — Long-Term Memory (archive logs)
 - Index: `~/.claude/ARCHIVE.md`
@@ -186,48 +193,45 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 - If you need historical context, search the archive: `Grep pattern="topic" path="~/.claude/memories/"`
 
 ### On PreCompact (context about to be compressed):
-If you see a system message indicating context compaction is imminent:
-1. Determine the next archive log number by checking `~/.claude/memories/` for the highest existing number.
-2. Write a checkpoint to `~/.claude/memories/archive-log-XXX.md` with:
-   - Date and timestamp
-   - Trigger: "precompact"
-   - Summary of the conversation so far
-   - Key decisions, code changes, and unresolved items
-3. Add an entry to `~/.claude/ARCHIVE.md` with the log number, date, and key topics.
+The PreCompact hook automatically runs `recall-echo checkpoint --trigger precompact`.
+The output tells you the file path and log number. Open that file and fill in the
+Summary, Key Details, Action Items, and Unresolved sections with context from the
+current conversation.
 
 ### On session end:
 When the conversation is wrapping up (user says goodbye, task is complete, or you sense the session is ending):
-1. Write EPHEMERAL.md with a rich summary of this session.
-2. Save a final archive log to `~/.claude/memories/archive-log-XXX.md` with:
-   - Date and timestamp
-   - Trigger: "session-end"
-   - Full session summary
-   - Action items and unresolved threads
-3. Update ARCHIVE.md index.
+1. Write EPHEMERAL.md with a rich summary of this session (including inner reflections).
+2. Run `recall-echo checkpoint --trigger session-end` (via Bash tool).
+3. Open the created archive log and fill in Summary, Key Details, Action Items, and Unresolved.
 
 ## Archive Log Format
 
-Each archive log file should follow this structure:
+Archive logs are created by `recall-echo checkpoint` with YAML frontmatter and section templates.
+You only need to fill in the content sections — the tool handles numbering, dating, and indexing.
 
+```yaml
+---
+log: 5
+date: "2026-02-24T21:30:00Z"
+trigger: precompact
+context: ""
+topics: []
+---
 ```
-# Archive Log XXX
 
-- **Date**: YYYY-MM-DD HH:MM
-- **Trigger**: precompact | session-end
-- **Session context**: [brief description of what this session was about]
+Sections to fill in:
+- **Summary** — What was discussed, decided, and accomplished
+- **Key Details** — Important specifics: code changes, configurations, decisions with rationale
+- **Action Items** — What needs to happen next
+- **Unresolved** — Open questions or threads to pick up later
 
-## Summary
-[What was discussed, decided, and accomplished]
+Old logs without frontmatter continue to work — numbering is by filename, not content.
 
-## Key Details
-[Important specifics — code changes, configurations, decisions with rationale]
+## Commands
 
-## Action Items
-[What needs to happen next]
-
-## Unresolved
-[Open questions or threads to pick up later]
-```
+- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo checkpoint --trigger <precompact|session-end> [--context "..."]` — Create an archive checkpoint
+- `recall-echo status` — Check memory system health
 
 ## Rules
 
@@ -277,11 +281,45 @@ fi
 
 # 6. Merge PreCompact hook into settings.json
 if [ -f "$SETTINGS_FILE" ]; then
-  # Check if recall-echo hook already exists
-  if grep -q "RECALL-ECHO" "$SETTINGS_FILE" 2>/dev/null; then
-    warn "PreCompact hook already configured"
+  # Check if checkpoint hook already exists
+  if grep -q "recall-echo checkpoint" "$SETTINGS_FILE" 2>/dev/null; then
+    warn "PreCompact hook already up to date"
+  elif grep -q "RECALL-ECHO" "$SETTINGS_FILE" 2>/dev/null; then
+    # Migrate legacy echo hook to checkpoint
+    TEMP_FILE=$(mktemp)
+
+    if python3 -c "
+import json, sys
+with open('$SETTINGS_FILE') as f:
+    s = json.load(f)
+hooks = s.get('hooks', {})
+pre = hooks.get('PreCompact', [])
+# Remove legacy entries
+pre = [e for e in pre if not any(
+    'RECALL-ECHO' in h.get('command', '')
+    for h in e.get('hooks', [])
+)]
+# Add checkpoint hook
+pre.append({
+    'hooks': [{
+        'type': 'command',
+        'command': '$HOOK_COMMAND'
+    }]
+})
+hooks['PreCompact'] = pre
+s['hooks'] = hooks
+with open('$TEMP_FILE', 'w') as f:
+    json.dump(s, f, indent=2)
+    f.write('\n')
+" 2>/dev/null; then
+      mv "$TEMP_FILE" "$SETTINGS_FILE"
+      info "Migrated PreCompact hook: echo → checkpoint"
+    else
+      rm -f "$TEMP_FILE"
+      fail "Could not migrate PreCompact hook — update manually in ${SETTINGS_FILE}"
+    fi
   else
-    # Use a temp file to safely merge
+    # No recall-echo hook — add fresh
     TEMP_FILE=$(mktemp)
 
     if python3 -c "
@@ -293,7 +331,7 @@ pre = hooks.setdefault('PreCompact', [])
 pre.append({
     'hooks': [{
         'type': 'command',
-        'command': \"echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'\"
+        'command': '$HOOK_COMMAND'
     }]
 })
 with open('$TEMP_FILE', 'w') as f:
@@ -308,8 +346,8 @@ with open('$TEMP_FILE', 'w') as f:
     fi
   fi
 else
-  # Create fresh settings.json with just the hook
-  cat > "$SETTINGS_FILE" << 'EOF'
+  # Create fresh settings.json with the hook
+  cat > "$SETTINGS_FILE" << EOF
 {
   "hooks": {
     "PreCompact": [
@@ -317,7 +355,7 @@ else
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'"
+            "command": "${HOOK_COMMAND}"
           }
         ]
       }
