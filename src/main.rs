@@ -3,6 +3,7 @@ mod checkpoint;
 mod frontmatter;
 mod init;
 mod paths;
+mod promote;
 mod status;
 
 use clap::{Parser, Subcommand};
@@ -31,6 +32,12 @@ enum Commands {
         #[arg(long, default_value = "")]
         context: String,
     },
+    /// Promote EPHEMERAL.md into an archive log
+    Promote {
+        /// Override context field
+        #[arg(long, default_value = "")]
+        context: String,
+    },
     /// Memory system health check
     Status,
 }
@@ -41,6 +48,7 @@ fn main() {
     let result = match cli.command {
         Some(Commands::Init) | None => init::run(),
         Some(Commands::Checkpoint { trigger, context }) => checkpoint::run(&trigger, &context),
+        Some(Commands::Promote { context }) => promote::run(&context),
         Some(Commands::Status) => status::run(),
     };
 

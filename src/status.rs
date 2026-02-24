@@ -43,9 +43,9 @@ fn run_with_base(base: &Path) -> Result<(), String> {
     if ephemeral_path.exists() {
         let content = fs::read_to_string(&ephemeral_path).unwrap_or_default();
         if content.trim().is_empty() {
-            println!("  EPHEMERAL.md: empty (mid-session or fresh)");
+            println!("  EPHEMERAL.md: empty (clean)");
         } else {
-            println!("  EPHEMERAL.md: has content (last session summary present)");
+            println!("  EPHEMERAL.md: has content (pending promotion)");
         }
     } else {
         println!("  EPHEMERAL.md: {YELLOW}not found{RESET}");
