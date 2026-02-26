@@ -6,9 +6,15 @@
 
 Persistent three-layer memory system for AI coding agents. Gives Claude Code (and similar tools) long-term recall across sessions.
 
-## The Problem
+## Why
 
-Claude Code's built-in memory (`MEMORY.md`) is a single flat file. It works for small notes, but breaks down as conversations accumulate — no session continuity, no archival history, no lifecycle management. You lose context every time a session ends or compaction kicks in.
+Claude Code's built-in memory is a single flat file (`MEMORY.md`). It works for small notes, but breaks down fast:
+
+- **No session continuity.** When a session ends, everything the agent learned that didn't fit in MEMORY.md is gone. The next session starts cold.
+- **Compaction destroys context.** Long conversations get silently compressed. Anything the agent hadn't saved yet vanishes.
+- **Memory management is voluntary.** The agent has to *choose* to save things — and it often doesn't. Instructions to "remember this" get lost in the noise.
+
+The core insight: **memory can't depend on the agent remembering to use it.** That's circular. recall-echo makes the entire lifecycle mechanical — hooks handle consumption, checkpointing, and archival automatically. The agent writes one summary at session end. Everything else is enforced by the system.
 
 ## How It Works
 
