@@ -16,6 +16,7 @@ const ARCHIVE_TEMPLATE: &str = "# Archive Index\n\n\
 
 const CHECKPOINT_COMMAND: &str = "recall-echo checkpoint --trigger precompact";
 const PROMOTE_COMMAND: &str = "recall-echo promote";
+const CONSUME_COMMAND: &str = "recall-echo consume";
 
 const LEGACY_MARKER: &str = "RECALL-ECHO";
 
@@ -170,6 +171,7 @@ fn merge_hooks(settings_path: &PathBuf) {
     let has_checkpoint = hook_has_command(&settings, "PreCompact", CHECKPOINT_COMMAND);
     let has_legacy = hook_has_command(&settings, "PreCompact", LEGACY_MARKER);
     let has_promote = hook_has_command(&settings, "SessionEnd", PROMOTE_COMMAND);
+    let has_consume = hook_has_command(&settings, "PreToolUse", CONSUME_COMMAND);
 
     // Track what changed so we do a single write
     let mut changed = false;
@@ -219,6 +221,18 @@ fn merge_hooks(settings_path: &PathBuf) {
     } else {
         add_hook_entry(&mut settings, "SessionEnd", PROMOTE_COMMAND);
         print_status(Status::Created, "Added SessionEnd hook");
+        changed = true;
+    }
+
+    // --- PreToolUse hook (consume ephemeral at session start) ---
+    if has_consume {
+        print_status(Status::Exists, "PreToolUse hook already up to date");
+    } else {
+        add_hook_entry(&mut settings, "PreToolUse", CONSUME_COMMAND);
+        print_status(
+            Status::Created,
+            "Added PreToolUse hook (ephemeral consumption)",
+        );
         changed = true;
     }
 
@@ -274,16 +288,19 @@ pub fn run() -> Result<(), String> {
     // Write ARCHIVE.md (never overwrite)
     write_if_not_exists(&paths::archive_index()?, ARCHIVE_TEMPLATE, "ARCHIVE.md");
 
-    // Merge hooks (PreCompact + SessionEnd)
+    // Merge hooks (PreCompact + SessionEnd + PreToolUse)
     merge_hooks(&paths::settings_file()?);
 
     // Summary
     println!(
         "\n{BOLD}Setup complete.{RESET} Your memory system is ready.\n\n\
          \x20 Layer 1 (MEMORY.md)     — Curated facts, always in context\n\
-         \x20 Layer 2 (EPHEMERAL.md)  — Last session summary, promoted on exit\n\
+         \x20 Layer 2 (EPHEMERAL.md)  — Last session summary, auto-consumed on start\n\
          \x20 Layer 3 (Archive)       — Searchable history in ~/.claude/memories/\n\n\
-         \x20 The memory protocol loads automatically via ~/.claude/rules/recall-echo.md\n\
+         \x20 Hooks installed:\n\
+         \x20   PreToolUse  → recall-echo consume  (reads EPHEMERAL.md into context)\n\
+         \x20   PreCompact  → recall-echo checkpoint (saves before context compression)\n\
+         \x20   SessionEnd  → recall-echo promote  (archives session summary)\n\n\
          \x20 Start a new Claude Code session and your agent will have persistent memory.\n"
     );
 

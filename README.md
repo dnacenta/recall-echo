@@ -51,17 +51,17 @@ recall-echo adds a structured memory protocol via Claude Code's auto-loaded rule
  ─────────────          ──────────────           ──────────────           ───────────
 
  ┌─────────────┐        ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
- │ recall-echo │        │ Update      │         │ PreCompact  │         │ Write        │
- │ promote     │───────▶│ MEMORY.md   │────────▶│ hook fires  │────────▶│ EPHEMERAL.md │
- │ (safety net │        │ with stable │         │             │         │ with session │
- │  — no-op if │        │ facts       │         └──────┬──────┘         │ summary      │
- │  already    │        └─────────────┘                │                └──────┬───────┘
- │  promoted)  │                                       ▼                       │
- └─────────────┘                              ┌──────────────┐                 ▼
-                                              │ recall-echo  │         ┌──────────────┐
-                                              │ checkpoint   │         │ SessionEnd   │
-                                              │ --trigger    │         │ hook fires   │
-                                              │ precompact   │         │              │
+ │ PreToolUse  │        │ Update      │         │ PreCompact  │         │ Write        │
+ │ hook fires  │───────▶│ MEMORY.md   │────────▶│ hook fires  │────────▶│ EPHEMERAL.md │
+ │             │        │ with stable │         │             │         │ with session │
+ │ recall-echo │        │ facts       │         └──────┬──────┘         │ summary      │
+ │ consume     │        └─────────────┘                │                └──────┬───────┘
+ │             │                                       ▼                       │
+ │ Reads       │                              ┌──────────────┐                 ▼
+ │ EPHEMERAL → │                              │ recall-echo  │         ┌──────────────┐
+ │ stdout,     │                              │ checkpoint   │         │ SessionEnd   │
+ │ clears file │                              │ --trigger    │         │ hook fires   │
+ └─────────────┘                              │ precompact   │         │              │
                                               └──────┬───────┘         │ recall-echo  │
                                                      │                 │ promote      │
                                                      ▼                 │              │
@@ -83,7 +83,7 @@ recall-echo adds a structured memory protocol via Claude Code's auto-loaded rule
                                               └──────────────┘
 ```
 
-The CLI handles all mechanical bookkeeping — numbering, file creation, timestamps, index updates. The agent writes one summary to EPHEMERAL.md at session end. The SessionEnd hook automatically promotes it to an archive log on exit. The session-start promote is a safety net in case the hook didn't fire.
+The entire lifecycle is now mechanical — no voluntary steps. The PreToolUse hook consumes last session's context at start, the PreCompact hook checkpoints before compaction, and the SessionEnd hook archives on exit. The agent only writes one summary to EPHEMERAL.md at session end.
 
 ## Installation
 
@@ -131,7 +131,7 @@ cargo build --release
 
 ### `recall-echo init`
 
-Initialize or upgrade the memory system. Creates directories, writes protocol rules, and configures hooks (PreCompact for checkpointing, SessionEnd for automatic promotion). Idempotent — running it again won't overwrite existing memory files. Upgrades legacy echo hooks to the new checkpoint hook.
+Initialize or upgrade the memory system. Creates directories, writes protocol rules, and configures all three hooks (PreToolUse for ephemeral consumption, PreCompact for checkpointing, SessionEnd for automatic promotion). Idempotent — running it again won't overwrite existing memory files. Upgrades legacy echo hooks to the new checkpoint hook.
 
 ### `recall-echo checkpoint`
 
@@ -183,6 +183,23 @@ recall-echo promote --context "session about auth"   # override context field
              "Promoted EPHEMERAL.md → Log 005 | Date: 2026-02-24"
 ```
 
+### `recall-echo consume`
+
+Consume EPHEMERAL.md at session start. Reads the file contents, outputs them to stdout wrapped in memory markers (so Claude Code captures it via hook), then clears the file. Silent if empty or missing. Idempotent — safe to call multiple times; only the first call with content produces output.
+
+```
+  recall-echo consume
+        │
+        ├──▶ Read EPHEMERAL.md (exit silently if empty/missing)
+        │
+        ├──▶ Output content wrapped in memory markers to stdout
+        │    [MEMORY — Last Session Summary ...]
+        │    <content>
+        │    [END MEMORY — EPHEMERAL.md has been cleared ...]
+        │
+        └──▶ Clear EPHEMERAL.md
+```
+
 ### `recall-echo status`
 
 Memory system health check. Shows MEMORY.md line count, EPHEMERAL.md state, archive log count, protocol status, and hook configuration. Warns about approaching limits or legacy hooks.
@@ -191,10 +208,10 @@ Memory system health check. Shows MEMORY.md line count, EPHEMERAL.md state, arch
 recall-echo — memory system status
 
   MEMORY.md:    142/200 lines (71%)
-  EPHEMERAL.md: has content (pending promotion)
+  EPHEMERAL.md: has content (pending consumption)
   Archive logs: 23 logs, latest: 2026-02-24
   Protocol:     installed
-  Hooks:        PreCompact ✓  SessionEnd ✓
+  Hooks:        PreToolUse ✓  PreCompact ✓  SessionEnd ✓
 
   No issues detected.
 ```
@@ -217,7 +234,7 @@ recall-echo — memory system status
 │
 ├── EPHEMERAL.md ·················· Layer 2 — session summary staging area
 ├── ARCHIVE.md ···················· Index — log number, date, trigger per entry
-└── settings.json ················· Hooks: PreCompact + SessionEnd
+└── settings.json ················· Hooks: PreToolUse + PreCompact + SessionEnd
 ```
 
 ## Archive Log Format
@@ -254,7 +271,8 @@ Old logs without frontmatter continue to work — numbering is by filename, not 
 
 recall-echo requires no configuration. It works out of the box with Claude Code's existing infrastructure.
 
-It adds two hooks to `settings.json`:
+It adds three hooks to `settings.json`:
+- **PreToolUse** — runs `recall-echo consume` on first tool use, injecting last session's context and clearing EPHEMERAL.md
 - **PreCompact** — runs `recall-echo checkpoint` before context compaction, creating a scaffolded archive log
 - **SessionEnd** — runs `recall-echo promote` on exit, archiving EPHEMERAL.md automatically
 
@@ -262,14 +280,12 @@ If you already have hooks configured, they're preserved. If upgrading from v0.2.
 
 ## How the Agent Uses It
 
-Once installed, the agent follows the protocol automatically:
+Once installed, the entire memory lifecycle is mechanical — managed by hooks, not voluntary behavior:
 
-- **Runs `recall-echo promote`** at session start as a safety net (usually already promoted by the SessionEnd hook)
-- **Updates `MEMORY.md`** when it learns stable facts (never speculative or session-specific info)
-- **Writes `EPHEMERAL.md`** at session end with a rich session summary
-- **Fills in archive log sections** when a precompact checkpoint fires
-- **Searches archives** with `Grep` when it needs historical context
-- **Distills `MEMORY.md`** proactively when it approaches 200 lines, moving details to topic files
+- **Session start** — PreToolUse hook runs `recall-echo consume`, injecting last session's context automatically
+- **During session** — agent updates `MEMORY.md` with stable facts and searches archives with `Grep` as needed
+- **On compaction** — PreCompact hook runs `recall-echo checkpoint`, creating a scaffolded archive log
+- **Session end** — agent writes `EPHEMERAL.md`, then SessionEnd hook runs `recall-echo promote` to archive it
 
 You can also explicitly tell the agent to remember something, search its history, or review what it knows. The memory is transparent — it's all plain markdown files you can read and edit yourself.
 
@@ -289,7 +305,7 @@ rm ~/.claude/rules/recall-echo.md
 rm -rf ~/.claude/memory ~/.claude/memories ~/.claude/EPHEMERAL.md ~/.claude/ARCHIVE.md
 ```
 
-You may also want to remove the `PreCompact` and `SessionEnd` hooks from `~/.claude/settings.json`.
+You may also want to remove the `PreToolUse`, `PreCompact`, and `SessionEnd` hooks from `~/.claude/settings.json`.
 
 ## Contributing
 
