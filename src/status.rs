@@ -11,6 +11,7 @@ const RESET: &str = "\x1b[0m";
 
 const CHECKPOINT_COMMAND: &str = "recall-echo checkpoint --trigger precompact";
 const PROMOTE_COMMAND: &str = "recall-echo promote";
+const CONSUME_COMMAND: &str = "recall-echo consume";
 
 fn run_with_base(base: &Path) -> Result<(), String> {
     if !base.exists() {
@@ -46,7 +47,7 @@ fn run_with_base(base: &Path) -> Result<(), String> {
         if content.trim().is_empty() {
             println!("  EPHEMERAL.md: empty (clean)");
         } else {
-            println!("  EPHEMERAL.md: has content (pending promotion)");
+            println!("  EPHEMERAL.md: has content (pending consumption)");
         }
     } else {
         println!("  EPHEMERAL.md: {YELLOW}not found{RESET}");
@@ -86,6 +87,7 @@ fn run_with_base(base: &Path) -> Result<(), String> {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
         let precompact_ok = content.contains(CHECKPOINT_COMMAND);
         let session_end_ok = content.contains(PROMOTE_COMMAND);
+        let consume_ok = content.contains(CONSUME_COMMAND);
         let has_legacy = content.contains("RECALL-ECHO") && !precompact_ok;
 
         if has_legacy {
@@ -103,7 +105,12 @@ fn run_with_base(base: &Path) -> Result<(), String> {
             } else {
                 format!("{YELLOW}⚠{RESET}")
             };
-            println!("  Hooks:        PreCompact {pc}  SessionEnd {se}");
+            let co = if consume_ok {
+                format!("{GREEN}✓{RESET}")
+            } else {
+                format!("{YELLOW}⚠{RESET}")
+            };
+            println!("  Hooks:        PreToolUse {co}  PreCompact {pc}  SessionEnd {se}");
         }
     } else {
         println!("  Hooks:        {YELLOW}no settings.json{RESET} — run recall-echo init");
@@ -124,6 +131,9 @@ fn run_with_base(base: &Path) -> Result<(), String> {
         }
         if !content.contains(PROMOTE_COMMAND) {
             issues.push("SessionEnd hook missing — run recall-echo init");
+        }
+        if !content.contains(CONSUME_COMMAND) {
+            issues.push("PreToolUse hook missing — run recall-echo init");
         }
     }
 
@@ -195,7 +205,7 @@ mod tests {
         fs::write(rules_dir.join("recall-echo.md"), "protocol").unwrap();
         fs::write(
             tmp.path().join("settings.json"),
-            r#"{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"recall-echo checkpoint --trigger precompact"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"recall-echo promote"}]}]}}"#,
+            r#"{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"recall-echo checkpoint --trigger precompact"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"recall-echo promote"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"recall-echo consume"}]}]}}"#,
         )
         .unwrap();
 
@@ -218,7 +228,6 @@ mod tests {
         )
         .unwrap();
 
-        // Should succeed (just prints warnings)
         let result = run_with_base(tmp.path());
         assert!(result.is_ok());
     }
