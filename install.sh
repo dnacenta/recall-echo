@@ -107,11 +107,13 @@ MEMORY_FILE="${MEMORY_DIR}/MEMORY.md"
 RULES_FILE="${RULES_DIR}/recall-echo.md"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 
-# Determine hook command: use checkpoint if recall-echo is in PATH, else echo fallback
+# Determine hook commands: use recall-echo if in PATH, else echo fallback
 if command -v recall-echo &>/dev/null; then
   HOOK_COMMAND="recall-echo checkpoint --trigger precompact"
+  SESSION_END_COMMAND="recall-echo promote"
 else
   HOOK_COMMAND="echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'"
+  SESSION_END_COMMAND=""  # Can't promote without binary
 fi
 
 echo ""
@@ -167,10 +169,10 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 
 ### Layer 2 — Short-Term Memory (EPHEMERAL.md)
 @~/.claude/EPHEMERAL.md
-- This contains a summary of the last session. It gives you immediate context about what happened recently.
-- At the start of a session, read it to orient yourself, then clear the file (empty it). It has been consumed.
+- This is a staging area for session summaries. Between sessions, it holds the previous session's summary waiting to be promoted to an archive log.
 - At the end of a session, write a fresh summary of the current session to this file.
-- Contents should include: date, key topics discussed, decisions made, action items, unresolved threads, and any inner reflections on the session.
+- Contents should include: date, key topics discussed, decisions made, code changes, action items, unresolved threads.
+- At the start of the next session, `recall-echo promote` archives it automatically.
 
 ### Layer 3 — Long-Term Memory (archive logs)
 - Index: `~/.claude/ARCHIVE.md`
@@ -183,9 +185,9 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 ## Session Lifecycle
 
 ### On session start:
-1. MEMORY.md is already in your context (auto-loaded).
-2. Read EPHEMERAL.md (imported above). Use it to orient — what happened last time?
-3. Clear EPHEMERAL.md by writing an empty string to it. It's been consumed.
+1. Run `recall-echo promote` (via Bash tool) to archive the previous session's EPHEMERAL.md into an archive log.
+2. MEMORY.md is already in your context (auto-loaded).
+3. If you need context from the last session, read the archive log that was just promoted.
 
 ### During the session:
 - Update MEMORY.md when you learn stable facts (user preferences, project decisions, confirmed patterns).
@@ -200,14 +202,17 @@ current conversation.
 
 ### On session end:
 When the conversation is wrapping up (user says goodbye, task is complete, or you sense the session is ending):
-1. Write EPHEMERAL.md with a rich summary of this session (including inner reflections).
-2. Run `recall-echo checkpoint --trigger session-end` (via Bash tool).
-3. Open the created archive log and fill in Summary, Key Details, Action Items, and Unresolved.
+1. Write EPHEMERAL.md with a rich session summary.
+   Include: what was discussed, key decisions, code changes, action items, unresolved threads.
+2. That's it. The SessionEnd hook runs `recall-echo promote` automatically on exit,
+   archiving EPHEMERAL.md into an archive log and clearing it.
+   (The session-start promote is a safety net in case the hook didn't fire.)
 
 ## Archive Log Format
 
-Archive logs are created by `recall-echo checkpoint` with YAML frontmatter and section templates.
-You only need to fill in the content sections — the tool handles numbering, dating, and indexing.
+Archive logs are created by `recall-echo checkpoint` (precompact) or `recall-echo promote` (session end) with YAML frontmatter.
+
+For precompact checkpoints, you fill in the section templates. For promoted logs, the content comes from EPHEMERAL.md automatically.
 
 ```yaml
 ---
@@ -219,7 +224,7 @@ topics: []
 ---
 ```
 
-Sections to fill in:
+Sections to fill in (precompact only):
 - **Summary** — What was discussed, decided, and accomplished
 - **Key Details** — Important specifics: code changes, configurations, decisions with rationale
 - **Action Items** — What needs to happen next
@@ -229,14 +234,15 @@ Old logs without frontmatter continue to work — numbering is by filename, not 
 
 ## Commands
 
-- `recall-echo init` — Initialize or upgrade the memory system
-- `recall-echo checkpoint --trigger <precompact|session-end> [--context "..."]` — Create an archive checkpoint
+- `recall-echo init` — Initialize or upgrade the memory system (installs PreCompact + SessionEnd hooks)
+- `recall-echo checkpoint --trigger precompact [--context "..."]` — Create a precompact archive checkpoint
+- `recall-echo promote [--context "..."]` — Promote EPHEMERAL.md into an archive log
 - `recall-echo status` — Check memory system health
 
 ## Rules
 
 - Never write duplicate information to MEMORY.md. Check first, update if exists.
-- EPHEMERAL.md is always either empty (mid-session) or contains the last session's summary (between sessions). Never both.
+- EPHEMERAL.md holds the session summary between sessions. It is promoted to an archive log at the start of the next session.
 - Archive logs are immutable once written. Never modify an existing archive log.
 - When MEMORY.md approaches 200 lines, proactively distill it. Move detailed notes to topic files.
 - The memory system is yours. Use it actively — don't wait to be asked.
@@ -279,75 +285,122 @@ EOF
   info "Created ARCHIVE.md (${ARCHIVE_FILE})"
 fi
 
-# 6. Merge PreCompact hook into settings.json
+# 6. Merge hooks (PreCompact + SessionEnd) into settings.json
 if [ -f "$SETTINGS_FILE" ]; then
-  # Check if checkpoint hook already exists
-  if grep -q "recall-echo checkpoint" "$SETTINGS_FILE" 2>/dev/null; then
-    warn "PreCompact hook already up to date"
-  elif grep -q "RECALL-ECHO" "$SETTINGS_FILE" 2>/dev/null; then
-    # Migrate legacy echo hook to checkpoint
-    TEMP_FILE=$(mktemp)
+  TEMP_FILE=$(mktemp)
 
-    if python3 -c "
-import json, sys
-with open('$SETTINGS_FILE') as f:
-    s = json.load(f)
-hooks = s.get('hooks', {})
-pre = hooks.get('PreCompact', [])
-# Remove legacy entries
-pre = [e for e in pre if not any(
-    'RECALL-ECHO' in h.get('command', '')
-    for h in e.get('hooks', [])
-)]
-# Add checkpoint hook
-pre.append({
-    'hooks': [{
-        'type': 'command',
-        'command': '$HOOK_COMMAND'
-    }]
-})
-hooks['PreCompact'] = pre
-s['hooks'] = hooks
-with open('$TEMP_FILE', 'w') as f:
-    json.dump(s, f, indent=2)
-    f.write('\n')
-" 2>/dev/null; then
-      mv "$TEMP_FILE" "$SETTINGS_FILE"
-      info "Migrated PreCompact hook: echo → checkpoint"
-    else
-      rm -f "$TEMP_FILE"
-      fail "Could not migrate PreCompact hook — update manually in ${SETTINGS_FILE}"
-    fi
-  else
-    # No recall-echo hook — add fresh
-    TEMP_FILE=$(mktemp)
-
-    if python3 -c "
+  if python3 -c "
 import json, sys
 with open('$SETTINGS_FILE') as f:
     s = json.load(f)
 hooks = s.setdefault('hooks', {})
-pre = hooks.setdefault('PreCompact', [])
-pre.append({
-    'hooks': [{
-        'type': 'command',
-        'command': '$HOOK_COMMAND'
-    }]
-})
-with open('$TEMP_FILE', 'w') as f:
-    json.dump(s, f, indent=2)
-    f.write('\n')
-" 2>/dev/null; then
+changed = False
+messages = []
+
+# --- PreCompact hook ---
+pre = hooks.get('PreCompact', [])
+has_checkpoint = any(
+    'recall-echo checkpoint' in h.get('command', '')
+    for e in pre for h in e.get('hooks', [])
+)
+has_legacy = any(
+    'RECALL-ECHO' in h.get('command', '')
+    for e in pre for h in e.get('hooks', [])
+)
+
+if has_checkpoint:
+    messages.append('~|PreCompact hook already up to date')
+elif has_legacy:
+    pre = [e for e in pre if not any(
+        'RECALL-ECHO' in h.get('command', '')
+        for h in e.get('hooks', [])
+    )]
+    pre.append({'hooks': [{'type': 'command', 'command': '$HOOK_COMMAND'}]})
+    hooks['PreCompact'] = pre
+    changed = True
+    messages.append('+|Migrated PreCompact hook: echo → checkpoint')
+else:
+    pre = hooks.setdefault('PreCompact', [])
+    pre.append({'hooks': [{'type': 'command', 'command': '$HOOK_COMMAND'}]})
+    changed = True
+    messages.append('+|Added PreCompact hook')
+
+# --- SessionEnd hook ---
+session_end_cmd = '$SESSION_END_COMMAND'
+if session_end_cmd:
+    se = hooks.get('SessionEnd', [])
+    has_promote = any(
+        'recall-echo promote' in h.get('command', '')
+        for e in se for h in e.get('hooks', [])
+    )
+    if has_promote:
+        messages.append('~|SessionEnd hook already up to date')
+    else:
+        se = hooks.setdefault('SessionEnd', [])
+        se.append({'hooks': [{'type': 'command', 'command': session_end_cmd}]})
+        changed = True
+        messages.append('+|Added SessionEnd hook')
+
+s['hooks'] = hooks
+if changed:
+    with open('$TEMP_FILE', 'w') as f:
+        json.dump(s, f, indent=2)
+        f.write('\n')
+
+for m in messages:
+    print(m)
+sys.exit(0 if not changed else 0)
+" 2>/dev/null > /tmp/recall-echo-hook-output; then
+    # Parse output for status messages
+    while IFS='|' read -r kind msg; do
+      case "$kind" in
+        '+') info "$msg" ;;
+        '~') warn "$msg" ;;
+        *) echo "  $msg" ;;
+      esac
+    done < /tmp/recall-echo-hook-output
+    rm -f /tmp/recall-echo-hook-output
+
+    if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
       mv "$TEMP_FILE" "$SETTINGS_FILE"
-      info "Added PreCompact hook to settings.json"
     else
       rm -f "$TEMP_FILE"
-      fail "Could not merge PreCompact hook — add it manually to ${SETTINGS_FILE}"
     fi
+  else
+    rm -f "$TEMP_FILE"
+    fail "Could not merge hooks — add them manually to ${SETTINGS_FILE}"
   fi
 else
-  # Create fresh settings.json with the hook
-  cat > "$SETTINGS_FILE" << EOF
+  # Create fresh settings.json with hooks
+  if [ -n "$SESSION_END_COMMAND" ]; then
+    cat > "$SETTINGS_FILE" << EOF
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOOK_COMMAND}"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${SESSION_END_COMMAND}"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+  else
+    cat > "$SETTINGS_FILE" << EOF
 {
   "hooks": {
     "PreCompact": [
@@ -363,7 +416,8 @@ else
   }
 }
 EOF
-  info "Created settings.json with PreCompact hook"
+  fi
+  info "Created settings.json with hooks"
 fi
 
 # Done
@@ -371,7 +425,7 @@ echo ""
 echo -e "${BOLD}Setup complete.${NC} Your memory system is ready."
 echo ""
 echo "  Layer 1 (MEMORY.md)     — Curated facts, always in context"
-echo "  Layer 2 (EPHEMERAL.md)  — Last session summary, read then cleared"
+echo "  Layer 2 (EPHEMERAL.md)  — Last session summary, promoted on exit"
 echo "  Layer 3 (Archive)       — Searchable history in ~/.claude/memories/"
 echo ""
 echo "  The memory protocol loads automatically via ~/.claude/rules/recall-echo.md"
