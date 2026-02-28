@@ -68,5 +68,5 @@ docs(#2): expand usage examples
 
 ## Code style
 
-- Run `npm run build` before submitting — no TypeScript errors
+- Run `cargo fmt && cargo clippy && cargo test` before submitting — no warnings or test failures
 - Keep changes focused — one issue per PR

@@ -235,12 +235,12 @@ Out of scope for v1 but architecture supports it.
 
 ### Isolated Test Environment
 
-We will NOT test against the existing Trinity setup. Instead:
+We will NOT test against an existing production setup. Instead:
 
 1. Create a temporary test directory with a fresh `.claude/` structure
 2. Run `recall-echo init` against it
 3. Verify file structure and contents are correct
-4. Manually validate rules file loads in a Claude Code session (separate from Trinity)
+4. Manually validate rules file loads in a Claude Code session (separate from production)
 
 ### Automated Tests
 
