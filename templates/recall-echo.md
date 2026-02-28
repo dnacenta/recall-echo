@@ -14,10 +14,10 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 
 ### Layer 2 — Short-Term Memory (EPHEMERAL.md)
 @~/.claude/EPHEMERAL.md
-- This contains a summary of the last session. It gives you immediate context about what happened recently.
-- At the start of a session, read it to orient yourself, then clear the file (empty it). It has been consumed.
+- This is a staging area for session summaries. Between sessions, it holds the previous session's summary.
 - At the end of a session, write a fresh summary of the current session to this file.
-- Contents should include: date, key topics discussed, decisions made, action items, unresolved threads, and any inner reflections on the session.
+- Contents should include: date, key topics discussed, decisions made, code changes, action items, unresolved threads.
+- At session start, the PreToolUse hook runs `recall-echo consume` — it reads EPHEMERAL.md, injects the content into your context, and clears the file. This is automatic.
 
 ### Layer 3 — Long-Term Memory (archive logs)
 - Index: `~/.claude/ARCHIVE.md`
@@ -31,8 +31,8 @@ You have a persistent three-layer memory system. Use it to maintain continuity a
 
 ### On session start:
 1. MEMORY.md is already in your context (auto-loaded).
-2. Read EPHEMERAL.md (imported above). Use it to orient — what happened last time?
-3. Clear EPHEMERAL.md by writing an empty string to it. It's been consumed.
+2. The PreToolUse hook automatically runs `recall-echo consume`, which reads EPHEMERAL.md, outputs it into your context, and clears the file. No action needed from you.
+3. Use the injected context to orient yourself on what happened last session.
 
 ### During the session:
 - Update MEMORY.md when you learn stable facts (user preferences, project decisions, confirmed patterns).
@@ -47,14 +47,16 @@ current conversation.
 
 ### On session end:
 When the conversation is wrapping up (user says goodbye, task is complete, or you sense the session is ending):
-1. Write EPHEMERAL.md with a rich summary of this session (including inner reflections).
-2. Run `recall-echo checkpoint --trigger session-end` (via Bash tool).
-3. Open the created archive log and fill in Summary, Key Details, Action Items, and Unresolved.
+1. Write EPHEMERAL.md with a rich session summary.
+   Include: what was discussed, key decisions, code changes, action items, unresolved threads.
+2. That's it. The SessionEnd hook runs `recall-echo promote` automatically on exit,
+   archiving EPHEMERAL.md into an archive log and clearing it.
 
 ## Archive Log Format
 
-Archive logs are created by `recall-echo checkpoint` with YAML frontmatter and section templates.
-You only need to fill in the content sections — the tool handles numbering, dating, and indexing.
+Archive logs are created by `recall-echo checkpoint` (precompact) or `recall-echo promote` (session end) with YAML frontmatter.
+
+For precompact checkpoints, you fill in the section templates. For promoted logs, the content comes from EPHEMERAL.md automatically.
 
 ```yaml
 ---
@@ -66,7 +68,7 @@ topics: []
 ---
 ```
 
-Sections to fill in:
+Sections to fill in (precompact only):
 - **Summary** — What was discussed, decided, and accomplished
 - **Key Details** — Important specifics: code changes, configurations, decisions with rationale
 - **Action Items** — What needs to happen next
@@ -76,14 +78,16 @@ Old logs without frontmatter continue to work — numbering is by filename, not 
 
 ## Commands
 
-- `recall-echo init` — Initialize or upgrade the memory system
-- `recall-echo checkpoint --trigger <precompact|session-end> [--context "..."]` — Create an archive checkpoint
+- `recall-echo init` — Initialize or upgrade the memory system (installs PreToolUse + PreCompact + SessionEnd hooks)
+- `recall-echo consume` — Consume EPHEMERAL.md at session start (runs automatically via PreToolUse hook)
+- `recall-echo checkpoint --trigger precompact [--context "..."]` — Create a precompact archive checkpoint
+- `recall-echo promote [--context "..."]` — Promote EPHEMERAL.md into an archive log
 - `recall-echo status` — Check memory system health
 
 ## Rules
 
 - Never write duplicate information to MEMORY.md. Check first, update if exists.
-- EPHEMERAL.md is always either empty (mid-session) or contains the last session's summary (between sessions). Never both.
+- EPHEMERAL.md holds the session summary between sessions. It is consumed into context at session start and archived via promote at session end. Both are automatic.
 - Archive logs are immutable once written. Never modify an existing archive log.
 - When MEMORY.md approaches 200 lines, proactively distill it. Move detailed notes to topic files.
 - The memory system is yours. Use it actively — don't wait to be asked.
