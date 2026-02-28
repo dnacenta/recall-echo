@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "0.3.0"
+version = "0.6.0"
 edition = "2021"
 description = "Persistent three-layer memory system for AI coding agents"
 license = "MIT"

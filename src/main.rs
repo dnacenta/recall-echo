@@ -1,8 +1,10 @@
 mod archive;
 mod checkpoint;
+mod consume;
 mod frontmatter;
 mod init;
 mod paths;
+mod promote;
 mod status;
 
 use clap::{Parser, Subcommand};
@@ -31,6 +33,14 @@ enum Commands {
         #[arg(long, default_value = "")]
         context: String,
     },
+    /// Promote EPHEMERAL.md into an archive log
+    Promote {
+        /// Override context field
+        #[arg(long, default_value = "")]
+        context: String,
+    },
+    /// Consume EPHEMERAL.md at session start (outputs content, clears file)
+    Consume,
     /// Memory system health check
     Status,
 }
@@ -41,6 +51,8 @@ fn main() {
     let result = match cli.command {
         Some(Commands::Init) | None => init::run(),
         Some(Commands::Checkpoint { trigger, context }) => checkpoint::run(&trigger, &context),
+        Some(Commands::Promote { context }) => promote::run(&context),
+        Some(Commands::Consume) => consume::run(),
         Some(Commands::Status) => status::run(),
     };
 
