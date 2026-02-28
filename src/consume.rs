@@ -16,12 +16,11 @@ fn run_with_path(ephemeral: &Path) -> Result<(), String> {
     }
 
     // Output for Claude to ingest via hook stdout
-    println!("[MEMORY — Last Session Summary (auto-consumed from EPHEMERAL.md)]");
+    println!("[MEMORY — Today's Session Log (from EPHEMERAL.md)]");
     println!("{}", content.trim());
-    println!("[END MEMORY — EPHEMERAL.md has been cleared. Use this context to orient yourself.]");
-
-    // Clear the file
-    fs::write(ephemeral, "").map_err(|e| format!("Failed to clear EPHEMERAL.md: {e}"))?;
+    println!(
+        "[END MEMORY — EPHEMERAL.md is accumulative. Append your session summary at session end.]"
+    );
 
     Ok(())
 }
@@ -43,7 +42,7 @@ mod tests {
     }
 
     #[test]
-    fn consumes_and_clears_ephemeral() {
+    fn consumes_without_clearing_ephemeral() {
         let (_tmp, ephemeral) = setup_test_dir();
 
         let content = "# Last Session\nWorked on recall-echo.\n\n## Action Items\n- Add consume\n";
@@ -52,7 +51,7 @@ mod tests {
         run_with_path(&ephemeral).unwrap();
 
         let remaining = fs::read_to_string(&ephemeral).unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, content);
     }
 
     #[test]
@@ -84,6 +83,6 @@ mod tests {
         run_with_path(&ephemeral).unwrap();
 
         let remaining = fs::read_to_string(&ephemeral).unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, "Session content.");
     }
 }
