@@ -1,13 +1,6 @@
-mod archive;
-mod checkpoint;
-mod consume;
-mod frontmatter;
-mod init;
-mod paths;
-mod promote;
-mod status;
-
 use clap::{Parser, Subcommand};
+
+use recall_echo::{checkpoint, consume, init, promote, status};
 
 #[derive(Parser)]
 #[command(
