@@ -6,7 +6,7 @@ use crate::archive;
 use crate::frontmatter::Frontmatter;
 use crate::paths;
 
-fn utc_now() -> String {
+pub fn utc_now() -> String {
     let output = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output();
@@ -17,7 +17,7 @@ fn utc_now() -> String {
     }
 }
 
-fn log_body(log_num: u32) -> String {
+pub fn log_body(log_num: u32) -> String {
     format!(
         "\n# Archive Log {log_num:03}\n\n\
          ## Summary\n\n\
