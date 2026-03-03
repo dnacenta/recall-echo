@@ -1,6 +1,6 @@
 # recall-echo
 
-[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green)](https://github.com/dnacenta/recall-echo/tags)
 [![Crates.io](https://img.shields.io/crates/v/recall-echo)](https://crates.io/crates/recall-echo)
 
@@ -319,4 +319,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, commit conventions, an
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[GPL-3.0](LICENSE)

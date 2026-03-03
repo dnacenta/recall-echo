@@ -138,6 +138,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-system-types"
+version = "0.2.0"
+source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.2.0#acbadc847e4af646025d67b968330c07083a0d96"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,10 +343,11 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "recall-echo"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "clap",
  "dirs",
+ "echo-system-types",
  "serde_json",
  "tempfile",
 ]
@@ -379,6 +389,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
