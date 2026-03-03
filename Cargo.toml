@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "Persistent three-layer memory system for AI coding agents"
 license = "AGPL-3.0-only"
@@ -10,6 +10,7 @@ categories = ["command-line-utilities"]
 authors = ["dnacenta"]
 
 [dependencies]
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.2.0" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 dirs = "6"

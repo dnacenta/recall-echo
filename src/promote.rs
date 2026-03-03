@@ -6,7 +6,7 @@ use crate::archive;
 use crate::frontmatter::Frontmatter;
 use crate::paths;
 
-fn utc_now() -> String {
+pub fn utc_now() -> String {
     let output = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output();
