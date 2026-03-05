@@ -1,6 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::paths;
 
@@ -10,15 +9,16 @@ const MEMORY_TEMPLATE: &str = "# Memory\n\n\
 <!-- recall-echo: Curated memory. Distilled facts, preferences, patterns. -->\n\
 <!-- Keep under 200 lines. Only write confirmed, stable information. -->\n";
 
-const ARCHIVE_TEMPLATE: &str = "# Archive Index\n\n\
-<!-- recall-echo: Lightweight index of archive logs. -->\n\
-<!-- Format: | log number | date | key topics | -->\n";
+const ARCHIVE_TEMPLATE: &str = "# Conversation Archive\n\n\
+| # | Date | Session | Topics | Messages | Duration |\n\
+|---|------|---------|--------|----------|----------|\n";
 
+const ARCHIVE_SESSION_COMMAND: &str = "recall-echo archive-session";
 const CHECKPOINT_COMMAND: &str = "recall-echo checkpoint --trigger precompact";
-const PROMOTE_COMMAND: &str = "recall-echo promote";
 const CONSUME_COMMAND: &str = "recall-echo consume";
 
-const LEGACY_MARKER: &str = "RECALL-ECHO";
+// Legacy commands to detect and migrate
+const LEGACY_PROMOTE_COMMAND: &str = "recall-echo promote";
 
 // ANSI color helpers
 const GREEN: &str = "\x1b[32m";
@@ -35,29 +35,24 @@ enum Status {
 
 fn print_status(status: Status, msg: &str) {
     match status {
-        Status::Created => println!("  {GREEN}✓{RESET} {msg}"),
-        Status::Exists => println!("  {YELLOW}~{RESET} {msg}"),
-        Status::Error => println!("  {RED}✗{RESET} {msg}"),
+        Status::Created => eprintln!("  {GREEN}✓{RESET} {msg}"),
+        Status::Exists => eprintln!("  {YELLOW}~{RESET} {msg}"),
+        Status::Error => eprintln!("  {RED}✗{RESET} {msg}"),
     }
 }
 
-fn confirm(question: &str) -> bool {
-    print!("  {question} [y/N] ");
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
-}
-
-fn ensure_dir(path: &PathBuf) {
+fn ensure_dir(path: &Path) {
     if !path.exists() {
-        fs::create_dir_all(path).ok();
+        if let Err(e) = fs::create_dir_all(path) {
+            print_status(
+                Status::Error,
+                &format!("Failed to create {}: {e}", path.display()),
+            );
+        }
     }
 }
 
-fn write_if_not_exists(path: &PathBuf, content: &str, label: &str) {
+fn write_if_not_exists(path: &Path, content: &str, label: &str) {
     if path.exists() {
         print_status(
             Status::Exists,
@@ -71,22 +66,19 @@ fn write_if_not_exists(path: &PathBuf, content: &str, label: &str) {
     }
 }
 
-fn write_protocol(path: &PathBuf) {
+fn write_protocol(path: &Path) {
     if path.exists() {
         let existing = fs::read_to_string(path).unwrap_or_default();
         if existing == PROTOCOL_TEMPLATE {
             print_status(Status::Exists, "Memory protocol already up to date");
             return;
         }
-        if !confirm("Memory protocol already exists but differs from latest. Overwrite?") {
-            print_status(Status::Exists, "Kept existing memory protocol");
-            return;
-        }
+        eprintln!("  {YELLOW}~{RESET} Updating memory protocol to latest version");
     }
     match fs::write(path, PROTOCOL_TEMPLATE) {
         Ok(()) => print_status(
             Status::Created,
-            "Created memory protocol (~/.claude/rules/recall-echo.md)",
+            "Installed memory protocol (rules/recall-echo.md)",
         ),
         Err(e) => print_status(
             Status::Error,
@@ -143,7 +135,33 @@ fn add_hook_entry(settings: &mut serde_json::Value, event: &str, command: &str) 
     event_arr.as_array_mut().unwrap().push(hook_entry);
 }
 
-fn merge_hooks(settings_path: &PathBuf) {
+/// Remove hook entries containing a specific command needle from an event.
+fn remove_hook_entries(settings: &mut serde_json::Value, event: &str, needle: &str) {
+    if let Some(hooks) = settings.get_mut("hooks") {
+        if let Some(event_hooks) = hooks.get_mut(event) {
+            if let Some(arr) = event_hooks.as_array_mut() {
+                arr.retain(|entry| {
+                    if let Some(inner_hooks) = entry.get("hooks") {
+                        if let Some(inner_arr) = inner_hooks.as_array() {
+                            for hook in inner_arr {
+                                if let Some(cmd) = hook.get("command") {
+                                    if let Some(s) = cmd.as_str() {
+                                        if s.contains(needle) {
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    true
+                });
+            }
+        }
+    }
+}
+
+fn merge_hooks(settings_path: &Path) {
     let mut settings: serde_json::Value = if settings_path.exists() {
         match fs::read_to_string(settings_path) {
             Ok(content) => match serde_json::from_str(&content) {
@@ -168,63 +186,44 @@ fn merge_hooks(settings_path: &PathBuf) {
         serde_json::json!({})
     };
 
-    let has_checkpoint = hook_has_command(&settings, "PreCompact", CHECKPOINT_COMMAND);
-    let has_legacy = hook_has_command(&settings, "PreCompact", LEGACY_MARKER);
-    let has_promote = hook_has_command(&settings, "SessionEnd", PROMOTE_COMMAND);
-    let has_consume = hook_has_command(&settings, "PreToolUse", CONSUME_COMMAND);
-
-    // Track what changed so we do a single write
     let mut changed = false;
 
-    // --- PreCompact hook ---
-    if has_checkpoint {
-        print_status(Status::Exists, "PreCompact hook already up to date");
-    } else if has_legacy {
-        // Migrate: remove legacy entries, add checkpoint
-        if let Some(hooks) = settings.get_mut("hooks") {
-            if let Some(precompact) = hooks.get_mut("PreCompact") {
-                if let Some(arr) = precompact.as_array_mut() {
-                    arr.retain(|entry| {
-                        if let Some(inner_hooks) = entry.get("hooks") {
-                            if let Some(inner_arr) = inner_hooks.as_array() {
-                                for hook in inner_arr {
-                                    if let Some(cmd) = hook.get("command") {
-                                        if let Some(s) = cmd.as_str() {
-                                            if s.contains(LEGACY_MARKER) {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        true
-                    });
-                }
-            }
-        }
-        add_hook_entry(&mut settings, "PreCompact", CHECKPOINT_COMMAND);
+    // --- SessionEnd hook: archive-session ---
+    let has_archive = hook_has_command(&settings, "SessionEnd", ARCHIVE_SESSION_COMMAND);
+    let has_legacy_promote = hook_has_command(&settings, "SessionEnd", LEGACY_PROMOTE_COMMAND);
+
+    if has_archive {
+        print_status(Status::Exists, "SessionEnd hook already up to date");
+    } else if has_legacy_promote {
+        // Migrate: remove promote, add archive-session
+        remove_hook_entries(&mut settings, "SessionEnd", LEGACY_PROMOTE_COMMAND);
+        add_hook_entry(&mut settings, "SessionEnd", ARCHIVE_SESSION_COMMAND);
         print_status(
             Status::Created,
-            "Migrated PreCompact hook: echo → checkpoint",
+            "Migrated SessionEnd hook: promote → archive-session",
         );
         changed = true;
+    } else {
+        add_hook_entry(&mut settings, "SessionEnd", ARCHIVE_SESSION_COMMAND);
+        print_status(
+            Status::Created,
+            "Added SessionEnd hook (conversation archiving)",
+        );
+        changed = true;
+    }
+
+    // --- PreCompact hook: checkpoint ---
+    let has_checkpoint = hook_has_command(&settings, "PreCompact", CHECKPOINT_COMMAND);
+    if has_checkpoint {
+        print_status(Status::Exists, "PreCompact hook already up to date");
     } else {
         add_hook_entry(&mut settings, "PreCompact", CHECKPOINT_COMMAND);
         print_status(Status::Created, "Added PreCompact hook");
         changed = true;
     }
 
-    // --- SessionEnd hook ---
-    if has_promote {
-        print_status(Status::Exists, "SessionEnd hook already up to date");
-    } else {
-        add_hook_entry(&mut settings, "SessionEnd", PROMOTE_COMMAND);
-        print_status(Status::Created, "Added SessionEnd hook");
-        changed = true;
-    }
-
-    // --- PreToolUse hook (consume ephemeral at session start) ---
+    // --- PreToolUse hook: consume ---
+    let has_consume = hook_has_command(&settings, "PreToolUse", CONSUME_COMMAND);
     if has_consume {
         print_status(Status::Exists, "PreToolUse hook already up to date");
     } else {
@@ -255,10 +254,12 @@ fn merge_hooks(settings_path: &PathBuf) {
 }
 
 pub fn run() -> Result<(), String> {
-    let claude = paths::claude_dir()?;
+    run_with_base(&paths::claude_dir()?)
+}
 
+pub fn run_with_base(base: &Path) -> Result<(), String> {
     // Pre-flight check
-    if !claude.exists() {
+    if !base.exists() {
         return Err(
             "~/.claude directory not found. Is Claude Code installed?\n  \
              Install Claude Code first, then run this again."
@@ -266,43 +267,174 @@ pub fn run() -> Result<(), String> {
         );
     }
 
-    println!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");
+    eprintln!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");
 
     // Create directories
-    let rules_dir = paths::rules_dir()?;
-    let memory_dir = claude.join("memory");
-    let memories_dir = paths::memories_dir()?;
+    let rules_dir = base.join("rules");
+    let memory_dir = base.join("memory");
+    let conversations_dir = base.join("conversations");
     ensure_dir(&rules_dir);
     ensure_dir(&memory_dir);
-    ensure_dir(&memories_dir);
+    ensure_dir(&conversations_dir);
 
     // Write protocol rules file
-    write_protocol(&paths::protocol_file()?);
+    write_protocol(&rules_dir.join("recall-echo.md"));
 
     // Write MEMORY.md (never overwrite)
-    write_if_not_exists(&paths::memory_file()?, MEMORY_TEMPLATE, "MEMORY.md");
+    write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
 
     // Write EPHEMERAL.md (never overwrite)
-    write_if_not_exists(&paths::ephemeral_file()?, "", "EPHEMERAL.md");
+    write_if_not_exists(&base.join("EPHEMERAL.md"), "", "EPHEMERAL.md");
 
     // Write ARCHIVE.md (never overwrite)
-    write_if_not_exists(&paths::archive_index()?, ARCHIVE_TEMPLATE, "ARCHIVE.md");
+    write_if_not_exists(&base.join("ARCHIVE.md"), ARCHIVE_TEMPLATE, "ARCHIVE.md");
 
-    // Merge hooks (PreCompact + SessionEnd + PreToolUse)
-    merge_hooks(&paths::settings_file()?);
+    // Merge hooks (SessionEnd + PreCompact + PreToolUse)
+    merge_hooks(&base.join("settings.json"));
 
     // Summary
-    println!(
+    eprintln!(
         "\n{BOLD}Setup complete.{RESET} Your memory system is ready.\n\n\
          \x20 Layer 1 (MEMORY.md)     — Curated facts, always in context\n\
-         \x20 Layer 2 (EPHEMERAL.md)  — Last session summary, auto-consumed on start\n\
-         \x20 Layer 3 (Archive)       — Searchable history in ~/.claude/memories/\n\n\
+         \x20 Layer 2 (EPHEMERAL.md)  — Rolling window of recent sessions\n\
+         \x20 Layer 3 (Archive)       — Full conversations in ~/.claude/conversations/\n\n\
          \x20 Hooks installed:\n\
          \x20   PreToolUse  → recall-echo consume  (reads EPHEMERAL.md into context)\n\
          \x20   PreCompact  → recall-echo checkpoint (saves before context compression)\n\
-         \x20   SessionEnd  → recall-echo promote  (archives session summary)\n\n\
-         \x20 Start a new Claude Code session and your agent will have persistent memory.\n"
+         \x20   SessionEnd  → recall-echo archive-session (archives conversation)\n\n\
+         \x20 Start a new Claude Code session and your conversations will be remembered.\n"
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_creates_directories_and_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+
+        run_with_base(&base).unwrap();
+
+        assert!(base.join("rules/recall-echo.md").exists());
+        assert!(base.join("memory/MEMORY.md").exists());
+        assert!(base.join("EPHEMERAL.md").exists());
+        assert!(base.join("ARCHIVE.md").exists());
+        assert!(base.join("conversations").exists());
+        assert!(base.join("settings.json").exists());
+    }
+
+    #[test]
+    fn init_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+
+        run_with_base(&base).unwrap();
+        fs::write(base.join("memory/MEMORY.md"), "custom content").unwrap();
+
+        run_with_base(&base).unwrap();
+        let content = fs::read_to_string(base.join("memory/MEMORY.md")).unwrap();
+        assert_eq!(content, "custom content");
+    }
+
+    #[test]
+    fn init_merges_hooks_into_existing_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+
+        let existing = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [{"type": "command", "command": "some-other-tool"}]
+                }]
+            }
+        });
+        fs::write(
+            base.join("settings.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        run_with_base(&base).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(base.join("settings.json")).unwrap()).unwrap();
+
+        assert!(hook_has_command(&settings, "PreToolUse", "some-other-tool"));
+        assert!(hook_has_command(
+            &settings,
+            "SessionEnd",
+            ARCHIVE_SESSION_COMMAND
+        ));
+        assert!(hook_has_command(
+            &settings,
+            "PreCompact",
+            CHECKPOINT_COMMAND
+        ));
+        assert!(hook_has_command(&settings, "PreToolUse", CONSUME_COMMAND));
+    }
+
+    #[test]
+    fn init_does_not_duplicate_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+
+        run_with_base(&base).unwrap();
+        run_with_base(&base).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(base.join("settings.json")).unwrap()).unwrap();
+
+        let session_end = settings["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(session_end.len(), 1);
+    }
+
+    #[test]
+    fn init_migrates_legacy_promote_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+
+        let legacy = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "recall-echo promote"}]
+                }]
+            }
+        });
+        fs::write(
+            base.join("settings.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        run_with_base(&base).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(base.join("settings.json")).unwrap()).unwrap();
+
+        assert!(hook_has_command(
+            &settings,
+            "SessionEnd",
+            ARCHIVE_SESSION_COMMAND
+        ));
+        assert!(!hook_has_command(
+            &settings,
+            "SessionEnd",
+            LEGACY_PROMOTE_COMMAND
+        ));
+    }
+
+    #[test]
+    fn fails_if_base_dir_missing() {
+        let result = run_with_base(std::path::Path::new("/nonexistent/path"));
+        assert!(result.is_err());
+    }
 }
