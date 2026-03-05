@@ -1,14 +1,17 @@
-/// YAML frontmatter for archive logs.
+/// YAML frontmatter for conversation archives.
 ///
-/// Parses and renders a minimal subset: log number, date, trigger, context, topics.
+/// Parses and renders a minimal subset: log number, date, session_id,
+/// message_count, duration, source, topics.
 /// No external YAML dependency — hand-rolled for the fixed schema.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frontmatter {
     pub log: u32,
     pub date: String,
-    pub trigger: String,
-    pub context: String,
+    pub session_id: String,
+    pub message_count: u32,
+    pub duration: String,
+    pub source: String,
     pub topics: Vec<String>,
 }
 
@@ -21,64 +24,69 @@ impl Frontmatter {
             format!("[{}]", items.join(", "))
         };
 
-        let ctx = &self.context;
         format!(
-            "---\nlog: {}\ndate: \"{}\"\ntrigger: {}\ncontext: \"{ctx}\"\ntopics: {topics}\n---",
-            self.log, self.date, self.trigger,
+            "---\nlog: {}\ndate: \"{}\"\nsession_id: \"{}\"\nmessage_count: {}\nduration: \"{}\"\nsource: \"{}\"\ntopics: {}\n---",
+            self.log, self.date, self.session_id, self.message_count, self.duration, self.source, topics
         )
     }
 }
 
 /// Parse frontmatter from file content. Returns None if no valid frontmatter found.
 pub fn parse(content: &str) -> Option<Frontmatter> {
-    let content = content.trim_start();
-    if !content.starts_with("---") {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("---") {
         return None;
     }
 
-    let after_open = &content[3..];
-    let end = after_open.find("\n---")?;
-    let block = &after_open[..end];
+    let after_first = &trimmed[3..];
+    let end = after_first.find("---")?;
+    let block = &after_first[..end];
 
-    let mut log: Option<u32> = None;
-    let mut date = String::new();
-    let mut trigger = String::new();
-    let mut context = String::new();
-    let mut topics: Vec<String> = Vec::new();
+    let mut log = None;
+    let mut date = None;
+    let mut session_id = None;
+    let mut message_count = None;
+    let mut duration = None;
+    let mut source = None;
+    let mut topics = Vec::new();
 
     for line in block.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some((key, val)) = line.split_once(':') {
-            let key = key.trim();
-            let val = val.trim();
-            match key {
-                "log" => log = val.parse().ok(),
-                "date" => date = val.trim_matches('"').to_string(),
-                "trigger" => trigger = val.trim_matches('"').to_string(),
-                "context" => context = val.trim_matches('"').to_string(),
-                "topics" => {
-                    let inner = val.trim_start_matches('[').trim_end_matches(']');
-                    if !inner.is_empty() {
-                        topics = inner
-                            .split(',')
-                            .map(|s| s.trim().trim_matches('"').to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                    }
+        let (key, val) = line.split_once(':')?;
+        let key = key.trim();
+        let val = val.trim().trim_matches('"');
+
+        match key {
+            "log" => log = val.parse().ok(),
+            "date" => date = Some(val.to_string()),
+            "session_id" => session_id = Some(val.to_string()),
+            "message_count" => message_count = val.parse().ok(),
+            "duration" => duration = Some(val.to_string()),
+            "source" => source = Some(val.to_string()),
+            "topics" => {
+                let inner = val.trim_matches(|c| c == '[' || c == ']');
+                if !inner.is_empty() {
+                    topics = inner
+                        .split(',')
+                        .map(|t| t.trim().trim_matches('"').to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 
     Some(Frontmatter {
         log: log?,
-        date,
-        trigger,
-        context,
+        date: date?,
+        session_id: session_id.unwrap_or_default(),
+        message_count: message_count.unwrap_or(0),
+        duration: duration.unwrap_or_default(),
+        source: source.unwrap_or_default(),
         topics,
     })
 }
@@ -88,54 +96,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_and_parse_roundtrip() {
+    fn render_parse_roundtrip() {
         let fm = Frontmatter {
-            log: 5,
-            date: "2026-02-24T21:30:00Z".to_string(),
-            trigger: "precompact".to_string(),
-            context: "working on recall-echo".to_string(),
-            topics: vec!["rust".to_string(), "memory".to_string()],
+            log: 42,
+            date: "2026-03-05T14:30:00Z".to_string(),
+            session_id: "abc123".to_string(),
+            message_count: 34,
+            duration: "45m".to_string(),
+            source: "jsonl".to_string(),
+            topics: vec!["auth".to_string(), "JWT".to_string()],
         };
-
         let rendered = fm.render();
-        let parsed = parse(&rendered).expect("should parse");
-        assert_eq!(parsed.log, 5);
-        assert_eq!(parsed.date, "2026-02-24T21:30:00Z");
-        assert_eq!(parsed.trigger, "precompact");
-        assert_eq!(parsed.context, "working on recall-echo");
-        assert_eq!(parsed.topics, vec!["rust", "memory"]);
-    }
-
-    #[test]
-    fn parse_empty_topics() {
-        let input = "---\nlog: 1\ndate: \"2026-01-01\"\ntrigger: session-end\ncontext: \"\"\ntopics: []\n---";
-        let fm = parse(input).expect("should parse");
-        assert!(fm.topics.is_empty());
-    }
-
-    #[test]
-    fn parse_missing_frontmatter() {
-        let input = "# Just a markdown file\n\nNo frontmatter here.";
-        assert!(parse(input).is_none());
-    }
-
-    #[test]
-    fn parse_malformed_frontmatter() {
-        let input = "---\nthis is not yaml at all\n---";
-        // Should return None because log field is missing (required)
-        assert!(parse(input).is_none());
+        let parsed = parse(&rendered).unwrap();
+        assert_eq!(fm, parsed);
     }
 
     #[test]
     fn render_empty_topics() {
         let fm = Frontmatter {
             log: 1,
-            date: "2026-01-01".to_string(),
-            trigger: "session-end".to_string(),
-            context: "".to_string(),
+            date: "2026-03-05T00:00:00Z".to_string(),
+            session_id: "xyz".to_string(),
+            message_count: 0,
+            duration: "< 1m".to_string(),
+            source: "jsonl".to_string(),
             topics: vec![],
         };
         let rendered = fm.render();
         assert!(rendered.contains("topics: []"));
+        let parsed = parse(&rendered).unwrap();
+        assert_eq!(parsed.topics, Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_missing_frontmatter() {
+        assert!(parse("no frontmatter here").is_none());
+    }
+
+    #[test]
+    fn parse_malformed_frontmatter() {
+        assert!(parse("---\nlog: abc\n---").is_none());
     }
 }
