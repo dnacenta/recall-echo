@@ -1,8 +1,9 @@
 //! recall-echo — Persistent three-layer memory system for AI coding agents.
 //!
 //! Provides a three-layer memory architecture: curated memory (MEMORY.md),
-//! short-term session memory (EPHEMERAL.md), and long-term archive logs.
-//! Designed for integration with echo-system as a core plugin.
+//! FIFO rolling window of recent sessions (EPHEMERAL.md), and full conversation
+//! archives from JSONL transcripts. Designed for integration with echo-system
+//! as a core plugin.
 //!
 //! # Usage as a library
 //!
@@ -19,12 +20,17 @@
 
 pub mod archive;
 pub mod checkpoint;
+pub mod config;
 pub mod consume;
+pub mod distill;
+pub mod ephemeral;
 pub mod frontmatter;
 pub mod init;
+pub mod jsonl;
 pub mod paths;
-pub mod promote;
+pub mod search;
 pub mod status;
+pub mod tags;
 
 use std::fs;
 use std::path::PathBuf;
@@ -38,9 +44,6 @@ pub struct RecallEcho {
 
 impl RecallEcho {
     /// Create a new RecallEcho instance with a specific base directory.
-    ///
-    /// The base directory is where all memory files live (MEMORY.md,
-    /// EPHEMERAL.md, ARCHIVE.md, memories/, etc).
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
@@ -56,9 +59,9 @@ impl RecallEcho {
         &self.base_dir
     }
 
-    /// Path to the memories directory (archive logs).
-    pub fn memories_dir(&self) -> PathBuf {
-        self.base_dir.join("memories")
+    /// Path to the conversations directory (full archives).
+    pub fn conversations_dir(&self) -> PathBuf {
+        self.base_dir.join("conversations")
     }
 
     /// Path to MEMORY.md.
@@ -93,101 +96,39 @@ impl RecallEcho {
         Ok(Some(content))
     }
 
-    /// Create an archive checkpoint. Returns the path to the new log file.
-    pub fn checkpoint(&self, trigger: &str, context: &str) -> Result<PathBuf, String> {
-        let memories = self.memories_dir();
+    /// Create an archive checkpoint. Returns the path to the new conversation file.
+    pub fn checkpoint(&self, trigger: &str, _context: &str) -> Result<PathBuf, String> {
+        let conversations = self.conversations_dir();
         let archive_idx = self.archive_index();
 
-        if !memories.exists() {
-            return Err("memories/ directory not found. Run init first.".to_string());
+        if !conversations.exists() {
+            return Err("conversations/ directory not found. Run init first.".to_string());
         }
 
-        let next_num = archive::highest_log_number(&memories) + 1;
-        let date = checkpoint::utc_now();
+        let next_num = archive::highest_conversation_number(&conversations) + 1;
+        let date = jsonl::utc_now();
         let date_short = date.split('T').next().unwrap_or(&date);
 
         let fm = frontmatter::Frontmatter {
             log: next_num,
             date: date.clone(),
-            trigger: trigger.to_string(),
-            context: context.to_string(),
+            session_id: String::new(),
+            message_count: 0,
+            duration: String::new(),
+            source: trigger.to_string(),
             topics: vec![],
         };
 
         let body = checkpoint::log_body(next_num);
         let content = format!("{}\n{}", fm.render(), body);
-        let log_path = memories.join(format!("archive-log-{next_num:03}.md"));
+        let log_path = conversations.join(format!("conversation-{next_num:03}.md"));
 
-        fs::write(&log_path, &content).map_err(|e| format!("Failed to create archive log: {e}"))?;
+        fs::write(&log_path, &content)
+            .map_err(|e| format!("Failed to create conversation file: {e}"))?;
 
-        archive::append_index(&archive_idx, next_num, date_short, trigger)?;
+        archive::append_index(&archive_idx, next_num, date_short, "", &[], 0, "")?;
 
         Ok(log_path)
-    }
-
-    /// Promote EPHEMERAL.md into an archive log.
-    /// Returns the path to the new log file, or None if nothing to promote.
-    /// Clears EPHEMERAL.md after promotion.
-    pub fn promote(&self, context: &str) -> Result<Option<PathBuf>, String> {
-        let ephemeral = self.ephemeral_file();
-        let memories = self.memories_dir();
-        let archive_idx = self.archive_index();
-
-        if !memories.exists() {
-            return Err("memories/ directory not found. Run init first.".to_string());
-        }
-
-        if !ephemeral.exists() {
-            return Ok(None);
-        }
-
-        let content = fs::read_to_string(&ephemeral)
-            .map_err(|e| format!("Failed to read EPHEMERAL.md: {e}"))?;
-
-        if content.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let next_num = archive::highest_log_number(&memories) + 1;
-        let date = promote::utc_now();
-        let date_short = date.split('T').next().unwrap_or(&date);
-
-        let ctx = if context.is_empty() {
-            content
-                .lines()
-                .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
-                .or_else(|| content.lines().find(|l| !l.trim().is_empty()))
-                .unwrap_or("")
-                .trim_start_matches('#')
-                .trim()
-                .to_string()
-        } else {
-            context.to_string()
-        };
-
-        let fm = frontmatter::Frontmatter {
-            log: next_num,
-            date: date.clone(),
-            trigger: "session-end".to_string(),
-            context: ctx,
-            topics: vec![],
-        };
-
-        let log_content = format!(
-            "{}\n\n# Archive Log {next_num:03}\n\n{}",
-            fm.render(),
-            content
-        );
-        let log_path = memories.join(format!("archive-log-{next_num:03}.md"));
-
-        fs::write(&log_path, &log_content)
-            .map_err(|e| format!("Failed to create archive log: {e}"))?;
-
-        archive::append_index(&archive_idx, next_num, date_short, "session-end")?;
-
-        fs::write(&ephemeral, "").map_err(|e| format!("Failed to clear EPHEMERAL.md: {e}"))?;
-
-        Ok(Some(log_path))
     }
 
     // ── Plugin interface ─────────────────────────────────────────────
@@ -200,8 +141,8 @@ impl RecallEcho {
         if !self.memory_file().exists() {
             return HealthStatus::Degraded("MEMORY.md not found".into());
         }
-        if !self.memories_dir().exists() {
-            return HealthStatus::Degraded("memories directory not found".into());
+        if !self.conversations_dir().exists() {
+            return HealthStatus::Degraded("conversations directory not found".into());
         }
         HealthStatus::Healthy
     }
