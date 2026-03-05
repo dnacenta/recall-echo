@@ -16,11 +16,9 @@ fn run_with_path(ephemeral: &Path) -> Result<(), String> {
     }
 
     // Output for Claude to ingest via hook stdout
-    println!("[MEMORY — Today's Session Log (from EPHEMERAL.md)]");
+    println!("[MEMORY — Recent Sessions (EPHEMERAL.md, rolling window)]");
     println!("{}", content.trim());
-    println!(
-        "[END MEMORY — EPHEMERAL.md is accumulative. Append your session summary at session end.]"
-    );
+    println!("[END MEMORY — EPHEMERAL.md is a FIFO rolling window of recent session summaries. Managed automatically by recall-echo.]");
 
     Ok(())
 }

@@ -36,3 +36,11 @@ pub fn rules_dir() -> Result<PathBuf, String> {
 pub fn protocol_file() -> Result<PathBuf, String> {
     Ok(rules_dir()?.join("recall-echo.md"))
 }
+
+pub fn conversations_dir() -> Result<PathBuf, String> {
+    Ok(claude_dir()?.join("conversations"))
+}
+
+pub fn config_file() -> Result<PathBuf, String> {
+    Ok(claude_dir()?.join(".recall-echo.toml"))
+}
