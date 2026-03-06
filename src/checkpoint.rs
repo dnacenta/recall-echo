@@ -1,111 +1,168 @@
+//! Checkpoint creation — saves a conversation snapshot before context compression.
+//!
+//! Called by pulse-null's session/context manager when the context window
+//! is getting long. Similar to archive but marks source as "checkpoint".
+
 use std::fs;
 use std::path::Path;
 
-use crate::archive;
+use echo_system_types::llm::{LmProvider, Message};
+
+use crate::archive::{self, SessionMetadata};
+use crate::conversation;
 use crate::frontmatter::Frontmatter;
-use crate::jsonl;
-use crate::paths;
+use crate::summarize;
+use crate::tags;
 
-pub fn log_body(log_num: u32) -> String {
-    format!(
-        "\n# Conversation {log_num:03}\n\n\
-         ## Summary\n\n\
-         <!-- Fill in: What was discussed, decided, and accomplished -->\n\n\
-         ## Key Details\n\n\
-         <!-- Fill in: Important specifics — code changes, configurations, decisions -->\n\n\
-         ## Action Items\n\n\
-         <!-- Fill in: What needs to happen next -->\n\n\
-         ## Unresolved\n\n\
-         <!-- Fill in: Open questions or threads to pick up later -->\n"
-    )
-}
+/// Create a checkpoint archive from the current conversation state.
+///
+/// Returns the conversation number of the created checkpoint.
+pub async fn create_checkpoint(
+    memory_dir: &Path,
+    messages: &[Message],
+    metadata: &SessionMetadata,
+    provider: Option<&dyn LmProvider>,
+) -> Result<u32, String> {
+    let conversations_dir = memory_dir.join("conversations");
+    let archive_index = memory_dir.join("ARCHIVE.md");
 
-fn run_with_paths(
-    conversations_dir: &Path,
-    archive_index: &Path,
-    trigger: &str,
-    context: &str,
-) -> Result<(), String> {
     if !conversations_dir.exists() {
-        return Err(
-            "conversations/ directory not found. Run `recall-echo init` first.".to_string(),
-        );
+        return Err("conversations/ directory not found. Run init first.".to_string());
     }
 
-    let next_num = archive::highest_conversation_number(conversations_dir) + 1;
-    let date = jsonl::utc_now();
-    let date_short = date.split('T').next().unwrap_or(&date);
+    let (user_count, _) = conversation::count_messages(messages);
+    if user_count == 0 {
+        return Ok(0);
+    }
+
+    let next_num = archive::highest_conversation_number(&conversations_dir) + 1;
+
+    let summary = summarize::extract_with_fallback(provider, messages).await;
+
+    let now = conversation::utc_now();
+    let date = conversation::date_from_timestamp(&now);
+    let duration = match (&metadata.started_at, &metadata.ended_at) {
+        (Some(start), Some(end)) => conversation::calculate_duration(start, end),
+        _ => "unknown".to_string(),
+    };
+    let total_messages = {
+        let (u, a) = conversation::count_messages(messages);
+        u + a
+    };
 
     let fm = Frontmatter {
         log: next_num,
-        date: date.clone(),
-        session_id: String::new(),
-        message_count: 0,
-        duration: String::new(),
-        source: trigger.to_string(),
-        topics: vec![],
+        date: now,
+        session_id: metadata.session_id.clone(),
+        message_count: total_messages,
+        duration: duration.clone(),
+        source: "checkpoint".to_string(),
+        topics: summary.topics.clone(),
     };
 
-    let content = format!("{}\n{}", fm.render(), log_body(next_num));
+    let md_body = conversation::conversation_to_markdown(messages, next_num);
+    let entries = conversation::flatten_messages(messages);
+    let conv_tags = tags::extract_tags(&entries);
+    let tags_section = tags::format_tags_section(&conv_tags);
+
+    let summary_section = if !summary.summary.is_empty() {
+        format!("## Summary\n\n{}\n\n", summary.summary)
+    } else {
+        String::new()
+    };
+
+    let full_content = format!(
+        "{}\n\n{}{}\n{}",
+        fm.render(),
+        summary_section,
+        md_body,
+        tags_section
+    );
+
     let log_path = conversations_dir.join(format!("conversation-{next_num:03}.md"));
+    fs::write(&log_path, &full_content)
+        .map_err(|e| format!("Failed to create checkpoint file: {e}"))?;
 
-    fs::write(&log_path, &content)
-        .map_err(|e| format!("Failed to create conversation file: {e}"))?;
+    archive::append_index(
+        &archive_index,
+        next_num,
+        &date,
+        &metadata.session_id,
+        &summary.topics,
+        total_messages,
+        &duration,
+    )?;
 
-    archive::append_index(archive_index, next_num, date_short, "", &[], 0, "")?;
+    eprintln!(
+        "recall-echo: checkpoint conversation-{:03}.md ({} messages)",
+        next_num, total_messages
+    );
 
-    let path_display = log_path.to_string_lossy();
-    println!("RECALL-ECHO checkpoint: {path_display}");
-    println!("Trigger: {trigger} | Log: {next_num:03} | Date: {date}");
-    if !context.is_empty() {
-        println!("Context: {context}");
-    }
-    println!("Fill in the Summary, Key Details, Action Items, and Unresolved sections.");
-
-    Ok(())
-}
-
-pub fn run(trigger: &str, context: &str) -> Result<(), String> {
-    let conversations_dir = paths::conversations_dir()?;
-    let archive_index = paths::archive_index()?;
-    run_with_paths(&conversations_dir, &archive_index, trigger, context)
+    Ok(next_num)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
-    fn setup_test_dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn setup_memory_dir() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let conversations = tmp.path().join("conversations");
-        let archive = tmp.path().join("ARCHIVE.md");
-        fs::create_dir_all(&conversations).unwrap();
-        (tmp, conversations, archive)
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        (tmp, memory)
     }
 
-    #[test]
-    fn creates_logs_and_sequences() {
-        let (_tmp, conversations, archive) = setup_test_dirs();
+    #[tokio::test]
+    async fn checkpoint_creates_file_and_index() {
+        let (_tmp, memory) = setup_memory_dir();
 
-        run_with_paths(&conversations, &archive, "precompact", "test session").unwrap();
+        let msgs = vec![
+            echo_system_types::llm::Message {
+                role: echo_system_types::llm::Role::User,
+                content: echo_system_types::llm::MessageContent::Text(
+                    "Set up the auth module".to_string(),
+                ),
+            },
+            echo_system_types::llm::Message {
+                role: echo_system_types::llm::Role::Assistant,
+                content: echo_system_types::llm::MessageContent::Text(
+                    "I'll implement JWT authentication.".to_string(),
+                ),
+            },
+        ];
 
-        let log = conversations.join("conversation-001.md");
-        assert!(log.exists());
+        let meta = SessionMetadata {
+            session_id: "test-session".to_string(),
+            started_at: Some("2026-03-06T10:00:00Z".to_string()),
+            ended_at: Some("2026-03-06T10:30:00Z".to_string()),
+            entity_name: "nova".to_string(),
+        };
 
-        let content = fs::read_to_string(&log).unwrap();
-        assert!(content.starts_with("---\n"));
-        assert!(content.contains("log: 1"));
-        assert!(content.contains("source: \"precompact\""));
-        assert!(content.contains("# Conversation 001"));
-        assert!(content.contains("## Summary"));
+        let num = create_checkpoint(&memory, &msgs, &meta, None)
+            .await
+            .unwrap();
+        assert_eq!(num, 1);
+        assert!(memory.join("conversations/conversation-001.md").exists());
 
-        // Second checkpoint — should get next number
-        run_with_paths(&conversations, &archive, "session-end", "").unwrap();
+        let content = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        assert!(content.contains("source: \"checkpoint\""));
 
-        assert!(conversations.join("conversation-002.md").exists());
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("001"));
+    }
 
-        let content = fs::read_to_string(conversations.join("conversation-002.md")).unwrap();
-        assert!(content.contains("log: 2"));
+    #[tokio::test]
+    async fn checkpoint_skips_empty_conversation() {
+        let (_tmp, memory) = setup_memory_dir();
+
+        let meta = SessionMetadata {
+            session_id: "empty".to_string(),
+            started_at: None,
+            ended_at: None,
+            entity_name: "nova".to_string(),
+        };
+
+        let num = create_checkpoint(&memory, &[], &meta, None).await.unwrap();
+        assert_eq!(num, 0);
     }
 }
