@@ -34,10 +34,14 @@ pub mod status;
 pub mod summarize;
 pub mod tags;
 
+use std::any::Any;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
-use echo_system_types::{HealthStatus, SetupPrompt};
+use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
+use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
 
 pub use archive::SessionMetadata;
 pub use summarize::ConversationSummary;
@@ -114,7 +118,7 @@ impl RecallEcho {
     // ── Plugin interface ─────────────────────────────────────────────
 
     /// Report health status.
-    pub fn health(&self) -> HealthStatus {
+    fn health_check(&self) -> HealthStatus {
         if !self.memory_dir().exists() {
             return HealthStatus::Down("memory directory not found".into());
         }
@@ -128,7 +132,7 @@ impl RecallEcho {
     }
 
     /// Configuration prompts for the pulse-null init wizard.
-    pub fn setup_prompts() -> Vec<SetupPrompt> {
+    fn get_setup_prompts() -> Vec<SetupPrompt> {
         vec![SetupPrompt {
             key: "entity_root".into(),
             question: "Entity root directory:".into(),
@@ -148,5 +152,53 @@ impl RecallEcho {
             .unwrap_or_default()
             .lines()
             .count()
+    }
+}
+
+/// Factory function — creates a fully initialized recall-echo plugin.
+pub async fn create(
+    config: &serde_json::Value,
+    ctx: &PluginContext,
+) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    let entity_root = config
+        .get("entity_root")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.entity_root.clone());
+
+    Ok(Box::new(RecallEcho::new(entity_root)))
+}
+
+impl Plugin for RecallEcho {
+    fn meta(&self) -> PluginMeta {
+        PluginMeta {
+            name: "recall-echo".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            description: "Persistent three-layer memory system".into(),
+        }
+    }
+
+    fn role(&self) -> PluginRole {
+        PluginRole::Memory
+    }
+
+    fn start(&mut self) -> PluginResult<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn stop(&mut self) -> PluginResult<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn health(&self) -> Pin<Box<dyn Future<Output = HealthStatus> + Send + '_>> {
+        Box::pin(async move { self.health_check() })
+    }
+
+    fn setup_prompts(&self) -> Vec<SetupPrompt> {
+        Self::get_setup_prompts()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
