@@ -1,111 +1,101 @@
 # recall-echo
 
-[![License: GPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green)](https://github.com/dnacenta/recall-echo/tags)
-[![Crates.io](https://img.shields.io/crates/v/recall-echo)](https://crates.io/crates/recall-echo)
 
-Persistent three-layer memory system for AI coding agents. Gives Claude Code (and similar tools) long-term recall across sessions.
+Persistent three-layer memory system for pulse-null entities. Gives AI agents long-term recall across sessions — curated facts, recent session context, and searchable conversation archives.
 
 ## Why
 
-Claude Code's built-in memory is a single flat file (`MEMORY.md`). It works for small notes, but breaks down fast:
+LLM coding agents start every session from zero. Built-in memory is typically a single flat file with no session continuity, no short-term vs long-term distinction, and no searchable history. Memory management that depends on the agent remembering to save things is circular.
 
-- **No session continuity.** When a session ends, everything the agent learned that didn't fit in MEMORY.md is gone. The next session starts cold.
-- **Compaction destroys context.** Long conversations get silently compressed. Anything the agent hadn't saved yet vanishes.
-- **Memory management is voluntary.** The agent has to *choose* to save things — and it often doesn't. Instructions to "remember this" get lost in the noise.
+recall-echo makes the memory lifecycle mechanical. When running as a pulse-null plugin, archival and checkpointing happen automatically. The agent writes to MEMORY.md during sessions. Everything else is handled by the system.
 
-The core insight: **memory can't depend on the agent remembering to use it.** That's circular. recall-echo makes the entire lifecycle mechanical — hooks handle consumption, checkpointing, and archival automatically. The agent writes one summary at session end. Everything else is enforced by the system.
+## Architecture
+
+recall-echo provides a three-layer memory model:
+
+```
+┌──────────────────────────────────────────────────────┐
+│              MEMORY ARCHITECTURE                      │
+│                                                       │
+│  Layer 1: CURATED (always in context)                 │
+│  ┌───────────┐                                        │
+│  │ MEMORY.md │  Facts, preferences, patterns          │
+│  └───────────┘  Distilled & maintained by the agent   │
+│                                                       │
+│  Layer 2: SHORT-TERM (FIFO rolling window)            │
+│  ┌───────────────┐                                    │
+│  │ EPHEMERAL.md  │  Last N session summaries          │
+│  └───────────────┘  Appended on archive, auto-trimmed │
+│                                                       │
+│  Layer 3: LONG-TERM (searched on demand)              │
+│  ┌─────────────┐    ┌────────────────────────────┐    │
+│  │ ARCHIVE.md  │───→│ conversations/             │    │
+│  └─────────────┘    │  conversation-001.md       │    │
+│                     │  conversation-002.md       │    │
+│                     │  ...                       │    │
+│                     └────────────────────────────┘    │
+│                     YAML frontmatter + markdown       │
+│                     LLM-summarized or algorithmic     │
+└──────────────────────────────────────────────────────┘
+```
+
+All paths are relative to an entity root directory:
+
+```
+{entity_root}/memory/
+├── MEMORY.md                 # Layer 1 — curated facts (≤200 lines)
+├── EPHEMERAL.md              # Layer 2 — rolling session window (default 5)
+├── ARCHIVE.md                # Layer 3 — conversation index
+├── conversations/            # Layer 3 — full conversation archives
+│   ├── conversation-001.md
+│   ├── conversation-002.md
+│   └── ...
+└── .recall-echo.toml         # Optional configuration
+```
 
 ## How It Works
 
-recall-echo adds a structured memory protocol via Claude Code's auto-loaded rules system (`~/.claude/rules/`). No patches, no forks — just a rules file that teaches the agent how to manage its own memory.
+recall-echo operates in two modes:
 
-```
-                         ┌──────────────────────────┐
-                         │      Claude Code agent    │
-                         │    (reads / writes all    │
-                         │     layers via protocol)  │
-                         └────┬─────────┬───────┬───┘
-                              │         │       │
-                    read+write│   write │       │ search
-                              │         │       │ on demand
-                              ▼         ▼       ▼
-┌─────────────────┐  ┌──────────────┐  ┌─────────────────────┐
-│   Layer 1       │  │   Layer 2    │  │      Layer 3        │
-│   MEMORY.md     │  │ EPHEMERAL.md │  │   Archive Logs      │
-│                 │  │              │  │                     │
-│ Curated facts,  │  │ Session      │  │ archive-log-001.md  │
-│ preferences,    │  │ summary,     │  │ archive-log-002.md  │
-│ stable patterns │  │ staging area │  │ ...                 │
-│                 │  │              │  │                     │
-│ Always in       │  │ Written at   │  │ YAML frontmatter    │
-│ context         │  │ session end, │  │ + content body      │
-│ (auto-loaded)   │  │ promoted     │  │                     │
-└─────────────────┘  │ automatically│  │ Created by CLI:     │
-                     └──────────────┘  │ recall-echo         │
-                                       │   promote/checkpoint│
-                                       │                     │
-                                       │ Indexed in          │
-                                       │ ARCHIVE.md          │
-                                       └─────────────────────┘
+### As a pulse-null Plugin
+
+recall-echo is a native pulse-null plugin implementing the `Plugin` trait from echo-system-types. It fills the required **Memory** role (exactly one per entity).
+
+- pulse-null calls `archive::archive_session()` at session end — creates a conversation archive with LLM-generated summary, updates ARCHIVE.md index, appends to EPHEMERAL.md
+- pulse-null calls `checkpoint::create_checkpoint()` before context compaction — preserves conversation state before details are lost
+- Health checks report memory directory state (Healthy / Degraded / Down)
+- Setup wizard prompts for entity_root during `pulse-null init`
+
+```rust
+use recall_echo::RecallEcho;
+
+// pulse-null creates the plugin via factory:
+let plugin = recall_echo::create(&config, &ctx).await?;
+// plugin.role() == PluginRole::Memory
 ```
 
-### Session Lifecycle
+### As a Standalone CLI
 
+For administration and use outside pulse-null:
+
+```bash
+recall-echo init [entity_root]         # Create memory directory structure
+recall-echo status [entity_root]       # Health check with dashboard
+recall-echo search <query>             # Line-level archive search
+recall-echo search <query> --ranked    # File-ranked relevance search
+recall-echo distill [entity_root]      # Analyze MEMORY.md, suggest cleanup
+recall-echo consume [entity_root]      # Output EPHEMERAL.md content
 ```
- Session Start          During Session           On Compaction            Session End
- ─────────────          ──────────────           ──────────────           ───────────
-
- ┌─────────────┐        ┌─────────────┐         ┌─────────────┐         ┌──────────────┐
- │ PreToolUse  │        │ Update      │         │ PreCompact  │         │ Write        │
- │ hook fires  │───────▶│ MEMORY.md   │────────▶│ hook fires  │────────▶│ EPHEMERAL.md │
- │             │        │ with stable │         │             │         │ with session │
- │ recall-echo │        │ facts       │         └──────┬──────┘         │ summary      │
- │ consume     │        └─────────────┘                │                └──────┬───────┘
- │             │                                       ▼                       │
- │ Reads       │                              ┌──────────────┐                 ▼
- │ EPHEMERAL → │                              │ recall-echo  │         ┌──────────────┐
- │ stdout,     │                              │ checkpoint   │         │ SessionEnd   │
- │ clears file │                              │ --trigger    │         │ hook fires   │
- └─────────────┘                              │ precompact   │         │              │
-                                              └──────┬───────┘         │ recall-echo  │
-                                                     │                 │ promote      │
-                                                     ▼                 │              │
-                                              ┌──────────────┐         │ Archives     │
-                                              │ CLI creates  │         │ EPHEMERAL →  │
-                                              │ scaffolded   │         │ archive log  │
-                                              │ archive log  │         │ + clears it  │
-                                              │ + updates    │         └──────────────┘
-                                              │ ARCHIVE.md   │
-                                              └──────┬───────┘
-                                                     │
-                                                     ▼
-                                              ┌──────────────┐
-                                              │ Agent fills  │
-                                              │ in Summary,  │
-                                              │ Key Details, │
-                                              │ Action Items,│
-                                              │ Unresolved   │
-                                              └──────────────┘
-```
-
-The entire lifecycle is now mechanical — no voluntary steps. The PreToolUse hook consumes last session's context at start, the PreCompact hook checkpoints before compaction, and the SessionEnd hook archives on exit. The agent only writes one summary to EPHEMERAL.md at session end.
 
 ## Installation
 
-### cargo install (recommended)
+### cargo install
 
 ```bash
 cargo install recall-echo
 recall-echo init
-```
-
-### Install script
-
-Downloads a prebuilt binary for your platform. Falls back to a bash-only installer if no binary is available.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.sh | bash
 ```
 
 ### Prebuilt binaries
@@ -117,14 +107,12 @@ Download from [GitHub Releases](https://github.com/dnacenta/recall-echo/releases
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin` (Apple Silicon)
 
-Extract and run:
-
 ```bash
 tar xzf recall-echo-<target>.tar.gz
 ./recall-echo init
 ```
 
-### Manual (from source)
+### From source
 
 ```bash
 git clone https://github.com/dnacenta/recall-echo.git
@@ -137,181 +125,85 @@ cargo build --release
 
 ### `recall-echo init`
 
-Initialize or upgrade the memory system. Creates directories, writes protocol rules, and configures all three hooks (PreToolUse for ephemeral consumption, PreCompact for checkpointing, SessionEnd for automatic promotion). Idempotent — running it again won't overwrite existing memory files. Upgrades legacy echo hooks to the new checkpoint hook.
-
-### `recall-echo checkpoint`
-
-Create a precompact archive checkpoint. Scaffolds a new archive log with YAML frontmatter and section templates, updates the ARCHIVE.md index, and prints the file path for the agent to fill in.
-
-```bash
-recall-echo checkpoint                              # default: precompact trigger
-recall-echo checkpoint --context "working on auth system"
-```
-
-```
-  recall-echo checkpoint
-        │
-        ├──▶ Scan ~/.claude/memories/ for highest archive-log-XXX.md
-        │
-        ├──▶ Create archive-log-{next}.md with YAML frontmatter
-        │    + empty Summary / Key Details / Action Items / Unresolved
-        │
-        ├──▶ Append entry to ARCHIVE.md index
-        │
-        └──▶ Print path + instructions for the agent
-             "RECALL-ECHO checkpoint: ~/.claude/memories/archive-log-005.md"
-```
-
-### `recall-echo promote`
-
-Promote EPHEMERAL.md into an archive log. Reads EPHEMERAL.md content, creates a new archive log with the content as the body, updates the ARCHIVE.md index, and clears EPHEMERAL.md. If EPHEMERAL.md is empty or missing, exits cleanly with no action.
-
-```bash
-recall-echo promote                                 # auto-extract context from content
-recall-echo promote --context "session about auth"   # override context field
-```
-
-```
-  recall-echo promote
-        │
-        ├──▶ Read EPHEMERAL.md (exit if empty)
-        │
-        ├──▶ Scan ~/.claude/memories/ for next log number
-        │
-        ├──▶ Create archive-log-{next}.md with YAML frontmatter
-        │    + EPHEMERAL.md content as the body
-        │
-        ├──▶ Append entry to ARCHIVE.md index
-        │
-        ├──▶ Clear EPHEMERAL.md
-        │
-        └──▶ Print confirmation
-             "Promoted EPHEMERAL.md → Log 005 | Date: 2026-02-24"
-```
-
-### `recall-echo consume`
-
-Consume EPHEMERAL.md at session start. Reads the file contents, outputs them to stdout wrapped in memory markers (so Claude Code captures it via hook), then clears the file. Silent if empty or missing. Idempotent — safe to call multiple times; only the first call with content produces output.
-
-```
-  recall-echo consume
-        │
-        ├──▶ Read EPHEMERAL.md (exit silently if empty/missing)
-        │
-        ├──▶ Output content wrapped in memory markers to stdout
-        │    [MEMORY — Last Session Summary ...]
-        │    <content>
-        │    [END MEMORY — EPHEMERAL.md has been cleared ...]
-        │
-        └──▶ Clear EPHEMERAL.md
-```
+Create the memory directory structure under entity_root. Creates `memory/` with MEMORY.md, EPHEMERAL.md, ARCHIVE.md, and `conversations/`. Idempotent — never overwrites existing files.
 
 ### `recall-echo status`
 
-Memory system health check. Shows MEMORY.md line count, EPHEMERAL.md state, archive log count, protocol status, and hook configuration. Warns about approaching limits or legacy hooks.
+Health check with a dashboard showing memory usage, ephemeral state, archive count, recent sessions, and health assessment. Color-coded bars show MEMORY.md capacity (green → yellow → red at 75% / 90%).
 
 ```
-recall-echo — memory system status
+recall-echo — healthy
 
   MEMORY.md:    142/200 lines (71%)
-  EPHEMERAL.md: has content (pending consumption)
-  Archive logs: 23 logs, latest: 2026-02-24
-  Protocol:     installed
-  Hooks:        PreToolUse ✓  PreCompact ✓  SessionEnd ✓
-
-  No issues detected.
+  EPHEMERAL.md: 3 entries
+  Archives:     23 conversations
 ```
 
-## What It Creates
+### `recall-echo search`
 
-```
-~/.claude/
-│
-├── rules/
-│   └── recall-echo.md ·········· Protocol rules (auto-loaded into every session)
-│
-├── memory/
-│   └── MEMORY.md ················ Layer 1 — curated facts (≤200 lines)
-│
-├── memories/
-│   ├── archive-log-001.md ······· Layer 3 — checkpoint (YAML frontmatter)
-│   ├── archive-log-002.md
-│   └── ...
-│
-├── EPHEMERAL.md ·················· Layer 2 — session summary staging area
-├── ARCHIVE.md ···················· Index — log number, date, trigger per entry
-└── settings.json ················· Hooks: PreToolUse + PreCompact + SessionEnd
+Search conversation archives.
+
+```bash
+recall-echo search "auth middleware"              # line-level matches
+recall-echo search "auth middleware" -C 3          # with 3 lines of context
+recall-echo search "auth middleware" --ranked      # ranked by relevance
+recall-echo search "auth middleware" --ranked --max-results 5
 ```
 
-## Archive Log Format
+Ranked search scores files by match count, word coverage, and recency.
 
-Logs created by `recall-echo checkpoint` and `recall-echo promote` include YAML frontmatter for structured metadata:
+### `recall-echo distill`
+
+Analyze MEMORY.md and suggest cleanup. Identifies sections over 30 lines that could be extracted to topic files (e.g., `memory/debugging.md`) with references left in MEMORY.md.
+
+### `recall-echo consume`
+
+Output EPHEMERAL.md content wrapped in memory markers. Used by hooks or scripts that need to inject recent session context into an agent's input.
+
+## Archive Format
+
+Conversation archives use YAML frontmatter with markdown content:
 
 ```yaml
 ---
 log: 5
-date: "2026-02-24T21:30:00Z"
-trigger: precompact
-context: "working on auth system"
-topics: []
+date: "2026-03-06T10:30:00Z"
+session_id: "abc123"
+message_count: 34
+duration: "30m"
+source: "session"
+topics: ["auth", "jwt", "middleware"]
 ---
 
-# Archive Log 005
-
 ## Summary
-<!-- Fill in: What was discussed, decided, and accomplished -->
+Summary of the conversation with key outcomes.
 
-## Key Details
-<!-- Fill in: Important specifics — code changes, configurations, decisions -->
+**Decisions**: Chose JWT for authentication.
+**Action Items**: Implement token refresh endpoint.
 
-## Action Items
-<!-- Fill in: What needs to happen next -->
+### User
+(message content)
 
-## Unresolved
-<!-- Fill in: Open questions or threads to pick up later -->
+### Assistant
+(message content)
+
+## Tags
+**Files**: src/auth.rs, src/middleware.rs
+**Tools**: Read, Edit, Bash
 ```
 
-Old logs without frontmatter continue to work — numbering is by filename, not content.
+Summaries are LLM-generated when a provider is available (via pulse-null), with silent fallback to algorithmic extraction.
 
 ## Configuration
 
-recall-echo requires no configuration. It works out of the box with Claude Code's existing infrastructure.
+Optional `.recall-echo.toml` in the memory directory:
 
-It adds three hooks to `settings.json`:
-- **PreToolUse** — runs `recall-echo consume` on first tool use, injecting last session's context and clearing EPHEMERAL.md
-- **PreCompact** — runs `recall-echo checkpoint` before context compaction, creating a scaffolded archive log
-- **SessionEnd** — runs `recall-echo promote` on exit, archiving EPHEMERAL.md automatically
-
-If you already have hooks configured, they're preserved. If upgrading from v0.2.0, the legacy echo hook is automatically replaced.
-
-## How the Agent Uses It
-
-Once installed, the entire memory lifecycle is mechanical — managed by hooks, not voluntary behavior:
-
-- **Session start** — PreToolUse hook runs `recall-echo consume`, injecting last session's context automatically
-- **During session** — agent updates `MEMORY.md` with stable facts and searches archives with `Grep` as needed
-- **On compaction** — PreCompact hook runs `recall-echo checkpoint`, creating a scaffolded archive log
-- **Session end** — agent writes `EPHEMERAL.md`, then SessionEnd hook runs `recall-echo promote` to archive it
-
-You can also explicitly tell the agent to remember something, search its history, or review what it knows. The memory is transparent — it's all plain markdown files you can read and edit yourself.
-
-## Upgrading from v0.2.0
-
-Run `recall-echo init` — it will detect the legacy echo hook and migrate it to the new checkpoint hook. Your existing memory files, archive logs, and settings are preserved.
-
-## Uninstall
-
-Remove the rules file and optionally delete the memory data:
-
-```bash
-# Remove the protocol (agent stops following it)
-rm ~/.claude/rules/recall-echo.md
-
-# Optionally remove all memory data
-rm -rf ~/.claude/memory ~/.claude/memories ~/.claude/EPHEMERAL.md ~/.claude/ARCHIVE.md
+```toml
+[ephemeral]
+max_entries = 5    # Rolling window size (1-50, default 5)
 ```
 
-You may also want to remove the `PreToolUse`, `PreCompact`, and `SessionEnd` hooks from `~/.claude/settings.json`.
+All settings have sensible defaults. Missing file or invalid values fall back silently.
 
 ## Contributing
 
@@ -319,4 +211,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, commit conventions, an
 
 ## License
 
-[GPL-3.0](LICENSE)
+[AGPL-3.0](LICENSE)
