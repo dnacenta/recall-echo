@@ -1,11 +1,13 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
-use recall_echo::{archive, checkpoint, consume, distill, init, search, status};
+use recall_echo::{distill, init, paths, search, status};
 
 #[derive(Parser)]
 #[command(
     name = "recall-echo",
-    about = "Persistent memory for AI coding agents",
+    about = "Persistent three-layer memory system for pulse-null entities",
     version
 )]
 struct Cli {
@@ -15,27 +17,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize the memory system
-    Init,
-    /// Archive a session from JSONL transcript (SessionEnd hook)
-    ArchiveSession,
-    /// Archive operations
-    Archive {
-        /// Archive all unarchived JSONL transcripts
-        #[arg(long)]
-        all_unarchived: bool,
+    /// Initialize the memory system for an entity
+    Init {
+        /// Entity root directory (defaults to current directory)
+        entity_root: Option<PathBuf>,
     },
-    /// Create an archive checkpoint (PreCompact hook)
-    Checkpoint {
-        /// Trigger type: precompact or manual
-        #[arg(long, default_value = "precompact")]
-        trigger: String,
-        /// Brief session context
-        #[arg(long, default_value = "")]
-        context: String,
+    /// Memory system health check
+    Status {
+        /// Entity root directory (defaults to current directory)
+        entity_root: Option<PathBuf>,
     },
-    /// Output EPHEMERAL.md at session start (PreToolUse hook)
-    Consume,
     /// Search conversation archives
     Search {
         /// Search query
@@ -51,27 +42,33 @@ enum Commands {
         max_results: usize,
     },
     /// Analyze MEMORY.md and suggest distillation
-    Distill,
-    /// Memory system health check
-    Status,
+    Distill {
+        /// Entity root directory (defaults to current directory)
+        entity_root: Option<PathBuf>,
+    },
+    /// Output EPHEMERAL.md content
+    Consume {
+        /// Entity root directory (defaults to current directory)
+        entity_root: Option<PathBuf>,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Some(Commands::Init) | None => init::run(),
-        Some(Commands::ArchiveSession) => archive::run_from_hook(),
-        Some(Commands::Archive { all_unarchived }) => {
-            if all_unarchived {
-                archive::archive_all_unarchived()
-            } else {
-                eprintln!("Use --all-unarchived to batch archive missed sessions.");
-                Ok(())
-            }
+        None => {
+            // Default: show status
+            status::run()
         }
-        Some(Commands::Checkpoint { trigger, context }) => checkpoint::run(&trigger, &context),
-        Some(Commands::Consume) => consume::run(),
+        Some(Commands::Init { entity_root }) => {
+            let root = resolve_entity_root(entity_root);
+            init::run(&root)
+        }
+        Some(Commands::Status { entity_root }) => {
+            let root = resolve_entity_root(entity_root);
+            status::run_with_base(&root)
+        }
         Some(Commands::Search {
             query,
             ranked,
@@ -84,12 +81,23 @@ fn main() {
                 search::run(&query, context)
             }
         }
-        Some(Commands::Distill) => distill::run(),
-        Some(Commands::Status) => status::run(),
+        Some(Commands::Distill { entity_root }) => {
+            let root = resolve_entity_root(entity_root);
+            distill::run_with_base(&root)
+        }
+        Some(Commands::Consume { entity_root }) => {
+            let root = resolve_entity_root(entity_root);
+            let ephemeral = root.join("memory").join("EPHEMERAL.md");
+            recall_echo::consume::run(&ephemeral)
+        }
     };
 
     if let Err(e) = result {
         eprintln!("\x1b[31m✗\x1b[0m {e}");
         std::process::exit(1);
     }
+}
+
+fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {
+    explicit.unwrap_or_else(|| paths::entity_root().unwrap_or_else(|_| PathBuf::from(".")))
 }

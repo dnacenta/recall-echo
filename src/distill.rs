@@ -11,7 +11,7 @@ const RESET: &str = "\x1b[0m";
 
 /// Analyze MEMORY.md and suggest distillation actions.
 pub fn run() -> Result<(), String> {
-    let base = paths::claude_dir()?;
+    let base = paths::entity_root()?;
     run_with_base(&base)
 }
 
@@ -92,8 +92,7 @@ fn analyze_memory(lines: &[&str]) -> Vec<String> {
     // 5. Suggest topic file extraction if over 170 lines
     if lines.len() > 170 {
         suggestions.push(
-            "Over 170 lines — extract detailed sections into topic files in ~/.claude/memory/"
-                .to_string(),
+            "Over 170 lines — extract detailed sections into topic files in memory/".to_string(),
         );
     }
 
@@ -153,7 +152,7 @@ fn find_near_duplicates(lines: &[&str]) -> Vec<(usize, usize)> {
 
 /// Count entries that reference dates more than ~30 days old.
 fn count_stale_entries(lines: &[&str]) -> usize {
-    let now = crate::jsonl::utc_now();
+    let now = crate::conversation::utc_now();
     let current_year_month = &now[..7]; // "2026-03"
 
     let mut stale = 0;

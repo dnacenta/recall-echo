@@ -25,7 +25,7 @@ pub struct RankedFile {
 }
 
 pub fn run(query: &str, context_lines: usize) -> Result<(), String> {
-    let base = paths::claude_dir()?;
+    let base = paths::memory_dir()?;
     let results = search_with_base(query, &base, context_lines)?;
 
     if results.is_empty() {
@@ -160,7 +160,7 @@ pub fn ranked_search(
 
 /// Run ranked search and display results.
 pub fn run_ranked(query: &str, max_results: usize) -> Result<(), String> {
-    let base = paths::claude_dir()?;
+    let base = paths::memory_dir()?;
     let results = ranked_search(query, &base, max_results)?;
 
     if results.is_empty() {
