@@ -139,8 +139,8 @@ dependencies = [
 
 [[package]]
 name = "echo-system-types"
-version = "0.3.0"
-source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.3.0#ad901031f50fe6f0bef5a9476bbc97a778d00124"
+version = "0.4.0"
+source = "git+https://github.com/dnacenta/echo-system-types?branch=feat%2Fv0.4.0-plugin-trait#3a220179d01805aad155ed5b62a0ff005019b438"
 dependencies = [
  "serde",
  "serde_json",
