@@ -22,6 +22,7 @@ pub mod archive;
 pub mod checkpoint;
 pub mod config;
 pub mod consume;
+pub mod dashboard;
 pub mod distill;
 pub mod ephemeral;
 pub mod frontmatter;
@@ -64,9 +65,14 @@ impl RecallEcho {
         self.base_dir.join("conversations")
     }
 
+    /// Memory directory: {base_dir}/memory/
+    pub fn memory_dir(&self) -> PathBuf {
+        self.base_dir.join("memory")
+    }
+
     /// Path to MEMORY.md.
     pub fn memory_file(&self) -> PathBuf {
-        self.base_dir.join("memory").join("MEMORY.md")
+        self.memory_dir().join("MEMORY.md")
     }
 
     /// Path to EPHEMERAL.md.
