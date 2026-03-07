@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 
-use recall_echo::{archive, checkpoint, consume, distill, init, search, status};
+use recall_echo::{
+    archive, checkpoint, consume, dashboard, distill, init, search, status, RecallEcho,
+};
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +56,8 @@ enum Commands {
     Distill,
     /// Memory system health check
     Status,
+    /// Memory dashboard with health, stats, and recent sessions
+    Dashboard,
 }
 
 fn main() {
@@ -86,6 +90,10 @@ fn main() {
         }
         Some(Commands::Distill) => distill::run(),
         Some(Commands::Status) => status::run(),
+        Some(Commands::Dashboard) => RecallEcho::from_default().map(|recall| {
+            let version = env!("CARGO_PKG_VERSION");
+            dashboard::render(&recall, "echo", version, 200);
+        })
     };
 
     if let Err(e) = result {
