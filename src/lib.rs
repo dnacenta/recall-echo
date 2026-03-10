@@ -1,9 +1,9 @@
-//! recall-echo — Persistent three-layer memory system for AI coding agents.
+//! recall-echo — Persistent three-layer memory system for pulse-null entities.
 //!
 //! Provides a three-layer memory architecture: curated memory (MEMORY.md),
 //! FIFO rolling window of recent sessions (EPHEMERAL.md), and full conversation
-//! archives from JSONL transcripts. Designed for integration with echo-system
-//! as a core plugin.
+//! archives with LLM-enhanced summaries. Designed as a core crate for
+//! pulse-null with standalone CLI support.
 //!
 //! # Usage as a library
 //!
@@ -22,52 +22,64 @@ pub mod archive;
 pub mod checkpoint;
 pub mod config;
 pub mod consume;
+pub mod conversation;
 pub mod dashboard;
 pub mod distill;
 pub mod ephemeral;
 pub mod frontmatter;
 pub mod init;
-pub mod jsonl;
 pub mod paths;
 pub mod search;
 pub mod status;
+pub mod summarize;
 pub mod tags;
 
+use std::any::Any;
 use std::fs;
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
-use echo_system_types::{HealthStatus, SetupPrompt};
+use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
+use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
+
+pub use archive::SessionMetadata;
+pub use summarize::ConversationSummary;
 
 /// The recall-echo plugin. Manages persistent three-layer memory.
+///
+/// All paths are derived from entity_root:
+/// ```text
+/// {entity_root}/memory/
+/// ├── MEMORY.md
+/// ├── EPHEMERAL.md
+/// ├── ARCHIVE.md
+/// └── conversations/
+/// ```
 pub struct RecallEcho {
-    base_dir: PathBuf,
+    entity_root: PathBuf,
 }
 
 impl RecallEcho {
-    /// Create a new RecallEcho instance with a specific base directory.
-    pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+    /// Create a new RecallEcho instance with a specific entity root directory.
+    pub fn new(entity_root: PathBuf) -> Self {
+        Self { entity_root }
     }
 
     /// Create a RecallEcho using the default path resolution
-    /// (~/.claude or RECALL_ECHO_HOME env var).
+    /// (RECALL_ECHO_HOME env var or current working directory).
     pub fn from_default() -> Result<Self, String> {
-        Ok(Self::new(paths::claude_dir()?))
+        Ok(Self::new(paths::entity_root()?))
     }
 
-    /// Base directory for all memory files.
-    pub fn base_dir(&self) -> &PathBuf {
-        &self.base_dir
+    /// Entity root directory.
+    pub fn entity_root(&self) -> &Path {
+        &self.entity_root
     }
 
-    /// Path to the conversations directory (full archives).
-    pub fn conversations_dir(&self) -> PathBuf {
-        self.base_dir.join("conversations")
-    }
-
-    /// Memory directory: {base_dir}/memory/
+    /// Memory directory: {entity_root}/memory/
     pub fn memory_dir(&self) -> PathBuf {
-        self.base_dir.join("memory")
+        self.entity_root.join("memory")
     }
 
     /// Path to MEMORY.md.
@@ -77,12 +89,17 @@ impl RecallEcho {
 
     /// Path to EPHEMERAL.md.
     pub fn ephemeral_file(&self) -> PathBuf {
-        self.base_dir.join("EPHEMERAL.md")
+        self.memory_dir().join("EPHEMERAL.md")
+    }
+
+    /// Path to conversations directory.
+    pub fn conversations_dir(&self) -> PathBuf {
+        self.memory_dir().join("conversations")
     }
 
     /// Path to ARCHIVE.md index.
     pub fn archive_index(&self) -> PathBuf {
-        self.base_dir.join("ARCHIVE.md")
+        self.memory_dir().join("ARCHIVE.md")
     }
 
     // ── Core operations ──────────────────────────────────────────────
@@ -90,59 +107,20 @@ impl RecallEcho {
     /// Read EPHEMERAL.md content without clearing it.
     /// Returns None if the file doesn't exist or is empty.
     pub fn consume_content(&self) -> Result<Option<String>, String> {
-        let ephemeral = self.ephemeral_file();
-        if !ephemeral.exists() {
-            return Ok(None);
-        }
-        let content = fs::read_to_string(&ephemeral)
-            .map_err(|e| format!("Failed to read EPHEMERAL.md: {e}"))?;
-        if content.trim().is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(content))
+        consume::consume(&self.ephemeral_file())
     }
 
-    /// Create an archive checkpoint. Returns the path to the new conversation file.
-    pub fn checkpoint(&self, trigger: &str, _context: &str) -> Result<PathBuf, String> {
-        let conversations = self.conversations_dir();
-        let archive_idx = self.archive_index();
-
-        if !conversations.exists() {
-            return Err("conversations/ directory not found. Run init first.".to_string());
-        }
-
-        let next_num = archive::highest_conversation_number(&conversations) + 1;
-        let date = jsonl::utc_now();
-        let date_short = date.split('T').next().unwrap_or(&date);
-
-        let fm = frontmatter::Frontmatter {
-            log: next_num,
-            date: date.clone(),
-            session_id: String::new(),
-            message_count: 0,
-            duration: String::new(),
-            source: trigger.to_string(),
-            topics: vec![],
-        };
-
-        let body = checkpoint::log_body(next_num);
-        let content = format!("{}\n{}", fm.render(), body);
-        let log_path = conversations.join(format!("conversation-{next_num:03}.md"));
-
-        fs::write(&log_path, &content)
-            .map_err(|e| format!("Failed to create conversation file: {e}"))?;
-
-        archive::append_index(&archive_idx, next_num, date_short, "", &[], 0, "")?;
-
-        Ok(log_path)
+    /// Check if the memory system has been initialized.
+    pub fn is_initialized(&self) -> bool {
+        self.memory_dir().exists() && self.conversations_dir().exists()
     }
 
     // ── Plugin interface ─────────────────────────────────────────────
 
     /// Report health status.
-    pub fn health(&self) -> HealthStatus {
-        if !self.base_dir.exists() {
-            return HealthStatus::Down("base directory not found".into());
+    fn health_check(&self) -> HealthStatus {
+        if !self.memory_dir().exists() {
+            return HealthStatus::Down("memory directory not found".into());
         }
         if !self.memory_file().exists() {
             return HealthStatus::Degraded("MEMORY.md not found".into());
@@ -153,14 +131,74 @@ impl RecallEcho {
         HealthStatus::Healthy
     }
 
-    /// Configuration prompts for the echo-system init wizard.
-    pub fn setup_prompts() -> Vec<SetupPrompt> {
+    /// Configuration prompts for the pulse-null init wizard.
+    fn get_setup_prompts() -> Vec<SetupPrompt> {
         vec![SetupPrompt {
-            key: "base_dir".into(),
-            question: "Memory system base directory:".into(),
+            key: "entity_root".into(),
+            question: "Entity root directory:".into(),
             required: true,
             secret: false,
-            default: Some("~/.claude".into()),
+            default: None,
         }]
+    }
+
+    /// Number of lines in MEMORY.md.
+    pub fn memory_line_count(&self) -> usize {
+        let path = self.memory_file();
+        if !path.exists() {
+            return 0;
+        }
+        fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+/// Factory function — creates a fully initialized recall-echo plugin.
+pub async fn create(
+    config: &serde_json::Value,
+    ctx: &PluginContext,
+) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    let entity_root = config
+        .get("entity_root")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.entity_root.clone());
+
+    Ok(Box::new(RecallEcho::new(entity_root)))
+}
+
+impl Plugin for RecallEcho {
+    fn meta(&self) -> PluginMeta {
+        PluginMeta {
+            name: "recall-echo".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            description: "Persistent three-layer memory system".into(),
+        }
+    }
+
+    fn role(&self) -> PluginRole {
+        PluginRole::Memory
+    }
+
+    fn start(&mut self) -> PluginResult<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn stop(&mut self) -> PluginResult<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn health(&self) -> Pin<Box<dyn Future<Output = HealthStatus> + Send + '_>> {
+        Box::pin(async move { self.health_check() })
+    }
+
+    fn setup_prompts(&self) -> Vec<SetupPrompt> {
+        Self::get_setup_prompts()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

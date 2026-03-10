@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::RecallEcho;
 
@@ -157,7 +159,7 @@ impl ArchiveStats {
 
 // ── Dashboard rendering ─────────────────────────────────────────────────
 
-/// Render the neofetch-style memory dashboard to stderr.
+/// Render the neofetch-style memory dashboard to stdout.
 pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_lines: usize) {
     let memory_stats = MemoryStats::collect(recall);
     let ephemeral_entries = parse_ephemeral_entries(recall);
@@ -184,51 +186,51 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
         format!("freshness {}", archive_stats.freshness_display()),
     ];
 
-    eprintln!();
+    println!();
     let logo_width = 26;
     for (i, logo_line) in logo_lines.iter().enumerate() {
         if i < meta_lines.len() {
-            eprintln!(
+            println!(
                 "  {GREEN}{:<width$}{RESET}  {}",
                 logo_line,
                 meta_lines[i],
                 width = logo_width,
             );
         } else {
-            eprintln!("  {GREEN}{}{RESET}", logo_line);
+            println!("  {GREEN}{}{RESET}", logo_line);
         }
     }
 
     // Print remaining metadata if logo ran out of lines
     for meta_line in meta_lines.iter().skip(logo_lines.len()) {
-        eprintln!("  {:<width$}  {}", "", meta_line, width = logo_width);
+        println!("  {:<width$}  {}", "", meta_line, width = logo_width);
     }
 
-    eprintln!("  v{version}");
-    eprintln!("{SEPARATOR}");
+    println!("  v{version}");
+    println!("{SEPARATOR}");
 
     // Memory Health
-    eprintln!();
-    eprintln!(
+    println!();
+    println!(
         "  {BOLD}Memory Health{RESET}                   {}",
         health.display()
     );
-    eprintln!();
+    println!();
 
-    eprintln!(
+    println!(
         "  {:<14} {}  {:<8} {}",
         "curated",
         memory_bar(memory_stats.line_count, max_memory_lines),
         format!("{}/{}", memory_stats.line_count, max_memory_lines),
         memory_status_word(memory_stats.line_count, max_memory_lines),
     );
-    eprintln!(
+    println!(
         "  {:<14} {}  {:<8} ok",
         "ephemeral",
         memory_bar(ephemeral_entries.len(), 5),
         format!("{}/5", ephemeral_entries.len()),
     );
-    eprintln!(
+    println!(
         "  {:<14} {} conversations     {}",
         "archive",
         archive_stats.count,
@@ -237,17 +239,17 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
 
     // Warnings
     for warning in &health.warnings {
-        eprintln!("  {YELLOW}!{RESET} {warning}");
+        println!("  {YELLOW}!{RESET} {warning}");
     }
 
     // Recent Sessions
     if !ephemeral_entries.is_empty() {
-        eprintln!();
-        eprintln!("  {BOLD}Recent Sessions{RESET}");
-        eprintln!();
+        println!();
+        println!("  {BOLD}Recent Sessions{RESET}");
+        println!();
 
         for entry in ephemeral_entries.iter().rev() {
-            eprintln!(
+            println!(
                 "  {DIM}#{:<4}{RESET} {DIM}{:<8}{RESET} {:<5} {:<8} {}",
                 entry.log_num,
                 entry.age_display,
@@ -260,10 +262,10 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
 
     // Memory Sections
     if !memory_stats.sections.is_empty() {
-        eprintln!();
-        eprintln!("  {BOLD}Memory Sections{RESET}");
-        eprintln!();
-        eprintln!(
+        println!();
+        println!("  {BOLD}Memory Sections{RESET}");
+        println!();
+        println!(
             "  {} sections · {} lines · last updated {}",
             memory_stats.sections.len(),
             memory_stats.line_count,
@@ -278,11 +280,295 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
             .map(|(name, size)| format!("{name} ({size} lines)"))
             .collect();
         if !top.is_empty() {
-            eprintln!("  {DIM}largest: {}{RESET}", top.join(", "));
+            println!("  {DIM}largest: {}{RESET}", top.join(", "));
         }
     }
 
-    eprintln!();
+    println!();
+}
+
+// ── Search ──────────────────────────────────────────────────────────────
+
+/// Line-level search across conversation archives.
+pub fn search_lines(recall: &RecallEcho, query: &str) -> Result<(), String> {
+    let conv_dir = recall.conversations_dir();
+    if !conv_dir.exists() {
+        println!("  No conversation archives found.");
+        return Ok(());
+    }
+
+    let files = list_conversation_files(&conv_dir)?;
+    if files.is_empty() {
+        println!("  No conversation archives found.");
+        return Ok(());
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut total_matches = 0;
+
+    for file in &files {
+        let content = fs::read_to_string(file)
+            .map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
+        let filename = file.file_name().unwrap_or_default().to_string_lossy();
+        let mut file_matches = Vec::new();
+
+        for (i, line) in content.lines().enumerate() {
+            if line.to_lowercase().contains(&query_lower) {
+                file_matches.push((i + 1, line.to_string()));
+            }
+        }
+
+        if !file_matches.is_empty() {
+            println!("\n  {CYAN}{filename}{RESET}");
+            for (line_num, line) in file_matches.iter().take(5) {
+                let display = if line.len() > 100 {
+                    format!("{}...", &line[..97])
+                } else {
+                    line.to_string()
+                };
+                println!("  {DIM}{line_num:>4}{RESET}  {display}");
+            }
+            if file_matches.len() > 5 {
+                println!(
+                    "  {DIM}  ...and {} more matches{RESET}",
+                    file_matches.len() - 5
+                );
+            }
+            total_matches += file_matches.len();
+        }
+    }
+
+    if total_matches == 0 {
+        println!("  No matches for \"{query}\"");
+    } else {
+        println!(
+            "\n  {DIM}{total_matches} matches across {} files{RESET}",
+            files.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Ranked file-level search across conversation archives.
+pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), String> {
+    let conv_dir = recall.conversations_dir();
+    if !conv_dir.exists() {
+        println!("  No conversation archives found.");
+        return Ok(());
+    }
+
+    let files = list_conversation_files(&conv_dir)?;
+    if files.is_empty() {
+        println!("  No conversation archives found.");
+        return Ok(());
+    }
+
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    let mut scored: Vec<(f64, &PathBuf, Vec<String>)> = Vec::new();
+
+    for (idx, file) in files.iter().enumerate() {
+        let content = fs::read_to_string(file)
+            .map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
+        let content_lower = content.to_lowercase();
+
+        let match_count = content_lower.matches(&query_lower).count();
+        if match_count == 0 {
+            continue;
+        }
+
+        let words_found = query_words
+            .iter()
+            .filter(|w| content_lower.contains(**w))
+            .count();
+        let word_ratio = words_found as f64 / query_words.len().max(1) as f64;
+
+        let recency = (idx as f64 + 1.0) / files.len() as f64;
+
+        let content_boost = if content_lower.contains(&format!("### user\n\n{}", query_lower)) {
+            1.5
+        } else {
+            1.0
+        };
+
+        let score = (match_count as f64 * word_ratio + recency) * content_boost;
+
+        let previews: Vec<String> = content
+            .lines()
+            .filter(|l| {
+                let lower = l.to_lowercase();
+                lower.contains(&query_lower) && !l.starts_with('#') && !l.starts_with("---")
+            })
+            .take(3)
+            .map(|l| {
+                if l.len() > 90 {
+                    format!("{}...", &l[..87])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+
+        scored.push((score, file, previews));
+    }
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if scored.is_empty() {
+        println!("  No matches for \"{query}\"");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "  {BOLD}Search Results{RESET}  ({} files matched)\n",
+        scored.len()
+    );
+
+    for (score, file, previews) in scored.iter().take(10) {
+        let filename = file.file_name().unwrap_or_default().to_string_lossy();
+        println!("  {CYAN}{filename}{RESET}  {DIM}(score: {score:.1}){RESET}");
+        for preview in previews {
+            println!("    {DIM}{preview}{RESET}");
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+// ── Auto-distill ────────────────────────────────────────────────────────
+
+/// Analyze MEMORY.md and auto-extract heavy sections into topic files.
+pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), String> {
+    let memory_path = recall.memory_file();
+    let memory_dir = recall.memory_dir();
+
+    if !memory_path.exists() {
+        println!("  MEMORY.md not found. Nothing to distill.");
+        return Ok(());
+    }
+
+    let content =
+        fs::read_to_string(&memory_path).map_err(|e| format!("Failed to read MEMORY.md: {e}"))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+
+    println!();
+    if line_count > (max_lines * 85 / 100) {
+        println!(
+            "  {YELLOW}!{RESET} MEMORY.md at {line_count}/{max_lines} lines ({}%) — cleanup recommended",
+            line_count * 100 / max_lines,
+        );
+    } else {
+        println!(
+            "  MEMORY.md at {line_count}/{max_lines} lines ({}%) — {GREEN}healthy{RESET}",
+            line_count * 100 / max_lines,
+        );
+        println!();
+        return Ok(());
+    }
+
+    // Find heavy sections
+    let sections = find_sections(&lines);
+    let mut extractions: Vec<(String, usize, PathBuf)> = Vec::new();
+
+    for (name, start, size) in &sections {
+        if *size <= 30 {
+            continue;
+        }
+
+        let slug: String = name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let slug = slug.trim_matches('-').to_string();
+        let topic_path = memory_dir.join(format!("{slug}.md"));
+
+        let section_lines: Vec<&str> = lines[*start..*start + *size].to_vec();
+        let section_content = section_lines.join("\n");
+
+        fs::write(&topic_path, format!("{section_content}\n"))
+            .map_err(|e| format!("Failed to write {}: {e}", topic_path.display()))?;
+
+        extractions.push((name.clone(), *size, topic_path));
+    }
+
+    if extractions.is_empty() {
+        let suggestions = analyze_non_section_issues(&lines);
+        if suggestions.is_empty() {
+            println!("  {DIM}No large sections to extract. Consider manual review.{RESET}");
+        } else {
+            println!();
+            println!("  {BOLD}Suggestions{RESET}");
+            println!();
+            for (i, s) in suggestions.iter().enumerate() {
+                println!("  {}. {s}", i + 1);
+            }
+        }
+        println!();
+        return Ok(());
+    }
+
+    // Rewrite MEMORY.md with references
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut skip_until_next_section = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let is_extracted = extractions.iter().find(|(name, _, _)| {
+            sections
+                .iter()
+                .any(|(sname, start, _)| sname == name && *start == i)
+        });
+
+        if let Some(extraction) = is_extracted {
+            new_lines.push(line.to_string());
+            let rel_path = extraction
+                .2
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            new_lines.push(format!("See memory/{rel_path} for details."));
+            new_lines.push(String::new());
+            skip_until_next_section = true;
+            continue;
+        }
+
+        if skip_until_next_section {
+            if (line.starts_with("# ") || line.starts_with("## ")) && i > 0 {
+                skip_until_next_section = false;
+                new_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        new_lines.push(line.to_string());
+    }
+
+    let new_content = new_lines.join("\n");
+    fs::write(&memory_path, format!("{new_content}\n"))
+        .map_err(|e| format!("Failed to write MEMORY.md: {e}"))?;
+
+    // Report
+    println!();
+    println!("  {BOLD}Extracted{RESET}");
+    println!();
+    for (name, size, path) in &extractions {
+        let rel = path.file_name().unwrap_or_default().to_string_lossy();
+        println!("  {GREEN}→{RESET} {name} ({size} lines) → memory/{rel}");
+    }
+
+    let new_line_count = new_content.lines().count();
+    println!();
+    println!(
+        "  MEMORY.md: {line_count} → {new_line_count} lines ({}%)",
+        new_line_count * 100 / max_lines,
+    );
+    println!();
+
+    Ok(())
 }
 
 // ── Health assessment ───────────────────────────────────────────────────
@@ -330,7 +616,7 @@ pub fn assess_health(
     HealthAssessment { level, warnings }
 }
 
-// ── Ephemeral parsing ───────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
     let ephemeral_path = recall.ephemeral_file();
@@ -374,7 +660,7 @@ pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
                 })
                 .unwrap_or_else(|| "\u{2014}".to_string());
 
-            // Extract message count from "**Messages**: <n>"
+            // Extract message count from "**Messages**: <n>" or "(N messages)" format
             let msg_count = entry
                 .lines()
                 .find(|l| l.contains("**Messages**"))
@@ -386,9 +672,20 @@ pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
                             .and_then(|n| n.parse::<u32>().ok())
                     })
                 })
+                .or_else(|| {
+                    entry
+                        .lines()
+                        .find(|l| l.contains("messages"))
+                        .and_then(|l| {
+                            l.split('(')
+                                .nth(1)
+                                .and_then(|s| s.split_whitespace().next())
+                                .and_then(|n| n.parse::<u32>().ok())
+                        })
+                })
                 .unwrap_or(0);
 
-            // Extract summary from "**Summary**: <text>"
+            // Extract summary from "**Summary**: <text>" or topic bullet points
             let summary = entry
                 .lines()
                 .find(|l| l.contains("**Summary**"))
@@ -401,7 +698,36 @@ pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
                         trimmed.to_string()
                     }
                 })
-                .unwrap_or_else(|| "\u{2014}".to_string());
+                .unwrap_or_else(|| {
+                    // Fall back to topic bullet points
+                    let topics: Vec<&str> = entry
+                        .lines()
+                        .filter(|l| l.starts_with("- ") && !l.contains("...and"))
+                        .take(3)
+                        .map(|l| l.trim_start_matches("- "))
+                        .collect();
+
+                    if topics.is_empty() {
+                        "\u{2014}".to_string()
+                    } else {
+                        let joined: String = topics
+                            .iter()
+                            .map(|t| {
+                                if t.len() > 30 {
+                                    format!("{}...", &t[..27])
+                                } else {
+                                    t.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if joined.len() > 60 {
+                            format!("{}...", &joined[..57])
+                        } else {
+                            joined
+                        }
+                    }
+                });
 
             EphemeralEntry {
                 log_num: format!("{}", i + 1),
@@ -417,8 +743,6 @@ pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
         })
         .collect()
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────
 
 fn memory_bar(count: usize, max: usize) -> String {
     let width = 10;
@@ -501,6 +825,60 @@ pub fn find_sections(lines: &[&str]) -> Vec<(String, usize, usize)> {
     }
 
     sections
+}
+
+fn list_conversation_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read conversations dir: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("conversation-")
+                && p.extension().is_some_and(|ext| ext == "md")
+        })
+        .collect();
+
+    files.sort();
+    Ok(files)
+}
+
+fn analyze_non_section_issues(lines: &[&str]) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut dup_count = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let normalized: String = line
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ");
+
+        if normalized.len() < 20 {
+            continue;
+        }
+
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(normalized) {
+            e.insert(i);
+        } else {
+            dup_count += 1;
+        }
+    }
+
+    if dup_count > 0 {
+        suggestions.push(format!(
+            "{dup_count} potential duplicate entries found — consider merging"
+        ));
+    }
+
+    suggestions
 }
 
 #[cfg(test)]
@@ -592,5 +970,19 @@ mod tests {
         };
         let health = assess_health(&memory, &archive, 200);
         assert!(matches!(health.level, HealthLevel::Watch));
+    }
+
+    #[test]
+    fn non_section_duplicates() {
+        let lines = vec![
+            "# Memory",
+            "",
+            "The server runs on Ubuntu Linux with SSH access",
+            "Some other content here that is long enough",
+            "The server runs on Ubuntu Linux with SSH access",
+        ];
+        let suggestions = analyze_non_section_issues(&lines);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("duplicate"));
     }
 }

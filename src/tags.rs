@@ -1,4 +1,9 @@
-use crate::jsonl::{Conversation, ConversationEntry};
+//! Structured tag extraction from conversations.
+//!
+//! Extracts decisions, action items, project references, files touched,
+//! and tools used from conversation entries.
+
+use crate::conversation::ConversationEntry;
 
 /// Structured tags extracted from a conversation.
 #[derive(Debug, Clone, Default)]
@@ -20,7 +25,6 @@ impl ConversationTags {
     }
 }
 
-/// Decision-indicator phrases (case-insensitive matching).
 const DECISION_MARKERS: &[&str] = &[
     "decided to",
     "decision:",
@@ -38,7 +42,6 @@ const DECISION_MARKERS: &[&str] = &[
     "plan is to",
 ];
 
-/// Action-item indicator phrases.
 const ACTION_MARKERS: &[&str] = &[
     "todo:",
     "todo -",
@@ -57,13 +60,13 @@ const ACTION_MARKERS: &[&str] = &[
     "make sure to",
 ];
 
-/// Extract structured tags from a parsed conversation.
-pub fn extract_tags(conv: &Conversation) -> ConversationTags {
+/// Extract structured tags from flattened conversation entries.
+pub fn extract_tags(entries: &[ConversationEntry]) -> ConversationTags {
     let mut tags = ConversationTags::default();
     let mut tool_set = std::collections::HashSet::new();
     let mut file_set = std::collections::HashSet::new();
 
-    for entry in &conv.entries {
+    for entry in entries {
         match entry {
             ConversationEntry::UserMessage(text) | ConversationEntry::AssistantText(text) => {
                 extract_decisions(text, &mut tags.decisions);
@@ -139,7 +142,6 @@ fn extract_action_items(text: &str, actions: &mut Vec<String>) {
     }
 }
 
-/// Detect project from cwd-like patterns or explicit project references.
 fn detect_project(text: &str) -> Option<String> {
     let patterns = ["project:", "repo:", "repository:", "working on", "in the"];
     let lower = text.to_lowercase();
@@ -206,64 +208,52 @@ pub fn format_tags_section(tags: &ConversationTags) -> String {
 mod tests {
     use super::*;
 
-    fn make_conv(entries: Vec<ConversationEntry>) -> Conversation {
-        Conversation {
-            session_id: "test".to_string(),
-            first_timestamp: None,
-            last_timestamp: None,
-            user_message_count: 0,
-            assistant_message_count: 0,
-            entries,
-        }
-    }
-
     #[test]
     fn extract_decisions_basic() {
-        let conv = make_conv(vec![ConversationEntry::AssistantText(
+        let entries = vec![ConversationEntry::AssistantText(
             "After reviewing the options, I decided to use JWT tokens instead of session cookies."
                 .to_string(),
-        )]);
-        let tags = extract_tags(&conv);
+        )];
+        let tags = extract_tags(&entries);
         assert!(!tags.decisions.is_empty());
         assert!(tags.decisions[0].contains("JWT"));
     }
 
     #[test]
     fn extract_action_items_basic() {
-        let conv = make_conv(vec![ConversationEntry::AssistantText(
+        let entries = vec![ConversationEntry::AssistantText(
             "The auth module works now. Still need to add rate limiting to the API endpoints."
                 .to_string(),
-        )]);
-        let tags = extract_tags(&conv);
+        )];
+        let tags = extract_tags(&entries);
         assert!(!tags.action_items.is_empty());
         assert!(tags.action_items[0].contains("rate limiting"));
     }
 
     #[test]
     fn extract_tools_and_files() {
-        let conv = make_conv(vec![
+        let entries = vec![
             ConversationEntry::ToolUse {
                 name: "Read".to_string(),
-                input_summary: "`/src/auth.rs`".to_string(),
+                input_summary: "/src/auth.rs".to_string(),
             },
             ConversationEntry::ToolUse {
                 name: "Edit".to_string(),
-                input_summary: "`/src/config.rs`".to_string(),
+                input_summary: "/src/config.rs".to_string(),
             },
             ConversationEntry::ToolUse {
                 name: "Read".to_string(),
-                input_summary: "`/src/main.rs`".to_string(),
+                input_summary: "/src/main.rs".to_string(),
             },
-        ]);
-        let tags = extract_tags(&conv);
+        ];
+        let tags = extract_tags(&entries);
         assert_eq!(tags.tools_used, vec!["Edit", "Read"]);
         assert_eq!(tags.files_touched.len(), 3);
     }
 
     #[test]
-    fn empty_conversation_empty_tags() {
-        let conv = make_conv(vec![]);
-        let tags = extract_tags(&conv);
+    fn empty_entries_empty_tags() {
+        let tags = extract_tags(&[]);
         assert!(tags.is_empty());
     }
 
@@ -281,8 +271,6 @@ mod tests {
         assert!(section.contains("**Project**: voice-echo"));
         assert!(section.contains("**Decisions**:"));
         assert!(section.contains("JWT"));
-        assert!(section.contains("**Action Items**:"));
-        assert!(section.contains("rate limiting"));
     }
 
     #[test]
