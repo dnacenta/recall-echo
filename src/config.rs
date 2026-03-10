@@ -29,6 +29,12 @@ fn default_max_entries() -> usize {
     DEFAULT_MAX_ENTRIES
 }
 
+/// Load config from .recall-echo.toml in the given directory.
+/// Returns defaults if file doesn't exist or is malformed.
+pub fn load_from_dir(dir: &Path) -> Config {
+    load(dir)
+}
+
 /// Load config from .recall-echo.toml in the base dir.
 /// Returns defaults if file doesn't exist or is malformed.
 pub fn load(base: &Path) -> Config {

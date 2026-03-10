@@ -1,3 +1,8 @@
+//! Memory system health check.
+//!
+//! Quick status overview of the three-layer memory system.
+//! For the full ASCII art dashboard, use the `dashboard` module.
+
 use std::fs;
 use std::path::Path;
 
@@ -13,20 +18,21 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 pub fn run() -> Result<(), String> {
-    run_with_base(&paths::claude_dir()?)
+    run_with_base(&paths::entity_root()?)
 }
 
-pub fn run_with_base(base: &Path) -> Result<(), String> {
-    if !base.exists() {
-        return Err("~/.claude directory not found. Run `recall-echo init` first.".to_string());
+pub fn run_with_base(entity_root: &Path) -> Result<(), String> {
+    let memory = entity_root.join("memory");
+    if !memory.exists() {
+        return Err("memory/ directory not found. Run `recall-echo init` first.".to_string());
     }
 
     let mut issues: Vec<String> = Vec::new();
 
     // Header
-    let overall = if base.join("conversations").exists()
-        && base.join("EPHEMERAL.md").exists()
-        && base.join("rules/recall-echo.md").exists()
+    let overall = if memory.join("conversations").exists()
+        && memory.join("EPHEMERAL.md").exists()
+        && memory.join("MEMORY.md").exists()
     {
         format!("{GREEN}healthy{RESET}")
     } else {
@@ -37,7 +43,7 @@ pub fn run_with_base(base: &Path) -> Result<(), String> {
     eprintln!("\n{BOLD}recall-echo{RESET} — {overall}\n");
 
     // MEMORY.md
-    let memory_path = base.join("memory/MEMORY.md");
+    let memory_path = memory.join("MEMORY.md");
     if memory_path.exists() {
         let lines = fs::read_to_string(&memory_path)
             .unwrap_or_default()
@@ -62,9 +68,9 @@ pub fn run_with_base(base: &Path) -> Result<(), String> {
     }
 
     // EPHEMERAL.md
-    let cfg = config::load(base);
+    let cfg = config::load(&memory);
     let max_entries = cfg.ephemeral.max_entries;
-    let ephemeral_path = base.join("EPHEMERAL.md");
+    let ephemeral_path = memory.join("EPHEMERAL.md");
     if ephemeral_path.exists() {
         let count = ephemeral::count_entries(&ephemeral_path).unwrap_or(0);
         eprintln!("  EPHEMERAL       {count}/{max_entries} sessions");
@@ -73,7 +79,7 @@ pub fn run_with_base(base: &Path) -> Result<(), String> {
     }
 
     // Archives
-    let conversations_dir = base.join("conversations");
+    let conversations_dir = memory.join("conversations");
     if conversations_dir.exists() {
         let (count, total_bytes) = count_conversations(&conversations_dir);
         let size_str = format_bytes(total_bytes);
@@ -92,58 +98,6 @@ pub fn run_with_base(base: &Path) -> Result<(), String> {
         eprintln!("  Archives        {DIM}not initialized{RESET}");
     }
 
-    // Protocol
-    let protocol_path = base.join("rules/recall-echo.md");
-    if protocol_path.exists() {
-        eprintln!("  Protocol        {GREEN}installed{RESET}");
-    } else {
-        eprintln!("  Protocol        {RED}missing{RESET}");
-        issues.push("Protocol file missing — run `recall-echo init`".to_string());
-    }
-
-    // Hooks
-    let settings_path = base.join("settings.json");
-    if settings_path.exists() {
-        let settings: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap_or_default())
-                .unwrap_or(serde_json::json!({}));
-
-        let has_session_end = has_hook(&settings, "SessionEnd", "recall-echo archive-session");
-        let has_precompact = has_hook(&settings, "PreCompact", "recall-echo checkpoint");
-        let has_consume = has_hook(&settings, "PreToolUse", "recall-echo consume");
-        let has_legacy = has_hook(&settings, "SessionEnd", "recall-echo promote");
-
-        if has_legacy {
-            eprintln!(
-                "  Hooks           {YELLOW}legacy promote hook{RESET} — run recall-echo init to upgrade"
-            );
-            issues.push("Legacy promote hook — run `recall-echo init` to migrate".to_string());
-        } else {
-            let se = if has_session_end {
-                format!("{GREEN}✓{RESET}")
-            } else {
-                format!("{RED}✗{RESET}")
-            };
-            let pc = if has_precompact {
-                format!("{GREEN}✓{RESET}")
-            } else {
-                format!("{YELLOW}⚠{RESET}")
-            };
-            let co = if has_consume {
-                format!("{GREEN}✓{RESET}")
-            } else {
-                format!("{YELLOW}⚠{RESET}")
-            };
-            eprintln!("  Hooks           SessionEnd {se}  PreCompact {pc}  PreToolUse {co}");
-        }
-
-        if !has_session_end && !has_legacy {
-            issues.push("SessionEnd hook missing — run `recall-echo init`".to_string());
-        }
-    } else {
-        eprintln!("  Hooks           {DIM}no settings.json{RESET}");
-    }
-
     // Issues
     eprintln!();
     if issues.is_empty() {
@@ -156,16 +110,6 @@ pub fn run_with_base(base: &Path) -> Result<(), String> {
     eprintln!();
 
     Ok(())
-}
-
-fn has_hook(settings: &serde_json::Value, event: &str, needle: &str) -> bool {
-    if let Some(hooks) = settings.get("hooks") {
-        if let Some(event_hooks) = hooks.get(event) {
-            let json = serde_json::to_string(event_hooks).unwrap_or_default();
-            return json.contains(needle);
-        }
-    }
-    false
 }
 
 fn count_conversations(dir: &Path) -> (usize, u64) {
@@ -234,9 +178,9 @@ mod tests {
     #[test]
     fn status_on_initialized_env() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path();
-        crate::init::run_with_base(base).unwrap();
-        assert!(run_with_base(base).is_ok());
+        let root = tmp.path();
+        crate::init::run(root).unwrap();
+        assert!(run_with_base(root).is_ok());
     }
 
     #[test]

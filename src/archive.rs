@@ -1,12 +1,28 @@
+//! Conversation archival — converts Messages into persistent markdown archives.
+//!
+//! Called by pulse-null's session manager at session end, or by the library API.
+//! Uses `summarize::extract_with_fallback` for metadata extraction.
+
 use std::fs;
 use std::path::Path;
 
+use echo_system_types::llm::{LmProvider, Message};
+
 use crate::config;
+use crate::conversation;
 use crate::ephemeral::{self, EphemeralEntry};
 use crate::frontmatter::Frontmatter;
-use crate::jsonl;
-use crate::paths;
+use crate::summarize;
 use crate::tags;
+
+/// Session metadata provided by the caller (pulse-null session manager).
+#[derive(Debug, Clone)]
+pub struct SessionMetadata {
+    pub session_id: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub entity_name: String,
+}
 
 /// Scan conversations/ for highest conversation-NNN number. Returns 0 if none.
 pub fn highest_conversation_number(conversations_dir: &Path) -> u32 {
@@ -34,7 +50,7 @@ pub fn highest_conversation_number(conversations_dir: &Path) -> u32 {
     max
 }
 
-/// Append an entry to ARCHIVE.md (markdown table row)
+/// Append an entry to ARCHIVE.md (markdown table row).
 pub fn append_index(
     archive_path: &Path,
     log_num: u32,
@@ -46,7 +62,6 @@ pub fn append_index(
 ) -> Result<(), String> {
     use std::io::Write;
 
-    // If file doesn't exist or is empty, write header first
     let needs_header = if archive_path.exists() {
         fs::read_to_string(archive_path)
             .unwrap_or_default()
@@ -92,70 +107,94 @@ pub fn append_index(
     Ok(())
 }
 
-/// Main archive-session flow, called from the SessionEnd hook.
-pub fn run_from_hook() -> Result<(), String> {
-    let hook_input = jsonl::read_hook_input()?;
-    archive_session_with_paths(
-        &hook_input.session_id,
-        &hook_input.transcript_path,
-        &paths::claude_dir()?,
-    )
-}
-
-/// Testable archive function with explicit paths.
-pub fn archive_session_with_paths(
-    session_id: &str,
-    transcript_path: &str,
-    base_dir: &Path,
-) -> Result<(), String> {
-    let conversations_dir = base_dir.join("conversations");
-    let archive_index = base_dir.join("ARCHIVE.md");
-    let ephemeral_path = base_dir.join("EPHEMERAL.md");
+/// Archive a session from in-memory messages.
+///
+/// This is the primary archive function called by pulse-null.
+/// Returns the conversation number of the created archive.
+pub async fn archive_session(
+    memory_dir: &Path,
+    messages: &[Message],
+    metadata: &SessionMetadata,
+    provider: Option<&dyn LmProvider>,
+) -> Result<u32, String> {
+    let conversations_dir = memory_dir.join("conversations");
+    let archive_index = memory_dir.join("ARCHIVE.md");
+    let ephemeral_path = memory_dir.join("EPHEMERAL.md");
 
     if !conversations_dir.exists() {
-        return Err(
-            "conversations/ directory not found. Run `recall-echo init` first.".to_string(),
-        );
+        return Err("conversations/ directory not found. Run init first.".to_string());
     }
-
-    // Parse the JSONL transcript
-    let conv = jsonl::parse_transcript(transcript_path, session_id)?;
 
     // Skip empty sessions
-    if conv.user_message_count == 0 {
-        return Ok(());
+    let (user_count, _) = conversation::count_messages(messages);
+    if user_count == 0 {
+        return Ok(0);
     }
 
-    // Determine next archive number
     let next_num = highest_conversation_number(&conversations_dir) + 1;
 
-    // Generate metadata
-    let now = jsonl::utc_now();
-    let date = jsonl::date_from_timestamp(&now);
-    let duration = match (&conv.first_timestamp, &conv.last_timestamp) {
-        (Some(first), Some(last)) => jsonl::calculate_duration(first, last),
+    // Generate metadata via LLM or algorithmic fallback
+    let summary = summarize::extract_with_fallback(provider, messages).await;
+
+    let now = conversation::utc_now();
+    let date = conversation::date_from_timestamp(&now);
+    let duration = match (&metadata.started_at, &metadata.ended_at) {
+        (Some(start), Some(end)) => conversation::calculate_duration(start, end),
         _ => "unknown".to_string(),
     };
-    let total_messages = conv.user_message_count + conv.assistant_message_count;
-    let topics = jsonl::extract_topics(&conv, 5);
-    let summary = jsonl::extract_summary(&conv);
+    let total_messages = {
+        let (u, a) = conversation::count_messages(messages);
+        u + a
+    };
 
     // Build frontmatter
     let fm = Frontmatter {
         log: next_num,
         date: now.clone(),
-        session_id: session_id.to_string(),
+        session_id: metadata.session_id.clone(),
         message_count: total_messages,
         duration: duration.clone(),
-        source: "jsonl".to_string(),
-        topics: topics.clone(),
+        source: "session".to_string(),
+        topics: summary.topics.clone(),
     };
 
-    // Convert to markdown with tags
-    let md_body = jsonl::conversation_to_markdown(&conv, next_num);
-    let conv_tags = tags::extract_tags(&conv);
+    // Convert conversation to markdown
+    let md_body = conversation::conversation_to_markdown(messages, next_num);
+
+    // Extract tags from flattened entries
+    let entries = conversation::flatten_messages(messages);
+    let conv_tags = tags::extract_tags(&entries);
     let tags_section = tags::format_tags_section(&conv_tags);
-    let full_content = format!("{}\n\n{}{}", fm.render(), md_body, tags_section);
+
+    // Add LLM summary section if available
+    let summary_section = if !summary.summary.is_empty() {
+        let mut s = format!("## Summary\n\n{}\n\n", summary.summary);
+        if !summary.decisions.is_empty() {
+            s.push_str("**Decisions**:\n");
+            for d in &summary.decisions {
+                s.push_str(&format!("- {d}\n"));
+            }
+            s.push('\n');
+        }
+        if !summary.action_items.is_empty() {
+            s.push_str("**Action Items**:\n");
+            for a in &summary.action_items {
+                s.push_str(&format!("- {a}\n"));
+            }
+            s.push('\n');
+        }
+        s
+    } else {
+        String::new()
+    };
+
+    let full_content = format!(
+        "{}\n\n{}{}\n{}",
+        fm.render(),
+        summary_section,
+        md_body,
+        tags_section
+    );
 
     // Write conversation file
     let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
@@ -167,23 +206,23 @@ pub fn archive_session_with_paths(
         &archive_index,
         next_num,
         &date,
-        session_id,
-        &topics,
+        &metadata.session_id,
+        &summary.topics,
         total_messages,
         &duration,
     )?;
 
     // Append to EPHEMERAL.md
     let entry = EphemeralEntry {
-        session_id: session_id.to_string(),
+        session_id: metadata.session_id.clone(),
         date: now,
         duration,
         message_count: total_messages,
         archive_file: format!("conversation-{next_num:03}.md"),
-        summary,
+        summary: summary.summary,
     };
     ephemeral::append_entry(&ephemeral_path, &entry)?;
-    let cfg = config::load(base_dir);
+    let cfg = config::load_from_dir(memory_dir);
     ephemeral::trim_to_limit(&ephemeral_path, cfg.ephemeral.max_entries)?;
 
     eprintln!(
@@ -191,105 +230,7 @@ pub fn archive_session_with_paths(
         next_num, total_messages
     );
 
-    Ok(())
-}
-
-/// Archive all unarchived JSONL transcripts found under ~/.claude/projects/.
-pub fn archive_all_unarchived() -> Result<(), String> {
-    let base = paths::claude_dir()?;
-    archive_all_with_base(&base)
-}
-
-pub fn archive_all_with_base(base: &Path) -> Result<(), String> {
-    let conversations_dir = base.join("conversations");
-    if !conversations_dir.exists() {
-        return Err(
-            "conversations/ directory not found. Run `recall-echo init` first.".to_string(),
-        );
-    }
-
-    // Collect already-archived session IDs from conversation frontmatter
-    let archived_sessions = collect_archived_sessions(&conversations_dir);
-
-    // Find all JSONL files under ~/.claude/projects/
-    let projects_dir = base.join("projects");
-    if !projects_dir.exists() {
-        eprintln!("No projects directory found — nothing to archive.");
-        return Ok(());
-    }
-
-    let mut jsonl_files = find_jsonl_files(&projects_dir);
-    jsonl_files.sort_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-
-    let mut archived_count = 0;
-    let mut skipped_count = 0;
-
-    for jsonl_path in &jsonl_files {
-        let session_id = match jsonl_path.file_stem().and_then(|s| s.to_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-
-        if archived_sessions.contains(&session_id) {
-            skipped_count += 1;
-            continue;
-        }
-
-        let path_str = jsonl_path.to_string_lossy().to_string();
-        match archive_session_with_paths(&session_id, &path_str, base) {
-            Ok(()) => archived_count += 1,
-            Err(e) => {
-                eprintln!("recall-echo: skipping {} — {}", session_id, e);
-            }
-        }
-    }
-
-    eprintln!(
-        "recall-echo: archived {archived_count} conversation{}, skipped {skipped_count} already archived",
-        if archived_count == 1 { "" } else { "s" }
-    );
-
-    Ok(())
-}
-
-fn collect_archived_sessions(conversations_dir: &Path) -> std::collections::HashSet<String> {
-    let mut sessions = std::collections::HashSet::new();
-    if let Ok(entries) = fs::read_dir(conversations_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("conversation-") && name.ends_with(".md") {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    for line in content.lines().take(15) {
-                        if let Some(sid) = line.strip_prefix("session_id: ") {
-                            sessions.insert(sid.trim().trim_matches('"').to_string());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    sessions
-}
-
-fn find_jsonl_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_jsonl_files(&path));
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                files.push(path);
-            }
-        }
-    }
-    files
+    Ok(next_num)
 }
 
 #[cfg(test)]
