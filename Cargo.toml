@@ -1,20 +1,32 @@
 [package]
 name = "recall-echo"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
-description = "Persistent three-layer memory system for pulse-null entities"
+description = "Persistent memory system with knowledge graph — for any LLM tool"
 license = "AGPL-3.0-only"
 repository = "https://github.com/dnacenta/recall-echo"
-keywords = ["pulse-null", "ai", "memory", "llm", "conversation"]
+keywords = ["ai", "memory", "llm", "conversation", "knowledge-graph"]
 categories = ["command-line-utilities"]
 authors = ["dnacenta"]
 
 [dependencies]
-echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", branch = "main" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+
+# Graph (default) — knowledge graph with SurrealDB + fastembed
+recall-graph = { path = "../recall-graph", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+# Pulse-null integration (optional) — plugin system for pulse-null entities
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", branch = "main", optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[features]
+default = ["graph"]
+graph = ["recall-graph", "tokio"]
+pulse-null = ["echo-system-types", "async-trait"]
 
 [dev-dependencies]
 tempfile = "3"

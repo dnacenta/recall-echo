@@ -1,7 +1,8 @@
 //! Path resolution utilities for recall-echo.
 //!
-//! Defaults to entity_root/memory/ layout used by pulse-null.
-//! Can be overridden with RECALL_ECHO_HOME environment variable.
+//! Supports two modes:
+//! 1. **Entity mode** (pulse-null) — entity_root/memory/ layout
+//! 2. **Claude mode** (standalone) — ~/.claude/ layout for Claude Code hooks
 
 use std::path::PathBuf;
 
@@ -40,4 +41,14 @@ pub fn conversations_dir() -> Result<PathBuf, String> {
 
 pub fn config_file() -> Result<PathBuf, String> {
     Ok(memory_dir()?.join(".recall-echo.toml"))
+}
+
+/// Returns the Claude Code base directory (~/.claude/).
+///
+/// Used when recall-echo is invoked as a Claude Code hook (archive-session,
+/// checkpoint). The memory layout inside ~/.claude/ mirrors the entity layout:
+/// ~/.claude/conversations/, ~/.claude/ARCHIVE.md, ~/.claude/EPHEMERAL.md, etc.
+pub fn claude_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home.join(".claude"))
 }
