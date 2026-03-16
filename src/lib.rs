@@ -1,22 +1,21 @@
-//! recall-echo — Persistent three-layer memory system for pulse-null entities.
+//! recall-echo — Persistent memory system with knowledge graph.
 //!
-//! Provides a three-layer memory architecture: curated memory (MEMORY.md),
-//! FIFO rolling window of recent sessions (EPHEMERAL.md), and full conversation
-//! archives with LLM-enhanced summaries. Designed as a core crate for
-//! pulse-null with standalone CLI support.
+//! A general-purpose persistent memory system for any LLM tool — Claude Code,
+//! Ollama, or any provider. Features a three-layer memory architecture with
+//! an optional knowledge graph powered by SurrealDB + fastembed.
 //!
-//! # Usage as a library
+//! # Architecture
 //!
-//! ```no_run
-//! use recall_echo::RecallEcho;
-//!
-//! # fn run() {
-//! let recall = RecallEcho::from_default().expect("memory system");
-//! if let Some(content) = recall.consume_content().expect("consume") {
-//!     println!("{content}");
-//! }
-//! # }
+//! ```text
+//! Input adapters (JSONL transcripts, pulse-null Messages)
+//!     → Conversation (universal internal format)
+//!     → Archive pipeline (markdown + index + ephemeral + graph)
 //! ```
+//!
+//! # Features
+//!
+//! - `graph` (default) — Knowledge graph with SurrealDB + fastembed
+//! - `pulse-null` — Plugin integration for pulse-null entities
 
 pub mod archive;
 pub mod checkpoint;
@@ -28,25 +27,28 @@ pub mod distill;
 pub mod ephemeral;
 pub mod frontmatter;
 pub mod init;
+pub mod jsonl;
 pub mod paths;
 pub mod search;
 pub mod status;
 pub mod summarize;
 pub mod tags;
 
-use std::any::Any;
-use std::fs;
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
+#[cfg(feature = "graph")]
+pub mod graph_bridge;
+#[cfg(feature = "graph")]
+pub mod graph_cli;
 
-use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
-use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
+#[cfg(feature = "pulse-null")]
+pub mod pulse_null;
+
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub use archive::SessionMetadata;
 pub use summarize::ConversationSummary;
 
-/// The recall-echo plugin. Manages persistent three-layer memory.
+/// The recall-echo memory system.
 ///
 /// All paths are derived from entity_root:
 /// ```text
@@ -54,7 +56,8 @@ pub use summarize::ConversationSummary;
 /// ├── MEMORY.md
 /// ├── EPHEMERAL.md
 /// ├── ARCHIVE.md
-/// └── conversations/
+/// ├── conversations/
+/// └── graph/ (when graph feature is enabled)
 /// ```
 pub struct RecallEcho {
     entity_root: PathBuf,
@@ -115,33 +118,6 @@ impl RecallEcho {
         self.memory_dir().exists() && self.conversations_dir().exists()
     }
 
-    // ── Plugin interface ─────────────────────────────────────────────
-
-    /// Report health status.
-    fn health_check(&self) -> HealthStatus {
-        if !self.memory_dir().exists() {
-            return HealthStatus::Down("memory directory not found".into());
-        }
-        if !self.memory_file().exists() {
-            return HealthStatus::Degraded("MEMORY.md not found".into());
-        }
-        if !self.conversations_dir().exists() {
-            return HealthStatus::Degraded("conversations directory not found".into());
-        }
-        HealthStatus::Healthy
-    }
-
-    /// Configuration prompts for the pulse-null init wizard.
-    fn get_setup_prompts() -> Vec<SetupPrompt> {
-        vec![SetupPrompt {
-            key: "entity_root".into(),
-            question: "Entity root directory:".into(),
-            required: true,
-            secret: false,
-            default: None,
-        }]
-    }
-
     /// Number of lines in MEMORY.md.
     pub fn memory_line_count(&self) -> usize {
         let path = self.memory_file();
@@ -155,50 +131,93 @@ impl RecallEcho {
     }
 }
 
-/// Factory function — creates a fully initialized recall-echo plugin.
-pub async fn create(
-    config: &serde_json::Value,
-    ctx: &PluginContext,
-) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
-    let entity_root = config
-        .get("entity_root")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| ctx.entity_root.clone());
+// ---------------------------------------------------------------------------
+// Pulse-null plugin implementation — behind feature flag
+// ---------------------------------------------------------------------------
 
-    Ok(Box::new(RecallEcho::new(entity_root)))
-}
+#[cfg(feature = "pulse-null")]
+mod plugin_impl {
+    use super::*;
+    use std::any::Any;
+    use std::future::Future;
+    use std::pin::Pin;
 
-impl Plugin for RecallEcho {
-    fn meta(&self) -> PluginMeta {
-        PluginMeta {
-            name: "recall-echo".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            description: "Persistent three-layer memory system".into(),
+    use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
+    use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
+
+    impl RecallEcho {
+        fn health_check(&self) -> HealthStatus {
+            if !self.memory_dir().exists() {
+                return HealthStatus::Down("memory directory not found".into());
+            }
+            if !self.memory_file().exists() {
+                return HealthStatus::Degraded("MEMORY.md not found".into());
+            }
+            if !self.conversations_dir().exists() {
+                return HealthStatus::Degraded("conversations directory not found".into());
+            }
+            HealthStatus::Healthy
+        }
+
+        fn get_setup_prompts() -> Vec<SetupPrompt> {
+            vec![SetupPrompt {
+                key: "entity_root".into(),
+                question: "Entity root directory:".into(),
+                required: true,
+                secret: false,
+                default: None,
+            }]
         }
     }
 
-    fn role(&self) -> PluginRole {
-        PluginRole::Memory
+    /// Factory function — creates a fully initialized recall-echo plugin.
+    pub async fn create(
+        config: &serde_json::Value,
+        ctx: &PluginContext,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+        let entity_root = config
+            .get("entity_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ctx.entity_root.clone());
+
+        Ok(Box::new(RecallEcho::new(entity_root)))
     }
 
-    fn start(&mut self) -> PluginResult<'_> {
-        Box::pin(async { Ok(()) })
-    }
+    impl Plugin for RecallEcho {
+        fn meta(&self) -> PluginMeta {
+            PluginMeta {
+                name: "recall-echo".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                description: "Persistent memory system with knowledge graph".into(),
+            }
+        }
 
-    fn stop(&mut self) -> PluginResult<'_> {
-        Box::pin(async { Ok(()) })
-    }
+        fn role(&self) -> PluginRole {
+            PluginRole::Memory
+        }
 
-    fn health(&self) -> Pin<Box<dyn Future<Output = HealthStatus> + Send + '_>> {
-        Box::pin(async move { self.health_check() })
-    }
+        fn start(&mut self) -> PluginResult<'_> {
+            Box::pin(async { Ok(()) })
+        }
 
-    fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        Self::get_setup_prompts()
-    }
+        fn stop(&mut self) -> PluginResult<'_> {
+            Box::pin(async { Ok(()) })
+        }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+        fn health(&self) -> Pin<Box<dyn Future<Output = HealthStatus> + Send + '_>> {
+            Box::pin(async move { self.health_check() })
+        }
+
+        fn setup_prompts(&self) -> Vec<SetupPrompt> {
+            Self::get_setup_prompts()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
     }
 }
+
+#[cfg(feature = "pulse-null")]
+pub use plugin_impl::create;

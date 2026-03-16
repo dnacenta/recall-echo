@@ -1,14 +1,17 @@
-//! Conversation processing for pulse-null entities.
+//! Core conversation types and processing.
 //!
-//! Converts `Vec<Message>` (from echo-system-types) into markdown archives,
-//! and provides algorithmic topic/summary extraction as a fallback when
-//! no LLM provider is available.
+//! Defines recall-echo's own conversation types — these are the universal
+//! internal format. All input adapters (JSONL transcripts, pulse-null Messages)
+//! produce these types, which then flow into the archive pipeline.
 
 use std::collections::HashMap;
 
-use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role};
+// ---------------------------------------------------------------------------
+// Core types
+// ---------------------------------------------------------------------------
 
-/// A parsed conversation entry for tag extraction and rendering.
+/// A parsed conversation entry — the universal internal format.
+/// All input adapters produce these.
 #[derive(Debug, Clone)]
 pub enum ConversationEntry {
     UserMessage(String),
@@ -17,99 +20,47 @@ pub enum ConversationEntry {
     ToolResult { content: String, is_error: bool },
 }
 
-/// Flatten `Vec<Message>` into a sequence of `ConversationEntry` items.
-pub fn flatten_messages(messages: &[Message]) -> Vec<ConversationEntry> {
-    let mut entries = Vec::new();
-    for msg in messages {
-        let role = &msg.role;
-        match &msg.content {
-            MessageContent::Text(text) => {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                match role {
-                    Role::User => entries.push(ConversationEntry::UserMessage(text.clone())),
-                    Role::Assistant => entries.push(ConversationEntry::AssistantText(text.clone())),
-                }
-            }
-            MessageContent::Blocks(blocks) => {
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            if text.trim().is_empty() {
-                                continue;
-                            }
-                            match role {
-                                Role::User => {
-                                    entries.push(ConversationEntry::UserMessage(text.clone()))
-                                }
-                                Role::Assistant => {
-                                    entries.push(ConversationEntry::AssistantText(text.clone()))
-                                }
-                            }
-                        }
-                        ContentBlock::ToolUse { name, input, .. } => {
-                            let summary = summarize_tool_input(name, input);
-                            entries.push(ConversationEntry::ToolUse {
-                                name: name.clone(),
-                                input_summary: summary,
-                            });
-                        }
-                        ContentBlock::ToolResult {
-                            content, is_error, ..
-                        } => {
-                            entries.push(ConversationEntry::ToolResult {
-                                content: content.clone(),
-                                is_error: is_error.unwrap_or(false),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    entries
+/// A parsed conversation — metadata + entries.
+/// Produced by input adapters (JSONL, pulse-null), consumed by archive pipeline.
+#[derive(Debug, Clone)]
+pub struct Conversation {
+    pub session_id: String,
+    pub first_timestamp: Option<String>,
+    pub last_timestamp: Option<String>,
+    pub user_message_count: u32,
+    pub assistant_message_count: u32,
+    pub entries: Vec<ConversationEntry>,
 }
 
-/// Summarize tool input JSON into a brief human-readable string.
-fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
-    // Extract the most relevant field based on tool name
-    if let Some(path) = input.get("file_path").or(input.get("path")) {
-        if let Some(s) = path.as_str() {
-            return s.to_string();
+impl Conversation {
+    /// Create a new empty conversation with the given session ID.
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            first_timestamp: None,
+            last_timestamp: None,
+            user_message_count: 0,
+            assistant_message_count: 0,
+            entries: Vec::new(),
         }
     }
-    if let Some(cmd) = input.get("command") {
-        if let Some(s) = cmd.as_str() {
-            let truncated: String = s.chars().take(80).collect();
-            return truncated;
-        }
+
+    /// Total message count (user + assistant).
+    pub fn total_messages(&self) -> u32 {
+        self.user_message_count + self.assistant_message_count
     }
-    if let Some(pattern) = input.get("pattern") {
-        if let Some(s) = pattern.as_str() {
-            return format!("pattern: {s}");
-        }
-    }
-    if let Some(query) = input.get("query") {
-        if let Some(s) = query.as_str() {
-            return format!("query: {s}");
-        }
-    }
-    if let Some(url) = input.get("url") {
-        if let Some(s) = url.as_str() {
-            return s.to_string();
-        }
-    }
-    format!("{name}(…)")
 }
 
-/// Convert messages into a markdown document for archival.
-pub fn conversation_to_markdown(messages: &[Message], log_num: u32) -> String {
+// ---------------------------------------------------------------------------
+// Markdown conversion
+// ---------------------------------------------------------------------------
+
+/// Convert conversation entries into a markdown document for archival.
+pub fn conversation_to_markdown(conv: &Conversation, log_num: u32) -> String {
     let mut md = format!("# Conversation {log_num:03}\n\n");
-    let entries = flatten_messages(messages);
     let mut last_role: Option<&str> = None;
 
-    for entry in &entries {
+    for entry in &conv.entries {
         match entry {
             ConversationEntry::UserMessage(text) => {
                 if last_role != Some("user") {
@@ -135,12 +86,10 @@ pub fn conversation_to_markdown(messages: &[Message], log_num: u32) -> String {
             }
             ConversationEntry::ToolResult { content, is_error } => {
                 let label = if *is_error { "Error" } else { "Result" };
-                let truncated = if content.len() > 2000 {
-                    format!("{}… (truncated)", &content[..2000])
-                } else {
-                    content.clone()
-                };
-                md.push_str(&format!("<details><summary>{label}</summary>\n\n```\n{truncated}\n```\n\n</details>\n\n"));
+                let truncated = truncate(content, 2000);
+                md.push_str(&format!(
+                    "<details><summary>{label}</summary>\n\n```\n{truncated}\n```\n\n</details>\n\n"
+                ));
             }
         }
     }
@@ -148,45 +97,10 @@ pub fn conversation_to_markdown(messages: &[Message], log_num: u32) -> String {
     md
 }
 
-/// Count user and assistant messages.
-pub fn count_messages(messages: &[Message]) -> (u32, u32) {
-    let mut user = 0u32;
-    let mut assistant = 0u32;
-    for msg in messages {
-        match msg.role {
-            Role::User => user += 1,
-            Role::Assistant => assistant += 1,
-        }
-    }
-    (user, assistant)
-}
+// ---------------------------------------------------------------------------
+// Topic extraction
+// ---------------------------------------------------------------------------
 
-/// Extract text content from all user messages.
-fn user_texts(messages: &[Message]) -> Vec<String> {
-    messages
-        .iter()
-        .filter(|m| matches!(m.role, Role::User))
-        .filter_map(|m| match &m.content {
-            MessageContent::Text(t) => Some(t.clone()),
-            MessageContent::Blocks(blocks) => {
-                let texts: Vec<String> = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                if texts.is_empty() {
-                    None
-                } else {
-                    Some(texts.join(" "))
-                }
-            }
-        })
-        .collect()
-}
-
-// Words to skip during topic extraction
 const STOP_WORDS: &[&str] = &[
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
     "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall", "to",
@@ -203,36 +117,41 @@ const STOP_WORDS: &[&str] = &[
     "aren't", "wasn't", "file", "code", "run", "set", "add", "put", "try",
 ];
 
-/// Algorithmic topic extraction from user messages.
+/// Algorithmic topic extraction from conversation entries.
 /// Uses keyword frequency with stop-word filtering and tool-target boosting.
-pub fn extract_topics_algorithmic(messages: &[Message], max: usize) -> Vec<String> {
+pub fn extract_topics(conv: &Conversation, max: usize) -> Vec<String> {
     let mut freq: HashMap<String, u32> = HashMap::new();
-    let texts = user_texts(messages);
 
     // Count words from first 5 user messages
-    for text in texts.iter().take(5) {
-        for word in text.split_whitespace() {
-            let clean: String = word
-                .to_lowercase()
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if clean.len() >= 3 && !STOP_WORDS.contains(&clean.as_str()) {
-                *freq.entry(clean).or_default() += 1;
+    let mut user_msg_count = 0;
+    for entry in &conv.entries {
+        if let ConversationEntry::UserMessage(text) = entry {
+            let cleaned = strip_channel_prefix(text);
+            for word in cleaned.split_whitespace() {
+                let clean: String = word
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if clean.len() >= 3 && !STOP_WORDS.contains(&clean.as_str()) {
+                    *freq.entry(clean).or_default() += 1;
+                }
+            }
+            user_msg_count += 1;
+            if user_msg_count >= 5 {
+                break;
             }
         }
     }
 
     // Boost tool targets (file paths, commands)
-    let entries = flatten_messages(messages);
-    for entry in &entries {
+    for entry in &conv.entries {
         if let ConversationEntry::ToolUse {
             input_summary,
             name,
             ..
         } = entry
         {
-            // Extract filename or last path component
             let target = input_summary
                 .rsplit('/')
                 .next()
@@ -240,13 +159,11 @@ pub fn extract_topics_algorithmic(messages: &[Message], max: usize) -> Vec<Strin
                 .trim_matches('`')
                 .to_lowercase();
             if target.len() >= 3 && !target.contains('(') {
-                // Remove extension for cleaner topics
                 let stem = target.split('.').next().unwrap_or(&target);
                 if !stem.is_empty() {
                     *freq.entry(stem.to_string()).or_default() += 2;
                 }
             }
-            // Boost the tool name itself
             let tool_lower = name.to_lowercase();
             if !STOP_WORDS.contains(&tool_lower.as_str()) {
                 *freq.entry(tool_lower).or_default() += 1;
@@ -255,34 +172,35 @@ pub fn extract_topics_algorithmic(messages: &[Message], max: usize) -> Vec<Strin
     }
 
     let mut sorted: Vec<(String, u32)> = freq.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     sorted.into_iter().take(max).map(|(k, _)| k).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Summary extraction
+// ---------------------------------------------------------------------------
+
 /// Algorithmic summary extraction — first user message, truncated.
-pub fn extract_summary_algorithmic(messages: &[Message]) -> String {
-    let texts = user_texts(messages);
-    match texts.first() {
-        Some(text) => {
-            // Strip channel prefixes like "[Channel: discord | ...]"
-            let cleaned = if text.starts_with('[') {
-                text.find("]\n")
-                    .or(text.find("] "))
-                    .map(|pos| text[pos + 1..].trim())
-                    .unwrap_or(text)
-            } else {
-                text
-            };
-            let truncated: String = cleaned.chars().take(120).collect();
-            if truncated.len() < cleaned.len() {
-                format!("{truncated}…")
-            } else {
-                truncated
+pub fn extract_summary(conv: &Conversation) -> String {
+    for entry in &conv.entries {
+        if let ConversationEntry::UserMessage(text) = entry {
+            let cleaned = strip_channel_prefix(text);
+            if cleaned.is_empty() {
+                continue;
             }
+            let truncated: String = cleaned.chars().take(200).collect();
+            if truncated.len() < cleaned.len() {
+                return format!("{truncated}...");
+            }
+            return truncated;
         }
-        None => String::new(),
     }
+    "Empty session".to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Timestamp / duration helpers
+// ---------------------------------------------------------------------------
 
 /// Get current UTC timestamp in ISO 8601 format.
 pub fn utc_now() -> String {
@@ -298,7 +216,6 @@ pub fn utc_now() -> String {
     let minutes = (day_secs % 3600) / 60;
     let seconds = day_secs % 60;
 
-    // Simple date calculation
     let mut y = 1970i64;
     let mut remaining_days = days as i64;
     loop {
@@ -340,143 +257,216 @@ pub fn date_from_timestamp(ts: &str) -> String {
 
 /// Calculate duration string from two ISO timestamps.
 pub fn calculate_duration(start: &str, end: &str) -> String {
-    fn parse_secs(ts: &str) -> Option<u64> {
-        // Parse "YYYY-MM-DDTHH:MM:SSZ" or similar
-        let t = ts.find('T')?;
-        let time_part = &ts[t + 1..];
-        let parts: Vec<&str> = time_part
+    fn parse_timestamp(ts: &str) -> Option<u64> {
+        let t_pos = ts.find('T')?;
+        let date_part = &ts[..t_pos];
+        let time_part = ts[t_pos + 1..]
             .trim_end_matches('Z')
-            .trim_end_matches("+00:00")
-            .split(':')
-            .collect();
-        if parts.len() >= 3 {
-            let h: u64 = parts[0].parse().ok()?;
-            let m: u64 = parts[1].parse().ok()?;
-            let s: u64 = parts[2].split('.').next()?.parse().ok()?;
-            Some(h * 3600 + m * 60 + s)
-        } else {
-            None
+            .trim_end_matches("+00:00");
+
+        let date_parts: Vec<&str> = date_part.split('-').collect();
+        if date_parts.len() != 3 {
+            return None;
         }
+        let year: u64 = date_parts[0].parse().ok()?;
+        let month: u64 = date_parts[1].parse().ok()?;
+        let day: u64 = date_parts[2].parse().ok()?;
+
+        let time_clean = time_part.split('.').next()?;
+        let time_parts: Vec<&str> = time_clean.split(':').collect();
+        if time_parts.len() != 3 {
+            return None;
+        }
+        let hour: u64 = time_parts[0].parse().ok()?;
+        let min: u64 = time_parts[1].parse().ok()?;
+        let sec: u64 = time_parts[2].parse().ok()?;
+
+        Some(((year * 365 + month * 30 + day) * 86400) + hour * 3600 + min * 60 + sec)
     }
 
-    match (parse_secs(start), parse_secs(end)) {
-        (Some(s), Some(e)) if e >= s => {
-            let diff = e - s;
-            let hours = diff / 3600;
-            let mins = (diff % 3600) / 60;
-            if hours > 0 {
-                format!("{hours}h{mins:02}m")
-            } else {
-                format!("{mins}m")
-            }
+    match (parse_timestamp(start), parse_timestamp(end)) {
+        (Some(a), Some(b)) => {
+            let diff = b.abs_diff(a);
+            format_duration(diff)
         }
         _ => "unknown".to_string(),
     }
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        "< 1m".to_string()
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        let h = seconds / 3600;
+        let m = (seconds % 3600) / 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m:02}m")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Strip [Channel: ...] and "User message:" prefixes from text.
+pub fn strip_channel_prefix(text: &str) -> String {
+    let mut s = text.trim().to_string();
+
+    if s.starts_with('[') {
+        if let Some(end) = s.find("]\n") {
+            s = s[end + 2..].trim().to_string();
+        } else if let Some(end) = s.find("] ") {
+            s = s[end + 2..].trim().to_string();
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("User message: ") {
+        s = rest.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("User message:") {
+        s = rest.trim().to_string();
+    }
+
+    s
+}
+
+/// Truncate a string, appending a notice if it was cut.
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let total = s.len();
+        format!("{}...\n\n[truncated, {total} chars total]", &s[..max])
+    }
+}
+
+/// Condense a conversation into a text block suitable for LLM summarization.
+/// Keeps it short to minimize token usage.
+pub fn condense_for_summary(conv: &Conversation) -> String {
+    let mut condensed = String::new();
+
+    for entry in &conv.entries {
+        match entry {
+            ConversationEntry::UserMessage(text) => {
+                condensed.push_str("User: ");
+                let t: String = text.chars().take(300).collect();
+                condensed.push_str(&t);
+                if t.len() < text.len() {
+                    condensed.push('\u{2026}');
+                }
+                condensed.push('\n');
+            }
+            ConversationEntry::AssistantText(text) => {
+                condensed.push_str("Assistant: ");
+                let t: String = text.chars().take(300).collect();
+                condensed.push_str(&t);
+                if t.len() < text.len() {
+                    condensed.push('\u{2026}');
+                }
+                condensed.push('\n');
+            }
+            ConversationEntry::ToolUse {
+                name,
+                input_summary,
+            } => {
+                condensed.push_str(&format!("[Tool: {name} \u{2192} {input_summary}]\n"));
+            }
+            ConversationEntry::ToolResult { .. } => {}
+        }
+    }
+
+    if condensed.len() > 4000 {
+        condensed.truncate(4000);
+        condensed.push_str("\n\u{2026} (conversation truncated)");
+    }
+
+    condensed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_user_msg(text: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: MessageContent::Text(text.to_string()),
+    fn make_conv(entries: Vec<ConversationEntry>) -> Conversation {
+        let mut user_count = 0u32;
+        let mut asst_count = 0u32;
+        for e in &entries {
+            match e {
+                ConversationEntry::UserMessage(_) => user_count += 1,
+                ConversationEntry::AssistantText(_) => asst_count += 1,
+                _ => {}
+            }
         }
-    }
-
-    fn make_assistant_msg(text: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::Text(text.to_string()),
-        }
-    }
-
-    fn make_tool_use_msg(name: &str, path: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                id: "t1".to_string(),
-                name: name.to_string(),
-                input: serde_json::json!({"file_path": path}),
-            }]),
+        Conversation {
+            session_id: "test".to_string(),
+            first_timestamp: None,
+            last_timestamp: None,
+            user_message_count: user_count,
+            assistant_message_count: asst_count,
+            entries,
         }
     }
 
     #[test]
-    fn flatten_simple_messages() {
-        let msgs = vec![make_user_msg("hello"), make_assistant_msg("hi there")];
-        let entries = flatten_messages(&msgs);
-        assert_eq!(entries.len(), 2);
-        assert!(matches!(&entries[0], ConversationEntry::UserMessage(t) if t == "hello"));
-        assert!(matches!(&entries[1], ConversationEntry::AssistantText(t) if t == "hi there"));
+    fn conversation_to_markdown_basic() {
+        let conv = make_conv(vec![
+            ConversationEntry::UserMessage("What is Rust?".to_string()),
+            ConversationEntry::AssistantText("Rust is a systems programming language.".to_string()),
+        ]);
+        let md = conversation_to_markdown(&conv, 1);
+        assert!(md.contains("# Conversation 001"));
+        assert!(md.contains("### User"));
+        assert!(md.contains("### Assistant"));
+        assert!(md.contains("What is Rust?"));
     }
 
     #[test]
-    fn flatten_with_tool_use() {
-        let msgs = vec![make_tool_use_msg("Read", "/src/main.rs")];
-        let entries = flatten_messages(&msgs);
-        assert_eq!(entries.len(), 1);
-        assert!(
-            matches!(&entries[0], ConversationEntry::ToolUse { name, input_summary } if name == "Read" && input_summary == "/src/main.rs")
-        );
-    }
-
-    #[test]
-    fn count_messages_basic() {
-        let msgs = vec![
-            make_user_msg("q1"),
-            make_assistant_msg("a1"),
-            make_user_msg("q2"),
-            make_assistant_msg("a2"),
-        ];
-        let (u, a) = count_messages(&msgs);
-        assert_eq!(u, 2);
-        assert_eq!(a, 2);
-    }
-
-    #[test]
-    fn algorithmic_topic_extraction() {
-        let msgs = vec![
-            make_user_msg("Let's work on the authentication module for the API"),
-            make_user_msg("The authentication needs JWT tokens and rate limiting"),
-            make_tool_use_msg("Read", "/src/auth.rs"),
-        ];
-        let topics = extract_topics_algorithmic(&msgs, 5);
+    fn topic_extraction() {
+        let conv = make_conv(vec![
+            ConversationEntry::UserMessage(
+                "Let's work on the authentication module for the API".to_string(),
+            ),
+            ConversationEntry::UserMessage(
+                "The authentication needs JWT tokens and rate limiting".to_string(),
+            ),
+            ConversationEntry::ToolUse {
+                name: "Read".to_string(),
+                input_summary: "/src/auth.rs".to_string(),
+            },
+        ]);
+        let topics = extract_topics(&conv, 5);
         assert!(!topics.is_empty());
         assert!(topics.iter().any(|t| t.contains("auth")));
     }
 
     #[test]
-    fn algorithmic_summary_extraction() {
-        let msgs = vec![
-            make_user_msg("Fix the login bug in the auth module"),
-            make_assistant_msg("Let me take a look at the auth module."),
-        ];
-        let summary = extract_summary_algorithmic(&msgs);
+    fn summary_extraction() {
+        let conv = make_conv(vec![
+            ConversationEntry::UserMessage("Fix the login bug in the auth module".to_string()),
+            ConversationEntry::AssistantText("Let me take a look at the auth module.".to_string()),
+        ]);
+        let summary = extract_summary(&conv);
         assert!(summary.contains("Fix the login bug"));
     }
 
     #[test]
     fn summary_strips_channel_prefix() {
-        let msgs = vec![make_user_msg(
-            "[Channel: discord | Trust: VERIFIED]\nFix the login bug",
-        )];
-        let summary = extract_summary_algorithmic(&msgs);
+        let conv = make_conv(vec![ConversationEntry::UserMessage(
+            "[Channel: discord | Trust: VERIFIED]\nFix the login bug".to_string(),
+        )]);
+        let summary = extract_summary(&conv);
         assert!(summary.starts_with("Fix the login bug"));
     }
 
     #[test]
-    fn conversation_to_markdown_basic() {
-        let msgs = vec![
-            make_user_msg("What is Rust?"),
-            make_assistant_msg("Rust is a systems programming language."),
-        ];
-        let md = conversation_to_markdown(&msgs, 1);
-        assert!(md.contains("# Conversation 001"));
-        assert!(md.contains("### User"));
-        assert!(md.contains("### Assistant"));
-        assert!(md.contains("What is Rust?"));
+    fn summary_empty_session() {
+        let conv = make_conv(vec![]);
+        assert_eq!(extract_summary(&conv), "Empty session");
     }
 
     #[test]
@@ -492,6 +482,19 @@ mod tests {
     }
 
     #[test]
+    fn duration_short() {
+        assert_eq!(
+            calculate_duration("2026-03-05T14:30:00.000Z", "2026-03-05T14:30:30.000Z"),
+            "< 1m"
+        );
+    }
+
+    #[test]
+    fn duration_invalid() {
+        assert_eq!(calculate_duration("garbage", "nonsense"), "unknown");
+    }
+
+    #[test]
     fn utc_now_format() {
         let ts = utc_now();
         assert!(ts.contains('T'));
@@ -501,7 +504,29 @@ mod tests {
 
     #[test]
     fn empty_messages_produce_empty_topics() {
-        let topics = extract_topics_algorithmic(&[], 5);
+        let conv = make_conv(vec![]);
+        let topics = extract_topics(&conv, 5);
         assert!(topics.is_empty());
+    }
+
+    #[test]
+    fn truncate_short() {
+        assert_eq!(truncate("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_long() {
+        let long = "x".repeat(3000);
+        let result = truncate(&long, 2000);
+        assert!(result.len() < 3000);
+        assert!(result.contains("[truncated, 3000 chars total]"));
+    }
+
+    #[test]
+    fn condense_truncates_long_messages() {
+        let conv = make_conv(vec![ConversationEntry::UserMessage("x".repeat(500))]);
+        let condensed = condense_for_summary(&conv);
+        assert!(condensed.len() < 400);
+        assert!(condensed.contains('\u{2026}'));
     }
 }
