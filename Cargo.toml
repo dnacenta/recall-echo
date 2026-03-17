@@ -17,7 +17,7 @@ toml = "0.8"
 dirs = "6"
 
 # Graph (default) — knowledge graph with SurrealDB + fastembed
-recall-graph = { path = "../recall-graph", optional = true }
+recall-graph = { git = "https://github.com/dnacenta/recall-graph", branch = "main", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"], optional = true }
 
 # LLM HTTP provider (optional) — for entity extraction via Anthropic/OpenAI-compat APIs
