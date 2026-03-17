@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 #[cfg(feature = "graph")]
 use recall_echo::graph_cli;
 use recall_echo::{
-    archive, checkpoint, dashboard, distill, init, paths, search, status, RecallEcho,
+    archive, checkpoint, config_cli, dashboard, distill, init, paths, search, status, RecallEcho,
 };
 
 #[derive(Parser)]
@@ -74,6 +74,14 @@ enum Commands {
         #[arg(long)]
         trigger: String,
     },
+    /// View or modify configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+        /// Entity root directory (defaults to current directory)
+        #[arg(long)]
+        entity_root: Option<PathBuf>,
+    },
     /// Knowledge graph operations
     #[cfg(feature = "graph")]
     Graph {
@@ -82,6 +90,19 @@ enum Commands {
         /// Entity root directory (defaults to current directory)
         #[arg(long)]
         entity_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Show current configuration
+    Show,
+    /// Set a config value (e.g., `config set provider ollama`)
+    Set {
+        /// Config key (provider, model, api_base, llm.provider, ephemeral.max_entries)
+        key: String,
+        /// New value
+        value: String,
     },
 }
 
@@ -179,6 +200,28 @@ enum GraphCommands {
     },
     /// Scan conversations/ for un-ingested archives and ingest them all
     IngestAll,
+    /// Extract entities from already-ingested archives using an LLM
+    #[cfg(feature = "llm")]
+    Extract {
+        /// Extract from a single archive by log number
+        #[arg(long)]
+        log: Option<u32>,
+        /// Extract from all un-extracted archives
+        #[arg(long)]
+        all: bool,
+        /// Dry run — show what would be extracted without calling the LLM
+        #[arg(long)]
+        dry_run: bool,
+        /// Override model (default from env or claude-haiku-4-5-20251001)
+        #[arg(long)]
+        model: Option<String>,
+        /// Override provider (anthropic or openai)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Milliseconds delay between archives (default: 100)
+        #[arg(long, default_value = "100")]
+        delay_ms: u64,
+    },
 }
 
 fn main() {
@@ -232,6 +275,17 @@ fn main() {
             }
         }
         Some(Commands::Checkpoint { trigger }) => checkpoint::run_from_hook(&trigger),
+        Some(Commands::Config {
+            command,
+            entity_root,
+        }) => {
+            let root = resolve_entity_root(entity_root);
+            let memory_dir = root.join("memory");
+            match command {
+                ConfigCommands::Show => config_cli::show(&memory_dir),
+                ConfigCommands::Set { key, value } => config_cli::set(&memory_dir, &key, &value),
+            }
+        }
         #[cfg(feature = "graph")]
         Some(Commands::Graph {
             command,
@@ -305,6 +359,15 @@ fn main() {
                 ),
                 GraphCommands::Ingest { archive } => graph_cli::ingest(&memory_dir, &archive),
                 GraphCommands::IngestAll => graph_cli::ingest_all(&memory_dir),
+                #[cfg(feature = "llm")]
+                GraphCommands::Extract {
+                    log,
+                    all,
+                    dry_run,
+                    model,
+                    provider,
+                    delay_ms,
+                } => graph_cli::extract(&memory_dir, log, all, dry_run, model, provider, delay_ms),
             }
         }
     };
