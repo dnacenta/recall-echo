@@ -1,6 +1,6 @@
 //! Graph memory CLI subcommands (behind `graph` feature flag).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use recall_graph::traverse::format_traversal;
 use recall_graph::types::*;
@@ -226,20 +226,7 @@ pub fn ingest_all(memory_dir: &Path) -> Result<(), String> {
         return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
     }
 
-    // Check both memory_dir/conversations/ and parent/conversations/ (Claude Code layout)
-    let conversations_dir = memory_dir.join("conversations");
-    let conversations_dir = if conversations_dir.exists() {
-        conversations_dir
-    } else if let Some(parent) = memory_dir.parent() {
-        let parent_conv = parent.join("conversations");
-        if parent_conv.exists() {
-            parent_conv
-        } else {
-            return Err("conversations/ directory not found.".into());
-        }
-    } else {
-        return Err("conversations/ directory not found.".into());
-    };
+    let conversations_dir = find_conversations_dir(memory_dir)?;
 
     // Collect all conversation files, sorted
     let mut files: Vec<_> = std::fs::read_dir(&conversations_dir)
@@ -435,4 +422,194 @@ pub fn hybrid_query(
 
         Ok(())
     })
+}
+
+/// Extract entities from already-ingested archives using an LLM.
+#[cfg(feature = "llm")]
+pub fn extract(
+    memory_dir: &Path,
+    log: Option<u32>,
+    all: bool,
+    dry_run: bool,
+    model_override: Option<String>,
+    provider_override: Option<String>,
+    delay_ms: u64,
+) -> Result<(), String> {
+    use crate::llm_provider::{HttpLlmProvider, LlmConfig};
+
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Determine which log numbers to process
+        let log_numbers: Vec<u32> = if let Some(ln) = log {
+            vec![ln]
+        } else if all {
+            gm.unextracted_log_numbers()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|n| n as u32)
+                .collect()
+        } else {
+            return Err("Specify --log <N> or --all".into());
+        };
+
+        if log_numbers.is_empty() {
+            println!("{YELLOW}No unextracted archives found.{RESET}");
+            return Ok(());
+        }
+
+        // Find conversations directory
+        let conversations_dir = find_conversations_dir(memory_dir)?;
+
+        if dry_run {
+            println!(
+                "{BOLD}Dry run — {}{RESET} archives to extract",
+                log_numbers.len()
+            );
+            for ln in &log_numbers {
+                let path = find_archive_file(&conversations_dir, *ln);
+                let label = match &path {
+                    Ok(p) => {
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    }
+                    Err(_) => format!("log {ln:03} (file not found)"),
+                };
+                println!("  {label}");
+            }
+            return Ok(());
+        }
+
+        // Build LLM config from .recall-echo.toml (CLI flags override)
+        let mut cfg_section = crate::config::load(memory_dir).llm;
+        if let Some(p) = provider_override {
+            let provider = crate::config::Provider::from_str_loose(&p)?;
+            cfg_section.provider = provider;
+        }
+        if let Some(m) = model_override {
+            cfg_section.model = m;
+        }
+        let config = LlmConfig::from_config_section(&cfg_section)?;
+
+        let llm = HttpLlmProvider::new(config);
+
+        println!(
+            "{BOLD}Extracting entities from {} archives using {}{RESET}",
+            log_numbers.len(),
+            llm.model()
+        );
+
+        let mut total_entities_created = 0u32;
+        let mut total_entities_merged = 0u32;
+        let mut total_entities_skipped = 0u32;
+        let mut total_relationships = 0u32;
+        let mut total_errors = Vec::new();
+        let mut processed = 0u32;
+
+        for ln in &log_numbers {
+            let archive_path = match find_archive_file(&conversations_dir, *ln) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("  {YELLOW}⚠{RESET} log {ln:03}: {e}");
+                    total_errors.push(format!("log {ln:03}: {e}"));
+                    continue;
+                }
+            };
+
+            let content = std::fs::read_to_string(&archive_path)
+                .map_err(|e| format!("read {}: {e}", archive_path.display()))?;
+
+            let (session_id, _) = extract_archive_metadata(&content, &archive_path);
+
+            let report = gm
+                .extract_from_archive(&content, &session_id, Some(*ln), &llm)
+                .await
+                .map_err(|e| format!("extraction log {ln:03}: {e}"))?;
+
+            println!(
+                "  {GREEN}✓{RESET} log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels",
+                report.entities_created,
+                report.entities_merged,
+                report.entities_skipped,
+                report.relationships_created,
+            );
+
+            gm.mark_extracted(*ln).await.map_err(|e| e.to_string())?;
+
+            total_entities_created += report.entities_created;
+            total_entities_merged += report.entities_merged;
+            total_entities_skipped += report.entities_skipped;
+            total_relationships += report.relationships_created;
+            total_errors.extend(report.errors);
+            processed += 1;
+
+            // Rate limiting between archives
+            if delay_ms > 0 && *ln != *log_numbers.last().unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        println!(
+            "\n{GREEN}✓{RESET} Done: {processed} archives — +{total_entities_created} created, ~{total_entities_merged} merged, -{total_entities_skipped} skipped, {total_relationships} relationships"
+        );
+
+        if !total_errors.is_empty() {
+            println!("\n{YELLOW}Warnings ({}):{RESET}", total_errors.len());
+            for err in total_errors.iter().take(10) {
+                println!("  {DIM}{err}{RESET}");
+            }
+            if total_errors.len() > 10 {
+                println!("  {DIM}... and {} more{RESET}", total_errors.len() - 10);
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Find the conversations directory — checks memory_dir/conversations/ then parent/conversations/.
+fn find_conversations_dir(memory_dir: &Path) -> Result<PathBuf, String> {
+    let conv = memory_dir.join("conversations");
+    if conv.exists() {
+        return Ok(conv);
+    }
+    if let Some(parent) = memory_dir.parent() {
+        let parent_conv = parent.join("conversations");
+        if parent_conv.exists() {
+            return Ok(parent_conv);
+        }
+    }
+    Err("conversations/ directory not found".into())
+}
+
+/// Find the archive file for a given log number.
+#[cfg(feature = "llm")]
+fn find_archive_file(conversations_dir: &Path, log_number: u32) -> Result<PathBuf, String> {
+    // Try both naming conventions
+    let patterns = [
+        format!("conversation-{log_number:03}.md"),
+        format!("conversation-{log_number}.md"),
+        format!("archive-log-{log_number:03}.md"),
+        format!("archive-log-{log_number}.md"),
+    ];
+
+    for name in &patterns {
+        let path = conversations_dir.join(name);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err(format!("no archive file for log {log_number:03}"))
 }

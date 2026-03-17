@@ -341,7 +341,12 @@ pub fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let total = s.len();
-        format!("{}...\n\n[truncated, {total} chars total]", &s[..max])
+        // Find a valid UTF-8 char boundary at or before `max`
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...\n\n[truncated, {total} chars total]", &s[..end])
     }
 }
 

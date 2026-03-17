@@ -20,6 +20,7 @@
 pub mod archive;
 pub mod checkpoint;
 pub mod config;
+pub mod config_cli;
 pub mod consume;
 pub mod conversation;
 pub mod dashboard;
@@ -38,6 +39,8 @@ pub mod tags;
 pub mod graph_bridge;
 #[cfg(feature = "graph")]
 pub mod graph_cli;
+#[cfg(feature = "llm")]
+pub mod llm_provider;
 
 #[cfg(feature = "pulse-null")]
 pub mod pulse_null;
