@@ -230,7 +230,7 @@ fn main() {
     let result = match cli.command {
         None => status::run(),
         Some(Commands::Init { entity_root }) => {
-            let root = resolve_entity_root(entity_root);
+            let root = resolve_init_root(entity_root);
             init::run(&root)
         }
         Some(Commands::Status { entity_root }) => {
@@ -380,4 +380,21 @@ fn main() {
 
 fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| paths::entity_root().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Resolve entity root for init, preferring Claude Code directory.
+fn resolve_init_root(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    // If RECALL_ECHO_HOME is set, use it
+    if let Ok(p) = std::env::var("RECALL_ECHO_HOME") {
+        return PathBuf::from(p);
+    }
+    // If ~/.claude/ exists, use it (Claude Code user)
+    if let Some(claude) = paths::detect_claude_code() {
+        return claude;
+    }
+    // Fall back to cwd
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
