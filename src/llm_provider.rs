@@ -87,6 +87,7 @@ impl LlmProvider for ClaudeCodeProvider {
             .arg("--system-prompt")
             .arg(system_prompt)
             .arg("--no-session-persistence")
+            .env_remove("CLAUDECODE") // Allow spawning from within a Claude Code session
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
