@@ -1,13 +1,14 @@
 //! Initialize the recall-echo memory system.
 //!
 //! Creates the directory structure and template files needed for
-//! three-layer memory, and prompts for LLM provider configuration.
+//! three-layer memory, knowledge graph, hooks, and LLM provider config.
 
 use std::fs;
 use std::io::{self, BufRead, Write as _};
 use std::path::Path;
 
 use crate::config::{self, Config, LlmSection, Provider};
+use crate::paths;
 
 // ANSI color helpers
 const GREEN: &str = "\x1b[32m";
@@ -69,19 +70,31 @@ fn write_if_not_exists(path: &Path, content: &str, label: &str) {
 fn prompt_provider(reader: &mut dyn BufRead) -> Option<Provider> {
     // Check if stdin is a terminal
     if !atty_check() {
-        return None;
+        // Non-interactive: default to claude-code if detected, else anthropic
+        return if paths::detect_claude_code().is_some() {
+            Some(Provider::ClaudeCode)
+        } else {
+            Some(Provider::Anthropic)
+        };
     }
 
+    let is_cc = paths::detect_claude_code().is_some();
+    let default_label = if is_cc { "3" } else { "1" };
+
     eprintln!("\n{BOLD}LLM provider for entity extraction:{RESET}");
-    eprintln!("  {BOLD}1{RESET}) anthropic   {DIM}— Claude API (default){RESET}");
+    eprintln!(
+        "  {BOLD}1{RESET}) anthropic   {DIM}— Claude API{}",
+        if !is_cc { " (default)" } else { "" }
+    );
     eprintln!("  {BOLD}2{RESET}) ollama      {DIM}— Local models via Ollama{RESET}");
     eprintln!(
-        "  {BOLD}3{RESET}) claude-code {DIM}— In-session only, no standalone extraction{RESET}"
+        "  {BOLD}3{RESET}) claude-code {DIM}— Uses `claude -p` subprocess{}",
+        if is_cc { " (default)" } else { "" }
     );
     eprintln!(
         "  {BOLD}4{RESET}) skip        {DIM}— Configure later with `recall-echo config`{RESET}"
     );
-    eprint!("\n  Choice [1]: ");
+    eprint!("\n  Choice [{default_label}]: ");
     io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -90,15 +103,224 @@ fn prompt_provider(reader: &mut dyn BufRead) -> Option<Provider> {
     }
 
     match input.trim() {
-        "" | "1" | "anthropic" => Some(Provider::Anthropic),
+        "" => {
+            if is_cc {
+                Some(Provider::ClaudeCode)
+            } else {
+                Some(Provider::Anthropic)
+            }
+        }
+        "1" | "anthropic" => Some(Provider::Anthropic),
         "2" | "ollama" => Some(Provider::Openai),
         "3" | "claude-code" => Some(Provider::ClaudeCode),
         "4" | "skip" => None,
         _ => {
-            eprintln!("  {YELLOW}~{RESET} Unknown choice, defaulting to anthropic");
-            Some(Provider::Anthropic)
+            let default = if is_cc {
+                Provider::ClaudeCode
+            } else {
+                Provider::Anthropic
+            };
+            eprintln!(
+                "  {YELLOW}~{RESET} Unknown choice, defaulting to {}",
+                default
+            );
+            Some(default)
         }
     }
+}
+
+/// Configure LLM provider. Returns true if the chosen provider is claude-code
+/// (indicating this is likely a Claude Code user).
+fn configure_llm(reader: &mut dyn BufRead, memory_dir: &Path) -> bool {
+    if !config::exists(memory_dir) {
+        if let Some(provider) = prompt_provider(reader) {
+            let is_cc = provider == Provider::ClaudeCode;
+            let cfg = Config {
+                llm: LlmSection {
+                    provider: provider.clone(),
+                    model: String::new(),
+                    api_base: String::new(),
+                },
+                ..Config::default()
+            };
+            match config::save(memory_dir, &cfg) {
+                Ok(()) => {
+                    let display_name = match &provider {
+                        Provider::Anthropic => "anthropic",
+                        Provider::Openai => "ollama (openai-compat)",
+                        Provider::ClaudeCode => "claude-code",
+                    };
+                    print_status(
+                        Status::Created,
+                        &format!("Created .recall-echo.toml (provider: {display_name})"),
+                    );
+                }
+                Err(e) => print_status(Status::Error, &format!("Failed to write config: {e}")),
+            }
+            return is_cc;
+        }
+        print_status(
+            Status::Exists,
+            "Skipped LLM config — run `recall-echo config set provider <name>` later",
+        );
+    } else {
+        print_status(
+            Status::Exists,
+            ".recall-echo.toml already exists — preserved",
+        );
+        // Check existing config
+        let cfg = config::load(memory_dir);
+        return cfg.llm.provider == Provider::ClaudeCode;
+    }
+    false
+}
+
+/// Initialize the graph store in memory/graph/.
+#[cfg(feature = "graph")]
+fn init_graph(memory_dir: &Path) {
+    let graph_dir = memory_dir.join("graph");
+    if graph_dir.exists() {
+        print_status(Status::Exists, "graph/ already exists — preserved");
+        return;
+    }
+
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => match rt.block_on(recall_graph::GraphMemory::open(&graph_dir)) {
+            Ok(_) => print_status(Status::Created, "Created graph/ (SurrealDB + fastembed)"),
+            Err(e) => print_status(Status::Error, &format!("Failed to init graph: {e}")),
+        },
+        Err(e) => print_status(Status::Error, &format!("Failed to start runtime: {e}")),
+    }
+}
+
+/// Auto-configure Claude Code hooks (settings.json).
+/// Returns true if hooks were configured.
+fn configure_hooks(entity_root: &Path) -> bool {
+    let claude_dir = match paths::detect_claude_code() {
+        Some(dir) => dir,
+        None => return false,
+    };
+
+    // Only configure hooks if entity_root is the Claude Code dir
+    if entity_root != claude_dir {
+        return false;
+    }
+
+    let settings_path = claude_dir.join("settings.json");
+    let recall_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "recall-echo".into());
+
+    let archive_cmd = format!("{recall_bin} archive-session");
+    let checkpoint_cmd = format!("{recall_bin} checkpoint --trigger precompact");
+
+    // Load existing settings or start fresh
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = settings.as_object_mut().and_then(|o| {
+        o.entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    });
+
+    let hooks = match hooks {
+        Some(h) => h,
+        None => {
+            print_status(Status::Error, "Could not parse settings.json hooks");
+            return false;
+        }
+    };
+
+    let mut changed = false;
+
+    // Add SessionEnd hook if not already present
+    if !hook_exists(hooks, "SessionEnd", &archive_cmd) {
+        let arr = hooks
+            .entry("SessionEnd")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(arr) = arr {
+            arr.push(serde_json::json!({
+                "hooks": [{"type": "command", "command": archive_cmd}]
+            }));
+            changed = true;
+        }
+    }
+
+    // Add PreCompact hook if not already present
+    if !hook_exists(hooks, "PreCompact", &checkpoint_cmd) {
+        let arr = hooks
+            .entry("PreCompact")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(arr) = arr {
+            arr.push(serde_json::json!({
+                "hooks": [{"type": "command", "command": checkpoint_cmd}]
+            }));
+            changed = true;
+        }
+    }
+
+    if changed {
+        match serde_json::to_string_pretty(&settings) {
+            Ok(content) => match fs::write(&settings_path, content) {
+                Ok(()) => {
+                    print_status(
+                        Status::Created,
+                        "Configured SessionEnd + PreCompact hooks in settings.json",
+                    );
+                    return true;
+                }
+                Err(e) => print_status(
+                    Status::Error,
+                    &format!("Failed to write settings.json: {e}"),
+                ),
+            },
+            Err(e) => print_status(Status::Error, &format!("Failed to serialize settings: {e}")),
+        }
+    } else {
+        print_status(Status::Exists, "Hooks already configured in settings.json");
+        return true;
+    }
+
+    false
+}
+
+/// Check if a hook command already exists in a hook event array.
+fn hook_exists(
+    hooks: &serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    command: &str,
+) -> bool {
+    if let Some(arr) = hooks.get(event).and_then(|v| v.as_array()) {
+        for group in arr {
+            if let Some(inner) = group.get("hooks").and_then(|h| h.as_array()) {
+                for hook in inner {
+                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                        // Match on the base command name, not the full path
+                        if cmd.contains("recall-echo archive-session")
+                            && command.contains("archive-session")
+                        {
+                            return true;
+                        }
+                        if cmd.contains("recall-echo checkpoint") && command.contains("checkpoint")
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Check if stderr is a terminal (for interactive prompts).
@@ -137,7 +359,7 @@ pub fn run(entity_root: &Path) -> Result<(), String> {
 pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(), String> {
     if !entity_root.exists() {
         return Err(format!(
-            "Entity root not found: {}\n  Create the directory first or run `pulse-null init`.",
+            "Directory not found: {}\n  Create the directory first, or run from a valid path.",
             entity_root.display()
         ));
     }
@@ -162,53 +384,34 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
         "ARCHIVE.md",
     );
 
+    // Initialize graph store
+    #[cfg(feature = "graph")]
+    init_graph(&memory_dir);
+
     // Configure LLM provider if no config exists yet
-    if !config::exists(&memory_dir) {
-        if let Some(provider) = prompt_provider(reader) {
-            let cfg = Config {
-                llm: LlmSection {
-                    provider: provider.clone(),
-                    model: String::new(),
-                    api_base: String::new(),
-                },
-                ..Config::default()
-            };
-            match config::save(&memory_dir, &cfg) {
-                Ok(()) => {
-                    let display_name = match &provider {
-                        Provider::Anthropic => "anthropic",
-                        Provider::Openai => "ollama (openai-compat)",
-                        Provider::ClaudeCode => "claude-code",
-                    };
-                    print_status(
-                        Status::Created,
-                        &format!("Created .recall-echo.toml (provider: {display_name})"),
-                    );
-                }
-                Err(e) => print_status(Status::Error, &format!("Failed to write config: {e}")),
-            }
-        } else {
-            print_status(
-                Status::Exists,
-                "Skipped LLM config — run `recall-echo config set provider <name>` later",
-            );
-        }
+    let is_claude_code = configure_llm(reader, &memory_dir);
+
+    // Auto-configure Claude Code hooks if applicable
+    let hooks_configured = if is_claude_code {
+        configure_hooks(entity_root)
     } else {
-        print_status(
-            Status::Exists,
-            ".recall-echo.toml already exists — preserved",
-        );
-    }
+        false
+    };
 
     // Summary
-    eprintln!(
-        "\n{BOLD}Setup complete.{RESET} Memory system is ready.\n\n\
-         \x20 Layer 1 (MEMORY.md)     — Curated facts, always in context\n\
-         \x20 Layer 2 (EPHEMERAL.md)  — Rolling window of recent sessions (FIFO, max 5)\n\
-         \x20 Layer 3 (Archive)       — Full conversations in memory/conversations/\n\n\
-         \x20 Run `recall-echo status` to check memory health.\n\
-         \x20 Run `recall-echo config show` to view configuration.\n"
-    );
+    eprintln!("\n{BOLD}Setup complete.{RESET} Memory system is ready.\n");
+    eprintln!("  Layer 1 (MEMORY.md)     — Curated facts, always in context");
+    eprintln!("  Layer 2 (EPHEMERAL.md)  — Rolling window of recent sessions (FIFO, max 5)");
+    eprintln!("  Layer 3 (Archive)       — Full conversations in memory/conversations/");
+    #[cfg(feature = "graph")]
+    eprintln!("  Layer 0 (Graph)         — Knowledge graph with semantic search");
+    eprintln!();
+    eprintln!("  Run `recall-echo status` to check memory health.");
+    eprintln!("  Run `recall-echo config show` to view configuration.");
+    if hooks_configured {
+        eprintln!("  Hooks configured — archiving happens automatically.");
+    }
+    eprintln!();
 
     Ok(())
 }

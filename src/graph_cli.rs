@@ -435,8 +435,6 @@ pub fn extract(
     provider_override: Option<String>,
     delay_ms: u64,
 ) -> Result<(), String> {
-    use crate::llm_provider::{HttpLlmProvider, LlmConfig};
-
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
@@ -491,23 +489,16 @@ pub fn extract(
             return Ok(());
         }
 
-        // Build LLM config from .recall-echo.toml (CLI flags override)
-        let mut cfg_section = crate::config::load(memory_dir).llm;
-        if let Some(p) = provider_override {
-            let provider = crate::config::Provider::from_str_loose(&p)?;
-            cfg_section.provider = provider;
-        }
-        if let Some(m) = model_override {
-            cfg_section.model = m;
-        }
-        let config = LlmConfig::from_config_section(&cfg_section)?;
-
-        let llm = HttpLlmProvider::new(config);
+        // Build LLM provider from .recall-echo.toml (CLI flags override)
+        let (llm, model_name) = crate::llm_provider::create_provider(
+            memory_dir,
+            provider_override.as_deref(),
+            model_override.as_deref(),
+        )?;
 
         println!(
-            "{BOLD}Extracting entities from {} archives using {}{RESET}",
+            "{BOLD}Extracting entities from {} archives using {model_name}{RESET}",
             log_numbers.len(),
-            llm.model()
         );
 
         let mut total_entities_created = 0u32;
@@ -533,7 +524,7 @@ pub fn extract(
             let (session_id, _) = extract_archive_metadata(&content, &archive_path);
 
             let report = gm
-                .extract_from_archive(&content, &session_id, Some(*ln), &llm)
+                .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
                 .await
                 .map_err(|e| format!("extraction log {ln:03}: {e}"))?;
 

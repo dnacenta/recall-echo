@@ -52,3 +52,15 @@ pub fn claude_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
     Ok(home.join(".claude"))
 }
+
+/// Detect Claude Code installation.
+/// Returns Some(~/.claude/) if it exists, None otherwise.
+pub fn detect_claude_code() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let claude = home.join(".claude");
+    if claude.exists() {
+        Some(claude)
+    } else {
+        None
+    }
+}

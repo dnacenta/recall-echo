@@ -18,7 +18,7 @@ dirs = "6"
 
 # Graph (default) — knowledge graph with SurrealDB + fastembed
 recall-graph = { path = "../recall-graph", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"], optional = true }
 
 # LLM HTTP provider (optional) — for entity extraction via Anthropic/OpenAI-compat APIs
 reqwest = { version = "0.12", features = ["json"], optional = true }
