@@ -145,8 +145,8 @@ mod plugin_impl {
     use std::future::Future;
     use std::pin::Pin;
 
-    use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
-    use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
+    use pulse_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
+    use pulse_system_types::{HealthStatus, PluginMeta, SetupPrompt};
 
     impl RecallEcho {
         fn health_check(&self) -> HealthStatus {

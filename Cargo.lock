@@ -1249,15 +1249,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "echo-system-types"
-version = "0.4.0"
-source = "git+https://github.com/dnacenta/echo-system-types?branch=main#2b4a1bdaab4baff0ffa6df44de039e01aece9805"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3728,6 +3719,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulse-system-types"
+version = "0.5.0"
+source = "git+https://github.com/dnacenta/pulse-null-types?branch=main#d99698ed694270610ccb45ce5b3b17ab59f8bf8a"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3951,7 +3951,7 @@ dependencies = [
  "async-trait",
  "clap",
  "dirs",
- "echo-system-types",
+ "pulse-system-types",
  "recall-graph",
  "reqwest",
  "serde",

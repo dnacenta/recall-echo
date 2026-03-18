@@ -56,7 +56,7 @@ Rules:
 /// LLM call errors, it falls back to algorithmic extraction silently.
 #[cfg(feature = "pulse-null")]
 pub async fn extract_with_fallback(
-    provider: Option<&dyn echo_system_types::llm::LmProvider>,
+    provider: Option<&dyn pulse_system_types::llm::LmProvider>,
     conv: &Conversation,
 ) -> ConversationSummary {
     if let Some(p) = provider {
@@ -74,10 +74,10 @@ pub async fn extract_with_fallback(
 /// Summarize using an LLM provider.
 #[cfg(feature = "pulse-null")]
 pub async fn summarize_conversation(
-    provider: &dyn echo_system_types::llm::LmProvider,
+    provider: &dyn pulse_system_types::llm::LmProvider,
     conv: &Conversation,
 ) -> Result<ConversationSummary, Box<dyn std::error::Error + Send + Sync>> {
-    use echo_system_types::llm::{Message, MessageContent, Role};
+    use pulse_system_types::llm::{Message, MessageContent, Role};
 
     let condensed = conversation::condense_for_summary(conv);
 
