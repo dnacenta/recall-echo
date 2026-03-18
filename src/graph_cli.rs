@@ -569,6 +569,250 @@ pub fn extract(
     })
 }
 
+// ── Pipeline commands ──────────────────────────────────────────────────
+
+/// Sync pipeline documents into the graph.
+pub fn pipeline_sync(memory_dir: &Path, docs_dir_override: Option<&Path>) -> Result<(), String> {
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    // Resolve docs directory: CLI flag > config > error
+    let docs_dir = if let Some(d) = docs_dir_override {
+        d.to_path_buf()
+    } else {
+        let cfg = crate::config::load_from_dir(memory_dir);
+        match cfg.pipeline.and_then(|p| p.docs_dir) {
+            Some(d) => {
+                let path = PathBuf::from(shellexpand(&d));
+                if !path.exists() {
+                    return Err(format!(
+                        "Configured docs_dir does not exist: {}",
+                        path.display()
+                    ));
+                }
+                path
+            }
+            None => {
+                return Err(
+                    "No docs directory specified. Use --docs-dir or set [pipeline] docs_dir in config.".into(),
+                );
+            }
+        }
+    };
+
+    // Read pipeline documents
+    let docs = read_pipeline_docs(&docs_dir)?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let report = gm.sync_pipeline(&docs).await.map_err(|e| e.to_string())?;
+
+        println!("{BOLD}Pipeline Sync{RESET}");
+        println!("  Created:      {}", report.entities_created);
+        println!("  Updated:      {}", report.entities_updated);
+        println!("  Archived:     {}", report.entities_archived);
+        println!(
+            "  Relationships: +{} / ~{} skipped",
+            report.relationships_created, report.relationships_skipped
+        );
+
+        if !report.errors.is_empty() {
+            println!("\n  {YELLOW}Warnings:{RESET}");
+            for err in &report.errors {
+                println!("    {DIM}{err}{RESET}");
+            }
+        }
+
+        if report.entities_created == 0
+            && report.entities_updated == 0
+            && report.entities_archived == 0
+        {
+            println!("\n  {DIM}No changes — graph is in sync.{RESET}");
+        }
+
+        Ok(())
+    })
+}
+
+/// Show pipeline health stats.
+pub fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(), String> {
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let stats = gm
+            .pipeline_stats(staleness_days)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        println!(
+            "{BOLD}Pipeline Status{RESET} ({} entities)",
+            stats.total_entities
+        );
+
+        if stats.by_stage.is_empty() {
+            println!(
+                "  {DIM}No pipeline entities in graph. Run `graph pipeline sync` first.{RESET}"
+            );
+            return Ok(());
+        }
+
+        // Display stages in pipeline order
+        let stage_order = ["learning", "thoughts", "curiosity", "reflections", "praxis"];
+        for stage in &stage_order {
+            if let Some(statuses) = stats.by_stage.get(*stage) {
+                println!("\n  {CYAN}{}{RESET}", stage.to_uppercase());
+                let mut items: Vec<_> = statuses.iter().collect();
+                items.sort_by_key(|(s, _)| (*s).clone());
+                for (status, count) in items {
+                    println!("    {status}: {count}");
+                }
+            }
+        }
+
+        if !stats.stale_thoughts.is_empty() {
+            println!("\n  {YELLOW}Stale thoughts (>{staleness_days}d):{RESET}");
+            for entity in &stats.stale_thoughts {
+                println!("    {DIM}•{RESET} {}", entity.name);
+            }
+        }
+
+        if !stats.stale_questions.is_empty() {
+            println!(
+                "\n  {YELLOW}Stale questions (>{}d):{RESET}",
+                staleness_days * 2
+            );
+            for entity in &stats.stale_questions {
+                println!("    {DIM}•{RESET} {}", entity.name);
+            }
+        }
+
+        if let Some(ref last) = stats.last_movement {
+            println!("\n  {DIM}Last movement: {last}{RESET}");
+        }
+
+        Ok(())
+    })
+}
+
+/// Trace pipeline flow for an entity.
+pub fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), String> {
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let chain = gm
+            .pipeline_flow(entity_name)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if chain.is_empty() {
+            println!("{YELLOW}No pipeline relationships found for \"{entity_name}\".{RESET}");
+            return Ok(());
+        }
+
+        println!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n");
+        for (source, rel_type, target) in &chain {
+            println!(
+                "  {} ({}) {CYAN}—[{rel_type}]→{RESET} {} ({})",
+                source.name, source.entity_type, target.name, target.entity_type
+            );
+        }
+
+        Ok(())
+    })
+}
+
+/// List stale pipeline entities.
+pub fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<(), String> {
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let stats = gm
+            .pipeline_stats(staleness_days)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let total_stale = stats.stale_thoughts.len() + stats.stale_questions.len();
+        if total_stale == 0 {
+            println!("{GREEN}✓{RESET} No stale pipeline entities.");
+            return Ok(());
+        }
+
+        println!("{BOLD}Stale Pipeline Entities{RESET}\n");
+
+        if !stats.stale_thoughts.is_empty() {
+            println!("  {YELLOW}Thoughts (>{staleness_days} days):{RESET}");
+            for entity in &stats.stale_thoughts {
+                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+            }
+        }
+
+        if !stats.stale_questions.is_empty() {
+            println!("  {YELLOW}Questions (>{} days):{RESET}", staleness_days * 2);
+            for entity in &stats.stale_questions {
+                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Read pipeline documents from a directory.
+fn read_pipeline_docs(dir: &Path) -> Result<PipelineDocuments, String> {
+    let read_or_empty = |name: &str| -> String {
+        let path = dir.join(name);
+        std::fs::read_to_string(&path).unwrap_or_default()
+    };
+
+    Ok(PipelineDocuments {
+        learning: read_or_empty("LEARNING.md"),
+        thoughts: read_or_empty("THOUGHTS.md"),
+        curiosity: read_or_empty("CURIOSITY.md"),
+        reflections: read_or_empty("REFLECTIONS.md"),
+        praxis: read_or_empty("PRAXIS.md"),
+    })
+}
+
+/// Expand ~ to home directory in paths.
+fn shellexpand(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
+
 /// Find the conversations directory — checks memory_dir/conversations/ then parent/conversations/.
 fn find_conversations_dir(memory_dir: &Path) -> Result<PathBuf, String> {
     let conv = memory_dir.join("conversations");

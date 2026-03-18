@@ -65,6 +65,8 @@ pub struct Config {
     pub ephemeral: EphemeralConfig,
     #[serde(default)]
     pub llm: LlmSection,
+    #[serde(default)]
+    pub pipeline: Option<PipelineSection>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +125,16 @@ impl LlmSection {
             &self.api_base
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineSection {
+    /// Directory containing pipeline documents (LEARNING.md, THOUGHTS.md, etc.)
+    #[serde(default)]
+    pub docs_dir: Option<String>,
+    /// Auto-sync pipeline on archive (default: false)
+    #[serde(default)]
+    pub auto_sync: Option<bool>,
 }
 
 fn default_provider() -> Provider {
@@ -212,6 +224,25 @@ impl Config {
                 self.ephemeral.max_entries = n;
                 Ok(())
             }
+            "pipeline.docs_dir" => {
+                let section = self.pipeline.get_or_insert(PipelineSection {
+                    docs_dir: None,
+                    auto_sync: None,
+                });
+                section.docs_dir = Some(value.to_string());
+                Ok(())
+            }
+            "pipeline.auto_sync" => {
+                let b: bool = value
+                    .parse()
+                    .map_err(|_| format!("invalid boolean: {value}"))?;
+                let section = self.pipeline.get_or_insert(PipelineSection {
+                    docs_dir: None,
+                    auto_sync: None,
+                });
+                section.auto_sync = Some(b);
+                Ok(())
+            }
             other => Err(format!("unknown config key: {other}")),
         }
     }
@@ -283,6 +314,7 @@ mod tests {
                 model: "llama3.2".into(),
                 api_base: "http://localhost:11434/v1".into(),
             },
+            pipeline: None,
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
@@ -339,6 +371,7 @@ mod tests {
                 model: String::new(),
                 api_base: String::new(),
             },
+            pipeline: None,
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path());
@@ -358,6 +391,7 @@ mod tests {
         let cfg = validate(Config {
             ephemeral: EphemeralConfig { max_entries: 100 },
             llm: LlmSection::default(),
+            pipeline: None,
         });
         assert_eq!(cfg.ephemeral.max_entries, 5);
     }
