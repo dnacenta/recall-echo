@@ -53,6 +53,19 @@ pub fn show(memory_dir: &Path) -> Result<(), String> {
         }
     );
 
+    // Pipeline
+    if let Some(ref pipeline) = cfg.pipeline {
+        eprintln!("\n{BOLD}[pipeline]{RESET}");
+        eprintln!(
+            "  docs_dir  = {}",
+            pipeline
+                .docs_dir
+                .as_deref()
+                .unwrap_or("{DIM}(not set){RESET}")
+        );
+        eprintln!("  auto_sync = {}", pipeline.auto_sync.unwrap_or(false));
+    }
+
     Ok(())
 }
 
