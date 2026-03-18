@@ -271,6 +271,158 @@ pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
     }
 }
 
+/// Sync pipeline documents into the graph (if auto_sync enabled).
+///
+/// Non-blocking: logs warnings on failure but never fails the caller.
+#[cfg(feature = "graph")]
+pub fn pipeline_sync_on_archive(memory_dir: &Path) {
+    let cfg = config::load_from_dir(memory_dir);
+    let pipeline = match cfg.pipeline {
+        Some(ref p) if p.auto_sync == Some(true) => p,
+        _ => return,
+    };
+
+    let docs_dir = match pipeline.docs_dir {
+        Some(ref d) => {
+            let path = std::path::PathBuf::from(shellexpand_path(d));
+            if !path.exists() {
+                eprintln!(
+                    "recall-echo: pipeline docs_dir not found: {}",
+                    path.display()
+                );
+                return;
+            }
+            path
+        }
+        None => {
+            eprintln!("recall-echo: pipeline auto_sync enabled but no docs_dir configured");
+            return;
+        }
+    };
+
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return;
+    }
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("recall-echo: pipeline sync runtime error: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = rt.block_on(async {
+        let gm = recall_graph::GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| format!("graph open: {e}"))?;
+
+        let docs = recall_graph::types::PipelineDocuments {
+            learning: read_opt_file(&docs_dir, "LEARNING.md"),
+            thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
+            curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
+            reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
+            praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
+        };
+
+        let report = gm.sync_pipeline(&docs).await.map_err(|e| format!("{e}"))?;
+
+        if report.entities_created > 0
+            || report.entities_updated > 0
+            || report.entities_archived > 0
+        {
+            eprintln!(
+                "recall-echo: pipeline synced — +{} created, ~{} updated, -{} archived",
+                report.entities_created, report.entities_updated, report.entities_archived
+            );
+        }
+
+        Ok::<(), String>(())
+    }) {
+        eprintln!("recall-echo: pipeline sync warning: {e}");
+    }
+}
+
+/// Async version of pipeline_sync_on_archive for use in async contexts (pulse-null).
+#[cfg(all(feature = "graph", feature = "pulse-null"))]
+async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
+    let cfg = config::load_from_dir(memory_dir);
+    let pipeline = match cfg.pipeline {
+        Some(ref p) if p.auto_sync == Some(true) => p.clone(),
+        _ => return,
+    };
+
+    let docs_dir = match pipeline.docs_dir {
+        Some(ref d) => {
+            let path = std::path::PathBuf::from(shellexpand_path(d));
+            if !path.exists() {
+                eprintln!(
+                    "recall-echo: pipeline docs_dir not found: {}",
+                    path.display()
+                );
+                return;
+            }
+            path
+        }
+        None => {
+            eprintln!("recall-echo: pipeline auto_sync enabled but no docs_dir configured");
+            return;
+        }
+    };
+
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return;
+    }
+
+    let gm = match recall_graph::GraphMemory::open(&graph_dir).await {
+        Ok(gm) => gm,
+        Err(e) => {
+            eprintln!("recall-echo: pipeline sync open error: {e}");
+            return;
+        }
+    };
+
+    let docs = recall_graph::types::PipelineDocuments {
+        learning: read_opt_file(&docs_dir, "LEARNING.md"),
+        thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
+        curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
+        reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
+        praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
+    };
+
+    match gm.sync_pipeline(&docs).await {
+        Ok(report) => {
+            if report.entities_created > 0
+                || report.entities_updated > 0
+                || report.entities_archived > 0
+            {
+                eprintln!(
+                    "recall-echo: pipeline synced — +{} created, ~{} updated, -{} archived",
+                    report.entities_created, report.entities_updated, report.entities_archived
+                );
+            }
+        }
+        Err(e) => eprintln!("recall-echo: pipeline sync warning: {e}"),
+    }
+}
+
+#[cfg(feature = "graph")]
+fn read_opt_file(dir: &Path, name: &str) -> String {
+    fs::read_to_string(dir.join(name)).unwrap_or_default()
+}
+
+#[cfg(feature = "graph")]
+fn shellexpand_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // JSONL path — for Claude Code hooks (standalone, no LLM)
 // ---------------------------------------------------------------------------
@@ -290,7 +442,10 @@ pub fn archive_from_jsonl(
     let log_number = result.log_number;
 
     #[cfg(feature = "graph")]
-    graph_ingest(base_dir, &result);
+    {
+        graph_ingest(base_dir, &result);
+        pipeline_sync_on_archive(base_dir);
+    }
 
     Ok(log_number)
 }
@@ -440,6 +595,7 @@ pub async fn archive_session(
         {
             eprintln!("recall-echo: graph ingestion warning: {e}");
         }
+        pipeline_sync_on_archive_async(memory_dir).await;
     }
 
     Ok(log_number)

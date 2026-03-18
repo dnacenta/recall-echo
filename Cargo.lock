@@ -3964,12 +3964,13 @@ dependencies = [
 [[package]]
 name = "recall-graph"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/recall-graph?branch=main#e83e426a2cec86bf7efb10e41772a7bcd23f5119"
+source = "git+https://github.com/dnacenta/recall-graph?branch=main#b25c278214e5992285c24c4e6480690950645f8c"
 dependencies = [
  "async-trait",
  "chrono",
  "fastembed",
  "futures",
+ "regex",
  "serde",
  "serde_json",
  "surrealdb",

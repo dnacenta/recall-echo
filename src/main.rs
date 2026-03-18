@@ -222,6 +222,39 @@ enum GraphCommands {
         #[arg(long, default_value = "100")]
         delay_ms: u64,
     },
+    /// Pipeline operations — sync, status, flow, stale detection
+    Pipeline {
+        #[command(subcommand)]
+        command: PipelineCommands,
+    },
+}
+
+#[cfg(feature = "graph")]
+#[derive(Subcommand)]
+enum PipelineCommands {
+    /// Sync pipeline documents (LEARNING, THOUGHTS, CURIOSITY, REFLECTIONS, PRAXIS) into the graph
+    Sync {
+        /// Directory containing pipeline documents (overrides config)
+        #[arg(long)]
+        docs_dir: Option<PathBuf>,
+    },
+    /// Show pipeline health — counts by stage/status, stale entities
+    Status {
+        /// Days before a thought is considered stale (default: 7)
+        #[arg(long, default_value = "7")]
+        days: u32,
+    },
+    /// Trace an entity's lineage through the pipeline
+    Flow {
+        /// Entity name to trace
+        entity: String,
+    },
+    /// List stale pipeline entities
+    Stale {
+        /// Days threshold (default: 7)
+        #[arg(long, default_value = "7")]
+        days: u32,
+    },
 }
 
 fn main() {
@@ -368,6 +401,20 @@ fn main() {
                     provider,
                     delay_ms,
                 } => graph_cli::extract(&memory_dir, log, all, dry_run, model, provider, delay_ms),
+                GraphCommands::Pipeline { command } => match command {
+                    PipelineCommands::Sync { docs_dir } => {
+                        graph_cli::pipeline_sync(&memory_dir, docs_dir.as_deref())
+                    }
+                    PipelineCommands::Status { days } => {
+                        graph_cli::pipeline_status(&memory_dir, days)
+                    }
+                    PipelineCommands::Flow { entity } => {
+                        graph_cli::pipeline_flow(&memory_dir, &entity)
+                    }
+                    PipelineCommands::Stale { days } => {
+                        graph_cli::pipeline_stale(&memory_dir, days)
+                    }
+                },
             }
         }
     };
