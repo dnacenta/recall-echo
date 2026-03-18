@@ -1,10 +1,10 @@
-//! Pulse-null adapter — converts echo-system-types Messages into Conversations.
+//! Pulse-null adapter — converts pulse-system-types Messages into Conversations.
 //!
 //! This module is gated behind the `pulse-null` feature flag.
-//! It bridges echo-system-types::Message → conversation::Conversation,
+//! It bridges pulse-system-types::Message → conversation::Conversation,
 //! allowing recall-echo to work inside pulse-null entities.
 
-use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role};
+use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role};
 
 use crate::conversation::{Conversation, ConversationEntry};
 

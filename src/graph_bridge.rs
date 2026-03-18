@@ -60,7 +60,7 @@ pub async fn ingest_into_graph_with_llm(
     archive_content: &str,
     session_id: &str,
     log_number: Option<u32>,
-    provider: Option<&dyn echo_system_types::llm::LmProvider>,
+    provider: Option<&dyn pulse_system_types::llm::LmProvider>,
 ) -> Result<recall_graph::types::IngestionReport, String> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
@@ -100,16 +100,16 @@ pub async fn ingest_into_graph_with_llm(
     Ok(report)
 }
 
-/// Adapter that wraps an `echo_system_types::LmProvider` to implement
+/// Adapter that wraps an `pulse_system_types::LmProvider` to implement
 /// `recall_graph::LlmProvider`.
 #[cfg(feature = "pulse-null")]
 pub struct GraphLlmBridge<'a> {
-    provider: &'a dyn echo_system_types::llm::LmProvider,
+    provider: &'a dyn pulse_system_types::llm::LmProvider,
 }
 
 #[cfg(feature = "pulse-null")]
 impl<'a> GraphLlmBridge<'a> {
-    pub fn new(provider: &'a dyn echo_system_types::llm::LmProvider) -> Self {
+    pub fn new(provider: &'a dyn pulse_system_types::llm::LmProvider) -> Self {
         Self { provider }
     }
 }
@@ -123,7 +123,7 @@ impl recall_graph::llm::LlmProvider for GraphLlmBridge<'_> {
         user_message: &str,
         max_tokens: u32,
     ) -> Result<String, GraphError> {
-        use echo_system_types::llm::{Message, MessageContent, Role};
+        use pulse_system_types::llm::{Message, MessageContent, Role};
 
         let messages = vec![Message {
             role: Role::User,

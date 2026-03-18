@@ -148,9 +148,9 @@ fn empty_checkpoint() -> CheckpointData {
 #[cfg(feature = "pulse-null")]
 pub async fn create_checkpoint(
     memory_dir: &Path,
-    messages: &[echo_system_types::llm::Message],
+    messages: &[pulse_system_types::llm::Message],
     metadata: &archive::SessionMetadata,
-    provider: Option<&dyn echo_system_types::llm::LmProvider>,
+    provider: Option<&dyn pulse_system_types::llm::LmProvider>,
 ) -> Result<u32, String> {
     let mut conv = crate::pulse_null::messages_to_conversation(messages, &metadata.session_id);
     conv.first_timestamp = metadata.started_at.clone();

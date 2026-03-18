@@ -570,9 +570,9 @@ fn find_jsonl_files(dir: &Path) -> Vec<std::path::PathBuf> {
 #[cfg(feature = "pulse-null")]
 pub async fn archive_session(
     memory_dir: &Path,
-    messages: &[echo_system_types::llm::Message],
+    messages: &[pulse_system_types::llm::Message],
     metadata: &SessionMetadata,
-    provider: Option<&dyn echo_system_types::llm::LmProvider>,
+    provider: Option<&dyn pulse_system_types::llm::LmProvider>,
 ) -> Result<u32, String> {
     let mut conv = crate::pulse_null::messages_to_conversation(messages, &metadata.session_id);
     conv.first_timestamp = metadata.started_at.clone();
