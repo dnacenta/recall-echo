@@ -1,0 +1,26 @@
+[package]
+name = "recall-graph"
+version = "0.1.0"
+edition = "2021"
+description = "Knowledge graph with semantic search for AI memory systems"
+license = "AGPL-3.0-only"
+repository = "https://github.com/dnacenta/recall-echo"
+keywords = ["knowledge-graph", "ai", "memory", "semantic-search", "embeddings"]
+categories = ["database", "science"]
+authors = ["dnacenta"]
+
+[dependencies]
+surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"] }
+fastembed = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
