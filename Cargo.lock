@@ -3721,7 +3721,8 @@ dependencies = [
 [[package]]
 name = "pulse-system-types"
 version = "0.5.0"
-source = "git+https://github.com/dnacenta/pulse-null-types?branch=main#d99698ed694270610ccb45ce5b3b17ab59f8bf8a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5093e2dc0ea828fec5ddee62acab60302df5732c331c3553a0e0c0c0adfc7536"
 dependencies = [
  "serde",
  "serde_json",
