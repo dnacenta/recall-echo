@@ -5,7 +5,7 @@ use std::path::Path;
 use surrealdb::engine::local::SurrealKv;
 use surrealdb::Surreal;
 
-use crate::error::GraphError;
+use super::error::GraphError;
 
 pub type Db = surrealdb::engine::local::Db;
 

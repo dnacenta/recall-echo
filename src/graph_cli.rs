@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use recall_graph::traverse::format_traversal;
-use recall_graph::types::*;
-use recall_graph::GraphMemory;
+use crate::graph::traverse::format_traversal;
+use crate::graph::types::*;
+use crate::graph::GraphMemory;
 
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";

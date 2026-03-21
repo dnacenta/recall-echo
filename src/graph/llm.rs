@@ -3,7 +3,7 @@
 //! recall-graph defines its own trait to stay independent of echo-system-types.
 //! Callers implement this to bridge their actual LLM backend.
 
-use crate::error::GraphError;
+use super::error::GraphError;
 
 /// Minimal LLM provider for extraction and deduplication.
 ///

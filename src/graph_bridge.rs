@@ -4,7 +4,7 @@
 //! When pulse-null feature is enabled, also bridges LmProvider → LlmProvider.
 
 #[allow(unused_imports)]
-use recall_graph::error::GraphError;
+use crate::graph::error::GraphError;
 
 /// Ingest a conversation archive into the knowledge graph.
 ///
@@ -15,13 +15,13 @@ pub async fn ingest_into_graph(
     archive_content: &str,
     session_id: &str,
     log_number: Option<u32>,
-) -> Result<recall_graph::types::IngestionReport, String> {
+) -> Result<crate::graph::types::IngestionReport, String> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err("graph/ not initialized \u{2014} run `graph init` first".into());
     }
 
-    let gm = recall_graph::GraphMemory::open(&graph_dir)
+    let gm = crate::graph::GraphMemory::open(&graph_dir)
         .await
         .map_err(|e| format!("graph open: {e}"))?;
 
@@ -61,20 +61,20 @@ pub async fn ingest_into_graph_with_llm(
     session_id: &str,
     log_number: Option<u32>,
     provider: Option<&dyn pulse_system_types::llm::LmProvider>,
-) -> Result<recall_graph::types::IngestionReport, String> {
+) -> Result<crate::graph::types::IngestionReport, String> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err("graph/ not initialized \u{2014} run `graph init` first".into());
     }
 
-    let gm = recall_graph::GraphMemory::open(&graph_dir)
+    let gm = crate::graph::GraphMemory::open(&graph_dir)
         .await
         .map_err(|e| format!("graph open: {e}"))?;
 
     let bridge = provider.map(GraphLlmBridge::new);
-    let llm_ref: Option<&dyn recall_graph::llm::LlmProvider> = bridge
+    let llm_ref: Option<&dyn crate::graph::llm::LlmProvider> = bridge
         .as_ref()
-        .map(|b| b as &dyn recall_graph::llm::LlmProvider);
+        .map(|b| b as &dyn crate::graph::llm::LlmProvider);
 
     let report = gm
         .ingest_archive(archive_content, session_id, log_number, llm_ref)
@@ -101,7 +101,7 @@ pub async fn ingest_into_graph_with_llm(
 }
 
 /// Adapter that wraps an `pulse_system_types::LmProvider` to implement
-/// `recall_graph::LlmProvider`.
+/// `crate::graph::LlmProvider`.
 #[cfg(feature = "pulse-null")]
 pub struct GraphLlmBridge<'a> {
     provider: &'a dyn pulse_system_types::llm::LmProvider,
@@ -116,7 +116,7 @@ impl<'a> GraphLlmBridge<'a> {
 
 #[cfg(feature = "pulse-null")]
 #[async_trait::async_trait]
-impl recall_graph::llm::LlmProvider for GraphLlmBridge<'_> {
+impl crate::graph::llm::LlmProvider for GraphLlmBridge<'_> {
     async fn complete(
         &self,
         system_prompt: &str,

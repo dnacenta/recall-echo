@@ -2,9 +2,9 @@
 
 use surrealdb::Surreal;
 
-use crate::error::GraphError;
-use crate::store::Db;
-use crate::types::*;
+use super::error::GraphError;
+use super::store::Db;
+use super::types::*;
 
 /// Traverse the graph from a named entity up to a given depth.
 /// Skips superseded relationships (valid_until IS NOT NULL).
@@ -25,12 +25,12 @@ pub async fn traverse_filtered(
     type_filter: Option<&str>,
 ) -> Result<TraversalNode, GraphError> {
     // Load root as full entity (for access_count increment), project to L0
-    let full = crate::crud::get_entity_by_name(db, entity_name)
+    let full = super::crud::get_entity_by_name(db, entity_name)
         .await?
         .ok_or_else(|| GraphError::NotFound(entity_name.to_string()))?;
 
     // Increment access count on root entity only
-    crate::crud::increment_access_counts(db, &[full.id_string()]).await?;
+    super::crud::increment_access_counts(db, &[full.id_string()]).await?;
 
     let root = EntitySummary {
         id: full.id.clone(),
@@ -83,7 +83,7 @@ fn traverse_from<'a>(
             .bind(("id", entity.id_string()))
             .await?;
 
-        let outgoing: Vec<EdgeRow> = crate::deserialize_take(&mut response, 0)?;
+        let outgoing: Vec<EdgeRow> = super::deserialize_take(&mut response, 0)?;
         collect_edges(
             db,
             outgoing,
@@ -113,7 +113,7 @@ fn traverse_from<'a>(
             .bind(("id", entity.id_string()))
             .await?;
 
-        let incoming: Vec<EdgeRow> = crate::deserialize_take(&mut response, 0)?;
+        let incoming: Vec<EdgeRow> = super::deserialize_take(&mut response, 0)?;
         collect_edges(
             db,
             incoming,
@@ -149,7 +149,7 @@ async fn collect_edges<'a>(
         let tid = edge.target_id_string();
 
         // Load L0 projection
-        let target: Option<EntitySummary> = crate::crud::get_entity_summary(db, &tid).await?;
+        let target: Option<EntitySummary> = super::crud::get_entity_summary(db, &tid).await?;
         if let Some(target) = target {
             if visited.contains(&target.id_string()) {
                 continue;

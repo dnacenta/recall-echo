@@ -4,7 +4,7 @@ use std::path::Path;
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-use crate::error::GraphError;
+use super::error::GraphError;
 
 /// Trait for embedding text into vectors.
 pub trait Embedder {

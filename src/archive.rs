@@ -314,11 +314,11 @@ pub fn pipeline_sync_on_archive(memory_dir: &Path) {
     };
 
     if let Err(e) = rt.block_on(async {
-        let gm = recall_graph::GraphMemory::open(&graph_dir)
+        let gm = crate::graph::GraphMemory::open(&graph_dir)
             .await
             .map_err(|e| format!("graph open: {e}"))?;
 
-        let docs = recall_graph::types::PipelineDocuments {
+        let docs = crate::graph::types::PipelineDocuments {
             learning: read_opt_file(&docs_dir, "LEARNING.md"),
             thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
             curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
@@ -376,7 +376,7 @@ async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
         return;
     }
 
-    let gm = match recall_graph::GraphMemory::open(&graph_dir).await {
+    let gm = match crate::graph::GraphMemory::open(&graph_dir).await {
         Ok(gm) => gm,
         Err(e) => {
             eprintln!("recall-echo: pipeline sync open error: {e}");
@@ -384,7 +384,7 @@ async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
         }
     };
 
-    let docs = recall_graph::types::PipelineDocuments {
+    let docs = crate::graph::types::PipelineDocuments {
         learning: read_opt_file(&docs_dir, "LEARNING.md"),
         thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
         curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),

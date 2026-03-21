@@ -4,12 +4,12 @@ use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt};
 
-use crate::dedup::{self, ResolvedEntity};
-use crate::error::GraphError;
-use crate::extract;
-use crate::llm::LlmProvider;
-use crate::types::*;
-use crate::GraphMemory;
+use super::dedup::{self, ResolvedEntity};
+use super::error::GraphError;
+use super::extract;
+use super::llm::LlmProvider;
+use super::types::*;
+use super::GraphMemory;
 
 /// Maximum number of concurrent LLM calls during extraction and dedup.
 const LLM_CONCURRENCY: usize = 10;
