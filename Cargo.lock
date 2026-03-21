@@ -3946,7 +3946,7 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -3964,7 +3964,6 @@ dependencies = [
 [[package]]
 name = "recall-graph"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/recall-graph?branch=main#b25c278214e5992285c24c4e6480690950645f8c"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3974,6 +3973,7 @@ dependencies = [
  "serde",
  "serde_json",
  "surrealdb",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -5313,6 +5313,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
