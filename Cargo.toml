@@ -11,6 +11,7 @@ repository = "https://github.com/dnacenta/recall-echo"
 keywords = ["ai", "memory", "llm", "conversation", "knowledge-graph"]
 categories = ["command-line-utilities"]
 authors = ["dnacenta"]
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -20,7 +21,7 @@ toml = "0.8"
 dirs = "6"
 
 # Graph (default) — knowledge graph with SurrealDB + fastembed
-recall-graph = { path = "recall-graph", optional = true }
+recall-graph = { version = "0.1", path = "recall-graph", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"], optional = true }
 
 # LLM HTTP provider (optional) — for entity extraction via Anthropic/OpenAI-compat APIs
@@ -28,7 +29,7 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 async-trait = { version = "0.1", optional = true }
 
 # Pulse-null integration (optional) — plugin system for pulse-null entities
-pulse-system-types = { git = "https://github.com/dnacenta/pulse-null-types", branch = "main", optional = true }
+pulse-system-types = { version = "0.5", optional = true }
 
 [features]
 default = ["graph"]
