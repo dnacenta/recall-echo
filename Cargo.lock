@@ -3947,36 +3947,24 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.1.0"
-dependencies = [
- "async-trait",
- "clap",
- "dirs",
- "pulse-system-types",
- "recall-graph",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "recall-graph"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "clap",
+ "dirs",
  "fastembed",
  "futures",
+ "pulse-system-types",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "surrealdb",
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -5314,7 +5302,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

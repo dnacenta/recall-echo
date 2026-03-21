@@ -1,4 +1,4 @@
-//! LLM providers implementing recall_graph::LlmProvider.
+//! LLM providers implementing crate::graph::LlmProvider.
 //!
 //! Three backends:
 //! - **Anthropic** — Claude API via HTTP (x-api-key)
@@ -12,8 +12,8 @@ use std::env;
 use std::path::Path;
 use std::process::Stdio;
 
-use recall_graph::error::GraphError;
-use recall_graph::llm::LlmProvider;
+use crate::graph::error::GraphError;
+use crate::graph::llm::LlmProvider;
 
 use crate::config::{self, Provider};
 

@@ -36,6 +36,8 @@ pub mod summarize;
 pub mod tags;
 
 #[cfg(feature = "graph")]
+pub mod graph;
+#[cfg(feature = "graph")]
 pub mod graph_bridge;
 #[cfg(feature = "graph")]
 pub mod graph_cli;

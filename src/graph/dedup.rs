@@ -1,9 +1,9 @@
 //! LLM-powered entity deduplication — skip, create, or merge decisions.
 
-use crate::error::GraphError;
-use crate::llm::LlmProvider;
-use crate::types::*;
-use crate::GraphMemory;
+use super::error::GraphError;
+use super::llm::LlmProvider;
+use super::types::*;
+use super::GraphMemory;
 
 const DEDUP_SYSTEM_PROMPT: &str = r#"You are a deduplication system for a knowledge graph. Given a candidate entity and existing similar entities, decide:
 

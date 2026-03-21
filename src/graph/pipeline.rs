@@ -7,7 +7,7 @@
 
 use regex::Regex;
 
-use crate::types::*;
+use super::types::*;
 
 /// Parse a LEARNING.md file into pipeline entries.
 ///

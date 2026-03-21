@@ -185,7 +185,7 @@ fn init_graph(memory_dir: &Path) {
     }
 
     match tokio::runtime::Runtime::new() {
-        Ok(rt) => match rt.block_on(recall_graph::GraphMemory::open(&graph_dir)) {
+        Ok(rt) => match rt.block_on(crate::graph::GraphMemory::open(&graph_dir)) {
             Ok(_) => print_status(Status::Created, "Created graph/ (SurrealDB + fastembed)"),
             Err(e) => print_status(Status::Error, &format!("Failed to init graph: {e}")),
         },

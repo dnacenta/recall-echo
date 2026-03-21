@@ -2,10 +2,10 @@
 
 use surrealdb::Surreal;
 
-use crate::embed::Embedder;
-use crate::error::GraphError;
-use crate::store::Db;
-use crate::types::*;
+use super::embed::Embedder;
+use super::error::GraphError;
+use super::store::Db;
+use super::types::*;
 
 /// Semantic search across entities using HNSW KNN + hotness scoring.
 ///
@@ -38,7 +38,7 @@ pub async fn search(
 
     let mut response = db.query(&sql).bind(("query_vec", query_embedding)).await?;
 
-    let rows: Vec<EntityWithDistance> = crate::deserialize_take(&mut response, 0)?;
+    let rows: Vec<EntityWithDistance> = super::deserialize_take(&mut response, 0)?;
 
     let now = chrono::Utc::now();
     let results: Vec<SearchResult> = rows
@@ -62,7 +62,7 @@ pub async fn search(
 
     // Batch increment access counts
     let ids: Vec<String> = results.iter().map(|r| r.entity.id_string()).collect();
-    crate::crud::increment_access_counts(db, &ids).await?;
+    super::crud::increment_access_counts(db, &ids).await?;
 
     Ok(results)
 }
@@ -97,7 +97,7 @@ pub async fn search_with_options(
 
     let mut response = db.query(&sql).bind(("query_vec", query_embedding)).await?;
 
-    let rows: Vec<DetailWithDistance> = crate::deserialize_take(&mut response, 0)?;
+    let rows: Vec<DetailWithDistance> = super::deserialize_take(&mut response, 0)?;
 
     let now = chrono::Utc::now();
     let mut results: Vec<ScoredEntity> = rows
@@ -141,7 +141,7 @@ pub async fn search_with_options(
 
     // Batch increment access counts
     let ids: Vec<String> = results.iter().map(|r| r.entity.id_string()).collect();
-    crate::crud::increment_access_counts(db, &ids).await?;
+    super::crud::increment_access_counts(db, &ids).await?;
 
     Ok(results)
 }
@@ -166,7 +166,7 @@ pub async fn search_episodes(
 
     let mut response = db.query(&sql).bind(("query_vec", query_embedding)).await?;
 
-    let rows: Vec<EpisodeWithDistance> = crate::deserialize_take(&mut response, 0)?;
+    let rows: Vec<EpisodeWithDistance> = super::deserialize_take(&mut response, 0)?;
 
     let results = rows
         .into_iter()

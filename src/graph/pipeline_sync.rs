@@ -8,10 +8,10 @@
 //!
 //! Fully idempotent — running twice on same state produces no changes.
 
-use crate::error::GraphError;
-use crate::pipeline;
-use crate::types::*;
-use crate::GraphMemory;
+use super::error::GraphError;
+use super::pipeline;
+use super::types::*;
+use super::GraphMemory;
 
 /// Sync pipeline documents into the graph.
 pub async fn sync_pipeline(
@@ -169,7 +169,7 @@ async fn get_pipeline_entities(gm: &GraphMemory) -> Result<Vec<Entity>, GraphErr
         .query("SELECT * FROM entity WHERE attributes.pipeline_stage IS NOT NONE")
         .await?;
 
-    let entities: Vec<Entity> = crate::deserialize_take(&mut response, 0)?;
+    let entities: Vec<Entity> = super::deserialize_take(&mut response, 0)?;
     Ok(entities)
 }
 

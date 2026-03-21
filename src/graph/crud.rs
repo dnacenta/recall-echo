@@ -2,11 +2,11 @@
 
 use surrealdb::Surreal;
 
-use crate::embed::Embedder;
-use crate::error::GraphError;
-use crate::store::Db;
-use crate::types::*;
-use crate::{deserialize_take, deserialize_take_opt};
+use super::embed::Embedder;
+use super::error::GraphError;
+use super::store::Db;
+use super::types::*;
+use super::{deserialize_take, deserialize_take_opt};
 
 /// Add a new entity to the graph. Embeds the abstract text for vector search.
 pub async fn add_entity(
@@ -367,7 +367,7 @@ pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, G
         log_number: i64,
     }
 
-    let rows: Vec<Row> = crate::deserialize_take(&mut response, 0)?;
+    let rows: Vec<Row> = super::deserialize_take(&mut response, 0)?;
     Ok(rows.into_iter().map(|r| r.log_number).collect())
 }
 

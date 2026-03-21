@@ -10,10 +10,10 @@ use std::collections::HashMap;
 
 use surrealdb::Surreal;
 
-use crate::embed::Embedder;
-use crate::error::GraphError;
-use crate::store::Db;
-use crate::types::*;
+use super::embed::Embedder;
+use super::error::GraphError;
+use super::store::Db;
+use super::types::*;
 
 /// Run a hybrid query: semantic search + graph expansion + optional episode search.
 pub async fn query(
@@ -35,7 +35,7 @@ pub async fn query(
         keyword: options.keyword.clone(),
     };
     let semantic_results =
-        crate::search::search_with_options(db, embedder, query_text, &semantic_options).await?;
+        super::search::search_with_options(db, embedder, query_text, &semantic_options).await?;
 
     // Collect into dedup map (id -> ScoredEntity)
     let mut entity_map: HashMap<String, ScoredEntity> = HashMap::new();
@@ -103,7 +103,7 @@ pub async fn query(
 
     // Phase 3: Episode search (optional)
     let episodes = if options.include_episodes {
-        crate::search::search_episodes(db, embedder, query_text, limit).await?
+        super::search::search_episodes(db, embedder, query_text, limit).await?
     } else {
         vec![]
     };
@@ -128,7 +128,7 @@ async fn get_neighbor_details(
         .bind(("id", entity_id.to_string()))
         .await?;
 
-    let outgoing: Vec<RelTarget> = crate::deserialize_take(&mut response, 0)?;
+    let outgoing: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;
 
     // Incoming
     let mut response = db
@@ -142,7 +142,7 @@ async fn get_neighbor_details(
         .bind(("id", entity_id.to_string()))
         .await?;
 
-    let incoming: Vec<RelTarget> = crate::deserialize_take(&mut response, 0)?;
+    let incoming: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;
 
     let mut results = Vec::new();
     let all_edges: Vec<_> = outgoing.into_iter().chain(incoming).collect();
@@ -153,7 +153,7 @@ async fn get_neighbor_details(
             other => other.to_string(),
         };
 
-        if let Some(detail) = crate::crud::get_entity_detail(db, &tid).await? {
+        if let Some(detail) = super::crud::get_entity_detail(db, &tid).await? {
             results.push((detail, edge.rel_type));
         }
     }
@@ -203,7 +203,7 @@ pub async fn pipeline_entities(
         None => db.query(query).bind(("stage", stage_owned)).await?,
     };
 
-    let entities: Vec<EntityDetail> = crate::deserialize_take(&mut response, 0)?;
+    let entities: Vec<EntityDetail> = super::deserialize_take(&mut response, 0)?;
     Ok(entities)
 }
 
@@ -225,7 +225,7 @@ pub async fn pipeline_stats(
         )
         .await?;
 
-    let rows: Vec<StageStatusCount> = crate::deserialize_take(&mut response, 0)?;
+    let rows: Vec<StageStatusCount> = super::deserialize_take(&mut response, 0)?;
 
     let mut by_stage: std::collections::HashMap<String, std::collections::HashMap<String, u64>> =
         std::collections::HashMap::new();
@@ -252,7 +252,7 @@ pub async fn pipeline_stats(
         .bind(("threshold", format!("{}d", staleness_days)))
         .await?;
 
-    let stale_thoughts: Vec<EntityDetail> = crate::deserialize_take(&mut stale_response, 0)?;
+    let stale_thoughts: Vec<EntityDetail> = super::deserialize_take(&mut stale_response, 0)?;
 
     // Find stale questions
     let mut stale_q_response = db
@@ -268,7 +268,7 @@ pub async fn pipeline_stats(
         .bind(("threshold", format!("{}d", staleness_days * 2)))
         .await?;
 
-    let stale_questions: Vec<EntityDetail> = crate::deserialize_take(&mut stale_q_response, 0)?;
+    let stale_questions: Vec<EntityDetail> = super::deserialize_take(&mut stale_q_response, 0)?;
 
     // Last movement (most recent graduated/dissolved/explored entity)
     let mut movement_response = db
@@ -281,7 +281,7 @@ pub async fn pipeline_stats(
         )
         .await?;
 
-    let movement_rows: Vec<UpdatedAtRow> = crate::deserialize_take(&mut movement_response, 0)?;
+    let movement_rows: Vec<UpdatedAtRow> = super::deserialize_take(&mut movement_response, 0)?;
     let last_movement = movement_rows.first().map(|r| match &r.updated_at {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
@@ -302,7 +302,7 @@ pub async fn pipeline_flow(
     entity_name: &str,
 ) -> Result<Vec<(EntityDetail, String, EntityDetail)>, GraphError> {
     // Get the entity
-    let entity = crate::crud::get_entity_by_name(db, entity_name)
+    let entity = super::crud::get_entity_by_name(db, entity_name)
         .await?
         .ok_or_else(|| GraphError::NotFound(format!("entity: {}", entity_name)))?;
 
@@ -333,15 +333,15 @@ pub async fn pipeline_flow(
         rel_types_str
     );
     let mut response = db.query(&query_out).bind(("id", entity_id.clone())).await?;
-    let outgoing: Vec<RelTarget> = crate::deserialize_take(&mut response, 0)?;
+    let outgoing: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;
 
     for edge in &outgoing {
         let tid = match &edge.target_id {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        if let Some(target) = crate::crud::get_entity_detail(db, &tid).await? {
-            let source_detail = crate::crud::get_entity_detail(db, &entity_id)
+        if let Some(target) = super::crud::get_entity_detail(db, &tid).await? {
+            let source_detail = super::crud::get_entity_detail(db, &entity_id)
                 .await?
                 .unwrap();
             chain.push((source_detail, edge.rel_type.clone(), target));
@@ -356,15 +356,15 @@ pub async fn pipeline_flow(
         rel_types_str
     );
     let mut response = db.query(&query_in).bind(("id", entity_id.clone())).await?;
-    let incoming: Vec<RelTarget> = crate::deserialize_take(&mut response, 0)?;
+    let incoming: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;
 
     for edge in &incoming {
         let tid = match &edge.target_id {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        if let Some(source) = crate::crud::get_entity_detail(db, &tid).await? {
-            let target_detail = crate::crud::get_entity_detail(db, &entity_id)
+        if let Some(source) = super::crud::get_entity_detail(db, &tid).await? {
+            let target_detail = super::crud::get_entity_detail(db, &entity_id)
                 .await?
                 .unwrap();
             chain.push((source, edge.rel_type.clone(), target_detail));
