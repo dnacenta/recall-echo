@@ -8,6 +8,7 @@ repository = "https://github.com/dnacenta/recall-echo"
 keywords = ["knowledge-graph", "ai", "memory", "semantic-search", "embeddings"]
 categories = ["database", "science"]
 authors = ["dnacenta"]
+readme = "README.md"
 
 [dependencies]
 surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"] }
