@@ -83,10 +83,16 @@ For administration and use outside pulse-null:
 ```bash
 recall-echo init [entity_root]         # Create memory directory structure
 recall-echo status [entity_root]       # Health check with dashboard
+recall-echo dashboard [entity_root]    # Full dashboard with health, stats, recent sessions
 recall-echo search <query>             # Line-level archive search
 recall-echo search <query> --ranked    # File-ranked relevance search
 recall-echo distill [entity_root]      # Analyze MEMORY.md, suggest cleanup
 recall-echo consume [entity_root]      # Output EPHEMERAL.md content
+recall-echo archive-session            # Archive a Claude Code session from JSONL transcript
+recall-echo archive --all-unarchived   # Batch archive all missed sessions
+recall-echo checkpoint                 # Save checkpoint before context compression
+recall-echo config                     # View or modify configuration
+recall-echo graph <subcommand>         # Knowledge graph operations
 ```
 
 ## Installation
@@ -160,6 +166,29 @@ Analyze MEMORY.md and suggest cleanup. Identifies sections over 30 lines that co
 
 Output EPHEMERAL.md content wrapped in memory markers. Used by hooks or scripts that need to inject recent session context into an agent's input.
 
+### `recall-echo archive-session`
+
+Archive a Claude Code session from a JSONL transcript. Extracts messages, generates a summary (LLM-powered when available, algorithmic fallback), updates ARCHIVE.md, and appends to EPHEMERAL.md. Designed to run as a SessionEnd hook.
+
+### `recall-echo checkpoint`
+
+Save a checkpoint before context compression. Creates a numbered checkpoint file so the agent can fill in summary details. Designed to run as a PreCompact hook.
+
+### `recall-echo graph`
+
+Knowledge graph operations for semantic memory:
+
+```bash
+recall-echo graph init                  # Initialize the graph store
+recall-echo graph status                # Show graph statistics
+recall-echo graph search <query>        # Semantic search across entities
+recall-echo graph query <query>         # Hybrid: semantic + graph expansion + episodes
+recall-echo graph ingest-all            # Ingest all un-ingested conversation archives
+recall-echo graph pipeline sync         # Sync pipeline documents into the graph
+recall-echo graph pipeline status       # Pipeline health from the graph
+recall-echo graph vigil-sync            # Sync vigil-pulse signals into the graph
+```
+
 ## Archive Format
 
 Conversation archives use YAML frontmatter with markdown content:
@@ -200,8 +229,26 @@ Optional `.recall-echo.toml` in the memory directory:
 
 ```toml
 [ephemeral]
-max_entries = 5    # Rolling window size (1-50, default 5)
+max_entries = 5              # Rolling window size (1-50, default 5)
+
+[llm]
+provider = "claude-code"     # LLM provider: "claude", "claude-code", or "ollama"
+model = ""                   # Model name (provider default if empty)
+api_base = ""                # Custom API base URL (provider default if empty)
+
+[pipeline]
+docs_dir = "/path/to/journal"  # Directory containing pipeline documents
+auto_sync = true               # Auto-sync pipeline docs to graph on archive
 ```
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `ephemeral` | `max_entries` | `5` | Rolling window size for session summaries (1-50) |
+| `llm` | `provider` | `claude` | LLM backend for summarization (`claude`, `claude-code`, `ollama`) |
+| `llm` | `model` | provider default | Model name |
+| `llm` | `api_base` | provider default | Custom API base URL |
+| `pipeline` | `docs_dir` | — | Path to pipeline documents (LEARNING.md, THOUGHTS.md, etc.) |
+| `pipeline` | `auto_sync` | `false` | Sync pipeline documents to the knowledge graph on archive |
 
 All settings have sensible defaults. Missing file or invalid values fall back silently.
 
