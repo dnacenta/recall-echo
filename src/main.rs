@@ -227,6 +227,15 @@ enum GraphCommands {
         #[command(subcommand)]
         command: PipelineCommands,
     },
+    /// Sync vigil-pulse signals and outcomes into the graph
+    VigilSync {
+        /// Path to signals.json (defaults to {entity_root}/vigil/signals.json)
+        #[arg(long)]
+        signals_path: Option<PathBuf>,
+        /// Path to outcomes.json (defaults to {entity_root}/caliber/outcomes.json)
+        #[arg(long)]
+        outcomes_path: Option<PathBuf>,
+    },
 }
 
 #[cfg(feature = "graph")]
@@ -401,6 +410,14 @@ fn main() {
                     provider,
                     delay_ms,
                 } => graph_cli::extract(&memory_dir, log, all, dry_run, model, provider, delay_ms),
+                GraphCommands::VigilSync {
+                    signals_path,
+                    outcomes_path,
+                } => graph_cli::vigil_sync(
+                    &memory_dir,
+                    signals_path.as_deref(),
+                    outcomes_path.as_deref(),
+                ),
                 GraphCommands::Pipeline { command } => match command {
                     PipelineCommands::Sync { docs_dir } => {
                         graph_cli::pipeline_sync(&memory_dir, docs_dir.as_deref())

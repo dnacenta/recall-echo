@@ -569,6 +569,64 @@ pub fn extract(
     })
 }
 
+// ── Vigil sync commands ──────────────────────────────────────────────
+
+/// Sync vigil-pulse signals and outcomes into the graph.
+pub fn vigil_sync(
+    memory_dir: &Path,
+    signals_path: Option<&Path>,
+    outcomes_path: Option<&Path>,
+) -> Result<(), String> {
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    // Default paths: look for vigil/ and caliber/ relative to memory_dir's parent (entity root)
+    let entity_root = memory_dir
+        .parent()
+        .unwrap_or(memory_dir);
+
+    let default_signals = entity_root.join("vigil").join("signals.json");
+    let default_outcomes = entity_root.join("caliber").join("outcomes.json");
+
+    let sig_path = signals_path.unwrap_or(&default_signals);
+    let out_path = outcomes_path.unwrap_or(&default_outcomes);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let report = gm
+            .sync_vigil(sig_path, out_path)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        println!("{BOLD}Vigil Sync{RESET}");
+        println!("  Measurements: +{}", report.measurements_created);
+        println!("  Outcomes:     +{}", report.outcomes_created);
+        println!("  Relationships: +{}", report.relationships_created);
+        println!("  Skipped:       {}", report.skipped);
+
+        if !report.errors.is_empty() {
+            println!("\n  {YELLOW}Warnings:{RESET}");
+            for err in &report.errors {
+                println!("    {DIM}{err}{RESET}");
+            }
+        }
+
+        if report.measurements_created == 0
+            && report.outcomes_created == 0
+        {
+            println!("\n  {DIM}No new data — graph is in sync.{RESET}");
+        }
+
+        Ok(())
+    })
+}
+
 // ── Pipeline commands ──────────────────────────────────────────────────
 
 /// Sync pipeline documents into the graph.

@@ -23,13 +23,20 @@ pub enum EntityType {
     Question,
     Observation,
     Policy,
+    Measurement,
+    Outcome,
 }
 
 impl EntityType {
     pub fn is_mutable(&self) -> bool {
         !matches!(
             self,
-            Self::Decision | Self::Event | Self::Case | Self::Observation
+            Self::Decision
+                | Self::Event
+                | Self::Case
+                | Self::Observation
+                | Self::Measurement
+                | Self::Outcome
         )
     }
 }
@@ -455,6 +462,24 @@ pub mod pipeline_rels {
     pub const GRADUATED_TO: &str = "GRADUATED_TO";
     pub const ARCHIVED_FROM: &str = "ARCHIVED_FROM";
     pub const CONNECTED_TO: &str = "CONNECTED_TO";
+}
+
+/// Canonical relationship types for vigil-pulse data.
+pub mod vigil_rels {
+    pub const MEASURED_DURING: &str = "MEASURED_DURING";
+    pub const RESULTED_IN: &str = "RESULTED_IN";
+    pub const TRIGGERED_BY: &str = "TRIGGERED_BY";
+}
+
+/// Report from a vigil sync operation.
+#[derive(Debug, Clone, Default)]
+pub struct VigilSyncReport {
+    pub measurements_created: u32,
+    pub outcomes_created: u32,
+    pub events_created: u32,
+    pub relationships_created: u32,
+    pub skipped: u32,
+    pub errors: Vec<String>,
 }
 
 /// Contents of all 5 pipeline markdown files.
