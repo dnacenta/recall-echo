@@ -17,6 +17,7 @@ pub mod search;
 pub mod store;
 pub mod traverse;
 pub mod types;
+pub mod vigil_sync;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -305,6 +306,33 @@ impl GraphMemory {
         entity_name: &str,
     ) -> Result<Vec<(EntityDetail, String, EntityDetail)>, GraphError> {
         query::pipeline_flow(&self.db, entity_name).await
+    }
+
+    // --- Vigil Sync ---
+
+    /// Sync vigil signal vectors into the graph as Measurement entities.
+    pub async fn sync_vigil_signals(
+        &self,
+        signals_path: &std::path::Path,
+    ) -> Result<VigilSyncReport, GraphError> {
+        vigil_sync::sync_vigil_signals(self, signals_path).await
+    }
+
+    /// Sync outcome records into the graph as Outcome entities.
+    pub async fn sync_outcomes(
+        &self,
+        outcomes_path: &std::path::Path,
+    ) -> Result<VigilSyncReport, GraphError> {
+        vigil_sync::sync_outcomes(self, outcomes_path).await
+    }
+
+    /// Sync both vigil signals and outcomes in one call.
+    pub async fn sync_vigil(
+        &self,
+        signals_path: &std::path::Path,
+        outcomes_path: &std::path::Path,
+    ) -> Result<VigilSyncReport, GraphError> {
+        vigil_sync::sync_vigil(self, signals_path, outcomes_path).await
     }
 
     // --- Stats ---
