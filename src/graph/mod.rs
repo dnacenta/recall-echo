@@ -3,6 +3,7 @@
 //! Provides a structured graph layer (Layer 0) underneath flat-file memory systems.
 //! Used by recall-echo (pulse-null entities) and recall-claude (Claude Code users).
 
+pub mod confidence;
 pub mod crud;
 pub mod dedup;
 pub mod embed;
@@ -157,6 +158,15 @@ impl GraphMemory {
         new: NewRelationship,
     ) -> Result<Relationship, GraphError> {
         crud::supersede_relationship(&self.db, old_id, new).await
+    }
+
+    /// Update relationship confidence (Bayesian posterior).
+    pub async fn update_relationship_confidence(
+        &self,
+        rel_id: &str,
+        confidence: f64,
+    ) -> Result<(), GraphError> {
+        crud::update_relationship_confidence(&self.db, rel_id, confidence).await
     }
 
     // --- Episodes ---

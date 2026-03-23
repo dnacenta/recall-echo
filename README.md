@@ -41,6 +41,32 @@ recall-echo provides a three-layer memory model:
 └──────────────────────────────────────────────────────┘
 ```
 
+### Knowledge Graph (default)
+
+On top of the three text layers, recall-echo builds a knowledge graph that turns conversation archives into structured, searchable memory. This is enabled by default via the `graph` feature.
+
+**What it does.** When conversations are archived, recall-echo extracts entities (people, projects, tools, concepts) and the relationships between them, then stores them in an embedded SurrealDB graph database. Semantic search via fastembed embeddings lets agents find relevant memories by meaning, not just keywords — so a search for "authentication" surfaces conversations about JWT, OAuth, and login flows even if those exact words weren't in the query.
+
+**Why Bayesian confidence.** Traditional knowledge graphs store facts as absolutes — "Dani uses NeoVim" is either true or not. But memories aren't binary. Things change, context matters, and some things are more certain than others. recall-echo uses a Beta-Binomial Bayesian confidence model on every relationship edge:
+
+- Each relationship starts with a confidence prior based on how it was established: authoritative (1.0), explicit (0.9), inferred (0.6), or speculative (0.3)
+- When new evidence corroborates a relationship, confidence increases. When evidence contradicts it, confidence decreases
+- Updates are gradual — it takes ~10 observations to overwhelm the prior, so a single contradictory mention doesn't erase established knowledge
+- Multi-hop queries compound confidence along the path, naturally preferring shorter, higher-confidence routes
+
+This means the graph handles contradictions, reinforces patterns over time, and lets uncertain or stale knowledge fade gracefully — instead of requiring manual cleanup or producing false-positive retrievals.
+
+**Graph operations:**
+
+```bash
+recall-echo graph init                  # Initialize the graph store
+recall-echo graph status                # Show graph statistics
+recall-echo graph search <query>        # Semantic search across entities
+recall-echo graph query <query>         # Hybrid: semantic + graph expansion + episodes
+recall-echo graph ingest-all            # Ingest all un-ingested conversation archives
+recall-echo graph pipeline sync         # Sync pipeline documents into the graph
+```
+
 All paths are relative to an entity root directory:
 
 ```
@@ -176,7 +202,7 @@ Save a checkpoint before context compression. Creates a numbered checkpoint file
 
 ### `recall-echo graph`
 
-Knowledge graph operations for semantic memory:
+Knowledge graph operations:
 
 ```bash
 recall-echo graph init                  # Initialize the graph store

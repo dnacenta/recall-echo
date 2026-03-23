@@ -583,9 +583,7 @@ pub fn vigil_sync(
     }
 
     // Default paths: look for vigil/ and caliber/ relative to memory_dir's parent (entity root)
-    let entity_root = memory_dir
-        .parent()
-        .unwrap_or(memory_dir);
+    let entity_root = memory_dir.parent().unwrap_or(memory_dir);
 
     let default_signals = entity_root.join("vigil").join("signals.json");
     let default_outcomes = entity_root.join("caliber").join("outcomes.json");
@@ -617,9 +615,7 @@ pub fn vigil_sync(
             }
         }
 
-        if report.measurements_created == 0
-            && report.outcomes_created == 0
-        {
+        if report.measurements_created == 0 && report.outcomes_created == 0 {
             println!("\n  {DIM}No new data — graph is in sync.{RESET}");
         }
 

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt};
 
+use super::confidence::{bayesian_update, ExtractionContext};
+use super::crud;
 use super::dedup::{self, ResolvedEntity};
 use super::error::GraphError;
 use super::extract;
@@ -155,22 +157,42 @@ async fn process_extraction(
         }
     }
 
-    // Phase 4: Create relationships sequentially
+    // Phase 4: Create relationships or Bayesian-update existing ones
     for rel in &all_relationships {
         let from_name = name_map.get(&rel.source).unwrap_or(&rel.source);
         let to_name = name_map.get(&rel.target).unwrap_or(&rel.target);
 
-        if relationship_exists(gm, from_name, to_name, &rel.rel_type).await {
+        // Check if a relationship of the same type already exists
+        if let Some(existing) =
+            find_existing_relationship(gm, from_name, to_name, &rel.rel_type).await
+        {
+            // Re-extraction is corroborating evidence — Bayesian update
+            let updated = bayesian_update(existing.confidence, true);
+            if let Err(e) =
+                crud::update_relationship_confidence(gm.db(), &existing.id_string(), updated).await
+            {
+                report.errors.push(format!(
+                    "confidence update {} -> {}: {}",
+                    from_name, to_name, e
+                ));
+            }
             report.relationships_skipped += 1;
             continue;
         }
+
+        // Parse extraction context from LLM output, default to Inferred
+        let context: ExtractionContext = rel
+            .confidence
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(ExtractionContext::Inferred);
 
         let new_rel = NewRelationship {
             from_entity: from_name.clone(),
             to_entity: to_name.clone(),
             rel_type: rel.rel_type.clone(),
             description: rel.description.clone(),
-            confidence: None,
+            confidence: Some(context.prior() as f32),
             source: Some(session_id.to_string()),
         };
 
@@ -260,23 +282,22 @@ fn build_episode_abstract(chunk: &str) -> String {
     }
 }
 
-/// Check if a relationship of the same type already exists between two entities.
-async fn relationship_exists(
+/// Find an existing relationship of the same type between two entities.
+/// Returns the full Relationship if found (for Bayesian update).
+async fn find_existing_relationship(
     gm: &GraphMemory,
     from_name: &str,
     to_name: &str,
     rel_type: &str,
-) -> bool {
-    let Ok(rels) = gm.get_relationships(from_name, Direction::Outgoing).await else {
-        return false;
-    };
-
-    let Ok(Some(to_entity)) = gm.get_entity(to_name).await else {
-        return false;
-    };
-
+) -> Option<Relationship> {
+    let rels = gm
+        .get_relationships(from_name, Direction::Outgoing)
+        .await
+        .ok()?;
+    let to_entity = gm.get_entity(to_name).await.ok()??;
     let to_id = to_entity.id_string();
-    rels.iter().any(|r| {
+
+    rels.into_iter().find(|r| {
         r.rel_type == rel_type && {
             let out_id = match &r.to_id {
                 serde_json::Value::String(s) => s.clone(),

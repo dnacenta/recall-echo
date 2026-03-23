@@ -63,7 +63,7 @@ pub async fn query(
 
             let neighbors = get_neighbor_details(db, parent_id).await?;
 
-            for (neighbor, rel_type) in neighbors {
+            for (neighbor, rel_type, confidence) in neighbors {
                 let neighbor_id = neighbor.id_string();
                 if entity_map.contains_key(&neighbor_id) {
                     continue; // Already in results
@@ -76,7 +76,7 @@ pub async fn query(
                     }
                 }
 
-                let graph_score = parent_score * 0.5;
+                let graph_score = parent_score * confidence;
                 entity_map.insert(
                     neighbor_id,
                     ScoredEntity {
@@ -111,18 +111,18 @@ pub async fn query(
     Ok(QueryResult { entities, episodes })
 }
 
-/// Get 1-hop neighbors as L1 (EntityDetail) with the relationship type.
+/// Get 1-hop neighbors as L1 (EntityDetail) with the relationship type and confidence.
 async fn get_neighbor_details(
     db: &Surreal<Db>,
     entity_id: &str,
-) -> Result<Vec<(EntityDetail, String)>, GraphError> {
+) -> Result<Vec<(EntityDetail, String, f64)>, GraphError> {
     // Outgoing
     let mut response = db
         .query(
             r#"
-            SELECT rel_type, out AS target_id
+            SELECT rel_type, confidence, out AS target_id
             FROM relates_to
-            WHERE in = type::record($id) AND valid_until IS NONE
+            WHERE in = type::record($id) AND valid_until IS NONE AND confidence >= 0.1
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -134,9 +134,9 @@ async fn get_neighbor_details(
     let mut response = db
         .query(
             r#"
-            SELECT rel_type, in AS target_id
+            SELECT rel_type, confidence, in AS target_id
             FROM relates_to
-            WHERE out = type::record($id) AND valid_until IS NONE
+            WHERE out = type::record($id) AND valid_until IS NONE AND confidence >= 0.1
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -154,17 +154,23 @@ async fn get_neighbor_details(
         };
 
         if let Some(detail) = super::crud::get_entity_detail(db, &tid).await? {
-            results.push((detail, edge.rel_type));
+            results.push((detail, edge.rel_type, edge.confidence));
         }
     }
 
     Ok(results)
 }
 
+fn default_rel_confidence() -> f64 {
+    1.0
+}
+
 #[derive(serde::Deserialize)]
 struct RelTarget {
     rel_type: String,
     target_id: serde_json::Value,
+    #[serde(default = "default_rel_confidence")]
+    confidence: f64,
 }
 
 // ── Pipeline queries ─────────────────────────────────────────────────

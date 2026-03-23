@@ -235,6 +235,20 @@ pub async fn get_relationships(
     deserialize_take(&mut response, 0)
 }
 
+/// Update a relationship's confidence score.
+pub async fn update_relationship_confidence(
+    db: &Surreal<Db>,
+    rel_id: &str,
+    confidence: f64,
+) -> Result<(), GraphError> {
+    db.query("UPDATE type::record($id) SET confidence = $confidence")
+        .bind(("id", rel_id.to_string()))
+        .bind(("confidence", confidence))
+        .await?
+        .check()?;
+    Ok(())
+}
+
 /// Supersede an existing relationship: set valid_until on the old one, create a new one.
 pub async fn supersede_relationship(
     db: &Surreal<Db>,

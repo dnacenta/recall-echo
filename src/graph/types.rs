@@ -316,6 +316,7 @@ pub struct TraversalEdge {
     pub target: TraversalNode,
     pub valid_from: serde_json::Value,
     pub valid_until: Option<serde_json::Value>,
+    pub confidence: f64,
 }
 
 /// A row from a relationship query (shared by traverse and query).
@@ -325,6 +326,12 @@ pub struct EdgeRow {
     pub valid_from: serde_json::Value,
     pub valid_until: Option<serde_json::Value>,
     pub target_id: serde_json::Value,
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+}
+
+fn default_confidence() -> f64 {
+    1.0
 }
 
 impl EdgeRow {
@@ -401,6 +408,8 @@ pub struct ExtractedRelationship {
     pub target: String,
     pub rel_type: String,
     pub description: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
 }
 
 /// An extracted case (problem-solution pair).

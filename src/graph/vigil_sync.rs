@@ -55,11 +55,10 @@ pub async fn sync_vigil_signals(
         return Ok(report);
     }
 
-    let content = std::fs::read_to_string(signals_path)
-        .map_err(|e| GraphError::Io(e))?;
+    let content = std::fs::read_to_string(signals_path).map_err(GraphError::Io)?;
 
-    let signals: Vec<SignalVector> = serde_json::from_str(&content)
-        .map_err(|e| GraphError::Json(e))?;
+    let signals: Vec<SignalVector> =
+        serde_json::from_str(&content).map_err(GraphError::Json)?;
 
     if signals.is_empty() {
         return Ok(report);
@@ -85,9 +84,18 @@ pub async fn sync_vigil_signals(
         }
 
         let mut attrs = serde_json::Map::new();
-        attrs.insert("timestamp".into(), serde_json::Value::String(signal.timestamp.clone()));
-        attrs.insert("trigger".into(), serde_json::Value::String(signal.trigger.clone()));
-        attrs.insert("source_type".into(), serde_json::Value::String("vigil_signal".into()));
+        attrs.insert(
+            "timestamp".into(),
+            serde_json::Value::String(signal.timestamp.clone()),
+        );
+        attrs.insert(
+            "trigger".into(),
+            serde_json::Value::String(signal.trigger.clone()),
+        );
+        attrs.insert(
+            "source_type".into(),
+            serde_json::Value::String("vigil_signal".into()),
+        );
 
         if let Some(v) = signal.signals.vocabulary_diversity {
             attrs.insert("vocabulary_diversity".into(), serde_json::json!(v));
@@ -117,7 +125,9 @@ pub async fn sync_vigil_signals(
 
         match gm.add_entity(entity).await {
             Ok(_) => report.measurements_created += 1,
-            Err(e) => report.errors.push(format!("signal {}: {}", signal.timestamp, e)),
+            Err(e) => report
+                .errors
+                .push(format!("signal {}: {}", signal.timestamp, e)),
         }
     }
 
@@ -135,11 +145,10 @@ pub async fn sync_outcomes(
         return Ok(report);
     }
 
-    let content = std::fs::read_to_string(outcomes_path)
-        .map_err(|e| GraphError::Io(e))?;
+    let content = std::fs::read_to_string(outcomes_path).map_err(GraphError::Io)?;
 
-    let outcomes: Vec<OutcomeRecord> = serde_json::from_str(&content)
-        .map_err(|e| GraphError::Json(e))?;
+    let outcomes: Vec<OutcomeRecord> =
+        serde_json::from_str(&content).map_err(GraphError::Json)?;
 
     if outcomes.is_empty() {
         return Ok(report);
@@ -165,19 +174,41 @@ pub async fn sync_outcomes(
         }
 
         let mut attrs = serde_json::Map::new();
-        attrs.insert("task_id".into(), serde_json::Value::String(outcome.task_id.clone()));
-        attrs.insert("timestamp".into(), serde_json::Value::String(outcome.timestamp.clone()));
-        attrs.insert("domain".into(), serde_json::Value::String(outcome.domain.clone()));
-        attrs.insert("task_type".into(), serde_json::Value::String(outcome.task_type.clone()));
-        attrs.insert("outcome_result".into(), serde_json::Value::String(outcome.outcome.clone()));
+        attrs.insert(
+            "task_id".into(),
+            serde_json::Value::String(outcome.task_id.clone()),
+        );
+        attrs.insert(
+            "timestamp".into(),
+            serde_json::Value::String(outcome.timestamp.clone()),
+        );
+        attrs.insert(
+            "domain".into(),
+            serde_json::Value::String(outcome.domain.clone()),
+        );
+        attrs.insert(
+            "task_type".into(),
+            serde_json::Value::String(outcome.task_type.clone()),
+        );
+        attrs.insert(
+            "outcome_result".into(),
+            serde_json::Value::String(outcome.outcome.clone()),
+        );
         attrs.insert("tokens_used".into(), serde_json::json!(outcome.tokens_used));
         attrs.insert("tool_rounds".into(), serde_json::json!(outcome.tool_rounds));
-        attrs.insert("source_type".into(), serde_json::Value::String("vigil_outcome".into()));
+        attrs.insert(
+            "source_type".into(),
+            serde_json::Value::String("vigil_outcome".into()),
+        );
 
         let abstract_text = format!(
             "{} task '{}' — {} ({}, {} tokens, {} tool rounds)",
-            outcome.outcome, outcome.task_id, outcome.description,
-            outcome.domain, outcome.tokens_used, outcome.tool_rounds,
+            outcome.outcome,
+            outcome.task_id,
+            outcome.description,
+            outcome.domain,
+            outcome.tokens_used,
+            outcome.tool_rounds,
         );
 
         let entity = NewEntity {
@@ -210,7 +241,9 @@ pub async fn sync_outcomes(
                     }
                 }
             }
-            Err(e) => report.errors.push(format!("outcome {}: {}", outcome.task_id, e)),
+            Err(e) => report
+                .errors
+                .push(format!("outcome {}: {}", outcome.task_id, e)),
         }
     }
 
@@ -273,6 +306,10 @@ fn format_signal_abstract(signals: &Signals, trigger: &str) -> String {
     if parts.is_empty() {
         format!("Signal measurement (trigger: {})", trigger)
     } else {
-        format!("Signal measurement: {} (trigger: {})", parts.join(", "), trigger)
+        format!(
+            "Signal measurement: {} (trigger: {})",
+            parts.join(", "),
+            trigger
+        )
     }
 }
