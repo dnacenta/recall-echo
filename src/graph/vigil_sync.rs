@@ -57,8 +57,7 @@ pub async fn sync_vigil_signals(
 
     let content = std::fs::read_to_string(signals_path).map_err(GraphError::Io)?;
 
-    let signals: Vec<SignalVector> =
-        serde_json::from_str(&content).map_err(GraphError::Json)?;
+    let signals: Vec<SignalVector> = serde_json::from_str(&content).map_err(GraphError::Json)?;
 
     if signals.is_empty() {
         return Ok(report);
@@ -147,8 +146,7 @@ pub async fn sync_outcomes(
 
     let content = std::fs::read_to_string(outcomes_path).map_err(GraphError::Io)?;
 
-    let outcomes: Vec<OutcomeRecord> =
-        serde_json::from_str(&content).map_err(GraphError::Json)?;
+    let outcomes: Vec<OutcomeRecord> = serde_json::from_str(&content).map_err(GraphError::Json)?;
 
     if outcomes.is_empty() {
         return Ok(report);
