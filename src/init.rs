@@ -195,16 +195,12 @@ fn init_graph(memory_dir: &Path) {
 
 /// Auto-configure Claude Code hooks (settings.json).
 /// Returns true if hooks were configured.
-fn configure_hooks(entity_root: &Path) -> bool {
+/// Hooks always go in ~/.claude/settings.json regardless of where entity_root is.
+fn configure_hooks(_entity_root: &Path) -> bool {
     let claude_dir = match paths::detect_claude_code() {
         Some(dir) => dir,
         None => return false,
     };
-
-    // Only configure hooks if entity_root is the Claude Code dir
-    if entity_root != claude_dir {
-        return false;
-    }
 
     let settings_path = claude_dir.join("settings.json");
     let recall_bin = std::env::current_exe()

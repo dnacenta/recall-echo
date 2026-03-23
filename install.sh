@@ -107,10 +107,11 @@ MEMORY_FILE="${MEMORY_DIR}/MEMORY.md"
 RULES_FILE="${RULES_DIR}/recall-echo.md"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 
-# Determine hook commands: use recall-echo if in PATH, else echo fallback
-if command -v recall-echo &>/dev/null; then
-  HOOK_COMMAND="recall-echo checkpoint --trigger precompact"
-  SESSION_END_COMMAND="recall-echo promote"
+# Determine hook commands: use full binary path to avoid PATH issues in hook subprocesses
+RECALL_BIN="${BINARY:-$(command -v recall-echo 2>/dev/null || echo "")}"
+if [ -n "$RECALL_BIN" ]; then
+  HOOK_COMMAND="${RECALL_BIN} checkpoint --trigger precompact"
+  SESSION_END_COMMAND="${RECALL_BIN} promote"
 else
   HOOK_COMMAND="echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'"
   SESSION_END_COMMAND=""  # Can't promote without binary
