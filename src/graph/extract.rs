@@ -24,7 +24,8 @@ Return EXACTLY this JSON structure (no markdown fencing, no explanation):
       "source": "Source Entity Name",
       "target": "Target Entity Name",
       "rel_type": "USES|BUILDS|DEPENDS_ON|WRITTEN_IN|PREFERS|INTERESTED_IN|RELATES_TO",
-      "description": "Why this relationship exists"
+      "description": "Why this relationship exists",
+      "confidence": "explicit|inferred|speculative"
     }
   ],
   "cases": [
@@ -58,7 +59,12 @@ Extraction rules:
 - Preserve detail in abstracts.
 - Entity names should be canonical (e.g., "NeoVim" not "neovim", "SurrealDB" not "surreal").
 - Return empty arrays for categories with no relevant content.
-- Do not extract trivial entities (common shell commands, generic concepts unless specifically discussed)."#;
+- Do not extract trivial entities (common shell commands, generic concepts unless specifically discussed).
+- Classify relationship confidence:
+  - explicit: Directly stated ("I use Rust", "this depends on X")
+  - inferred: Implied by context (discussed together, co-occurring)
+  - speculative: Possible connection based on domain knowledge
+  - When unsure, use "inferred""#;
 
 /// Split conversation text into chunks of approximately `target_tokens` tokens.
 ///

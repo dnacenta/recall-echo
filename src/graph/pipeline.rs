@@ -417,6 +417,7 @@ fn infer_relationships(entries: &[PipelineEntry]) -> Vec<ExtractedRelationship> 
                         target: target.clone(),
                         rel_type: pipeline_rels::GRADUATED_TO.into(),
                         description: Some(format!("Graduated from thoughts to {}", dest)),
+                        confidence: None,
                     });
                 }
             }
@@ -436,6 +437,7 @@ fn infer_relationships(entries: &[PipelineEntry]) -> Vec<ExtractedRelationship> 
                     target: target.clone(),
                     rel_type: rel_type.into(),
                     description: Some(format!("From source: {}", source)),
+                    confidence: None,
                 });
             }
         }
@@ -448,6 +450,7 @@ fn infer_relationships(entries: &[PipelineEntry]) -> Vec<ExtractedRelationship> 
                     target,
                     rel_type: pipeline_rels::CONNECTED_TO.into(),
                     description: Some(conn.clone()),
+                    confidence: None,
                 });
             }
         }

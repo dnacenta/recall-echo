@@ -74,10 +74,12 @@ fn traverse_from<'a>(
                 rel_type,
                 valid_from,
                 valid_until,
+                confidence,
                 out AS target_id
             FROM relates_to
             WHERE in = type::record($id)
               AND valid_until IS NONE
+              AND confidence >= 0.1
             "#,
             )
             .bind(("id", entity.id_string()))
@@ -104,10 +106,12 @@ fn traverse_from<'a>(
                 rel_type,
                 valid_from,
                 valid_until,
+                confidence,
                 in AS target_id
             FROM relates_to
             WHERE out = type::record($id)
               AND valid_until IS NONE
+              AND confidence >= 0.1
             "#,
             )
             .bind(("id", entity.id_string()))
@@ -178,6 +182,7 @@ async fn collect_edges<'a>(
                 target: child,
                 valid_from: edge.valid_from,
                 valid_until: edge.valid_until,
+                confidence: edge.confidence,
             });
         }
     }
@@ -204,9 +209,21 @@ pub fn format_traversal(node: &TraversalNode, indent: usize) -> String {
             ""
         };
 
+        let confidence_tag = if edge.confidence < 1.0 {
+            format!(" [{}%]", (edge.confidence * 100.0).round() as u32)
+        } else {
+            String::new()
+        };
+
         out.push_str(&format!(
-            "{}{} {} {} {}{}\n",
-            prefix, "├──", edge.direction, edge.rel_type, edge.target.entity.name, superseded,
+            "{}{} {} {} {}{}{}\n",
+            prefix,
+            "├──",
+            edge.direction,
+            edge.rel_type,
+            edge.target.entity.name,
+            confidence_tag,
+            superseded,
         ));
 
         if !edge.target.edges.is_empty() {
