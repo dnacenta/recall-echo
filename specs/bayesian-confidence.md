@@ -1,7 +1,7 @@
 # Spec: Bayesian Confidence for Knowledge Graph
 
-**Status**: Draft
-**Scope**: recall-echo v3.4.0
+**Status**: IMPLEMENTED (shipped in v3.3.0)
+**Scope**: recall-echo v3.3.0
 **Author**: Echo + Synth
 
 ## Problem

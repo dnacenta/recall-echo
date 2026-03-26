@@ -3,7 +3,7 @@
 [![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green)](https://github.com/dnacenta/recall-echo/tags)
 
-Persistent three-layer memory system for pulse-null entities. Gives AI agents long-term recall across sessions — curated facts, recent session context, and searchable conversation archives.
+Persistent four-layer memory system for pulse-null entities. Gives AI agents long-term recall across sessions — a knowledge graph with Bayesian confidence, curated facts, recent session context, and searchable conversation archives.
 
 ## Why
 
@@ -13,37 +13,45 @@ recall-echo makes the memory lifecycle mechanical. When running as a pulse-null 
 
 ## Architecture
 
-recall-echo provides a three-layer memory model:
+recall-echo provides a four-layer memory model:
 
 ```
-┌──────────────────────────────────────────────────────┐
-│              MEMORY ARCHITECTURE                      │
-│                                                       │
-│  Layer 1: CURATED (always in context)                 │
-│  ┌───────────┐                                        │
-│  │ MEMORY.md │  Facts, preferences, patterns          │
-│  └───────────┘  Distilled & maintained by the agent   │
-│                                                       │
-│  Layer 2: SHORT-TERM (FIFO rolling window)            │
-│  ┌───────────────┐                                    │
-│  │ EPHEMERAL.md  │  Last N session summaries          │
-│  └───────────────┘  Appended on archive, auto-trimmed │
-│                                                       │
-│  Layer 3: LONG-TERM (searched on demand)              │
-│  ┌─────────────┐    ┌────────────────────────────┐    │
-│  │ ARCHIVE.md  │───→│ conversations/             │    │
-│  └─────────────┘    │  conversation-001.md       │    │
-│                     │  conversation-002.md       │    │
-│                     │  ...                       │    │
-│                     └────────────────────────────┘    │
-│                     YAML frontmatter + markdown       │
-│                     LLM-summarized or algorithmic     │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│              MEMORY ARCHITECTURE                          │
+│                                                           │
+│  Layer 0: KNOWLEDGE GRAPH (structured, semantic)          │
+│  ┌──────────────────────────────────────────────────┐     │
+│  │ SurrealDB + FastEmbed                            │     │
+│  │ Entities, relationships, episodes                │     │
+│  │ Bayesian confidence · Semantic search (HNSW)     │     │
+│  │ LLM-powered extraction + deduplication           │     │
+│  └──────────────────────────────────────────────────┘     │
+│                                                           │
+│  Layer 1: CURATED (always in context)                     │
+│  ┌───────────┐                                            │
+│  │ MEMORY.md │  Facts, preferences, patterns              │
+│  └───────────┘  Distilled & maintained by the agent       │
+│                                                           │
+│  Layer 2: SHORT-TERM (FIFO rolling window)                │
+│  ┌───────────────┐                                        │
+│  │ EPHEMERAL.md  │  Last N session summaries              │
+│  └───────────────┘  Appended on archive, auto-trimmed     │
+│                                                           │
+│  Layer 3: LONG-TERM (searched on demand)                  │
+│  ┌─────────────┐    ┌────────────────────────────┐        │
+│  │ ARCHIVE.md  │───→│ conversations/             │        │
+│  └─────────────┘    │  conversation-001.md       │        │
+│                     │  conversation-002.md       │        │
+│                     │  ...                       │        │
+│                     └────────────────────────────┘        │
+│                     YAML frontmatter + markdown           │
+│                     LLM-summarized or algorithmic         │
+└──────────────────────────────────────────────────────────┘
 ```
 
-### Knowledge Graph (default)
+### Knowledge Graph (Layer 0, default)
 
-On top of the three text layers, recall-echo builds a knowledge graph that turns conversation archives into structured, searchable memory. This is enabled by default via the `graph` feature.
+The knowledge graph is the structural foundation of recall-echo. It turns conversation archives into structured, searchable memory. Enabled by default via the `graph` feature.
 
 **What it does.** When conversations are archived, recall-echo extracts entities (people, projects, tools, concepts) and the relationships between them, then stores them in an embedded SurrealDB graph database. Semantic search via fastembed embeddings lets agents find relevant memories by meaning, not just keywords — so a search for "authentication" surfaces conversations about JWT, OAuth, and login flows even if those exact words weren't in the query.
 
@@ -56,15 +64,37 @@ On top of the three text layers, recall-echo builds a knowledge graph that turns
 
 This means the graph handles contradictions, reinforces patterns over time, and lets uncertain or stale knowledge fade gracefully — instead of requiring manual cleanup or producing false-positive retrievals.
 
-**Graph operations:**
+**Entity types:** person, project, tool, service, preference, decision, event, concept, case, pattern, thread, thought, question, observation, policy, measurement, outcome. Mutable types (person, project, tool, etc.) can be updated; immutable types (decision, event, case, etc.) are append-only.
+
+**Extraction pipeline:** When conversations are archived, an LLM-powered pipeline chunks the text (~500 tokens), extracts entities and relationships in parallel (up to 10 concurrent), then deduplicates sequentially with LLM-assisted skip/create/merge decisions. Re-extracted relationships receive Bayesian corroboration updates, so knowledge confirmed across multiple conversations gains confidence automatically.
+
+**Tiered content:** Entities store content at three levels — L0 (abstract, used for embeddings and cheap traversal), L1 (overview, used for reranking), and L2 (full content, pulled on demand). This keeps graph traversal fast.
+
+**Graph commands:**
 
 ```bash
-recall-echo graph init                  # Initialize the graph store
-recall-echo graph status                # Show graph statistics
-recall-echo graph search <query>        # Semantic search across entities
-recall-echo graph query <query>         # Hybrid: semantic + graph expansion + episodes
-recall-echo graph ingest-all            # Ingest all un-ingested conversation archives
-recall-echo graph pipeline sync         # Sync pipeline documents into the graph
+# Core
+recall-echo graph init                          # Initialize the graph store
+recall-echo graph status                        # Show graph statistics
+
+# Search & traversal
+recall-echo graph search <query>                # Semantic search across entities
+recall-echo graph query <query>                 # Hybrid: semantic + graph expansion + episodes
+recall-echo graph traverse <entity>             # Graph traversal from entity (shows confidence)
+
+# Data management
+recall-echo graph add-entity --name <n> --type <t> --abstract <a>   # Add entity manually
+recall-echo graph relate <from> --rel <type> --target <to>          # Create relationship
+recall-echo graph ingest <archive>              # Ingest single archive (episodes only)
+recall-echo graph ingest-all                    # Ingest all un-ingested archives
+recall-echo graph extract --all                 # LLM entity extraction from archives
+
+# Pipeline & integrations
+recall-echo graph pipeline sync                 # Sync pipeline documents into the graph
+recall-echo graph pipeline status               # Pipeline health from the graph
+recall-echo graph pipeline flow <entity>        # Trace entity lineage through pipeline
+recall-echo graph pipeline stale                # List stale pipeline entities
+recall-echo graph vigil-sync                    # Sync vigil-pulse signals into the graph
 ```
 
 All paths are relative to an entity root directory:
@@ -78,6 +108,9 @@ All paths are relative to an entity root directory:
 │   ├── conversation-001.md
 │   ├── conversation-002.md
 │   └── ...
+├── graph/                    # Layer 0 — knowledge graph
+│   ├── surreal/              # SurrealDB embedded data
+│   └── models/               # FastEmbed cached models
 └── .recall-echo.toml         # Optional configuration
 ```
 
@@ -87,7 +120,7 @@ recall-echo operates in two modes:
 
 ### As a pulse-null Plugin
 
-recall-echo is a native pulse-null plugin implementing the `Plugin` trait from echo-system-types. It fills the required **Memory** role (exactly one per entity).
+recall-echo is a native pulse-null plugin implementing the `Plugin` trait from pulse-system-types. It fills the required **Memory** role (exactly one per entity).
 
 - pulse-null calls `archive::archive_session()` at session end — creates a conversation archive with LLM-generated summary, updates ARCHIVE.md index, appends to EPHEMERAL.md
 - pulse-null calls `checkpoint::create_checkpoint()` before context compaction — preserves conversation state before details are lost
@@ -202,18 +235,29 @@ Save a checkpoint before context compression. Creates a numbered checkpoint file
 
 ### `recall-echo graph`
 
-Knowledge graph operations:
+Knowledge graph operations. See the Architecture section above for the full command list.
 
-```bash
-recall-echo graph init                  # Initialize the graph store
-recall-echo graph status                # Show graph statistics
-recall-echo graph search <query>        # Semantic search across entities
-recall-echo graph query <query>         # Hybrid: semantic + graph expansion + episodes
-recall-echo graph ingest-all            # Ingest all un-ingested conversation archives
-recall-echo graph pipeline sync         # Sync pipeline documents into the graph
-recall-echo graph pipeline status       # Pipeline health from the graph
-recall-echo graph vigil-sync            # Sync vigil-pulse signals into the graph
-```
+**Search & traversal:**
+
+- `graph search <query>` — Semantic search across entities. Supports `--limit`, `--type` (filter by entity type), and `--keyword` (filter by name/abstract).
+- `graph query <query>` — Hybrid query combining semantic search, confidence-weighted graph expansion, and optional episode retrieval. Supports `--depth` (expansion depth, default 1, 0 = semantic only), `--episodes` (include episode results), `--limit`, `--type`, `--keyword`.
+- `graph traverse <entity>` — DFS traversal from a named entity with cycle detection. Displays confidence percentages on edges (e.g. `[85%]`). Edges below 0.1 confidence are filtered. Supports `--depth` (default 2) and `--type-filter`.
+
+**Data management:**
+
+- `graph add-entity` — Manually add an entity. Requires `--name`, `--type`, `--abstract`. Supports `--overview` and `--source`.
+- `graph relate <from> --rel <type> --target <to>` — Create a relationship between two entities. Supports `--description` and `--source`.
+- `graph ingest <archive>` — Ingest a single archive file (creates episodes, no LLM required).
+- `graph ingest-all` — Scan conversations/ and ingest all un-ingested archives.
+- `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (anthropic or openai), `--delay-ms`.
+
+**Pipeline & integrations:**
+
+- `graph pipeline sync` — Sync pipeline documents (LEARNING.md, THOUGHTS.md, CURIOSITY.md, REFLECTIONS.md, PRAXIS.md) into the graph. Idempotent — diffs parsed entries vs existing graph entities.
+- `graph pipeline status` — Pipeline health with staleness tracking.
+- `graph pipeline flow <entity>` — Trace an entity's lineage through the pipeline stages.
+- `graph pipeline stale` — List stale pipeline entities. Supports `--days` (threshold, default 7).
+- `graph vigil-sync` — Sync vigil-pulse metacognitive signals and caliber outcomes into the graph as Measurement and Outcome entities. Supports `--signals-path` and `--outcomes-path`.
 
 ## Archive Format
 

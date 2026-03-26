@@ -1,8 +1,8 @@
-# recall-echo — Spec v2.0
+# recall-echo — Spec v3.0
 
 ## What It Is
 
-recall-echo is a persistent three-layer memory system for pulse-null entities. It gives AI agents long-term recall across sessions — curated facts, recent session context, and searchable conversation archives. Designed as a native pulse-null plugin (Memory role) with standalone CLI support for administration.
+recall-echo is a persistent four-layer memory system for pulse-null entities. It gives AI agents long-term recall across sessions — a knowledge graph with Bayesian confidence, curated facts, recent session context, and searchable conversation archives. Designed as a native pulse-null plugin (Memory role) with standalone CLI support for administration.
 
 Inspired by MemGPT (arxiv:2310.08560) — event-driven memory management for LLMs.
 
@@ -15,29 +15,37 @@ recall-echo makes the entire memory lifecycle mechanical. When integrated with p
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│              MEMORY ARCHITECTURE                      │
-│                                                       │
-│  Layer 1: CURATED (always in context)                 │
-│  ┌───────────┐                                        │
-│  │ MEMORY.md │  Facts, preferences, patterns          │
-│  └───────────┘  Distilled & maintained by the agent   │
-│                                                       │
-│  Layer 2: SHORT-TERM (FIFO rolling window)            │
-│  ┌───────────────┐                                    │
-│  │ EPHEMERAL.md  │  Last N session summaries          │
-│  └───────────────┘  Appended on archive, trimmed      │
-│                                                       │
-│  Layer 3: LONG-TERM (searched on demand)              │
-│  ┌─────────────┐    ┌────────────────────────────┐    │
-│  │ ARCHIVE.md  │───→│ conversations/             │    │
-│  └─────────────┘    │  conversation-001.md       │    │
-│                     │  conversation-002.md       │    │
-│                     │  ...                       │    │
-│                     └────────────────────────────┘    │
-│                     YAML frontmatter + markdown       │
-│                     LLM-summarized or algorithmic     │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│              MEMORY ARCHITECTURE                          │
+│                                                           │
+│  Layer 0: KNOWLEDGE GRAPH (structured, semantic)          │
+│  ┌──────────────────────────────────────────────────┐     │
+│  │ SurrealDB + FastEmbed                            │     │
+│  │ Entities, relationships, episodes                │     │
+│  │ Bayesian confidence · Semantic search (HNSW)     │     │
+│  │ LLM-powered extraction + deduplication           │     │
+│  └──────────────────────────────────────────────────┘     │
+│                                                           │
+│  Layer 1: CURATED (always in context)                     │
+│  ┌───────────┐                                            │
+│  │ MEMORY.md │  Facts, preferences, patterns              │
+│  └───────────┘  Distilled & maintained by the agent       │
+│                                                           │
+│  Layer 2: SHORT-TERM (FIFO rolling window)                │
+│  ┌───────────────┐                                        │
+│  │ EPHEMERAL.md  │  Last N session summaries              │
+│  └───────────────┘  Appended on archive, auto-trimmed     │
+│                                                           │
+│  Layer 3: LONG-TERM (searched on demand)                  │
+│  ┌─────────────┐    ┌────────────────────────────┐        │
+│  │ ARCHIVE.md  │───→│ conversations/             │        │
+│  └─────────────┘    │  conversation-001.md       │        │
+│                     │  conversation-002.md       │        │
+│                     │  ...                       │        │
+│                     └────────────────────────────┘        │
+│                     YAML frontmatter + markdown           │
+│                     LLM-summarized or algorithmic         │
+└──────────────────────────────────────────────────────────┘
 ```
 
 All paths are relative to an entity root directory:
@@ -51,6 +59,9 @@ All paths are relative to an entity root directory:
 │   ├── conversation-001.md
 │   ├── conversation-002.md
 │   └── ...
+├── graph/                       # Layer 0 — knowledge graph
+│   ├── surreal/                 # SurrealDB embedded data
+│   └── models/                  # FastEmbed cached models
 └── .recall-echo.toml            # Optional configuration
 ```
 
@@ -60,7 +71,7 @@ recall-echo operates in two modes:
 
 ### 1. pulse-null Plugin (Primary)
 
-As a native pulse-null plugin implementing the `Plugin` trait from echo-system-types:
+As a native pulse-null plugin implementing the `Plugin` trait from pulse-system-types:
 
 - **Role**: `PluginRole::Memory` (required — exactly one per entity)
 - **Factory**: `create(config, ctx) -> Box<dyn Plugin>`
@@ -77,10 +88,16 @@ For administration and use outside pulse-null:
 ```
 recall-echo init [entity_root]       # Create memory directory structure
 recall-echo status [entity_root]     # Health check with dashboard
+recall-echo dashboard [entity_root]  # Full dashboard with stats and health
 recall-echo search <query>           # Line-level archive search
 recall-echo search <query> --ranked  # File-ranked search with relevance scoring
 recall-echo distill [entity_root]    # Analyze MEMORY.md, suggest cleanup
 recall-echo consume [entity_root]    # Output EPHEMERAL.md content
+recall-echo archive-session          # Archive Claude Code session from JSONL
+recall-echo archive --all-unarchived # Batch archive all missed sessions
+recall-echo checkpoint               # Save checkpoint before context compression
+recall-echo config                   # View or modify configuration
+recall-echo graph <subcommand>       # Knowledge graph operations
 ```
 
 ## Layer Details
@@ -171,9 +188,9 @@ Max: 5 decisions, 5 action items, 10 files per archive.
 
 ## Plugin Integration
 
-### echo-system-types Dependency
+### pulse-system-types Dependency
 
-recall-echo depends on echo-system-types v0.4.0 for:
+recall-echo depends on pulse-system-types v0.5 for:
 - `Plugin` trait — lifecycle, health, meta, role, setup prompts, `as_any()`
 - `PluginContext` — entity_root, entity_name, `Arc<dyn LmProvider>`
 - `PluginRole::Memory`
@@ -212,8 +229,9 @@ All settings have sensible defaults. Missing file or invalid values fall back si
 
 - **Language**: Rust
 - **License**: AGPL-3.0
-- **Dependencies**: echo-system-types, clap, serde, serde_json, dirs
-- **Zero external deps** for YAML, TOML, and date handling (hand-rolled parsers)
+- **Dependencies**: pulse-system-types (v0.5), clap, serde, serde_json, dirs, surrealdb, fastembed, tokio, chrono, thiserror, futures, regex
+- **Graph**: surrealdb (embedded, kv-surrealkv), fastembed (BGE-Small-EN-v1.5, 384 dimensions)
+- **Zero external deps** for YAML and date handling (hand-rolled parsers)
 - **Dev dependencies**: tempfile, tokio
 
 ## Testing
@@ -237,7 +255,7 @@ All tests run in isolated temporary directories — no production memory touched
 2. **Markdown archives**: Replaced JSONL with markdown + YAML frontmatter. Human-readable, Grep-searchable.
 3. **FIFO ephemeral**: Rolling window of N entries (default 5) instead of single session summary.
 4. **LLM summaries with fallback**: Graceful degradation when no provider available.
-5. **No hooks or rules**: pulse-null manages lifecycle. recall-echo is purely a data layer + CLI admin tool.
+5. **Lifecycle hooks**: As a standalone CLI, recall-echo installs PreToolUse (consume), PreCompact (checkpoint), and SessionEnd (archive-session) hooks. As a pulse-null plugin, pulse-null manages lifecycle directly.
 6. **Zero external date/YAML/TOML deps**: Hand-rolled parsers for minimal bloat.
-7. **Plugin role**: Memory (required, exactly one). No tools, no tasks, no routes contributed.
+7. **Plugin role**: Memory (required, exactly one). No scheduled tasks or HTTP routes contributed. Graph query tool is contributed via pulse-null's GraphQueryTool, not the plugin itself.
 8. **Async throughout**: Factory and archival functions are async to match pulse-null's architecture.

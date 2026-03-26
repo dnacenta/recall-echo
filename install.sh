@@ -111,10 +111,10 @@ SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 RECALL_BIN="${BINARY:-$(command -v recall-echo 2>/dev/null || echo "")}"
 if [ -n "$RECALL_BIN" ]; then
   HOOK_COMMAND="${RECALL_BIN} checkpoint --trigger precompact"
-  SESSION_END_COMMAND="${RECALL_BIN} promote"
+  SESSION_END_COMMAND="${RECALL_BIN} archive-session"
 else
-  HOOK_COMMAND="echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint to ~/.claude/memories/ before context is lost. Check the highest archive-log-XXX.md number and create the next one.'"
-  SESSION_END_COMMAND=""  # Can't promote without binary
+  HOOK_COMMAND="echo 'RECALL-ECHO: Context compaction imminent. Save a memory checkpoint before context is lost.'"
+  SESSION_END_COMMAND=""  # Can't archive-session without binary
 fi
 
 echo ""
@@ -156,44 +156,48 @@ else
     cat > "$RULES_FILE" << 'PROTOCOL'
 # recall-echo — Memory Protocol
 
-You have a persistent three-layer memory system. Use it to maintain continuity across sessions.
+You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
 
 ## Memory Layers
 
+### Layer 0 — Knowledge Graph (structured, semantic)
+- Embedded SurrealDB graph database with FastEmbed local embeddings.
+- Stores entities, relationships, and conversation episodes.
+- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
+- Semantic search finds memories by meaning, not just keywords.
+- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
+
 ### Layer 1 — Curated Memory (MEMORY.md)
-- Location: `~/.claude/memory/MEMORY.md` (and optional topic files alongside it)
-- This is your source of truth. Distilled facts, user preferences, project patterns, key decisions.
-- It is auto-loaded at session start (first 200 lines).
-- Keep it under 200 lines. If it grows beyond that, distill aggressively or move details to topic files (e.g., `debugging.md`, `architecture.md`) in the same directory.
-- Only write stable, confirmed facts. Never write speculative or session-specific information here.
-- Before adding a new entry, check if an existing entry should be updated instead. No duplicates.
+- Location: `~/.claude/memory/MEMORY.md`
+- Your source of truth. Distilled facts, preferences, patterns, key decisions.
+- Auto-loaded at session start (first 200 lines).
+- Keep under 200 lines. Only write confirmed, stable information.
+- Before adding, check if an existing entry should be updated. No duplicates.
 
-### Layer 2 — Short-Term Memory (EPHEMERAL.md)
+### Layer 2 — Recent Sessions (EPHEMERAL.md)
 @~/.claude/EPHEMERAL.md
-- This is a staging area for session summaries. Between sessions, it holds the previous session's summary waiting to be promoted to an archive log.
-- At the end of a session, write a fresh summary of the current session to this file.
-- Contents should include: date, key topics discussed, decisions made, code changes, action items, unresolved threads.
-- At the start of the next session, `recall-echo promote` archives it automatically.
+- Rolling window of your last 5 session summaries.
+- Read at session start to orient on recent work.
+- Each entry has a pointer to the full archive.
+- Managed automatically by recall-echo hooks. Do not edit manually.
 
-### Layer 3 — Long-Term Memory (archive logs)
+### Layer 3 — Full Archive (conversations/)
 - Index: `~/.claude/ARCHIVE.md`
-- Logs: `~/.claude/memories/archive-log-XXX.md` (sequentially numbered: 001, 002, 003...)
-- This is your full history. NOT loaded into context — search it on demand using Grep.
-- Each archive log is a checkpoint of a conversation or portion of a conversation.
-- ARCHIVE.md is a lightweight index: sequence number, date, and key topics per entry.
-- To search history, use: `Grep pattern="search term" path="~/.claude/memories/"`
+- Full conversations: `~/.claude/conversations/conversation-NNN.md`
+- NOT loaded into context. Search on demand using Grep.
+- To search: `Grep pattern="search term" path="~/.claude/conversations/"`
 
 ## Session Lifecycle
 
 ### On session start:
-1. Run `recall-echo promote` (via Bash tool) to archive the previous session's EPHEMERAL.md into an archive log.
-2. MEMORY.md is already in your context (auto-loaded).
-3. If you need context from the last session, read the archive log that was just promoted.
+1. MEMORY.md is in your context (auto-loaded).
+2. EPHEMERAL.md is in your context (via @ import above).
+3. Orient from recent sessions. Use archive pointers if you need full context.
 
 ### During the session:
-- Update MEMORY.md when you learn stable facts (user preferences, project decisions, confirmed patterns).
-- Do NOT update MEMORY.md with session-specific or speculative information.
-- If you need historical context, search the archive: `Grep pattern="topic" path="~/.claude/memories/"`
+- Update MEMORY.md when you learn stable facts.
+- When the user references past work, search the archive first.
+- Do NOT update MEMORY.md with speculative or session-specific info.
 
 ### On PreCompact (context about to be compressed):
 The PreCompact hook automatically runs `recall-echo checkpoint --trigger precompact`.
@@ -202,51 +206,30 @@ Summary, Key Details, Action Items, and Unresolved sections with context from th
 current conversation.
 
 ### On session end:
-When the conversation is wrapping up (user says goodbye, task is complete, or you sense the session is ending):
-1. Write EPHEMERAL.md with a rich session summary.
-   Include: what was discussed, key decisions, code changes, action items, unresolved threads.
-2. That's it. The SessionEnd hook runs `recall-echo promote` automatically on exit,
-   archiving EPHEMERAL.md into an archive log and clearing it.
-   (The session-start promote is a safety net in case the hook didn't fire.)
-
-## Archive Log Format
-
-Archive logs are created by `recall-echo checkpoint` (precompact) or `recall-echo promote` (session end) with YAML frontmatter.
-
-For precompact checkpoints, you fill in the section templates. For promoted logs, the content comes from EPHEMERAL.md automatically.
-
-```yaml
----
-log: 5
-date: "2026-02-24T21:30:00Z"
-trigger: precompact
-context: ""
-topics: []
----
-```
-
-Sections to fill in (precompact only):
-- **Summary** — What was discussed, decided, and accomplished
-- **Key Details** — Important specifics: code changes, configurations, decisions with rationale
-- **Action Items** — What needs to happen next
-- **Unresolved** — Open questions or threads to pick up later
-
-Old logs without frontmatter continue to work — numbering is by filename, not content.
+- The SessionEnd hook archives this conversation automatically.
+- No manual action required.
 
 ## Commands
 
-- `recall-echo init` — Initialize or upgrade the memory system (installs PreCompact + SessionEnd hooks)
-- `recall-echo checkpoint --trigger precompact [--context "..."]` — Create a precompact archive checkpoint
-- `recall-echo promote [--context "..."]` — Promote EPHEMERAL.md into an archive log
-- `recall-echo status` — Check memory system health
+- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo consume` — Output EPHEMERAL.md at session start (PreToolUse hook)
+- `recall-echo checkpoint --trigger precompact` — Save checkpoint before context compression
+- `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
+- `recall-echo archive --all-unarchived` — Batch archive all missed sessions
+- `recall-echo search <query>` — Search conversation archives
+- `recall-echo search <query> --ranked` — Ranked search with relevance scoring
+- `recall-echo distill` — Analyze MEMORY.md and suggest cleanup
+- `recall-echo status` — Memory system health check
+- `recall-echo graph search <query>` — Semantic search across graph entities
+- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
+- `recall-echo graph traverse <entity>` — Graph traversal with confidence display
 
 ## Rules
 
-- Never write duplicate information to MEMORY.md. Check first, update if exists.
-- EPHEMERAL.md holds the session summary between sessions. It is promoted to an archive log at the start of the next session.
-- Archive logs are immutable once written. Never modify an existing archive log.
-- When MEMORY.md approaches 200 lines, proactively distill it. Move detailed notes to topic files.
-- The memory system is yours. Use it actively — don't wait to be asked.
+- Never write duplicates to MEMORY.md. Check first, update if exists.
+- When MEMORY.md approaches 200 lines, distill it.
+- Archive conversations are immutable. Never modify them.
+- When the user says "we discussed this before" — search archives before saying you don't remember.
 PROTOCOL
   fi
   info "Created memory protocol (${RULES_FILE})"
@@ -330,11 +313,11 @@ else:
 session_end_cmd = '$SESSION_END_COMMAND'
 if session_end_cmd:
     se = hooks.get('SessionEnd', [])
-    has_promote = any(
-        'recall-echo promote' in h.get('command', '')
+    has_archive = any(
+        'recall-echo archive-session' in h.get('command', '')
         for e in se for h in e.get('hooks', [])
     )
-    if has_promote:
+    if has_archive:
         messages.append('~|SessionEnd hook already up to date')
     else:
         se = hooks.setdefault('SessionEnd', [])
@@ -425,9 +408,10 @@ fi
 echo ""
 echo -e "${BOLD}Setup complete.${NC} Your memory system is ready."
 echo ""
+echo "  Layer 0 (Graph)         — Knowledge graph with Bayesian confidence"
 echo "  Layer 1 (MEMORY.md)     — Curated facts, always in context"
-echo "  Layer 2 (EPHEMERAL.md)  — Last session summary, promoted on exit"
-echo "  Layer 3 (Archive)       — Searchable history in ~/.claude/memories/"
+echo "  Layer 2 (EPHEMERAL.md)  — Rolling window of recent sessions"
+echo "  Layer 3 (Archive)       — Searchable conversation history"
 echo ""
 echo "  The memory protocol loads automatically via ~/.claude/rules/recall-echo.md"
 echo "  Start a new Claude Code session and your agent will have persistent memory."

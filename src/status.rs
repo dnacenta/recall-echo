@@ -1,6 +1,6 @@
 //! Memory system health check.
 //!
-//! Quick status overview of the three-layer memory system.
+//! Quick status overview of the four-layer memory system.
 //! For the full ASCII art dashboard, use the `dashboard` module.
 
 use std::fs;
