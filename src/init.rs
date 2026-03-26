@@ -1,7 +1,7 @@
 //! Initialize the recall-echo memory system.
 //!
 //! Creates the directory structure and template files needed for
-//! three-layer memory, knowledge graph, hooks, and LLM provider config.
+//! four-layer memory (graph, curated, short-term, long-term), hooks, and LLM provider config.
 
 use std::fs;
 use std::io::{self, BufRead, Write as _};

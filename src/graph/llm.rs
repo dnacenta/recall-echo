@@ -1,6 +1,6 @@
 //! Minimal LLM provider trait for knowledge graph operations.
 //!
-//! recall-graph defines its own trait to stay independent of echo-system-types.
+//! recall-graph defines its own trait to stay independent of pulse-system-types.
 //! Callers implement this to bridge their actual LLM backend.
 
 use super::error::GraphError;

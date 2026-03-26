@@ -1,8 +1,15 @@
 # recall-echo — Memory Protocol
 
-You have a persistent three-layer memory system. Use it to maintain continuity across sessions.
+You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
 
 ## Memory Layers
+
+### Layer 0 — Knowledge Graph (structured, semantic)
+- Embedded SurrealDB graph database with FastEmbed local embeddings.
+- Stores entities, relationships, and conversation episodes.
+- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
+- Semantic search finds memories by meaning, not just keywords.
+- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
 
 ### Layer 1 — Curated Memory (MEMORY.md)
 - Location: `~/.claude/memory/MEMORY.md`
@@ -57,6 +64,9 @@ current conversation.
 - `recall-echo search <query> --ranked` — Ranked search with relevance scoring
 - `recall-echo distill` — Analyze MEMORY.md and suggest cleanup
 - `recall-echo status` — Memory system health check
+- `recall-echo graph search <query>` — Semantic search across graph entities
+- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
+- `recall-echo graph traverse <entity>` — Graph traversal with confidence display
 
 ## Rules
 
