@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "3.3.0"
+version = "3.4.0"
 edition = "2021"
 description = "Persistent memory system with knowledge graph — for any LLM tool"
 license = "AGPL-3.0-only"
@@ -31,7 +31,7 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 async-trait = { version = "0.1", optional = true }
 
 # Pulse-null integration (optional) — plugin system for pulse-null entities
-pulse-system-types = { version = "0.5", optional = true }
+pulse-system-types = { version = "0.6", optional = true }
 
 [features]
 default = ["graph"]
