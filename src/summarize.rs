@@ -84,6 +84,7 @@ pub async fn summarize_conversation(
     let llm_messages = vec![Message {
         role: Role::User,
         content: MessageContent::Text(condensed),
+        source: None,
     }];
 
     let response = provider
