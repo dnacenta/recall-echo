@@ -128,6 +128,7 @@ mod tests {
         Message {
             role: Role::User,
             content: MessageContent::Text(text.to_string()),
+            source: None,
         }
     }
 
@@ -135,6 +136,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: MessageContent::Text(text.to_string()),
+            source: None,
         }
     }
 
@@ -146,6 +148,7 @@ mod tests {
                 name: name.to_string(),
                 input: serde_json::json!({"file_path": path}),
             }]),
+            source: None,
         }
     }
 
@@ -190,6 +193,7 @@ mod tests {
         let msgs = vec![Message {
             role: Role::User,
             content: MessageContent::Text("   ".to_string()),
+            source: None,
         }];
         let conv = messages_to_conversation(&msgs, "test");
         assert_eq!(conv.user_message_count, 0);

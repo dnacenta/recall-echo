@@ -128,6 +128,7 @@ impl crate::graph::llm::LlmProvider for GraphLlmBridge<'_> {
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(user_message.to_string()),
+            source: None,
         }];
 
         let response = self
