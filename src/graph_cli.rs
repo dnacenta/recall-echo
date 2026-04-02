@@ -882,6 +882,117 @@ fn find_conversations_dir(memory_dir: &Path) -> Result<PathBuf, String> {
     Err("conversations/ directory not found".into())
 }
 
+/// Run garbage collection on the graph.
+#[allow(clippy::too_many_arguments)]
+pub fn gc(
+    memory_dir: &Path,
+    execute: bool,
+    stale_days: u64,
+    stale_confidence: f64,
+    dead_confidence: f64,
+    dead_min_age_days: u64,
+    stats_only: bool,
+) -> Result<(), String> {
+    use crate::graph::gc::{GcActionKind, GcConfig};
+
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if stats_only {
+            let stats = gm.gc_stats().await.map_err(|e| e.to_string())?;
+            println!("{BOLD}Graph Health{RESET}");
+            println!("  Entities:              {}", stats.total_entities);
+            println!("  Relationships:         {}", stats.total_relationships);
+            println!(
+                "  Pipeline entities:     {} {DIM}(protected){RESET}",
+                stats.pipeline_entities
+            );
+            println!("  Zero-access entities:  {}", stats.zero_access_entities);
+            println!(
+                "  Low confidence rels:   {} {DIM}(< 0.5){RESET}",
+                stats.low_confidence_rels
+            );
+            println!(
+                "  Very low conf. rels:   {} {DIM}(< 0.2){RESET}",
+                stats.very_low_confidence_rels
+            );
+            println!("  Superseded rels:       {}", stats.superseded_rels);
+            return Ok(());
+        }
+
+        let config = GcConfig {
+            stale_days,
+            stale_confidence,
+            dead_confidence,
+            dead_min_age_days,
+            dry_run: !execute,
+            protect_pipeline: true,
+        };
+
+        let report = gm.run_gc(&config).await.map_err(|e| e.to_string())?;
+
+        // Header
+        if report.dry_run {
+            println!(
+                "{BOLD}{YELLOW}GC Dry Run{RESET} {DIM}(pass --execute to actually delete){RESET}"
+            );
+        } else {
+            println!("{BOLD}{GREEN}GC Executed{RESET}");
+        }
+
+        println!("\n{BOLD}Scan{RESET}");
+        println!("  Entities scanned:      {}", report.entities_scanned);
+        println!("  Relationships scanned: {}", report.relationships_scanned);
+
+        println!("\n{BOLD}Results{RESET}");
+        println!("  Stale relationships:   {}", report.stale_relationships);
+        println!("  Dead relationships:    {}", report.dead_relationships);
+        println!("  Orphaned entities:     {}", report.orphaned_entities);
+
+        let verb = if report.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        };
+        println!("  Total {verb}:         {}", report.total_removed);
+
+        // Details
+        if !report.actions.is_empty() {
+            println!("\n{BOLD}Actions{RESET}");
+            for action in &report.actions {
+                let icon = match action.kind {
+                    GcActionKind::StaleRelationship => format!("{YELLOW}⚠{RESET}"),
+                    GcActionKind::DeadRelationship => format!("{YELLOW}✗{RESET}"),
+                    GcActionKind::OrphanedEntity => format!("{CYAN}○{RESET}"),
+                };
+                println!(
+                    "  {icon} [{kind}] {name}",
+                    kind = action.kind,
+                    name = action.target_name,
+                );
+                println!("    {DIM}{reason}{RESET}", reason = action.reason);
+            }
+        }
+
+        if !report.errors.is_empty() {
+            println!("\n{BOLD}Errors{RESET}");
+            for err in &report.errors {
+                println!("  \x1b[31m✗\x1b[0m {err}");
+            }
+        }
+
+        Ok(())
+    })
+}
+
 /// Find the archive file for a given log number.
 #[cfg(feature = "llm")]
 fn find_archive_file(conversations_dir: &Path, log_number: u32) -> Result<PathBuf, String> {

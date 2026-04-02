@@ -296,6 +296,41 @@ pub async fn get_entity_detail(
     deserialize_take_opt(&mut response, 0)
 }
 
+/// Delete a single relationship by its record ID.
+pub async fn delete_relationship(db: &Surreal<Db>, id: &str) -> Result<(), GraphError> {
+    db.query("DELETE FROM type::record($id)")
+        .bind(("id", id.to_string()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// Get all relationships in the graph (for GC scanning).
+pub async fn list_all_relationships(db: &Surreal<Db>) -> Result<Vec<Relationship>, GraphError> {
+    let mut response = db.query("SELECT * FROM relates_to").await?;
+    super::deserialize_take(&mut response, 0)
+}
+
+/// Count relationships for a given entity.
+pub async fn count_relationships(db: &Surreal<Db>, entity_id: &str) -> Result<u64, GraphError> {
+    let mut response = db
+        .query(
+            r#"SELECT count() AS count FROM relates_to
+               WHERE in = type::record($id) OR out = type::record($id)
+               GROUP ALL"#,
+        )
+        .bind(("id", entity_id.to_string()))
+        .await?;
+
+    #[derive(serde::Deserialize)]
+    struct Row {
+        count: u64,
+    }
+
+    let rows: Vec<Row> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows.first().map(|r| r.count).unwrap_or(0))
+}
+
 /// Batch increment access counts for multiple entities.
 pub async fn increment_access_counts(db: &Surreal<Db>, ids: &[String]) -> Result<(), GraphError> {
     if ids.is_empty() {

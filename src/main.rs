@@ -227,6 +227,27 @@ enum GraphCommands {
         #[command(subcommand)]
         command: PipelineCommands,
     },
+    /// Garbage collection — prune stale/dead relationships and orphaned entities
+    Gc {
+        /// Actually delete (default is dry-run)
+        #[arg(long)]
+        execute: bool,
+        /// Days before a low-confidence relationship is stale (default: 30)
+        #[arg(long, default_value = "30")]
+        stale_days: u64,
+        /// Confidence threshold for stale relationships (default: 0.5)
+        #[arg(long, default_value = "0.5")]
+        stale_confidence: f64,
+        /// Confidence threshold for dead relationships (default: 0.2)
+        #[arg(long, default_value = "0.2")]
+        dead_confidence: f64,
+        /// Minimum age in days for dead relationship pruning (default: 14)
+        #[arg(long, default_value = "14")]
+        dead_min_age_days: u64,
+        /// Only show graph health stats, don't compute GC candidates
+        #[arg(long)]
+        stats_only: bool,
+    },
     /// Sync vigil-pulse signals and outcomes into the graph
     VigilSync {
         /// Path to signals.json (defaults to {entity_root}/vigil/signals.json)
@@ -417,6 +438,22 @@ fn main() {
                     &memory_dir,
                     signals_path.as_deref(),
                     outcomes_path.as_deref(),
+                ),
+                GraphCommands::Gc {
+                    execute,
+                    stale_days,
+                    stale_confidence,
+                    dead_confidence,
+                    dead_min_age_days,
+                    stats_only,
+                } => graph_cli::gc(
+                    &memory_dir,
+                    execute,
+                    stale_days,
+                    stale_confidence,
+                    dead_confidence,
+                    dead_min_age_days,
+                    stats_only,
                 ),
                 GraphCommands::Pipeline { command } => match command {
                     PipelineCommands::Sync { docs_dir } => {
