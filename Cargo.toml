@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "3.4.1"
+version = "3.5.0"
 edition = "2021"
 description = "Persistent memory system with knowledge graph — for any LLM tool"
 license = "AGPL-3.0-only"

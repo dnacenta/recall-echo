@@ -9,6 +9,7 @@ pub mod dedup;
 pub mod embed;
 pub mod error;
 pub mod extract;
+pub mod gc;
 pub mod ingest;
 pub mod llm;
 pub mod pipeline;
@@ -343,6 +344,23 @@ impl GraphMemory {
         outcomes_path: &std::path::Path,
     ) -> Result<VigilSyncReport, GraphError> {
         vigil_sync::sync_vigil(self, signals_path, outcomes_path).await
+    }
+
+    // --- Garbage Collection ---
+
+    /// Run garbage collection with the given config.
+    pub async fn run_gc(&self, config: &gc::GcConfig) -> Result<gc::GcReport, GraphError> {
+        gc::run_gc(&self.db, config).await
+    }
+
+    /// Get GC health stats without running collection.
+    pub async fn gc_stats(&self) -> Result<gc::GcStatsReport, GraphError> {
+        gc::stats_only(&self.db).await
+    }
+
+    /// Delete a single relationship by ID.
+    pub async fn delete_relationship(&self, id: &str) -> Result<(), GraphError> {
+        crud::delete_relationship(&self.db, id).await
     }
 
     // --- Stats ---
