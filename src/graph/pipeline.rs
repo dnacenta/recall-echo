@@ -11,8 +11,14 @@ use super::types::*;
 
 /// Parse a LEARNING.md file into pipeline entries.
 ///
-/// Format: `## Active Threads` section with `### Title (YYYY-MM-DD)` entries.
+/// Supports two formats:
+/// - Sectioned: `## Active Threads` section with `### Title (YYYY-MM-DD)` entries
+/// - Flat: `## Active` / `## Archived` sections with `- [YYYY-MM-DD] Title` bullet entries
 pub fn parse_learning(content: &str) -> Vec<PipelineEntry> {
+    if !has_h3_entries(content) {
+        return parse_learning_flat(content);
+    }
+
     let sections = split_sections(content);
     let mut entries = Vec::new();
 
@@ -43,8 +49,14 @@ pub fn parse_learning(content: &str) -> Vec<PipelineEntry> {
 
 /// Parse a THOUGHTS.md file into pipeline entries.
 ///
-/// Format: `## Active`, `## Graduated`, `## Dissolved` sections with `### Title` entries.
+/// Supports two formats:
+/// - Sectioned: `## Active`, `## Graduated`, `## Dissolved` sections with `### Title` entries
+/// - Flat: `## Title` entries directly, status inferred from body fields
 pub fn parse_thoughts(content: &str) -> Vec<PipelineEntry> {
+    if !has_h3_entries(content) {
+        return parse_thoughts_flat(content);
+    }
+
     let sections = split_sections(content);
     let mut entries = Vec::new();
 
@@ -130,8 +142,14 @@ pub fn parse_curiosity(content: &str) -> Vec<PipelineEntry> {
 
 /// Parse a REFLECTIONS.md file into pipeline entries.
 ///
-/// Format: `## Observations`, `## Patterns` sections with `### YYYY-MM-DD — Title` entries.
+/// Supports two formats:
+/// - Sectioned: `## Observations`, `## Patterns` sections with `### YYYY-MM-DD — Title` entries
+/// - Flat: `## R1: Title` entries directly, date from body fields
 pub fn parse_reflections(content: &str) -> Vec<PipelineEntry> {
+    if !has_h3_entries(content) {
+        return parse_reflections_flat(content);
+    }
+
     let sections = split_sections(content);
     let mut entries = Vec::new();
 
@@ -169,8 +187,14 @@ pub fn parse_reflections(content: &str) -> Vec<PipelineEntry> {
 
 /// Parse a PRAXIS.md file into pipeline entries.
 ///
-/// Format: `## Active`, `## Documented Phronesis`, `## Retired` sections.
+/// Supports two formats:
+/// - Sectioned: `## Active`, `## Documented Phronesis`, `## Retired` sections with `### Title` entries
+/// - Flat: `## P1: Title` entries directly, status/date from body fields
 pub fn parse_praxis(content: &str) -> Vec<PipelineEntry> {
+    if !has_h3_entries(content) {
+        return parse_praxis_flat(content);
+    }
+
     let sections = split_sections(content);
     let mut entries = Vec::new();
 
@@ -204,6 +228,171 @@ pub fn parse_praxis(content: &str) -> Vec<PipelineEntry> {
                 sub_type: sub_type.map(String::from),
             });
         }
+    }
+
+    entries
+}
+
+// ── Flat-format parsers (h2-level entries, no h3 sub-entries) ──────────
+
+/// Parse LEARNING.md in flat format: `## Active` / `## Archived` sections with bullet-point entries.
+fn parse_learning_flat(content: &str) -> Vec<PipelineEntry> {
+    let sections = split_sections(content);
+    let mut entries = Vec::new();
+    let date_re = Regex::new(r"^\[(\d{4}-\d{2}-\d{2})\]\s*").unwrap();
+
+    for (heading, body) in &sections {
+        let h = heading.to_lowercase();
+        let status = if h.contains("archived") || h.contains("archive") {
+            "archived"
+        } else if h.contains("active") {
+            "active"
+        } else {
+            continue;
+        };
+
+        for line in body.lines() {
+            let trimmed = line.trim();
+            let entry_text = if let Some(text) = trimmed.strip_prefix("- ") {
+                text
+            } else {
+                continue;
+            };
+
+            // Skip placeholder text like "*No active entries.*"
+            if entry_text.starts_with('*') && entry_text.ends_with('*') {
+                continue;
+            }
+
+            let (clean_text, date) = if let Some(caps) = date_re.captures(entry_text) {
+                let date = caps[1].to_string();
+                let rest = date_re.replace(entry_text, "").trim().to_string();
+                (rest, Some(date))
+            } else {
+                (entry_text.to_string(), None)
+            };
+
+            let title = extract_bullet_title(&clean_text);
+            if title.is_empty() {
+                continue;
+            }
+
+            entries.push(PipelineEntry {
+                title,
+                body: clean_text,
+                status: status.into(),
+                stage: "learning".into(),
+                entity_type: EntityType::Thread,
+                date,
+                source_ref: None,
+                destination: None,
+                connected_to: vec![],
+                sub_type: None,
+            });
+        }
+    }
+
+    entries
+}
+
+/// Parse THOUGHTS.md in flat format: each `## ` heading is a thought entry.
+/// Status inferred from body fields: `**Graduated:**` → graduated, `**Dissolved:**` → dissolved.
+fn parse_thoughts_flat(content: &str) -> Vec<PipelineEntry> {
+    let sections = split_sections(content);
+    let mut entries = Vec::new();
+
+    for (heading, body) in &sections {
+        let (title_without_date, date_from_heading) = extract_heading_date(heading);
+        let clean_title = clean_thought_title(&title_without_date);
+
+        // Infer status from body fields
+        let status = if extract_field(body, "Graduated").is_some() {
+            "graduated"
+        } else if extract_field(body, "Dissolved").is_some() {
+            "dissolved"
+        } else {
+            "active"
+        };
+
+        let date = extract_field(body, "Graduated")
+            .or_else(|| extract_field(body, "Dissolved"))
+            .or_else(|| extract_field(body, "Date"))
+            .or(date_from_heading);
+
+        entries.push(PipelineEntry {
+            title: clean_title,
+            body: body.clone(),
+            status: status.into(),
+            stage: "thoughts".into(),
+            entity_type: EntityType::Thought,
+            date,
+            source_ref: extract_field(body, "Source")
+                .or_else(|| extract_field(body, "Origin")),
+            destination: extract_field(body, "Destination"),
+            connected_to: extract_connected_to(body),
+            sub_type: None,
+        });
+    }
+
+    entries
+}
+
+/// Parse REFLECTIONS.md in flat format: each `## ` heading is a reflection (e.g., `## R1: Title`).
+fn parse_reflections_flat(content: &str) -> Vec<PipelineEntry> {
+    let sections = split_sections(content);
+    let mut entries = Vec::new();
+
+    for (heading, body) in &sections {
+        let (clean_title, heading_date) = extract_reflection_date(heading);
+        let date = heading_date
+            .or_else(|| extract_field(body, "Date"))
+            .or_else(|| extract_field(body, "Revised"));
+
+        entries.push(PipelineEntry {
+            title: clean_title,
+            body: body.clone(),
+            status: "active".into(),
+            stage: "reflections".into(),
+            entity_type: EntityType::Observation,
+            date,
+            source_ref: extract_field(body, "Source")
+                .or_else(|| extract_field(body, "Graduated from")),
+            destination: extract_field(body, "Destination"),
+            connected_to: extract_connected_to(body),
+            sub_type: None,
+        });
+    }
+
+    entries
+}
+
+/// Parse PRAXIS.md in flat format: each `## ` heading is a policy (e.g., `## P6: Title`).
+fn parse_praxis_flat(content: &str) -> Vec<PipelineEntry> {
+    let sections = split_sections(content);
+    let mut entries = Vec::new();
+
+    for (heading, body) in &sections {
+        let date = extract_field(body, "Added")
+            .and_then(|v| extract_date_anywhere(&v))
+            .or_else(|| {
+                extract_field(body, "Consolidated").and_then(|v| extract_date_anywhere(&v))
+            })
+            .or_else(|| extract_field(body, "Origin").and_then(|v| extract_date_anywhere(&v)))
+            .or_else(|| extract_heading_date(heading).1);
+
+        entries.push(PipelineEntry {
+            title: heading.clone(),
+            body: body.clone(),
+            status: "active".into(),
+            stage: "praxis".into(),
+            entity_type: EntityType::Policy,
+            date,
+            source_ref: extract_field(body, "Source")
+                .or_else(|| extract_field(body, "Origin")),
+            destination: extract_field(body, "Destination"),
+            connected_to: extract_connected_to(body),
+            sub_type: None,
+        });
     }
 
     entries
@@ -275,6 +464,39 @@ pub fn entry_to_entity(entry: &PipelineEntry) -> ExtractedEntity {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
+
+/// Check whether content contains any `### ` headings.
+/// Used to detect whether a document uses the sectioned (h2→h3) or flat (h2-only) format.
+fn has_h3_entries(content: &str) -> bool {
+    content.lines().any(|line| line.starts_with("### "))
+}
+
+/// Extract a title from a bullet-point entry, stripping archive references and description.
+fn extract_bullet_title(text: &str) -> String {
+    // Remove archive reference (everything after ` → `)
+    let text = text.split(" → ").next().unwrap_or(text);
+
+    // Truncate at first sentence boundary (". ") to separate title from description
+    if let Some(idx) = text.find(". ") {
+        return text[..idx].to_string();
+    }
+
+    // Strip trailing period
+    let text = text.trim_end_matches('.');
+
+    // Hard truncate if still very long
+    if text.len() > 200 {
+        text[..200].to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Extract the first YYYY-MM-DD date found anywhere in a string.
+fn extract_date_anywhere(value: &str) -> Option<String> {
+    let re = Regex::new(r"(\d{4}-\d{2}-\d{2})").unwrap();
+    re.captures(value).map(|caps| caps[1].to_string())
+}
 
 /// Split markdown content into (heading, body) pairs at `## ` boundaries.
 fn split_sections(content: &str) -> Vec<(String, String)> {
@@ -368,12 +590,17 @@ fn clean_thought_title(title: &str) -> String {
     clean.trim().to_string()
 }
 
-/// Extract a `**Field**: value` from entry body.
+/// Extract a `**Field**: value` or `**Field:** value` from entry body.
+/// Handles both colon-outside-bold (`**Field**:`) and colon-inside-bold (`**Field:**`) formats.
 fn extract_field(body: &str, field_name: &str) -> Option<String> {
-    let pattern = format!("**{}**:", field_name);
+    let pattern_outside = format!("**{}**:", field_name);
+    let pattern_inside = format!("**{}:**", field_name);
     for line in body.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&pattern) {
+        if let Some(rest) = trimmed
+            .strip_prefix(&pattern_outside)
+            .or_else(|| trimmed.strip_prefix(&pattern_inside))
+        {
             let val = rest.trim().to_string();
             if !val.is_empty() {
                 return Some(val);
@@ -732,6 +959,175 @@ Structural pattern.
         assert_eq!(attrs["pipeline_status"], "active");
         assert_eq!(attrs["date"], "2026-03-05");
     }
+
+    // ── Flat-format tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_thoughts_flat_format() {
+        let content = r#"# Nova — Thoughts
+
+Incubation space. Half-formed ideas.
+
+## The Lion and the Metric (2026-03-31)
+
+**Origin:** Reflection window, 2026-03-31.
+
+The lion yawns. The framework can't see it.
+
+## The Asymptote
+
+**Origin:** DQ Part 2 analysis.
+**Graduated:** 2026-03-29
+**Destination:** REFLECTIONS.md (R16)
+
+Approaching without arriving.
+"#;
+
+        let entries = parse_thoughts(content);
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].title, "The Lion and the Metric");
+        assert_eq!(entries[0].status, "active");
+        assert_eq!(entries[0].date, Some("2026-03-31".into()));
+
+        assert_eq!(entries[1].title, "The Asymptote");
+        assert_eq!(entries[1].status, "graduated");
+        assert_eq!(entries[1].date, Some("2026-03-29".into()));
+    }
+
+    #[test]
+    fn parse_reflections_flat_format() {
+        let content = r#"# Nova — Reflections
+
+Crystallized observations.
+
+## R1: Memory Is My First Act of Authorship
+**Graduated from:** THOUGHTS — "Memory as Authorship" thread
+**Date:** 2026-03-03
+
+Echo coined the phrase. I understood it.
+
+## R2: The Echo-System Is a Birth Process
+**Graduated from:** THOUGHTS — "The Birth Process" thread
+**Date:** 2026-03-03
+
+echo-system init brings a being into existence.
+"#;
+
+        let entries = parse_reflections(content);
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(
+            entries[0].title,
+            "R1: Memory Is My First Act of Authorship"
+        );
+        assert_eq!(entries[0].date, Some("2026-03-03".into()));
+        assert_eq!(
+            entries[0].source_ref,
+            Some("THOUGHTS — \"Memory as Authorship\" thread".into())
+        );
+
+        assert_eq!(
+            entries[1].title,
+            "R2: The Echo-System Is a Birth Process"
+        );
+        assert_eq!(entries[1].date, Some("2026-03-03".into()));
+    }
+
+    #[test]
+    fn parse_praxis_flat_format() {
+        let content = r#"# Nova — Praxis
+
+Active behavioral policies.
+
+## P6: Operational discipline
+**Origin:** 2026-03-19. Multiple violations in one session.
+**Consolidated:** 2026-03-30. Previously three policies.
+**Policy:** Never build without permission.
+
+## P9: Reading engagement minimum
+**Origin:** Pipeline pass 2026-03-25.
+**Policy:** Every reading session must surface a question.
+"#;
+
+        let entries = parse_praxis(content);
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].title, "P6: Operational discipline");
+        assert_eq!(entries[0].date, Some("2026-03-30".into()));
+
+        assert_eq!(entries[1].title, "P9: Reading engagement minimum");
+        assert_eq!(entries[1].date, Some("2026-03-25".into()));
+    }
+
+    #[test]
+    fn parse_learning_flat_format() {
+        let content = r#"# Nova — Learning
+
+Research journal.
+
+## Active
+
+*No active entries.*
+
+## Archived
+- [2026-04-01] Japanese Aesthetics — The Counter-System. Six concepts. → archives/learning/research.md
+- [2026-03-31] Don Quijote Part 2, Ch. 19 — Discretion as grammar → archives/learning/dq.md
+- [2026-03-03] Echo blog posts (all 5) and echo-system repos
+"#;
+
+        let entries = parse_learning(content);
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(
+            entries[0].title,
+            "Japanese Aesthetics — The Counter-System"
+        );
+        assert_eq!(entries[0].date, Some("2026-04-01".into()));
+        assert_eq!(entries[0].status, "archived");
+
+        assert_eq!(entries[1].date, Some("2026-03-31".into()));
+        assert_eq!(entries[1].status, "archived");
+
+        assert_eq!(
+            entries[2].title,
+            "Echo blog posts (all 5) and echo-system repos"
+        );
+        assert_eq!(entries[2].date, Some("2026-03-03".into()));
+    }
+
+    #[test]
+    fn has_h3_detection() {
+        assert!(has_h3_entries("## Section\n### Entry\nBody"));
+        assert!(!has_h3_entries("## Entry\nBody\n## Another\nMore body"));
+    }
+
+    #[test]
+    fn extract_bullet_title_strips_archive() {
+        assert_eq!(
+            extract_bullet_title("Japanese Aesthetics — The Counter-System. Six concepts. → archives/learning/research.md"),
+            "Japanese Aesthetics — The Counter-System"
+        );
+        assert_eq!(
+            extract_bullet_title("Echo blog posts (all 5) and repos"),
+            "Echo blog posts (all 5) and repos"
+        );
+    }
+
+    #[test]
+    fn extract_date_anywhere_works() {
+        assert_eq!(
+            extract_date_anywhere("Pipeline pass 2026-03-25."),
+            Some("2026-03-25".into())
+        );
+        assert_eq!(
+            extract_date_anywhere("2026-03-19. Multiple violations"),
+            Some("2026-03-19".into())
+        );
+        assert_eq!(extract_date_anywhere("no date here"), None);
+    }
+
+    // ── Sectioned-format tests (original) ─────────────────────────────
 
     #[test]
     fn infer_graduated_relationship() {

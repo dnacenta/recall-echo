@@ -54,8 +54,12 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS description ON relates_to TYPE option<string>;
         DEFINE FIELD IF NOT EXISTS valid_from  ON relates_to TYPE datetime DEFAULT time::now();
         DEFINE FIELD IF NOT EXISTS valid_until ON relates_to TYPE option<datetime>;
-        DEFINE FIELD IF NOT EXISTS confidence  ON relates_to TYPE float DEFAULT 1.0;
-        DEFINE FIELD IF NOT EXISTS source      ON relates_to TYPE option<string>;
+        DEFINE FIELD IF NOT EXISTS confidence      ON relates_to TYPE float DEFAULT 1.0;
+        DEFINE FIELD IF NOT EXISTS last_reinforced ON relates_to TYPE datetime DEFAULT time::now();
+        DEFINE FIELD IF NOT EXISTS source          ON relates_to TYPE option<string>;
+
+        -- Backfill: set last_reinforced = valid_from on relationships that predate the field
+        UPDATE relates_to SET last_reinforced = valid_from WHERE last_reinforced IS NONE;
 
         DEFINE INDEX IF NOT EXISTS rel_type_idx ON relates_to FIELDS rel_type;
 

@@ -249,7 +249,6 @@ pub fn archive_conversation(
 }
 
 /// Ingest an archive result into the knowledge graph (if enabled).
-#[cfg(feature = "graph")]
 pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
     if result.log_number == 0 {
         return;
@@ -274,7 +273,6 @@ pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
 /// Sync pipeline documents into the graph (if auto_sync enabled).
 ///
 /// Non-blocking: logs warnings on failure but never fails the caller.
-#[cfg(feature = "graph")]
 pub fn pipeline_sync_on_archive(memory_dir: &Path) {
     let cfg = config::load_from_dir(memory_dir);
     let pipeline = match cfg.pipeline {
@@ -345,7 +343,7 @@ pub fn pipeline_sync_on_archive(memory_dir: &Path) {
 }
 
 /// Async version of pipeline_sync_on_archive for use in async contexts (pulse-null).
-#[cfg(all(feature = "graph", feature = "pulse-null"))]
+#[cfg(feature = "pulse-null")]
 async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
     let cfg = config::load_from_dir(memory_dir);
     let pipeline = match cfg.pipeline {
@@ -408,12 +406,10 @@ async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
     }
 }
 
-#[cfg(feature = "graph")]
 fn read_opt_file(dir: &Path, name: &str) -> String {
     fs::read_to_string(dir.join(name)).unwrap_or_default()
 }
 
-#[cfg(feature = "graph")]
 fn shellexpand_path(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -441,11 +437,8 @@ pub fn archive_from_jsonl(
     let result = archive_conversation(base_dir, &conv, &summary, "jsonl")?;
     let log_number = result.log_number;
 
-    #[cfg(feature = "graph")]
-    {
-        graph_ingest(base_dir, &result);
-        pipeline_sync_on_archive(base_dir);
-    }
+    graph_ingest(base_dir, &result);
+    pipeline_sync_on_archive(base_dir);
 
     Ok(log_number)
 }
@@ -583,7 +576,6 @@ pub async fn archive_session(
     let log_number = result.log_number;
 
     // Graph ingestion (async path — no need for Runtime)
-    #[cfg(feature = "graph")]
     if log_number > 0 {
         if let Err(e) = crate::graph_bridge::ingest_into_graph(
             memory_dir,

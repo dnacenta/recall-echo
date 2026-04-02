@@ -9,6 +9,7 @@ pub mod dedup;
 pub mod embed;
 pub mod error;
 pub mod extract;
+pub mod gc;
 pub mod ingest;
 pub mod llm;
 pub mod pipeline;
@@ -343,6 +344,13 @@ impl GraphMemory {
         outcomes_path: &std::path::Path,
     ) -> Result<VigilSyncReport, GraphError> {
         vigil_sync::sync_vigil(self, signals_path, outcomes_path).await
+    }
+
+    // --- Garbage Collection ---
+
+    /// Run garbage collection on the graph.
+    pub async fn gc(&self, config: &gc::GcConfig) -> Result<gc::GcStats, GraphError> {
+        gc::run_gc(&self.db, config).await
     }
 
     // --- Stats ---

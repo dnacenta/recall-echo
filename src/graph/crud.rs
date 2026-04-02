@@ -191,6 +191,7 @@ pub async fn add_relationship(
                 valid_from = time::now(),
                 valid_until = NONE,
                 confidence = $confidence,
+                last_reinforced = time::now(),
                 source = $source
             "#,
         )
@@ -242,6 +243,21 @@ pub async fn update_relationship_confidence(
     confidence: f64,
 ) -> Result<(), GraphError> {
     db.query("UPDATE type::record($id) SET confidence = $confidence")
+        .bind(("id", rel_id.to_string()))
+        .bind(("confidence", confidence))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// Update a relationship's confidence AND reset the last_reinforced timestamp.
+/// Used when a relationship is corroborated during ingestion.
+pub async fn reinforce_relationship(
+    db: &Surreal<Db>,
+    rel_id: &str,
+    confidence: f64,
+) -> Result<(), GraphError> {
+    db.query("UPDATE type::record($id) SET confidence = $confidence, last_reinforced = time::now()")
         .bind(("id", rel_id.to_string()))
         .bind(("confidence", confidence))
         .await?

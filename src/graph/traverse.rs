@@ -2,6 +2,7 @@
 
 use surrealdb::Surreal;
 
+use super::confidence::{effective_confidence, DecayConfig};
 use super::error::GraphError;
 use super::store::Db;
 use super::types::*;
@@ -66,6 +67,8 @@ fn traverse_from<'a>(
 
         let mut edges = Vec::new();
 
+        let decay_config = DecayConfig::default();
+
         // Get outgoing relationships that are still active
         let mut response = db
             .query(
@@ -75,17 +78,30 @@ fn traverse_from<'a>(
                 valid_from,
                 valid_until,
                 confidence,
+                last_reinforced,
                 out AS target_id
             FROM relates_to
             WHERE in = type::record($id)
               AND valid_until IS NONE
-              AND confidence >= 0.1
             "#,
             )
             .bind(("id", entity.id_string()))
             .await?;
 
         let outgoing: Vec<EdgeRow> = super::deserialize_take(&mut response, 0)?;
+        // Apply temporal decay and filter by effective confidence >= 0.1
+        let outgoing: Vec<EdgeRow> = outgoing
+            .into_iter()
+            .filter(|e| {
+                let eff = effective_confidence(
+                    e.confidence,
+                    e.last_reinforced.as_ref(),
+                    &e.valid_from,
+                    &decay_config,
+                );
+                eff >= 0.1
+            })
+            .collect();
         collect_edges(
             db,
             outgoing,
@@ -107,17 +123,30 @@ fn traverse_from<'a>(
                 valid_from,
                 valid_until,
                 confidence,
+                last_reinforced,
                 in AS target_id
             FROM relates_to
             WHERE out = type::record($id)
               AND valid_until IS NONE
-              AND confidence >= 0.1
             "#,
             )
             .bind(("id", entity.id_string()))
             .await?;
 
         let incoming: Vec<EdgeRow> = super::deserialize_take(&mut response, 0)?;
+        // Apply temporal decay and filter by effective confidence >= 0.1
+        let incoming: Vec<EdgeRow> = incoming
+            .into_iter()
+            .filter(|e| {
+                let eff = effective_confidence(
+                    e.confidence,
+                    e.last_reinforced.as_ref(),
+                    &e.valid_from,
+                    &decay_config,
+                );
+                eff >= 0.1
+            })
+            .collect();
         collect_edges(
             db,
             incoming,
@@ -138,6 +167,7 @@ fn traverse_from<'a>(
 }
 
 /// Process edge rows, load targets as L0, apply type filter, recurse.
+/// Uses effective (decayed) confidence for display.
 #[allow(clippy::too_many_arguments)]
 async fn collect_edges<'a>(
     db: &'a Surreal<Db>,
@@ -149,6 +179,8 @@ async fn collect_edges<'a>(
     type_filter: Option<&'a str>,
     edges: &'a mut Vec<TraversalEdge>,
 ) -> Result<(), GraphError> {
+    let decay_config = DecayConfig::default();
+
     for edge in edge_rows {
         let tid = edge.target_id_string();
 
@@ -176,13 +208,21 @@ async fn collect_edges<'a>(
             )
             .await?;
 
+            // Use effective (decayed) confidence for display
+            let eff_confidence = effective_confidence(
+                edge.confidence,
+                edge.last_reinforced.as_ref(),
+                &edge.valid_from,
+                &decay_config,
+            );
+
             edges.push(TraversalEdge {
                 rel_type: edge.rel_type,
                 direction: direction.to_string(),
                 target: child,
                 valid_from: edge.valid_from,
                 valid_until: edge.valid_until,
-                confidence: edge.confidence,
+                confidence: eff_confidence,
             });
         }
     }

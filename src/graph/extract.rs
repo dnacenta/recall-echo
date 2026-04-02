@@ -151,7 +151,7 @@ pub fn flatten_extraction(result: &ExtractionResult) -> Vec<ExtractedEntity> {
 
     for case in &result.cases {
         entities.push(ExtractedEntity {
-            name: format!("Case: {}", &case.problem[..case.problem.len().min(60)]),
+            name: format!("Case: {}", truncate_to_char_boundary(&case.problem, 60)),
             entity_type: EntityType::Case,
             abstract_text: format!("Problem: {} Solution: {}", case.problem, case.solution),
             overview: case.context.clone(),
@@ -188,6 +188,18 @@ pub fn flatten_extraction(result: &ExtractionResult) -> Vec<ExtractedEntity> {
     }
 
     entities
+}
+
+/// Truncate a string to at most `max_bytes` bytes, ensuring we land on a char boundary.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn strip_markdown_fencing(text: &str) -> String {

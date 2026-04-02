@@ -569,6 +569,144 @@ pub fn extract(
     })
 }
 
+// ── Garbage collection ───────────────────────────────────────────────
+
+/// Run garbage collection on the knowledge graph.
+#[allow(clippy::too_many_arguments)]
+pub fn gc(
+    memory_dir: &Path,
+    execute: bool,
+    stale_days: u64,
+    stale_confidence: f64,
+    dead_confidence: f64,
+    dead_min_age_days: u64,
+    protect_pipeline: bool,
+    stats_only: bool,
+    half_life_days: f64,
+) -> Result<(), String> {
+    use crate::graph::gc::{GcConfig, GcRemovalKind};
+
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if stats_only {
+            let stats = gm.stats().await.map_err(|e| e.to_string())?;
+            println!("{BOLD}Graph Health{RESET}");
+            println!("  Entities:      {}", stats.entity_count);
+            println!("  Relationships: {}", stats.relationship_count);
+            println!("  Episodes:      {}", stats.episode_count);
+            return Ok(());
+        }
+
+        let config = GcConfig {
+            stale_days,
+            stale_confidence,
+            dead_confidence,
+            dead_min_age_days,
+            dry_run: !execute,
+            protect_pipeline,
+            half_life_days,
+        };
+
+        let mode = if config.dry_run { "DRY RUN" } else { "EXECUTING" };
+        println!("{BOLD}Graph GC ({mode}){RESET}\n");
+
+        let result = gm.gc(&config).await.map_err(|e| e.to_string())?;
+
+        println!(
+            "  Scanned: {} entities, {} relationships",
+            result.entities_scanned, result.relationships_scanned
+        );
+
+        if result.total_removed() == 0 {
+            println!("\n  {GREEN}✓{RESET} Graph is clean — nothing to remove.");
+            return Ok(());
+        }
+
+        // Show details grouped by kind
+        let stale: Vec<_> = result
+            .details
+            .iter()
+            .filter(|d| d.kind == GcRemovalKind::StaleRelationship)
+            .collect();
+        let dead: Vec<_> = result
+            .details
+            .iter()
+            .filter(|d| d.kind == GcRemovalKind::DeadRelationship)
+            .collect();
+        let orphans: Vec<_> = result
+            .details
+            .iter()
+            .filter(|d| d.kind == GcRemovalKind::OrphanedEntity)
+            .collect();
+
+        if !stale.is_empty() {
+            println!(
+                "\n  {YELLOW}Stale relationships ({}):{RESET}",
+                stale.len()
+            );
+            for d in &stale {
+                println!("    {DIM}•{RESET} {}", d.reason);
+            }
+        }
+
+        if !dead.is_empty() {
+            println!(
+                "\n  {YELLOW}Dead relationships ({}):{RESET}",
+                dead.len()
+            );
+            for d in &dead {
+                println!("    {DIM}•{RESET} {}", d.reason);
+            }
+        }
+
+        if !orphans.is_empty() {
+            println!(
+                "\n  {YELLOW}Orphaned entities ({}):{RESET}",
+                orphans.len()
+            );
+            for d in &orphans {
+                let name = d.name.as_deref().unwrap_or("?");
+                println!("    {DIM}•{RESET} {name} — {}", d.reason);
+            }
+        }
+
+        if result.pipeline_protected > 0 {
+            println!(
+                "\n  {CYAN}Pipeline-protected:{RESET} {} entities spared",
+                result.pipeline_protected
+            );
+        }
+
+        println!(
+            "\n  {BOLD}Total:{RESET} {} relationships + {} entities {}",
+            result.stale_relationships + result.dead_relationships,
+            result.orphaned_entities,
+            if config.dry_run {
+                "would be removed"
+            } else {
+                "removed"
+            }
+        );
+
+        if config.dry_run {
+            println!(
+                "\n  {DIM}Run with --execute to actually delete.{RESET}"
+            );
+        }
+
+        Ok(())
+    })
+}
+
 // ── Vigil sync commands ──────────────────────────────────────────────
 
 /// Sync vigil-pulse signals and outcomes into the graph.

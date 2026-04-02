@@ -2,7 +2,7 @@
 //!
 //! A general-purpose persistent memory system for any LLM tool — Claude Code,
 //! Ollama, or any provider. Features a three-layer memory architecture with
-//! an optional knowledge graph powered by SurrealDB + fastembed.
+//! a knowledge graph powered by SurrealDB + fastembed.
 //!
 //! # Architecture
 //!
@@ -14,8 +14,8 @@
 //!
 //! # Features
 //!
-//! - `graph` (default) — Knowledge graph with SurrealDB + fastembed
 //! - `pulse-null` — Plugin integration for pulse-null entities
+//! - `llm` — HTTP-based LLM provider for entity extraction
 
 pub mod archive;
 pub mod checkpoint;
@@ -35,11 +35,8 @@ pub mod status;
 pub mod summarize;
 pub mod tags;
 
-#[cfg(feature = "graph")]
 pub mod graph;
-#[cfg(feature = "graph")]
 pub mod graph_bridge;
-#[cfg(feature = "graph")]
 pub mod graph_cli;
 #[cfg(feature = "llm")]
 pub mod llm_provider;
@@ -62,7 +59,7 @@ pub use summarize::ConversationSummary;
 /// ├── EPHEMERAL.md
 /// ├── ARCHIVE.md
 /// ├── conversations/
-/// └── graph/ (when graph feature is enabled)
+/// └── graph/
 /// ```
 pub struct RecallEcho {
     entity_root: PathBuf,

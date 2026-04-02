@@ -63,6 +63,83 @@ pub fn bayesian_update(current_confidence: f64, corroborate: bool) -> f64 {
     }
 }
 
+/// Configuration for temporal decay of relationship confidence.
+#[derive(Debug, Clone)]
+pub struct DecayConfig {
+    /// Half-life in days. After this many days unreinforced, confidence halves.
+    pub half_life_days: f64,
+    /// Minimum effective confidence. Relationships never decay below this.
+    pub floor: f64,
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            half_life_days: 90.0,
+            floor: 0.05,
+        }
+    }
+}
+
+/// Compute the effective confidence after temporal decay.
+///
+/// Uses half-life exponential decay:
+///   effective = stored × 0.5^(days_since_reinforced / half_life)
+///
+/// Clamped to `floor` so relationships never fully vanish — they become GC candidates.
+/// If `days_since_reinforced` is zero or negative, returns stored confidence unchanged.
+pub fn temporal_decay(stored_confidence: f64, days_since_reinforced: f64, config: &DecayConfig) -> f64 {
+    if days_since_reinforced <= 0.0 || config.half_life_days <= 0.0 {
+        return stored_confidence;
+    }
+
+    let decay_factor = 0.5_f64.powf(days_since_reinforced / config.half_life_days);
+    let effective = stored_confidence * decay_factor;
+
+    effective.max(config.floor)
+}
+
+/// Parse a SurrealDB datetime JSON value and compute days elapsed since then.
+/// Returns None if the value can't be parsed or is in the future.
+pub fn days_since(timestamp: &serde_json::Value) -> Option<f64> {
+    let ts_str = match timestamp {
+        serde_json::Value::String(s) => s.as_str(),
+        _ => return None,
+    };
+
+    // SurrealDB returns ISO 8601 datetimes
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts_str)
+        .or_else(|_| {
+            // Try without timezone (SurrealDB sometimes omits it)
+            chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|naive| naive.and_utc().fixed_offset())
+        })
+        .ok()?;
+
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(parsed);
+    let days = duration.num_seconds() as f64 / 86400.0;
+
+    if days < 0.0 { None } else { Some(days) }
+}
+
+/// Compute effective confidence for an edge, applying temporal decay.
+///
+/// Uses `last_reinforced` if available, falls back to `valid_from`.
+/// If neither can be parsed, returns stored confidence unchanged.
+pub fn effective_confidence(
+    stored_confidence: f64,
+    last_reinforced: Option<&serde_json::Value>,
+    valid_from: &serde_json::Value,
+    config: &DecayConfig,
+) -> f64 {
+    let reference_time = last_reinforced.unwrap_or(valid_from);
+    match days_since(reference_time) {
+        Some(days) => temporal_decay(stored_confidence, days, config),
+        None => stored_confidence,
+    }
+}
+
 /// Compound confidence along a multi-hop path.
 ///
 /// Returns the product of edge confidences. An empty path returns 1.0.
@@ -130,6 +207,57 @@ mod tests {
         assert_eq!(ExtractionContext::Explicit.prior(), 0.9);
         assert_eq!(ExtractionContext::Inferred.prior(), 0.6);
         assert_eq!(ExtractionContext::Speculative.prior(), 0.3);
+    }
+
+    // ── Temporal decay tests ─────────────────────────────────────────
+
+    #[test]
+    fn decay_zero_days_unchanged() {
+        let config = DecayConfig::default();
+        let result = temporal_decay(0.6, 0.0, &config);
+        assert_eq!(result, 0.6);
+    }
+
+    #[test]
+    fn decay_half_life_halves() {
+        let config = DecayConfig::default(); // 90 days
+        let result = temporal_decay(0.6, 90.0, &config);
+        assert!(approx_eq(result, 0.3), "got {}", result);
+    }
+
+    #[test]
+    fn decay_two_half_lives_quarters() {
+        let config = DecayConfig::default(); // 90 days
+        let result = temporal_decay(0.8, 180.0, &config);
+        assert!(approx_eq(result, 0.2), "got {}", result);
+    }
+
+    #[test]
+    fn decay_respects_floor() {
+        let config = DecayConfig {
+            half_life_days: 90.0,
+            floor: 0.05,
+        };
+        // After many half-lives, should clamp to floor
+        let result = temporal_decay(0.6, 900.0, &config);
+        assert!(approx_eq(result, 0.05), "got {}", result);
+    }
+
+    #[test]
+    fn decay_negative_days_unchanged() {
+        let config = DecayConfig::default();
+        let result = temporal_decay(0.6, -5.0, &config);
+        assert_eq!(result, 0.6);
+    }
+
+    #[test]
+    fn decay_custom_half_life() {
+        let config = DecayConfig {
+            half_life_days: 30.0,
+            floor: 0.01,
+        };
+        let result = temporal_decay(1.0, 30.0, &config);
+        assert!(approx_eq(result, 0.5), "got {}", result);
     }
 
     #[test]

@@ -166,10 +166,10 @@ async fn process_extraction(
         if let Some(existing) =
             find_existing_relationship(gm, from_name, to_name, &rel.rel_type).await
         {
-            // Re-extraction is corroborating evidence — Bayesian update
+            // Re-extraction is corroborating evidence — Bayesian update + reinforce
             let updated = bayesian_update(existing.confidence, true);
             if let Err(e) =
-                crud::update_relationship_confidence(gm.db(), &existing.id_string(), updated).await
+                crud::reinforce_relationship(gm.db(), &existing.id_string(), updated).await
             {
                 report.errors.push(format!(
                     "confidence update {} -> {}: {}",

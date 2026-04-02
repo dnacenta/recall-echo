@@ -153,6 +153,9 @@ pub struct Relationship {
     pub valid_from: serde_json::Value,
     pub valid_until: Option<serde_json::Value>,
     pub confidence: f64,
+    /// When this relationship was last corroborated. Defaults to valid_from.
+    #[serde(default)]
+    pub last_reinforced: Option<serde_json::Value>,
     pub source: Option<String>,
 }
 
@@ -328,6 +331,9 @@ pub struct EdgeRow {
     pub target_id: serde_json::Value,
     #[serde(default = "default_confidence")]
     pub confidence: f64,
+    /// When this relationship was last reinforced (for temporal decay).
+    #[serde(default)]
+    pub last_reinforced: Option<serde_json::Value>,
 }
 
 fn default_confidence() -> f64 {

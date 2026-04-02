@@ -176,7 +176,6 @@ fn configure_llm(reader: &mut dyn BufRead, memory_dir: &Path) -> bool {
 }
 
 /// Initialize the graph store in memory/graph/.
-#[cfg(feature = "graph")]
 fn init_graph(memory_dir: &Path) {
     let graph_dir = memory_dir.join("graph");
     if graph_dir.exists() {
@@ -381,7 +380,6 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
     );
 
     // Initialize graph store
-    #[cfg(feature = "graph")]
     init_graph(&memory_dir);
 
     // Configure LLM provider if no config exists yet
@@ -399,7 +397,6 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
     eprintln!("  Layer 1 (MEMORY.md)     — Curated facts, always in context");
     eprintln!("  Layer 2 (EPHEMERAL.md)  — Rolling window of recent sessions (FIFO, max 5)");
     eprintln!("  Layer 3 (Archive)       — Full conversations in memory/conversations/");
-    #[cfg(feature = "graph")]
     eprintln!("  Layer 0 (Graph)         — Knowledge graph with semantic search");
     eprintln!();
     eprintln!("  Run `recall-echo status` to check memory health.");

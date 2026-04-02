@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-#[cfg(feature = "graph")]
 use recall_echo::graph_cli;
 use recall_echo::{
     archive, checkpoint, config_cli, dashboard, distill, init, paths, search, status, RecallEcho,
@@ -83,7 +82,6 @@ enum Commands {
         entity_root: Option<PathBuf>,
     },
     /// Knowledge graph operations
-    #[cfg(feature = "graph")]
     Graph {
         #[command(subcommand)]
         command: GraphCommands,
@@ -106,7 +104,6 @@ enum ConfigCommands {
     },
 }
 
-#[cfg(feature = "graph")]
 #[derive(Subcommand)]
 enum GraphCommands {
     /// Initialize the graph store
@@ -222,6 +219,33 @@ enum GraphCommands {
         #[arg(long, default_value = "100")]
         delay_ms: u64,
     },
+    /// Garbage collect stale relationships and orphaned entities
+    Gc {
+        /// Actually delete (default is dry-run)
+        #[arg(long)]
+        execute: bool,
+        /// Days before a low-confidence relationship is stale (default: 30)
+        #[arg(long, default_value = "30")]
+        stale_days: u64,
+        /// Confidence threshold for stale decay (default: 0.5)
+        #[arg(long, default_value = "0.5")]
+        stale_confidence: f64,
+        /// Confidence threshold for dead pruning (default: 0.2)
+        #[arg(long, default_value = "0.2")]
+        dead_confidence: f64,
+        /// Minimum age in days for dead pruning (default: 14)
+        #[arg(long, default_value = "14")]
+        dead_min_age_days: u64,
+        /// Don't protect pipeline-linked entities
+        #[arg(long)]
+        no_protect_pipeline: bool,
+        /// Only show graph health stats, no sweep
+        #[arg(long)]
+        stats_only: bool,
+        /// Half-life in days for temporal decay (default: 90)
+        #[arg(long, default_value = "90")]
+        half_life_days: f64,
+    },
     /// Pipeline operations — sync, status, flow, stale detection
     Pipeline {
         #[command(subcommand)]
@@ -238,7 +262,6 @@ enum GraphCommands {
     },
 }
 
-#[cfg(feature = "graph")]
 #[derive(Subcommand)]
 enum PipelineCommands {
     /// Sync pipeline documents (LEARNING, THOUGHTS, CURIOSITY, REFLECTIONS, PRAXIS) into the graph
@@ -328,7 +351,6 @@ fn main() {
                 ConfigCommands::Set { key, value } => config_cli::set(&memory_dir, &key, &value),
             }
         }
-        #[cfg(feature = "graph")]
         Some(Commands::Graph {
             command,
             entity_root,
@@ -410,6 +432,26 @@ fn main() {
                     provider,
                     delay_ms,
                 } => graph_cli::extract(&memory_dir, log, all, dry_run, model, provider, delay_ms),
+                GraphCommands::Gc {
+                    execute,
+                    stale_days,
+                    stale_confidence,
+                    dead_confidence,
+                    dead_min_age_days,
+                    no_protect_pipeline,
+                    stats_only,
+                    half_life_days,
+                } => graph_cli::gc(
+                    &memory_dir,
+                    execute,
+                    stale_days,
+                    stale_confidence,
+                    dead_confidence,
+                    dead_min_age_days,
+                    !no_protect_pipeline,
+                    stats_only,
+                    half_life_days,
+                ),
                 GraphCommands::VigilSync {
                     signals_path,
                     outcomes_path,
