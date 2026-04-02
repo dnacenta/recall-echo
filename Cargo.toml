@@ -17,27 +17,26 @@ serde_json = "1"
 toml = "0.8"
 dirs = "6"
 
-# Graph (default) — knowledge graph with SurrealDB + fastembed
-surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"], optional = true }
-fastembed = { version = "4", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"], optional = true }
-chrono = { version = "0.4", features = ["serde"], optional = true }
-thiserror = { version = "2", optional = true }
-futures = { version = "0.3", optional = true }
-regex = { version = "1", optional = true }
+# Graph — knowledge graph with SurrealDB + fastembed (always on)
+surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"] }
+fastembed = "4"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+futures = "0.3"
+regex = "1"
+async-trait = "0.1"
 
 # LLM HTTP provider (optional) — for entity extraction via Anthropic/OpenAI-compat APIs
 reqwest = { version = "0.12", features = ["json"], optional = true }
-async-trait = { version = "0.1", optional = true }
 
 # Pulse-null integration (optional) — plugin system for pulse-null entities
 pulse-system-types = { version = "0.6", optional = true }
 
 [features]
-default = ["graph"]
-graph = ["surrealdb", "fastembed", "tokio", "chrono", "thiserror", "futures", "regex", "async-trait"]
-llm = ["graph", "reqwest"]
-pulse-null = ["pulse-system-types", "async-trait"]
+default = []
+llm = ["reqwest"]
+pulse-null = ["pulse-system-types"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-#[cfg(feature = "graph")]
 use recall_echo::graph_cli;
 use recall_echo::{
     archive, checkpoint, config_cli, dashboard, distill, init, paths, search, status, RecallEcho,
@@ -83,7 +82,6 @@ enum Commands {
         entity_root: Option<PathBuf>,
     },
     /// Knowledge graph operations
-    #[cfg(feature = "graph")]
     Graph {
         #[command(subcommand)]
         command: GraphCommands,
@@ -106,7 +104,6 @@ enum ConfigCommands {
     },
 }
 
-#[cfg(feature = "graph")]
 #[derive(Subcommand)]
 enum GraphCommands {
     /// Initialize the graph store
@@ -259,7 +256,6 @@ enum GraphCommands {
     },
 }
 
-#[cfg(feature = "graph")]
 #[derive(Subcommand)]
 enum PipelineCommands {
     /// Sync pipeline documents (LEARNING, THOUGHTS, CURIOSITY, REFLECTIONS, PRAXIS) into the graph
@@ -349,7 +345,6 @@ fn main() {
                 ConfigCommands::Set { key, value } => config_cli::set(&memory_dir, &key, &value),
             }
         }
-        #[cfg(feature = "graph")]
         Some(Commands::Graph {
             command,
             entity_root,
