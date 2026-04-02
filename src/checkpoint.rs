@@ -60,7 +60,6 @@ pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), St
         .map_err(|e| format!("Failed to create checkpoint file: {e}"))?;
 
     // Graph ingestion
-    #[cfg(feature = "graph")]
     {
         let result = archive::ArchiveResult {
             log_number: next_num,
@@ -161,7 +160,6 @@ pub async fn create_checkpoint(
     let log_number = result.log_number;
 
     // Graph ingestion (async path)
-    #[cfg(feature = "graph")]
     if log_number > 0 {
         if let Err(e) = crate::graph_bridge::ingest_into_graph(
             memory_dir,
