@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use surrealdb::Surreal;
 
+use super::confidence;
 use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
@@ -111,18 +112,20 @@ pub async fn query(
     Ok(QueryResult { entities, episodes })
 }
 
-/// Get 1-hop neighbors as L1 (EntityDetail) with the relationship type and confidence.
+/// Get 1-hop neighbors as L1 (EntityDetail) with the relationship type and effective confidence.
 async fn get_neighbor_details(
     db: &Surreal<Db>,
     entity_id: &str,
 ) -> Result<Vec<(EntityDetail, String, f64)>, GraphError> {
+    let now = chrono::Utc::now();
+
     // Outgoing
     let mut response = db
         .query(
             r#"
-            SELECT rel_type, confidence, out AS target_id
+            SELECT rel_type, confidence, last_reinforced, valid_from, out AS target_id
             FROM relates_to
-            WHERE in = type::record($id) AND valid_until IS NONE AND confidence >= 0.1
+            WHERE in = type::record($id) AND valid_until IS NONE
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -134,9 +137,9 @@ async fn get_neighbor_details(
     let mut response = db
         .query(
             r#"
-            SELECT rel_type, confidence, in AS target_id
+            SELECT rel_type, confidence, last_reinforced, valid_from, in AS target_id
             FROM relates_to
-            WHERE out = type::record($id) AND valid_until IS NONE AND confidence >= 0.1
+            WHERE out = type::record($id) AND valid_until IS NONE
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -148,13 +151,26 @@ async fn get_neighbor_details(
     let all_edges: Vec<_> = outgoing.into_iter().chain(incoming).collect();
 
     for edge in all_edges {
+        // Apply temporal decay at read time
+        let effective = confidence::effective_confidence(
+            edge.confidence,
+            edge.last_reinforced.as_ref(),
+            &edge.valid_from,
+            &now,
+        );
+
+        // Filter by effective confidence
+        if effective < 0.1 {
+            continue;
+        }
+
         let tid = match &edge.target_id {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
 
         if let Some(detail) = super::crud::get_entity_detail(db, &tid).await? {
-            results.push((detail, edge.rel_type, edge.confidence));
+            results.push((detail, edge.rel_type, effective));
         }
     }
 
@@ -171,6 +187,10 @@ struct RelTarget {
     target_id: serde_json::Value,
     #[serde(default = "default_rel_confidence")]
     confidence: f64,
+    #[serde(default)]
+    last_reinforced: Option<serde_json::Value>,
+    #[serde(default)]
+    valid_from: serde_json::Value,
 }
 
 // ── Pipeline queries ─────────────────────────────────────────────────

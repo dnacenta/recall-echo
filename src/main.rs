@@ -254,6 +254,15 @@ enum GraphCommands {
         #[arg(long)]
         outcomes_path: Option<PathBuf>,
     },
+    /// Show relationship decay report — stored vs effective confidence
+    DecayReport {
+        /// Show only relationships for a specific entity
+        #[arg(long)]
+        entity: Option<String>,
+        /// Show all relationships including those with no decay
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -450,6 +459,9 @@ fn main() {
                     dead_min_age_days,
                     stats_only,
                 ),
+                GraphCommands::DecayReport { entity, all } => {
+                    graph_cli::decay_report(&memory_dir, entity.as_deref(), all)
+                }
                 GraphCommands::Pipeline { command } => match command {
                     PipelineCommands::Sync { docs_dir } => {
                         graph_cli::pipeline_sync(&memory_dir, docs_dir.as_deref())

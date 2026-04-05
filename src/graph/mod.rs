@@ -170,6 +170,18 @@ impl GraphMemory {
         crud::update_relationship_confidence(&self.db, rel_id, confidence).await
     }
 
+    /// Reinforce a relationship: Bayesian update + reset decay clock.
+    ///
+    /// Called when a relationship is corroborated. Updates confidence and resets
+    /// `last_reinforced` to now, preventing temporal decay from eroding the edge.
+    pub async fn reinforce_relationship(
+        &self,
+        rel_id: &str,
+        new_confidence: f64,
+    ) -> Result<(), GraphError> {
+        crud::reinforce_relationship(&self.db, rel_id, new_confidence).await
+    }
+
     // --- Episodes ---
 
     /// Add a new episode to the graph.

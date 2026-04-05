@@ -2,6 +2,7 @@
 
 use surrealdb::Surreal;
 
+use super::confidence;
 use super::error::GraphError;
 use super::store::Db;
 use super::types::*;
@@ -66,6 +67,8 @@ fn traverse_from<'a>(
 
         let mut edges = Vec::new();
 
+        let now = chrono::Utc::now();
+
         // Get outgoing relationships that are still active
         let mut response = db
             .query(
@@ -75,11 +78,11 @@ fn traverse_from<'a>(
                 valid_from,
                 valid_until,
                 confidence,
+                last_reinforced,
                 out AS target_id
             FROM relates_to
             WHERE in = type::record($id)
               AND valid_until IS NONE
-              AND confidence >= 0.1
             "#,
             )
             .bind(("id", entity.id_string()))
@@ -95,6 +98,7 @@ fn traverse_from<'a>(
             visited,
             type_filter,
             &mut edges,
+            &now,
         )
         .await?;
 
@@ -107,11 +111,11 @@ fn traverse_from<'a>(
                 valid_from,
                 valid_until,
                 confidence,
+                last_reinforced,
                 in AS target_id
             FROM relates_to
             WHERE out = type::record($id)
               AND valid_until IS NONE
-              AND confidence >= 0.1
             "#,
             )
             .bind(("id", entity.id_string()))
@@ -127,6 +131,7 @@ fn traverse_from<'a>(
             visited,
             type_filter,
             &mut edges,
+            &now,
         )
         .await?;
 
@@ -137,7 +142,7 @@ fn traverse_from<'a>(
     })
 }
 
-/// Process edge rows, load targets as L0, apply type filter, recurse.
+/// Process edge rows, load targets as L0, apply type filter and decay, recurse.
 #[allow(clippy::too_many_arguments)]
 async fn collect_edges<'a>(
     db: &'a Surreal<Db>,
@@ -148,8 +153,22 @@ async fn collect_edges<'a>(
     visited: &'a mut Vec<String>,
     type_filter: Option<&'a str>,
     edges: &'a mut Vec<TraversalEdge>,
+    now: &'a chrono::DateTime<chrono::Utc>,
 ) -> Result<(), GraphError> {
     for edge in edge_rows {
+        // Apply temporal decay at read time
+        let effective = confidence::effective_confidence(
+            edge.confidence,
+            edge.last_reinforced.as_ref(),
+            &edge.valid_from,
+            now,
+        );
+
+        // Filter by effective confidence (not stored)
+        if effective < 0.1 {
+            continue;
+        }
+
         let tid = edge.target_id_string();
 
         // Load L0 projection
@@ -182,7 +201,7 @@ async fn collect_edges<'a>(
                 target: child,
                 valid_from: edge.valid_from,
                 valid_until: edge.valid_until,
-                confidence: edge.confidence,
+                confidence: effective,
             });
         }
     }
