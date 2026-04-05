@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "3.5.0"
+version = "3.5.1"
 edition = "2021"
 description = "Persistent memory system with knowledge graph — for any LLM tool"
 license = "AGPL-3.0-only"
@@ -19,7 +19,7 @@ dirs = "6"
 
 # Graph — knowledge graph with SurrealDB + fastembed (always on)
 surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"] }
-fastembed = "4"
+fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
@@ -28,7 +28,7 @@ regex = "1"
 async-trait = "0.1"
 
 # LLM HTTP provider (optional) — for entity extraction via Anthropic/OpenAI-compat APIs
-reqwest = { version = "0.12", features = ["json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"], optional = true }
 
 # Pulse-null integration (optional) — plugin system for pulse-null entities
 pulse-system-types = { version = "0.6", optional = true }
