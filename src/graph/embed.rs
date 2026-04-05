@@ -7,7 +7,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use super::error::GraphError;
 
 /// Trait for embedding text into vectors.
-pub trait Embedder {
+pub trait Embedder: Send + Sync {
     fn embed(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, GraphError>;
     fn embed_single(&self, text: &str) -> Result<Vec<f32>, GraphError>;
     fn dimensions(&self) -> usize;
