@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 
+use super::confidence;
 use super::crud;
 use super::error::GraphError;
 use super::store::Db;
@@ -139,7 +140,8 @@ pub async fn run_gc(db: &Surreal<Db>, config: &GcConfig) -> Result<GcReport, Gra
     Ok(report)
 }
 
-/// Phase 1: Find relationships older than stale_days with confidence below stale_confidence.
+/// Phase 1: Find relationships older than stale_days with effective confidence below stale_confidence.
+/// Uses temporal decay — effective confidence accounts for time since last reinforcement.
 /// Only considers active relationships (valid_until is None).
 fn phase_stale_relationships(
     rels: &[Relationship],
@@ -155,8 +157,16 @@ fn phase_stale_relationships(
             continue;
         }
 
-        // Check confidence threshold
-        if rel.confidence >= config.stale_confidence {
+        // Compute effective confidence with temporal decay
+        let effective = confidence::effective_confidence(
+            rel.confidence,
+            rel.last_reinforced.as_ref(),
+            &rel.valid_from,
+            now,
+        );
+
+        // Check effective confidence threshold
+        if effective >= config.stale_confidence {
             continue;
         }
 
@@ -182,8 +192,8 @@ fn phase_stale_relationships(
             ),
             kind: GcActionKind::StaleRelationship,
             reason: format!(
-                "confidence {:.2} < {:.2}, age {} days > {}, desc: {}",
-                rel.confidence, config.stale_confidence, age_days, config.stale_days, description
+                "effective_confidence {:.2} (stored {:.2}) < {:.2}, age {} days > {}, desc: {}",
+                effective, rel.confidence, config.stale_confidence, age_days, config.stale_days, description
             ),
         });
         stale_ids.push(id);
@@ -193,8 +203,8 @@ fn phase_stale_relationships(
     stale_ids
 }
 
-/// Phase 2: Find very low confidence relationships older than dead_min_age_days.
-/// Excludes relationships already caught in phase 1.
+/// Phase 2: Find very low effective confidence relationships older than dead_min_age_days.
+/// Uses temporal decay. Excludes relationships already caught in phase 1.
 fn phase_dead_relationships(
     rels: &[Relationship],
     config: &GcConfig,
@@ -212,8 +222,16 @@ fn phase_dead_relationships(
             continue;
         }
 
-        // Check confidence threshold (lower bar than stale)
-        if rel.confidence >= config.dead_confidence {
+        // Compute effective confidence with temporal decay
+        let effective = confidence::effective_confidence(
+            rel.confidence,
+            rel.last_reinforced.as_ref(),
+            &rel.valid_from,
+            now,
+        );
+
+        // Check effective confidence threshold (lower bar than stale)
+        if effective >= config.dead_confidence {
             continue;
         }
 
@@ -238,7 +256,8 @@ fn phase_dead_relationships(
             ),
             kind: GcActionKind::DeadRelationship,
             reason: format!(
-                "confidence {:.2} < {:.2}, age {} days > {}, desc: {}",
+                "effective_confidence {:.2} (stored {:.2}) < {:.2}, age {} days > {}, desc: {}",
+                effective,
                 rel.confidence,
                 config.dead_confidence,
                 age_days,
@@ -389,7 +408,9 @@ fn value_to_short_id(val: &serde_json::Value) -> String {
 }
 
 /// Get stats-only report without computing deletion candidates.
+/// Uses effective confidence (with temporal decay) for threshold counts.
 pub async fn stats_only(db: &Surreal<Db>) -> Result<GcStatsReport, GraphError> {
+    let now = Utc::now();
     let all_rels = crud::list_all_relationships(db).await?;
     let all_entities = crud::list_entities(db, None).await?;
 
@@ -400,9 +421,29 @@ pub async fn stats_only(db: &Surreal<Db>) -> Result<GcStatsReport, GraphError> {
 
     let zero_access_entities = all_entities.iter().filter(|e| e.access_count == 0).count();
 
-    let low_confidence_rels = all_rels.iter().filter(|r| r.confidence < 0.5).count();
+    let low_confidence_rels = all_rels
+        .iter()
+        .filter(|r| {
+            confidence::effective_confidence(
+                r.confidence,
+                r.last_reinforced.as_ref(),
+                &r.valid_from,
+                &now,
+            ) < 0.5
+        })
+        .count();
 
-    let very_low_confidence_rels = all_rels.iter().filter(|r| r.confidence < 0.2).count();
+    let very_low_confidence_rels = all_rels
+        .iter()
+        .filter(|r| {
+            confidence::effective_confidence(
+                r.confidence,
+                r.last_reinforced.as_ref(),
+                &r.valid_from,
+                &now,
+            ) < 0.2
+        })
+        .count();
 
     let superseded_rels = all_rels.iter().filter(|r| r.valid_until.is_some()).count();
 
@@ -424,7 +465,9 @@ pub struct GcStatsReport {
     pub total_relationships: u64,
     pub pipeline_entities: u64,
     pub zero_access_entities: u64,
+    /// Count of relationships with effective (decayed) confidence < 0.5
     pub low_confidence_rels: u64,
+    /// Count of relationships with effective (decayed) confidence < 0.2
     pub very_low_confidence_rels: u64,
     pub superseded_rels: u64,
 }
@@ -551,6 +594,7 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.3,
+            last_reinforced: None,
             source: Some("ingest".to_string()),
         }];
 
@@ -576,6 +620,7 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.8,
+            last_reinforced: None,
             source: None,
         }];
 
@@ -600,6 +645,7 @@ mod tests {
             valid_from: serde_json::Value::String(recent_date),
             valid_until: None,
             confidence: 0.3,
+            last_reinforced: None,
             source: None,
         }];
 
@@ -624,6 +670,7 @@ mod tests {
             valid_from: serde_json::Value::String(old_date.clone()),
             valid_until: Some(serde_json::Value::String(old_date)),
             confidence: 0.3,
+            last_reinforced: None,
             source: None,
         }];
 
@@ -648,6 +695,7 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.1,
+            last_reinforced: None,
             source: None,
         }];
 
@@ -674,6 +722,7 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.1,
+            last_reinforced: None,
             source: None,
         }];
 
@@ -696,5 +745,62 @@ mod tests {
             "dead_relationship"
         );
         assert_eq!(GcActionKind::OrphanedEntity.to_string(), "orphaned_entity");
+    }
+
+    #[test]
+    fn test_phase_stale_decay_makes_high_stored_confidence_stale() {
+        // A relationship with stored confidence 0.6 (above stale threshold 0.5)
+        // but last reinforced 180 days ago — decay brings effective to ~0.15
+        let now = Utc::now();
+        let old_date = (now - chrono::Duration::days(180)).to_rfc3339();
+
+        let rels = vec![Relationship {
+            id: serde_json::Value::String("relates_to:decayed".to_string()),
+            from_id: serde_json::Value::String("entity:a".to_string()),
+            to_id: serde_json::Value::String("entity:b".to_string()),
+            rel_type: "CONNECTED_TO".to_string(),
+            description: Some("decayed rel".to_string()),
+            valid_from: serde_json::Value::String(old_date),
+            valid_until: None,
+            confidence: 0.6, // Above stale threshold!
+            last_reinforced: None, // Never reinforced, so decays from valid_from
+            source: None,
+        }];
+
+        let config = GcConfig::default();
+        let mut report = GcReport::default();
+        let stale = phase_stale_relationships(&rels, &config, &now, &mut report);
+
+        // Without decay: 0.6 >= 0.5, would NOT be caught
+        // With decay: 0.6 * 0.5^(180/90) = 0.6 * 0.25 = 0.15 < 0.5, IS caught
+        assert_eq!(stale.len(), 1, "decayed relationship should be caught as stale");
+    }
+
+    #[test]
+    fn test_phase_stale_reinforced_prevents_decay() {
+        // Same stored confidence 0.6, old valid_from, but recently reinforced
+        let now = Utc::now();
+        let old_date = (now - chrono::Duration::days(180)).to_rfc3339();
+        let recent_reinforce = (now - chrono::Duration::days(5)).to_rfc3339();
+
+        let rels = vec![Relationship {
+            id: serde_json::Value::String("relates_to:reinforced".to_string()),
+            from_id: serde_json::Value::String("entity:a".to_string()),
+            to_id: serde_json::Value::String("entity:b".to_string()),
+            rel_type: "CONNECTED_TO".to_string(),
+            description: None,
+            valid_from: serde_json::Value::String(old_date),
+            valid_until: None,
+            confidence: 0.6,
+            last_reinforced: Some(serde_json::Value::String(recent_reinforce)),
+            source: None,
+        }];
+
+        let config = GcConfig::default();
+        let mut report = GcReport::default();
+        let stale = phase_stale_relationships(&rels, &config, &now, &mut report);
+
+        // Reinforced 5 days ago: effective ≈ 0.6 * 0.5^(5/90) ≈ 0.577 > 0.5
+        assert!(stale.is_empty(), "recently reinforced relationship should NOT be stale");
     }
 }

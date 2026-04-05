@@ -153,6 +153,10 @@ pub struct Relationship {
     pub valid_from: serde_json::Value,
     pub valid_until: Option<serde_json::Value>,
     pub confidence: f64,
+    /// When this relationship was last reinforced (Bayesian corroboration).
+    /// Used by temporal decay: effective_confidence = confidence × 0.5^(days_since / half_life).
+    #[serde(default)]
+    pub last_reinforced: Option<serde_json::Value>,
     pub source: Option<String>,
 }
 
@@ -328,6 +332,8 @@ pub struct EdgeRow {
     pub target_id: serde_json::Value,
     #[serde(default = "default_confidence")]
     pub confidence: f64,
+    #[serde(default)]
+    pub last_reinforced: Option<serde_json::Value>,
 }
 
 fn default_confidence() -> f64 {

@@ -55,6 +55,7 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS valid_from  ON relates_to TYPE datetime DEFAULT time::now();
         DEFINE FIELD IF NOT EXISTS valid_until ON relates_to TYPE option<datetime>;
         DEFINE FIELD IF NOT EXISTS confidence  ON relates_to TYPE float DEFAULT 1.0;
+        DEFINE FIELD IF NOT EXISTS last_reinforced ON relates_to TYPE option<datetime>;
         DEFINE FIELD IF NOT EXISTS source      ON relates_to TYPE option<string>;
 
         DEFINE INDEX IF NOT EXISTS rel_type_idx ON relates_to FIELDS rel_type;

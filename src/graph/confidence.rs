@@ -63,6 +63,69 @@ pub fn bayesian_update(current_confidence: f64, corroborate: bool) -> f64 {
     }
 }
 
+/// Default half-life for temporal decay (days).
+/// At 90 days without reinforcement, effective confidence halves.
+pub const DEFAULT_HALF_LIFE_DAYS: f64 = 90.0;
+
+/// Minimum effective confidence floor — decay never goes below this.
+pub const DECAY_FLOOR: f64 = 0.05;
+
+/// Compute effective confidence after temporal decay.
+///
+/// Formula: `effective = stored × 0.5^(days_since_reinforced / half_life)`
+///
+/// - `stored_confidence`: the Bayesian posterior (stored in DB)
+/// - `days_since_reinforced`: days since `last_reinforced` (or `valid_from` if never reinforced)
+/// - `half_life_days`: how many days until confidence halves (default: 90)
+///
+/// Returns at least `DECAY_FLOOR` (0.05) — relationships never fully disappear through decay alone.
+pub fn temporal_decay(stored_confidence: f64, days_since_reinforced: f64, half_life_days: f64) -> f64 {
+    if days_since_reinforced <= 0.0 {
+        return stored_confidence;
+    }
+
+    let decay_factor = 0.5_f64.powf(days_since_reinforced / half_life_days);
+    let effective = stored_confidence * decay_factor;
+    effective.max(DECAY_FLOOR)
+}
+
+/// Compute effective confidence for a relationship, using `last_reinforced` or `valid_from` as anchor.
+///
+/// This is the convenience wrapper that parses datetime values and calls `temporal_decay`.
+pub fn effective_confidence(
+    stored_confidence: f64,
+    last_reinforced: Option<&serde_json::Value>,
+    valid_from: &serde_json::Value,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> f64 {
+    let anchor = last_reinforced
+        .and_then(parse_datetime_value)
+        .or_else(|| parse_datetime_value(valid_from));
+
+    match anchor {
+        Some(dt) => {
+            let days = (*now - dt).num_hours() as f64 / 24.0;
+            temporal_decay(stored_confidence, days, DEFAULT_HALF_LIFE_DAYS)
+        }
+        None => stored_confidence, // Can't compute decay without a timestamp
+    }
+}
+
+/// Parse a serde_json datetime value into chrono DateTime.
+fn parse_datetime_value(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    match val {
+        serde_json::Value::String(s) => s
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ")
+                    .ok()
+                    .map(|ndt| ndt.and_utc())
+            }),
+        _ => None,
+    }
+}
+
 /// Compound confidence along a multi-hop path.
 ///
 /// Returns the product of edge confidences. An empty path returns 1.0.
@@ -130,6 +193,82 @@ mod tests {
         assert_eq!(ExtractionContext::Explicit.prior(), 0.9);
         assert_eq!(ExtractionContext::Inferred.prior(), 0.6);
         assert_eq!(ExtractionContext::Speculative.prior(), 0.3);
+    }
+
+    #[test]
+    fn temporal_decay_zero_days() {
+        let result = temporal_decay(0.9, 0.0, 90.0);
+        assert!(approx_eq(result, 0.9), "got {}", result);
+    }
+
+    #[test]
+    fn temporal_decay_one_half_life() {
+        // After exactly 90 days, confidence should halve
+        let result = temporal_decay(0.6, 90.0, 90.0);
+        assert!(approx_eq(result, 0.3), "got {}", result);
+    }
+
+    #[test]
+    fn temporal_decay_two_half_lives() {
+        // After 180 days, confidence should quarter
+        let result = temporal_decay(0.8, 180.0, 90.0);
+        assert!(approx_eq(result, 0.2), "got {}", result);
+    }
+
+    #[test]
+    fn temporal_decay_floor() {
+        // After many half-lives, should hit the floor
+        let result = temporal_decay(0.3, 900.0, 90.0);
+        assert!(approx_eq(result, DECAY_FLOOR), "got {}", result);
+    }
+
+    #[test]
+    fn temporal_decay_negative_days() {
+        // Negative days (future timestamp) should return stored confidence
+        let result = temporal_decay(0.7, -5.0, 90.0);
+        assert!(approx_eq(result, 0.7), "got {}", result);
+    }
+
+    #[test]
+    fn temporal_decay_high_confidence_still_decays() {
+        // Even 1.0 confidence decays
+        let result = temporal_decay(1.0, 90.0, 90.0);
+        assert!(approx_eq(result, 0.5), "got {}", result);
+    }
+
+    #[test]
+    fn effective_confidence_with_last_reinforced() {
+        let now = chrono::Utc::now();
+        let ninety_days_ago = (now - chrono::Duration::days(90)).to_rfc3339();
+        let valid_from_long_ago = (now - chrono::Duration::days(365)).to_rfc3339();
+
+        let last_reinforced = serde_json::Value::String(ninety_days_ago);
+        let valid_from = serde_json::Value::String(valid_from_long_ago);
+
+        // Should use last_reinforced (90 days) not valid_from (365 days)
+        let result = effective_confidence(0.6, Some(&last_reinforced), &valid_from, &now);
+        assert!(approx_eq(result, 0.3), "got {} (expected ~0.3, one half-life from last_reinforced)", result);
+    }
+
+    #[test]
+    fn effective_confidence_falls_back_to_valid_from() {
+        let now = chrono::Utc::now();
+        let ninety_days_ago = (now - chrono::Duration::days(90)).to_rfc3339();
+        let valid_from = serde_json::Value::String(ninety_days_ago);
+
+        // No last_reinforced — should use valid_from
+        let result = effective_confidence(0.6, None, &valid_from, &now);
+        assert!(approx_eq(result, 0.3), "got {} (expected ~0.3, one half-life from valid_from)", result);
+    }
+
+    #[test]
+    fn effective_confidence_no_parseable_date() {
+        let now = chrono::Utc::now();
+        let bad_date = serde_json::Value::String("not-a-date".to_string());
+
+        // Unparseable dates should return stored confidence unchanged
+        let result = effective_confidence(0.8, None, &bad_date, &now);
+        assert!(approx_eq(result, 0.8), "got {}", result);
     }
 
     #[test]

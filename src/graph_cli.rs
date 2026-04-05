@@ -993,6 +993,112 @@ pub fn gc(
     })
 }
 
+/// Show relationship decay report — lists all relationships with their stored vs effective confidence.
+pub fn decay_report(
+    memory_dir: &Path,
+    entity_name: Option<&str>,
+    show_all: bool,
+) -> Result<(), String> {
+    use crate::graph::confidence;
+    use crate::graph::types::Direction;
+
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.exists() {
+        return Err("Graph store not initialized. Run `recall-echo graph init` first.".into());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let gm = GraphMemory::open(&graph_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let now = chrono::Utc::now();
+
+        let rels = if let Some(name) = entity_name {
+            gm.get_relationships(name, Direction::Both)
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            crate::graph::crud::list_all_relationships(gm.db())
+                .await
+                .map_err(|e| e.to_string())?
+        };
+
+        if rels.is_empty() {
+            println!("{YELLOW}No relationships found.{RESET}");
+            return Ok(());
+        }
+
+        println!(
+            "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n",
+            rels.len(),
+            confidence::DEFAULT_HALF_LIFE_DAYS
+        );
+
+        let mut decayed_count = 0u32;
+        let mut total_decay = 0.0_f64;
+
+        for rel in &rels {
+            let effective = confidence::effective_confidence(
+                rel.confidence,
+                rel.last_reinforced.as_ref(),
+                &rel.valid_from,
+                &now,
+            );
+
+            let decay_amount = rel.confidence - effective;
+            if decay_amount > 0.001 {
+                decayed_count += 1;
+            }
+            total_decay += decay_amount;
+
+            if !show_all && decay_amount < 0.001 {
+                continue;
+            }
+
+            let from_short = match &rel.from_id {
+                serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
+                other => other.to_string(),
+            };
+            let to_short = match &rel.to_id {
+                serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
+                other => other.to_string(),
+            };
+
+            let reinforced_tag = match &rel.last_reinforced {
+                Some(serde_json::Value::String(s)) => format!(" {DIM}(reinforced: {s}){RESET}"),
+                _ => String::new(),
+            };
+
+            let decay_indicator = if decay_amount > 0.2 {
+                format!("\x1b[31m↓{:.0}%\x1b[0m", decay_amount * 100.0)
+            } else if decay_amount > 0.05 {
+                format!("{YELLOW}↓{:.0}%{RESET}", decay_amount * 100.0)
+            } else {
+                format!("{DIM}≈{RESET}")
+            };
+
+            println!(
+                "  {from_short} {CYAN}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{reinforced_tag}",
+                rel.rel_type, rel.confidence, effective,
+            );
+        }
+
+        println!(
+            "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}",
+            rels.len(),
+            if rels.is_empty() {
+                0.0
+            } else {
+                total_decay / rels.len() as f64
+            }
+        );
+
+        Ok(())
+    })
+}
+
 /// Find the archive file for a given log number.
 #[cfg(feature = "llm")]
 fn find_archive_file(conversations_dir: &Path, log_number: u32) -> Result<PathBuf, String> {

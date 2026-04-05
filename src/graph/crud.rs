@@ -191,6 +191,7 @@ pub async fn add_relationship(
                 valid_from = time::now(),
                 valid_until = NONE,
                 confidence = $confidence,
+                last_reinforced = time::now(),
                 source = $source
             "#,
         )
@@ -244,6 +245,23 @@ pub async fn update_relationship_confidence(
     db.query("UPDATE type::record($id) SET confidence = $confidence")
         .bind(("id", rel_id.to_string()))
         .bind(("confidence", confidence))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// Reinforce a relationship: Bayesian update + reset last_reinforced timestamp.
+///
+/// Called when a relationship is corroborated by re-extraction. Updates confidence
+/// via Bayesian posterior and resets the decay clock by setting `last_reinforced = now`.
+pub async fn reinforce_relationship(
+    db: &Surreal<Db>,
+    rel_id: &str,
+    new_confidence: f64,
+) -> Result<(), GraphError> {
+    db.query("UPDATE type::record($id) SET confidence = $confidence, last_reinforced = time::now()")
+        .bind(("id", rel_id.to_string()))
+        .bind(("confidence", new_confidence))
         .await?
         .check()?;
     Ok(())
