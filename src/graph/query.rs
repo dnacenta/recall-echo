@@ -400,9 +400,50 @@ pub async fn pipeline_flow(
     Ok(chain)
 }
 
+fn lenient_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct Visitor;
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string, integer, or null")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<String, E> {
+            Ok("unknown".to_string())
+        }
+        fn visit_none<E: de::Error>(self) -> Result<String, E> {
+            Ok("unknown".to_string())
+        }
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    deserializer.deserialize_any(Visitor)
+}
+
 #[derive(serde::Deserialize)]
 struct StageStatusCount {
+    #[serde(deserialize_with = "lenient_string")]
     stage: String,
+    #[serde(deserialize_with = "lenient_string")]
     status: String,
     count: u64,
 }
