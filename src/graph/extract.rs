@@ -140,8 +140,20 @@ pub fn parse_extraction_response(text: &str) -> Result<ExtractionResult, GraphEr
 
     Err(GraphError::Parse(format!(
         "failed to parse extraction response: {}",
-        &text[..text.len().min(200)]
+        safe_truncate(text, 200)
     )))
+}
+
+/// Truncate a string at a char boundary, never panicking on multi-byte characters.
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Convert cases, patterns, and preferences into ExtractedEntity entries
@@ -151,7 +163,7 @@ pub fn flatten_extraction(result: &ExtractionResult) -> Vec<ExtractedEntity> {
 
     for case in &result.cases {
         entities.push(ExtractedEntity {
-            name: format!("Case: {}", &case.problem[..case.problem.len().min(60)]),
+            name: format!("Case: {}", safe_truncate(&case.problem, 60)),
             entity_type: EntityType::Case,
             abstract_text: format!("Problem: {} Solution: {}", case.problem, case.solution),
             overview: case.context.clone(),
