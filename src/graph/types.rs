@@ -28,6 +28,7 @@ pub enum EntityType {
 }
 
 impl EntityType {
+    #[must_use]
     pub fn is_mutable(&self) -> bool {
         !matches!(
             self,
@@ -46,8 +47,8 @@ impl fmt::Display for EntityType {
         let s = serde_json::to_value(self)
             .ok()
             .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", self));
-        write!(f, "{}", s)
+            .unwrap_or_else(|| format!("{self:?}"));
+        write!(f, "{s}")
     }
 }
 
@@ -56,7 +57,7 @@ impl std::str::FromStr for EntityType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_json::from_value(serde_json::Value::String(s.to_string()))
-            .map_err(|_| format!("unknown entity type: {}", s))
+            .map_err(|_| format!("unknown entity type: {s}"))
     }
 }
 
@@ -96,6 +97,7 @@ pub struct Entity {
 
 impl Entity {
     /// Get the record ID as a string (e.g. "entity:abc123").
+    #[must_use]
     pub fn id_string(&self) -> String {
         match &self.id {
             serde_json::Value::String(s) => s.clone(),
@@ -104,6 +106,7 @@ impl Entity {
     }
 
     /// Get the updated_at timestamp as a string.
+    #[must_use]
     pub fn updated_at_string(&self) -> String {
         match &self.updated_at {
             serde_json::Value::String(s) => s.clone(),
@@ -162,6 +165,7 @@ pub struct Relationship {
 
 impl Relationship {
     /// Get the record ID as a string.
+    #[must_use]
     pub fn id_string(&self) -> String {
         match &self.id {
             serde_json::Value::String(s) => s.clone(),
@@ -191,6 +195,7 @@ pub struct EntitySummary {
 }
 
 impl EntitySummary {
+    #[must_use]
     pub fn id_string(&self) -> String {
         match &self.id {
             serde_json::Value::String(s) => s.clone(),
@@ -216,6 +221,7 @@ pub struct EntityDetail {
 }
 
 impl EntityDetail {
+    #[must_use]
     pub fn id_string(&self) -> String {
         match &self.id {
             serde_json::Value::String(s) => s.clone(),
@@ -223,6 +229,7 @@ impl EntityDetail {
         }
     }
 
+    #[must_use]
     pub fn updated_at_string(&self) -> String {
         match &self.updated_at {
             serde_json::Value::String(s) => s.clone(),
@@ -341,6 +348,7 @@ fn default_confidence() -> f64 {
 }
 
 impl EdgeRow {
+    #[must_use]
     pub fn target_id_string(&self) -> String {
         match &self.target_id {
             serde_json::Value::String(s) => s.clone(),
@@ -386,6 +394,7 @@ pub struct Episode {
 }
 
 impl Episode {
+    #[must_use]
     pub fn id_string(&self) -> String {
         match &self.id {
             serde_json::Value::String(s) => s.clone(),
@@ -405,6 +414,22 @@ pub struct ExtractedEntity {
     pub overview: Option<String>,
     pub content: Option<String>,
     pub attributes: Option<serde_json::Value>,
+}
+
+impl ExtractedEntity {
+    /// Convert this extraction result into a `NewEntity` ready for storage.
+    #[must_use]
+    pub fn to_new_entity(&self, session_id: &str) -> NewEntity {
+        NewEntity {
+            name: self.name.clone(),
+            entity_type: self.entity_type.clone(),
+            abstract_text: self.abstract_text.clone(),
+            overview: self.overview.clone(),
+            content: self.content.clone(),
+            attributes: self.attributes.clone(),
+            source: Some(session_id.to_string()),
+        }
+    }
 }
 
 /// A candidate relationship extracted by the LLM.
@@ -563,4 +588,5 @@ pub struct IngestionReport {
     pub relationships_created: u32,
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
+    pub estimated_tokens: u64,
 }

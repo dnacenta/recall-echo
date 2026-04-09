@@ -21,6 +21,7 @@ pub enum ExtractionContext {
 
 impl ExtractionContext {
     /// Initial confidence prior for this extraction context.
+    #[must_use]
     pub fn prior(self) -> f64 {
         match self {
             Self::Authoritative => 1.0,
@@ -40,7 +41,7 @@ impl std::str::FromStr for ExtractionContext {
             "inferred" => Ok(Self::Inferred),
             "speculative" => Ok(Self::Speculative),
             "authoritative" => Ok(Self::Authoritative),
-            other => Err(format!("unknown extraction context: {}", other)),
+            other => Err(format!("unknown extraction context: {other}")),
         }
     }
 }
@@ -52,6 +53,7 @@ impl std::str::FromStr for ExtractionContext {
 ///
 /// - `corroborate = true`: alpha += 1 (evidence supports the relationship)
 /// - `corroborate = false`: beta += 1 (evidence contradicts the relationship)
+#[must_use]
 pub fn bayesian_update(current_confidence: f64, corroborate: bool) -> f64 {
     let alpha = current_confidence * PSEUDOCOUNT;
     let beta = PSEUDOCOUNT - alpha;
@@ -79,7 +81,12 @@ pub const DECAY_FLOOR: f64 = 0.05;
 /// - `half_life_days`: how many days until confidence halves (default: 90)
 ///
 /// Returns at least `DECAY_FLOOR` (0.05) — relationships never fully disappear through decay alone.
-pub fn temporal_decay(stored_confidence: f64, days_since_reinforced: f64, half_life_days: f64) -> f64 {
+#[must_use]
+pub fn temporal_decay(
+    stored_confidence: f64,
+    days_since_reinforced: f64,
+    half_life_days: f64,
+) -> f64 {
     if days_since_reinforced <= 0.0 {
         return stored_confidence;
     }
@@ -111,24 +118,12 @@ pub fn effective_confidence(
     }
 }
 
-/// Parse a serde_json datetime value into chrono DateTime.
-fn parse_datetime_value(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    match val {
-        serde_json::Value::String(s) => s
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .ok()
-            .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ")
-                    .ok()
-                    .map(|ndt| ndt.and_utc())
-            }),
-        _ => None,
-    }
-}
+use super::util::parse_datetime as parse_datetime_value;
 
 /// Compound confidence along a multi-hop path.
 ///
 /// Returns the product of edge confidences. An empty path returns 1.0.
+#[must_use]
 pub fn path_confidence(edge_confidences: &[f64]) -> f64 {
     edge_confidences.iter().product()
 }
@@ -247,7 +242,11 @@ mod tests {
 
         // Should use last_reinforced (90 days) not valid_from (365 days)
         let result = effective_confidence(0.6, Some(&last_reinforced), &valid_from, &now);
-        assert!(approx_eq(result, 0.3), "got {} (expected ~0.3, one half-life from last_reinforced)", result);
+        assert!(
+            approx_eq(result, 0.3),
+            "got {} (expected ~0.3, one half-life from last_reinforced)",
+            result
+        );
     }
 
     #[test]
@@ -258,7 +257,11 @@ mod tests {
 
         // No last_reinforced — should use valid_from
         let result = effective_confidence(0.6, None, &valid_from, &now);
-        assert!(approx_eq(result, 0.3), "got {} (expected ~0.3, one half-life from valid_from)", result);
+        assert!(
+            approx_eq(result, 0.3),
+            "got {} (expected ~0.3, one half-life from valid_from)",
+            result
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::BufRead;
 use std::path::Path;
 
+use crate::error::RecallError;
 use crate::paths;
 
 const BOLD: &str = "\x1b[1m";
@@ -24,7 +25,7 @@ pub struct RankedFile {
     pub preview_lines: Vec<String>,
 }
 
-pub fn run(query: &str, context_lines: usize) -> Result<(), String> {
+pub fn run(query: &str, context_lines: usize) -> Result<(), RecallError> {
     let base = paths::memory_dir()?;
     let results = search_with_base(query, &base, context_lines)?;
 
@@ -56,20 +57,19 @@ pub fn ranked_search(
     query: &str,
     base: &Path,
     max_results: usize,
-) -> Result<Vec<RankedFile>, String> {
+) -> Result<Vec<RankedFile>, RecallError> {
     let conversations_dir = base.join("conversations");
     if !conversations_dir.exists() {
-        return Err(
-            "conversations/ directory not found. Run `recall-echo init` first.".to_string(),
-        );
+        return Err(RecallError::NotInitialized(
+            "conversations/ directory not found. Run `recall-echo init` first.".into(),
+        ));
     }
 
     let query_lower = query.to_lowercase();
     let query_words: Vec<&str> = query_lower.split_whitespace().collect();
     let mut ranked: Vec<RankedFile> = Vec::new();
 
-    let mut files: Vec<_> = fs::read_dir(&conversations_dir)
-        .map_err(|e| format!("Failed to read conversations directory: {e}"))?
+    let mut files: Vec<_> = fs::read_dir(&conversations_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let name = e.file_name();
@@ -159,7 +159,7 @@ pub fn ranked_search(
 }
 
 /// Run ranked search and display results.
-pub fn run_ranked(query: &str, max_results: usize) -> Result<(), String> {
+pub fn run_ranked(query: &str, max_results: usize) -> Result<(), RecallError> {
     let base = paths::memory_dir()?;
     let results = ranked_search(query, &base, max_results)?;
 
@@ -198,19 +198,18 @@ pub fn search_with_base(
     query: &str,
     base: &Path,
     context_lines: usize,
-) -> Result<Vec<SearchResult>, String> {
+) -> Result<Vec<SearchResult>, RecallError> {
     let conversations_dir = base.join("conversations");
     if !conversations_dir.exists() {
-        return Err(
-            "conversations/ directory not found. Run `recall-echo init` first.".to_string(),
-        );
+        return Err(RecallError::NotInitialized(
+            "conversations/ directory not found. Run `recall-echo init` first.".into(),
+        ));
     }
 
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
 
-    let mut files: Vec<_> = fs::read_dir(&conversations_dir)
-        .map_err(|e| format!("Failed to read conversations directory: {e}"))?
+    let mut files: Vec<_> = fs::read_dir(&conversations_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let name = e.file_name();
@@ -221,10 +220,7 @@ pub fn search_with_base(
     files.sort_by_key(|e| e.file_name());
 
     for entry in &files {
-        let file = std::io::BufReader::new(
-            fs::File::open(entry.path())
-                .map_err(|e| format!("Failed to open {}: {e}", entry.path().display()))?,
-        );
+        let file = std::io::BufReader::new(fs::File::open(entry.path())?);
 
         let lines: Vec<String> = file.lines().map_while(Result::ok).collect();
         let filename = entry.file_name().to_string_lossy().to_string();

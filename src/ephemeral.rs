@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::error::RecallError;
+
 pub const DEFAULT_MAX_ENTRIES: usize = 5;
 const ENTRY_SEPARATOR: &str = "\n---\n\n";
 
@@ -14,6 +16,7 @@ pub struct EphemeralEntry {
 }
 
 impl EphemeralEntry {
+    #[must_use]
     pub fn render(&self) -> String {
         let display_date = self.date.replace('T', " ").replace('Z', " UTC");
         format!(
@@ -25,10 +28,9 @@ impl EphemeralEntry {
 }
 
 /// Append a session entry to EPHEMERAL.md
-pub fn append_entry(ephemeral_path: &Path, entry: &EphemeralEntry) -> Result<(), String> {
+pub fn append_entry(ephemeral_path: &Path, entry: &EphemeralEntry) -> Result<(), RecallError> {
     let existing = if ephemeral_path.exists() {
-        fs::read_to_string(ephemeral_path)
-            .map_err(|e| format!("Failed to read EPHEMERAL.md: {e}"))?
+        fs::read_to_string(ephemeral_path)?
     } else {
         String::new()
     };
@@ -44,13 +46,13 @@ pub fn append_entry(ephemeral_path: &Path, entry: &EphemeralEntry) -> Result<(),
         )
     };
 
-    fs::write(ephemeral_path, format!("{}\n", new_content))
-        .map_err(|e| format!("Failed to write EPHEMERAL.md: {e}"))?;
+    fs::write(ephemeral_path, format!("{new_content}\n"))?;
 
     Ok(())
 }
 
 /// Parse EPHEMERAL.md content into individual entry strings.
+#[must_use]
 pub fn parse_entries(content: &str) -> Vec<&str> {
     if content.trim().is_empty() {
         return Vec::new();
@@ -64,23 +66,21 @@ pub fn parse_entries(content: &str) -> Vec<&str> {
 }
 
 /// Count current entries in EPHEMERAL.md
-pub fn count_entries(ephemeral_path: &Path) -> Result<usize, String> {
+pub fn count_entries(ephemeral_path: &Path) -> Result<usize, RecallError> {
     if !ephemeral_path.exists() {
         return Ok(0);
     }
-    let content = fs::read_to_string(ephemeral_path)
-        .map_err(|e| format!("Failed to read EPHEMERAL.md: {e}"))?;
+    let content = fs::read_to_string(ephemeral_path)?;
     Ok(parse_entries(&content).len())
 }
 
 /// Trim EPHEMERAL.md to max_entries, removing oldest entries (FIFO).
-pub fn trim_to_limit(ephemeral_path: &Path, max_entries: usize) -> Result<(), String> {
+pub fn trim_to_limit(ephemeral_path: &Path, max_entries: usize) -> Result<(), RecallError> {
     if !ephemeral_path.exists() {
         return Ok(());
     }
 
-    let content = fs::read_to_string(ephemeral_path)
-        .map_err(|e| format!("Failed to read EPHEMERAL.md: {e}"))?;
+    let content = fs::read_to_string(ephemeral_path)?;
 
     let entries = parse_entries(&content);
     if entries.len() <= max_entries {
@@ -91,8 +91,7 @@ pub fn trim_to_limit(ephemeral_path: &Path, max_entries: usize) -> Result<(), St
     let kept: Vec<&str> = entries[entries.len() - max_entries..].to_vec();
     let new_content = kept.join(ENTRY_SEPARATOR);
 
-    fs::write(ephemeral_path, format!("{}\n", new_content))
-        .map_err(|e| format!("Failed to write EPHEMERAL.md: {e}"))?;
+    fs::write(ephemeral_path, format!("{new_content}\n"))?;
 
     Ok(())
 }

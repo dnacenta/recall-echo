@@ -19,6 +19,7 @@ pub mod search;
 pub mod store;
 pub mod traverse;
 pub mod types;
+pub mod util;
 pub mod vigil_sync;
 
 use std::collections::HashMap;
@@ -27,7 +28,7 @@ use std::path::{Path, PathBuf};
 use embed::FastEmbedder;
 use error::GraphError;
 use store::Db;
-#[allow(unused_imports)]
+#[allow(unused_imports)] // Required in scope for SurrealValue derive macro expansion
 use surrealdb::types::SurrealValue;
 use surrealdb::Surreal;
 use types::*;
@@ -405,7 +406,7 @@ impl GraphMemory {
 }
 
 async fn db_count(db: &Surreal<Db>, table: &str) -> Result<u64, GraphError> {
-    let query = format!("SELECT count() AS count FROM {} GROUP ALL", table);
+    let query = format!("SELECT count() AS count FROM {table} GROUP ALL");
     let mut response = db.query(&query).await?;
     let rows: Vec<CountRow> = response.take(0)?;
     Ok(rows.first().map(|r| r.count).unwrap_or(0))

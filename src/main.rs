@@ -218,6 +218,9 @@ enum GraphCommands {
         /// Milliseconds delay between archives (default: 100)
         #[arg(long, default_value = "100")]
         delay_ms: u64,
+        /// Maximum estimated tokens to spend (0 = unlimited, default: 5000000)
+        #[arg(long, default_value = "5000000")]
+        max_tokens: u64,
     },
     /// Pipeline operations — sync, status, flow, stale detection
     Pipeline {
@@ -339,7 +342,7 @@ fn main() {
             if all_unarchived {
                 archive::archive_all_unarchived()
             } else {
-                Err("Use --all-unarchived to archive all unarchived JSONL transcripts.".to_string())
+                Err("Use --all-unarchived to archive all unarchived JSONL transcripts.".into())
             }
         }
         Some(Commands::Checkpoint { trigger }) => checkpoint::run_from_hook(&trigger),
@@ -360,123 +363,170 @@ fn main() {
         }) => {
             let root = resolve_entity_root(entity_root);
             let memory_dir = root.join("memory");
-            match command {
-                GraphCommands::Init => graph_cli::init(&memory_dir),
-                GraphCommands::Status => graph_cli::graph_status(&memory_dir),
-                GraphCommands::AddEntity {
-                    name,
-                    r#type,
-                    r#abstract,
-                    overview,
-                    source,
-                } => graph_cli::add_entity(
-                    &memory_dir,
-                    &name,
-                    &r#type,
-                    &r#abstract,
-                    overview.as_deref(),
-                    source.as_deref(),
-                ),
-                GraphCommands::Relate {
-                    from,
-                    rel,
-                    target,
-                    description,
-                    source,
-                } => graph_cli::relate(
-                    &memory_dir,
-                    &from,
-                    &rel,
-                    &target,
-                    description.as_deref(),
-                    source.as_deref(),
-                ),
-                GraphCommands::Search {
-                    query,
-                    limit,
-                    r#type,
-                    keyword,
-                } => graph_cli::search(
-                    &memory_dir,
-                    &query,
-                    limit,
-                    r#type.as_deref(),
-                    keyword.as_deref(),
-                ),
-                GraphCommands::Traverse {
-                    entity,
-                    depth,
-                    type_filter,
-                } => graph_cli::traverse(&memory_dir, &entity, depth, type_filter.as_deref()),
-                GraphCommands::Query {
-                    query,
-                    limit,
-                    r#type,
-                    keyword,
-                    depth,
-                    episodes,
-                } => graph_cli::hybrid_query(
-                    &memory_dir,
-                    &query,
-                    limit,
-                    r#type.as_deref(),
-                    keyword.as_deref(),
-                    depth,
-                    episodes,
-                ),
-                GraphCommands::Ingest { archive } => graph_cli::ingest(&memory_dir, &archive),
-                GraphCommands::IngestAll => graph_cli::ingest_all(&memory_dir),
-                #[cfg(feature = "llm")]
-                GraphCommands::Extract {
-                    log,
-                    all,
-                    dry_run,
-                    model,
-                    provider,
-                    delay_ms,
-                } => graph_cli::extract(&memory_dir, log, all, dry_run, model, provider, delay_ms),
-                GraphCommands::VigilSync {
-                    signals_path,
-                    outcomes_path,
-                } => graph_cli::vigil_sync(
-                    &memory_dir,
-                    signals_path.as_deref(),
-                    outcomes_path.as_deref(),
-                ),
-                GraphCommands::Gc {
-                    execute,
-                    stale_days,
-                    stale_confidence,
-                    dead_confidence,
-                    dead_min_age_days,
-                    stats_only,
-                } => graph_cli::gc(
-                    &memory_dir,
-                    execute,
-                    stale_days,
-                    stale_confidence,
-                    dead_confidence,
-                    dead_min_age_days,
-                    stats_only,
-                ),
-                GraphCommands::DecayReport { entity, all } => {
-                    graph_cli::decay_report(&memory_dir, entity.as_deref(), all)
-                }
-                GraphCommands::Pipeline { command } => match command {
-                    PipelineCommands::Sync { docs_dir } => {
-                        graph_cli::pipeline_sync(&memory_dir, docs_dir.as_deref())
-                    }
-                    PipelineCommands::Status { days } => {
-                        graph_cli::pipeline_status(&memory_dir, days)
-                    }
-                    PipelineCommands::Flow { entity } => {
-                        graph_cli::pipeline_flow(&memory_dir, &entity)
-                    }
-                    PipelineCommands::Stale { days } => {
-                        graph_cli::pipeline_stale(&memory_dir, days)
-                    }
-                },
-            }
+            tokio::runtime::Runtime::new()
+                .map_err(recall_echo::error::RecallError::from)
+                .and_then(|rt| {
+                    rt.block_on(async {
+                        match command {
+                            GraphCommands::Init => graph_cli::init(&memory_dir).await,
+                            GraphCommands::Status => graph_cli::graph_status(&memory_dir).await,
+                            GraphCommands::AddEntity {
+                                name,
+                                r#type,
+                                r#abstract,
+                                overview,
+                                source,
+                            } => {
+                                graph_cli::add_entity(
+                                    &memory_dir,
+                                    &name,
+                                    &r#type,
+                                    &r#abstract,
+                                    overview.as_deref(),
+                                    source.as_deref(),
+                                )
+                                .await
+                            }
+                            GraphCommands::Relate {
+                                from,
+                                rel,
+                                target,
+                                description,
+                                source,
+                            } => {
+                                graph_cli::relate(
+                                    &memory_dir,
+                                    &from,
+                                    &rel,
+                                    &target,
+                                    description.as_deref(),
+                                    source.as_deref(),
+                                )
+                                .await
+                            }
+                            GraphCommands::Search {
+                                query,
+                                limit,
+                                r#type,
+                                keyword,
+                            } => {
+                                graph_cli::search(
+                                    &memory_dir,
+                                    &query,
+                                    limit,
+                                    r#type.as_deref(),
+                                    keyword.as_deref(),
+                                )
+                                .await
+                            }
+                            GraphCommands::Traverse {
+                                entity,
+                                depth,
+                                type_filter,
+                            } => {
+                                graph_cli::traverse(
+                                    &memory_dir,
+                                    &entity,
+                                    depth,
+                                    type_filter.as_deref(),
+                                )
+                                .await
+                            }
+                            GraphCommands::Query {
+                                query,
+                                limit,
+                                r#type,
+                                keyword,
+                                depth,
+                                episodes,
+                            } => {
+                                graph_cli::hybrid_query(
+                                    &memory_dir,
+                                    &query,
+                                    limit,
+                                    r#type.as_deref(),
+                                    keyword.as_deref(),
+                                    depth,
+                                    episodes,
+                                )
+                                .await
+                            }
+                            GraphCommands::Ingest { archive } => {
+                                graph_cli::ingest(&memory_dir, &archive).await
+                            }
+                            GraphCommands::IngestAll => graph_cli::ingest_all(&memory_dir).await,
+                            #[cfg(feature = "llm")]
+                            GraphCommands::Extract {
+                                log,
+                                all,
+                                dry_run,
+                                model,
+                                provider,
+                                delay_ms,
+                                max_tokens,
+                            } => {
+                                graph_cli::extract(
+                                    &memory_dir,
+                                    log,
+                                    all,
+                                    dry_run,
+                                    model,
+                                    provider,
+                                    delay_ms,
+                                    max_tokens,
+                                )
+                                .await
+                            }
+                            GraphCommands::VigilSync {
+                                signals_path,
+                                outcomes_path,
+                            } => {
+                                graph_cli::vigil_sync(
+                                    &memory_dir,
+                                    signals_path.as_deref(),
+                                    outcomes_path.as_deref(),
+                                )
+                                .await
+                            }
+                            GraphCommands::Gc {
+                                execute,
+                                stale_days,
+                                stale_confidence,
+                                dead_confidence,
+                                dead_min_age_days,
+                                stats_only,
+                            } => {
+                                graph_cli::gc(
+                                    &memory_dir,
+                                    execute,
+                                    stale_days,
+                                    stale_confidence,
+                                    dead_confidence,
+                                    dead_min_age_days,
+                                    stats_only,
+                                )
+                                .await
+                            }
+                            GraphCommands::DecayReport { entity, all } => {
+                                graph_cli::decay_report(&memory_dir, entity.as_deref(), all).await
+                            }
+                            GraphCommands::Pipeline { command } => match command {
+                                PipelineCommands::Sync { docs_dir } => {
+                                    graph_cli::pipeline_sync(&memory_dir, docs_dir.as_deref()).await
+                                }
+                                PipelineCommands::Status { days } => {
+                                    graph_cli::pipeline_status(&memory_dir, days).await
+                                }
+                                PipelineCommands::Flow { entity } => {
+                                    graph_cli::pipeline_flow(&memory_dir, &entity).await
+                                }
+                                PipelineCommands::Stale { days } => {
+                                    graph_cli::pipeline_stale(&memory_dir, days).await
+                                }
+                            },
+                        }
+                    })
+                })
         }
     };
 

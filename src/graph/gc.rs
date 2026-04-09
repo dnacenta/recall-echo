@@ -193,7 +193,12 @@ fn phase_stale_relationships(
             kind: GcActionKind::StaleRelationship,
             reason: format!(
                 "effective_confidence {:.2} (stored {:.2}) < {:.2}, age {} days > {}, desc: {}",
-                effective, rel.confidence, config.stale_confidence, age_days, config.stale_days, description
+                effective,
+                rel.confidence,
+                config.stale_confidence,
+                age_days,
+                config.stale_days,
+                description
             ),
         });
         stale_ids.push(id);
@@ -383,21 +388,7 @@ fn is_pipeline_entity(entity: &Entity) -> bool {
     false
 }
 
-/// Parse a SurrealDB datetime value into a chrono DateTime.
-fn parse_datetime(val: &serde_json::Value) -> Option<DateTime<Utc>> {
-    match val {
-        serde_json::Value::String(s) => {
-            // Try ISO 8601 formats
-            s.parse::<DateTime<Utc>>().ok().or_else(|| {
-                // SurrealDB sometimes returns format like "2024-01-15T10:30:00Z"
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ")
-                    .ok()
-                    .map(|ndt| ndt.and_utc())
-            })
-        }
-        _ => None,
-    }
-}
+use super::util::parse_datetime;
 
 /// Extract a short ID from a record ID value (e.g. "entity:abc" → "abc").
 fn value_to_short_id(val: &serde_json::Value) -> String {
@@ -762,7 +753,7 @@ mod tests {
             description: Some("decayed rel".to_string()),
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
-            confidence: 0.6, // Above stale threshold!
+            confidence: 0.6,       // Above stale threshold!
             last_reinforced: None, // Never reinforced, so decays from valid_from
             source: None,
         }];
@@ -773,7 +764,11 @@ mod tests {
 
         // Without decay: 0.6 >= 0.5, would NOT be caught
         // With decay: 0.6 * 0.5^(180/90) = 0.6 * 0.25 = 0.15 < 0.5, IS caught
-        assert_eq!(stale.len(), 1, "decayed relationship should be caught as stale");
+        assert_eq!(
+            stale.len(),
+            1,
+            "decayed relationship should be caught as stale"
+        );
     }
 
     #[test]
@@ -801,6 +796,9 @@ mod tests {
         let stale = phase_stale_relationships(&rels, &config, &now, &mut report);
 
         // Reinforced 5 days ago: effective ≈ 0.6 * 0.5^(5/90) ≈ 0.577 > 0.5
-        assert!(stale.is_empty(), "recently reinforced relationship should NOT be stale");
+        assert!(
+            stale.is_empty(),
+            "recently reinforced relationship should NOT be stale"
+        );
     }
 }

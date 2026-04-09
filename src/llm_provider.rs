@@ -24,7 +24,7 @@ pub fn create_provider(
     memory_dir: &Path,
     provider_override: Option<&str>,
     model_override: Option<&str>,
-) -> Result<(Box<dyn LlmProvider>, String), String> {
+) -> Result<(Box<dyn LlmProvider>, String), crate::error::RecallError> {
     let mut cfg = config::load(memory_dir).llm;
 
     if let Some(p) = provider_override {
@@ -151,12 +151,16 @@ pub struct HttpConfig {
 
 impl HttpConfig {
     /// Build from a config LlmSection (for Anthropic/OpenAI providers only).
-    pub fn from_config_section(llm: &config::LlmSection) -> Result<Self, String> {
+    pub fn from_config_section(
+        llm: &config::LlmSection,
+    ) -> Result<Self, crate::error::RecallError> {
         let api_style = match llm.provider {
             Provider::Anthropic => ApiStyle::Anthropic,
             Provider::Openai => ApiStyle::OpenAiCompat,
             Provider::ClaudeCode => {
-                return Err("Use create_provider() for claude-code provider".into())
+                return Err(crate::error::RecallError::Config(
+                    "Use create_provider() for claude-code provider".into(),
+                ))
             }
         };
 
@@ -168,8 +172,10 @@ impl HttpConfig {
                 }
             })
             .map_err(|_| {
-                "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your environment."
-                    .to_string()
+                crate::error::RecallError::Config(
+                    "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your environment."
+                        .into(),
+                )
             })?;
 
         let model = llm.resolved_model().to_string();

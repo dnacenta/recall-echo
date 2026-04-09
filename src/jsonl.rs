@@ -19,26 +19,24 @@ use crate::conversation::{Conversation, ConversationEntry};
 pub struct HookInput {
     pub session_id: String,
     pub transcript_path: String,
-    #[allow(dead_code)]
-    pub cwd: Option<String>,
-    #[allow(dead_code)]
-    pub hook_event_name: Option<String>,
+    #[serde(rename = "cwd")]
+    pub _cwd: Option<String>,
+    #[serde(rename = "hook_event_name")]
+    pub _hook_event_name: Option<String>,
 }
 
-pub fn read_hook_input() -> Result<HookInput, String> {
+pub fn read_hook_input() -> Result<HookInput, crate::error::RecallError> {
     let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| format!("Failed to read stdin: {e}"))?;
+    std::io::stdin().read_to_string(&mut buf)?;
 
     if buf.trim().is_empty() {
-        return Err(
+        return Err(crate::error::RecallError::Other(
             "No input on stdin. This command is called by the Claude Code SessionEnd hook."
                 .to_string(),
-        );
+        ));
     }
 
-    serde_json::from_str(&buf).map_err(|e| format!("Invalid hook JSON on stdin: {e}"))
+    Ok(serde_json::from_str(&buf)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -50,9 +48,6 @@ struct JsonlEntry {
     #[serde(rename = "type")]
     entry_type: String,
     timestamp: Option<String>,
-    #[serde(rename = "sessionId")]
-    #[allow(dead_code)]
-    session_id: Option<String>,
     message: Option<RawMessage>,
 }
 
@@ -60,8 +55,6 @@ struct JsonlEntry {
 struct RawMessage {
     role: Option<String>,
     content: Option<ContentValue>,
-    #[allow(dead_code)]
-    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -76,8 +69,11 @@ enum ContentValue {
 // ---------------------------------------------------------------------------
 
 /// Parse a Claude Code JSONL transcript into a Conversation.
-pub fn parse_transcript(path: &str, session_id: &str) -> Result<Conversation, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open transcript {path}: {e}"))?;
+pub fn parse_transcript(
+    path: &str,
+    session_id: &str,
+) -> Result<Conversation, crate::error::RecallError> {
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
 
     let mut conv = Conversation::new(session_id);

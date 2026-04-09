@@ -7,12 +7,14 @@
 //! Both converge into `archive_conversation()` which writes the markdown file,
 //! updates ARCHIVE.md, and appends to EPHEMERAL.md.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
 use crate::config;
 use crate::conversation::{self, Conversation};
 use crate::ephemeral::{self, EphemeralEntry};
+use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
 use crate::summarize;
 use crate::tags;
@@ -34,6 +36,7 @@ pub struct ArchiveResult {
 }
 
 /// Scan conversations/ for highest conversation-NNN number. Returns 0 if none.
+#[must_use]
 pub fn highest_conversation_number(conversations_dir: &Path) -> u32 {
     let entries = match fs::read_dir(conversations_dir) {
         Ok(e) => e,
@@ -68,7 +71,7 @@ pub fn append_index(
     topics: &[String],
     message_count: u32,
     duration: &str,
-) -> Result<(), String> {
+) -> Result<(), RecallError> {
     use std::io::Write;
 
     let needs_header = if archive_path.exists() {
@@ -83,22 +86,18 @@ pub fn append_index(
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(archive_path)
-        .map_err(|e| format!("Failed to open ARCHIVE.md: {e}"))?;
+        .open(archive_path)?;
 
     if needs_header {
-        writeln!(file, "# Conversation Archive\n")
-            .map_err(|e| format!("Failed to write ARCHIVE.md header: {e}"))?;
+        writeln!(file, "# Conversation Archive\n")?;
         writeln!(
             file,
             "| # | Date | Session | Topics | Messages | Duration |"
-        )
-        .map_err(|e| format!("Failed to write ARCHIVE.md header: {e}"))?;
+        )?;
         writeln!(
             file,
             "|---|------|---------|--------|----------|----------|"
-        )
-        .map_err(|e| format!("Failed to write ARCHIVE.md header: {e}"))?;
+        )?;
     }
 
     let topics_str = if topics.is_empty() {
@@ -110,8 +109,7 @@ pub fn append_index(
     writeln!(
         file,
         "| {log_num:03} | {date} | {session_id} | {topics_str} | {message_count} | {duration} |"
-    )
-    .map_err(|e| format!("Failed to write to ARCHIVE.md: {e}"))?;
+    )?;
 
     Ok(())
 }
@@ -131,13 +129,15 @@ pub fn archive_conversation(
     conv: &Conversation,
     summary: &summarize::ConversationSummary,
     source: &str,
-) -> Result<ArchiveResult, String> {
+) -> Result<ArchiveResult, RecallError> {
     let conversations_dir = memory_dir.join("conversations");
     let archive_index = memory_dir.join("ARCHIVE.md");
     let ephemeral_path = memory_dir.join("EPHEMERAL.md");
 
     if !conversations_dir.exists() {
-        return Err("conversations/ directory not found. Run init first.".to_string());
+        return Err(RecallError::NotInitialized(
+            "conversations/ directory not found. Run init first.".into(),
+        ));
     }
 
     // Skip empty sessions
@@ -183,14 +183,14 @@ pub fn archive_conversation(
         if !summary.decisions.is_empty() {
             s.push_str("**Decisions**:\n");
             for d in &summary.decisions {
-                s.push_str(&format!("- {d}\n"));
+                let _ = writeln!(s, "- {d}");
             }
             s.push('\n');
         }
         if !summary.action_items.is_empty() {
             s.push_str("**Action Items**:\n");
             for a in &summary.action_items {
-                s.push_str(&format!("- {a}\n"));
+                let _ = writeln!(s, "- {a}");
             }
             s.push('\n');
         }
@@ -209,8 +209,7 @@ pub fn archive_conversation(
 
     // Write conversation file
     let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&conv_file, &full_content)
-        .map_err(|e| format!("Failed to write conversation file: {e}"))?;
+    fs::write(&conv_file, &full_content)?;
 
     // Append to ARCHIVE.md index
     append_index(
@@ -236,10 +235,7 @@ pub fn archive_conversation(
     let cfg = config::load_from_dir(memory_dir);
     ephemeral::trim_to_limit(&ephemeral_path, cfg.ephemeral.max_entries)?;
 
-    eprintln!(
-        "recall-echo: archived conversation-{:03}.md ({} messages)",
-        next_num, total_messages
-    );
+    eprintln!("recall-echo: archived conversation-{next_num:03}.md ({total_messages} messages)");
 
     Ok(ArchiveResult {
         log_number: next_num,
@@ -431,7 +427,7 @@ pub fn archive_from_jsonl(
     base_dir: &Path,
     session_id: &str,
     transcript_path: &str,
-) -> Result<u32, String> {
+) -> Result<u32, RecallError> {
     let conv = crate::jsonl::parse_transcript(transcript_path, session_id)?;
     let summary = summarize::algorithmic_summary(&conv);
     let result = archive_conversation(base_dir, &conv, &summary, "jsonl")?;
@@ -445,7 +441,7 @@ pub fn archive_from_jsonl(
 
 /// Main archive-session flow, called from the SessionEnd hook.
 /// Reads hook input from stdin.
-pub fn run_from_hook() -> Result<(), String> {
+pub fn run_from_hook() -> Result<(), RecallError> {
     let hook_input = crate::jsonl::read_hook_input()?;
     let base_dir = crate::paths::claude_dir()?;
     archive_from_jsonl(
@@ -457,17 +453,17 @@ pub fn run_from_hook() -> Result<(), String> {
 }
 
 /// Archive all unarchived JSONL transcripts found under ~/.claude/projects/.
-pub fn archive_all_unarchived() -> Result<(), String> {
+pub fn archive_all_unarchived() -> Result<(), RecallError> {
     let base = crate::paths::claude_dir()?;
     archive_all_with_base(&base)
 }
 
-pub fn archive_all_with_base(base: &Path) -> Result<(), String> {
+pub fn archive_all_with_base(base: &Path) -> Result<(), RecallError> {
     let conversations_dir = base.join("conversations");
     if !conversations_dir.exists() {
-        return Err(
-            "conversations/ directory not found. Run `recall-echo init` first.".to_string(),
-        );
+        return Err(RecallError::NotInitialized(
+            "conversations/ directory not found. Run `recall-echo init` first.".into(),
+        ));
     }
 
     let archived_sessions = collect_archived_sessions(&conversations_dir);
@@ -503,7 +499,7 @@ pub fn archive_all_with_base(base: &Path) -> Result<(), String> {
         match archive_from_jsonl(base, &session_id, &path_str) {
             Ok(_) => archived_count += 1,
             Err(e) => {
-                eprintln!("recall-echo: skipping {} \u{2014} {}", session_id, e);
+                eprintln!("recall-echo: skipping {session_id} \u{2014} {e}");
             }
         }
     }
@@ -566,7 +562,7 @@ pub async fn archive_session(
     messages: &[pulse_system_types::llm::Message],
     metadata: &SessionMetadata,
     provider: Option<&dyn pulse_system_types::llm::LmProvider>,
-) -> Result<u32, String> {
+) -> Result<u32, RecallError> {
     let mut conv = crate::pulse_null::messages_to_conversation(messages, &metadata.session_id);
     conv.first_timestamp = metadata.started_at.clone();
     conv.last_timestamp = metadata.ended_at.clone();

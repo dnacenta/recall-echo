@@ -6,15 +6,16 @@
 use std::fs;
 use std::path::Path;
 
+use crate::error::RecallError;
+
 /// Read EPHEMERAL.md content without clearing it.
 /// Returns None if the file doesn't exist or is empty.
-pub fn consume(ephemeral_path: &Path) -> Result<Option<String>, String> {
+pub fn consume(ephemeral_path: &Path) -> Result<Option<String>, RecallError> {
     if !ephemeral_path.exists() {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(ephemeral_path)
-        .map_err(|e| format!("Failed to read EPHEMERAL.md: {e}"))?;
+    let content = fs::read_to_string(ephemeral_path)?;
 
     if content.trim().is_empty() {
         return Ok(None);
@@ -24,7 +25,7 @@ pub fn consume(ephemeral_path: &Path) -> Result<Option<String>, String> {
 }
 
 /// CLI command: print EPHEMERAL.md to stdout.
-pub fn run(ephemeral_path: &Path) -> Result<(), String> {
+pub fn run(ephemeral_path: &Path) -> Result<(), RecallError> {
     match consume(ephemeral_path)? {
         Some(content) => {
             println!("{}", content.trim());

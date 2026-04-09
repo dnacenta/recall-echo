@@ -3,6 +3,8 @@
 //! Extracts decisions, action items, project references, files touched,
 //! and tools used from conversation entries.
 
+use std::fmt::Write as _;
+
 use crate::conversation::ConversationEntry;
 
 /// Structured tags extracted from a conversation.
@@ -16,6 +18,7 @@ pub struct ConversationTags {
 }
 
 impl ConversationTags {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.decisions.is_empty()
             && self.action_items.is_empty()
@@ -61,6 +64,7 @@ const ACTION_MARKERS: &[&str] = &[
 ];
 
 /// Extract structured tags from flattened conversation entries.
+#[must_use]
 pub fn extract_tags(entries: &[ConversationEntry]) -> ConversationTags {
     let mut tags = ConversationTags::default();
     let mut tool_set = std::collections::HashSet::new();
@@ -164,6 +168,7 @@ fn detect_project(text: &str) -> Option<String> {
 }
 
 /// Format tags as a markdown section for inclusion in conversation archives.
+#[must_use]
 pub fn format_tags_section(tags: &ConversationTags) -> String {
     if tags.is_empty() {
         return String::new();
@@ -172,20 +177,20 @@ pub fn format_tags_section(tags: &ConversationTags) -> String {
     let mut section = String::from("\n## Tags\n");
 
     if let Some(ref project) = tags.project {
-        section.push_str(&format!("\n**Project**: {project}\n"));
+        let _ = write!(section, "\n**Project**: {project}\n");
     }
 
     if !tags.decisions.is_empty() {
         section.push_str("\n**Decisions**:\n");
         for d in &tags.decisions {
-            section.push_str(&format!("- {d}\n"));
+            let _ = writeln!(section, "- {d}");
         }
     }
 
     if !tags.action_items.is_empty() {
         section.push_str("\n**Action Items**:\n");
         for a in &tags.action_items {
-            section.push_str(&format!("- {a}\n"));
+            let _ = writeln!(section, "- {a}");
         }
     }
 

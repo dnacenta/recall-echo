@@ -16,6 +16,7 @@ pub struct Frontmatter {
 }
 
 impl Frontmatter {
+    #[must_use]
     pub fn render(&self) -> String {
         let topics = if self.topics.is_empty() {
             "[]".to_string()
@@ -32,6 +33,7 @@ impl Frontmatter {
 }
 
 /// Parse frontmatter from file content. Returns None if no valid frontmatter found.
+#[must_use]
 pub fn parse(content: &str) -> Option<Frontmatter> {
     let trimmed = content.trim();
     if !trimmed.starts_with("---") {

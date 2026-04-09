@@ -19,6 +19,7 @@ pub enum Provider {
 }
 
 impl Provider {
+    #[must_use]
     pub fn default_model(&self) -> &'static str {
         match self {
             Provider::Anthropic => "claude-haiku-4-5-20251001",
@@ -27,6 +28,7 @@ impl Provider {
         }
     }
 
+    #[must_use]
     pub fn default_api_base(&self) -> &'static str {
         match self {
             Provider::Anthropic => "https://api.anthropic.com/v1/messages",
@@ -35,14 +37,14 @@ impl Provider {
         }
     }
 
-    pub fn from_str_loose(s: &str) -> Result<Self, String> {
+    pub fn from_str_loose(s: &str) -> Result<Self, crate::error::RecallError> {
         match s.to_lowercase().as_str() {
             "anthropic" | "claude" => Ok(Provider::Anthropic),
             "openai" | "ollama" => Ok(Provider::Openai),
             "claude-code" | "claudecode" => Ok(Provider::ClaudeCode),
-            other => Err(format!(
+            other => Err(crate::error::RecallError::Config(format!(
                 "unknown provider: {other} (use 'anthropic', 'ollama', or 'claude-code')"
-            )),
+            ))),
         }
     }
 }
@@ -109,6 +111,7 @@ impl Default for LlmSection {
 
 impl LlmSection {
     /// Resolved model — uses configured value or provider default.
+    #[must_use]
     pub fn resolved_model(&self) -> &str {
         if self.model.is_empty() {
             self.provider.default_model()
@@ -118,6 +121,7 @@ impl LlmSection {
     }
 
     /// Resolved API base — uses configured value or provider default.
+    #[must_use]
     pub fn resolved_api_base(&self) -> &str {
         if self.api_base.is_empty() {
             self.provider.default_api_base()
@@ -144,18 +148,21 @@ fn default_provider() -> Provider {
 // ── Load / Save ──────────────────────────────────────────────────────────
 
 /// Config file path for a given base directory.
+#[must_use]
 pub fn config_path(base: &Path) -> std::path::PathBuf {
     base.join(CONFIG_FILE)
 }
 
 /// Load config from .recall-echo.toml in the given directory.
 /// Returns defaults if file doesn't exist or is malformed.
+#[must_use]
 pub fn load_from_dir(dir: &Path) -> Config {
     load(dir)
 }
 
 /// Load config from .recall-echo.toml in the base dir.
 /// Returns defaults if file doesn't exist or is malformed.
+#[must_use]
 pub fn load(base: &Path) -> Config {
     let path = config_path(base);
     if !path.exists() {
@@ -174,13 +181,15 @@ pub fn load(base: &Path) -> Config {
 }
 
 /// Save config to .recall-echo.toml in the base dir.
-pub fn save(base: &Path, config: &Config) -> Result<(), String> {
+pub fn save(base: &Path, config: &Config) -> Result<(), crate::error::RecallError> {
     let path = config_path(base);
-    let content = toml::to_string_pretty(config).map_err(|e| format!("serialize config: {e}"))?;
-    fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))
+    let content = toml::to_string_pretty(config)?;
+    fs::write(&path, content)?;
+    Ok(())
 }
 
 /// Returns true if .recall-echo.toml exists in the directory.
+#[must_use]
 pub fn exists(base: &Path) -> bool {
     config_path(base).exists()
 }
@@ -196,7 +205,8 @@ fn validate(mut cfg: Config) -> Config {
 
 impl Config {
     /// Set a dotted config key (e.g. "llm.provider", "ephemeral.max_entries").
-    pub fn set_key(&mut self, key: &str, value: &str) -> Result<(), String> {
+    pub fn set_key(&mut self, key: &str, value: &str) -> Result<(), crate::error::RecallError> {
+        use crate::error::RecallError;
         match key {
             "llm.provider" | "provider" => {
                 let provider = Provider::from_str_loose(value)?;
@@ -217,9 +227,11 @@ impl Config {
             "ephemeral.max_entries" => {
                 let n: usize = value
                     .parse()
-                    .map_err(|_| format!("invalid number: {value}"))?;
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
                 if !(1..=50).contains(&n) {
-                    return Err("max_entries must be between 1 and 50".into());
+                    return Err(RecallError::Config(
+                        "max_entries must be between 1 and 50".into(),
+                    ));
                 }
                 self.ephemeral.max_entries = n;
                 Ok(())
@@ -235,7 +247,7 @@ impl Config {
             "pipeline.auto_sync" => {
                 let b: bool = value
                     .parse()
-                    .map_err(|_| format!("invalid boolean: {value}"))?;
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 let section = self.pipeline.get_or_insert(PipelineSection {
                     docs_dir: None,
                     auto_sync: None,
@@ -243,7 +255,7 @@ impl Config {
                 section.auto_sync = Some(b);
                 Ok(())
             }
-            other => Err(format!("unknown config key: {other}")),
+            other => Err(RecallError::Config(format!("unknown config key: {other}"))),
         }
     }
 }

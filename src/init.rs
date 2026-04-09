@@ -8,6 +8,7 @@ use std::io::{self, BufRead, Write as _};
 use std::path::Path;
 
 use crate::config::{self, Config, LlmSection, Provider};
+use crate::error::RecallError;
 use crate::paths;
 
 // ANSI color helpers
@@ -120,10 +121,7 @@ fn prompt_provider(reader: &mut dyn BufRead) -> Option<Provider> {
             } else {
                 Provider::Anthropic
             };
-            eprintln!(
-                "  {YELLOW}~{RESET} Unknown choice, defaulting to {}",
-                default
-            );
+            eprintln!("  {YELLOW}~{RESET} Unknown choice, defaulting to {default}");
             Some(default)
         }
     }
@@ -320,17 +318,8 @@ fn hook_exists(
 
 /// Check if stderr is a terminal (for interactive prompts).
 fn atty_check() -> bool {
-    #[cfg(unix)]
-    {
-        extern "C" {
-            fn isatty(fd: std::os::raw::c_int) -> std::os::raw::c_int;
-        }
-        unsafe { isatty(2) != 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
 }
 
 /// Initialize memory structure at the given entity root.
@@ -344,19 +333,19 @@ fn atty_check() -> bool {
 /// ├── .recall-echo.toml
 /// └── conversations/
 /// ```
-pub fn run(entity_root: &Path) -> Result<(), String> {
+pub fn run(entity_root: &Path) -> Result<(), RecallError> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     run_with_reader(entity_root, &mut reader)
 }
 
 /// Testable init with injectable reader.
-pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(), String> {
+pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(), RecallError> {
     if !entity_root.exists() {
-        return Err(format!(
+        return Err(RecallError::NotInitialized(format!(
             "Directory not found: {}\n  Create the directory first, or run from a valid path.",
             entity_root.display()
-        ));
+        )));
     }
 
     eprintln!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");

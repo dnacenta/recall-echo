@@ -51,7 +51,7 @@ pub async fn ingest_archive(
         match gm.add_episode(episode).await {
             Ok(_) => report.episodes_created += 1,
             Err(e) => {
-                report.errors.push(format!("episode chunk {}: {}", i, e));
+                report.errors.push(format!("episode chunk {i}: {e}"));
             }
         }
     }
@@ -122,9 +122,11 @@ async fn process_extraction(
             Ok(extraction) => {
                 all_entities.extend(extract::flatten_extraction(&extraction));
                 all_relationships.extend(extraction.relationships);
+                // Estimate ~2500 tokens per extracted chunk (system prompt + chunk input + output)
+                report.estimated_tokens += 2500;
             }
             Err(e) => {
-                report.errors.push(format!("extraction chunk {}: {}", i, e));
+                report.errors.push(format!("extraction chunk {i}: {e}"));
             }
         }
     }
@@ -136,6 +138,8 @@ async fn process_extraction(
     let mut name_map: HashMap<String, String> = HashMap::new();
 
     for candidate in &deduplicated {
+        // Estimate ~600 tokens per dedup call (vector search + LLM decision)
+        report.estimated_tokens += 600;
         match dedup::resolve_entity(gm, llm, candidate, session_id).await {
             Ok(ResolvedEntity::Created(entity)) => {
                 name_map.insert(candidate.name.clone(), entity.name.clone());
@@ -171,10 +175,9 @@ async fn process_extraction(
             if let Err(e) =
                 crud::reinforce_relationship(gm.db(), &existing.id_string(), updated).await
             {
-                report.errors.push(format!(
-                    "confidence update {} -> {}: {}",
-                    from_name, to_name, e
-                ));
+                report
+                    .errors
+                    .push(format!("confidence update {from_name} -> {to_name}: {e}"));
             }
             report.relationships_skipped += 1;
             continue;
@@ -201,7 +204,7 @@ async fn process_extraction(
             Err(e) => {
                 report
                     .errors
-                    .push(format!("relationship {} -> {}: {}", from_name, to_name, e));
+                    .push(format!("relationship {from_name} -> {to_name}: {e}"));
             }
         }
     }
@@ -231,14 +234,14 @@ fn local_merge_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> 
             // Concatenate overviews
             if let Some(new_overview) = entity.overview {
                 existing.overview = Some(match &existing.overview {
-                    Some(o) => format!("{}\n\n{}", o, new_overview),
+                    Some(o) => format!("{o}\n\n{new_overview}"),
                     None => new_overview,
                 });
             }
             // Concatenate content
             if let Some(new_content) = entity.content {
                 existing.content = Some(match &existing.content {
-                    Some(c) => format!("{}\n\n{}", c, new_content),
+                    Some(c) => format!("{c}\n\n{new_content}"),
                     None => new_content,
                 });
             }
@@ -259,18 +262,7 @@ fn local_merge_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> 
     order.into_iter().filter_map(|k| seen.remove(&k)).collect()
 }
 
-fn merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
-    match (base, overlay) {
-        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
-            let mut merged = b.clone();
-            for (k, v) in o {
-                merged.insert(k.clone(), v.clone());
-            }
-            serde_json::Value::Object(merged)
-        }
-        _ => overlay.clone(),
-    }
-}
+use super::util::merge_json_objects as merge_json;
 
 /// Build a short abstract for an episode chunk.
 fn build_episode_abstract(chunk: &str) -> String {

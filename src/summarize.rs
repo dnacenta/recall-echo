@@ -20,6 +20,7 @@ pub struct ConversationSummary {
 }
 
 /// Pure algorithmic summary — no LLM calls. Always available.
+#[must_use]
 pub fn algorithmic_summary(conv: &Conversation) -> ConversationSummary {
     ConversationSummary {
         summary: conversation::extract_summary(conv),

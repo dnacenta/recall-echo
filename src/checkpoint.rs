@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::archive;
 use crate::conversation;
+use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
 use crate::tags;
 
@@ -18,16 +19,18 @@ use crate::tags;
 
 /// Checkpoint from a JSONL transcript (Claude Code hook).
 /// Reads hook input from stdin.
-pub fn run_from_hook(trigger: &str) -> Result<(), String> {
+pub fn run_from_hook(trigger: &str) -> Result<(), RecallError> {
     run_from_hook_with_paths(trigger, &crate::paths::claude_dir()?)
 }
 
-pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), String> {
+pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), RecallError> {
     let conversations_dir = base_dir.join("conversations");
     let archive_index = base_dir.join("ARCHIVE.md");
 
     if !conversations_dir.exists() {
-        return Err("conversations/ directory not found. Run init first.".to_string());
+        return Err(RecallError::NotInitialized(
+            "conversations/ directory not found. Run init first.".into(),
+        ));
     }
 
     // Try to read hook input from stdin (Claude Code passes transcript_path)
@@ -56,8 +59,7 @@ pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), St
     let full_content = format!("{}\n\n{}{}", fm.render(), data.md_body, data.tags_section);
 
     let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&conv_file, &full_content)
-        .map_err(|e| format!("Failed to create checkpoint file: {e}"))?;
+    fs::write(&conv_file, &full_content)?;
 
     // Graph ingestion
     {
@@ -150,7 +152,7 @@ pub async fn create_checkpoint(
     messages: &[pulse_system_types::llm::Message],
     metadata: &archive::SessionMetadata,
     provider: Option<&dyn pulse_system_types::llm::LmProvider>,
-) -> Result<u32, String> {
+) -> Result<u32, RecallError> {
     let mut conv = crate::pulse_null::messages_to_conversation(messages, &metadata.session_id);
     conv.first_timestamp = metadata.started_at.clone();
     conv.last_timestamp = metadata.ended_at.clone();
@@ -207,8 +209,8 @@ mod tests {
         let input = crate::jsonl::HookInput {
             session_id: "test-ckpt".to_string(),
             transcript_path: p,
-            cwd: None,
-            hook_event_name: Some("PreCompact".to_string()),
+            _cwd: None,
+            _hook_event_name: Some("PreCompact".to_string()),
         };
 
         let data = extract_from_transcript(&input);

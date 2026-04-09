@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use crate::error::RecallError;
 use crate::paths;
 
 const BOLD: &str = "\x1b[1m";
@@ -10,19 +11,20 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 /// Analyze MEMORY.md and suggest distillation actions.
-pub fn run() -> Result<(), String> {
+pub fn run() -> Result<(), RecallError> {
     let base = paths::entity_root()?;
     run_with_base(&base)
 }
 
-pub fn run_with_base(base: &Path) -> Result<(), String> {
+pub fn run_with_base(base: &Path) -> Result<(), RecallError> {
     let memory_path = base.join("memory/MEMORY.md");
     if !memory_path.exists() {
-        return Err("MEMORY.md not found. Run `recall-echo init` first.".to_string());
+        return Err(RecallError::NotInitialized(
+            "MEMORY.md not found. Run `recall-echo init` first.".into(),
+        ));
     }
 
-    let content =
-        fs::read_to_string(&memory_path).map_err(|e| format!("Failed to read MEMORY.md: {e}"))?;
+    let content = fs::read_to_string(&memory_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let line_count = lines.len();
 

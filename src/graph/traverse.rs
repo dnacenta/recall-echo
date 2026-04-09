@@ -1,5 +1,7 @@
 //! Graph traversal — recursive depth-first with cycle detection.
 
+use std::fmt::Write as _;
+
 use surrealdb::Surreal;
 
 use super::confidence;
@@ -210,15 +212,13 @@ async fn collect_edges<'a>(
 }
 
 /// Format a traversal tree as an indented string for display.
+#[must_use]
 pub fn format_traversal(node: &TraversalNode, indent: usize) -> String {
     let mut out = String::new();
     let prefix = "  ".repeat(indent);
 
     if indent == 0 {
-        out.push_str(&format!(
-            "{} ({})\n",
-            node.entity.name, node.entity.entity_type
-        ));
+        let _ = writeln!(out, "{} ({})", node.entity.name, node.entity.entity_type);
     }
 
     for edge in &node.edges {
@@ -234,16 +234,11 @@ pub fn format_traversal(node: &TraversalNode, indent: usize) -> String {
             String::new()
         };
 
-        out.push_str(&format!(
-            "{}{} {} {} {}{}{}\n",
-            prefix,
-            "├──",
-            edge.direction,
-            edge.rel_type,
-            edge.target.entity.name,
-            confidence_tag,
-            superseded,
-        ));
+        let _ = writeln!(
+            out,
+            "{prefix}├── {} {} {}{confidence_tag}{superseded}",
+            edge.direction, edge.rel_type, edge.target.entity.name,
+        );
 
         if !edge.target.edges.is_empty() {
             out.push_str(&format_traversal(&edge.target, indent + 1));

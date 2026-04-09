@@ -259,11 +259,13 @@ pub async fn reinforce_relationship(
     rel_id: &str,
     new_confidence: f64,
 ) -> Result<(), GraphError> {
-    db.query("UPDATE type::record($id) SET confidence = $confidence, last_reinforced = time::now()")
-        .bind(("id", rel_id.to_string()))
-        .bind(("confidence", new_confidence))
-        .await?
-        .check()?;
+    db.query(
+        "UPDATE type::record($id) SET confidence = $confidence, last_reinforced = time::now()",
+    )
+    .bind(("id", rel_id.to_string()))
+    .bind(("confidence", new_confidence))
+    .await?
+    .check()?;
     Ok(())
 }
 

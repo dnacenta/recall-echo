@@ -1,5 +1,7 @@
 //! LLM-powered entity deduplication — skip, create, or merge decisions.
 
+use std::fmt::Write as _;
+
 use super::error::GraphError;
 use super::llm::LlmProvider;
 use super::types::*;
@@ -53,17 +55,7 @@ pub async fn resolve_entity(
 
     if relevant.is_empty() {
         // No similar entities — create directly
-        let entity = gm
-            .add_entity(NewEntity {
-                name: candidate.name.clone(),
-                entity_type: candidate.entity_type.clone(),
-                abstract_text: candidate.abstract_text.clone(),
-                overview: candidate.overview.clone(),
-                content: candidate.content.clone(),
-                attributes: candidate.attributes.clone(),
-                source: Some(session_id.to_string()),
-            })
-            .await?;
+        let entity = gm.add_entity(candidate.to_new_entity(session_id)).await?;
         return Ok(ResolvedEntity::Created(entity));
     }
 
@@ -79,17 +71,7 @@ pub async fn resolve_entity(
         DedupDecision::Skip => Ok(ResolvedEntity::Skipped),
 
         DedupDecision::Create => {
-            let entity = gm
-                .add_entity(NewEntity {
-                    name: candidate.name.clone(),
-                    entity_type: candidate.entity_type.clone(),
-                    abstract_text: candidate.abstract_text.clone(),
-                    overview: candidate.overview.clone(),
-                    content: candidate.content.clone(),
-                    attributes: candidate.attributes.clone(),
-                    source: Some(session_id.to_string()),
-                })
-                .await?;
+            let entity = gm.add_entity(candidate.to_new_entity(session_id)).await?;
             Ok(ResolvedEntity::Created(entity))
         }
 
@@ -98,34 +80,14 @@ pub async fn resolve_entity(
             let target_entity = gm.get_entity(&target).await?;
             let Some(target_entity) = target_entity else {
                 // Target not found — fall back to create
-                let entity = gm
-                    .add_entity(NewEntity {
-                        name: candidate.name.clone(),
-                        entity_type: candidate.entity_type.clone(),
-                        abstract_text: candidate.abstract_text.clone(),
-                        overview: candidate.overview.clone(),
-                        content: candidate.content.clone(),
-                        attributes: candidate.attributes.clone(),
-                        source: Some(session_id.to_string()),
-                    })
-                    .await?;
+                let entity = gm.add_entity(candidate.to_new_entity(session_id)).await?;
                 return Ok(ResolvedEntity::Created(entity));
             };
 
             // Check mutability
             if !target_entity.mutable {
                 // Immutable — can't merge, create instead
-                let entity = gm
-                    .add_entity(NewEntity {
-                        name: candidate.name.clone(),
-                        entity_type: candidate.entity_type.clone(),
-                        abstract_text: candidate.abstract_text.clone(),
-                        overview: candidate.overview.clone(),
-                        content: candidate.content.clone(),
-                        attributes: candidate.attributes.clone(),
-                        source: Some(session_id.to_string()),
-                    })
-                    .await?;
+                let entity = gm.add_entity(candidate.to_new_entity(session_id)).await?;
                 return Ok(ResolvedEntity::Created(entity));
             }
 
@@ -162,7 +124,7 @@ async fn merge_entity(
     });
 
     let new_content = candidate.content.as_ref().map(|cc| match &target.content {
-        Some(tc) => format!("{}\n\n{}", tc, cc),
+        Some(tc) => format!("{tc}\n\n{cc}"),
         None => cc.clone(),
     });
 
@@ -190,14 +152,15 @@ fn build_dedup_message(candidate: &ExtractedEntity, similar: &[&SearchResult]) -
         candidate.name, candidate.entity_type, candidate.abstract_text
     );
     for (i, r) in similar.iter().enumerate() {
-        msg.push_str(&format!(
+        let _ = write!(
+            msg,
             "\n{}. Name: {} (score: {:.3})\n   Type: {}\n   Abstract: {}\n",
             i + 1,
             r.entity.name,
             r.score,
             r.entity.entity_type,
             r.entity.abstract_text
-        ));
+        );
     }
     msg
 }
@@ -215,7 +178,7 @@ pub fn parse_dedup_response(text: &str) -> Result<DedupDecision, GraphError> {
                     .unwrap_or_else(|| GraphError::Parse(e.to_string()));
             }
         }
-        GraphError::Parse(format!("dedup response not valid JSON: {}", e))
+        GraphError::Parse(format!("dedup response not valid JSON: {e}"))
     })?;
 
     parse_decision_value(&v)
@@ -239,51 +202,11 @@ fn parse_decision_value(v: &serde_json::Value) -> Result<DedupDecision, GraphErr
                 target: target.to_string(),
             })
         }
-        other => Err(GraphError::Parse(format!("unknown decision: {}", other))),
+        other => Err(GraphError::Parse(format!("unknown decision: {other}"))),
     }
 }
 
-fn strip_markdown_fencing(text: &str) -> String {
-    let trimmed = text.trim();
-    let stripped = trimmed
-        .strip_prefix("```json")
-        .or(trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    let stripped = stripped.strip_suffix("```").unwrap_or(stripped);
-    stripped.trim().to_string()
-}
-
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0;
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..start + i + 1]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn merge_json_objects(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
-    match (base, overlay) {
-        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
-            let mut merged = b.clone();
-            for (k, v) in o {
-                merged.insert(k.clone(), v.clone());
-            }
-            serde_json::Value::Object(merged)
-        }
-        _ => overlay.clone(),
-    }
-}
+use super::util::{extract_json_object, merge_json_objects, strip_markdown_fencing};
 
 #[cfg(test)]
 mod tests {

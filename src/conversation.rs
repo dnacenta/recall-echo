@@ -5,6 +5,7 @@
 //! produce these types, which then flow into the archive pipeline.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -34,6 +35,7 @@ pub struct Conversation {
 
 impl Conversation {
     /// Create a new empty conversation with the given session ID.
+    #[must_use]
     pub fn new(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
@@ -46,6 +48,7 @@ impl Conversation {
     }
 
     /// Total message count (user + assistant).
+    #[must_use]
     pub fn total_messages(&self) -> u32 {
         self.user_message_count + self.assistant_message_count
     }
@@ -56,6 +59,7 @@ impl Conversation {
 // ---------------------------------------------------------------------------
 
 /// Convert conversation entries into a markdown document for archival.
+#[must_use]
 pub fn conversation_to_markdown(conv: &Conversation, log_num: u32) -> String {
     let mut md = format!("# Conversation {log_num:03}\n\n");
     let mut last_role: Option<&str> = None;
@@ -82,14 +86,15 @@ pub fn conversation_to_markdown(conv: &Conversation, log_num: u32) -> String {
                 name,
                 input_summary,
             } => {
-                md.push_str(&format!("> **{name}**: `{input_summary}`\n\n"));
+                let _ = write!(md, "> **{name}**: `{input_summary}`\n\n");
             }
             ConversationEntry::ToolResult { content, is_error } => {
                 let label = if *is_error { "Error" } else { "Result" };
                 let truncated = truncate(content, 2000);
-                md.push_str(&format!(
+                let _ = write!(
+                    md,
                     "<details><summary>{label}</summary>\n\n```\n{truncated}\n```\n\n</details>\n\n"
-                ));
+                );
             }
         }
     }
@@ -119,6 +124,7 @@ const STOP_WORDS: &[&str] = &[
 
 /// Algorithmic topic extraction from conversation entries.
 /// Uses keyword frequency with stop-word filtering and tool-target boosting.
+#[must_use]
 pub fn extract_topics(conv: &Conversation, max: usize) -> Vec<String> {
     let mut freq: HashMap<String, u32> = HashMap::new();
 
@@ -181,6 +187,7 @@ pub fn extract_topics(conv: &Conversation, max: usize) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Algorithmic summary extraction — first user message, truncated.
+#[must_use]
 pub fn extract_summary(conv: &Conversation) -> String {
     for entry in &conv.entries {
         if let ConversationEntry::UserMessage(text) = entry {
@@ -203,59 +210,19 @@ pub fn extract_summary(conv: &Conversation) -> String {
 // ---------------------------------------------------------------------------
 
 /// Get current UTC timestamp in ISO 8601 format.
+#[must_use]
 pub fn utc_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs_per_day = 86400u64;
-    let days = now / secs_per_day;
-    let day_secs = now % secs_per_day;
-    let hours = day_secs / 3600;
-    let minutes = (day_secs % 3600) / 60;
-    let seconds = day_secs % 60;
-
-    let mut y = 1970i64;
-    let mut remaining_days = days as i64;
-    loop {
-        let year_days = if is_leap(y) { 366 } else { 365 };
-        if remaining_days < year_days {
-            break;
-        }
-        remaining_days -= year_days;
-        y += 1;
-    }
-    let month_days = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 0usize;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining_days < md {
-            m = i;
-            break;
-        }
-        remaining_days -= md;
-    }
-    let d = remaining_days + 1;
-    format!(
-        "{y:04}-{:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z",
-        m + 1
-    )
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Extract just the date portion from an ISO timestamp.
+#[must_use]
 pub fn date_from_timestamp(ts: &str) -> String {
     ts.split('T').next().unwrap_or(ts).to_string()
 }
 
 /// Calculate duration string from two ISO timestamps.
+#[must_use]
 pub fn calculate_duration(start: &str, end: &str) -> String {
     fn parse_timestamp(ts: &str) -> Option<u64> {
         let t_pos = ts.find('T')?;
@@ -314,6 +281,7 @@ fn format_duration(seconds: u64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Strip [Channel: ...] and "User message:" prefixes from text.
+#[must_use]
 pub fn strip_channel_prefix(text: &str) -> String {
     let mut s = text.trim().to_string();
 
@@ -336,6 +304,7 @@ pub fn strip_channel_prefix(text: &str) -> String {
 }
 
 /// Truncate a string, appending a notice if it was cut.
+#[must_use]
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -352,6 +321,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 /// Condense a conversation into a text block suitable for LLM summarization.
 /// Keeps it short to minimize token usage.
+#[must_use]
 pub fn condense_for_summary(conv: &Conversation) -> String {
     let mut condensed = String::new();
 
@@ -379,7 +349,7 @@ pub fn condense_for_summary(conv: &Conversation) -> String {
                 name,
                 input_summary,
             } => {
-                condensed.push_str(&format!("[Tool: {name} \u{2192} {input_summary}]\n"));
+                let _ = writeln!(condensed, "[Tool: {name} \u{2192} {input_summary}]");
             }
             ConversationEntry::ToolResult { .. } => {}
         }

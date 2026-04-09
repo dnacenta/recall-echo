@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::error::RecallError;
 use crate::RecallEcho;
 
 // ── ANSI colors ─────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ pub struct HealthAssessment {
 }
 
 impl HealthAssessment {
+    #[must_use]
     pub fn display(&self) -> String {
         match self.level {
             HealthLevel::Healthy => format!("{GREEN}HEALTHY{RESET}"),
@@ -53,6 +55,7 @@ pub struct MemoryStats {
 }
 
 impl MemoryStats {
+    #[must_use]
     pub fn collect(recall: &RecallEcho) -> Self {
         let memory_path = recall.memory_file();
         if !memory_path.exists() {
@@ -83,6 +86,7 @@ impl MemoryStats {
         }
     }
 
+    #[must_use]
     pub fn freshness_display(&self) -> String {
         match self.modified {
             Some(time) => format_age(time),
@@ -108,6 +112,7 @@ pub struct ArchiveStats {
 }
 
 impl ArchiveStats {
+    #[must_use]
     pub fn collect(recall: &RecallEcho) -> Self {
         let conv_dir = recall.conversations_dir();
         if !conv_dir.exists() {
@@ -149,6 +154,7 @@ impl ArchiveStats {
         }
     }
 
+    #[must_use]
     pub fn freshness_display(&self) -> String {
         match self.newest_modified {
             Some(time) => format_age(time),
@@ -197,7 +203,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
                 width = logo_width,
             );
         } else {
-            println!("  {GREEN}{}{RESET}", logo_line);
+            println!("  {GREEN}{logo_line}{RESET}");
         }
     }
 
@@ -290,7 +296,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
 // ── Search ──────────────────────────────────────────────────────────────
 
 /// Line-level search across conversation archives.
-pub fn search_lines(recall: &RecallEcho, query: &str) -> Result<(), String> {
+pub fn search_lines(recall: &RecallEcho, query: &str) -> Result<(), RecallError> {
     let conv_dir = recall.conversations_dir();
     if !conv_dir.exists() {
         println!("  No conversation archives found.");
@@ -307,8 +313,7 @@ pub fn search_lines(recall: &RecallEcho, query: &str) -> Result<(), String> {
     let mut total_matches = 0;
 
     for file in &files {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
+        let content = fs::read_to_string(file)?;
         let filename = file.file_name().unwrap_or_default().to_string_lossy();
         let mut file_matches = Vec::new();
 
@@ -351,7 +356,7 @@ pub fn search_lines(recall: &RecallEcho, query: &str) -> Result<(), String> {
 }
 
 /// Ranked file-level search across conversation archives.
-pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), String> {
+pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), RecallError> {
     let conv_dir = recall.conversations_dir();
     if !conv_dir.exists() {
         println!("  No conversation archives found.");
@@ -369,8 +374,7 @@ pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), String> {
     let mut scored: Vec<(f64, &PathBuf, Vec<String>)> = Vec::new();
 
     for (idx, file) in files.iter().enumerate() {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
+        let content = fs::read_to_string(file)?;
         let content_lower = content.to_lowercase();
 
         let match_count = content_lower.matches(&query_lower).count();
@@ -386,7 +390,7 @@ pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), String> {
 
         let recency = (idx as f64 + 1.0) / files.len() as f64;
 
-        let content_boost = if content_lower.contains(&format!("### user\n\n{}", query_lower)) {
+        let content_boost = if content_lower.contains(&format!("### user\n\n{query_lower}")) {
             1.5
         } else {
             1.0
@@ -441,7 +445,7 @@ pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), String> {
 // ── Auto-distill ────────────────────────────────────────────────────────
 
 /// Analyze MEMORY.md and auto-extract heavy sections into topic files.
-pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), String> {
+pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), RecallError> {
     let memory_path = recall.memory_file();
     let memory_dir = recall.memory_dir();
 
@@ -450,8 +454,7 @@ pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), String>
         return Ok(());
     }
 
-    let content =
-        fs::read_to_string(&memory_path).map_err(|e| format!("Failed to read MEMORY.md: {e}"))?;
+    let content = fs::read_to_string(&memory_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let line_count = lines.len();
 
@@ -490,8 +493,7 @@ pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), String>
         let section_lines: Vec<&str> = lines[*start..*start + *size].to_vec();
         let section_content = section_lines.join("\n");
 
-        fs::write(&topic_path, format!("{section_content}\n"))
-            .map_err(|e| format!("Failed to write {}: {e}", topic_path.display()))?;
+        fs::write(&topic_path, format!("{section_content}\n"))?;
 
         extractions.push((name.clone(), *size, topic_path));
     }
@@ -548,8 +550,7 @@ pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), String>
     }
 
     let new_content = new_lines.join("\n");
-    fs::write(&memory_path, format!("{new_content}\n"))
-        .map_err(|e| format!("Failed to write MEMORY.md: {e}"))?;
+    fs::write(&memory_path, format!("{new_content}\n"))?;
 
     // Report
     println!();
@@ -573,6 +574,7 @@ pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), String>
 
 // ── Health assessment ───────────────────────────────────────────────────
 
+#[must_use]
 pub fn assess_health(
     memory: &MemoryStats,
     archive: &ArchiveStats,
@@ -618,6 +620,7 @@ pub fn assess_health(
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+#[must_use]
 pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
     let ephemeral_path = recall.ephemeral_file();
     if !ephemeral_path.exists() {
@@ -780,6 +783,7 @@ fn memory_status_word(count: usize, max: usize) -> &'static str {
     }
 }
 
+#[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -806,6 +810,7 @@ fn format_age(time: std::time::SystemTime) -> String {
 }
 
 /// Find sections: returns (name, start_line, line_count)
+#[must_use]
 pub fn find_sections(lines: &[&str]) -> Vec<(String, usize, usize)> {
     let mut sections = Vec::new();
     let mut current_name = String::new();
@@ -827,9 +832,8 @@ pub fn find_sections(lines: &[&str]) -> Vec<(String, usize, usize)> {
     sections
 }
 
-fn list_conversation_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read conversations dir: {e}"))?
+fn list_conversation_files(dir: &Path) -> Result<Vec<PathBuf>, RecallError> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {

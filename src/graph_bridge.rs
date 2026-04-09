@@ -3,9 +3,6 @@
 //! Provides graph ingestion for archived conversations.
 //! When pulse-null feature is enabled, also bridges LmProvider → LlmProvider.
 
-#[allow(unused_imports)]
-use crate::graph::error::GraphError;
-
 /// Ingest a conversation archive into the knowledge graph.
 ///
 /// Non-blocking: logs warnings on failure but never fails the caller.
@@ -15,21 +12,20 @@ pub async fn ingest_into_graph(
     archive_content: &str,
     session_id: &str,
     log_number: Option<u32>,
-) -> Result<crate::graph::types::IngestionReport, String> {
+) -> Result<crate::graph::types::IngestionReport, crate::error::RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
-        return Err("graph/ not initialized \u{2014} run `graph init` first".into());
+        return Err(crate::error::RecallError::NotInitialized(
+            "graph/ not initialized \u{2014} run `graph init` first".into(),
+        ));
     }
 
-    let gm = crate::graph::GraphMemory::open(&graph_dir)
-        .await
-        .map_err(|e| format!("graph open: {e}"))?;
+    let gm = crate::graph::GraphMemory::open(&graph_dir).await?;
 
     // No LLM provider in standalone mode — episodes only, no entity extraction
     let report = gm
         .ingest_archive(archive_content, session_id, log_number, None)
-        .await
-        .map_err(|e| format!("ingestion: {e}"))?;
+        .await?;
 
     eprintln!(
         "recall-echo: graph ingested \u{2014} {} episodes, {} entities created, {} merged, {} skipped, {} relationships",
@@ -61,15 +57,15 @@ pub async fn ingest_into_graph_with_llm(
     session_id: &str,
     log_number: Option<u32>,
     provider: Option<&dyn pulse_system_types::llm::LmProvider>,
-) -> Result<crate::graph::types::IngestionReport, String> {
+) -> Result<crate::graph::types::IngestionReport, crate::error::RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
-        return Err("graph/ not initialized \u{2014} run `graph init` first".into());
+        return Err(crate::error::RecallError::NotInitialized(
+            "graph/ not initialized \u{2014} run `graph init` first".into(),
+        ));
     }
 
-    let gm = crate::graph::GraphMemory::open(&graph_dir)
-        .await
-        .map_err(|e| format!("graph open: {e}"))?;
+    let gm = crate::graph::GraphMemory::open(&graph_dir).await?;
 
     let bridge = provider.map(GraphLlmBridge::new);
     let llm_ref: Option<&dyn crate::graph::llm::LlmProvider> = bridge
@@ -78,8 +74,7 @@ pub async fn ingest_into_graph_with_llm(
 
     let report = gm
         .ingest_archive(archive_content, session_id, log_number, llm_ref)
-        .await
-        .map_err(|e| format!("ingestion: {e}"))?;
+        .await?;
 
     eprintln!(
         "recall-echo: graph ingested \u{2014} {} episodes, {} entities created, {} merged, {} skipped, {} relationships",
@@ -122,7 +117,7 @@ impl crate::graph::llm::LlmProvider for GraphLlmBridge<'_> {
         system_prompt: &str,
         user_message: &str,
         max_tokens: u32,
-    ) -> Result<String, GraphError> {
+    ) -> Result<String, crate::graph::error::GraphError> {
         use pulse_system_types::llm::{Message, MessageContent, Role};
 
         let messages = vec![Message {
@@ -135,7 +130,7 @@ impl crate::graph::llm::LlmProvider for GraphLlmBridge<'_> {
             .provider
             .invoke(system_prompt, &messages, max_tokens, None)
             .await
-            .map_err(|e| GraphError::Llm(e.to_string()))?;
+            .map_err(|e| crate::graph::error::GraphError::Llm(e.to_string()))?;
 
         Ok(response.text())
     }

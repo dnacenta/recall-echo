@@ -70,6 +70,7 @@ Extraction rules:
 ///
 /// Splits on `---` separators (role boundaries in recall-echo archive format).
 /// Token estimate: chars / 4.
+#[must_use]
 pub fn chunk_conversation(text: &str, target_tokens: usize) -> Vec<String> {
     if text.trim().is_empty() {
         return vec![];
@@ -115,7 +116,7 @@ pub async fn extract_from_chunk(
     );
 
     let response = llm
-        .complete(EXTRACTION_SYSTEM_PROMPT, &user_message, 2000)
+        .complete(EXTRACTION_SYSTEM_PROMPT, &user_message, 8192)
         .await?;
 
     parse_extraction_response(&response)
@@ -158,6 +159,7 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 
 /// Convert cases, patterns, and preferences into ExtractedEntity entries
 /// so they go through the same dedup pipeline.
+#[must_use]
 pub fn flatten_extraction(result: &ExtractionResult) -> Vec<ExtractedEntity> {
     let mut entities = result.entities.clone();
 
@@ -202,34 +204,7 @@ pub fn flatten_extraction(result: &ExtractionResult) -> Vec<ExtractedEntity> {
     entities
 }
 
-fn strip_markdown_fencing(text: &str) -> String {
-    let trimmed = text.trim();
-    let stripped = trimmed
-        .strip_prefix("```json")
-        .or(trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    let stripped = stripped.strip_suffix("```").unwrap_or(stripped);
-    stripped.trim().to_string()
-}
-
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0;
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..start + i + 1]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
+use super::util::{extract_json_object, strip_markdown_fencing};
 
 #[cfg(test)]
 mod tests {

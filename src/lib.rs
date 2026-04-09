@@ -26,6 +26,7 @@ pub mod conversation;
 pub mod dashboard;
 pub mod distill;
 pub mod ephemeral;
+pub mod error;
 pub mod frontmatter;
 pub mod init;
 pub mod jsonl;
@@ -67,42 +68,49 @@ pub struct RecallEcho {
 
 impl RecallEcho {
     /// Create a new RecallEcho instance with a specific entity root directory.
+    #[must_use]
     pub fn new(entity_root: PathBuf) -> Self {
         Self { entity_root }
     }
 
     /// Create a RecallEcho using the default path resolution
     /// (RECALL_ECHO_HOME env var or current working directory).
-    pub fn from_default() -> Result<Self, String> {
+    pub fn from_default() -> Result<Self, error::RecallError> {
         Ok(Self::new(paths::entity_root()?))
     }
 
     /// Entity root directory.
+    #[must_use]
     pub fn entity_root(&self) -> &Path {
         &self.entity_root
     }
 
     /// Memory directory: {entity_root}/memory/
+    #[must_use]
     pub fn memory_dir(&self) -> PathBuf {
         self.entity_root.join("memory")
     }
 
     /// Path to MEMORY.md.
+    #[must_use]
     pub fn memory_file(&self) -> PathBuf {
         self.memory_dir().join("MEMORY.md")
     }
 
     /// Path to EPHEMERAL.md.
+    #[must_use]
     pub fn ephemeral_file(&self) -> PathBuf {
         self.memory_dir().join("EPHEMERAL.md")
     }
 
     /// Path to conversations directory.
+    #[must_use]
     pub fn conversations_dir(&self) -> PathBuf {
         self.memory_dir().join("conversations")
     }
 
     /// Path to ARCHIVE.md index.
+    #[must_use]
     pub fn archive_index(&self) -> PathBuf {
         self.memory_dir().join("ARCHIVE.md")
     }
@@ -111,16 +119,18 @@ impl RecallEcho {
 
     /// Read EPHEMERAL.md content without clearing it.
     /// Returns None if the file doesn't exist or is empty.
-    pub fn consume_content(&self) -> Result<Option<String>, String> {
+    pub fn consume_content(&self) -> Result<Option<String>, error::RecallError> {
         consume::consume(&self.ephemeral_file())
     }
 
     /// Check if the memory system has been initialized.
+    #[must_use]
     pub fn is_initialized(&self) -> bool {
         self.memory_dir().exists() && self.conversations_dir().exists()
     }
 
     /// Number of lines in MEMORY.md.
+    #[must_use]
     pub fn memory_line_count(&self) -> usize {
         let path = self.memory_file();
         if !path.exists() {

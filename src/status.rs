@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::config;
 use crate::ephemeral;
+use crate::error::RecallError;
 use crate::paths;
 
 const BOLD: &str = "\x1b[1m";
@@ -17,14 +18,16 @@ const RED: &str = "\x1b[31m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-pub fn run() -> Result<(), String> {
+pub fn run() -> Result<(), RecallError> {
     run_with_base(&paths::entity_root()?)
 }
 
-pub fn run_with_base(entity_root: &Path) -> Result<(), String> {
+pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {
     let memory = entity_root.join("memory");
     if !memory.exists() {
-        return Err("memory/ directory not found. Run `recall-echo init` first.".to_string());
+        return Err(RecallError::NotInitialized(
+            "memory/ directory not found. Run `recall-echo init` first.".into(),
+        ));
     }
 
     let mut issues: Vec<String> = Vec::new();

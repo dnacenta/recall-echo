@@ -160,7 +160,7 @@ pub async fn sync_outcomes(
             let attrs = e.attributes.as_ref()?;
             let task_id = attrs.get("task_id")?.as_str()?;
             let ts = attrs.get("timestamp")?.as_str()?;
-            Some(format!("{}:{}", task_id, ts))
+            Some(format!("{task_id}:{ts}"))
         })
         .collect();
 
@@ -235,7 +235,7 @@ pub async fn sync_outcomes(
                     };
                     match gm.add_relationship(rel).await {
                         Ok(_) => report.relationships_created += 1,
-                        Err(e) => report.errors.push(format!("rel outcome->domain: {}", e)),
+                        Err(e) => report.errors.push(format!("rel outcome->domain: {e}")),
                     }
                 }
             }
@@ -290,19 +290,19 @@ async fn get_vigil_entities(
 fn format_signal_abstract(signals: &Signals, trigger: &str) -> String {
     let mut parts = Vec::new();
     if let Some(v) = signals.vocabulary_diversity {
-        parts.push(format!("vocab={:.2}", v));
+        parts.push(format!("vocab={v:.2}"));
     }
     if let Some(v) = signals.question_generation {
-        parts.push(format!("questions={:.1}", v));
+        parts.push(format!("questions={v:.1}"));
     }
     if let Some(v) = signals.thought_lifecycle {
-        parts.push(format!("thought_lifecycle={:.2}", v));
+        parts.push(format!("thought_lifecycle={v:.2}"));
     }
     if let Some(v) = signals.evidence_grounding {
-        parts.push(format!("evidence={:.2}", v));
+        parts.push(format!("evidence={v:.2}"));
     }
     if parts.is_empty() {
-        format!("Signal measurement (trigger: {})", trigger)
+        format!("Signal measurement (trigger: {trigger})")
     } else {
         format!(
             "Signal measurement: {} (trigger: {})",

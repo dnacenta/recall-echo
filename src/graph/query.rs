@@ -275,7 +275,7 @@ pub async fn pipeline_stats(
                  AND updated_at < time::now() - type::duration($threshold)
                ORDER BY updated_at ASC"#,
         )
-        .bind(("threshold", format!("{}d", staleness_days)))
+        .bind(("threshold", format!("{staleness_days}d")))
         .await?;
 
     let stale_thoughts: Vec<EntityDetail> = super::deserialize_take(&mut stale_response, 0)?;
@@ -330,7 +330,7 @@ pub async fn pipeline_flow(
     // Get the entity
     let entity = super::crud::get_entity_by_name(db, entity_name)
         .await?
-        .ok_or_else(|| GraphError::NotFound(format!("entity: {}", entity_name)))?;
+        .ok_or_else(|| GraphError::NotFound(format!("entity: {entity_name}")))?;
 
     let entity_id = entity.id_string();
     let mut chain = Vec::new();
@@ -347,7 +347,7 @@ pub async fn pipeline_flow(
     ];
     let rel_types_str = pipeline_rel_types
         .iter()
-        .map(|r| format!("'{}'", r))
+        .map(|r| format!("'{r}'"))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -355,8 +355,7 @@ pub async fn pipeline_flow(
     let query_out = format!(
         r#"SELECT rel_type, out AS target_id
            FROM relates_to
-           WHERE in = type::record($id) AND rel_type IN [{}] AND valid_until IS NONE"#,
-        rel_types_str
+           WHERE in = type::record($id) AND rel_type IN [{rel_types_str}] AND valid_until IS NONE"#
     );
     let mut response = db.query(&query_out).bind(("id", entity_id.clone())).await?;
     let outgoing: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;
@@ -378,8 +377,7 @@ pub async fn pipeline_flow(
     let query_in = format!(
         r#"SELECT rel_type, in AS target_id
            FROM relates_to
-           WHERE out = type::record($id) AND rel_type IN [{}] AND valid_until IS NONE"#,
-        rel_types_str
+           WHERE out = type::record($id) AND rel_type IN [{rel_types_str}] AND valid_until IS NONE"#
     );
     let mut response = db.query(&query_in).bind(("id", entity_id.clone())).await?;
     let incoming: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;

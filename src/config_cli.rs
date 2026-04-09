@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::config::{self, Provider};
+use crate::error::RecallError;
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -10,7 +11,7 @@ const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
 
 /// Display current configuration.
-pub fn show(memory_dir: &Path) -> Result<(), String> {
+pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
     let cfg = config::load(memory_dir);
     let path = config::config_path(memory_dir);
     let exists = path.exists();
@@ -70,7 +71,7 @@ pub fn show(memory_dir: &Path) -> Result<(), String> {
 }
 
 /// Set a config key and save.
-pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), String> {
+pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError> {
     let mut cfg = config::load(memory_dir);
     cfg.set_key(key, value)?;
     config::save(memory_dir, &cfg)?;

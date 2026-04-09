@@ -12,6 +12,7 @@ use super::types::*;
 /// Parse a LEARNING.md file into pipeline entries.
 ///
 /// Format: `## Active Threads` section with `### Title (YYYY-MM-DD)` entries.
+#[must_use]
 pub fn parse_learning(content: &str) -> Vec<PipelineEntry> {
     let sections = split_sections(content);
     let mut entries = Vec::new();
@@ -44,6 +45,7 @@ pub fn parse_learning(content: &str) -> Vec<PipelineEntry> {
 /// Parse a THOUGHTS.md file into pipeline entries.
 ///
 /// Format: `## Active`, `## Graduated`, `## Dissolved` sections with `### Title` entries.
+#[must_use]
 pub fn parse_thoughts(content: &str) -> Vec<PipelineEntry> {
     let sections = split_sections(content);
     let mut entries = Vec::new();
@@ -210,6 +212,7 @@ pub fn parse_praxis(content: &str) -> Vec<PipelineEntry> {
 }
 
 /// Parse all pipeline documents and return entries + inferred relationships.
+#[must_use]
 pub fn parse_all_documents(
     docs: &PipelineDocuments,
 ) -> (Vec<PipelineEntry>, Vec<ExtractedRelationship>) {
@@ -227,6 +230,7 @@ pub fn parse_all_documents(
 }
 
 /// Convert a pipeline entry into an ExtractedEntity.
+#[must_use]
 pub fn entry_to_entity(entry: &PipelineEntry) -> ExtractedEntity {
     // Build the abstract from the first ~200 chars of body
     let abstract_text = if entry.body.len() > 200 {
@@ -370,7 +374,7 @@ fn clean_thought_title(title: &str) -> String {
 
 /// Extract a `**Field**: value` from entry body.
 fn extract_field(body: &str, field_name: &str) -> Option<String> {
-    let pattern = format!("**{}**:", field_name);
+    let pattern = format!("**{field_name}**:");
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix(&pattern) {
@@ -416,7 +420,7 @@ fn infer_relationships(entries: &[PipelineEntry]) -> Vec<ExtractedRelationship> 
                         source: entry.title.clone(),
                         target: target.clone(),
                         rel_type: pipeline_rels::GRADUATED_TO.into(),
-                        description: Some(format!("Graduated from thoughts to {}", dest)),
+                        description: Some(format!("Graduated from thoughts to {dest}")),
                         confidence: None,
                     });
                 }
@@ -436,7 +440,7 @@ fn infer_relationships(entries: &[PipelineEntry]) -> Vec<ExtractedRelationship> 
                     source: entry.title.clone(),
                     target: target.clone(),
                     rel_type: rel_type.into(),
-                    description: Some(format!("From source: {}", source)),
+                    description: Some(format!("From source: {source}")),
                     confidence: None,
                 });
             }
