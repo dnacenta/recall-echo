@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "3.6.1"
+version = "3.7.0"
 edition = "2021"
 description = "Persistent memory system with knowledge graph — for any LLM tool"
 license = "AGPL-3.0-only"
@@ -17,8 +17,8 @@ serde_json = "1"
 toml = "0.8"
 dirs = "6"
 
-# Graph — knowledge graph with SurrealDB + fastembed (always on)
-surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv"] }
+# Graph — knowledge graph with SurrealDB + fastembed
+surrealdb = { version = "3", default-features = false }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,7 +34,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 pulse-system-types = { version = "0.6", optional = true }
 
 [features]
-default = []
+default = ["embedded"]
+embedded = ["surrealdb/kv-surrealkv"]
+server = ["surrealdb/protocol-ws"]
 llm = ["reqwest"]
 pulse-null = ["pulse-system-types"]
 

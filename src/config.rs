@@ -69,6 +69,8 @@ pub struct Config {
     pub llm: LlmSection,
     #[serde(default)]
     pub pipeline: Option<PipelineSection>,
+    #[serde(default)]
+    pub graph: Option<GraphSection>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +141,53 @@ pub struct PipelineSection {
     /// Auto-sync pipeline on archive (default: false)
     #[serde(default)]
     pub auto_sync: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphSection {
+    /// Connection mode: "embedded" or "server"
+    #[serde(default = "default_graph_mode")]
+    pub mode: String,
+    /// SurrealDB server URL (server mode only)
+    #[serde(default = "default_graph_url")]
+    pub url: String,
+    /// SurrealDB namespace
+    #[serde(default = "default_graph_namespace")]
+    pub namespace: String,
+    /// SurrealDB database name (typically the entity name)
+    #[serde(default)]
+    pub database: String,
+    /// SurrealDB username (typically the entity name)
+    #[serde(default)]
+    pub username: String,
+    /// Path to file containing the database password
+    #[serde(default)]
+    pub password_file: String,
+}
+
+impl Default for GraphSection {
+    fn default() -> Self {
+        Self {
+            mode: default_graph_mode(),
+            url: default_graph_url(),
+            namespace: default_graph_namespace(),
+            database: String::new(),
+            username: String::new(),
+            password_file: String::new(),
+        }
+    }
+}
+
+fn default_graph_mode() -> String {
+    "embedded".to_string()
+}
+
+fn default_graph_url() -> String {
+    "ws://localhost:8787".to_string()
+}
+
+fn default_graph_namespace() -> String {
+    "nullarc".to_string()
 }
 
 fn default_provider() -> Provider {

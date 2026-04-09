@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use embed::FastEmbedder;
 use error::GraphError;
 use store::Db;
+#[cfg(feature = "server")]
+pub use store::ServerConfig;
 #[allow(unused_imports)] // Required in scope for SurrealValue derive macro expansion
 use surrealdb::types::SurrealValue;
 use surrealdb::Surreal;
@@ -62,8 +64,13 @@ pub struct GraphMemory {
 }
 
 impl GraphMemory {
-    /// Open or create a graph store at the given path.
-    /// Path should be the `graph/` directory inside the memory directory.
+    /// Open a graph store at the given path.
+    ///
+    /// In embedded mode: opens SurrealKV at `path/surreal/`.
+    /// In server mode: reads `.recall-echo.toml` from the parent directory
+    /// to get connection settings, then connects via WebSocket.
+    /// The `path` is still used for the FastEmbed models cache.
+    #[cfg(feature = "embedded")]
     pub async fn open(path: &Path) -> Result<Self, GraphError> {
         std::fs::create_dir_all(path)?;
 
@@ -78,6 +85,63 @@ impl GraphMemory {
             db,
             embedder,
             path: path.to_path_buf(),
+        })
+    }
+
+    /// Open a graph store at the given path.
+    ///
+    /// In server mode: reads `.recall-echo.toml` from the parent directory
+    /// (memory_dir) to get connection settings, then connects via WebSocket.
+    /// The `path` is still used for the FastEmbed models cache.
+    #[cfg(feature = "server")]
+    pub async fn open(path: &Path) -> Result<Self, GraphError> {
+        let memory_dir = path.parent().unwrap_or(path);
+        let config = crate::config::load_from_dir(memory_dir);
+
+        let graph_section = config.graph.unwrap_or_default();
+        let password = if graph_section.password_file.is_empty() {
+            String::new()
+        } else {
+            let pw_path = if graph_section.password_file.starts_with('/') {
+                std::path::PathBuf::from(&graph_section.password_file)
+            } else {
+                // Relative to entity root (memory_dir's parent)
+                let entity_root = memory_dir.parent().unwrap_or(memory_dir);
+                entity_root.join(&graph_section.password_file)
+            };
+            std::fs::read_to_string(&pw_path)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+
+        let server_config = store::ServerConfig {
+            url: graph_section.url,
+            username: graph_section.username,
+            password,
+            namespace: graph_section.namespace,
+            database: graph_section.database,
+        };
+
+        let models_dir = path.join("models");
+        Self::connect(&server_config, &models_dir).await
+    }
+
+    /// Connect to a SurrealDB server over WebSocket with explicit config.
+    #[cfg(feature = "server")]
+    pub async fn connect(
+        config: &store::ServerConfig,
+        models_dir: &Path,
+    ) -> Result<Self, GraphError> {
+        let db = store::connect(config).await?;
+        store::init_schema(&db).await?;
+
+        std::fs::create_dir_all(models_dir)?;
+        let embedder = FastEmbedder::new(models_dir)?;
+
+        Ok(Self {
+            db,
+            embedder,
+            path: models_dir.to_path_buf(),
         })
     }
 

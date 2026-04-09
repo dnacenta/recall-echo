@@ -1,24 +1,58 @@
-//! SurrealDB embedded store — open, schema init.
+//! SurrealDB store — embedded (kv-surrealkv) or server (WebSocket).
 
-use std::path::Path;
-
-use surrealdb::engine::local::SurrealKv;
 use surrealdb::Surreal;
 
 use super::error::GraphError;
 
+#[cfg(feature = "embedded")]
+use std::path::Path;
+
+#[cfg(feature = "embedded")]
+use surrealdb::engine::local::SurrealKv;
+
+#[cfg(feature = "embedded")]
 pub type Db = surrealdb::engine::local::Db;
 
-const NAMESPACE: &str = "recall";
-const DATABASE: &str = "graph";
+#[cfg(feature = "server")]
+pub type Db = surrealdb::engine::remote::ws::Client;
+
+/// Connection config for server mode.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub namespace: String,
+    pub database: String,
+}
 
 /// Open (or create) a SurrealDB embedded store at the given path.
+#[cfg(feature = "embedded")]
 pub async fn open(path: &Path) -> Result<Surreal<Db>, GraphError> {
     let surreal_path = path.join("surreal");
     std::fs::create_dir_all(&surreal_path)?;
 
     let db: Surreal<Db> = Surreal::new::<SurrealKv>(surreal_path.to_str().unwrap()).await?;
-    db.use_ns(NAMESPACE).use_db(DATABASE).await?;
+    db.use_ns("recall").use_db("graph").await?;
+
+    Ok(db)
+}
+
+/// Connect to a SurrealDB server over WebSocket.
+#[cfg(feature = "server")]
+pub async fn connect(config: &ServerConfig) -> Result<Surreal<Db>, GraphError> {
+    let db = Surreal::new::<surrealdb::engine::remote::ws::Ws>(&config.url).await?;
+    db.signin(surrealdb::opt::auth::Database {
+        namespace: config.namespace.clone(),
+        database: config.database.clone(),
+        username: config.username.clone(),
+        password: config.password.clone(),
+    })
+    .await?;
+    db.use_ns(&config.namespace)
+        .use_db(&config.database)
+        .await?;
 
     Ok(db)
 }

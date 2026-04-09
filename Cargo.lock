@@ -3930,7 +3930,7 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.6.1"
+version = "3.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4812,6 +4812,7 @@ dependencies = [
  "surrealdb-types",
  "surrealdb-types-derive",
  "tokio",
+ "tokio-tungstenite",
  "tokio-tungstenite-wasm",
  "tokio-util",
  "tracing",
@@ -5546,6 +5547,7 @@ dependencies = [
  "rand 0.9.2",
  "sha1",
  "thiserror",
+ "url",
  "utf-8",
 ]
 
