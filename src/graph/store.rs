@@ -1,5 +1,8 @@
 //! SurrealDB store — embedded (kv-surrealkv) or server (WebSocket).
 
+#[cfg(all(feature = "embedded", feature = "server"))]
+compile_error!("Features `embedded` and `server` are mutually exclusive. Choose one.");
+
 use surrealdb::Surreal;
 
 use super::error::GraphError;
@@ -18,7 +21,7 @@ pub type Db = surrealdb::engine::remote::ws::Client;
 
 /// Connection config for server mode.
 #[cfg(feature = "server")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     pub url: String,
     pub username: String,
@@ -27,13 +30,32 @@ pub struct ServerConfig {
     pub database: String,
 }
 
+#[cfg(feature = "server")]
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("namespace", &self.namespace)
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
 /// Open (or create) a SurrealDB embedded store at the given path.
 #[cfg(feature = "embedded")]
 pub async fn open(path: &Path) -> Result<Surreal<Db>, GraphError> {
     let surreal_path = path.join("surreal");
     std::fs::create_dir_all(&surreal_path)?;
 
-    let db: Surreal<Db> = Surreal::new::<SurrealKv>(surreal_path.to_str().unwrap()).await?;
+    let path_str = surreal_path.to_str().ok_or_else(|| {
+        GraphError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "graph store path contains non-UTF8 characters",
+        ))
+    })?;
+    let db: Surreal<Db> = Surreal::new::<SurrealKv>(path_str).await?;
     db.use_ns("recall").use_db("graph").await?;
 
     Ok(db)

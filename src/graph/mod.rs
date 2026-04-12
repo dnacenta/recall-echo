@@ -111,7 +111,15 @@ impl GraphMemory {
             };
             std::fs::read_to_string(&pw_path)
                 .map(|s| s.trim().to_string())
-                .unwrap_or_default()
+                .map_err(|e| {
+                    GraphError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to read graph password file {}: {e}",
+                            pw_path.display()
+                        ),
+                    ))
+                })?
         };
 
         let server_config = store::ServerConfig {
