@@ -95,30 +95,54 @@ pub async fn record_outcome_feedback(
 
     let reward = outcome.reward();
 
-    for entity_id in retrieved_entity_ids {
-        let was_used = used_entity_ids
-            .map(|used| used.iter().any(|u| u == entity_id))
-            .unwrap_or(true);
+    // Build a HashSet for O(1) "was used" lookups instead of O(n) per entity
+    let used_set: Option<std::collections::HashSet<&str>> =
+        used_entity_ids.map(|ids| ids.iter().map(|s| s.as_str()).collect());
 
-        match create_contribution_edge(db, entity_id, &outcome_id, outcome, was_used, session_id)
-            .await
-        {
+    // Process all entities concurrently — each entity's feedback is independent
+    let outcome_id_ref = &outcome_id;
+    let futures: Vec<_> = retrieved_entity_ids
+        .iter()
+        .map(|entity_id| {
+            let was_used = used_set
+                .as_ref()
+                .map(|s| s.contains(entity_id.as_str()))
+                .unwrap_or(true);
+            let (alpha, effective_reward) = if was_used {
+                (USED_ALPHA, reward)
+            } else {
+                (UNUSED_ALPHA, UNUSED_REWARD)
+            };
+
+            async move {
+                let edge_result = create_contribution_edge(
+                    db,
+                    entity_id,
+                    outcome_id_ref,
+                    outcome,
+                    was_used,
+                    session_id,
+                )
+                .await;
+                let utility_result =
+                    update_utility_score(db, entity_id, effective_reward, alpha).await;
+                (entity_id, edge_result, utility_result)
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    for (entity_id, edge_result, utility_result) in results {
+        match edge_result {
             Ok(()) => report.edges_created += 1,
             Err(e) => {
                 report
                     .errors
                     .push(format!("edge {entity_id} -> {outcome_id}: {e}"));
-                continue;
             }
         }
-
-        let (alpha, effective_reward) = if was_used {
-            (USED_ALPHA, reward)
-        } else {
-            (UNUSED_ALPHA, UNUSED_REWARD)
-        };
-
-        match update_utility_score(db, entity_id, effective_reward, alpha).await {
+        match utility_result {
             Ok(()) => report.entities_updated += 1,
             Err(e) => {
                 report
@@ -211,43 +235,28 @@ async fn create_contribution_edge(
     Ok(())
 }
 
+/// Atomic EMA update — single query, no read-modify-write race.
 async fn update_utility_score(
     db: &Surreal<Db>,
     entity_id: &str,
     reward: f64,
     alpha: f64,
 ) -> Result<(), GraphError> {
-    #[derive(Deserialize)]
-    struct UtilityRow {
-        #[serde(default = "default_utility")]
-        utility_score: f64,
-    }
-
-    fn default_utility() -> f64 {
-        DEFAULT_UTILITY
-    }
-
-    let mut response = db
-        .query(r#"SELECT utility_score FROM type::record($id)"#)
-        .bind(("id", entity_id.to_string()))
-        .await?;
-
-    let rows: Vec<UtilityRow> = super::deserialize_take(&mut response, 0)?;
-    let current = rows
-        .first()
-        .map(|r| r.utility_score)
-        .unwrap_or(DEFAULT_UTILITY);
-
-    let new_score = ((1.0 - alpha) * current + alpha * reward).clamp(0.0, 1.0);
-
+    // Inline EMA: new = (1 - alpha) * current + alpha * reward, clamped to [0, 1].
+    // SurrealDB doesn't have math::clamp, so we use nested IF expressions.
     db.query(
-        r#"UPDATE type::record($id) SET
-            utility_score = $score,
+        r#"
+        LET $raw = (1.0 - $alpha) * type::record($id).utility_score + $alpha * $reward;
+        LET $clamped = IF $raw < 0.0 THEN 0.0 ELSE IF $raw > 1.0 THEN 1.0 ELSE $raw END END;
+        UPDATE type::record($id) SET
+            utility_score = $clamped,
             utility_updates += 1,
-            updated_at = time::now()"#,
+            updated_at = time::now()
+        "#,
     )
     .bind(("id", entity_id.to_string()))
-    .bind(("score", new_score))
+    .bind(("alpha", alpha))
+    .bind(("reward", reward))
     .await?;
 
     Ok(())
