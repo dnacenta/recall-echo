@@ -226,6 +226,8 @@ pub struct EntityDetail {
     pub attributes: Option<serde_json::Value>,
     #[serde(default)]
     pub access_count: i64,
+    #[serde(default = "default_utility_score")]
+    pub utility_score: f64,
     pub updated_at: serde_json::Value,
     pub source: Option<String>,
 }
