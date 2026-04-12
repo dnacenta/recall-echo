@@ -313,6 +313,8 @@ mod tests {
             embedding: None,
             mutable: true,
             access_count: 0,
+            utility_score: 0.5,
+            utility_updates: 0,
             created_at: serde_json::Value::String("2026-01-01".into()),
             updated_at: serde_json::Value::String("2026-01-01".into()),
             source: None,

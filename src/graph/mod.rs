@@ -20,6 +20,7 @@ pub mod store;
 pub mod traverse;
 pub mod types;
 pub mod util;
+pub mod utility;
 pub mod vigil_sync;
 
 use std::collections::HashMap;

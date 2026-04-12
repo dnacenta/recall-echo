@@ -90,6 +90,12 @@ pub struct Entity {
     pub mutable: bool,
     #[serde(default)]
     pub access_count: i64,
+    /// How useful this entity has been across sessions (0.0-1.0, default 0.5 neutral).
+    #[serde(default = "default_utility_score")]
+    pub utility_score: f64,
+    /// Number of times utility_score has been updated via outcome feedback.
+    #[serde(default)]
+    pub utility_updates: i64,
     pub created_at: serde_json::Value,
     pub updated_at: serde_json::Value,
     pub source: Option<String>,
@@ -117,6 +123,10 @@ impl Entity {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_utility_score() -> f64 {
+    0.5
 }
 
 /// Fields that can be updated on an entity.
