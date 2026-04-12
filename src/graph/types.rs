@@ -502,6 +502,8 @@ pub mod pipeline_rels {
     pub const GRADUATED_TO: &str = "GRADUATED_TO";
     pub const ARCHIVED_FROM: &str = "ARCHIVED_FROM";
     pub const CONNECTED_TO: &str = "CONNECTED_TO";
+    pub const PROMPTED_BY: &str = "PROMPTED_BY";
+    pub const ANSWERED_BY: &str = "ANSWERED_BY";
 }
 
 /// Canonical relationship types for vigil-pulse data.
@@ -549,6 +551,7 @@ pub struct PipelineGraphStats {
     pub by_stage: HashMap<String, HashMap<String, u64>>,
     pub stale_thoughts: Vec<EntityDetail>,
     pub stale_questions: Vec<EntityDetail>,
+    pub orphan_count: u64,
     pub total_entities: u64,
     pub last_movement: Option<String>,
 }

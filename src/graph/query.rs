@@ -265,7 +265,8 @@ pub async fn pipeline_stats(
             .insert(row.status, row.count);
     }
 
-    // Find stale thoughts (active, not updated in staleness_days)
+    // Find stale thoughts — connectivity-aware: active thoughts with no relationships
+    // updated within staleness_days AND entity itself not updated within staleness_days.
     let mut stale_response = db
         .query(
             r#"SELECT id, name, entity_type, abstract, overview, attributes, access_count, updated_at, source
@@ -273,6 +274,11 @@ pub async fn pipeline_stats(
                WHERE attributes.pipeline_stage = 'thoughts'
                  AND attributes.pipeline_status = 'active'
                  AND updated_at < time::now() - type::duration($threshold)
+                 AND count(
+                     SELECT * FROM relates_to
+                     WHERE (in = $parent.id OR out = $parent.id)
+                       AND valid_from > time::now() - type::duration($threshold)
+                 ) = 0
                ORDER BY updated_at ASC"#,
         )
         .bind(("threshold", format!("{staleness_days}d")))
@@ -280,7 +286,7 @@ pub async fn pipeline_stats(
 
     let stale_thoughts: Vec<EntityDetail> = super::deserialize_take(&mut stale_response, 0)?;
 
-    // Find stale questions
+    // Find stale questions — same connectivity-aware approach
     let mut stale_q_response = db
         .query(
             r#"SELECT id, name, entity_type, abstract, overview, attributes, access_count, updated_at, source
@@ -289,12 +295,31 @@ pub async fn pipeline_stats(
                  AND attributes.pipeline_status = 'active'
                  AND attributes.sub_type IS NONE
                  AND updated_at < time::now() - type::duration($threshold)
+                 AND count(
+                     SELECT * FROM relates_to
+                     WHERE (in = $parent.id OR out = $parent.id)
+                       AND valid_from > time::now() - type::duration($threshold)
+                 ) = 0
                ORDER BY updated_at ASC"#,
         )
         .bind(("threshold", format!("{}d", staleness_days * 2)))
         .await?;
 
     let stale_questions: Vec<EntityDetail> = super::deserialize_take(&mut stale_q_response, 0)?;
+
+    // Orphan detection — active pipeline entities with zero graph connections
+    let mut orphan_response = db
+        .query(
+            r#"SELECT count() AS count FROM entity
+               WHERE attributes.pipeline_stage IS NOT NONE
+                 AND attributes.pipeline_status = 'active'
+                 AND count(SELECT * FROM relates_to WHERE in = $parent.id OR out = $parent.id) = 0
+               GROUP ALL"#,
+        )
+        .await?;
+
+    let orphan_rows: Vec<CountRow> = super::deserialize_take(&mut orphan_response, 0)?;
+    let orphan_count = orphan_rows.first().map(|r| r.count).unwrap_or(0);
 
     // Last movement (most recent graduated/dissolved/explored entity)
     let mut movement_response = db
@@ -317,6 +342,7 @@ pub async fn pipeline_stats(
         by_stage,
         stale_thoughts,
         stale_questions,
+        orphan_count,
         total_entities: total,
         last_movement,
     })
@@ -449,4 +475,9 @@ struct StageStatusCount {
 #[derive(serde::Deserialize)]
 struct UpdatedAtRow {
     updated_at: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct CountRow {
+    count: u64,
 }

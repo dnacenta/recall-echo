@@ -159,7 +159,50 @@ pub async fn sync_pipeline(
         }
     }
 
+    // Cross-reference pipeline entries with episodes via session references in body text
+    cross_reference_episodes(gm, &entries, &mut report).await;
+
     Ok(report)
+}
+
+/// Extract session/log references from pipeline entry bodies and create PROMPTED_BY relationships.
+async fn cross_reference_episodes(
+    gm: &GraphMemory,
+    entries: &[PipelineEntry],
+    report: &mut PipelineSyncReport,
+) {
+    let session_pattern =
+        regex::Regex::new(r"(?i)(?:session|conversation|log)\s+(\d{1,4})").unwrap();
+
+    for entry in entries {
+        for cap in session_pattern.captures_iter(&entry.body) {
+            let log_num: u32 = match cap[1].parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            // Check if the episode exists
+            let episode = match gm.get_episode_by_log_number(log_num).await {
+                Ok(Some(ep)) => ep,
+                _ => continue,
+            };
+
+            // Create PROMPTED_BY relationship: pipeline entry → episode
+            let new_rel = NewRelationship {
+                from_entity: entry.title.clone(),
+                to_entity: episode.id_string(),
+                rel_type: pipeline_rels::PROMPTED_BY.to_string(),
+                description: Some(format!("Referenced in {} entry", entry.stage)),
+                confidence: Some(0.9),
+                source: Some("pipeline:cross-ref".into()),
+            };
+
+            match gm.add_relationship(new_rel).await {
+                Ok(_) => report.relationships_created += 1,
+                Err(_) => {} // Silently skip — entity name might not match graph entity name
+            }
+        }
+    }
 }
 
 /// Get all entities that have a pipeline_stage attribute (i.e., pipeline entities).
