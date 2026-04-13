@@ -7,16 +7,16 @@ use super::error::GraphError;
 use super::store::Db;
 use super::types::*;
 
-/// Semantic search across entities using HNSW KNN + hotness scoring.
+/// Semantic search across entities using HNSW KNN + utility-weighted scoring.
 ///
-/// This is the simple search — returns full `Entity` objects for backwards
-/// compatibility. For L1 projections and filters, use `search_with_options`.
+/// Scoring formula (Adaptive Learning v2):
+///   final_score = 0.4 × semantic_similarity
+///               + 0.15 × hotness
+///               + 0.25 × utility_score
+///               + 0.2 × access_norm
 ///
-/// Hotness formula:
-///   hotness = sigmoid(ln(1 + access_count)) * exp(-λ * days_since_update)
-///   final_score = α * semantic_similarity + (1 - α) * hotness
-///
-/// Where λ = ln(2)/7 (7-day half-life), α = 0.7
+/// Where hotness = sigmoid(ln(1 + access_count)) × exp(-λ × days_since_update)
+/// and utility_score comes from outcome feedback (Phase 1).
 pub async fn search(
     db: &Surreal<Db>,
     embedder: &dyn Embedder,
@@ -50,7 +50,8 @@ pub async fn search(
                 &row.entity.updated_at_string(),
                 &now,
             );
-            let score = 0.7 * similarity + 0.3 * hotness;
+            let utility = row.entity.utility_score;
+            let score = score_with_utility(similarity, hotness, utility);
 
             SearchResult {
                 entity: row.entity,
@@ -88,7 +89,7 @@ pub async fn search_with_options(
     let ef = (fetch_limit * 4).max(40);
     let sql = format!(
         r#"SELECT id, name, entity_type, abstract, overview, attributes,
-                  access_count, updated_at, source,
+                  access_count, utility_score, updated_at, source,
                   vector::distance::knn() AS distance
            FROM entity
            WHERE embedding <|{fetch_limit}, {ef}|> $query_vec
@@ -127,7 +128,8 @@ pub async fn search_with_options(
                 &row.entity.updated_at_string(),
                 &now,
             );
-            let score = 0.7 * similarity + 0.3 * hotness;
+            let utility = row.entity.utility_score;
+            let score = score_with_utility(similarity, hotness, utility);
 
             ScoredEntity {
                 entity: row.entity,
@@ -204,6 +206,17 @@ struct EpisodeWithDistance {
     #[serde(flatten)]
     episode: Episode,
     distance: f64,
+}
+
+// ── Utility-weighted scoring (Adaptive Learning v2 Phase 2) ────────
+
+/// Compute final score with utility weighting.
+///
+/// Weights: semantic=0.45, hotness=0.30, utility=0.25
+/// Utility gets 25% — enough to meaningfully prioritize high-value memories
+/// without overwhelming semantic relevance.
+fn score_with_utility(similarity: f64, hotness: f64, utility: f64) -> f64 {
+    0.45 * similarity + 0.30 * hotness + 0.25 * utility
 }
 
 // ── Hotness scoring ─────────────────────────────────────────────────

@@ -93,6 +93,8 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS embedding    ON entity TYPE option<array<float>>;
         DEFINE FIELD IF NOT EXISTS mutable      ON entity TYPE bool DEFAULT true;
         DEFINE FIELD IF NOT EXISTS access_count ON entity TYPE int DEFAULT 0;
+        DEFINE FIELD IF NOT EXISTS utility_score    ON entity TYPE float DEFAULT 0.5;
+        DEFINE FIELD IF NOT EXISTS utility_updates  ON entity TYPE int DEFAULT 0;
         DEFINE FIELD IF NOT EXISTS created_at   ON entity TYPE datetime DEFAULT time::now();
         DEFINE FIELD IF NOT EXISTS updated_at   ON entity TYPE datetime DEFAULT time::now();
         DEFINE FIELD IF NOT EXISTS source       ON entity TYPE option<string>;
@@ -126,12 +128,17 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS log_number  ON episode TYPE option<int>;
         DEFINE FIELD IF NOT EXISTS extracted  ON episode TYPE bool DEFAULT false;
 
-        -- Backfill: set extracted = false on episodes that predate the field
-        UPDATE episode SET extracted = false WHERE extracted IS NONE;
-
         DEFINE INDEX IF NOT EXISTS episode_session ON episode FIELDS session_id;
         DEFINE INDEX IF NOT EXISTS episode_time    ON episode FIELDS timestamp;
         DEFINE INDEX IF NOT EXISTS episode_vector  ON episode FIELDS embedding HNSW DIMENSION 384 DIST COSINE;
+
+        DEFINE TABLE IF NOT EXISTS contributed_to SCHEMAFULL TYPE RELATION;
+        DEFINE FIELD IF NOT EXISTS outcome_result ON contributed_to TYPE string;
+        DEFINE FIELD IF NOT EXISTS was_used       ON contributed_to TYPE bool DEFAULT true;
+        DEFINE FIELD IF NOT EXISTS session_id     ON contributed_to TYPE string;
+        DEFINE FIELD IF NOT EXISTS timestamp      ON contributed_to TYPE datetime DEFAULT time::now();
+
+        DEFINE INDEX IF NOT EXISTS ct_session ON contributed_to FIELDS session_id;
         "#,
     )
     .await?
