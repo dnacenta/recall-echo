@@ -15,11 +15,13 @@ use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
 use super::types::*;
+use crate::config::GraphScoringConfig;
 
 /// Run a hybrid query: semantic search + graph expansion + optional episode search.
 pub async fn query(
     db: &Surreal<Db>,
     embedder: &dyn Embedder,
+    scoring: &GraphScoringConfig,
     query_text: &str,
     options: &QueryOptions,
 ) -> Result<QueryResult, GraphError> {
@@ -36,7 +38,8 @@ pub async fn query(
         keyword: options.keyword.clone(),
     };
     let semantic_results =
-        super::search::search_with_options(db, embedder, query_text, &semantic_options).await?;
+        super::search::search_with_options(db, embedder, scoring, query_text, &semantic_options)
+            .await?;
 
     // Collect into dedup map (id -> ScoredEntity)
     let mut entity_map: HashMap<String, ScoredEntity> = HashMap::new();

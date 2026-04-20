@@ -18,9 +18,16 @@ async fn add_and_retrieve_episode() {
     let created = db.graph.add_episode(episode).await.unwrap();
     assert_eq!(created.session_id, "session-001");
 
-    let episodes = db.graph.get_episodes_by_session("session-001").await.unwrap();
+    let episodes = db
+        .graph
+        .get_episodes_by_session("session-001")
+        .await
+        .unwrap();
     assert_eq!(episodes.len(), 1);
-    assert_eq!(episodes[0].abstract_text, "Discussed Rust ownership patterns");
+    assert_eq!(
+        episodes[0].abstract_text,
+        "Discussed Rust ownership patterns"
+    );
 }
 
 #[tokio::test]
@@ -63,7 +70,11 @@ async fn multiple_episodes_per_session() {
         db.graph.add_episode(episode).await.unwrap();
     }
 
-    let episodes = db.graph.get_episodes_by_session("session-multi").await.unwrap();
+    let episodes = db
+        .graph
+        .get_episodes_by_session("session-multi")
+        .await
+        .unwrap();
     assert_eq!(episodes.len(), 3);
 }
 

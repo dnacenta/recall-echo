@@ -62,6 +62,7 @@ pub struct GraphMemory {
     db: Surreal<Db>,
     embedder: FastEmbedder,
     path: PathBuf,
+    scoring: crate::config::GraphScoringConfig,
 }
 
 impl GraphMemory {
@@ -82,10 +83,13 @@ impl GraphMemory {
         std::fs::create_dir_all(&models_dir)?;
         let embedder = FastEmbedder::new(&models_dir)?;
 
+        let scoring = load_scoring_config(path);
+
         Ok(Self {
             db,
             embedder,
             path: path.to_path_buf(),
+            scoring,
         })
     }
 
@@ -123,6 +127,7 @@ impl GraphMemory {
                 })?
         };
 
+        let scoring = graph_section.scoring.clone();
         let server_config = store::ServerConfig {
             url: graph_section.url,
             username: graph_section.username,
@@ -132,7 +137,9 @@ impl GraphMemory {
         };
 
         let models_dir = path.join("models");
-        Self::connect(&server_config, &models_dir).await
+        let mut gm = Self::connect(&server_config, &models_dir).await?;
+        gm.scoring = scoring;
+        Ok(gm)
     }
 
     /// Connect to a SurrealDB server over WebSocket with explicit config.
@@ -151,6 +158,7 @@ impl GraphMemory {
             db,
             embedder,
             path: models_dir.to_path_buf(),
+            scoring: crate::config::GraphScoringConfig::default(),
         })
     }
 
@@ -317,7 +325,7 @@ impl GraphMemory {
 
     /// Semantic search across entities (legacy — returns full Entity).
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, GraphError> {
-        search::search(&self.db, &self.embedder, query, limit).await
+        search::search(&self.db, &self.embedder, &self.scoring, query, limit).await
     }
 
     /// Search with options — L1 projections, type/keyword filters.
@@ -326,7 +334,7 @@ impl GraphMemory {
         query: &str,
         options: &SearchOptions,
     ) -> Result<Vec<ScoredEntity>, GraphError> {
-        search::search_with_options(&self.db, &self.embedder, query, options).await
+        search::search_with_options(&self.db, &self.embedder, &self.scoring, query, options).await
     }
 
     /// Semantic search across episodes.
@@ -346,7 +354,7 @@ impl GraphMemory {
         query_text: &str,
         options: &QueryOptions,
     ) -> Result<QueryResult, GraphError> {
-        query::query(&self.db, &self.embedder, query_text, options).await
+        query::query(&self.db, &self.embedder, &self.scoring, query_text, options).await
     }
 
     // --- Traversal ---
@@ -476,6 +484,18 @@ impl GraphMemory {
             entity_type_counts,
         })
     }
+}
+
+/// Load `[graph.scoring]` from `.recall-echo.toml` in the memory directory
+/// (the parent of the graph store path). Returns defaults if the config file
+/// or the `[graph.scoring]` section is absent, preserving legacy behavior.
+#[cfg(feature = "embedded")]
+fn load_scoring_config(graph_path: &Path) -> crate::config::GraphScoringConfig {
+    let memory_dir = graph_path.parent().unwrap_or(graph_path);
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .map(|g| g.scoring)
+        .unwrap_or_default()
 }
 
 async fn db_count(db: &Surreal<Db>, table: &str) -> Result<u64, GraphError> {
