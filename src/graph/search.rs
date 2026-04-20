@@ -6,20 +6,27 @@ use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
 use super::types::*;
+use crate::config::GraphScoringConfig;
 
 /// Semantic search across entities using HNSW KNN + utility-weighted scoring.
 ///
-/// Scoring formula (Adaptive Learning v2):
-///   final_score = 0.4 × semantic_similarity
-///               + 0.15 × hotness
-///               + 0.25 × utility_score
-///               + 0.2 × access_norm
+/// Scoring formula:
 ///
-/// Where hotness = sigmoid(ln(1 + access_count)) × exp(-λ × days_since_update)
-/// and utility_score comes from outcome feedback (Phase 1).
+/// ```text
+/// final_score = w_semantic * similarity
+///             + w_hotness  * hotness
+///             + w_utility  * utility_score
+/// ```
+///
+/// Weights come from `scoring` (see [`GraphScoringConfig`]). Defaults
+/// (`0.45` / `0.30` / `0.25`) preserve legacy behavior.
+///
+/// Where `hotness = sigmoid(ln(1 + access_count)) * exp(-lambda * days_since_update)`
+/// and `utility_score` comes from outcome feedback.
 pub async fn search(
     db: &Surreal<Db>,
     embedder: &dyn Embedder,
+    scoring: &GraphScoringConfig,
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>, GraphError> {
@@ -51,7 +58,7 @@ pub async fn search(
                 &now,
             );
             let utility = row.entity.utility_score;
-            let score = score_with_utility(similarity, hotness, utility);
+            let score = score_with_utility(scoring, similarity, hotness, utility);
 
             SearchResult {
                 entity: row.entity,
@@ -72,6 +79,7 @@ pub async fn search(
 pub async fn search_with_options(
     db: &Surreal<Db>,
     embedder: &dyn Embedder,
+    scoring: &GraphScoringConfig,
     query_text: &str,
     options: &SearchOptions,
 ) -> Result<Vec<ScoredEntity>, GraphError> {
@@ -129,7 +137,7 @@ pub async fn search_with_options(
                 &now,
             );
             let utility = row.entity.utility_score;
-            let score = score_with_utility(similarity, hotness, utility);
+            let score = score_with_utility(scoring, similarity, hotness, utility);
 
             ScoredEntity {
                 entity: row.entity,
@@ -212,11 +220,18 @@ struct EpisodeWithDistance {
 
 /// Compute final score with utility weighting.
 ///
-/// Weights: semantic=0.45, hotness=0.30, utility=0.25
-/// Utility gets 25% — enough to meaningfully prioritize high-value memories
-/// without overwhelming semantic relevance.
-fn score_with_utility(similarity: f64, hotness: f64, utility: f64) -> f64 {
-    0.45 * similarity + 0.30 * hotness + 0.25 * utility
+/// Linear combination of similarity, hotness, and utility using weights
+/// from `scoring`. Defaults (0.45 / 0.30 / 0.25) preserve legacy behavior
+/// so deployments without a `[graph.scoring]` TOML section see no change.
+fn score_with_utility(
+    scoring: &GraphScoringConfig,
+    similarity: f64,
+    hotness: f64,
+    utility: f64,
+) -> f64 {
+    scoring.weight_semantic * similarity
+        + scoring.weight_hotness * hotness
+        + scoring.weight_utility * utility
 }
 
 // ── Hotness scoring ─────────────────────────────────────────────────
@@ -239,4 +254,70 @@ pub(crate) fn compute_hotness(
 
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIMILARITY: f64 = 0.8;
+    const HOTNESS: f64 = 0.4;
+    const UTILITY: f64 = 0.6;
+
+    /// The default config must produce the exact same value as the pre-v3.9.0
+    /// hard-coded formula (`0.45 * similarity + 0.30 * hotness + 0.25 * utility`).
+    /// Anyone running with no `[graph.scoring]` section in `.recall-echo.toml`
+    /// must see identical scoring output.
+    #[test]
+    fn default_config_matches_legacy_hardcoded_formula() {
+        let scoring = GraphScoringConfig::default();
+        let legacy = 0.45 * SIMILARITY + 0.30 * HOTNESS + 0.25 * UTILITY;
+        let actual = score_with_utility(&scoring, SIMILARITY, HOTNESS, UTILITY);
+        assert!((actual - legacy).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn raising_weight_utility_raises_score_for_high_utility_entity() {
+        let low = GraphScoringConfig {
+            weight_semantic: 0.45,
+            weight_hotness: 0.30,
+            weight_utility: 0.25,
+        };
+        let high = GraphScoringConfig {
+            weight_semantic: 0.25,
+            weight_hotness: 0.25,
+            weight_utility: 0.5,
+        };
+        let high_utility = 0.9;
+        let low_score = score_with_utility(&low, SIMILARITY, HOTNESS, high_utility);
+        let high_score = score_with_utility(&high, SIMILARITY, HOTNESS, high_utility);
+        assert!(
+            high_score > low_score,
+            "boosting weight_utility should raise the score for a high-utility entity \
+             (low={low_score}, high={high_score})"
+        );
+    }
+
+    #[test]
+    fn zero_weights_produce_zero_score() {
+        let scoring = GraphScoringConfig {
+            weight_semantic: 0.0,
+            weight_hotness: 0.0,
+            weight_utility: 0.0,
+        };
+        let score = score_with_utility(&scoring, SIMILARITY, HOTNESS, UTILITY);
+        assert!((score - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn custom_weights_compute_linear_combination() {
+        let scoring = GraphScoringConfig {
+            weight_semantic: 0.5,
+            weight_hotness: 0.2,
+            weight_utility: 0.3,
+        };
+        let expected = 0.5 * SIMILARITY + 0.2 * HOTNESS + 0.3 * UTILITY;
+        let actual = score_with_utility(&scoring, SIMILARITY, HOTNESS, UTILITY);
+        assert!((actual - expected).abs() < f64::EPSILON);
+    }
 }

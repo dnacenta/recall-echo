@@ -31,7 +31,10 @@ async fn gc_dry_run_no_mutations() {
     let after = db.graph.stats().await.unwrap();
 
     // Dry run should not delete anything
-    assert_eq!(before.entity_count, after.entity_count, "entities unchanged");
+    assert_eq!(
+        before.entity_count, after.entity_count,
+        "entities unchanged"
+    );
     assert_eq!(
         before.relationship_count, after.relationship_count,
         "relationships unchanged"
@@ -108,7 +111,10 @@ async fn gc_protects_pipeline_entities() {
 
     // Pipeline entity should survive
     let found = db.graph.get_entity("Learning Thread").await.unwrap();
-    assert!(found.is_some(), "pipeline entity should be protected from GC");
+    assert!(
+        found.is_some(),
+        "pipeline entity should be protected from GC"
+    );
 }
 
 #[tokio::test]

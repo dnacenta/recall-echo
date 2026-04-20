@@ -34,7 +34,10 @@ fn bayesian_update_all_priors() {
 fn bayesian_update_contradiction_reduces() {
     let before = 0.6;
     let after = bayesian_update(before, false);
-    assert!(after < before, "contradiction should reduce: {before} -> {after}");
+    assert!(
+        after < before,
+        "contradiction should reduce: {before} -> {after}"
+    );
 }
 
 #[test]
@@ -43,7 +46,10 @@ fn bayesian_update_repeated_corroboration_converges() {
     for _ in 0..50 {
         score = bayesian_update(score, true);
     }
-    assert!(score > 0.95, "50 corroborations should converge near 1.0: {score}");
+    assert!(
+        score > 0.95,
+        "50 corroborations should converge near 1.0: {score}"
+    );
 }
 
 #[test]
@@ -52,7 +58,10 @@ fn bayesian_update_repeated_contradiction_converges() {
     for _ in 0..50 {
         score = bayesian_update(score, false);
     }
-    assert!(score < 0.05, "50 contradictions should converge near 0.0: {score}");
+    assert!(
+        score < 0.05,
+        "50 contradictions should converge near 0.0: {score}"
+    );
 }
 
 // ── Temporal Decay ────────────────────────────────────────────────
@@ -78,13 +87,19 @@ fn decay_at_three_half_lives() {
 #[test]
 fn decay_floor_prevents_zero() {
     let result = temporal_decay(1.0, 10000.0, 90.0);
-    assert_eq!(result, DECAY_FLOOR, "extreme age should hit floor: {result}");
+    assert_eq!(
+        result, DECAY_FLOOR,
+        "extreme age should hit floor: {result}"
+    );
 }
 
 #[test]
 fn decay_floor_with_low_initial() {
     let result = temporal_decay(0.1, 900.0, 90.0);
-    assert_eq!(result, DECAY_FLOOR, "low initial + long time = floor: {result}");
+    assert_eq!(
+        result, DECAY_FLOOR,
+        "low initial + long time = floor: {result}"
+    );
 }
 
 #[test]
@@ -173,7 +188,10 @@ fn effective_confidence_uses_last_reinforced_over_valid_from() {
 
     let result = effective_confidence(0.8, Some(&last_reinforced), &valid_from, &now);
     // Should use 10 days (recent), not 300 days (old)
-    assert!(result > 0.7, "should use last_reinforced (10d), got {result}");
+    assert!(
+        result > 0.7,
+        "should use last_reinforced (10d), got {result}"
+    );
 }
 
 #[test]
@@ -181,5 +199,8 @@ fn effective_confidence_unparseable_returns_stored() {
     let now = chrono::Utc::now();
     let bad = serde_json::Value::String("not-a-date".into());
     let result = effective_confidence(0.8, None, &bad, &now);
-    assert!(approx(result, 0.8), "unparseable should return stored: {result}");
+    assert!(
+        approx(result, 0.8),
+        "unparseable should return stored: {result}"
+    );
 }

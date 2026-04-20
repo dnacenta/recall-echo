@@ -163,6 +163,13 @@ pub struct GraphSection {
     /// Path to file containing the database password
     #[serde(default)]
     pub password_file: String,
+    /// Scoring weights for utility-weighted semantic search.
+    ///
+    /// Maps to the `[graph.scoring]` section of `.recall-echo.toml`. When
+    /// absent, defaults preserve the original hard-coded weights
+    /// (0.45 / 0.30 / 0.25). See `GraphScoringConfig` for details.
+    #[serde(default)]
+    pub scoring: GraphScoringConfig,
 }
 
 impl Default for GraphSection {
@@ -174,6 +181,46 @@ impl Default for GraphSection {
             database: String::new(),
             username: String::new(),
             password_file: String::new(),
+            scoring: GraphScoringConfig::default(),
+        }
+    }
+}
+
+/// Scoring weights for utility-weighted semantic search.
+///
+/// The final score for a retrieved entity is computed as a linear combination
+/// of three signals:
+///
+/// ```text
+/// score = weight_semantic * similarity
+///       + weight_hotness  * hotness
+///       + weight_utility  * utility_score
+/// ```
+///
+/// Defaults (`0.45 / 0.30 / 0.25`) match the original hard-coded values, so
+/// omitting the `[graph.scoring]` section from `.recall-echo.toml` produces
+/// identical behavior to pre-v3.9.0 recall-echo.
+///
+/// Weights are not constrained to sum to 1.0 — the scoring function does not
+/// normalize. Callers that change these should calibrate against their own
+/// retrieval outcomes; see `utility-feedback-loop-spec.md` in pulse-null.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphScoringConfig {
+    /// Weight applied to cosine similarity. Default `0.45`.
+    pub weight_semantic: f64,
+    /// Weight applied to the recency/access hotness signal. Default `0.30`.
+    pub weight_hotness: f64,
+    /// Weight applied to the utility score (outcome-feedback EMA). Default `0.25`.
+    pub weight_utility: f64,
+}
+
+impl Default for GraphScoringConfig {
+    fn default() -> Self {
+        Self {
+            weight_semantic: 0.45,
+            weight_hotness: 0.30,
+            weight_utility: 0.25,
         }
     }
 }
@@ -376,6 +423,7 @@ mod tests {
                 api_base: "http://localhost:11434/v1".into(),
             },
             pipeline: None,
+            graph: None,
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
@@ -433,6 +481,7 @@ mod tests {
                 api_base: String::new(),
             },
             pipeline: None,
+            graph: None,
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path());
@@ -453,7 +502,46 @@ mod tests {
             ephemeral: EphemeralConfig { max_entries: 100 },
             llm: LlmSection::default(),
             pipeline: None,
+            graph: None,
         });
         assert_eq!(cfg.ephemeral.max_entries, 5);
+    }
+
+    #[test]
+    fn graph_scoring_defaults_match_legacy_hardcodes() {
+        let scoring = GraphScoringConfig::default();
+        assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
+        assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
+        assert!((scoring.weight_utility - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_scoring_partial_toml_fills_defaults() {
+        let scoring: GraphScoringConfig =
+            toml::from_str("weight_utility = 0.5\n").expect("parse partial scoring");
+        assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
+        assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
+        assert!((scoring.weight_utility - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_scoring_empty_section_yields_defaults() {
+        let section: GraphSection = toml::from_str("").expect("parse empty graph section");
+        let defaults = GraphScoringConfig::default();
+        assert!((section.scoring.weight_semantic - defaults.weight_semantic).abs() < f64::EPSILON);
+        assert!((section.scoring.weight_hotness - defaults.weight_hotness).abs() < f64::EPSILON);
+        assert!((section.scoring.weight_utility - defaults.weight_utility).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_scoring_nested_under_graph() {
+        let cfg: Config = toml::from_str(
+            "[graph]\nmode = \"embedded\"\n\n[graph.scoring]\nweight_utility = 0.5\n",
+        )
+        .expect("parse nested scoring");
+        let scoring = cfg.graph.expect("graph section present").scoring;
+        assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
+        assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
+        assert!((scoring.weight_utility - 0.5).abs() < f64::EPSILON);
     }
 }

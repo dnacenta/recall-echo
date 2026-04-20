@@ -19,7 +19,10 @@ async fn traverse_outgoing_edges() {
 
     // Daniel -> BUILDS -> pulse-null
     let result = db.graph.traverse("Daniel", 2).await.unwrap();
-    assert!(!result.edges.is_empty(), "Daniel should have outgoing edges");
+    assert!(
+        !result.edges.is_empty(),
+        "Daniel should have outgoing edges"
+    );
 }
 
 #[tokio::test]
@@ -31,7 +34,10 @@ async fn traverse_no_edges() {
     db.graph.add_entity(entities[0].clone()).await.unwrap();
 
     let result = db.graph.traverse("Rust", 2).await.unwrap();
-    assert!(result.edges.is_empty(), "Rust with no relationships should have no traversal results");
+    assert!(
+        result.edges.is_empty(),
+        "Rust with no relationships should have no traversal results"
+    );
 }
 
 #[tokio::test]
