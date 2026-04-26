@@ -440,6 +440,27 @@ impl GraphMemory {
         vigil_sync::sync_vigil(self, signals_path, outcomes_path).await
     }
 
+    /// Record outcome feedback: link retrieved entities to a session outcome and
+    /// update their `utility_score` via EMA. `used_entity_ids` distinguishes the
+    /// entities the response actually leaned on (full alpha) from retrieved-but-
+    /// unused (muted alpha). Pass `None` to treat all retrieved as used.
+    pub async fn record_outcome_feedback(
+        &self,
+        session_id: &str,
+        outcome: utility::OutcomeKind,
+        retrieved_entity_ids: &[String],
+        used_entity_ids: Option<&[String]>,
+    ) -> Result<utility::FeedbackReport, GraphError> {
+        utility::record_outcome_feedback(
+            &self.db,
+            session_id,
+            outcome,
+            retrieved_entity_ids,
+            used_entity_ids,
+        )
+        .await
+    }
+
     // --- Garbage Collection ---
 
     /// Run garbage collection with the given config.
