@@ -39,6 +39,9 @@ embedded = ["surrealdb/kv-surrealkv"]
 server = ["surrealdb/protocol-ws"]
 llm = ["reqwest"]
 pulse-null = ["pulse-system-types"]
+# LoCoMo benchmark harness — exposes ingest/answer primitives via library API
+# and a `bench` CLI subcommand. Requires the `llm` feature to answer questions.
+bench = ["llm"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -45,6 +45,9 @@ pub mod llm_provider;
 #[cfg(feature = "pulse-null")]
 pub mod pulse_null;
 
+#[cfg(feature = "bench")]
+pub mod bench;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

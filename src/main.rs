@@ -89,6 +89,65 @@ enum Commands {
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
+    /// LoCoMo benchmark harness (ingest a conversation, answer a question)
+    #[cfg(feature = "bench")]
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommands,
+    },
+}
+
+#[cfg(feature = "bench")]
+#[derive(Subcommand)]
+enum BenchCommands {
+    /// Ingest a single LoCoMo conversation JSON
+    Ingest {
+        /// Entity root directory
+        #[arg(long)]
+        entity_root: PathBuf,
+        /// Path to a JSON file containing a BenchConversation; omit to read stdin
+        #[arg(long)]
+        conv_json: Option<PathBuf>,
+        /// Override LLM provider for extraction (anthropic, openai, claude-code)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Override LLM model for extraction
+        #[arg(long)]
+        model: Option<String>,
+        /// Skip the LLM during ingest — episodes only, no entity extraction
+        #[arg(long)]
+        no_llm: bool,
+    },
+    /// Answer a question against an already-ingested entity
+    Answer {
+        /// Entity root directory
+        #[arg(long)]
+        entity_root: PathBuf,
+        /// The question to answer (use `--question-stdin` to read from stdin instead)
+        #[arg(long)]
+        question: Option<String>,
+        /// Read the question from stdin
+        #[arg(long)]
+        question_stdin: bool,
+        /// Override LLM provider (anthropic, openai, claude-code)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Override LLM model
+        #[arg(long)]
+        model: Option<String>,
+        /// Graph expansion depth
+        #[arg(long, default_value = "2")]
+        graph_depth: usize,
+        /// Graph result limit
+        #[arg(long, default_value = "20")]
+        graph_limit: usize,
+        /// Archive top-K
+        #[arg(long, default_value = "5")]
+        archive_top_k: usize,
+        /// Exclude episode search
+        #[arg(long)]
+        no_episodes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -357,6 +416,8 @@ fn main() {
                 ConfigCommands::Set { key, value } => config_cli::set(&memory_dir, &key, &value),
             }
         }
+        #[cfg(feature = "bench")]
+        Some(Commands::Bench { command }) => run_bench(command),
         Some(Commands::Graph {
             command,
             entity_root,
@@ -538,6 +599,112 @@ fn main() {
 
 fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| paths::entity_root().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+#[cfg(feature = "bench")]
+fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::bench::{answer_question, ingest_conversation, AnswerOpts, BenchConversation};
+    use recall_echo::config::Provider;
+
+    let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
+
+    match command {
+        BenchCommands::Ingest {
+            entity_root,
+            conv_json,
+            provider,
+            model,
+            no_llm,
+        } => {
+            let raw = read_json_input(conv_json.as_deref())?;
+            let conv: BenchConversation = serde_json::from_str(&raw)?;
+
+            rt.block_on(async {
+                let memory_dir = entity_root.join("memory");
+                let llm_pair = if no_llm {
+                    None
+                } else {
+                    Some(recall_echo::llm_provider::create_provider(
+                        &memory_dir,
+                        provider.as_deref(),
+                        model.as_deref(),
+                    )?)
+                };
+                let llm_ref: Option<&dyn recall_echo::graph::llm::LlmProvider> = llm_pair
+                    .as_ref()
+                    .map(|(p, _)| p.as_ref() as &dyn recall_echo::graph::llm::LlmProvider);
+
+                let stats = ingest_conversation(&entity_root, &conv, llm_ref).await?;
+                println!("{}", serde_json::to_string(&stats)?);
+                Ok::<_, recall_echo::error::RecallError>(())
+            })
+        }
+        BenchCommands::Answer {
+            entity_root,
+            question,
+            question_stdin,
+            provider,
+            model,
+            graph_depth,
+            graph_limit,
+            archive_top_k,
+            no_episodes,
+        } => {
+            let question_text = match (question, question_stdin) {
+                (Some(q), false) => q,
+                (None, true) => read_stdin_to_string()?,
+                _ => {
+                    return Err(recall_echo::error::RecallError::Config(
+                        "exactly one of --question or --question-stdin is required".into(),
+                    ))
+                }
+            };
+
+            let provider_override = match provider.as_deref() {
+                Some(p) => Some(Provider::from_str_loose(p)?),
+                None => None,
+            };
+
+            let opts = AnswerOpts {
+                graph_depth,
+                graph_limit,
+                archive_top_k,
+                include_episodes: !no_episodes,
+                provider_override,
+                model_override: model,
+                ..AnswerOpts::default()
+            };
+
+            rt.block_on(async {
+                let answer = answer_question(&entity_root, &question_text, opts).await?;
+                println!("{}", serde_json::to_string(&answer)?);
+                Ok::<_, recall_echo::error::RecallError>(())
+            })
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn read_json_input(
+    path: Option<&std::path::Path>,
+) -> Result<String, recall_echo::error::RecallError> {
+    use std::io::Read;
+    match path {
+        Some(p) => Ok(std::fs::read_to_string(p)?),
+        None => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn read_stdin_to_string() -> Result<String, recall_echo::error::RecallError> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf.trim().to_string())
 }
 
 /// Resolve entity root for init, preferring Claude Code directory.
