@@ -689,13 +689,15 @@ fn read_json_input(
     path: Option<&std::path::Path>,
 ) -> Result<String, recall_echo::error::RecallError> {
     use std::io::Read;
+    let stdin = || -> Result<String, recall_echo::error::RecallError> {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    };
     match path {
+        Some(p) if p.as_os_str() == "-" => stdin(),
         Some(p) => Ok(std::fs::read_to_string(p)?),
-        None => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            Ok(buf)
-        }
+        None => stdin(),
     }
 }
 
