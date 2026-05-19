@@ -207,6 +207,7 @@ fn configure_hooks(_entity_root: &Path) -> bool {
 
     let archive_cmd = format!("{recall_bin} archive-session");
     let checkpoint_cmd = format!("{recall_bin} checkpoint --trigger precompact");
+    let consume_cmd = format!("{recall_bin} consume");
 
     // Load existing settings or start fresh
     let mut settings: serde_json::Value = if settings_path.exists() {
@@ -233,6 +234,24 @@ fn configure_hooks(_entity_root: &Path) -> bool {
     };
 
     let mut changed = false;
+
+    // Add SessionStart hook if not already present
+    // Fires once per session (on startup or resume) — injects EPHEMERAL.md
+    // into context via stdout. Skips `clear` (user reset) and `compact`
+    // (we just recovered from a compaction, no prior session to surface).
+    if !hook_exists(hooks, "SessionStart", &consume_cmd) {
+        let arr = hooks
+            .entry("SessionStart")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(arr) = arr {
+            arr.push(serde_json::json!({
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": consume_cmd}]
+            }));
+            changed = true;
+        }
+    }
 
     // Add SessionEnd hook if not already present
     if !hook_exists(hooks, "SessionEnd", &archive_cmd) {
@@ -268,7 +287,7 @@ fn configure_hooks(_entity_root: &Path) -> bool {
                 Ok(()) => {
                     print_status(
                         Status::Created,
-                        "Configured SessionEnd + PreCompact hooks in settings.json",
+                        "Configured SessionStart + SessionEnd + PreCompact hooks in settings.json",
                     );
                     return true;
                 }
@@ -306,6 +325,9 @@ fn hook_exists(
                         }
                         if cmd.contains("recall-echo checkpoint") && command.contains("checkpoint")
                         {
+                            return true;
+                        }
+                        if cmd.contains("recall-echo consume") && command.contains("consume") {
                             return true;
                         }
                     }
@@ -437,6 +459,34 @@ mod tests {
         let mut reader = Cursor::new(b"" as &[u8]);
         let result = run_with_reader(Path::new("/nonexistent/path"), &mut reader);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn hook_exists_recognizes_consume_command() {
+        let hooks_json: serde_json::Value = serde_json::json!({
+            "SessionStart": [{
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume"}]
+            }]
+        });
+        let hooks = hooks_json.as_object().unwrap();
+        assert!(hook_exists(hooks, "SessionStart", "recall-echo consume"));
+        assert!(!hook_exists(hooks, "SessionEnd", "recall-echo consume"));
+    }
+
+    #[test]
+    fn hook_exists_distinguishes_archive_from_consume() {
+        let hooks_json: serde_json::Value = serde_json::json!({
+            "SessionEnd": [{
+                "hooks": [{"type": "command", "command": "recall-echo archive-session"}]
+            }]
+        });
+        let hooks = hooks_json.as_object().unwrap();
+        assert!(hook_exists(
+            hooks,
+            "SessionEnd",
+            "recall-echo archive-session"
+        ));
     }
 
     #[test]
