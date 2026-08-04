@@ -770,35 +770,30 @@ pub async fn pipeline_sync(
     // Read pipeline documents
     let docs = read_pipeline_docs(&docs_dir)?;
 
-    serve_client::exclusive(memory_dir, |gm| async move {
-        let report = gm.sync_pipeline(&docs).await?;
+    let report = crate::graph_bridge::sync_pipeline_into_graph(memory_dir, docs).await?;
 
-        println!("{BOLD}Pipeline Sync{RESET}");
-        println!("  Created:      {}", report.entities_created);
-        println!("  Updated:      {}", report.entities_updated);
-        println!("  Archived:     {}", report.entities_archived);
-        println!(
-            "  Relationships: +{} / ~{} skipped",
-            report.relationships_created, report.relationships_skipped
-        );
+    println!("{BOLD}Pipeline Sync{RESET}");
+    println!("  Created:      {}", report.entities_created);
+    println!("  Updated:      {}", report.entities_updated);
+    println!("  Archived:     {}", report.entities_archived);
+    println!(
+        "  Relationships: +{} / ~{} skipped",
+        report.relationships_created, report.relationships_skipped
+    );
 
-        if !report.errors.is_empty() {
-            println!("\n  {YELLOW}Warnings:{RESET}");
-            for err in &report.errors {
-                println!("    {DIM}{err}{RESET}");
-            }
+    if !report.errors.is_empty() {
+        println!("\n  {YELLOW}Warnings:{RESET}");
+        for err in &report.errors {
+            println!("    {DIM}{err}{RESET}");
         }
+    }
 
-        if report.entities_created == 0
-            && report.entities_updated == 0
-            && report.entities_archived == 0
-        {
-            println!("\n  {DIM}No changes — graph is in sync.{RESET}");
-        }
+    if report.entities_created == 0 && report.entities_updated == 0 && report.entities_archived == 0
+    {
+        println!("\n  {DIM}No changes — graph is in sync.{RESET}");
+    }
 
-        Ok(())
-    })
-    .await
+    Ok(())
 }
 
 /// Show pipeline health stats.

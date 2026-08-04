@@ -21,19 +21,40 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::error::RecallError;
 use crate::graph::error::GraphError;
-use crate::graph::types::{EntityType, NewEntity, NewRelationship, QueryOptions, SearchOptions};
+use crate::graph::types::{
+    EntityType, NewEntity, NewRelationship, PipelineDocuments, QueryOptions, SearchOptions,
+};
 use crate::graph::GraphMemory;
+use crate::serve_security::{
+    append_private_file, check_peer_uid, current_uid, unlink_socket, PRIVATE_FILE_MODE,
+};
 
 /// Longest idle-poll interval; keeps a long-lived daemon from spinning.
 const MAX_IDLE_POLL: Duration = Duration::from_secs(30);
 /// Shortest idle-poll interval; keeps short test timeouts responsive.
 const MIN_IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// Largest request line the daemon will read. An archive ingest is the biggest
+/// legitimate request by far and stays far below this; anything larger is a
+/// buggy or hostile client trying to make the daemon buffer without bound.
+const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest result set a request may ask for. Wire-supplied limits reach the
+/// HNSW KNN operator, where an unbounded value is an unbounded scan.
+const MAX_LIMIT: usize = 1000;
+/// Deepest graph expansion a request may ask for. Expansion is exponential in
+/// the branching factor.
+const MAX_DEPTH: u32 = 8;
+/// How long the daemon waits for its own store to close before giving up and
+/// unlinking the socket anyway.
+const STORE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Polling interval while waiting for connection tasks to release the store.
+const STORE_RELEASE_POLL: Duration = Duration::from_millis(10);
 
 // ── Protocol ─────────────────────────────────────────────────────────────
 
@@ -59,6 +80,8 @@ pub enum Request {
     Relate(RelateArgs),
     /// Ingest a conversation archive (episodes only, no LLM extraction).
     IngestArchive(IngestArchiveArgs),
+    /// Sync the pipeline documents into the graph (no LLM extraction).
+    SyncPipeline(SyncPipelineArgs),
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -77,7 +100,30 @@ impl Request {
             Request::AddEntity(_) => "add_entity",
             Request::Relate(_) => "relate",
             Request::IngestArchive(_) => "ingest_archive",
+            Request::SyncPipeline(_) => "sync_pipeline",
             Request::Shutdown => "shutdown",
+        }
+    }
+
+    /// Whether repeating this request against a fresh daemon is safe.
+    ///
+    /// A connection that drops mid-request cannot tell us whether the daemon
+    /// applied it before dying, so only read-only or idempotent operations may
+    /// be retried. Repeating an archive ingest would duplicate its episodes —
+    /// a silently corrupted memory is worse than a reported failure.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Request::Hello
+            | Request::Status
+            | Request::Search(_)
+            | Request::SearchEpisodes(_)
+            | Request::Query(_)
+            | Request::Traverse(_)
+            // Pipeline sync diffs documents against the graph.
+            | Request::SyncPipeline(_)
+            | Request::Shutdown => true,
+            Request::AddEntity(_) | Request::Relate(_) | Request::IngestArchive(_) => false,
         }
     }
 }
@@ -146,6 +192,13 @@ pub struct IngestArchiveArgs {
     pub session_id: String,
     #[serde(default)]
     pub log_number: Option<u32>,
+}
+
+/// Pipeline sync needs no LLM provider, so it runs against the daemon like any
+/// other graph operation instead of taking the store exclusively.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncPipelineArgs {
+    pub docs: PipelineDocuments,
 }
 
 /// A daemon response. Wire form is `{"ok": true, "data": ...}` or
@@ -261,6 +314,16 @@ pub async fn dispatch_graph(graph: &GraphMemory, request: &Request) -> Response 
     }
 }
 
+/// Clamp a wire-supplied result limit into a range the store can serve.
+fn clamp_limit(limit: usize) -> usize {
+    limit.clamp(1, MAX_LIMIT)
+}
+
+/// Clamp a wire-supplied expansion depth.
+fn clamp_depth(depth: u32) -> u32 {
+    depth.clamp(1, MAX_DEPTH)
+}
+
 /// `Ok(None)` means "not a graph operation".
 async fn execute_graph(
     graph: &GraphMemory,
@@ -271,28 +334,42 @@ async fn execute_graph(
         Request::Status => serde_json::to_value(graph.stats().await?)?,
         Request::Search(args) => {
             let options = SearchOptions {
-                limit: args.limit,
+                limit: clamp_limit(args.limit),
                 entity_type: args.entity_type.clone(),
                 keyword: args.keyword.clone(),
             };
             serde_json::to_value(graph.search_with_options(&args.query, &options).await?)?
         }
         Request::SearchEpisodes(args) => {
-            serde_json::to_value(graph.search_episodes(&args.query, args.limit).await?)?
+            let mut episodes = graph
+                .search_episodes(&args.query, clamp_limit(args.limit))
+                .await?;
+            for result in &mut episodes {
+                result.episode.embedding = None;
+            }
+            serde_json::to_value(episodes)?
         }
         Request::Query(args) => {
             let options = QueryOptions {
-                limit: args.limit,
+                limit: clamp_limit(args.limit),
                 entity_type: args.entity_type.clone(),
                 keyword: args.keyword.clone(),
-                graph_depth: args.depth,
+                graph_depth: clamp_depth(args.depth),
                 include_episodes: args.episodes,
             };
-            serde_json::to_value(graph.query(&args.query, &options).await?)?
+            let mut result = graph.query(&args.query, &options).await?;
+            for episode in &mut result.episodes {
+                episode.episode.embedding = None;
+            }
+            serde_json::to_value(result)?
         }
         Request::Traverse(args) => serde_json::to_value(
             graph
-                .traverse_filtered(&args.entity, args.depth, args.type_filter.as_deref())
+                .traverse_filtered(
+                    &args.entity,
+                    clamp_depth(args.depth),
+                    args.type_filter.as_deref(),
+                )
                 .await?,
         )?,
         Request::AddEntity(args) => {
@@ -300,7 +377,7 @@ async fn execute_graph(
                 .entity_type
                 .parse()
                 .map_err(|e: String| GraphError::Parse(e))?;
-            let entity = graph
+            let mut entity = graph
                 .add_entity(NewEntity {
                     name: args.name.clone(),
                     entity_type,
@@ -311,6 +388,8 @@ async fn execute_graph(
                     source: args.source.clone(),
                 })
                 .await?;
+            // 384 floats of JSON text no client has ever read.
+            entity.embedding = None;
             serde_json::to_value(entity)?
         }
         Request::Relate(args) => {
@@ -331,6 +410,9 @@ async fn execute_graph(
                 .ingest_archive(&args.content, &args.session_id, args.log_number, None)
                 .await?;
             serde_json::to_value(report)?
+        }
+        Request::SyncPipeline(args) => {
+            serde_json::to_value(graph.sync_pipeline(&args.docs).await?)?
         }
     };
     Ok(Some(data))
@@ -443,11 +525,7 @@ pub struct DaemonLog {
 impl DaemonLog {
     #[must_use]
     pub fn open(path: &Path, echo_stderr: bool) -> Self {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok();
+        let file = append_private_file().open(path).ok();
         Self {
             file: Mutex::new(file),
             echo_stderr,
@@ -518,6 +596,8 @@ struct DaemonContext {
     started: Instant,
     memory_dir: PathBuf,
     socket_path: PathBuf,
+    /// Only this uid may use the socket.
+    owner_uid: u32,
     idle: IdleTracker,
     shutdown: Notify,
 }
@@ -562,15 +642,11 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
         log.log("warning: [graph] mode = \"server\" — clients bypass the daemon");
     }
 
+    let owner_uid = current_uid()?;
+
     // Own the store before advertising the socket: clients that connect only
     // after a successful bind never see a half-initialized daemon.
-    let graph = match GraphMemory::open_embedded(&graph_dir).await {
-        Ok(graph) => Arc::new(graph),
-        Err(err) => {
-            log.log(&format!("failed to open graph store: {err}"));
-            return Err(err.into());
-        }
-    };
+    let graph = open_store(&graph_dir, &options.socket_path, &log).await?;
 
     let listener = match bind_socket(&options.socket_path) {
         Ok(listener) => listener,
@@ -585,17 +661,105 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
         started: Instant::now(),
         memory_dir: options.memory_dir.clone(),
         socket_path: options.socket_path.clone(),
+        owner_uid,
         idle: IdleTracker::new(options.idle_timeout),
         shutdown: Notify::new(),
     });
+    warm_embedder(Arc::clone(&graph), Arc::clone(&log));
     log.log("ready");
 
-    accept_loop(listener, graph, Arc::clone(&context), Arc::clone(&log)).await;
+    accept_loop(
+        listener,
+        Arc::clone(&graph),
+        Arc::clone(&context),
+        Arc::clone(&log),
+    )
+    .await;
 
-    let _ = std::fs::remove_file(&options.socket_path);
+    // Close the store *before* the socket disappears: a client waiting for the
+    // socket to go treats that as "the store is free", and would otherwise
+    // race the SurrealKV file lock we have not released yet.
+    release_store(graph, &log).await;
+    if let Err(err) = unlink_socket(&options.socket_path) {
+        log.log(&format!("socket cleanup: {err}"));
+    }
     let _ = std::fs::remove_file(pidfile_path(&options.socket_path));
     log.log("stopped");
     Ok(())
+}
+
+/// Open the store, waiting out an admin operation that currently owns it.
+async fn open_store(
+    graph_dir: &Path,
+    socket_path: &Path,
+    log: &DaemonLog,
+) -> Result<Arc<GraphMemory>, RecallError> {
+    let deadline = Instant::now() + crate::serve_client::ADMIN_WAIT_TIMEOUT;
+    loop {
+        crate::serve_client::wait_for_admin_lock(socket_path, deadline).await?;
+        match GraphMemory::open_embedded(graph_dir).await {
+            Ok(graph) => return Ok(Arc::new(graph)),
+            Err(GraphError::Locked(message))
+                if Instant::now() < deadline
+                    && crate::serve_client::admin_lock_is_held(socket_path) =>
+            {
+                log.log(&format!("waiting for an admin operation: {message}"));
+            }
+            Err(err) => {
+                log.log(&format!("failed to open graph store: {err}"));
+                return Err(err.into());
+            }
+        }
+    }
+}
+
+/// Drop the store once every in-flight connection has let go of it.
+async fn release_store(graph: Arc<GraphMemory>, log: &DaemonLog) {
+    let deadline = Instant::now() + STORE_RELEASE_TIMEOUT;
+    let mut graph = graph;
+    loop {
+        match Arc::try_unwrap(graph) {
+            Ok(store) => {
+                drop(store);
+                return;
+            }
+            Err(shared) => {
+                if Instant::now() >= deadline {
+                    log.log("gave up waiting for in-flight requests to release the store");
+                    return;
+                }
+                graph = shared;
+                tokio::time::sleep(STORE_RELEASE_POLL).await;
+            }
+        }
+    }
+}
+
+/// Load the ONNX embedding model in the background, so the first request that
+/// needs an embedding does not pay for it inline.
+///
+/// Skipped while the model cache is empty: warming a cold cache downloads the
+/// model, which must stay tied to a request that actually needs it rather than
+/// happening on every daemon start.
+fn warm_embedder(graph: Arc<GraphMemory>, log: Arc<DaemonLog>) {
+    let models_dir = graph.path().join("models");
+    if !has_cached_model(&models_dir) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        match graph.embedder() {
+            Ok(_) => log.log(&format!(
+                "embedder warm in {}ms",
+                started.elapsed().as_millis()
+            )),
+            Err(err) => log.log(&format!("embedder warm-up failed: {err}")),
+        }
+    });
+}
+
+fn has_cached_model(models_dir: &Path) -> bool {
+    std::fs::read_dir(models_dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 async fn accept_loop(
@@ -639,18 +803,36 @@ async fn handle_connection(
     log: Arc<DaemonLog>,
 ) {
     let _activity = ActivityGuard::new(Arc::clone(&context));
+    if let Err(err) = authorize_peer(&stream, context.owner_uid) {
+        log.log(&format!("rejected connection: {err}"));
+        return;
+    }
+
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = BufReader::new(reader.take(MAX_REQUEST_BYTES)).lines();
 
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
-            Ok(None) => break,
+            Ok(None) => {
+                // The reader stopped at the byte cap instead of at a newline:
+                // the client is sending a request larger than we will read.
+                if request_cap_reached(&mut lines) {
+                    let response = Response::failure(
+                        "bad_request",
+                        format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
+                    );
+                    log.log("rejected an oversized request");
+                    let _ = write_response(&mut writer, &response).await;
+                }
+                break;
+            }
             Err(err) => {
                 log.log(&format!("read error: {err}"));
                 break;
             }
         };
+        recharge_request_cap(&mut lines);
         if line.trim().is_empty() {
             continue;
         }
@@ -699,6 +881,28 @@ async fn handle_connection(
     }
 }
 
+/// A connection's request reader, capped at [`MAX_REQUEST_BYTES`] per request.
+type RequestLines = tokio::io::Lines<BufReader<tokio::io::Take<tokio::net::unix::OwnedReadHalf>>>;
+
+/// True when the reader stopped because the request hit the byte cap.
+fn request_cap_reached(lines: &mut RequestLines) -> bool {
+    lines.get_mut().get_mut().limit() == 0
+}
+
+/// Give the next request on this connection its own full byte budget.
+fn recharge_request_cap(lines: &mut RequestLines) {
+    lines.get_mut().get_mut().set_limit(MAX_REQUEST_BYTES);
+}
+
+/// The socket has no authentication of its own: anyone who can open it can
+/// read every ingest payload and forge every answer. Only our own uid may.
+fn authorize_peer(stream: &UnixStream, owner_uid: u32) -> Result<(), RecallError> {
+    let peer = stream.peer_cred().map_err(|err| {
+        RecallError::Daemon(format!("cannot read socket peer credentials: {err}"))
+    })?;
+    check_peer_uid(peer.uid(), owner_uid)
+}
+
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,
@@ -710,40 +914,70 @@ async fn write_response(
     Ok(())
 }
 
+/// Path the socket is bound to before it is published under its real name.
+fn staging_path(socket_path: &Path) -> PathBuf {
+    let mut path = socket_path.as_os_str().to_os_string();
+    path.push(".new");
+    PathBuf::from(path)
+}
+
 /// Bind the listening socket, clearing a stale socket left by a dead daemon.
+///
+/// The socket is bound under a temporary name in the same directory, made
+/// owner-only, and only then renamed into place: `bind` applies the process
+/// umask, so publishing first would leave a world-reachable socket for as long
+/// as it takes to chmod it.
 fn bind_socket(socket_path: &Path) -> Result<UnixListener, RecallError> {
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(parent) = socket_path.parent() {
         crate::serve_client::ensure_socket_dir(parent)?;
     }
-
-    match UnixListener::bind(socket_path) {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-                return Err(RecallError::Daemon(format!(
-                    "another daemon is already listening on {}",
-                    socket_path.display()
-                )));
-            }
-            std::fs::remove_file(socket_path)?;
-            UnixListener::bind(socket_path).map_err(|err| {
-                RecallError::Daemon(format!("cannot listen on {}: {err}", socket_path.display()))
-            })
-        }
-        Err(err) => Err(RecallError::Daemon(format!(
-            "cannot listen on {}: {err}",
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        return Err(RecallError::Daemon(format!(
+            "another daemon is already listening on {}",
             socket_path.display()
-        ))),
+        )));
     }
+
+    let staged = staging_path(socket_path);
+    unlink_socket(&staged)?;
+    let listener = UnixListener::bind(&staged).map_err(|err| {
+        RecallError::Daemon(format!("cannot listen on {}: {err}", staged.display()))
+    })?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE)).map_err(
+        |err| {
+            RecallError::Daemon(format!(
+                "cannot restrict the daemon socket {}: {err}",
+                staged.display()
+            ))
+        },
+    )?;
+
+    // Whatever sits at the published path is a socket a dead daemon left.
+    unlink_socket(socket_path)?;
+    std::fs::rename(&staged, socket_path).map_err(|err| {
+        let _ = std::fs::remove_file(&staged);
+        RecallError::Daemon(format!(
+            "cannot publish the daemon socket at {}: {err}",
+            socket_path.display()
+        ))
+    })?;
+    Ok(listener)
 }
 
 fn write_pidfile(socket_path: &Path) -> Result<(), RecallError> {
+    use std::io::Write as _;
+
     let contents = serde_json::json!({
         "pid": std::process::id(),
         "version": env!("CARGO_PKG_VERSION"),
         "socket_path": socket_path.display().to_string(),
     });
-    std::fs::write(pidfile_path(socket_path), format!("{contents}\n"))?;
+    let path = pidfile_path(socket_path);
+    let _ = std::fs::remove_file(&path);
+    let mut file = crate::serve_security::create_new_private_file().open(&path)?;
+    writeln!(file, "{contents}")?;
     Ok(())
 }
 
@@ -831,6 +1065,12 @@ mod tests {
                 content: "# log".into(),
                 session_id: "s1".into(),
                 log_number: Some(7),
+            }),
+            Request::SyncPipeline(SyncPipelineArgs {
+                docs: PipelineDocuments {
+                    learning: "# learning".into(),
+                    ..PipelineDocuments::default()
+                },
             }),
             Request::Shutdown,
         ];
@@ -950,6 +1190,62 @@ mod tests {
             IdleTracker::new_at(Some(Duration::from_secs(100)), now).poll_interval(),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn only_repeatable_operations_are_retryable() {
+        assert!(Request::Status.is_retryable());
+        assert!(Request::Traverse(TraverseArgs {
+            entity: "Rust".into(),
+            depth: 1,
+            type_filter: None,
+        })
+        .is_retryable());
+
+        // Replaying this one would duplicate every episode of a conversation.
+        assert!(!Request::IngestArchive(IngestArchiveArgs {
+            content: "# log".into(),
+            session_id: "s1".into(),
+            log_number: Some(1),
+        })
+        .is_retryable());
+        assert!(!Request::AddEntity(AddEntityArgs {
+            name: "Rust".into(),
+            entity_type: "tool".into(),
+            abstract_text: "language".into(),
+            overview: None,
+            source: None,
+        })
+        .is_retryable());
+    }
+
+    #[test]
+    fn wire_limits_are_clamped_into_a_servable_range() {
+        assert_eq!(clamp_limit(10), 10);
+        assert_eq!(clamp_limit(MAX_LIMIT), MAX_LIMIT);
+        // A limit this large overflows the `limit * 4` KNN `ef` computation
+        // and asks SurrealDB for an unbounded scan.
+        assert_eq!(clamp_limit(usize::MAX), MAX_LIMIT);
+        assert_eq!(clamp_limit(0), 1);
+    }
+
+    #[test]
+    fn wire_depths_are_clamped_into_a_servable_range() {
+        assert_eq!(clamp_depth(2), 2);
+        assert_eq!(clamp_depth(MAX_DEPTH), MAX_DEPTH);
+        assert_eq!(clamp_depth(u32::MAX), MAX_DEPTH);
+        assert_eq!(clamp_depth(0), 1);
+    }
+
+    #[test]
+    fn the_staged_socket_sits_beside_the_published_one() {
+        let socket = Path::new("/run/recall-echo/abc.sock");
+        let staged = staging_path(socket);
+        assert_eq!(staged.parent(), socket.parent());
+        assert_ne!(staged, socket);
+        // `sockaddr_un.sun_path` is 108 bytes and the published path is capped
+        // at 100, so the staging name must stay within the remainder.
+        assert!(staged.as_os_str().len() - socket.as_os_str().len() <= 7);
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod paths;
 pub mod search;
 pub mod serve;
 pub mod serve_client;
+mod serve_security;
 pub mod status;
 pub mod summarize;
 pub mod tags;

@@ -33,11 +33,14 @@ pub async fn search(
     let query_embedding = embedder.embed_single(query)?;
 
     // HNSW KNN — uses the entity_vector index (HNSW DIMENSION 384 DIST COSINE)
-    // KNN operator requires literal integers (not bind params)
-    let ef = (limit * 4).max(40);
+    // KNN operator requires literal integers (not bind params).
+    // `limit` can arrive over the daemon socket, so every derived count
+    // saturates instead of wrapping.
+    let ef = limit.saturating_mul(4).max(40);
     let sql = format!(
         r#"SELECT *,
                 vector::distance::knn() AS distance
+            OMIT embedding
             FROM entity
             WHERE embedding <|{limit}, {ef}|> $query_vec
             ORDER BY distance"#,
@@ -93,8 +96,12 @@ pub async fn search_with_options(
     let has_filters = options.entity_type.is_some() || options.keyword.is_some();
 
     // KNN doesn't support post-filter AND clauses, so fetch more and filter in Rust
-    let fetch_limit = if has_filters { limit * 4 } else { limit };
-    let ef = (fetch_limit * 4).max(40);
+    let fetch_limit = if has_filters {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    };
+    let ef = fetch_limit.saturating_mul(4).max(40);
     let sql = format!(
         r#"SELECT id, name, entity_type, abstract, overview, attributes,
                   access_count, utility_score, updated_at, source,
@@ -165,10 +172,13 @@ pub async fn search_episodes(
 ) -> Result<Vec<EpisodeSearchResult>, GraphError> {
     let query_embedding = embedder.embed_single(query_text)?;
 
-    let ef = (limit * 4).max(40);
+    let ef = limit.saturating_mul(4).max(40);
+    // Episode embeddings are 384 floats each and no caller reads them; leaving
+    // them out of the projection keeps them out of the row and off the wire.
     let sql = format!(
         r#"SELECT *,
                 vector::distance::knn() AS distance
+            OMIT embedding
             FROM episode
             WHERE embedding <|{limit}, {ef}|> $query_vec
             ORDER BY distance"#,

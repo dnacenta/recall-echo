@@ -374,9 +374,16 @@ embedding model, which also removes the per-command ONNX model reload. After
   named error explaining what went wrong, including the tail of
   `<memory_dir>/graph/daemon.log`.
 - **Admin commands take the store exclusively.** `graph init`, `gc`,
-  `extract`, `ingest-all`, `pipeline …`, `vigil-sync` and `decay-report` stop
-  the daemon, run in-process, and let the next command start a fresh daemon —
-  so there is exactly one owner of the store at every instant.
+  `extract`, `ingest-all`, `pipeline status`/`flow`/`stale`, `vigil-sync` and
+  `decay-report` take an admin lock beside the socket, stop the daemon and run
+  in-process. A command that arrives while that lock is held waits for it
+  instead of starting a daemon, and the lock is released only after the store
+  is closed — so there is exactly one owner of the store at every instant.
+- **Owner-only, both ends.** The socket and its directory are `0700`/`0600`
+  and both ends check the peer's uid, so no other local user can read what you
+  ingest or answer your queries. A `[serve] socket_path` you configure must
+  already exist as a directory only you can write into: recall-echo validates
+  it, but never creates or chmods a directory it did not derive itself.
 - Inspect it with `graph daemon status`; stop it with `graph daemon stop`.
 
 **External SurrealDB (advanced).** For deployments that already run a

@@ -10,8 +10,13 @@
 //! - `[graph] mode = "server"` (advanced): the store is an external SurrealDB
 //!   server, so there is nothing to serialize — requests run in-process.
 //! - [`exclusive`]: admin operations (init, gc, extraction, bulk ingest, …)
-//!   stop the daemon and take the store for themselves; the next hot operation
-//!   starts a fresh daemon.
+//!   take an admin lock, stop the daemon and keep the store for themselves;
+//!   hot operations that arrive meanwhile wait for the lock, and the next one
+//!   after it is released starts a fresh daemon.
+//!
+//! Both ends of the socket check the peer's uid, and the socket, its
+//! directory, the pidfile and the daemon log are all owner-only — see
+//! [`crate::serve_security`].
 
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
@@ -24,10 +29,34 @@ use tokio::net::UnixStream;
 use crate::error::RecallError;
 use crate::graph::GraphMemory;
 use crate::serve::{DaemonInfo, Request, Response};
+use crate::serve_security::{
+    append_private_file, check_peer_uid, create_new_private_file, create_private_dir, current_uid,
+    require_owned_dir, unlink_socket,
+};
 
 /// Environment override for the binary used to start the daemon.
 /// Defaults to the running executable; tests and wrappers set it explicitly.
 pub const DAEMON_BIN_ENV: &str = "RECALL_ECHO_BIN";
+
+/// Environment the detached daemon inherits. Everything else is dropped: the
+/// daemon outlives the command that started it by up to an hour, and hook
+/// contexts hand their process API credentials to every child they spawn.
+const DAEMON_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "XDG_RUNTIME_DIR",
+    "RECALL_ECHO_HOME",
+    DAEMON_BIN_ENV,
+    // fastembed downloads the ONNX model over TLS on first use.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+];
 
 /// `sockaddr_un.sun_path` is 108 bytes on Linux; stay well inside it.
 const MAX_SOCKET_PATH_LEN: usize = 100;
@@ -39,8 +68,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STALE_LOCK_AGE: Duration = Duration::from_secs(30);
 /// How long to wait for a daemon to answer the version handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on a single request/response exchange with the daemon. Long
+/// enough for an ingest of a large archive, short enough that a wedged daemon
+/// cannot hang a session hook forever.
+const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Upper bound on connect → spawn → reconnect rounds.
 const MAX_CONNECT_ROUNDS: u32 = 3;
+/// How long a hot operation waits for an admin operation to release the store
+/// before failing with a named error.
+pub(crate) const ADMIN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+/// An admin lock whose owner cannot be found in `/proc` is stale immediately;
+/// where process liveness is unknowable, it is stale after this long.
+const ADMIN_LOCK_STALE_AGE: Duration = Duration::from_secs(900);
+/// How many times `exclusive` re-stops a daemon that raced in behind it.
+const MAX_STOP_ROUNDS: u32 = 3;
 
 // ── Socket location ──────────────────────────────────────────────────────
 
@@ -56,7 +97,7 @@ pub fn socket_path(memory_dir: &Path) -> Result<PathBuf, RecallError> {
         Some(configured) if !configured.trim().is_empty() => {
             PathBuf::from(crate::paths::expand_tilde(configured.trim()))
         }
-        _ => runtime_dir().join(format!("{}.sock", path_hash(&canonical(memory_dir)))),
+        _ => runtime_dir()?.join(format!("{}.sock", path_hash(&canonical(memory_dir)))),
     };
 
     if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH_LEN {
@@ -70,20 +111,15 @@ pub fn socket_path(memory_dir: &Path) -> Result<PathBuf, RecallError> {
     Ok(path)
 }
 
-fn runtime_dir() -> PathBuf {
+/// The directory recall-echo derives its own sockets in.
+fn runtime_dir() -> Result<PathBuf, RecallError> {
     match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("recall-echo"),
-        _ => PathBuf::from(format!("/tmp/recall-echo-{}", current_uid())),
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir).join("recall-echo")),
+        _ => Ok(PathBuf::from(format!(
+            "/tmp/recall-echo-{}",
+            current_uid()?
+        ))),
     }
-}
-
-/// Owner uid, read from the filesystem so no libc dependency is needed.
-fn current_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self")
-        .or_else(|_| std::fs::metadata(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))))
-        .map(|meta| meta.uid())
-        .unwrap_or(0)
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -101,18 +137,19 @@ fn path_hash(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Create the socket directory, owner-only.
+/// Make sure the socket directory exists and only this user can write into it.
+///
+/// recall-echo creates (and then validates as `0o700`) the runtime directory
+/// it derives itself. Any other directory comes from `[serve] socket_path`,
+/// i.e. from a config file that may not be trustworthy — it is validated but
+/// never created and never chmod-ed, so a config file cannot make the tool
+/// mutate an arbitrary directory.
 pub(crate) fn ensure_socket_dir(dir: &Path) -> Result<(), RecallError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(dir).map_err(|err| {
-        RecallError::Daemon(format!(
-            "cannot create daemon socket directory {}: {err}",
-            dir.display()
-        ))
-    })?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    Ok(())
+    if runtime_dir().is_ok_and(|derived| derived == dir) {
+        create_private_dir(dir)
+    } else {
+        require_owned_dir(dir)
+    }
 }
 
 // ── Public entry points ──────────────────────────────────────────────────
@@ -143,7 +180,17 @@ pub async fn execute(
 
     let socket = socket_path(memory_dir)?;
     let mut connection = connect_or_spawn(memory_dir, &socket).await?;
-    connection.call(request).await?.into_result()
+    match connection.call(request).await {
+        Ok(response) => response.into_result(),
+        // The daemon went away between the handshake and its answer (a crash,
+        // or an `exclusive` operation racing us). One fresh daemon, one retry —
+        // but only for a request that is safe to apply twice.
+        Err(CallError::Disconnected(_)) if request.is_retryable() => {
+            let mut connection = connect_or_spawn(memory_dir, &socket).await?;
+            connection.call(request).await?.into_result()
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn execute_direct(
@@ -158,9 +205,14 @@ async fn execute_direct(
 
 /// Take exclusive ownership of the store for an admin operation.
 ///
-/// Stops a running daemon, opens the store in-process, and runs `operation`.
-/// The daemon is not restarted here — the next hot operation starts a fresh
-/// one, so the store has exactly one owner at every instant.
+/// Takes the admin lock, stops a running daemon, opens the store in-process
+/// and runs `operation`. Hot clients that arrive while the lock is held wait
+/// for it instead of starting a daemon, so the store has exactly one owner at
+/// every instant. The daemon is not restarted here — the next hot operation
+/// starts a fresh one.
+///
+/// The lock is released only after the store has been closed, so the client
+/// that wakes up next never races the admin operation for the file lock.
 pub async fn exclusive<T, F, Fut>(memory_dir: &Path, operation: F) -> Result<T, RecallError>
 where
     F: FnOnce(GraphMemory) -> Fut,
@@ -171,9 +223,27 @@ where
         return operation(GraphMemory::open(&graph_dir).await?).await;
     }
 
-    stop_daemon(memory_dir).await?;
+    let socket = socket_path(memory_dir)?;
+    let admin = acquire_admin_lock(&socket, Instant::now() + ADMIN_WAIT_TIMEOUT).await?;
+    stop_daemon_for_admin(memory_dir).await?;
+
     let graph = GraphMemory::open_embedded(&graph_dir).await?;
-    operation(graph).await
+    let result = operation(graph).await;
+    drop(admin);
+    result
+}
+
+/// Stop the daemon, and any daemon that races in behind it.
+async fn stop_daemon_for_admin(memory_dir: &Path) -> Result<(), RecallError> {
+    for _ in 0..MAX_STOP_ROUNDS {
+        if !stop_daemon(memory_dir).await? {
+            return Ok(());
+        }
+    }
+    Err(RecallError::Daemon(format!(
+        "a graph daemon for {} keeps restarting; cannot take the store exclusively",
+        memory_dir.display()
+    )))
 }
 
 /// Identity of the running daemon, or `None` when none is running (or when
@@ -200,17 +270,57 @@ pub async fn stop_daemon(memory_dir: &Path) -> Result<bool, RecallError> {
     let socket = socket_path(memory_dir)?;
     let Some(mut connection) = Connection::try_connect(&socket).await else {
         // Nothing listening — clear a stale socket so the next start is clean.
-        let _ = std::fs::remove_file(&socket);
+        unlink_socket(&socket)?;
         return Ok(false);
     };
 
-    connection.call(&Request::Shutdown).await?.into_result()?;
+    match connection.call(&Request::Shutdown).await {
+        Ok(response) => {
+            response.into_result()?;
+        }
+        // The daemon died (or shut itself down) before it could answer: the
+        // end state we asked for is the one we got.
+        Err(CallError::Disconnected(_)) => {}
+        Err(err) => return Err(err.into()),
+    }
     drop(connection);
     wait_for_socket_gone(&socket, Instant::now() + START_TIMEOUT).await?;
     Ok(true)
 }
 
 // ── Connection ───────────────────────────────────────────────────────────
+
+/// Why a request over the daemon socket failed.
+///
+/// The distinction matters on the hook path: a dead daemon is recoverable by
+/// starting a fresh one, while a protocol or timeout failure is not and must
+/// surface as-is.
+enum CallError {
+    /// The daemon closed the connection: idle timeout, shutdown, or a crash.
+    Disconnected(RecallError),
+    /// Anything else — retrying will not help.
+    Fatal(RecallError),
+}
+
+impl From<CallError> for RecallError {
+    fn from(err: CallError) -> Self {
+        match err {
+            CallError::Disconnected(err) | CallError::Fatal(err) => err,
+        }
+    }
+}
+
+/// A broken pipe or reset means the daemon went away mid-request.
+fn classify_io(err: std::io::Error) -> CallError {
+    match err.kind() {
+        ErrorKind::BrokenPipe
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::NotConnected => CallError::Disconnected(err.into()),
+        _ => CallError::Fatal(err.into()),
+    }
+}
 
 /// One JSON-line conversation with a daemon.
 struct Connection {
@@ -221,6 +331,7 @@ struct Connection {
 impl Connection {
     async fn connect(socket: &Path) -> std::io::Result<Self> {
         let stream = UnixStream::connect(socket).await?;
+        verify_daemon_peer(&stream)?;
         let (reader, writer) = stream.into_split();
         Ok(Self {
             reader: BufReader::new(reader),
@@ -233,50 +344,95 @@ impl Connection {
         Self::connect(socket).await.ok()
     }
 
-    async fn call(&mut self, request: &Request) -> Result<Response, RecallError> {
-        let mut line = serde_json::to_vec(request)?;
+    /// Send one request and read its response, bounded by [`CALL_TIMEOUT`].
+    async fn call(&mut self, request: &Request) -> Result<Response, CallError> {
+        match tokio::time::timeout(CALL_TIMEOUT, self.exchange(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(CallError::Fatal(RecallError::Daemon(format!(
+                "the graph daemon did not answer `{}` within {}s — see the daemon log",
+                request.op_name(),
+                CALL_TIMEOUT.as_secs()
+            )))),
+        }
+    }
+
+    async fn exchange(&mut self, request: &Request) -> Result<Response, CallError> {
+        let mut line = serde_json::to_vec(request).map_err(|err| CallError::Fatal(err.into()))?;
         line.push(b'\n');
-        self.writer.write_all(&line).await?;
-        self.writer.flush().await?;
+        self.writer.write_all(&line).await.map_err(classify_io)?;
+        self.writer.flush().await.map_err(classify_io)?;
 
         let mut response_line = String::new();
-        let read = self.reader.read_line(&mut response_line).await?;
+        let read = self
+            .reader
+            .read_line(&mut response_line)
+            .await
+            .map_err(classify_io)?;
         if read == 0 {
-            return Err(RecallError::Daemon(format!(
+            return Err(CallError::Disconnected(RecallError::Daemon(format!(
                 "daemon closed the connection while handling `{}` — see the daemon log",
                 request.op_name()
-            )));
+            ))));
         }
-        Ok(serde_json::from_str(&response_line)?)
+        serde_json::from_str(&response_line).map_err(|err| CallError::Fatal(err.into()))
     }
 
-    async fn hello(&mut self) -> Result<DaemonInfo, RecallError> {
-        let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.call(&Request::Hello))
-            .await
-            .map_err(|_| {
-                RecallError::Daemon("daemon did not answer the version handshake within 10s".into())
-            })??;
-        let data = response.into_result()?;
-        Ok(serde_json::from_value(data)?)
+    async fn hello(&mut self) -> Result<DaemonInfo, CallError> {
+        let response =
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.exchange(&Request::Hello)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(CallError::Fatal(RecallError::Daemon(format!(
+                        "daemon did not answer the version handshake within {}s",
+                        HANDSHAKE_TIMEOUT.as_secs()
+                    ))))
+                }
+            };
+        let data = response.into_result().map_err(CallError::Fatal)?;
+        serde_json::from_value(data).map_err(|err| CallError::Fatal(err.into()))
     }
+}
+
+/// Refuse to talk to a daemon running as another user: it would see every
+/// ingest payload we send and could answer every query with anything it likes.
+fn verify_daemon_peer(stream: &UnixStream) -> std::io::Result<()> {
+    let peer = stream.peer_cred()?;
+    let owner = current_uid().map_err(permission_denied)?;
+    check_peer_uid(peer.uid(), owner).map_err(permission_denied)
+}
+
+fn permission_denied(err: RecallError) -> std::io::Error {
+    std::io::Error::new(ErrorKind::PermissionDenied, err.to_string())
 }
 
 /// Connect to the daemon for `socket`, starting one if needed.
 async fn connect_or_spawn(memory_dir: &Path, socket: &Path) -> Result<Connection, RecallError> {
+    // Establish that the socket lives somewhere only we can write *before*
+    // touching anything in it, so an unusable location is reported as such
+    // rather than as a puzzling connect failure.
+    if let Some(parent) = socket.parent() {
+        ensure_socket_dir(parent)?;
+    }
     let deadline = Instant::now() + START_TIMEOUT;
 
     for _ in 0..MAX_CONNECT_ROUNDS {
         match Connection::connect(socket).await {
-            Ok(mut connection) => {
-                let info = connection.hello().await?;
-                if info.version == env!("CARGO_PKG_VERSION") {
-                    return Ok(connection);
+            Ok(mut connection) => match connection.hello().await {
+                Ok(info) if info.version == env!("CARGO_PKG_VERSION") => return Ok(connection),
+                Ok(_) => {
+                    // Upgraded binary, stale daemon: ask it to go, then respawn.
+                    let _ = connection.call(&Request::Shutdown).await;
+                    drop(connection);
+                    wait_for_socket_gone(socket, deadline).await?;
                 }
-                // Upgraded binary, stale daemon: ask it to go, then respawn.
-                let _ = connection.call(&Request::Shutdown).await;
-                drop(connection);
-                wait_for_socket_gone(socket, deadline).await?;
-            }
+                // The daemon closed the socket mid-handshake — it went idle or
+                // an admin operation stopped it. Clean up and start a fresh one.
+                Err(CallError::Disconnected(_)) => {
+                    drop(connection);
+                    unlink_socket(socket)?;
+                }
+                Err(CallError::Fatal(err)) => return Err(err),
+            },
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
                 return Err(RecallError::Daemon(format!(
                     "permission denied opening the daemon socket {}: {err}. \
@@ -288,11 +444,11 @@ async fn connect_or_spawn(memory_dir: &Path, socket: &Path) -> Result<Connection
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(_) => {
                 // Socket file exists but nothing is listening (crashed daemon).
-                let _ = std::fs::remove_file(socket);
+                unlink_socket(socket)?;
             }
         }
 
-        start_daemon(memory_dir, socket, deadline).await?;
+        start_daemon(memory_dir, socket, Instant::now() + START_TIMEOUT).await?;
     }
 
     Err(RecallError::Daemon(format!(
@@ -302,11 +458,16 @@ async fn connect_or_spawn(memory_dir: &Path, socket: &Path) -> Result<Connection
 }
 
 /// Start a daemon — exactly one client wins the race; the rest wait.
+///
+/// An admin operation ([`exclusive`]) owns the store while its lock is held,
+/// so a daemon started now would collide with it: wait for the lock first.
 async fn start_daemon(
     memory_dir: &Path,
     socket: &Path,
     deadline: Instant,
 ) -> Result<(), RecallError> {
+    wait_for_admin_lock(socket, Instant::now() + ADMIN_WAIT_TIMEOUT).await?;
+
     match acquire_spawn_lock(socket)? {
         Some(lock) => {
             let result = match spawn_daemon(memory_dir, socket) {
@@ -366,10 +527,7 @@ fn acquire_spawn_lock(socket: &Path) -> Result<Option<SpawnLock>, RecallError> {
 
 fn create_lock_file(path: &Path) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut file = create_new_private_file().open(path)?;
     writeln!(file, "{}", std::process::id())
 }
 
@@ -378,6 +536,130 @@ fn lock_is_stale(path: &Path) -> bool {
         .and_then(|meta| meta.modified())
         .map(|modified| modified.elapsed().unwrap_or_default() > STALE_LOCK_AGE)
         .unwrap_or(true)
+}
+
+// ── Admin lock ───────────────────────────────────────────────────────────
+
+/// Exclusive ownership of a store by an admin operation.
+///
+/// Held for the whole operation — which can run for minutes — and released
+/// only after the store has been closed. Hot clients wait for it instead of
+/// starting a daemon that would collide with the operation.
+///
+/// Crash safety comes from the owning pid rather than from a heartbeat: an
+/// admin operation blocks its thread inside the ONNX embedder for long
+/// stretches, so a timer-based heartbeat would report a healthy operation as
+/// dead. Where process liveness cannot be read (`/proc` absent), the lock's
+/// mtime bounds how long a crashed holder can block others.
+#[derive(Debug)]
+struct AdminLock {
+    path: PathBuf,
+}
+
+impl Drop for AdminLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Path of the admin lockfile that accompanies a socket.
+fn admin_lock_path(socket: &Path) -> PathBuf {
+    let mut path = socket.as_os_str().to_os_string();
+    path.push(".admin");
+    PathBuf::from(path)
+}
+
+/// Take the admin lock, waiting for another admin operation to finish.
+async fn acquire_admin_lock(socket: &Path, deadline: Instant) -> Result<AdminLock, RecallError> {
+    if let Some(parent) = socket.parent() {
+        ensure_socket_dir(parent)?;
+    }
+    let path = admin_lock_path(socket);
+
+    loop {
+        match create_lock_file(&path) {
+            Ok(()) => return Ok(AdminLock { path }),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if !admin_lock_is_live(&path) {
+                    let _ = std::fs::remove_file(&path);
+                } else if Instant::now() >= deadline {
+                    return Err(admin_wait_timeout(&path));
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+                if Instant::now() >= deadline {
+                    return Err(admin_wait_timeout(&path));
+                }
+            }
+            Err(err) => {
+                return Err(RecallError::Daemon(format!(
+                    "cannot create the admin lock {}: {err}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Wait until no admin operation owns the store for `socket`.
+pub(crate) async fn wait_for_admin_lock(
+    socket: &Path,
+    deadline: Instant,
+) -> Result<(), RecallError> {
+    let path = admin_lock_path(socket);
+    while admin_lock_is_live(&path) {
+        if Instant::now() >= deadline {
+            return Err(admin_wait_timeout(&path));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    Ok(())
+}
+
+fn admin_wait_timeout(path: &Path) -> RecallError {
+    RecallError::Daemon(format!(
+        "a recall-echo admin operation has owned the graph store for more than {}s \
+         (lock {}). Wait for it to finish, or remove the lock if its process is gone.",
+        ADMIN_WAIT_TIMEOUT.as_secs(),
+        path.display()
+    ))
+}
+
+/// True when an admin lockfile belongs to a live admin operation.
+pub(crate) fn admin_lock_is_held(socket: &Path) -> bool {
+    admin_lock_is_live(&admin_lock_path(socket))
+}
+
+fn admin_lock_is_live(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    match lock_owner_pid(path).map(process_is_alive) {
+        Some(Some(alive)) => alive,
+        // Unreadable pid, or a platform without `/proc`: fall back to age.
+        _ => meta
+            .modified()
+            .map(|modified| modified.elapsed().unwrap_or_default() < ADMIN_LOCK_STALE_AGE)
+            .unwrap_or(false),
+    }
+}
+
+fn lock_owner_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `Some(alive)` where process liveness can be read from `/proc` (Linux),
+/// `None` where it cannot.
+fn process_is_alive(pid: u32) -> Option<bool> {
+    if !Path::new("/proc/self").exists() {
+        return None;
+    }
+    Some(Path::new(&format!("/proc/{pid}")).exists())
 }
 
 fn daemon_binary() -> Result<PathBuf, RecallError> {
@@ -402,16 +684,12 @@ fn spawn_daemon(memory_dir: &Path, socket: &Path) -> Result<std::process::Child,
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|err| {
-            RecallError::Daemon(format!(
-                "cannot open the daemon log {}: {err}",
-                log_path.display()
-            ))
-        })?;
+    let log = append_private_file().open(&log_path).map_err(|err| {
+        RecallError::Daemon(format!(
+            "cannot open the daemon log {}: {err}",
+            log_path.display()
+        ))
+    })?;
 
     let mut command = std::process::Command::new(&binary);
     command
@@ -424,6 +702,7 @@ fn spawn_daemon(memory_dir: &Path, socket: &Path) -> Result<std::process::Child,
         // Own process group: terminal signals aimed at the client never reach
         // the daemon, and the daemon outlives the shell that started it.
         .process_group(0);
+    apply_daemon_env(&mut command);
 
     command.spawn().map_err(|err| {
         RecallError::Daemon(format!(
@@ -434,6 +713,20 @@ fn spawn_daemon(memory_dir: &Path, socket: &Path) -> Result<std::process::Child,
             socket.display()
         ))
     })
+}
+
+/// Hand the daemon a minimal environment.
+///
+/// The daemon is detached and long-lived; inheriting the client's environment
+/// would hand it whatever credentials the calling context happens to export
+/// (a Claude Code hook exports API keys) for the rest of its hour-long life.
+fn apply_daemon_env(command: &mut std::process::Command) {
+    command.env_clear();
+    for key in DAEMON_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
 }
 
 /// Daemon log path for a memory directory.
@@ -479,7 +772,7 @@ async fn wait_for_socket(
 async fn wait_for_socket_gone(socket: &Path, deadline: Instant) -> Result<(), RecallError> {
     while Instant::now() < deadline {
         if Connection::try_connect(socket).await.is_none() {
-            let _ = std::fs::remove_file(socket);
+            unlink_socket(socket)?;
             return Ok(());
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -621,15 +914,36 @@ mod tests {
     }
 
     #[test]
-    fn socket_dir_is_owner_only() {
+    fn the_derived_runtime_dir_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let derived = runtime_dir().unwrap();
+        ensure_socket_dir(&derived).unwrap();
+
+        let mode = std::fs::metadata(&derived).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// A `[serve] socket_path` can point anywhere, so its directory is only
+    /// ever validated — never created, never chmod-ed.
+    #[test]
+    fn a_configured_socket_dir_is_validated_not_created() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let socket_dir = dir.path().join("run");
-        ensure_socket_dir(&socket_dir).unwrap();
+        let missing = dir.path().join("run");
 
-        let mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
+        let err = ensure_socket_dir(&missing).unwrap_err();
+        assert!(matches!(err, RecallError::Daemon(_)), "{err}");
+        assert!(err.to_string().contains("socket directory"), "{err}");
+        assert!(!missing.exists(), "the directory must not be created");
+
+        // An existing directory only we can write into is accepted as-is.
+        std::fs::create_dir(&missing).unwrap();
+        std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_socket_dir(&missing).unwrap();
+        let mode = std::fs::metadata(&missing).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the directory must not be chmod-ed");
     }
 
     #[test]
@@ -641,6 +955,80 @@ mod tests {
         let err = ensure_socket_dir(&blocker.join("run")).unwrap_err();
         assert!(matches!(err, RecallError::Daemon(_)), "{err}");
         assert!(err.to_string().contains("socket directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn admin_lock_admits_one_holder_and_frees_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("graph.sock");
+
+        assert!(!admin_lock_is_held(&socket));
+        let held = acquire_admin_lock(&socket, Instant::now() + Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(admin_lock_is_held(&socket));
+
+        let err = acquire_admin_lock(&socket, Instant::now() + Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("admin operation"), "{err}");
+
+        drop(held);
+        assert!(!admin_lock_is_held(&socket));
+        acquire_admin_lock(&socket, Instant::now() + Duration::from_millis(50))
+            .await
+            .unwrap();
+    }
+
+    /// A client that died mid-operation must not block the store forever.
+    #[tokio::test]
+    async fn an_admin_lock_owned_by_a_dead_process_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("graph.sock");
+        let path = admin_lock_path(&socket);
+
+        // pid 0 never names a live process, so `/proc/0` never exists.
+        std::fs::write(&path, "0\n").unwrap();
+        assert!(!admin_lock_is_held(&socket));
+        acquire_admin_lock(&socket, Instant::now() + Duration::from_millis(50))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_admin_lock_is_honored_by_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("graph.sock");
+        let path = admin_lock_path(&socket);
+
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        assert!(admin_lock_is_held(&socket));
+
+        let err = wait_for_admin_lock(&socket, Instant::now() + Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RecallError::Daemon(_)), "{err}");
+
+        std::fs::remove_file(&path).unwrap();
+        wait_for_admin_lock(&socket, Instant::now() + Duration::from_millis(50))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn the_daemon_environment_is_an_allowlist() {
+        assert!(DAEMON_ENV_ALLOWLIST.contains(&"PATH"));
+        assert!(DAEMON_ENV_ALLOWLIST.contains(&DAEMON_BIN_ENV));
+        for secret in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                !DAEMON_ENV_ALLOWLIST.contains(&secret),
+                "{secret} must not reach the detached daemon"
+            );
+        }
     }
 
     /// Backdate a file's mtime without a libc dependency: rewrite it through a

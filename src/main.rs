@@ -451,7 +451,7 @@ fn main() {
         }) => {
             let root = resolve_entity_root(entity_root);
             let memory_dir = root.join("memory");
-            tokio::runtime::Runtime::new()
+            client_runtime()
                 .map_err(recall_echo::error::RecallError::from)
                 .and_then(|rt| {
                     rt.block_on(async {
@@ -628,6 +628,15 @@ fn main() {
         eprintln!("\x1b[31m\u{2717}\x1b[0m {e}");
         std::process::exit(1);
     }
+}
+
+/// A runtime for a command that talks to the graph daemon: mostly socket
+/// round-trips, so one thread is enough. Only the daemon itself, which serves
+/// concurrent connections, needs the multi-thread runtime.
+fn client_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
 }
 
 /// Run the graph daemon for a memory directory until it stops.

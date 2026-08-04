@@ -308,6 +308,187 @@ async fn two_concurrent_cli_invocations_share_one_daemon() {
     fixture.stop().await;
 }
 
+/// `exclusive` must actually be exclusive: the daemon that owned the store is
+/// gone for the whole operation, and the next hot operation starts a new one.
+#[tokio::test]
+async fn exclusive_takes_the_store_from_the_daemon_and_hands_it_back() {
+    let fixture = Fixture::new();
+    fixture.status().await.expect("start the daemon");
+    let before = fixture.info().await.expect("daemon running").pid;
+
+    let seen_inside = serve_client::exclusive(&fixture.memory_dir, |_graph| async {
+        // No daemon may be serving while an admin operation owns the store.
+        Ok(serve_client::daemon_info(&fixture.memory_dir)
+            .await
+            .unwrap())
+    })
+    .await
+    .expect("exclusive operation runs");
+    assert!(seen_inside.is_none(), "the daemon must be stopped");
+    assert!(!fixture.socket.exists(), "the socket is gone with it");
+
+    fixture.status().await.expect("hot op respawns the daemon");
+    let after = fixture.info().await.expect("replacement daemon").pid;
+    assert_ne!(before, after);
+
+    fixture.stop().await;
+}
+
+/// A hot operation that arrives while an admin operation owns the store waits
+/// for it instead of starting a daemon that would collide with it.
+#[tokio::test]
+async fn a_hot_operation_waits_for_a_running_admin_operation() {
+    let fixture = Fixture::new();
+
+    let memory_dir = fixture.memory_dir.clone();
+    let admin = tokio::spawn(async move {
+        serve_client::exclusive(&memory_dir, |_graph| async {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            Ok(())
+        })
+        .await
+    });
+
+    // Give the admin operation time to take the lock, then race it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let started = std::time::Instant::now();
+    fixture
+        .status()
+        .await
+        .expect("hot op completes after waiting");
+
+    admin.await.expect("join").expect("admin operation");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "the hot operation did not wait for the admin lock ({:?})",
+        started.elapsed()
+    );
+
+    fixture.stop().await;
+}
+
+/// A daemon that goes away between `connect` and the handshake — an idle
+/// timeout, or another process's `exclusive` — must not fail the caller. On
+/// the SessionEnd hook path that would silently lose a conversation ingest.
+#[tokio::test]
+async fn a_daemon_that_dies_mid_handshake_is_replaced() {
+    let fixture = Fixture::new();
+
+    let listener = tokio::net::UnixListener::bind(&fixture.socket).expect("bind mock");
+    let mock = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        // Closing without answering is exactly what an exiting daemon looks like.
+        drop(stream);
+        drop(listener);
+    });
+
+    let stats = fixture
+        .status()
+        .await
+        .expect("status despite the dead daemon");
+    assert_eq!(stats["entity_count"], 0);
+    assert!(fixture.info().await.is_some(), "a fresh daemon took over");
+
+    mock.await.expect("mock daemon exits");
+    fixture.stop().await;
+}
+
+/// An oversized request is rejected by code, and the daemon keeps serving.
+#[tokio::test]
+async fn an_oversized_request_is_refused_and_the_daemon_survives() {
+    let fixture = Fixture::new();
+    fixture.status().await.expect("start the daemon");
+    let before = fixture.info().await.expect("daemon running").pid;
+
+    let stream = tokio::net::UnixStream::connect(&fixture.socket)
+        .await
+        .expect("connect");
+    let (reader, mut writer) = stream.into_split();
+
+    // 9 MiB of a syntactically valid request, one MiB past the cap.
+    let opening = br#"{"op":"search","args":{"limit":1,"query":""#;
+    writer.write_all(opening).await.expect("write opening");
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..(9 * 16) {
+        if writer.write_all(&chunk).await.is_err() {
+            break;
+        }
+    }
+    let _ = writer.write_all(b"\"}}\n").await;
+    let _ = writer.flush().await;
+
+    let mut response = String::new();
+    BufReader::new(reader)
+        .read_line(&mut response)
+        .await
+        .expect("read response");
+    let parsed: Response = serde_json::from_str(&response).expect("parse response");
+    assert!(!parsed.ok, "{response}");
+    assert_eq!(parsed.error.expect("error").code, "bad_request");
+
+    let after = fixture.info().await.expect("daemon still serving").pid;
+    assert_eq!(
+        before, after,
+        "the daemon must survive an oversized request"
+    );
+    fixture.status().await.expect("still answering requests");
+
+    fixture.stop().await;
+}
+
+/// The daemon socket is owner-only and only the owning uid may use it.
+#[tokio::test]
+async fn the_socket_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    fixture.status().await.expect("start the daemon");
+
+    let mode = std::fs::metadata(&fixture.socket)
+        .expect("socket exists")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "socket mode {mode:o}");
+
+    let pidfile = PathBuf::from(format!("{}.pid", fixture.socket.display()));
+    let mode = std::fs::metadata(&pidfile)
+        .expect("pidfile exists")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "pidfile mode {mode:o}");
+
+    fixture.stop().await;
+}
+
+/// A `[serve] socket_path` must not make recall-echo unlink arbitrary files.
+#[tokio::test]
+async fn a_configured_socket_path_pointing_at_a_regular_file_is_refused() {
+    use_test_binary();
+
+    let dir = TempDir::new().expect("temp dir");
+    let memory_dir = dir.path().join("memory");
+    std::fs::create_dir_all(memory_dir.join("graph")).expect("memory dir");
+
+    let precious = dir.path().join("precious.toml");
+    std::fs::write(&precious, b"keep me").expect("write file");
+    std::fs::write(
+        memory_dir.join(".recall-echo.toml"),
+        format!("[serve]\nsocket_path = \"{}\"\n", precious.display()),
+    )
+    .expect("write config");
+
+    let err = serve_client::execute(&memory_dir, &Request::Status)
+        .await
+        .expect_err("daemon cannot use a regular file as its socket");
+    assert!(matches!(err, RecallError::Daemon(_)), "{err}");
+    assert!(precious.exists(), "the file must survive");
+    assert_eq!(
+        std::fs::read_to_string(&precious).unwrap(),
+        "keep me",
+        "the file must be untouched"
+    );
+}
+
 /// Poll until nothing is listening on `socket`.
 async fn wait_until_gone(socket: &std::path::Path) {
     for _ in 0..200 {

@@ -50,6 +50,22 @@ pub async fn ingest_into_graph(
     Ok(report)
 }
 
+/// Sync the pipeline documents into the knowledge graph.
+///
+/// Pipeline sync needs no LLM provider, so it runs as an ordinary daemon
+/// request. That matters on the SessionEnd hook path: ingest and sync then
+/// share one warm daemon instead of the sync stopping the daemon the ingest
+/// just started and reloading the embedding model in-process.
+pub async fn sync_pipeline_into_graph(
+    memory_dir: &std::path::Path,
+    docs: crate::graph::types::PipelineDocuments,
+) -> Result<crate::graph::types::PipelineSyncReport, crate::error::RecallError> {
+    let request = crate::serve::Request::SyncPipeline(crate::serve::SyncPipelineArgs { docs });
+    Ok(serde_json::from_value(
+        crate::serve_client::execute(memory_dir, &request).await?,
+    )?)
+}
+
 /// Ingest with an LLM provider for entity extraction.
 ///
 /// When pulse-null feature is enabled, this bridges the LmProvider

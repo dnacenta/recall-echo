@@ -181,7 +181,10 @@ fn init_graph(memory_dir: &Path) {
         return;
     }
 
-    match tokio::runtime::Runtime::new() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    match runtime {
         Ok(rt) => match rt.block_on(crate::graph::GraphMemory::open(&graph_dir)) {
             Ok(_) => print_status(
                 Status::Created,

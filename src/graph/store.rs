@@ -22,8 +22,12 @@ pub type Db = Any;
 
 /// How many times to retry opening an embedded store that is locked by
 /// another process, and the base backoff between attempts (doubled each try).
-const LOCK_RETRY_ATTEMPTS: u32 = 4;
-const LOCK_RETRY_BASE: Duration = Duration::from_millis(250);
+///
+/// The common case is a daemon that has just been asked to stop and is
+/// releasing the store, which takes single-digit milliseconds: start far
+/// below that and spend the same total budget (~3.8s) on more attempts.
+const LOCK_RETRY_ATTEMPTS: u32 = 8;
+const LOCK_RETRY_BASE: Duration = Duration::from_millis(15);
 
 /// Connection config for server mode.
 #[derive(Clone)]
