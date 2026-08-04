@@ -251,6 +251,11 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph ingest-all` — Scan conversations/ and ingest all un-ingested archives.
 - `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (anthropic or openai), `--delay-ms`.
 
+**Daemon:**
+
+- `graph daemon status` — Socket path, pid, version and uptime of the daemon serving this graph.
+- `graph daemon stop` — Stop that daemon. The next graph command starts a fresh one.
+
 **Pipeline & integrations:**
 
 - `graph pipeline sync` — Sync pipeline documents (LEARNING.md, THOUGHTS.md, CURIOSITY.md, REFLECTIONS.md, PRAXIS.md) into the graph. Idempotent — diffs parsed entries vs existing graph entities.
@@ -258,6 +263,19 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph pipeline flow <entity>` — Trace an entity's lineage through the pipeline stages.
 - `graph pipeline stale` — List stale pipeline entities. Supports `--days` (threshold, default 7).
 - `graph vigil-sync` — Sync vigil-pulse metacognitive signals and caliber outcomes into the graph as Measurement and Outcome entities. Supports `--signals-path` and `--outcomes-path`.
+
+### `recall-echo serve`
+
+Runs the graph daemon for a memory directory. You never need to run this by
+hand — graph commands and hooks start it automatically. It exists for
+supervised deployments:
+
+```bash
+recall-echo serve --dir /path/to/memory --foreground
+```
+
+`--foreground` logs to stderr as well as `<memory_dir>/graph/daemon.log` and
+disables idle shutdown, leaving lifetime to systemd.
 
 ## Archive Format
 
@@ -313,6 +331,10 @@ auto_sync = true               # Auto-sync pipeline docs to graph on archive
 [graph]
 mode = "embedded"            # Storage backend: "embedded" (default) or "server"
 url = "ws://localhost:8787"  # SurrealDB server URL (server mode only)
+
+[serve]
+socket_path = ""             # Daemon socket override (default: XDG runtime dir)
+idle_timeout_secs = 3600     # Shut the daemon down after this much inactivity (0 = never)
 ```
 
 | Section | Key | Default | Description |
@@ -325,21 +347,48 @@ url = "ws://localhost:8787"  # SurrealDB server URL (server mode only)
 | `pipeline` | `auto_sync` | `false` | Sync pipeline documents to the knowledge graph on archive |
 | `graph` | `mode` | `embedded` | Storage backend: `embedded` (single-process SurrealKV) or `server` (shared SurrealDB) |
 | `graph` | `url` | `ws://localhost:8787` | SurrealDB server URL, `server` mode only |
+| `serve` | `socket_path` | XDG runtime dir | Daemon socket path override |
+| `serve` | `idle_timeout_secs` | `3600` | Daemon idle shutdown timeout (`0` disables) |
 
 All settings have sensible defaults. Missing file or invalid values fall back silently.
 
 ## Concurrency
 
 The default `embedded` backend (SurrealKV) takes a **process-exclusive file
-lock** on the graph store: one recall-echo process at a time. A second
-process retries briefly with backoff, then fails with a `store locked` error
-naming the holder scenario — it never crashes with a raw LOCK panic.
+lock** on the graph store: one process may hold it at a time. recall-echo
+resolves that with a small daemon rather than with locking rules you have to
+remember.
 
-If you need concurrent access (parallel sessions, benchmarking, other tools
-reading the graph), set `[graph] mode = "server"` and point `url` at a
-running SurrealDB server — the backend is chosen at runtime, no rebuild
-needed. Flat-file layers (MEMORY.md, EPHEMERAL.md, archives) are unaffected
-by any of this.
+**How it works.** The first graph command or hook that needs the store starts
+a daemon in the background (`recall-echo serve`) and talks to it over a unix
+socket in `$XDG_RUNTIME_DIR/recall-echo/`. Every later command — from any
+number of concurrent sessions — goes through that same daemon, so concurrent
+searches, queries and ingests all succeed. The daemon owns the store and the
+embedding model, which also removes the per-command ONNX model reload. After
+`[serve] idle_timeout_secs` of inactivity (default one hour) it exits.
+
+- One daemon **per memory directory**: separate graphs never share a process.
+- **Crash-only**: the daemon keeps no state outside the database. Kill it at
+  any moment; the next command cleans up the dead socket and starts a new one.
+- **No silent fallback**: if the daemon cannot start, the command fails with a
+  named error explaining what went wrong, including the tail of
+  `<memory_dir>/graph/daemon.log`.
+- **Admin commands take the store exclusively.** `graph init`, `gc`,
+  `extract`, `ingest-all`, `pipeline …`, `vigil-sync` and `decay-report` stop
+  the daemon, run in-process, and let the next command start a fresh daemon —
+  so there is exactly one owner of the store at every instant.
+- Inspect it with `graph daemon status`; stop it with `graph daemon stop`.
+
+**External SurrealDB (advanced).** For deployments that already run a
+SurrealDB server (benchmark rigs, shared entity hosts), set
+`[graph] mode = "server"` and point `url` at it. Commands then connect
+directly and no daemon is involved. The backend is chosen at runtime — no
+rebuild needed.
+
+If the embedded store is locked by a foreign process, the daemon retries with
+backoff and then fails with a named `store locked` error — never a raw LOCK
+panic. Flat-file layers (MEMORY.md, EPHEMERAL.md, archives) are unaffected by
+any of this.
 
 ## Contributing
 

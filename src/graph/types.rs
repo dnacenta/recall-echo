@@ -261,7 +261,8 @@ pub struct SearchOptions {
 }
 
 /// How an entity was found.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatchSource {
     /// Found via semantic similarity.
     Semantic,
@@ -272,7 +273,7 @@ pub enum MatchSource {
 }
 
 /// A scored entity in search results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredEntity {
     pub entity: EntityDetail,
     pub score: f64,
@@ -280,7 +281,7 @@ pub struct ScoredEntity {
 }
 
 /// An episode search result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeSearchResult {
     pub episode: Episode,
     pub score: f64,
@@ -310,14 +311,14 @@ impl Default for QueryOptions {
 }
 
 /// Result of a hybrid query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub entities: Vec<ScoredEntity>,
     pub episodes: Vec<EpisodeSearchResult>,
 }
 
 /// A search result with scoring (legacy — wraps full Entity).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub entity: Entity,
     pub score: f64,
@@ -325,14 +326,14 @@ pub struct SearchResult {
 }
 
 /// A node in a traversal tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraversalNode {
     pub entity: EntitySummary,
     pub edges: Vec<TraversalEdge>,
 }
 
 /// An edge in a traversal tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraversalEdge {
     pub rel_type: String,
     pub direction: String,
@@ -370,7 +371,7 @@ impl EdgeRow {
 }
 
 /// Graph-level statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphStats {
     pub entity_count: u64,
     pub relationship_count: u64,
@@ -594,7 +595,7 @@ pub struct PipelineEntry {
 }
 
 /// Result of a full ingestion run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionReport {
     pub episodes_created: u32,
     pub entities_created: u32,

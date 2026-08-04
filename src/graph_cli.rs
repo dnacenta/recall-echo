@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use crate::error::RecallError;
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::*;
-use crate::graph::GraphMemory;
+use crate::serve::{
+    AddEntityArgs, IngestArchiveArgs, QueryArgs, RelateArgs, Request, SearchArgs, TraverseArgs,
+};
+use crate::serve_client;
 
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
@@ -17,7 +20,7 @@ const RESET: &str = "\x1b[0m";
 /// Initialize the graph store at {memory_dir}/graph/.
 pub async fn init(memory_dir: &Path) -> Result<(), RecallError> {
     let graph_dir = memory_dir.join("graph");
-    GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |_graph| async { Ok(()) }).await?;
     println!(
         "{GREEN}✓{RESET} Graph store initialized at {}",
         graph_dir.display()
@@ -33,8 +36,8 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
             "Graph store not initialized. Run `recall-echo graph init` first.".into(),
         ));
     }
-    let gm = GraphMemory::open(&graph_dir).await?;
-    let stats = gm.stats().await?;
+    let data = serve_client::execute(memory_dir, &Request::Status).await?;
+    let stats: GraphStats = serde_json::from_value(data)?;
 
     println!("{BOLD}Graph Memory Status{RESET}");
     println!("  Entities:      {}", stats.entity_count);
@@ -49,6 +52,60 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
             println!("    {t}: {count}");
         }
     }
+
+    print_daemon_line(memory_dir).await;
+    Ok(())
+}
+
+/// Print the identity of the daemon serving this graph, or why there is none.
+async fn print_daemon_line(memory_dir: &Path) {
+    println!();
+    match serve_client::daemon_info(memory_dir).await {
+        Ok(Some(info)) => println!(
+            "  {DIM}Daemon:{RESET} running — pid {}, v{}, up {}s",
+            info.pid, info.version, info.uptime_secs
+        ),
+        Ok(None) if serve_client::graph_mode(memory_dir) == "server" => {
+            println!("  {DIM}Daemon:{RESET} not used — [graph] mode = server");
+        }
+        Ok(None) => println!("  {DIM}Daemon:{RESET} not running"),
+        Err(e) => println!("  {DIM}Daemon:{RESET} unknown ({e})"),
+    }
+}
+
+/// Show daemon status without touching the graph.
+pub async fn daemon_status(memory_dir: &Path) -> Result<(), RecallError> {
+    println!("{BOLD}Graph Daemon{RESET}");
+    println!(
+        "  Socket: {}",
+        serve_client::socket_path(memory_dir)?.display()
+    );
+    match serve_client::daemon_info(memory_dir).await? {
+        Some(info) => {
+            println!("  State:  {GREEN}running{RESET}");
+            println!("  Pid:    {}", info.pid);
+            println!("  Version: {}", info.version);
+            println!("  Uptime: {}s", info.uptime_secs);
+        }
+        None if serve_client::graph_mode(memory_dir) == "server" => {
+            println!("  State:  not used — [graph] mode = server");
+        }
+        None => println!("  State:  {YELLOW}not running{RESET}"),
+    }
+    println!(
+        "  Log:    {}",
+        serve_client::daemon_log_path(memory_dir).display()
+    );
+    Ok(())
+}
+
+/// Stop the daemon serving this graph, if one is running.
+pub async fn daemon_stop(memory_dir: &Path) -> Result<(), RecallError> {
+    if serve_client::stop_daemon(memory_dir).await? {
+        println!("{GREEN}✓{RESET} Graph daemon stopped");
+    } else {
+        println!("{YELLOW}No graph daemon running.{RESET}");
+    }
     Ok(())
 }
 
@@ -61,24 +118,15 @@ pub async fn add_entity(
     overview: Option<&str>,
     source: Option<&str>,
 ) -> Result<(), RecallError> {
-    let graph_dir = memory_dir.join("graph");
-    let et: EntityType = entity_type
-        .parse()
-        .map_err(|e: String| RecallError::Other(e))?;
-
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    let entity = gm
-        .add_entity(NewEntity {
-            name: name.to_string(),
-            entity_type: et,
-            abstract_text: abstract_text.to_string(),
-            overview: overview.map(String::from),
-            content: None,
-            attributes: None,
-            source: source.map(String::from),
-        })
-        .await?;
+    let request = Request::AddEntity(AddEntityArgs {
+        name: name.to_string(),
+        entity_type: entity_type.to_string(),
+        abstract_text: abstract_text.to_string(),
+        overview: overview.map(String::from),
+        source: source.map(String::from),
+    });
+    let entity: Entity =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
         "{GREEN}✓{RESET} Created entity: {BOLD}{}{RESET} ({}) [{}]",
@@ -98,19 +146,15 @@ pub async fn relate(
     description: Option<&str>,
     source: Option<&str>,
 ) -> Result<(), RecallError> {
-    let graph_dir = memory_dir.join("graph");
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    let rel = gm
-        .add_relationship(NewRelationship {
-            from_entity: from.to_string(),
-            to_entity: to.to_string(),
-            rel_type: rel_type.to_string(),
-            description: description.map(String::from),
-            confidence: None,
-            source: source.map(String::from),
-        })
-        .await?;
+    let request = Request::Relate(RelateArgs {
+        from: from.to_string(),
+        rel_type: rel_type.to_string(),
+        to: to.to_string(),
+        description: description.map(String::from),
+        source: source.map(String::from),
+    });
+    let rel: Relationship =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
         "{GREEN}✓{RESET} {from} {CYAN}—[{rel_type}]→{RESET} {to} [{}]",
@@ -127,16 +171,14 @@ pub async fn search(
     entity_type: Option<&str>,
     keyword: Option<&str>,
 ) -> Result<(), RecallError> {
-    let graph_dir = memory_dir.join("graph");
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    let options = SearchOptions {
+    let request = Request::Search(SearchArgs {
+        query: query.to_string(),
         limit,
         entity_type: entity_type.map(String::from),
         keyword: keyword.map(String::from),
-    };
-
-    let results = gm.search_with_options(query, &options).await?;
+    });
+    let results: Vec<ScoredEntity> =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     if results.is_empty() {
         println!("{YELLOW}No results.{RESET}");
@@ -170,11 +212,13 @@ pub async fn ingest(memory_dir: &Path, archive_path: &Path) -> Result<(), Recall
     // Extract session_id and log_number from frontmatter if available
     let (session_id, log_number) = extract_archive_metadata(&content, archive_path);
 
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    let report = gm
-        .ingest_archive(&content, &session_id, log_number, None)
-        .await?;
+    let request = Request::IngestArchive(IngestArchiveArgs {
+        content,
+        session_id,
+        log_number,
+    });
+    let report: IngestionReport =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
         "{GREEN}✓{RESET} Ingested {}: {} episodes created",
@@ -215,44 +259,45 @@ pub async fn ingest_all(memory_dir: &Path) -> Result<(), RecallError> {
         return Ok(());
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let mut total_episodes = 0u32;
+        let mut ingested = 0u32;
+        let mut skipped = 0u32;
 
-    let mut total_episodes = 0u32;
-    let mut ingested = 0u32;
-    let mut skipped = 0u32;
+        for entry in &files {
+            let path = entry.path();
+            let content = std::fs::read_to_string(&path)?;
 
-    for entry in &files {
-        let path = entry.path();
-        let content = std::fs::read_to_string(&path)?;
+            let (session_id, log_number) = extract_archive_metadata(&content, &path);
 
-        let (session_id, log_number) = extract_archive_metadata(&content, &path);
-
-        // Check if already ingested (has episodes for this log_number)
-        if let Some(ln) = log_number {
-            if let Ok(Some(_)) = gm.get_episode_by_log_number(ln).await {
-                skipped += 1;
-                continue;
+            // Check if already ingested (has episodes for this log_number)
+            if let Some(ln) = log_number {
+                if let Ok(Some(_)) = gm.get_episode_by_log_number(ln).await {
+                    skipped += 1;
+                    continue;
+                }
             }
+
+            let report = gm
+                .ingest_archive(&content, &session_id, log_number, None)
+                .await?;
+
+            total_episodes += report.episodes_created;
+            ingested += 1;
+
+            println!(
+                "  {GREEN}✓{RESET} {} — {} episodes",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                report.episodes_created
+            );
         }
 
-        let report = gm
-            .ingest_archive(&content, &session_id, log_number, None)
-            .await?;
-
-        total_episodes += report.episodes_created;
-        ingested += 1;
-
         println!(
-            "  {GREEN}✓{RESET} {} — {} episodes",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            report.episodes_created
+            "\n{GREEN}✓{RESET} Ingested {ingested} archives ({total_episodes} episodes), skipped {skipped} already ingested"
         );
-    }
-
-    println!(
-        "\n{GREEN}✓{RESET} Ingested {ingested} archives ({total_episodes} episodes), skipped {skipped} already ingested"
-    );
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// Extract session_id and log_number from a conversation archive's frontmatter.
@@ -295,12 +340,13 @@ pub async fn traverse(
     depth: u32,
     type_filter: Option<&str>,
 ) -> Result<(), RecallError> {
-    let graph_dir = memory_dir.join("graph");
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    let tree = gm
-        .traverse_filtered(entity_name, depth, type_filter)
-        .await?;
+    let request = Request::Traverse(TraverseArgs {
+        entity: entity_name.to_string(),
+        depth,
+        type_filter: type_filter.map(String::from),
+    });
+    let tree: TraversalNode =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     let output = format_traversal(&tree, 0);
     print!("{output}");
@@ -317,18 +363,16 @@ pub async fn hybrid_query(
     depth: u32,
     episodes: bool,
 ) -> Result<(), RecallError> {
-    let graph_dir = memory_dir.join("graph");
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    let options = QueryOptions {
+    let request = Request::Query(QueryArgs {
+        query: query.to_string(),
         limit,
         entity_type: entity_type.map(String::from),
         keyword: keyword.map(String::from),
-        graph_depth: depth,
-        include_episodes: episodes,
-    };
-
-    let result = gm.query(query, &options).await?;
+        depth,
+        episodes,
+    });
+    let result: QueryResult =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     if result.entities.is_empty() && result.episodes.is_empty() {
         println!("{YELLOW}No results.{RESET}");
@@ -479,160 +523,161 @@ pub async fn extract(
         ));
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    // Determine which log numbers to process
-    let log_numbers: Vec<u32> = if let Some(ln) = log {
-        vec![ln]
-    } else if all {
-        gm.unextracted_log_numbers()
-            .await?
-            .into_iter()
-            .map(|n| n as u32)
-            .collect()
-    } else {
-        return Err(RecallError::Other("Specify --log <N> or --all".into()));
-    };
-
-    if log_numbers.is_empty() {
-        println!("{YELLOW}No unextracted archives found.{RESET}");
-        return Ok(());
-    }
-
-    let conversations_dir = find_conversations_dir(memory_dir)?;
-
-    if dry_run {
-        print_extract_dry_run(&conversations_dir, &log_numbers);
-        return Ok(());
-    }
-
-    // Build LLM provider from .recall-echo.toml (CLI flags override)
-    let (llm, model_name) = crate::llm_provider::create_provider(
-        memory_dir,
-        provider_override.as_deref(),
-        model_override.as_deref(),
-    )?;
-
-    let total_count = log_numbers.len();
-    let budget_label = if max_tokens > 0 {
-        format!(" (budget: {})", format_tokens(max_tokens))
-    } else {
-        String::new()
-    };
-    println!(
-        "{BOLD}Extracting entities from {total_count} archives using {model_name}{budget_label}{RESET}",
-    );
-
-    let quarantine_path = graph_dir.join("extraction-quarantine.txt");
-    let mut totals = ExtractionTotals::default();
-
-    for (idx, ln) in log_numbers.iter().enumerate() {
-        // Budget check
-        if max_tokens > 0 && totals.estimated_tokens >= max_tokens {
-            println!(
-                "\n{YELLOW}⚠ Token budget exhausted (~{} / {}). Stopping.{RESET}",
-                format_tokens(totals.estimated_tokens),
-                format_tokens(max_tokens),
-            );
-            println!("  Re-run to continue — resume is automatic via unextracted log numbers.");
-            break;
-        }
-
-        let archive_path = match find_archive_file(&conversations_dir, *ln) {
-            Ok(p) => p,
-            Err(e) => {
-                println!(
-                    "  {YELLOW}⚠{RESET} [{}/{}] log {ln:03}: {e}",
-                    idx + 1,
-                    total_count
-                );
-                totals.errors.push(format!("log {ln:03}: {e}"));
-                continue;
-            }
+    serve_client::exclusive(memory_dir, |gm| async move {
+        // Determine which log numbers to process
+        let log_numbers: Vec<u32> = if let Some(ln) = log {
+            vec![ln]
+        } else if all {
+            gm.unextracted_log_numbers()
+                .await?
+                .into_iter()
+                .map(|n| n as u32)
+                .collect()
+        } else {
+            return Err(RecallError::Other("Specify --log <N> or --all".into()));
         };
 
-        let content = std::fs::read_to_string(&archive_path)?;
-        let (session_id, _) = extract_archive_metadata(&content, &archive_path);
+        if log_numbers.is_empty() {
+            println!("{YELLOW}No unextracted archives found.{RESET}");
+            return Ok(());
+        }
 
-        // Try extraction, retry once on failure, quarantine on second failure
-        let report = match gm
-            .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        let conversations_dir = find_conversations_dir(memory_dir)?;
+
+        if dry_run {
+            print_extract_dry_run(&conversations_dir, &log_numbers);
+            return Ok(());
+        }
+
+        // Build LLM provider from .recall-echo.toml (CLI flags override)
+        let (llm, model_name) = crate::llm_provider::create_provider(
+            memory_dir,
+            provider_override.as_deref(),
+            model_override.as_deref(),
+        )?;
+
+        let total_count = log_numbers.len();
+        let budget_label = if max_tokens > 0 {
+            format!(" (budget: {})", format_tokens(max_tokens))
+        } else {
+            String::new()
+        };
+        println!(
+            "{BOLD}Extracting entities from {total_count} archives using {model_name}{budget_label}{RESET}",
+        );
+
+        let quarantine_path = graph_dir.join("extraction-quarantine.txt");
+        let mut totals = ExtractionTotals::default();
+
+        for (idx, ln) in log_numbers.iter().enumerate() {
+            // Budget check
+            if max_tokens > 0 && totals.estimated_tokens >= max_tokens {
                 println!(
-                    "  {YELLOW}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
-                    idx + 1,
-                    total_count
+                    "\n{YELLOW}⚠ Token budget exhausted (~{} / {}). Stopping.{RESET}",
+                    format_tokens(totals.estimated_tokens),
+                    format_tokens(max_tokens),
                 );
-                match gm
-                    .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e2) => {
-                        println!(
-                            "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
-                            idx + 1,
-                            total_count
-                        );
-                        totals.quarantined.push(*ln);
-                        totals
-                            .errors
-                            .push(format!("log {ln:03}: quarantined after retry: {e2}"));
-                        continue;
+                println!("  Re-run to continue — resume is automatic via unextracted log numbers.");
+                break;
+            }
+
+            let archive_path = match find_archive_file(&conversations_dir, *ln) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!(
+                        "  {YELLOW}⚠{RESET} [{}/{}] log {ln:03}: {e}",
+                        idx + 1,
+                        total_count
+                    );
+                    totals.errors.push(format!("log {ln:03}: {e}"));
+                    continue;
+                }
+            };
+
+            let content = std::fs::read_to_string(&archive_path)?;
+            let (session_id, _) = extract_archive_metadata(&content, &archive_path);
+
+            // Try extraction, retry once on failure, quarantine on second failure
+            let report = match gm
+                .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    println!(
+                        "  {YELLOW}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
+                        idx + 1,
+                        total_count
+                    );
+                    match gm
+                        .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e2) => {
+                            println!(
+                                "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
+                                idx + 1,
+                                total_count
+                            );
+                            totals.quarantined.push(*ln);
+                            totals
+                                .errors
+                                .push(format!("log {ln:03}: quarantined after retry: {e2}"));
+                            continue;
+                        }
                     }
                 }
+            };
+
+            println!(
+                "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels (~{})",
+                idx + 1,
+                total_count,
+                report.entities_created,
+                report.entities_merged,
+                report.entities_skipped,
+                report.relationships_created,
+                format_tokens(report.estimated_tokens),
+            );
+
+            gm.mark_extracted(*ln).await?;
+
+            totals.entities_created += report.entities_created;
+            totals.entities_merged += report.entities_merged;
+            totals.entities_skipped += report.entities_skipped;
+            totals.relationships += report.relationships_created;
+            totals.errors.extend(report.errors);
+            totals.processed += 1;
+            totals.estimated_tokens += report.estimated_tokens;
+
+            // Rate limiting between archives
+            if delay_ms > 0 && *ln != *log_numbers.last().unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-        };
-
-        println!(
-            "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels (~{})",
-            idx + 1,
-            total_count,
-            report.entities_created,
-            report.entities_merged,
-            report.entities_skipped,
-            report.relationships_created,
-            format_tokens(report.estimated_tokens),
-        );
-
-        gm.mark_extracted(*ln).await?;
-
-        totals.entities_created += report.entities_created;
-        totals.entities_merged += report.entities_merged;
-        totals.entities_skipped += report.entities_skipped;
-        totals.relationships += report.relationships_created;
-        totals.errors.extend(report.errors);
-        totals.processed += 1;
-        totals.estimated_tokens += report.estimated_tokens;
-
-        // Rate limiting between archives
-        if delay_ms > 0 && *ln != *log_numbers.last().unwrap() {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-    }
 
-    // Write quarantine file if any archives failed
-    if !totals.quarantined.is_empty() {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&quarantine_path)?;
-        for ln in &totals.quarantined {
-            writeln!(file, "{ln:03}")?;
+        // Write quarantine file if any archives failed
+        if !totals.quarantined.is_empty() {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&quarantine_path)?;
+            for ln in &totals.quarantined {
+                writeln!(file, "{ln:03}")?;
+            }
+            println!(
+                "\n  {YELLOW}Quarantined {} archives → {}{RESET}",
+                totals.quarantined.len(),
+                quarantine_path.display()
+            );
         }
-        println!(
-            "\n  {YELLOW}Quarantined {} archives → {}{RESET}",
-            totals.quarantined.len(),
-            quarantine_path.display()
-        );
-    }
 
-    print_extract_summary(&totals);
-    Ok(())
+        print_extract_summary(&totals);
+        Ok(())
+    })
+    .await
 }
 
 // ── Vigil sync commands ──────────────────────────────────────────────
@@ -659,28 +704,29 @@ pub async fn vigil_sync(
     let sig_path = signals_path.unwrap_or(&default_signals);
     let out_path = outcomes_path.unwrap_or(&default_outcomes);
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let report = gm.sync_vigil(sig_path, out_path).await?;
 
-    let report = gm.sync_vigil(sig_path, out_path).await?;
+        println!("{BOLD}Vigil Sync{RESET}");
+        println!("  Measurements: +{}", report.measurements_created);
+        println!("  Outcomes:     +{}", report.outcomes_created);
+        println!("  Relationships: +{}", report.relationships_created);
+        println!("  Skipped:       {}", report.skipped);
 
-    println!("{BOLD}Vigil Sync{RESET}");
-    println!("  Measurements: +{}", report.measurements_created);
-    println!("  Outcomes:     +{}", report.outcomes_created);
-    println!("  Relationships: +{}", report.relationships_created);
-    println!("  Skipped:       {}", report.skipped);
-
-    if !report.errors.is_empty() {
-        println!("\n  {YELLOW}Warnings:{RESET}");
-        for err in &report.errors {
-            println!("    {DIM}{err}{RESET}");
+        if !report.errors.is_empty() {
+            println!("\n  {YELLOW}Warnings:{RESET}");
+            for err in &report.errors {
+                println!("    {DIM}{err}{RESET}");
+            }
         }
-    }
 
-    if report.measurements_created == 0 && report.outcomes_created == 0 {
-        println!("\n  {DIM}No new data — graph is in sync.{RESET}");
-    }
+        if report.measurements_created == 0 && report.outcomes_created == 0 {
+            println!("\n  {DIM}No new data — graph is in sync.{RESET}");
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 // ── Pipeline commands ──────────────────────────────────────────────────
@@ -724,32 +770,35 @@ pub async fn pipeline_sync(
     // Read pipeline documents
     let docs = read_pipeline_docs(&docs_dir)?;
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let report = gm.sync_pipeline(&docs).await?;
 
-    let report = gm.sync_pipeline(&docs).await?;
+        println!("{BOLD}Pipeline Sync{RESET}");
+        println!("  Created:      {}", report.entities_created);
+        println!("  Updated:      {}", report.entities_updated);
+        println!("  Archived:     {}", report.entities_archived);
+        println!(
+            "  Relationships: +{} / ~{} skipped",
+            report.relationships_created, report.relationships_skipped
+        );
 
-    println!("{BOLD}Pipeline Sync{RESET}");
-    println!("  Created:      {}", report.entities_created);
-    println!("  Updated:      {}", report.entities_updated);
-    println!("  Archived:     {}", report.entities_archived);
-    println!(
-        "  Relationships: +{} / ~{} skipped",
-        report.relationships_created, report.relationships_skipped
-    );
-
-    if !report.errors.is_empty() {
-        println!("\n  {YELLOW}Warnings:{RESET}");
-        for err in &report.errors {
-            println!("    {DIM}{err}{RESET}");
+        if !report.errors.is_empty() {
+            println!("\n  {YELLOW}Warnings:{RESET}");
+            for err in &report.errors {
+                println!("    {DIM}{err}{RESET}");
+            }
         }
-    }
 
-    if report.entities_created == 0 && report.entities_updated == 0 && report.entities_archived == 0
-    {
-        println!("\n  {DIM}No changes — graph is in sync.{RESET}");
-    }
+        if report.entities_created == 0
+            && report.entities_updated == 0
+            && report.entities_archived == 0
+        {
+            println!("\n  {DIM}No changes — graph is in sync.{RESET}");
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// Show pipeline health stats.
@@ -761,55 +810,58 @@ pub async fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(
         ));
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let stats = gm.pipeline_stats(staleness_days).await?;
 
-    let stats = gm.pipeline_stats(staleness_days).await?;
+        println!(
+            "{BOLD}Pipeline Status{RESET} ({} entities)",
+            stats.total_entities
+        );
 
-    println!(
-        "{BOLD}Pipeline Status{RESET} ({} entities)",
-        stats.total_entities
-    );
+        if stats.by_stage.is_empty() {
+            println!(
+                "  {DIM}No pipeline entities in graph. Run `graph pipeline sync` first.{RESET}"
+            );
+            return Ok(());
+        }
 
-    if stats.by_stage.is_empty() {
-        println!("  {DIM}No pipeline entities in graph. Run `graph pipeline sync` first.{RESET}");
-        return Ok(());
-    }
-
-    // Display stages in pipeline order
-    let stage_order = ["learning", "thoughts", "curiosity", "reflections", "praxis"];
-    for stage in &stage_order {
-        if let Some(statuses) = stats.by_stage.get(*stage) {
-            println!("\n  {CYAN}{}{RESET}", stage.to_uppercase());
-            let mut items: Vec<_> = statuses.iter().collect();
-            items.sort_by_key(|(s, _)| (*s).clone());
-            for (status, count) in items {
-                println!("    {status}: {count}");
+        // Display stages in pipeline order
+        let stage_order = ["learning", "thoughts", "curiosity", "reflections", "praxis"];
+        for stage in &stage_order {
+            if let Some(statuses) = stats.by_stage.get(*stage) {
+                println!("\n  {CYAN}{}{RESET}", stage.to_uppercase());
+                let mut items: Vec<_> = statuses.iter().collect();
+                items.sort_by_key(|(s, _)| (*s).clone());
+                for (status, count) in items {
+                    println!("    {status}: {count}");
+                }
             }
         }
-    }
 
-    if !stats.stale_thoughts.is_empty() {
-        println!("\n  {YELLOW}Stale thoughts (>{staleness_days}d):{RESET}");
-        for entity in &stats.stale_thoughts {
-            println!("    {DIM}•{RESET} {}", entity.name);
+        if !stats.stale_thoughts.is_empty() {
+            println!("\n  {YELLOW}Stale thoughts (>{staleness_days}d):{RESET}");
+            for entity in &stats.stale_thoughts {
+                println!("    {DIM}•{RESET} {}", entity.name);
+            }
         }
-    }
 
-    if !stats.stale_questions.is_empty() {
-        println!(
-            "\n  {YELLOW}Stale questions (>{}d):{RESET}",
-            staleness_days * 2
-        );
-        for entity in &stats.stale_questions {
-            println!("    {DIM}•{RESET} {}", entity.name);
+        if !stats.stale_questions.is_empty() {
+            println!(
+                "\n  {YELLOW}Stale questions (>{}d):{RESET}",
+                staleness_days * 2
+            );
+            for entity in &stats.stale_questions {
+                println!("    {DIM}•{RESET} {}", entity.name);
+            }
         }
-    }
 
-    if let Some(ref last) = stats.last_movement {
-        println!("\n  {DIM}Last movement: {last}{RESET}");
-    }
+        if let Some(ref last) = stats.last_movement {
+            println!("\n  {DIM}Last movement: {last}{RESET}");
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// Trace pipeline flow for an entity.
@@ -821,24 +873,25 @@ pub async fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), R
         ));
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let chain = gm.pipeline_flow(entity_name).await?;
 
-    let chain = gm.pipeline_flow(entity_name).await?;
+        if chain.is_empty() {
+            println!("{YELLOW}No pipeline relationships found for \"{entity_name}\".{RESET}");
+            return Ok(());
+        }
 
-    if chain.is_empty() {
-        println!("{YELLOW}No pipeline relationships found for \"{entity_name}\".{RESET}");
-        return Ok(());
-    }
+        println!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n");
+        for (source, rel_type, target) in &chain {
+            println!(
+                "  {} ({}) {CYAN}—[{rel_type}]→{RESET} {} ({})",
+                source.name, source.entity_type, target.name, target.entity_type
+            );
+        }
 
-    println!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n");
-    for (source, rel_type, target) in &chain {
-        println!(
-            "  {} ({}) {CYAN}—[{rel_type}]→{RESET} {} ({})",
-            source.name, source.entity_type, target.name, target.entity_type
-        );
-    }
-
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// List stale pipeline entities.
@@ -850,33 +903,34 @@ pub async fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<()
         ));
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let stats = gm.pipeline_stats(staleness_days).await?;
 
-    let stats = gm.pipeline_stats(staleness_days).await?;
-
-    let total_stale = stats.stale_thoughts.len() + stats.stale_questions.len();
-    if total_stale == 0 {
-        println!("{GREEN}✓{RESET} No stale pipeline entities.");
-        return Ok(());
-    }
-
-    println!("{BOLD}Stale Pipeline Entities{RESET}\n");
-
-    if !stats.stale_thoughts.is_empty() {
-        println!("  {YELLOW}Thoughts (>{staleness_days} days):{RESET}");
-        for entity in &stats.stale_thoughts {
-            println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+        let total_stale = stats.stale_thoughts.len() + stats.stale_questions.len();
+        if total_stale == 0 {
+            println!("{GREEN}✓{RESET} No stale pipeline entities.");
+            return Ok(());
         }
-    }
 
-    if !stats.stale_questions.is_empty() {
-        println!("  {YELLOW}Questions (>{} days):{RESET}", staleness_days * 2);
-        for entity in &stats.stale_questions {
-            println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+        println!("{BOLD}Stale Pipeline Entities{RESET}\n");
+
+        if !stats.stale_thoughts.is_empty() {
+            println!("  {YELLOW}Thoughts (>{staleness_days} days):{RESET}");
+            for entity in &stats.stale_thoughts {
+                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+            }
         }
-    }
 
-    Ok(())
+        if !stats.stale_questions.is_empty() {
+            println!("  {YELLOW}Questions (>{} days):{RESET}", staleness_days * 2);
+            for entity in &stats.stale_questions {
+                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+            }
+        }
+
+        Ok(())
+    })
+    .await
 }
 
 /// Read pipeline documents from a directory.
@@ -942,90 +996,93 @@ pub async fn gc(
         ));
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
-
-    if stats_only {
-        let stats = gm.gc_stats().await?;
-        println!("{BOLD}Graph Health{RESET}");
-        println!("  Entities:              {}", stats.total_entities);
-        println!("  Relationships:         {}", stats.total_relationships);
-        println!(
-            "  Pipeline entities:     {} {DIM}(protected){RESET}",
-            stats.pipeline_entities
-        );
-        println!("  Zero-access entities:  {}", stats.zero_access_entities);
-        println!(
-            "  Low confidence rels:   {} {DIM}(< 0.5){RESET}",
-            stats.low_confidence_rels
-        );
-        println!(
-            "  Very low conf. rels:   {} {DIM}(< 0.2){RESET}",
-            stats.very_low_confidence_rels
-        );
-        println!("  Superseded rels:       {}", stats.superseded_rels);
-        return Ok(());
-    }
-
-    let config = GcConfig {
-        stale_days,
-        stale_confidence,
-        dead_confidence,
-        dead_min_age_days,
-        dry_run: !execute,
-        protect_pipeline: true,
-    };
-
-    let report = gm.run_gc(&config).await?;
-
-    // Header
-    if report.dry_run {
-        println!("{BOLD}{YELLOW}GC Dry Run{RESET} {DIM}(pass --execute to actually delete){RESET}");
-    } else {
-        println!("{BOLD}{GREEN}GC Executed{RESET}");
-    }
-
-    println!("\n{BOLD}Scan{RESET}");
-    println!("  Entities scanned:      {}", report.entities_scanned);
-    println!("  Relationships scanned: {}", report.relationships_scanned);
-
-    println!("\n{BOLD}Results{RESET}");
-    println!("  Stale relationships:   {}", report.stale_relationships);
-    println!("  Dead relationships:    {}", report.dead_relationships);
-    println!("  Orphaned entities:     {}", report.orphaned_entities);
-
-    let verb = if report.dry_run {
-        "would remove"
-    } else {
-        "removed"
-    };
-    println!("  Total {verb}:         {}", report.total_removed);
-
-    // Details
-    if !report.actions.is_empty() {
-        println!("\n{BOLD}Actions{RESET}");
-        for action in &report.actions {
-            let icon = match action.kind {
-                GcActionKind::StaleRelationship => format!("{YELLOW}⚠{RESET}"),
-                GcActionKind::DeadRelationship => format!("{YELLOW}✗{RESET}"),
-                GcActionKind::OrphanedEntity => format!("{CYAN}○{RESET}"),
-            };
+    serve_client::exclusive(memory_dir, |gm| async move {
+        if stats_only {
+            let stats = gm.gc_stats().await?;
+            println!("{BOLD}Graph Health{RESET}");
+            println!("  Entities:              {}", stats.total_entities);
+            println!("  Relationships:         {}", stats.total_relationships);
             println!(
-                "  {icon} [{kind}] {name}",
-                kind = action.kind,
-                name = action.target_name,
+                "  Pipeline entities:     {} {DIM}(protected){RESET}",
+                stats.pipeline_entities
             );
-            println!("    {DIM}{reason}{RESET}", reason = action.reason);
+            println!("  Zero-access entities:  {}", stats.zero_access_entities);
+            println!(
+                "  Low confidence rels:   {} {DIM}(< 0.5){RESET}",
+                stats.low_confidence_rels
+            );
+            println!(
+                "  Very low conf. rels:   {} {DIM}(< 0.2){RESET}",
+                stats.very_low_confidence_rels
+            );
+            println!("  Superseded rels:       {}", stats.superseded_rels);
+            return Ok(());
         }
-    }
 
-    if !report.errors.is_empty() {
-        println!("\n{BOLD}Errors{RESET}");
-        for err in &report.errors {
-            println!("  \x1b[31m✗\x1b[0m {err}");
+        let config = GcConfig {
+            stale_days,
+            stale_confidence,
+            dead_confidence,
+            dead_min_age_days,
+            dry_run: !execute,
+            protect_pipeline: true,
+        };
+
+        let report = gm.run_gc(&config).await?;
+
+        // Header
+        if report.dry_run {
+            println!(
+                "{BOLD}{YELLOW}GC Dry Run{RESET} {DIM}(pass --execute to actually delete){RESET}"
+            );
+        } else {
+            println!("{BOLD}{GREEN}GC Executed{RESET}");
         }
-    }
 
-    Ok(())
+        println!("\n{BOLD}Scan{RESET}");
+        println!("  Entities scanned:      {}", report.entities_scanned);
+        println!("  Relationships scanned: {}", report.relationships_scanned);
+
+        println!("\n{BOLD}Results{RESET}");
+        println!("  Stale relationships:   {}", report.stale_relationships);
+        println!("  Dead relationships:    {}", report.dead_relationships);
+        println!("  Orphaned entities:     {}", report.orphaned_entities);
+
+        let verb = if report.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        };
+        println!("  Total {verb}:         {}", report.total_removed);
+
+        // Details
+        if !report.actions.is_empty() {
+            println!("\n{BOLD}Actions{RESET}");
+            for action in &report.actions {
+                let icon = match action.kind {
+                    GcActionKind::StaleRelationship => format!("{YELLOW}⚠{RESET}"),
+                    GcActionKind::DeadRelationship => format!("{YELLOW}✗{RESET}"),
+                    GcActionKind::OrphanedEntity => format!("{CYAN}○{RESET}"),
+                };
+                println!(
+                    "  {icon} [{kind}] {name}",
+                    kind = action.kind,
+                    name = action.target_name,
+                );
+                println!("    {DIM}{reason}{RESET}", reason = action.reason);
+            }
+        }
+
+        if !report.errors.is_empty() {
+            println!("\n{BOLD}Errors{RESET}");
+            for err in &report.errors {
+                println!("  \x1b[31m✗\x1b[0m {err}");
+            }
+        }
+
+        Ok(())
+    })
+    .await
 }
 
 /// Show relationship decay report — lists all relationships with their stored vs effective confidence.
@@ -1044,87 +1101,88 @@ pub async fn decay_report(
         ));
     }
 
-    let gm = GraphMemory::open(&graph_dir).await?;
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let now = chrono::Utc::now();
 
-    let now = chrono::Utc::now();
-
-    let rels = if let Some(name) = entity_name {
-        gm.get_relationships(name, Direction::Both).await?
-    } else {
-        crate::graph::crud::list_all_relationships(gm.db()).await?
-    };
-
-    if rels.is_empty() {
-        println!("{YELLOW}No relationships found.{RESET}");
-        return Ok(());
-    }
-
-    println!(
-        "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n",
-        rels.len(),
-        confidence::DEFAULT_HALF_LIFE_DAYS
-    );
-
-    let mut decayed_count = 0u32;
-    let mut total_decay = 0.0_f64;
-
-    for rel in &rels {
-        let effective = confidence::effective_confidence(
-            rel.confidence,
-            rel.last_reinforced.as_ref(),
-            &rel.valid_from,
-            &now,
-        );
-
-        let decay_amount = rel.confidence - effective;
-        if decay_amount > 0.001 {
-            decayed_count += 1;
-        }
-        total_decay += decay_amount;
-
-        if !show_all && decay_amount < 0.001 {
-            continue;
-        }
-
-        let from_short = match &rel.from_id {
-            serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
-            other => other.to_string(),
-        };
-        let to_short = match &rel.to_id {
-            serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
-            other => other.to_string(),
-        };
-
-        let reinforced_tag = match &rel.last_reinforced {
-            Some(serde_json::Value::String(s)) => format!(" {DIM}(reinforced: {s}){RESET}"),
-            _ => String::new(),
-        };
-
-        let decay_indicator = if decay_amount > 0.2 {
-            format!("\x1b[31m↓{:.0}%\x1b[0m", decay_amount * 100.0)
-        } else if decay_amount > 0.05 {
-            format!("{YELLOW}↓{:.0}%{RESET}", decay_amount * 100.0)
+        let rels = if let Some(name) = entity_name {
+            gm.get_relationships(name, Direction::Both).await?
         } else {
-            format!("{DIM}≈{RESET}")
+            crate::graph::crud::list_all_relationships(gm.db()).await?
         };
+
+        if rels.is_empty() {
+            println!("{YELLOW}No relationships found.{RESET}");
+            return Ok(());
+        }
 
         println!(
-            "  {from_short} {CYAN}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{reinforced_tag}",
-            rel.rel_type, rel.confidence, effective,
+            "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n",
+            rels.len(),
+            confidence::DEFAULT_HALF_LIFE_DAYS
         );
-    }
 
-    println!(
-        "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}",
-        rels.len(),
-        if rels.is_empty() {
-            0.0
-        } else {
-            total_decay / rels.len() as f64
+        let mut decayed_count = 0u32;
+        let mut total_decay = 0.0_f64;
+
+        for rel in &rels {
+            let effective = confidence::effective_confidence(
+                rel.confidence,
+                rel.last_reinforced.as_ref(),
+                &rel.valid_from,
+                &now,
+            );
+
+            let decay_amount = rel.confidence - effective;
+            if decay_amount > 0.001 {
+                decayed_count += 1;
+            }
+            total_decay += decay_amount;
+
+            if !show_all && decay_amount < 0.001 {
+                continue;
+            }
+
+            let from_short = match &rel.from_id {
+                serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
+                other => other.to_string(),
+            };
+            let to_short = match &rel.to_id {
+                serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
+                other => other.to_string(),
+            };
+
+            let reinforced_tag = match &rel.last_reinforced {
+                Some(serde_json::Value::String(s)) => format!(" {DIM}(reinforced: {s}){RESET}"),
+                _ => String::new(),
+            };
+
+            let decay_indicator = if decay_amount > 0.2 {
+                format!("\x1b[31m↓{:.0}%\x1b[0m", decay_amount * 100.0)
+            } else if decay_amount > 0.05 {
+                format!("{YELLOW}↓{:.0}%{RESET}", decay_amount * 100.0)
+            } else {
+                format!("{DIM}≈{RESET}")
+            };
+
+            println!(
+                "  {from_short} {CYAN}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{reinforced_tag}",
+                rel.rel_type, rel.confidence, effective,
+            );
         }
-    );
 
-    Ok(())
+        println!(
+            "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}",
+            rels.len(),
+            if rels.is_empty() {
+                0.0
+            } else {
+                total_decay / rels.len() as f64
+            }
+        );
+
+        Ok(())
+    })
+    .await
 }
 
 /// Find the archive file for a given log number.

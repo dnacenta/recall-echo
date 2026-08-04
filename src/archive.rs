@@ -307,33 +307,35 @@ pub fn pipeline_sync_on_archive(memory_dir: &Path) {
         }
     };
 
-    if let Err(e) = rt.block_on(async {
-        let gm = crate::graph::GraphMemory::open(&graph_dir)
-            .await
-            .map_err(|e| format!("graph open: {e}"))?;
+    // Pipeline sync is an admin operation: it takes the store exclusively,
+    // stopping the daemon the ingest above may have started. The next graph
+    // command starts a fresh one.
+    if let Err(e) = rt.block_on(crate::serve_client::exclusive(
+        memory_dir,
+        |gm| async move {
+            let docs = crate::graph::types::PipelineDocuments {
+                learning: read_opt_file(&docs_dir, "LEARNING.md"),
+                thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
+                curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
+                reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
+                praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
+            };
 
-        let docs = crate::graph::types::PipelineDocuments {
-            learning: read_opt_file(&docs_dir, "LEARNING.md"),
-            thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
-            curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
-            reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
-            praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
-        };
+            let report = gm.sync_pipeline(&docs).await?;
 
-        let report = gm.sync_pipeline(&docs).await.map_err(|e| format!("{e}"))?;
+            if report.entities_created > 0
+                || report.entities_updated > 0
+                || report.entities_archived > 0
+            {
+                eprintln!(
+                    "recall-echo: pipeline synced — +{} created, ~{} updated, -{} archived",
+                    report.entities_created, report.entities_updated, report.entities_archived
+                );
+            }
 
-        if report.entities_created > 0
-            || report.entities_updated > 0
-            || report.entities_archived > 0
-        {
-            eprintln!(
-                "recall-echo: pipeline synced — +{} created, ~{} updated, -{} archived",
-                report.entities_created, report.entities_updated, report.entities_archived
-            );
-        }
-
-        Ok::<(), String>(())
-    }) {
+            Ok(())
+        },
+    )) {
         eprintln!("recall-echo: pipeline sync warning: {e}");
     }
 }
@@ -370,23 +372,19 @@ async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
         return;
     }
 
-    let gm = match crate::graph::GraphMemory::open(&graph_dir).await {
-        Ok(gm) => gm,
-        Err(e) => {
-            eprintln!("recall-echo: pipeline sync open error: {e}");
-            return;
-        }
-    };
+    let synced = crate::serve_client::exclusive(memory_dir, |gm| async move {
+        let docs = crate::graph::types::PipelineDocuments {
+            learning: read_opt_file(&docs_dir, "LEARNING.md"),
+            thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
+            curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
+            reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
+            praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
+        };
+        Ok(gm.sync_pipeline(&docs).await?)
+    })
+    .await;
 
-    let docs = crate::graph::types::PipelineDocuments {
-        learning: read_opt_file(&docs_dir, "LEARNING.md"),
-        thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
-        curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
-        reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
-        praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
-    };
-
-    match gm.sync_pipeline(&docs).await {
+    match synced {
         Ok(report) => {
             if report.entities_created > 0
                 || report.entities_updated > 0

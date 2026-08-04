@@ -81,6 +81,16 @@ enum Commands {
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
+    /// Run the graph daemon (started automatically by graph commands and hooks)
+    Serve {
+        /// Memory directory to serve (defaults to {entity_root}/memory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Stay in the foreground: log to stderr and never idle-shut-down
+        /// (for systemd units and debugging)
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Knowledge graph operations
     Graph {
         #[command(subcommand)]
@@ -316,6 +326,11 @@ enum GraphCommands {
         #[arg(long)]
         outcomes_path: Option<PathBuf>,
     },
+    /// Inspect or stop the graph daemon
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     /// Show relationship decay report — stored vs effective confidence
     DecayReport {
         /// Show only relationships for a specific entity
@@ -325,6 +340,14 @@ enum GraphCommands {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Show the daemon's socket, pid, version and uptime
+    Status,
+    /// Stop the daemon serving this graph
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -418,6 +441,10 @@ fn main() {
         }
         #[cfg(feature = "bench")]
         Some(Commands::Bench { command }) => run_bench(command),
+        Some(Commands::Serve { dir, foreground }) => {
+            let memory_dir = dir.unwrap_or_else(|| resolve_entity_root(None).join("memory"));
+            run_serve(&memory_dir, foreground)
+        }
         Some(Commands::Graph {
             command,
             entity_root,
@@ -568,6 +595,12 @@ fn main() {
                                 )
                                 .await
                             }
+                            GraphCommands::Daemon { command } => match command {
+                                DaemonCommands::Status => {
+                                    graph_cli::daemon_status(&memory_dir).await
+                                }
+                                DaemonCommands::Stop => graph_cli::daemon_stop(&memory_dir).await,
+                            },
                             GraphCommands::DecayReport { entity, all } => {
                                 graph_cli::decay_report(&memory_dir, entity.as_deref(), all).await
                             }
@@ -595,6 +628,19 @@ fn main() {
         eprintln!("\x1b[31m\u{2717}\x1b[0m {e}");
         std::process::exit(1);
     }
+}
+
+/// Run the graph daemon for a memory directory until it stops.
+fn run_serve(
+    memory_dir: &std::path::Path,
+    foreground: bool,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::serve::{run, ServeOptions};
+
+    let options = ServeOptions::from_config(memory_dir, foreground)?;
+    tokio::runtime::Runtime::new()
+        .map_err(recall_echo::error::RecallError::from)
+        .and_then(|rt| rt.block_on(run(options)))
 }
 
 fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {

@@ -20,7 +20,7 @@ dirs = "6"
 # Graph — knowledge graph with SurrealDB + fastembed
 surrealdb = { version = "3", default-features = false }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "net", "time", "sync", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 futures = "0.3"

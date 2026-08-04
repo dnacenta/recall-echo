@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_ENTRIES: usize = 5;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
 const CONFIG_FILE: &str = ".recall-echo.toml";
 
 // ── Provider enum ────────────────────────────────────────────────────────
@@ -71,6 +72,8 @@ pub struct Config {
     pub pipeline: Option<PipelineSection>,
     #[serde(default)]
     pub graph: Option<GraphSection>,
+    #[serde(default)]
+    pub serve: ServeSection,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,6 +185,31 @@ impl Default for GraphSection {
             username: String::new(),
             password_file: String::new(),
             scoring: GraphScoringConfig::default(),
+        }
+    }
+}
+
+/// Settings for the `recall-echo serve` graph daemon.
+///
+/// Maps to the `[serve]` section of `.recall-echo.toml`. The daemon is started
+/// transparently by graph commands and hooks when `[graph] mode = "embedded"`
+/// (the default); these keys only tune where it listens and how long it lives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServeSection {
+    /// Override the unix socket path. Defaults to
+    /// `$XDG_RUNTIME_DIR/recall-echo/<hash of memory dir>.sock`.
+    pub socket_path: Option<String>,
+    /// Seconds of inactivity before the daemon shuts itself down.
+    /// `0` disables idle shutdown. Default `3600`.
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for ServeSection {
+    fn default() -> Self {
+        Self {
+            socket_path: None,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
         }
     }
 }
@@ -351,6 +379,21 @@ impl Config {
                 section.auto_sync = Some(b);
                 Ok(())
             }
+            "serve.idle_timeout_secs" => {
+                let secs: u64 = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                self.serve.idle_timeout_secs = secs;
+                Ok(())
+            }
+            "serve.socket_path" => {
+                self.serve.socket_path = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(())
+            }
             other => Err(RecallError::Config(format!("unknown config key: {other}"))),
         }
     }
@@ -388,6 +431,31 @@ mod tests {
         let g = cfg.graph.unwrap();
         assert_eq!(g.mode, "server");
         assert_eq!(g.url, "ws://db.local:8787");
+    }
+
+    #[test]
+    fn serve_defaults_when_section_absent() {
+        let cfg: Config = toml::from_str("[ephemeral]\nmax_entries = 3\n").unwrap();
+        assert_eq!(cfg.serve.idle_timeout_secs, DEFAULT_IDLE_TIMEOUT_SECS);
+        assert!(cfg.serve.socket_path.is_none());
+    }
+
+    #[test]
+    fn serve_section_parses_overrides() {
+        let cfg: Config = toml::from_str(
+            "[serve]\nsocket_path = \"/run/re/graph.sock\"\nidle_timeout_secs = 60\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.serve.idle_timeout_secs, 60);
+        assert_eq!(cfg.serve.socket_path.as_deref(), Some("/run/re/graph.sock"));
+    }
+
+    #[test]
+    fn set_key_serve_idle_timeout() {
+        let mut cfg = Config::default();
+        cfg.set_key("serve.idle_timeout_secs", "120").unwrap();
+        assert_eq!(cfg.serve.idle_timeout_secs, 120);
+        assert!(cfg.set_key("serve.idle_timeout_secs", "soon").is_err());
     }
 
     #[test]
@@ -439,6 +507,7 @@ mod tests {
             },
             pipeline: None,
             graph: None,
+            serve: ServeSection::default(),
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
@@ -497,6 +566,7 @@ mod tests {
             },
             pipeline: None,
             graph: None,
+            serve: ServeSection::default(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path());
@@ -518,6 +588,7 @@ mod tests {
             llm: LlmSection::default(),
             pipeline: None,
             graph: None,
+            serve: ServeSection::default(),
         });
         assert_eq!(cfg.ephemeral.max_entries, 5);
     }

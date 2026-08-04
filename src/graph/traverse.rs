@@ -45,8 +45,10 @@ pub async fn traverse_filtered(
     traverse_from(db, &root, max_depth, 0, &mut vec![], type_filter).await
 }
 
-type TraversalFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<TraversalNode, GraphError>> + 'a>>;
+/// `Send` matters: the serve daemon traverses inside a spawned tokio task.
+type TraversalFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<TraversalNode, GraphError>> + Send + 'a>,
+>;
 
 /// Recursive traversal with cycle detection, using L0 projections.
 fn traverse_from<'a>(

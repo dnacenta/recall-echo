@@ -32,6 +32,8 @@ pub mod init;
 pub mod jsonl;
 pub mod paths;
 pub mod search;
+pub mod serve;
+pub mod serve_client;
 pub mod status;
 pub mod summarize;
 pub mod tags;

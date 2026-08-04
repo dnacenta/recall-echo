@@ -56,6 +56,17 @@ pub fn claude_dir() -> Result<PathBuf, RecallError> {
     Ok(home.join(".claude"))
 }
 
+/// Expand a leading `~/` to the home directory. Other paths pass through.
+#[must_use]
+pub fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
+
 /// Detect Claude Code installation.
 /// Returns Some(~/.claude/) if it exists, None otherwise.
 #[must_use]

@@ -87,6 +87,23 @@ pub async fn extract_from_archive(
     Ok(report)
 }
 
+/// Extract one chunk, tagged with its index.
+///
+/// A named async fn rather than an inline `async move` block: the inline form
+/// makes the resulting stream non-`Send` (the closure would have to implement
+/// `FnOnce` for any two lifetimes), and the serve daemon runs ingestion inside
+/// a spawned tokio task.
+async fn extract_indexed(
+    llm: &dyn LlmProvider,
+    chunk: &str,
+    session_id: &str,
+    log_number: Option<u32>,
+    index: usize,
+) -> (usize, Result<ExtractionResult, GraphError>) {
+    let result = extract::extract_from_chunk(llm, chunk, session_id, log_number).await;
+    (index, result)
+}
+
 /// Shared extraction logic — parallel extraction, sequential dedup.
 ///
 /// Four phases:
@@ -102,13 +119,18 @@ async fn process_extraction(
     llm: &dyn LlmProvider,
     report: &mut IngestionReport,
 ) -> Result<(), GraphError> {
-    // Phase 1: Extract all chunks in parallel
+    // Phase 1: Extract all chunks in parallel.
+    // The per-chunk futures are built by the iterator, not by a stream
+    // combinator: a closure applied inside the stream would have to be
+    // higher-ranked over the item lifetime, which makes the whole stream
+    // non-`Send` and would bar ingestion from the serve daemon's tasks.
+    let pending: Vec<_> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| extract_indexed(llm, chunk, session_id, log_number, i))
+        .collect();
     let extraction_results: Vec<(usize, Result<ExtractionResult, GraphError>)> =
-        stream::iter(chunks.iter().enumerate())
-            .map(|(i, chunk)| async move {
-                let result = extract::extract_from_chunk(llm, chunk, session_id, log_number).await;
-                (i, result)
-            })
+        stream::iter(pending)
             .buffer_unordered(LLM_CONCURRENCY)
             .collect()
             .await;
