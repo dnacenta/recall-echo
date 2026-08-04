@@ -518,6 +518,41 @@ impl GraphMemory {
         .await
     }
 
+    /// Apply an outcome to every entity a session touched.
+    ///
+    /// Resolves the session's entities from the `contributed_to` records
+    /// ingestion left behind (falling back to the entities the session
+    /// authored), then records the outcome and moves their utility scores.
+    /// The report says which entities moved and where they landed.
+    pub async fn record_session_outcome(
+        &self,
+        session_id: &str,
+        outcome: utility::OutcomeKind,
+    ) -> Result<utility::FeedbackReport, GraphError> {
+        let session = utility::session_entities(&self.db, session_id).await?;
+        if session.is_empty() {
+            return Ok(utility::FeedbackReport::default());
+        }
+
+        utility::record_outcome_feedback(
+            &self.db,
+            session_id,
+            outcome,
+            &session.retrieved,
+            Some(&session.used),
+        )
+        .await
+    }
+
+    /// Record that a session touched these entities, without judging it.
+    pub async fn record_session_use(
+        &self,
+        session_id: &str,
+        entity_ids: &[String],
+    ) -> Result<u32, GraphError> {
+        utility::record_session_use(&self.db, session_id, entity_ids).await
+    }
+
     // --- Garbage Collection ---
 
     /// Run garbage collection with the given config.

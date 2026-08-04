@@ -30,6 +30,7 @@ use crate::graph::error::GraphError;
 use crate::graph::types::{
     EntityType, NewEntity, NewRelationship, PipelineDocuments, QueryOptions, SearchOptions,
 };
+use crate::graph::utility::OutcomeKind;
 use crate::graph::{GraphMemory, IngestContext, Provenance};
 use crate::serve_security::{
     append_private_file, check_peer_uid, current_uid, unlink_socket, PRIVATE_FILE_MODE,
@@ -82,6 +83,8 @@ pub enum Request {
     IngestArchive(IngestArchiveArgs),
     /// Sync the pipeline documents into the graph (no LLM extraction).
     SyncPipeline(SyncPipelineArgs),
+    /// Apply an outcome to the entities a session touched.
+    Feedback(FeedbackArgs),
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -101,6 +104,7 @@ impl Request {
             Request::Relate(_) => "relate",
             Request::IngestArchive(_) => "ingest_archive",
             Request::SyncPipeline(_) => "sync_pipeline",
+            Request::Feedback(_) => "feedback",
             Request::Shutdown => "shutdown",
         }
     }
@@ -122,6 +126,8 @@ impl Request {
             | Request::Traverse(_)
             // Pipeline sync diffs documents against the graph.
             | Request::SyncPipeline(_)
+            // Outcome records replace per (entity, session) — reruns correct.
+            | Request::Feedback(_)
             | Request::Shutdown => true,
             Request::AddEntity(_) | Request::Relate(_) | Request::IngestArchive(_) => false,
         }
@@ -203,6 +209,12 @@ pub struct IngestArchiveArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncPipelineArgs {
     pub docs: PipelineDocuments,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackArgs {
+    pub session_id: String,
+    pub outcome: OutcomeKind,
 }
 
 /// A daemon response. Wire form is `{"ok": true, "data": ...}` or
@@ -418,6 +430,11 @@ async fn execute_graph(
         Request::SyncPipeline(args) => {
             serde_json::to_value(graph.sync_pipeline(&args.docs).await?)?
         }
+        Request::Feedback(args) => serde_json::to_value(
+            graph
+                .record_session_outcome(&args.session_id, args.outcome)
+                .await?,
+        )?,
     };
     Ok(Some(data))
 }
@@ -1077,6 +1094,10 @@ mod tests {
                     ..PipelineDocuments::default()
                 },
             }),
+            Request::Feedback(FeedbackArgs {
+                session_id: "s1".into(),
+                outcome: OutcomeKind::Success,
+            }),
             Request::Shutdown,
         ];
 
@@ -1104,6 +1125,19 @@ mod tests {
                 provenance: None,
             })
         );
+    }
+
+    #[test]
+    fn feedback_is_a_hot_op_with_a_snake_case_outcome() {
+        let request = Request::Feedback(FeedbackArgs {
+            session_id: "conversation-042".into(),
+            outcome: OutcomeKind::Failed,
+        });
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["op"], "feedback");
+        assert_eq!(json["args"]["session_id"], "conversation-042");
+        assert_eq!(json["args"]["outcome"], "failed");
+        assert_eq!(request.op_name(), "feedback");
     }
 
     #[test]

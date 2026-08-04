@@ -188,7 +188,7 @@ pub async fn search_episodes(
 
     let rows: Vec<EpisodeWithDistance> = super::deserialize_take(&mut response, 0)?;
 
-    let results = rows
+    let results: Vec<EpisodeSearchResult> = rows
         .into_iter()
         .map(|row| {
             let similarity = 1.0 - row.distance;
@@ -199,6 +199,11 @@ pub async fn search_episodes(
             }
         })
         .collect();
+
+    // Retrieval is the signal episode GC reads: an episode that has been
+    // returned to someone is not spent, however old it is.
+    let ids: Vec<String> = results.iter().map(|r| r.episode.id_string()).collect();
+    super::crud::increment_episode_access_counts(db, &ids).await?;
 
     Ok(results)
 }

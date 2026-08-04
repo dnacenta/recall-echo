@@ -473,6 +473,33 @@ pub async fn get_episodes_by_session(
     deserialize_take(&mut response, 0)
 }
 
+/// Delete a single episode by its record ID.
+pub async fn delete_episode(db: &Surreal<Db>, id: &str) -> Result<(), GraphError> {
+    db.query("DELETE FROM type::record($id)")
+        .bind(("id", id.to_string()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// Batch increment episode retrieval counts.
+///
+/// Coalesces the absent case: episodes written before the counter existed
+/// read as NONE, and `NONE + 1` is not a count.
+pub async fn increment_episode_access_counts(
+    db: &Surreal<Db>,
+    ids: &[String],
+) -> Result<(), GraphError> {
+    for id in ids {
+        let _ = db
+            .query("UPDATE type::record($id) SET access_count = (access_count ?? 0) + 1")
+            .bind(("id", id.clone()))
+            .await;
+    }
+
+    Ok(())
+}
+
 /// Mark all episodes with a given log_number as extracted.
 pub async fn mark_episodes_extracted(db: &Surreal<Db>, log_number: u32) -> Result<(), GraphError> {
     db.query("UPDATE episode SET extracted = true WHERE log_number = $ln")

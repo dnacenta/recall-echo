@@ -1,6 +1,19 @@
 //! Shared utility functions for the graph subsystem.
 
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
+
+/// Read a counter that a record may predate.
+///
+/// SurrealDB renders a field an older record never had as absent under
+/// `SELECT *` and as `null` under a projection; both mean the same thing here,
+/// and both mean zero.
+pub fn count_or_zero<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
+}
 
 /// Strip markdown code fencing (```json ... ```) from LLM responses.
 #[must_use]

@@ -1,16 +1,25 @@
 //! Garbage collection for the knowledge graph.
 //!
-//! Four-phase sweep: stale relationships → dead relationships → orphaned entities → delete.
-//! Dry-run by default. Pipeline-linked entities are protected.
+//! Sweep order: stale relationships → dead relationships → orphaned entities →
+//! spent episodes → delete. Dry-run by default. Pipeline-linked entities are
+//! protected, and so is anything a surviving record cites as its source.
+
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 
-use super::confidence;
+use super::confidence::{self, Provenance};
 use super::crud;
 use super::error::GraphError;
 use super::store::Db;
 use super::types::{Entity, Relationship};
+
+/// Default age, in days, before a never-retrieved episode may be collected.
+///
+/// Two confidence half-lives: an episode nothing has read in half a year, and
+/// which no surviving entity or edge cites, is storage rather than memory.
+pub const DEFAULT_EPISODE_MAX_AGE_DAYS: u64 = 180;
 
 /// Configuration for garbage collection thresholds.
 #[derive(Debug, Clone)]
@@ -23,6 +32,11 @@ pub struct GcConfig {
     pub dead_confidence: f64,
     /// Minimum age in days for dead relationship pruning.
     pub dead_min_age_days: u64,
+    /// If true, also sweep episodes. Off by default: the relationship sweep
+    /// predates episode collection and must keep behaving as it did.
+    pub collect_episodes: bool,
+    /// Days since an episode's timestamp before it may be collected.
+    pub episode_max_age_days: u64,
     /// If true, only report — don't delete anything.
     pub dry_run: bool,
     /// If true, never GC entities linked to pipeline documents.
@@ -36,6 +50,8 @@ impl Default for GcConfig {
             stale_confidence: 0.5,
             dead_confidence: 0.2,
             dead_min_age_days: 14,
+            collect_episodes: false,
+            episode_max_age_days: DEFAULT_EPISODE_MAX_AGE_DAYS,
             dry_run: true,
             protect_pipeline: true,
         }
@@ -57,6 +73,7 @@ pub enum GcActionKind {
     StaleRelationship,
     DeadRelationship,
     OrphanedEntity,
+    SpentEpisode,
 }
 
 impl std::fmt::Display for GcActionKind {
@@ -65,6 +82,7 @@ impl std::fmt::Display for GcActionKind {
             Self::StaleRelationship => write!(f, "stale_relationship"),
             Self::DeadRelationship => write!(f, "dead_relationship"),
             Self::OrphanedEntity => write!(f, "orphaned_entity"),
+            Self::SpentEpisode => write!(f, "spent_episode"),
         }
     }
 }
@@ -74,9 +92,11 @@ impl std::fmt::Display for GcActionKind {
 pub struct GcReport {
     pub entities_scanned: u64,
     pub relationships_scanned: u64,
+    pub episodes_scanned: u64,
     pub stale_relationships: u64,
     pub dead_relationships: u64,
     pub orphaned_entities: u64,
+    pub spent_episodes: u64,
     pub total_removed: u64,
     pub dry_run: bool,
     pub actions: Vec<GcAction>,
@@ -112,7 +132,15 @@ pub async fn run_gc(db: &Surreal<Db>, config: &GcConfig) -> Result<GcReport, Gra
     let orphan_ids =
         phase_orphaned_entities(db, &all_entities, config, &rel_ids_to_delete, &mut report).await?;
 
-    // Phase 4: Execute deletions
+    // Phase 4: Spent episodes (must account for everything above being removed:
+    // an episode is evidence only for records that survive the sweep)
+    let pending = Pending {
+        relationships: &rel_ids_to_delete,
+        entities: &orphan_ids,
+    };
+    let episode_ids = phase_spent_episodes(db, config, &now, &pending, &mut report).await?;
+
+    // Phase 5: Execute deletions
     if !config.dry_run {
         for rel_id in &rel_ids_to_delete {
             if let Err(e) = crud::delete_relationship(db, rel_id).await {
@@ -133,11 +161,29 @@ pub async fn run_gc(db: &Surreal<Db>, config: &GcConfig) -> Result<GcReport, Gra
                 report.total_removed += 1;
             }
         }
+
+        for episode_id in &episode_ids {
+            if let Err(e) = crud::delete_episode(db, episode_id).await {
+                report
+                    .errors
+                    .push(format!("Failed to delete episode {episode_id}: {e}"));
+            } else {
+                report.total_removed += 1;
+            }
+        }
     } else {
-        report.total_removed = rel_ids_to_delete.len() as u64 + orphan_ids.len() as u64;
+        report.total_removed =
+            (rel_ids_to_delete.len() + orphan_ids.len() + episode_ids.len()) as u64;
     }
 
     Ok(report)
+}
+
+/// Records this sweep has already decided to remove. Episode collection reads
+/// it so that "cited by a surviving record" means what it says.
+struct Pending<'a> {
+    relationships: &'a [String],
+    entities: &'a [String],
 }
 
 /// Phase 1: Find relationships older than stale_days with effective confidence below stale_confidence.
@@ -369,6 +415,163 @@ async fn count_pending_deletions_for_entity(
     Ok(count as u64)
 }
 
+// ── Episodes ─────────────────────────────────────────────────────────
+//
+// Episodes are the raw text a session left behind. The graph does not link
+// them to entities or edges directly; the one linkage the schema has is by
+// session: entities and relationships extracted from a session carry its id
+// in `source`. So "evidence for a surviving record" is exactly "some record
+// that survives this sweep cites my session as its source", and an episode is
+// collectable only when it is old, never retrieved, self-authored, and cited
+// by nothing.
+
+/// The scan projection for an episode: everything the sweep judges on, and
+/// nothing it does not — no content, no embedding.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct EpisodeRow {
+    id: serde_json::Value,
+    session_id: String,
+    timestamp: serde_json::Value,
+    #[serde(default)]
+    log_number: Option<i64>,
+    #[serde(default)]
+    provenance: Option<String>,
+    #[serde(default, deserialize_with = "super::util::count_or_zero")]
+    access_count: i64,
+}
+
+impl EpisodeRow {
+    fn id_string(&self) -> String {
+        value_to_record_id(&self.id)
+    }
+
+    /// Who authored this episode; absent and unrecognised resolve to `self`.
+    fn provenance(&self) -> Provenance {
+        Provenance::from_stored(self.provenance.as_deref())
+    }
+
+    /// How this episode reads in a GC report.
+    fn label(&self) -> String {
+        match self.log_number {
+            Some(n) => format!("{} (log {n:03})", self.session_id),
+            None => self.session_id.clone(),
+        }
+    }
+}
+
+/// Phase 4: find episodes nothing needs any more.
+async fn phase_spent_episodes(
+    db: &Surreal<Db>,
+    config: &GcConfig,
+    now: &DateTime<Utc>,
+    pending: &Pending<'_>,
+    report: &mut GcReport,
+) -> Result<Vec<String>, GraphError> {
+    if !config.collect_episodes {
+        return Ok(Vec::new());
+    }
+
+    let episodes = load_episode_rows(db).await?;
+    report.episodes_scanned = episodes.len() as u64;
+
+    let cited = cited_session_ids(db, pending).await?;
+    let mut spent_ids = Vec::new();
+
+    for episode in &episodes {
+        let Some(reason) = episode_prune_reason(episode, &cited, config, now) else {
+            continue;
+        };
+
+        report.actions.push(GcAction {
+            target_id: episode.id_string(),
+            target_name: episode.label(),
+            kind: GcActionKind::SpentEpisode,
+            reason,
+        });
+        spent_ids.push(episode.id_string());
+        report.spent_episodes += 1;
+    }
+
+    Ok(spent_ids)
+}
+
+/// Why this episode is collectable, or `None` if it is not.
+///
+/// All four conditions must hold, and the order is cheapest-first:
+/// never retrieved, self-authored, cited by no surviving record, older than
+/// the configured age. An unparseable timestamp keeps the episode.
+fn episode_prune_reason(
+    episode: &EpisodeRow,
+    cited_sessions: &HashSet<String>,
+    config: &GcConfig,
+    now: &DateTime<Utc>,
+) -> Option<String> {
+    if episode.access_count > 0 {
+        return None;
+    }
+    if episode.provenance() != Provenance::SelfGenerated {
+        return None;
+    }
+    if cited_sessions.contains(&episode.session_id) {
+        return None;
+    }
+
+    let age_days = (*now - parse_datetime(&episode.timestamp)?).num_days();
+    if age_days < config.episode_max_age_days as i64 {
+        return None;
+    }
+
+    Some(format!(
+        "age {age_days} days > {}, never retrieved, provenance self, session {} cited by nothing",
+        config.episode_max_age_days, episode.session_id
+    ))
+}
+
+/// Load every episode's judgeable fields.
+async fn load_episode_rows(db: &Surreal<Db>) -> Result<Vec<EpisodeRow>, GraphError> {
+    let mut response = db
+        .query(
+            "SELECT id, session_id, timestamp, log_number, provenance, access_count FROM episode",
+        )
+        .await?;
+
+    super::deserialize_take(&mut response, 0)
+}
+
+/// Session ids cited as `source` by records that survive this sweep.
+async fn cited_session_ids(
+    db: &Surreal<Db>,
+    pending: &Pending<'_>,
+) -> Result<HashSet<String>, GraphError> {
+    #[derive(serde::Deserialize)]
+    struct SourceRow {
+        id: serde_json::Value,
+        source: Option<String>,
+    }
+
+    let mut cited = HashSet::new();
+
+    for (table, doomed) in [
+        ("relates_to", pending.relationships),
+        ("entity", pending.entities),
+    ] {
+        let query = format!("SELECT id, source FROM {table} WHERE source IS NOT NONE");
+        let mut response = db.query(&query).await?;
+        let rows: Vec<SourceRow> = super::deserialize_take(&mut response, 0)?;
+
+        for row in rows {
+            if doomed.contains(&value_to_record_id(&row.id)) {
+                continue;
+            }
+            if let Some(source) = row.source {
+                cited.insert(source);
+            }
+        }
+    }
+
+    Ok(cited)
+}
+
 /// Check if an entity is linked to a pipeline document.
 fn is_pipeline_entity(entity: &Entity) -> bool {
     // Check source field
@@ -394,6 +597,14 @@ use super::util::parse_datetime;
 fn value_to_short_id(val: &serde_json::Value) -> String {
     match val {
         serde_json::Value::String(s) => s.split(':').next_back().unwrap_or(s).to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Render a record ID value whole (e.g. "entity:abc"), as deletion needs it.
+fn value_to_record_id(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
 }
@@ -760,6 +971,169 @@ mod tests {
             "dead_relationship"
         );
         assert_eq!(GcActionKind::OrphanedEntity.to_string(), "orphaned_entity");
+        assert_eq!(GcActionKind::SpentEpisode.to_string(), "spent_episode");
+    }
+
+    // ── Episode collection ───────────────────────────────────────────
+
+    /// An episode as old as `age_days`, never retrieved, self-authored — the
+    /// shape that is collectable unless a test says otherwise.
+    fn spent_episode(age_days: i64) -> EpisodeRow {
+        EpisodeRow {
+            id: serde_json::Value::String("episode:old".to_string()),
+            session_id: "session-1".to_string(),
+            timestamp: serde_json::Value::String(
+                (Utc::now() - chrono::Duration::days(age_days)).to_rfc3339(),
+            ),
+            log_number: Some(7),
+            provenance: Some("self".to_string()),
+            access_count: 0,
+        }
+    }
+
+    fn cited(sessions: &[&str]) -> HashSet<String> {
+        sessions.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn old_unread_self_authored_episode_is_collectable() {
+        let reason = episode_prune_reason(
+            &spent_episode(200),
+            &HashSet::new(),
+            &GcConfig::default(),
+            &Utc::now(),
+        );
+        let reason = reason.expect("200-day-old orphan episode should be a candidate");
+        assert!(reason.contains("never retrieved"), "{reason}");
+        assert!(reason.contains("session session-1"), "{reason}");
+    }
+
+    #[test]
+    fn young_episode_survives() {
+        assert!(episode_prune_reason(
+            &spent_episode(179),
+            &HashSet::new(),
+            &GcConfig::default(),
+            &Utc::now(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn retrieved_episode_survives_any_age() {
+        let mut episode = spent_episode(3650);
+        episode.access_count = 1;
+
+        assert!(
+            episode_prune_reason(&episode, &HashSet::new(), &GcConfig::default(), &Utc::now())
+                .is_none(),
+            "an episode retrieval has returned is not spent"
+        );
+    }
+
+    #[test]
+    fn non_self_authored_episodes_survive_any_age() {
+        // The human's words and ingested documents are not the agent's to
+        // discard: they are the only evidence in the store that is not the
+        // agent restating itself.
+        for class in ["user", "external"] {
+            let mut episode = spent_episode(3650);
+            episode.provenance = Some(class.to_string());
+
+            assert!(
+                episode_prune_reason(&episode, &HashSet::new(), &GcConfig::default(), &Utc::now())
+                    .is_none(),
+                "{class}-authored episodes must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_episodes_without_provenance_are_collectable() {
+        // AC7's conservative default cuts the other way here: unlabelled text
+        // reads as self-authored, and self-authored text is collectable.
+        let mut episode = spent_episode(200);
+        episode.provenance = None;
+
+        assert!(
+            episode_prune_reason(&episode, &HashSet::new(), &GcConfig::default(), &Utc::now())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn episode_cited_as_evidence_survives_any_age() {
+        let episode = spent_episode(3650);
+
+        assert!(
+            episode_prune_reason(
+                &episode,
+                &cited(&["session-1"]),
+                &GcConfig::default(),
+                &Utc::now()
+            )
+            .is_none(),
+            "an episode a surviving record cites is evidence, not garbage"
+        );
+        assert!(
+            episode_prune_reason(
+                &episode,
+                &cited(&["some-other-session"]),
+                &GcConfig::default(),
+                &Utc::now()
+            )
+            .is_some(),
+            "another session's citation protects nothing here"
+        );
+    }
+
+    #[test]
+    fn unparseable_timestamp_keeps_the_episode() {
+        let mut episode = spent_episode(200);
+        episode.timestamp = serde_json::Value::String("not-a-date".to_string());
+
+        assert!(
+            episode_prune_reason(&episode, &HashSet::new(), &GcConfig::default(), &Utc::now())
+                .is_none(),
+            "an episode whose age cannot be established is never collected"
+        );
+    }
+
+    #[test]
+    fn episode_age_threshold_is_configurable() {
+        let config = GcConfig {
+            episode_max_age_days: 30,
+            ..Default::default()
+        };
+
+        assert!(
+            episode_prune_reason(&spent_episode(31), &HashSet::new(), &config, &Utc::now())
+                .is_some()
+        );
+        assert!(
+            episode_prune_reason(&spent_episode(29), &HashSet::new(), &config, &Utc::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn episode_labels_carry_the_log_number_when_there_is_one() {
+        assert_eq!(spent_episode(1).label(), "session-1 (log 007)");
+
+        let mut unnumbered = spent_episode(1);
+        unnumbered.log_number = None;
+        assert_eq!(unnumbered.label(), "session-1");
+    }
+
+    #[test]
+    fn episode_collection_is_off_by_default() {
+        let config = GcConfig::default();
+        assert!(!config.collect_episodes, "episodes are opt-in");
+        assert_eq!(config.episode_max_age_days, DEFAULT_EPISODE_MAX_AGE_DAYS);
+        assert!(
+            config.dry_run,
+            "and the sweep still only reports by default"
+        );
     }
 
     #[test]

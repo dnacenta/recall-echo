@@ -305,7 +305,7 @@ enum GraphCommands {
         #[command(subcommand)]
         command: PipelineCommands,
     },
-    /// Garbage collection — prune stale/dead relationships and orphaned entities
+    /// Garbage collection — prune stale/dead relationships, orphaned entities, spent episodes
     Gc {
         /// Actually delete (default is dry-run)
         #[arg(long)]
@@ -322,9 +322,23 @@ enum GraphCommands {
         /// Minimum age in days for dead relationship pruning (default: 14)
         #[arg(long, default_value = "14")]
         dead_min_age_days: u64,
+        /// Also sweep episodes: old, never-retrieved, self-authored, cited by nothing
+        #[arg(long)]
+        episodes: bool,
+        /// Days before a never-retrieved episode may be collected (default: 180)
+        #[arg(long, default_value = "180")]
+        episode_max_age_days: u64,
         /// Only show graph health stats, don't compute GC candidates
         #[arg(long)]
         stats_only: bool,
+    },
+    /// Apply a session outcome to the entities it touched (utility feedback)
+    Feedback {
+        /// Session identifier the archive was ingested under
+        session_id: String,
+        /// How the session went: success, partial, failed
+        #[arg(long, default_value = "success")]
+        outcome: String,
     },
     /// Sync vigil-pulse signals and outcomes into the graph
     VigilSync {
@@ -599,19 +613,26 @@ fn main() {
                                 stale_confidence,
                                 dead_confidence,
                                 dead_min_age_days,
+                                episodes,
+                                episode_max_age_days,
                                 stats_only,
                             } => {
-                                graph_cli::gc(
-                                    &memory_dir,
+                                let options = graph_cli::GcOptions {
                                     execute,
                                     stale_days,
                                     stale_confidence,
                                     dead_confidence,
                                     dead_min_age_days,
+                                    episodes,
+                                    episode_max_age_days,
                                     stats_only,
-                                )
-                                .await
+                                };
+                                graph_cli::gc(&memory_dir, &options).await
                             }
+                            GraphCommands::Feedback {
+                                session_id,
+                                outcome,
+                            } => graph_cli::feedback(&memory_dir, &session_id, &outcome).await,
                             GraphCommands::Daemon { command } => match command {
                                 DaemonCommands::Status => {
                                     graph_cli::daemon_status(&memory_dir).await

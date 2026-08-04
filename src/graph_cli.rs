@@ -990,18 +990,62 @@ fn find_conversations_dir(memory_dir: &Path) -> Result<PathBuf, RecallError> {
     ))
 }
 
+/// Thresholds and mode for one `graph gc` invocation.
+///
+/// A struct rather than eight positional arguments: every field is a knob the
+/// CLI exposes, and callers should be able to take the defaults.
+#[derive(Debug, Clone)]
+pub struct GcOptions {
+    /// Actually delete. The default is a dry run.
+    pub execute: bool,
+    pub stale_days: u64,
+    pub stale_confidence: f64,
+    pub dead_confidence: f64,
+    pub dead_min_age_days: u64,
+    /// Also sweep episodes.
+    pub episodes: bool,
+    pub episode_max_age_days: u64,
+    /// Report health only, computing no deletion candidates.
+    pub stats_only: bool,
+}
+
+impl Default for GcOptions {
+    fn default() -> Self {
+        let defaults = crate::graph::gc::GcConfig::default();
+        Self {
+            execute: false,
+            stale_days: defaults.stale_days,
+            stale_confidence: defaults.stale_confidence,
+            dead_confidence: defaults.dead_confidence,
+            dead_min_age_days: defaults.dead_min_age_days,
+            episodes: false,
+            episode_max_age_days: defaults.episode_max_age_days,
+            stats_only: false,
+        }
+    }
+}
+
+impl GcOptions {
+    fn to_config(&self) -> crate::graph::gc::GcConfig {
+        crate::graph::gc::GcConfig {
+            stale_days: self.stale_days,
+            stale_confidence: self.stale_confidence,
+            dead_confidence: self.dead_confidence,
+            dead_min_age_days: self.dead_min_age_days,
+            collect_episodes: self.episodes,
+            episode_max_age_days: self.episode_max_age_days,
+            dry_run: !self.execute,
+            protect_pipeline: true,
+        }
+    }
+}
+
 /// Run garbage collection on the graph.
-#[allow(clippy::too_many_arguments)]
-pub async fn gc(
-    memory_dir: &Path,
-    execute: bool,
-    stale_days: u64,
-    stale_confidence: f64,
-    dead_confidence: f64,
-    dead_min_age_days: u64,
-    stats_only: bool,
-) -> Result<(), RecallError> {
-    use crate::graph::gc::{GcActionKind, GcConfig};
+pub async fn gc(memory_dir: &Path, options: &GcOptions) -> Result<(), RecallError> {
+    use crate::graph::gc::GcActionKind;
+
+    let stats_only = options.stats_only;
+    let config = options.to_config();
 
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
@@ -1033,15 +1077,6 @@ pub async fn gc(
             return Ok(());
         }
 
-        let config = GcConfig {
-            stale_days,
-            stale_confidence,
-            dead_confidence,
-            dead_min_age_days,
-            dry_run: !execute,
-            protect_pipeline: true,
-        };
-
         let report = gm.run_gc(&config).await?;
 
         // Header
@@ -1056,11 +1091,17 @@ pub async fn gc(
         println!("\n{BOLD}Scan{RESET}");
         println!("  Entities scanned:      {}", report.entities_scanned);
         println!("  Relationships scanned: {}", report.relationships_scanned);
+        if config.collect_episodes {
+            println!("  Episodes scanned:      {}", report.episodes_scanned);
+        }
 
         println!("\n{BOLD}Results{RESET}");
         println!("  Stale relationships:   {}", report.stale_relationships);
         println!("  Dead relationships:    {}", report.dead_relationships);
         println!("  Orphaned entities:     {}", report.orphaned_entities);
+        if config.collect_episodes {
+            println!("  Spent episodes:        {}", report.spent_episodes);
+        }
 
         let verb = if report.dry_run {
             "would remove"
@@ -1077,6 +1118,7 @@ pub async fn gc(
                     GcActionKind::StaleRelationship => format!("{YELLOW}⚠{RESET}"),
                     GcActionKind::DeadRelationship => format!("{YELLOW}✗{RESET}"),
                     GcActionKind::OrphanedEntity => format!("{CYAN}○{RESET}"),
+                    GcActionKind::SpentEpisode => format!("{CYAN}◌{RESET}"),
                 };
                 println!(
                     "  {icon} [{kind}] {name}",
@@ -1097,6 +1139,58 @@ pub async fn gc(
         Ok(())
     })
     .await
+}
+
+/// Apply an outcome to every entity a session touched.
+///
+/// A hot operation: it goes through the daemon like search and ingest, so it
+/// can be run while a session is still using the store.
+pub async fn feedback(
+    memory_dir: &Path,
+    session_id: &str,
+    outcome: &str,
+) -> Result<(), RecallError> {
+    use crate::graph::utility::OutcomeKind;
+    use crate::serve::FeedbackArgs;
+
+    let outcome: OutcomeKind = outcome.parse().map_err(RecallError::Other)?;
+
+    let request = Request::Feedback(FeedbackArgs {
+        session_id: session_id.to_string(),
+        outcome,
+    });
+    let report: crate::graph::utility::FeedbackReport =
+        serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
+
+    if report.entities_updated == 0 && report.utilities.is_empty() {
+        println!(
+            "{YELLOW}No entities recorded for session {session_id}.{RESET} \
+             {DIM}Nothing to apply the outcome to.{RESET}"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{GREEN}✓{RESET} Session {BOLD}{session_id}{RESET} recorded as {BOLD}{outcome}{RESET} \
+         — {} entities updated",
+        report.entities_updated
+    );
+
+    for entity in &report.utilities {
+        println!(
+            "  {DIM}{}{RESET} utility {CYAN}{:.3}{RESET}",
+            entity.entity_id, entity.utility_score
+        );
+    }
+
+    if !report.errors.is_empty() {
+        println!("\n{YELLOW}Warnings:{RESET}");
+        for err in &report.errors {
+            println!("  {DIM}{err}{RESET}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Show relationship decay report — lists all relationships with their stored vs effective confidence.

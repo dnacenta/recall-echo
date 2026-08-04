@@ -67,13 +67,43 @@ const UNUSED_ALPHA: f64 = 0.05;
 /// Reward override for "retrieved but not used" — slight negative signal.
 const UNUSED_REWARD: f64 = 0.3;
 
+/// One entity's utility score after an outcome was applied to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityUtility {
+    pub entity_id: String,
+    pub utility_score: f64,
+}
+
 /// Report from a feedback recording operation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeedbackReport {
     pub outcome_entity_id: String,
     pub edges_created: u32,
     pub entities_updated: u32,
+    /// Post-update utility of every entity the outcome reached — the
+    /// observable half of the feedback loop.
+    #[serde(default)]
+    pub utilities: Vec<EntityUtility>,
     pub errors: Vec<String>,
+}
+
+/// The entities one session is known to have touched.
+///
+/// `retrieved` is everything linked to the session; `used` is the subset the
+/// session's own records say it actually leaned on. Entities in `retrieved`
+/// but not `used` get the muted "retrieved and ignored" signal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionEntities {
+    pub retrieved: Vec<String>,
+    pub used: Vec<String>,
+}
+
+impl SessionEntities {
+    /// True when the session has no entities to apply an outcome to.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.retrieved.is_empty()
+    }
 }
 
 /// Record outcome feedback: link retrieved entities to an outcome and update utility scores.
@@ -90,7 +120,8 @@ pub async fn record_outcome_feedback(
         return Ok(report);
     }
 
-    let outcome_id = create_outcome_entity(db, session_id, outcome).await?;
+    let result = ContributionResult::Resolved(outcome);
+    let outcome_id = outcome_entity_for_session(db, session_id, result).await?;
     report.outcome_entity_id = outcome_id.clone();
 
     let reward = outcome.reward();
@@ -119,21 +150,22 @@ pub async fn record_outcome_feedback(
                     db,
                     entity_id,
                     outcome_id_ref,
-                    outcome,
+                    result,
                     was_used,
                     session_id,
                 )
                 .await;
                 let utility_result =
                     update_utility_score(db, entity_id, effective_reward, alpha).await;
-                (entity_id, edge_result, utility_result)
+                let score = get_utility_score(db, entity_id).await;
+                (entity_id, edge_result, utility_result, score)
             }
         })
         .collect();
 
     let results = futures::future::join_all(futures).await;
 
-    for (entity_id, edge_result, utility_result) in results {
+    for (entity_id, edge_result, utility_result, score) in results {
         match edge_result {
             Ok(()) => report.edges_created += 1,
             Err(e) => {
@@ -150,17 +182,224 @@ pub async fn record_outcome_feedback(
                     .push(format!("utility update {entity_id}: {e}"));
             }
         }
+        if let Ok(utility_score) = score {
+            report.utilities.push(EntityUtility {
+                entity_id: entity_id.clone(),
+                utility_score,
+            });
+        }
     }
 
     Ok(report)
 }
 
+/// Record that a session touched these entities, without judging the outcome.
+///
+/// The passive half of the feedback loop: ingestion knows which entities a
+/// session produced or reinforced, and says so here. A later
+/// `graph feedback <session>` supplies the outcome and this is what tells it
+/// which entities the outcome applies to.
+///
+/// Idempotent per session: re-ingesting a session rewrites its records rather
+/// than accumulating duplicates. Utility scores are untouched — an
+/// unadjudicated session is not evidence of usefulness.
+pub async fn record_session_use(
+    db: &Surreal<Db>,
+    session_id: &str,
+    entity_ids: &[String],
+) -> Result<u32, GraphError> {
+    if entity_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let outcome_id =
+        outcome_entity_for_session(db, session_id, ContributionResult::Pending).await?;
+
+    let mut recorded = 0;
+    for entity_id in entity_ids {
+        create_contribution_edge(
+            db,
+            entity_id,
+            &outcome_id,
+            ContributionResult::Pending,
+            true,
+            session_id,
+        )
+        .await?;
+        recorded += 1;
+    }
+
+    Ok(recorded)
+}
+
+/// The entities a session touched, as its `contributed_to` records tell it.
+///
+/// Falls back to the entities the session authored (`source = session_id`)
+/// when no records exist — the shape of a store whose sessions were ingested
+/// before passive recording, where authorship is the only session link.
+pub async fn session_entities(
+    db: &Surreal<Db>,
+    session_id: &str,
+) -> Result<SessionEntities, GraphError> {
+    #[derive(Deserialize)]
+    struct EdgeRow {
+        #[serde(rename = "in")]
+        entity: serde_json::Value,
+        #[serde(default = "default_was_used")]
+        was_used: bool,
+    }
+
+    fn default_was_used() -> bool {
+        true
+    }
+
+    let mut response = db
+        .query("SELECT in, was_used FROM contributed_to WHERE session_id = $sid")
+        .bind(("sid", session_id.to_string()))
+        .await?;
+
+    let rows: Vec<EdgeRow> = super::deserialize_take(&mut response, 0)?;
+    if !rows.is_empty() {
+        let mut session = SessionEntities::default();
+        for row in rows {
+            let id = record_id_string(&row.entity);
+            if session.retrieved.contains(&id) {
+                continue;
+            }
+            if row.was_used {
+                session.used.push(id.clone());
+            }
+            session.retrieved.push(id);
+        }
+        return Ok(session);
+    }
+
+    let mut response = db
+        .query("SELECT id FROM entity WHERE source = $sid")
+        .bind(("sid", session_id.to_string()))
+        .await?;
+
+    #[derive(Deserialize)]
+    struct IdRow {
+        id: serde_json::Value,
+    }
+
+    let rows: Vec<IdRow> = super::deserialize_take(&mut response, 0)?;
+    let retrieved: Vec<String> = rows.iter().map(|r| record_id_string(&r.id)).collect();
+
+    Ok(SessionEntities {
+        used: retrieved.clone(),
+        retrieved,
+    })
+}
+
+/// Render a record ID value as `table:id`.
+fn record_id_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// What a contribution record says about its session so far.
+///
+/// A session is linked to its entities the moment ingestion knows about them,
+/// which is before anyone has judged how it went. `Pending` is that state; it
+/// carries no reward and never moves a utility score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ContributionResult {
+    Pending,
+    Resolved(OutcomeKind),
+}
+
+impl std::fmt::Display for ContributionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Resolved(outcome) => write!(f, "{outcome}"),
+        }
+    }
+}
+
+/// The session's outcome entity, created on first use and reused after.
+///
+/// One outcome record per session, whatever order the passive linkage and the
+/// adjudicated outcome arrive in: re-running feedback for a session corrects
+/// its record rather than growing a second one.
+async fn outcome_entity_for_session(
+    db: &Surreal<Db>,
+    session_id: &str,
+    result: ContributionResult,
+) -> Result<String, GraphError> {
+    match find_outcome_entity(db, session_id).await? {
+        Some(id) => {
+            update_outcome_entity(db, &id, session_id, result).await?;
+            Ok(id)
+        }
+        None => create_outcome_entity(db, session_id, result).await,
+    }
+}
+
+async fn find_outcome_entity(
+    db: &Surreal<Db>,
+    session_id: &str,
+) -> Result<Option<String>, GraphError> {
+    #[derive(Deserialize)]
+    struct IdRow {
+        id: serde_json::Value,
+    }
+
+    let mut response = db
+        .query(
+            r#"SELECT id FROM entity
+               WHERE entity_type = "outcome" AND attributes.session_id = $sid
+               LIMIT 1"#,
+        )
+        .bind(("sid", session_id.to_string()))
+        .await?;
+
+    let rows: Vec<IdRow> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows.first().map(|r| record_id_string(&r.id)))
+}
+
+async fn update_outcome_entity(
+    db: &Surreal<Db>,
+    outcome_id: &str,
+    session_id: &str,
+    result: ContributionResult,
+) -> Result<(), GraphError> {
+    db.query(
+        r#"UPDATE type::record($id) SET
+               abstract = $abstract,
+               attributes = $attributes,
+               updated_at = time::now()"#,
+    )
+    .bind(("id", outcome_id.to_string()))
+    .bind(("abstract", outcome_abstract(session_id, result)))
+    .bind(("attributes", outcome_attributes(session_id, result)))
+    .await?
+    .check()?;
+
+    Ok(())
+}
+
+fn outcome_abstract(session_id: &str, result: ContributionResult) -> String {
+    format!("Session {session_id} outcome: {result}")
+}
+
+fn outcome_attributes(session_id: &str, result: ContributionResult) -> serde_json::Value {
+    serde_json::json!({
+        "outcome_result": result.to_string(),
+        "session_id": session_id,
+    })
+}
+
 async fn create_outcome_entity(
     db: &Surreal<Db>,
     session_id: &str,
-    outcome: OutcomeKind,
+    outcome: ContributionResult,
 ) -> Result<String, GraphError> {
-    let abstract_text = format!("Session {session_id} outcome: {outcome}");
+    let abstract_text = outcome_abstract(session_id, outcome);
 
     let mut response = db
         .query(
@@ -184,13 +423,7 @@ async fn create_outcome_entity(
         )
         .bind(("name", format!("outcome-{session_id}")))
         .bind(("abstract", abstract_text))
-        .bind((
-            "attributes",
-            serde_json::json!({
-                "outcome_result": outcome.to_string(),
-                "session_id": session_id,
-            }),
-        ))
+        .bind(("attributes", outcome_attributes(session_id, outcome)))
         .bind(("utility", DEFAULT_UTILITY))
         .bind(("source", format!("caliber:{session_id}")))
         .await?;
@@ -205,11 +438,17 @@ async fn create_outcome_entity(
     Ok(entity.id_string())
 }
 
+/// Write one entity's contribution record for a session, replacing any
+/// earlier record for the same pair.
+///
+/// One record per entity per session: the passive "this session touched it"
+/// marker and the adjudicated outcome are the same fact learned twice, not
+/// two contributions.
 async fn create_contribution_edge(
     db: &Surreal<Db>,
     entity_id: &str,
     outcome_id: &str,
-    outcome: OutcomeKind,
+    outcome: ContributionResult,
     was_used: bool,
     session_id: &str,
 ) -> Result<(), GraphError> {
@@ -217,6 +456,7 @@ async fn create_contribution_edge(
         r#"
         LET $from = type::record($from_id);
         LET $to = type::record($to_id);
+        DELETE contributed_to WHERE in = $from AND session_id = $session_id;
         RELATE $from -> contributed_to -> $to SET
             outcome_result = $outcome_result,
             was_used = $was_used,
@@ -243,11 +483,12 @@ async fn update_utility_score(
     alpha: f64,
 ) -> Result<(), GraphError> {
     // Inline EMA: new = (1 - alpha) * current + alpha * reward, clamped to [0, 1].
-    // SurrealDB doesn't have math::clamp, so we use nested IF expressions.
+    // SurrealDB has no clamp, so the bounds are an IF chain — one chain, one
+    // `END`, whatever the branch count.
     db.query(
         r#"
         LET $raw = (1.0 - $alpha) * type::record($id).utility_score + $alpha * $reward;
-        LET $clamped = IF $raw < 0.0 THEN 0.0 ELSE IF $raw > 1.0 THEN 1.0 ELSE $raw END END;
+        LET $clamped = IF $raw < 0.0 THEN 0.0 ELSE IF $raw > 1.0 THEN 1.0 ELSE $raw END;
         UPDATE type::record($id) SET
             utility_score = $clamped,
             utility_updates += 1,
@@ -257,7 +498,8 @@ async fn update_utility_score(
     .bind(("id", entity_id.to_string()))
     .bind(("alpha", alpha))
     .bind(("reward", reward))
-    .await?;
+    .await?
+    .check()?;
 
     Ok(())
 }
@@ -351,6 +593,60 @@ mod tests {
             score = (1.0 - USED_ALPHA) * score + USED_ALPHA * 0.0;
         }
         assert!(score < 0.01);
+    }
+
+    #[test]
+    fn pending_contribution_reads_as_unadjudicated() {
+        assert_eq!(ContributionResult::Pending.to_string(), "pending");
+        assert_eq!(
+            ContributionResult::Resolved(OutcomeKind::Success).to_string(),
+            "success"
+        );
+        assert_eq!(
+            outcome_abstract("s1", ContributionResult::Pending),
+            "Session s1 outcome: pending"
+        );
+        assert_eq!(
+            outcome_attributes("s1", ContributionResult::Resolved(OutcomeKind::Failed)),
+            serde_json::json!({"outcome_result": "failed", "session_id": "s1"})
+        );
+    }
+
+    #[test]
+    fn session_with_no_entities_is_empty() {
+        assert!(SessionEntities::default().is_empty());
+        assert!(!SessionEntities {
+            retrieved: vec!["entity:a".into()],
+            used: vec![],
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn record_ids_render_as_table_colon_id() {
+        assert_eq!(
+            record_id_string(&serde_json::json!("entity:abc")),
+            "entity:abc"
+        );
+        assert_eq!(record_id_string(&serde_json::json!(42)), "42");
+    }
+
+    #[test]
+    fn feedback_report_crosses_the_wire() {
+        let report = FeedbackReport {
+            outcome_entity_id: "entity:outcome".into(),
+            edges_created: 2,
+            entities_updated: 2,
+            utilities: vec![EntityUtility {
+                entity_id: "entity:a".into(),
+                utility_score: 0.55,
+            }],
+            errors: vec![],
+        };
+        let json = serde_json::to_value(&report).expect("serialize");
+        let parsed: FeedbackReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed.utilities, report.utilities);
+        assert_eq!(parsed.entities_updated, 2);
     }
 
     #[test]

@@ -191,6 +191,10 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS embedding   ON episode TYPE option<array<float>>;
         DEFINE FIELD IF NOT EXISTS log_number  ON episode TYPE option<int>;
         DEFINE FIELD IF NOT EXISTS extracted  ON episode TYPE bool DEFAULT false;
+        -- How many times retrieval has returned this episode. Absent on
+        -- episodes written before the field existed; read paths resolve that
+        -- to zero, which is also what it means. No backfill, no version bump.
+        DEFINE FIELD IF NOT EXISTS access_count ON episode TYPE option<int>;
         -- Authorship class: 'external' | 'user' | 'self'. `option` with no
         -- default on purpose — an absent value means an episode written
         -- before provenance existed, and reads resolve that to 'self'. No

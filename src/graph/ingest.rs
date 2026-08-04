@@ -11,6 +11,7 @@ use super::error::GraphError;
 use super::extract;
 use super::llm::LlmProvider;
 use super::types::*;
+use super::utility;
 use super::GraphMemory;
 
 /// Maximum number of concurrent LLM calls during extraction and dedup.
@@ -213,11 +214,12 @@ async fn extract_indexed(
 
 /// Shared extraction logic — parallel extraction, sequential dedup.
 ///
-/// Four phases:
+/// Five phases:
 /// 1. Extract all chunks in parallel (up to LLM_CONCURRENCY)
 /// 2. Local pre-dedup: merge same-name entities from different chunks
 /// 3. Dedup sequentially against the DB (each call sees prior results)
 /// 4. Create relationships sequentially (fast, no LLM)
+/// 5. Record which entities the session touched (passive was-used signal)
 async fn process_extraction(
     gm: &GraphMemory,
     chunks: &[String],
@@ -281,10 +283,12 @@ async fn process_extraction(
         match dedup::resolve_entity(gm, llm, candidate, session_id).await {
             Ok(ResolvedEntity::Created(entity)) => {
                 name_map.insert(candidate.name.clone(), entity.name.clone());
+                report.entity_ids.push(entity.id_string());
                 report.entities_created += 1;
             }
             Ok(ResolvedEntity::Merged(entity)) => {
                 name_map.insert(candidate.name.clone(), entity.name.clone());
+                report.entity_ids.push(entity.id_string());
                 report.entities_merged += 1;
             }
             Ok(ResolvedEntity::Skipped) => {
@@ -349,6 +353,15 @@ async fn process_extraction(
                     .push(format!("relationship {from_name} -> {to_name}: {e}"));
             }
         }
+    }
+
+    // Phase 5: link the session to the entities it touched, so a later
+    // outcome knows what it applies to. Bookkeeping, never fatal: a failed
+    // link costs the feedback loop one session, not the ingestion.
+    if let Err(e) = utility::record_session_use(gm.db(), session_id, &report.entity_ids).await {
+        report
+            .errors
+            .push(format!("session use record for {session_id}: {e}"));
     }
 
     Ok(())

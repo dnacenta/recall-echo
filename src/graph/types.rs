@@ -441,6 +441,10 @@ pub struct Episode {
     /// resolves absent and unrecognised values conservatively.
     #[serde(default)]
     pub provenance: Option<String>,
+    /// How many times retrieval has returned this episode. Absent on episodes
+    /// written before the counter existed — which reads as never retrieved.
+    #[serde(default, deserialize_with = "super::util::count_or_zero")]
+    pub access_count: i64,
 }
 
 impl Episode {
@@ -650,6 +654,11 @@ pub struct IngestionReport {
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
     pub estimated_tokens: u64,
+    /// Record IDs of the entities this run created or merged into — the
+    /// entities the session touched, and so the ones a session outcome
+    /// applies to. Empty when the run had no LLM to extract with.
+    #[serde(default)]
+    pub entity_ids: Vec<String>,
 }
 
 #[cfg(test)]
