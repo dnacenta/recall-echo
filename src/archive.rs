@@ -249,7 +249,7 @@ pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
     if result.log_number == 0 {
         return;
     }
-    let rt = match tokio::runtime::Runtime::new() {
+    let rt = match client_runtime() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("recall-echo: graph runtime error: {e}");
@@ -266,14 +266,22 @@ pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
     }
 }
 
-/// Sync pipeline documents into the graph (if auto_sync enabled).
-///
-/// Non-blocking: logs warnings on failure but never fails the caller.
-pub fn pipeline_sync_on_archive(memory_dir: &Path) {
+/// A runtime for a client-side command: a handful of socket round-trips, plus
+/// whatever the daemon does on our behalf. One thread is enough — the worker
+/// pool of a multi-thread runtime exists to be idle here.
+fn client_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+/// The pipeline documents to sync, or `None` when auto-sync is off, no
+/// `docs_dir` is configured, or there is no graph to sync into.
+fn pipeline_docs_to_sync(memory_dir: &Path) -> Option<crate::graph::types::PipelineDocuments> {
     let cfg = config::load_from_dir(memory_dir);
     let pipeline = match cfg.pipeline {
         Some(ref p) if p.auto_sync == Some(true) => p,
-        _ => return,
+        _ => return None,
     };
 
     let docs_dir = match pipeline.docs_dir {
@@ -284,109 +292,52 @@ pub fn pipeline_sync_on_archive(memory_dir: &Path) {
                     "recall-echo: pipeline docs_dir not found: {}",
                     path.display()
                 );
-                return;
+                return None;
             }
             path
         }
         None => {
             eprintln!("recall-echo: pipeline auto_sync enabled but no docs_dir configured");
-            return;
+            return None;
         }
     };
 
-    let graph_dir = memory_dir.join("graph");
-    if !graph_dir.exists() {
-        return;
+    if !memory_dir.join("graph").exists() {
+        return None;
     }
+    Some(read_pipeline_docs(&docs_dir))
+}
 
-    let rt = match tokio::runtime::Runtime::new() {
+/// Sync pipeline documents into the graph (if auto_sync enabled).
+///
+/// Non-blocking: logs warnings on failure but never fails the caller.
+pub fn pipeline_sync_on_archive(memory_dir: &Path) {
+    let Some(docs) = pipeline_docs_to_sync(memory_dir) else {
+        return;
+    };
+    let rt = match client_runtime() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("recall-echo: pipeline sync runtime error: {e}");
             return;
         }
     };
-
-    if let Err(e) = rt.block_on(async {
-        let gm = crate::graph::GraphMemory::open(&graph_dir)
-            .await
-            .map_err(|e| format!("graph open: {e}"))?;
-
-        let docs = crate::graph::types::PipelineDocuments {
-            learning: read_opt_file(&docs_dir, "LEARNING.md"),
-            thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
-            curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
-            reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
-            praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
-        };
-
-        let report = gm.sync_pipeline(&docs).await.map_err(|e| format!("{e}"))?;
-
-        if report.entities_created > 0
-            || report.entities_updated > 0
-            || report.entities_archived > 0
-        {
-            eprintln!(
-                "recall-echo: pipeline synced — +{} created, ~{} updated, -{} archived",
-                report.entities_created, report.entities_updated, report.entities_archived
-            );
-        }
-
-        Ok::<(), String>(())
-    }) {
-        eprintln!("recall-echo: pipeline sync warning: {e}");
-    }
+    report_pipeline_sync(rt.block_on(crate::graph_bridge::sync_pipeline_into_graph(
+        memory_dir, docs,
+    )));
 }
 
 /// Async version of pipeline_sync_on_archive for use in async contexts (pulse-null).
 #[cfg(feature = "pulse-null")]
 async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
-    let cfg = config::load_from_dir(memory_dir);
-    let pipeline = match cfg.pipeline {
-        Some(ref p) if p.auto_sync == Some(true) => p.clone(),
-        _ => return,
-    };
-
-    let docs_dir = match pipeline.docs_dir {
-        Some(ref d) => {
-            let path = std::path::PathBuf::from(shellexpand_path(d));
-            if !path.exists() {
-                eprintln!(
-                    "recall-echo: pipeline docs_dir not found: {}",
-                    path.display()
-                );
-                return;
-            }
-            path
-        }
-        None => {
-            eprintln!("recall-echo: pipeline auto_sync enabled but no docs_dir configured");
-            return;
-        }
-    };
-
-    let graph_dir = memory_dir.join("graph");
-    if !graph_dir.exists() {
+    let Some(docs) = pipeline_docs_to_sync(memory_dir) else {
         return;
-    }
-
-    let gm = match crate::graph::GraphMemory::open(&graph_dir).await {
-        Ok(gm) => gm,
-        Err(e) => {
-            eprintln!("recall-echo: pipeline sync open error: {e}");
-            return;
-        }
     };
+    report_pipeline_sync(crate::graph_bridge::sync_pipeline_into_graph(memory_dir, docs).await);
+}
 
-    let docs = crate::graph::types::PipelineDocuments {
-        learning: read_opt_file(&docs_dir, "LEARNING.md"),
-        thoughts: read_opt_file(&docs_dir, "THOUGHTS.md"),
-        curiosity: read_opt_file(&docs_dir, "CURIOSITY.md"),
-        reflections: read_opt_file(&docs_dir, "REFLECTIONS.md"),
-        praxis: read_opt_file(&docs_dir, "PRAXIS.md"),
-    };
-
-    match gm.sync_pipeline(&docs).await {
+fn report_pipeline_sync(result: Result<crate::graph::types::PipelineSyncReport, RecallError>) {
+    match result {
         Ok(report) => {
             if report.entities_created > 0
                 || report.entities_updated > 0
@@ -399,6 +350,16 @@ async fn pipeline_sync_on_archive_async(memory_dir: &Path) {
             }
         }
         Err(e) => eprintln!("recall-echo: pipeline sync warning: {e}"),
+    }
+}
+
+fn read_pipeline_docs(docs_dir: &Path) -> crate::graph::types::PipelineDocuments {
+    crate::graph::types::PipelineDocuments {
+        learning: read_opt_file(docs_dir, "LEARNING.md"),
+        thoughts: read_opt_file(docs_dir, "THOUGHTS.md"),
+        curiosity: read_opt_file(docs_dir, "CURIOSITY.md"),
+        reflections: read_opt_file(docs_dir, "REFLECTIONS.md"),
+        praxis: read_opt_file(docs_dir, "PRAXIS.md"),
     }
 }
 
@@ -422,7 +383,8 @@ fn shellexpand_path(path: &str) -> String {
 /// Archive a session from a JSONL transcript file.
 ///
 /// Parses JSONL, generates algorithmic summary, archives, and optionally
-/// ingests into the knowledge graph.
+/// ingests into the knowledge graph. Both graph steps are daemon requests, so
+/// the hook pays for one warm store and one embedding-model load, not two.
 pub fn archive_from_jsonl(
     base_dir: &Path,
     session_id: &str,

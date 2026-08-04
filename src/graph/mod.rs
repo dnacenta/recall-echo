@@ -26,10 +26,9 @@ pub mod vigil_sync;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use embed::FastEmbedder;
+use embed::{FastEmbedder, LazyEmbedder};
 use error::GraphError;
 use store::Db;
-#[cfg(feature = "server")]
 pub use store::ServerConfig;
 #[allow(unused_imports)] // Required in scope for SurrealValue derive macro expansion
 use surrealdb::types::SurrealValue;
@@ -60,7 +59,7 @@ pub(crate) fn deserialize_take_opt<T: serde::de::DeserializeOwned>(
 /// The main entry point for graph memory operations.
 pub struct GraphMemory {
     db: Surreal<Db>,
-    embedder: FastEmbedder,
+    embedder: LazyEmbedder,
     path: PathBuf,
     scoring: crate::config::GraphScoringConfig,
 }
@@ -68,12 +67,28 @@ pub struct GraphMemory {
 impl GraphMemory {
     /// Open a graph store at the given path.
     ///
-    /// In embedded mode: opens SurrealKV at `path/surreal/`.
-    /// In server mode: reads `.recall-echo.toml` from the parent directory
-    /// to get connection settings, then connects via WebSocket.
-    /// The `path` is still used for the FastEmbed models cache.
-    #[cfg(feature = "embedded")]
+    /// The backend is chosen at runtime from the `[graph] mode` key of
+    /// `.recall-echo.toml` in the parent directory (memory_dir):
+    /// `embedded` (default) opens SurrealKV at `path/surreal/`; `server`
+    /// connects to a SurrealDB server via the configured URL.
+    /// The `path` is used for the FastEmbed models cache in both modes.
     pub async fn open(path: &Path) -> Result<Self, GraphError> {
+        let memory_dir = path.parent().unwrap_or(path);
+        let config = crate::config::load_from_dir(memory_dir);
+        let mode = config
+            .graph
+            .as_ref()
+            .map(|g| g.mode.clone())
+            .unwrap_or_else(|| "embedded".to_string());
+
+        match mode.as_str() {
+            "server" => Self::open_server(path).await,
+            _ => Self::open_embedded(path).await,
+        }
+    }
+
+    /// Open the embedded SurrealKV store at `path/surreal/`.
+    pub async fn open_embedded(path: &Path) -> Result<Self, GraphError> {
         std::fs::create_dir_all(path)?;
 
         let db = store::open(path).await?;
@@ -81,7 +96,7 @@ impl GraphMemory {
 
         let models_dir = path.join("models");
         std::fs::create_dir_all(&models_dir)?;
-        let embedder = FastEmbedder::new(&models_dir)?;
+        let embedder = LazyEmbedder::new(&models_dir);
 
         let scoring = load_scoring_config(path);
 
@@ -93,13 +108,10 @@ impl GraphMemory {
         })
     }
 
-    /// Open a graph store at the given path.
-    ///
-    /// In server mode: reads `.recall-echo.toml` from the parent directory
-    /// (memory_dir) to get connection settings, then connects via WebSocket.
+    /// Connect to a SurrealDB server using `[graph]` settings from
+    /// `.recall-echo.toml` in the parent directory (memory_dir).
     /// The `path` is still used for the FastEmbed models cache.
-    #[cfg(feature = "server")]
-    pub async fn open(path: &Path) -> Result<Self, GraphError> {
+    pub async fn open_server(path: &Path) -> Result<Self, GraphError> {
         let memory_dir = path.parent().unwrap_or(path);
         let config = crate::config::load_from_dir(memory_dir);
 
@@ -143,7 +155,6 @@ impl GraphMemory {
     }
 
     /// Connect to a SurrealDB server over WebSocket with explicit config.
-    #[cfg(feature = "server")]
     pub async fn connect(
         config: &store::ServerConfig,
         models_dir: &Path,
@@ -152,7 +163,7 @@ impl GraphMemory {
         store::init_schema(&db).await?;
 
         std::fs::create_dir_all(models_dir)?;
-        let embedder = FastEmbedder::new(models_dir)?;
+        let embedder = LazyEmbedder::new(models_dir);
 
         Ok(Self {
             db,
@@ -173,17 +184,17 @@ impl GraphMemory {
         &self.db
     }
 
-    /// Internal access to the embedder.
+    /// Internal access to the embedder (initializes it on first use).
     #[allow(dead_code)]
-    pub(crate) fn embedder(&self) -> &FastEmbedder {
-        &self.embedder
+    pub(crate) fn embedder(&self) -> Result<&FastEmbedder, GraphError> {
+        self.embedder.get()
     }
 
     // --- Entity CRUD ---
 
     /// Add a new entity to the graph.
     pub async fn add_entity(&self, entity: NewEntity) -> Result<Entity, GraphError> {
-        crud::add_entity(&self.db, &self.embedder, entity).await
+        crud::add_entity(&self.db, self.embedder.get()?, entity).await
     }
 
     /// Get an entity by name.
@@ -202,7 +213,7 @@ impl GraphMemory {
         id: &str,
         updates: EntityUpdate,
     ) -> Result<Entity, GraphError> {
-        crud::update_entity(&self.db, &self.embedder, id, updates).await
+        crud::update_entity(&self.db, self.embedder.get()?, id, updates).await
     }
 
     /// Delete an entity and its relationships.
@@ -268,7 +279,7 @@ impl GraphMemory {
 
     /// Add a new episode to the graph.
     pub async fn add_episode(&self, episode: NewEpisode) -> Result<Episode, GraphError> {
-        crud::add_episode(&self.db, &self.embedder, episode).await
+        crud::add_episode(&self.db, self.embedder.get()?, episode).await
     }
 
     /// Get episodes by session ID.
@@ -325,7 +336,7 @@ impl GraphMemory {
 
     /// Semantic search across entities (legacy — returns full Entity).
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, GraphError> {
-        search::search(&self.db, &self.embedder, &self.scoring, query, limit).await
+        search::search(&self.db, self.embedder.get()?, &self.scoring, query, limit).await
     }
 
     /// Search with options — L1 projections, type/keyword filters.
@@ -334,7 +345,14 @@ impl GraphMemory {
         query: &str,
         options: &SearchOptions,
     ) -> Result<Vec<ScoredEntity>, GraphError> {
-        search::search_with_options(&self.db, &self.embedder, &self.scoring, query, options).await
+        search::search_with_options(
+            &self.db,
+            self.embedder.get()?,
+            &self.scoring,
+            query,
+            options,
+        )
+        .await
     }
 
     /// Semantic search across episodes.
@@ -343,7 +361,7 @@ impl GraphMemory {
         query: &str,
         limit: usize,
     ) -> Result<Vec<EpisodeSearchResult>, GraphError> {
-        search::search_episodes(&self.db, &self.embedder, query, limit).await
+        search::search_episodes(&self.db, self.embedder.get()?, query, limit).await
     }
 
     // --- Hybrid Query ---
@@ -354,7 +372,14 @@ impl GraphMemory {
         query_text: &str,
         options: &QueryOptions,
     ) -> Result<QueryResult, GraphError> {
-        query::query(&self.db, &self.embedder, &self.scoring, query_text, options).await
+        query::query(
+            &self.db,
+            self.embedder.get()?,
+            &self.scoring,
+            query_text,
+            options,
+        )
+        .await
     }
 
     // --- Traversal ---
@@ -510,7 +535,6 @@ impl GraphMemory {
 /// Load `[graph.scoring]` from `.recall-echo.toml` in the memory directory
 /// (the parent of the graph store path). Returns defaults if the config file
 /// or the `[graph.scoring]` section is absent, preserving legacy behavior.
-#[cfg(feature = "embedded")]
 fn load_scoring_config(graph_path: &Path) -> crate::config::GraphScoringConfig {
     let memory_dir = graph_path.parent().unwrap_or(graph_path);
     crate::config::load_from_dir(memory_dir)

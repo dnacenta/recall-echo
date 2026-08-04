@@ -1,6 +1,6 @@
 # Phase 0 — Unblock Measurement
 
-**Status**: In progress
+**Status**: Done (2026-08-04) — AC4 delivered as provisional N=10 baseline; 50-question run + full-context/grep baselines deferred by decision (see drift note on AC4)
 **Date**: 2026-08-04
 **Parent roadmap**: `/opt/pulse-vault/pulse-null/specs/todo/recall-echo-v4-roadmap-spec.md` (Phase 0 of 5)
 **Doctrine**: "No number, no claim" — every later phase (confidence rework, retrieval modernization) must land as a measured before/after. This phase makes measurement possible.
@@ -26,7 +26,8 @@ Three blockers prevent any measured claim about recall-echo today:
 - Make embedded-vs-server a **runtime** decision (config + CLI flag), not a compile-time feature split. Both backends compiled in by default. Mechanism: `surrealdb::engine::any` (`surrealkv://` or `ws://` chosen from config) — also enables pointing at an external SurrealDB server (benchmark harness, VPS).
 - `recall-echo serve` subcommand: long-running daemon owning the DB, listening on a unix socket (default) with idle auto-shutdown (configurable timeout, default 15 min). Protocol: command-level JSON over the socket (the SurrealDB SDK cannot serve its own wire protocol); the daemon holds the single `FastEmbedder`, eliminating per-invocation ONNX reload.
 - **Transparent auto-start**: CLI commands and hooks try the socket first; if absent, spawn the daemon in the background and proceed. No user ever needs to run `serve` manually. (D's decision 2026-08-04: no opt-in.)
-- Embedded direct-open remains as fallback (config-disable of serve) and gains lock detection: friendly error naming the constraint + bounded retry/backoff instead of a raw SurrealKV LOCK panic.
+- **Daemon-only UX** (D's decision 2026-08-04, supersedes the earlier fallback design): every graph command and hook goes through the daemon — no embedded fallback path, no user-facing mode switch, no `serve.enabled` toggle. If the daemon cannot start, that is a clear error, not a silent degradation. The direct embedded open remains **internal only** (it is what the daemon and the test suite use). The `[graph] mode = "server"` key survives as an *advanced* config for deployments with an external SurrealDB (Echo's VPS, benchmark rigs) and is documented as such, not as a normal choice.
+- Embedded open (inside the daemon) keeps lock detection: friendly error naming the constraint + bounded retry/backoff instead of a raw SurrealKV LOCK panic — covers a stale daemon or foreign process holding the store.
 - Document the concurrency model in README (currently zero mentions).
 - One `FastEmbedder` instance lives in the daemon → eliminates per-invocation ONNX model reload as a side effect.
 
@@ -42,17 +43,17 @@ Three blockers prevent any measured claim about recall-echo today:
 - [ ] `v3.11.1` tagged; CI release drafted with binaries; crates.io published; SessionEnd hook with a missing transcript exits 0 with an explanatory note.
 - [ ] Two concurrent `recall-echo graph search` invocations both succeed (via shared daemon) — the pilot's LOCK failure mode is gone.
 - [ ] First CLI/hook invocation with no daemon running transparently starts one and completes; daemon idle-shuts-down after the configured timeout.
-- [ ] Full LongMemEval run completes and `docs/benchmarks/baseline-2026-08.md` exists with retrieval metrics, answer metrics, and both baselines.
+- [x] *(rescoped 2026-08-04)* Provisional N=10 LongMemEval run complete; `docs/benchmarks/baseline-2026-08.md` exists with retrieval metrics (MRR .778, R@3 .648) separated from answer metrics (0/9 headline — assembly bottleneck identified). 50-question run and full-context/grep baselines deferred until Phase 2 reduces dedup cost (~5x ingest-estimate overrun, D's decision); same subset code guarantees comparability.
 - [ ] `query.rs` golden-set tests pass in CI.
 
 ### Edge cases
 - [ ] Stale socket (daemon crashed): client detects, cleans up, respawns, completes.
-- [ ] `serve` disabled by config: embedded path works as before, and a lock collision yields the friendly retry/error, not a raw LOCK panic.
+- [ ] Advanced `mode = "server"` config (external SurrealDB): commands connect directly, no daemon involved — Echo's VPS layout keeps working.
 - [ ] Concurrent auto-start race (two clients, no daemon): exactly one daemon wins; both clients complete.
 
 ### Failure modes
-- [ ] Daemon cannot start (port/socket denied): clear error + automatic embedded fallback; no silent hang.
-- [ ] Benchmark harness against a genuinely locked embedded DB: named, actionable error — never a panic.
+- [ ] Daemon cannot start (socket denied, spawn fails): clear, named error telling the user what failed — no silent hang, no silent fallback.
+- [ ] Daemon (or foreign process) already holds the store when a new daemon starts: bounded retry, then named `store locked` error — never a raw LOCK panic.
 
 ## Out of scope
 

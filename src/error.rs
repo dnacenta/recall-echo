@@ -36,6 +36,15 @@ pub enum RecallError {
     #[error("graph: {0}")]
     Graph(#[from] GraphError),
 
+    /// The graph daemon could not be reached or started. Carries an actionable
+    /// message — there is no silent fallback to a direct store open.
+    #[error("graph daemon: {0}")]
+    Daemon(String),
+
+    /// A failure reported by the graph daemon, with its stable error code.
+    #[error("{message}")]
+    Remote { code: String, message: String },
+
     /// General errors that don't fit other categories.
     #[error("{0}")]
     Other(String),

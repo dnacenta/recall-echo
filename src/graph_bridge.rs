@@ -20,12 +20,16 @@ pub async fn ingest_into_graph(
         ));
     }
 
-    let gm = crate::graph::GraphMemory::open(&graph_dir).await?;
-
-    // No LLM provider in standalone mode — episodes only, no entity extraction
-    let report = gm
-        .ingest_archive(archive_content, session_id, log_number, None)
-        .await?;
+    // Hot path (SessionEnd hook): goes through the serve daemon so a
+    // concurrent session never collides on the embedded store lock.
+    // No LLM provider in standalone mode — episodes only, no entity extraction.
+    let request = crate::serve::Request::IngestArchive(crate::serve::IngestArchiveArgs {
+        content: archive_content.to_string(),
+        session_id: session_id.to_string(),
+        log_number,
+    });
+    let report: crate::graph::types::IngestionReport =
+        serde_json::from_value(crate::serve_client::execute(memory_dir, &request).await?)?;
 
     eprintln!(
         "recall-echo: graph ingested \u{2014} {} episodes, {} entities created, {} merged, {} skipped, {} relationships",
@@ -44,6 +48,22 @@ pub async fn ingest_into_graph(
     }
 
     Ok(report)
+}
+
+/// Sync the pipeline documents into the knowledge graph.
+///
+/// Pipeline sync needs no LLM provider, so it runs as an ordinary daemon
+/// request. That matters on the SessionEnd hook path: ingest and sync then
+/// share one warm daemon instead of the sync stopping the daemon the ingest
+/// just started and reloading the embedding model in-process.
+pub async fn sync_pipeline_into_graph(
+    memory_dir: &std::path::Path,
+    docs: crate::graph::types::PipelineDocuments,
+) -> Result<crate::graph::types::PipelineSyncReport, crate::error::RecallError> {
+    let request = crate::serve::Request::SyncPipeline(crate::serve::SyncPipelineArgs { docs });
+    Ok(serde_json::from_value(
+        crate::serve_client::execute(memory_dir, &request).await?,
+    )?)
 }
 
 /// Ingest with an LLM provider for entity extraction.
@@ -65,16 +85,19 @@ pub async fn ingest_into_graph_with_llm(
         ));
     }
 
-    let gm = crate::graph::GraphMemory::open(&graph_dir).await?;
+    // LLM-backed extraction cannot cross the socket (the provider lives in
+    // this process), so this path takes the store exclusively instead.
+    let report = crate::serve_client::exclusive(memory_dir, |gm| async move {
+        let bridge = provider.map(GraphLlmBridge::new);
+        let llm_ref: Option<&dyn crate::graph::llm::LlmProvider> = bridge
+            .as_ref()
+            .map(|b| b as &dyn crate::graph::llm::LlmProvider);
 
-    let bridge = provider.map(GraphLlmBridge::new);
-    let llm_ref: Option<&dyn crate::graph::llm::LlmProvider> = bridge
-        .as_ref()
-        .map(|b| b as &dyn crate::graph::llm::LlmProvider);
-
-    let report = gm
-        .ingest_archive(archive_content, session_id, log_number, llm_ref)
-        .await?;
+        Ok(gm
+            .ingest_archive(archive_content, session_id, log_number, llm_ref)
+            .await?)
+    })
+    .await?;
 
     eprintln!(
         "recall-echo: graph ingested \u{2014} {} episodes, {} entities created, {} merged, {} skipped, {} relationships",

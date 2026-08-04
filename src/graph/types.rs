@@ -84,7 +84,9 @@ pub struct Entity {
     pub overview: String,
     pub content: Option<String>,
     pub attributes: Option<serde_json::Value>,
-    #[serde(default)]
+    /// Omitted when absent: an entity crossing the daemon socket carries no
+    /// embedding, and 384 floats of JSON text per entity is pure overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     #[serde(default = "default_true")]
     pub mutable: bool,
@@ -261,7 +263,8 @@ pub struct SearchOptions {
 }
 
 /// How an entity was found.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatchSource {
     /// Found via semantic similarity.
     Semantic,
@@ -272,7 +275,7 @@ pub enum MatchSource {
 }
 
 /// A scored entity in search results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredEntity {
     pub entity: EntityDetail,
     pub score: f64,
@@ -280,7 +283,7 @@ pub struct ScoredEntity {
 }
 
 /// An episode search result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeSearchResult {
     pub episode: Episode,
     pub score: f64,
@@ -310,14 +313,14 @@ impl Default for QueryOptions {
 }
 
 /// Result of a hybrid query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub entities: Vec<ScoredEntity>,
     pub episodes: Vec<EpisodeSearchResult>,
 }
 
 /// A search result with scoring (legacy — wraps full Entity).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub entity: Entity,
     pub score: f64,
@@ -325,14 +328,14 @@ pub struct SearchResult {
 }
 
 /// A node in a traversal tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraversalNode {
     pub entity: EntitySummary,
     pub edges: Vec<TraversalEdge>,
 }
 
 /// An edge in a traversal tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraversalEdge {
     pub rel_type: String,
     pub direction: String,
@@ -370,7 +373,7 @@ impl EdgeRow {
 }
 
 /// Graph-level statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphStats {
     pub entity_count: u64,
     pub relationship_count: u64,
@@ -400,7 +403,8 @@ pub struct Episode {
     pub abstract_text: String,
     pub overview: Option<String>,
     pub content: Option<String>,
-    #[serde(default)]
+    /// Omitted when absent — see [`Entity::embedding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     pub log_number: Option<i64>,
 }
@@ -537,7 +541,7 @@ pub struct VigilSyncReport {
 }
 
 /// Contents of all 5 pipeline markdown files.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineDocuments {
     pub learning: String,
     pub thoughts: String,
@@ -547,7 +551,7 @@ pub struct PipelineDocuments {
 }
 
 /// Report from a pipeline sync operation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineSyncReport {
     pub entities_created: u32,
     pub entities_updated: u32,
@@ -594,7 +598,7 @@ pub struct PipelineEntry {
 }
 
 /// Result of a full ingestion run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionReport {
     pub episodes_created: u32,
     pub entities_created: u32,
@@ -604,4 +608,57 @@ pub struct IngestionReport {
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
     pub estimated_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode_with(embedding: Option<Vec<f32>>) -> Episode {
+        Episode {
+            id: serde_json::json!("episode:one"),
+            session_id: "s1".into(),
+            timestamp: serde_json::json!("2026-01-01T00:00:00Z"),
+            abstract_text: "a".into(),
+            overview: None,
+            content: None,
+            embedding,
+            log_number: Some(1),
+        }
+    }
+
+    /// Embeddings are 384 floats each. They exist to be searched inside the
+    /// store, never to be shipped to a caller that discards them.
+    #[test]
+    fn an_episode_without_an_embedding_carries_no_embedding_field() {
+        let json = serde_json::to_value(episode_with(None)).unwrap();
+        assert!(json.get("embedding").is_none(), "{json}");
+
+        let json = serde_json::to_value(episode_with(Some(vec![0.5; 384]))).unwrap();
+        assert!(json.get("embedding").is_some(), "{json}");
+    }
+
+    #[test]
+    fn an_episode_round_trips_without_its_embedding() {
+        let line = serde_json::to_string(&episode_with(None)).unwrap();
+        let parsed: Episode = serde_json::from_str(&line).unwrap();
+        assert!(parsed.embedding.is_none());
+        assert_eq!(parsed.session_id, "s1");
+    }
+
+    #[test]
+    fn pipeline_documents_survive_the_daemon_wire_format() {
+        let docs = PipelineDocuments {
+            learning: "# learning".into(),
+            thoughts: "# thoughts".into(),
+            curiosity: String::new(),
+            reflections: "# reflections".into(),
+            praxis: String::new(),
+        };
+        let line = serde_json::to_string(&docs).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PipelineDocuments>(&line).unwrap(),
+            docs
+        );
+    }
 }
