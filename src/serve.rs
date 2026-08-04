@@ -1265,6 +1265,7 @@ mod tests {
             content: "# log".into(),
             session_id: "s1".into(),
             log_number: Some(1),
+            provenance: None,
         })
         .is_retryable());
         assert!(!Request::AddEntity(AddEntityArgs {

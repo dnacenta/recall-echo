@@ -675,6 +675,8 @@ mod tests {
             content: None,
             embedding,
             log_number: Some(1),
+            provenance: None,
+            access_count: 0,
         }
     }
 
