@@ -1,6 +1,6 @@
 # Phase 0 — Unblock Measurement
 
-**Status**: In progress
+**Status**: Done (2026-08-04) — AC4 delivered as provisional N=10 baseline; 50-question run + full-context/grep baselines deferred by decision (see drift note on AC4)
 **Date**: 2026-08-04
 **Parent roadmap**: `/opt/pulse-vault/pulse-null/specs/todo/recall-echo-v4-roadmap-spec.md` (Phase 0 of 5)
 **Doctrine**: "No number, no claim" — every later phase (confidence rework, retrieval modernization) must land as a measured before/after. This phase makes measurement possible.
@@ -43,7 +43,7 @@ Three blockers prevent any measured claim about recall-echo today:
 - [ ] `v3.11.1` tagged; CI release drafted with binaries; crates.io published; SessionEnd hook with a missing transcript exits 0 with an explanatory note.
 - [ ] Two concurrent `recall-echo graph search` invocations both succeed (via shared daemon) — the pilot's LOCK failure mode is gone.
 - [ ] First CLI/hook invocation with no daemon running transparently starts one and completes; daemon idle-shuts-down after the configured timeout.
-- [ ] Full LongMemEval run completes and `docs/benchmarks/baseline-2026-08.md` exists with retrieval metrics, answer metrics, and both baselines.
+- [x] *(rescoped 2026-08-04)* Provisional N=10 LongMemEval run complete; `docs/benchmarks/baseline-2026-08.md` exists with retrieval metrics (MRR .778, R@3 .648) separated from answer metrics (0/9 headline — assembly bottleneck identified). 50-question run and full-context/grep baselines deferred until Phase 2 reduces dedup cost (~5x ingest-estimate overrun, D's decision); same subset code guarantees comparability.
 - [ ] `query.rs` golden-set tests pass in CI.
 
 ### Edge cases
