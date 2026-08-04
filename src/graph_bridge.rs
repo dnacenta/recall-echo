@@ -23,10 +23,13 @@ pub async fn ingest_into_graph(
     // Hot path (SessionEnd hook): goes through the serve daemon so a
     // concurrent session never collides on the embedded store lock.
     // No LLM provider in standalone mode — episodes only, no entity extraction.
+    // Provenance is left to per-chunk turn-role inference: this is a
+    // conversation archive, the one place where authorship is visible.
     let request = crate::serve::Request::IngestArchive(crate::serve::IngestArchiveArgs {
         content: archive_content.to_string(),
         session_id: session_id.to_string(),
         log_number,
+        provenance: None,
     });
     let report: crate::graph::types::IngestionReport =
         serde_json::from_value(crate::serve_client::execute(memory_dir, &request).await?)?;
@@ -87,6 +90,7 @@ pub async fn ingest_into_graph_with_llm(
 
     // LLM-backed extraction cannot cross the socket (the provider lives in
     // this process), so this path takes the store exclusively instead.
+    let context = crate::graph::IngestContext::new(session_id, log_number);
     let report = crate::serve_client::exclusive(memory_dir, |gm| async move {
         let bridge = provider.map(GraphLlmBridge::new);
         let llm_ref: Option<&dyn crate::graph::llm::LlmProvider> = bridge
@@ -94,7 +98,7 @@ pub async fn ingest_into_graph_with_llm(
             .map(|b| b as &dyn crate::graph::llm::LlmProvider);
 
         Ok(gm
-            .ingest_archive(archive_content, session_id, log_number, llm_ref)
+            .ingest_archive(archive_content, &context, llm_ref)
             .await?)
     })
     .await?;

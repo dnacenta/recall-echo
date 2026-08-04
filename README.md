@@ -58,15 +58,17 @@ The knowledge graph is the structural foundation of recall-echo. It turns conver
 **Why Bayesian confidence.** Traditional knowledge graphs store facts as absolutes — "Dani uses NeoVim" is either true or not. But memories aren't binary. Things change, context matters, and some things are more certain than others. recall-echo uses a Beta-Binomial Bayesian confidence model on every relationship edge:
 
 - Each relationship starts with a confidence prior based on how it was established: authoritative (1.0), explicit (0.9), inferred (0.6), or speculative (0.3)
-- When new evidence corroborates a relationship, confidence increases. When evidence contradicts it, confidence decreases
-- Updates are gradual — it takes ~10 observations to overwhelm the prior, so a single contradictory mention doesn't erase established knowledge
+- Evidence is **persisted on the edge** as Beta pseudo-counts (`alpha` for corroboration, `beta` for contradiction). Corroboration adds to α, contradiction adds to β, and the stored confidence is the posterior mean `α / (α + β)`
+- Because the counts accumulate, the graph distinguishes "believed at 0.9" from "believed at 0.9 for good reason" — the posterior variance narrows as evidence builds, and a prior's initial skepticism persists rather than being recomputed away
+- Updates are gradual — a prior is worth ~10 observations, so a single contradictory mention doesn't erase established knowledge
+- **Observations are weighted by provenance.** Every episode is stamped at ingestion with who authored it, and an observation contributes evidence accordingly: an independent external source counts fully (1.0), the human nearly fully (0.8), the agent restating its own belief almost not at all (0.05, configurable via `[graph.provenance]`). Self-corroboration is also tallied separately on the edge, so coherence never passes for evidence
 - Multi-hop queries compound confidence along the path, naturally preferring shorter, higher-confidence routes
 
 This means the graph handles contradictions, reinforces patterns over time, and lets uncertain or stale knowledge fade gracefully — instead of requiring manual cleanup or producing false-positive retrievals.
 
 **Entity types:** person, project, tool, service, preference, decision, event, concept, case, pattern, thread, thought, question, observation, policy, measurement, outcome. Mutable types (person, project, tool, etc.) can be updated; immutable types (decision, event, case, etc.) are append-only.
 
-**Extraction pipeline:** When conversations are archived, an LLM-powered pipeline chunks the text (~500 tokens), extracts entities and relationships in parallel (up to 10 concurrent), then deduplicates sequentially with LLM-assisted skip/create/merge decisions. Re-extracted relationships receive Bayesian corroboration updates, so knowledge confirmed across multiple conversations gains confidence automatically.
+**Extraction pipeline:** When conversations are archived, an LLM-powered pipeline chunks the text (~500 tokens), extracts entities and relationships in parallel (up to 10 concurrent), then deduplicates sequentially with LLM-assisted skip/create/merge decisions. Re-extracted relationships receive Bayesian corroboration updates weighted by the provenance of the chunk they came from — conversation turn roles are read to tell the human's words from the agent's, and `graph ingest --external` marks genuinely external material — so knowledge confirmed by independent sources gains confidence while the agent repeating itself barely moves the score.
 
 **Tiered content:** Entities store content at three levels — L0 (abstract, used for embeddings and cheap traversal), L1 (overview, used for reranking), and L2 (full content, pulled on demand). This keeps graph traversal fast.
 

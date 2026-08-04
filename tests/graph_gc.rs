@@ -73,6 +73,7 @@ async fn gc_execute_removes_low_confidence_relationship() {
         stale_days: 0,
         stale_confidence: 0.5,
         protect_pipeline: true,
+        ..Default::default()
     };
     let _report = db.graph.run_gc(&config).await.unwrap();
 

@@ -2,6 +2,7 @@
 
 use surrealdb::Surreal;
 
+use super::confidence::{EdgeEvidence, Evidence, Provenance};
 use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
@@ -180,6 +181,12 @@ pub async fn add_relationship(
     let from_id = from.id_string();
     let to_id = to.id_string();
 
+    // A new edge starts at the prior: its mean is the requested confidence,
+    // its concentration is PRIOR_CONCENTRATION. The mean is stored as
+    // requested rather than re-derived, so creation is bit-for-bit unchanged.
+    let confidence = rel.confidence.unwrap_or(1.0) as f64;
+    let evidence = Evidence::from_prior(confidence);
+
     let mut response = db
         .query(
             r#"
@@ -191,6 +198,9 @@ pub async fn add_relationship(
                 valid_from = time::now(),
                 valid_until = NONE,
                 confidence = $confidence,
+                alpha = $alpha,
+                beta = $beta,
+                self_reinforcements = 0,
                 last_reinforced = time::now(),
                 source = $source
             "#,
@@ -199,7 +209,9 @@ pub async fn add_relationship(
         .bind(("to_id", to_id))
         .bind(("rel_type", rel.rel_type))
         .bind(("description", rel.description))
-        .bind(("confidence", rel.confidence.unwrap_or(1.0) as f64))
+        .bind(("confidence", confidence))
+        .bind(("alpha", evidence.alpha()))
+        .bind(("beta", evidence.beta()))
         .bind(("source", rel.source))
         .await?;
 
@@ -236,34 +248,58 @@ pub async fn get_relationships(
     deserialize_take(&mut response, 0)
 }
 
-/// Update a relationship's confidence score.
+/// Overwrite a relationship's confidence, discarding its accumulated evidence.
+///
+/// This is an assertion of a mean, not an observation: the edge is reset to the
+/// prior concentration around the new value, so the stored counts keep matching
+/// the stored mean. Use [`reinforce_relationship`] to *add* evidence.
 pub async fn update_relationship_confidence(
     db: &Surreal<Db>,
     rel_id: &str,
     confidence: f64,
 ) -> Result<(), GraphError> {
-    db.query("UPDATE type::record($id) SET confidence = $confidence")
+    let evidence = Evidence::from_prior(confidence);
+    db.query("UPDATE type::record($id) SET confidence = $confidence, alpha = $alpha, beta = $beta")
         .bind(("id", rel_id.to_string()))
         .bind(("confidence", confidence))
+        .bind(("alpha", evidence.alpha()))
+        .bind(("beta", evidence.beta()))
         .await?
         .check()?;
     Ok(())
 }
 
-/// Reinforce a relationship: Bayesian update + reset last_reinforced timestamp.
+/// Persist updated evidence for a relationship and reset its decay clock.
 ///
-/// Called when a relationship is corroborated by re-extraction. Updates confidence
-/// via Bayesian posterior and resets the decay clock by setting `last_reinforced = now`.
+/// Called when a relationship is corroborated (or contradicted) by
+/// re-extraction: the caller loads the edge's [`EdgeEvidence`], records the
+/// observation with its provenance, and hands the result here. The stored
+/// `confidence` is the posterior mean of the new counts, `self_reinforcements`
+/// is the coherence tally kept out of that mean, and `last_reinforced = now`
+/// restarts temporal decay.
+///
+/// The counts are written whole rather than incremented in SurrealQL: the
+/// caller has already read them, and a full write keeps mean and counts from
+/// ever disagreeing.
 pub async fn reinforce_relationship(
     db: &Surreal<Db>,
     rel_id: &str,
-    new_confidence: f64,
+    evidence: EdgeEvidence,
 ) -> Result<(), GraphError> {
+    let counts = evidence.evidence();
     db.query(
-        "UPDATE type::record($id) SET confidence = $confidence, last_reinforced = time::now()",
+        r#"UPDATE type::record($id) SET
+               confidence = $confidence,
+               alpha = $alpha,
+               beta = $beta,
+               self_reinforcements = $self_reinforcements,
+               last_reinforced = time::now()"#,
     )
     .bind(("id", rel_id.to_string()))
-    .bind(("confidence", new_confidence))
+    .bind(("confidence", counts.mean()))
+    .bind(("alpha", counts.alpha()))
+    .bind(("beta", counts.beta()))
+    .bind(("self_reinforcements", evidence.self_reinforcements()))
     .await?
     .check()?;
     Ok(())
@@ -369,11 +405,30 @@ pub async fn increment_access_counts(db: &Surreal<Db>, ids: &[String]) -> Result
 
 // ── Episode CRUD ─────────────────────────────────────────────────────
 
-/// Add a new episode to the graph. Embeds the abstract text for vector search.
+/// Add a new episode authored by the agent itself.
+///
+/// The conservative default for callers that cannot say where the text came
+/// from: unattributed text must never be counted as independent evidence.
 pub async fn add_episode(
     db: &Surreal<Db>,
     embedder: &dyn Embedder,
     episode: NewEpisode,
+) -> Result<Episode, GraphError> {
+    add_episode_from(db, embedder, episode, Provenance::SelfGenerated).await
+}
+
+/// Add a new episode stamped with who authored it. Embeds the abstract text
+/// for vector search.
+///
+/// Provenance is an argument rather than a field of [`NewEpisode`] because it
+/// is a property of the *ingestion context*, not of the text: the same chunk
+/// is external when read out of a document and self-authored when the agent
+/// wrote it.
+pub async fn add_episode_from(
+    db: &Surreal<Db>,
+    embedder: &dyn Embedder,
+    episode: NewEpisode,
+    provenance: Provenance,
 ) -> Result<Episode, GraphError> {
     let embedding = embedder.embed_single(&episode.abstract_text)?;
 
@@ -387,7 +442,8 @@ pub async fn add_episode(
                 overview = $overview,
                 content = $content,
                 embedding = $embedding,
-                log_number = $log_number
+                log_number = $log_number,
+                provenance = $provenance
             "#,
         )
         .bind(("session_id", episode.session_id))
@@ -396,6 +452,7 @@ pub async fn add_episode(
         .bind(("content", episode.content))
         .bind(("embedding", embedding))
         .bind(("log_number", episode.log_number.map(|n| n as i64)))
+        .bind(("provenance", provenance.as_str().to_string()))
         .await?;
 
     let created: Option<Episode> = deserialize_take_opt(&mut response, 0)?;
@@ -414,6 +471,33 @@ pub async fn get_episodes_by_session(
         .await?;
 
     deserialize_take(&mut response, 0)
+}
+
+/// Delete a single episode by its record ID.
+pub async fn delete_episode(db: &Surreal<Db>, id: &str) -> Result<(), GraphError> {
+    db.query("DELETE FROM type::record($id)")
+        .bind(("id", id.to_string()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// Batch increment episode retrieval counts.
+///
+/// Coalesces the absent case: episodes written before the counter existed
+/// read as NONE, and `NONE + 1` is not a count.
+pub async fn increment_episode_access_counts(
+    db: &Surreal<Db>,
+    ids: &[String],
+) -> Result<(), GraphError> {
+    for id in ids {
+        let _ = db
+            .query("UPDATE type::record($id) SET access_count = (access_count ?? 0) + 1")
+            .bind(("id", id.clone()))
+            .await;
+    }
+
+    Ok(())
 }
 
 /// Mark all episodes with a given log_number as extracted.

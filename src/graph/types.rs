@@ -3,6 +3,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::confidence::{EdgeEvidence, Evidence, Provenance};
+
 /// Node types in the knowledge graph.
 /// Mutable types can be merged/updated. Immutable types are historical facts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -167,7 +169,20 @@ pub struct Relationship {
     pub description: Option<String>,
     pub valid_from: serde_json::Value,
     pub valid_until: Option<serde_json::Value>,
+    /// Posterior mean of the edge's Beta distribution — `alpha / (alpha + beta)`.
+    /// Kept in sync with the counts on every write; this is what read paths score on.
     pub confidence: f64,
+    /// Accumulated corroborating evidence (Beta α).
+    /// `None` only on an edge the schema migration has not reached yet.
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    /// Accumulated contradicting evidence (Beta β).
+    #[serde(default)]
+    pub beta: Option<f64>,
+    /// How many corroborations came from the agent itself — counted, never
+    /// laundered into confidence. Populated from Phase 1 increment 2 onward.
+    #[serde(default)]
+    pub self_reinforcements: Option<i64>,
     /// When this relationship was last reinforced (Bayesian corroboration).
     /// Used by temporal decay: effective_confidence = confidence × 0.5^(days_since / half_life).
     #[serde(default)]
@@ -183,6 +198,20 @@ impl Relationship {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         }
+    }
+
+    /// The edge's accumulated evidence, falling back to the prior implied by
+    /// its mean when the counts have not been backfilled yet.
+    #[must_use]
+    pub fn evidence(&self) -> Evidence {
+        Evidence::from_stored(self.alpha, self.beta, self.confidence)
+    }
+
+    /// The edge's full evidence state — Beta counts plus coherence tally.
+    /// This is what a confidence-moving observation is applied to.
+    #[must_use]
+    pub fn edge_evidence(&self) -> EdgeEvidence {
+        EdgeEvidence::new(self.evidence(), self.self_reinforcements.unwrap_or(0))
     }
 }
 
@@ -407,6 +436,15 @@ pub struct Episode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     pub log_number: Option<i64>,
+    /// Authorship class as stored. Absent on episodes written before
+    /// provenance existed; read it through [`Episode::provenance`], which
+    /// resolves absent and unrecognised values conservatively.
+    #[serde(default)]
+    pub provenance: Option<String>,
+    /// How many times retrieval has returned this episode. Absent on episodes
+    /// written before the counter existed — which reads as never retrieved.
+    #[serde(default, deserialize_with = "super::util::count_or_zero")]
+    pub access_count: i64,
 }
 
 impl Episode {
@@ -416,6 +454,14 @@ impl Episode {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         }
+    }
+
+    /// Who authored this episode. Legacy and unrecognised values resolve to
+    /// [`Provenance::SelfGenerated`] — unlabelled text never earns full
+    /// evidence weight.
+    #[must_use]
+    pub fn provenance(&self) -> Provenance {
+        Provenance::from_stored(self.provenance.as_deref())
     }
 }
 
@@ -608,6 +654,11 @@ pub struct IngestionReport {
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
     pub estimated_tokens: u64,
+    /// Record IDs of the entities this run created or merged into — the
+    /// entities the session touched, and so the ones a session outcome
+    /// applies to. Empty when the run had no LLM to extract with.
+    #[serde(default)]
+    pub entity_ids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -624,6 +675,8 @@ mod tests {
             content: None,
             embedding,
             log_number: Some(1),
+            provenance: None,
+            access_count: 0,
         }
     }
 

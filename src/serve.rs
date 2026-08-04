@@ -30,7 +30,8 @@ use crate::graph::error::GraphError;
 use crate::graph::types::{
     EntityType, NewEntity, NewRelationship, PipelineDocuments, QueryOptions, SearchOptions,
 };
-use crate::graph::GraphMemory;
+use crate::graph::utility::OutcomeKind;
+use crate::graph::{GraphMemory, IngestContext, Provenance};
 use crate::serve_security::{
     append_private_file, check_peer_uid, current_uid, unlink_socket, PRIVATE_FILE_MODE,
 };
@@ -82,6 +83,8 @@ pub enum Request {
     IngestArchive(IngestArchiveArgs),
     /// Sync the pipeline documents into the graph (no LLM extraction).
     SyncPipeline(SyncPipelineArgs),
+    /// Apply an outcome to the entities a session touched.
+    Feedback(FeedbackArgs),
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -101,6 +104,7 @@ impl Request {
             Request::Relate(_) => "relate",
             Request::IngestArchive(_) => "ingest_archive",
             Request::SyncPipeline(_) => "sync_pipeline",
+            Request::Feedback(_) => "feedback",
             Request::Shutdown => "shutdown",
         }
     }
@@ -122,6 +126,8 @@ impl Request {
             | Request::Traverse(_)
             // Pipeline sync diffs documents against the graph.
             | Request::SyncPipeline(_)
+            // Outcome records replace per (entity, session) — reruns correct.
+            | Request::Feedback(_)
             | Request::Shutdown => true,
             Request::AddEntity(_) | Request::Relate(_) | Request::IngestArchive(_) => false,
         }
@@ -192,6 +198,10 @@ pub struct IngestArchiveArgs {
     pub session_id: String,
     #[serde(default)]
     pub log_number: Option<u32>,
+    /// Force one provenance class on every episode of this run. Absent — the
+    /// shape older clients send — means infer per chunk from turn roles.
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
 }
 
 /// Pipeline sync needs no LLM provider, so it runs against the daemon like any
@@ -199,6 +209,12 @@ pub struct IngestArchiveArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncPipelineArgs {
     pub docs: PipelineDocuments,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackArgs {
+    pub session_id: String,
+    pub outcome: OutcomeKind,
 }
 
 /// A daemon response. Wire form is `{"ok": true, "data": ...}` or
@@ -406,14 +422,19 @@ async fn execute_graph(
             serde_json::to_value(relationship)?
         }
         Request::IngestArchive(args) => {
-            let report = graph
-                .ingest_archive(&args.content, &args.session_id, args.log_number, None)
-                .await?;
+            let context = IngestContext::new(args.session_id.clone(), args.log_number)
+                .with_override(args.provenance);
+            let report = graph.ingest_archive(&args.content, &context, None).await?;
             serde_json::to_value(report)?
         }
         Request::SyncPipeline(args) => {
             serde_json::to_value(graph.sync_pipeline(&args.docs).await?)?
         }
+        Request::Feedback(args) => serde_json::to_value(
+            graph
+                .record_session_outcome(&args.session_id, args.outcome)
+                .await?,
+        )?,
     };
     Ok(Some(data))
 }
@@ -1065,12 +1086,17 @@ mod tests {
                 content: "# log".into(),
                 session_id: "s1".into(),
                 log_number: Some(7),
+                provenance: Some(Provenance::External),
             }),
             Request::SyncPipeline(SyncPipelineArgs {
                 docs: PipelineDocuments {
                     learning: "# learning".into(),
                     ..PipelineDocuments::default()
                 },
+            }),
+            Request::Feedback(FeedbackArgs {
+                session_id: "s1".into(),
+                outcome: OutcomeKind::Success,
             }),
             Request::Shutdown,
         ];
@@ -1080,6 +1106,38 @@ mod tests {
             let parsed: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(parsed, request, "round trip failed for {line}");
         }
+    }
+
+    #[test]
+    fn ingest_requests_without_provenance_still_parse() {
+        // The wire shape older clients send: absent means "infer from turn
+        // roles", so a pre-provenance client keeps working unchanged.
+        let parsed: Request = serde_json::from_str(
+            r##"{"op":"ingest_archive","args":{"content":"# log","session_id":"s1"}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Request::IngestArchive(IngestArchiveArgs {
+                content: "# log".into(),
+                session_id: "s1".into(),
+                log_number: None,
+                provenance: None,
+            })
+        );
+    }
+
+    #[test]
+    fn feedback_is_a_hot_op_with_a_snake_case_outcome() {
+        let request = Request::Feedback(FeedbackArgs {
+            session_id: "conversation-042".into(),
+            outcome: OutcomeKind::Failed,
+        });
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["op"], "feedback");
+        assert_eq!(json["args"]["session_id"], "conversation-042");
+        assert_eq!(json["args"]["outcome"], "failed");
+        assert_eq!(request.op_name(), "feedback");
     }
 
     #[test]
@@ -1207,6 +1265,7 @@ mod tests {
             content: "# log".into(),
             session_id: "s1".into(),
             log_number: Some(1),
+            provenance: None,
         })
         .is_retryable());
         assert!(!Request::AddEntity(AddEntityArgs {

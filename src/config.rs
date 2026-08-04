@@ -4,6 +4,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// Evidence weights per provenance class, re-exported from the confidence
+/// model that owns them: `[graph.provenance]` is only their config surface.
+pub use crate::graph::confidence::ProvenanceWeights;
+
 const DEFAULT_MAX_ENTRIES: usize = 5;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
 const CONFIG_FILE: &str = ".recall-echo.toml";
@@ -173,6 +177,13 @@ pub struct GraphSection {
     /// (0.45 / 0.30 / 0.25). See `GraphScoringConfig` for details.
     #[serde(default)]
     pub scoring: GraphScoringConfig,
+    /// Evidence weights per provenance class.
+    ///
+    /// Maps to the `[graph.provenance]` section of `.recall-echo.toml`. When
+    /// absent, defaults are 1.0 external / 0.8 user / 0.05 self. See
+    /// [`ProvenanceWeights`] for details.
+    #[serde(default)]
+    pub provenance: ProvenanceWeights,
 }
 
 impl Default for GraphSection {
@@ -185,6 +196,7 @@ impl Default for GraphSection {
             username: String::new(),
             password_file: String::new(),
             scoring: GraphScoringConfig::default(),
+            provenance: ProvenanceWeights::default(),
         }
     }
 }
@@ -394,9 +406,42 @@ impl Config {
                 };
                 Ok(())
             }
+            "graph.provenance.weight_external" => {
+                self.graph_section().provenance.weight_external = parse_weight(value)?;
+                Ok(())
+            }
+            "graph.provenance.weight_user" => {
+                self.graph_section().provenance.weight_user = parse_weight(value)?;
+                Ok(())
+            }
+            "graph.provenance.weight_self" => {
+                self.graph_section().provenance.weight_self = parse_weight(value)?;
+                Ok(())
+            }
             other => Err(RecallError::Config(format!("unknown config key: {other}"))),
         }
     }
+
+    /// The `[graph]` section, created at its defaults if the config has none.
+    fn graph_section(&mut self) -> &mut GraphSection {
+        self.graph.get_or_insert_with(GraphSection::default)
+    }
+}
+
+/// Parse an evidence weight: a finite, non-negative number.
+///
+/// Zero is allowed — it is how a class is switched off entirely.
+fn parse_weight(value: &str) -> Result<f64, crate::error::RecallError> {
+    use crate::error::RecallError;
+    let weight: f64 = value
+        .parse()
+        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+    if !weight.is_finite() || weight < 0.0 {
+        return Err(RecallError::Config(format!(
+            "evidence weight must be finite and non-negative, got {value}"
+        )));
+    }
+    Ok(weight)
 }
 
 #[cfg(test)]
@@ -617,6 +662,59 @@ mod tests {
         assert!((section.scoring.weight_semantic - defaults.weight_semantic).abs() < f64::EPSILON);
         assert!((section.scoring.weight_hotness - defaults.weight_hotness).abs() < f64::EPSILON);
         assert!((section.scoring.weight_utility - defaults.weight_utility).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_provenance_defaults_when_section_absent() {
+        let section: GraphSection = toml::from_str("mode = \"embedded\"\n").expect("parse section");
+        let defaults = ProvenanceWeights::default();
+        assert_eq!(section.provenance, defaults);
+        assert!((defaults.weight_external - 1.0).abs() < f64::EPSILON);
+        assert!((defaults.weight_user - 0.8).abs() < f64::EPSILON);
+        assert!((defaults.weight_self - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_provenance_partial_toml_fills_defaults() {
+        let cfg: Config =
+            toml::from_str("[graph]\n\n[graph.provenance]\nweight_self = 0.5\n").expect("parse");
+        let provenance = cfg.graph.expect("graph section present").provenance;
+        assert!((provenance.weight_self - 0.5).abs() < f64::EPSILON);
+        assert!((provenance.weight_external - 1.0).abs() < f64::EPSILON);
+        assert!((provenance.weight_user - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn set_key_provenance_weights() {
+        let mut cfg = Config::default();
+        cfg.set_key("graph.provenance.weight_self", "0.2").unwrap();
+        cfg.set_key("graph.provenance.weight_user", "0").unwrap();
+        cfg.set_key("graph.provenance.weight_external", "1.5")
+            .unwrap();
+
+        let provenance = cfg
+            .graph
+            .as_ref()
+            .expect("graph section created")
+            .provenance;
+        assert!((provenance.weight_self - 0.2).abs() < f64::EPSILON);
+        assert!(provenance.weight_user.abs() < f64::EPSILON);
+        assert!((provenance.weight_external - 1.5).abs() < f64::EPSILON);
+
+        assert!(cfg.set_key("graph.provenance.weight_self", "-1").is_err());
+        assert!(cfg.set_key("graph.provenance.weight_self", "lots").is_err());
+    }
+
+    #[test]
+    fn provenance_weights_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        cfg.set_key("graph.provenance.weight_self", "0.05").unwrap();
+        let rendered = toml::to_string_pretty(&cfg).expect("render");
+        let parsed: Config = toml::from_str(&rendered).expect("reparse");
+        assert_eq!(
+            parsed.graph.expect("graph section survives").provenance,
+            ProvenanceWeights::default()
+        );
     }
 
     #[test]

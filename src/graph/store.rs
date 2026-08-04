@@ -16,9 +16,20 @@ use std::time::Duration;
 use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 
+use super::confidence::PRIOR_CONCENTRATION;
 use super::error::GraphError;
 
 pub type Db = Any;
+
+/// Schema version this build writes. Bumped by every migration.
+///
+/// - `0` — pre-Phase-1: edges carry a bare `confidence` mean.
+/// - `1` — edges carry persisted Beta evidence (`alpha`, `beta`) and a
+///   `self_reinforcements` coherence counter.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Record ID of the singleton row holding graph-wide metadata.
+const META_RECORD: &str = "meta:schema";
 
 /// How many times to retry opening an embedded store that is locked by
 /// another process, and the base backoff between attempts (doubled each try).
@@ -120,8 +131,15 @@ pub async fn connect(config: &ServerConfig) -> Result<Surreal<Db>, GraphError> {
     Ok(db)
 }
 
-/// Initialize the graph schema. Idempotent — safe to call on every open.
-pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
+/// Initialize the graph schema, then bring the store up to
+/// [`SCHEMA_VERSION`]. Idempotent — safe to call on every open.
+pub async fn init_schema(db: &Surreal<Db>) -> Result<MigrationReport, GraphError> {
+    define_schema(db).await?;
+    migrate(db).await
+}
+
+/// Declare tables, fields and indexes. Every statement is `IF NOT EXISTS`.
+async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
     db.query(
         r#"
         DEFINE TABLE IF NOT EXISTS entity SCHEMAFULL;
@@ -154,6 +172,11 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS valid_from  ON relates_to TYPE datetime DEFAULT time::now();
         DEFINE FIELD IF NOT EXISTS valid_until ON relates_to TYPE option<datetime>;
         DEFINE FIELD IF NOT EXISTS confidence  ON relates_to TYPE float DEFAULT 1.0;
+        -- Persisted Beta evidence. `option` because edges written before
+        -- schema version 1 have none until the backfill reaches them.
+        DEFINE FIELD IF NOT EXISTS alpha       ON relates_to TYPE option<float>;
+        DEFINE FIELD IF NOT EXISTS beta        ON relates_to TYPE option<float>;
+        DEFINE FIELD IF NOT EXISTS self_reinforcements ON relates_to TYPE option<int>;
         DEFINE FIELD IF NOT EXISTS last_reinforced ON relates_to TYPE option<datetime>;
         DEFINE FIELD IF NOT EXISTS source      ON relates_to TYPE option<string>;
 
@@ -168,6 +191,16 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS embedding   ON episode TYPE option<array<float>>;
         DEFINE FIELD IF NOT EXISTS log_number  ON episode TYPE option<int>;
         DEFINE FIELD IF NOT EXISTS extracted  ON episode TYPE bool DEFAULT false;
+        -- How many times retrieval has returned this episode. Absent on
+        -- episodes written before the field existed; read paths resolve that
+        -- to zero, which is also what it means. No backfill, no version bump.
+        DEFINE FIELD IF NOT EXISTS access_count ON episode TYPE option<int>;
+        -- Authorship class: 'external' | 'user' | 'self'. `option` with no
+        -- default on purpose — an absent value means an episode written
+        -- before provenance existed, and reads resolve that to 'self'. No
+        -- backfill, so no schema version bump: the absent case is already
+        -- the conservative one.
+        DEFINE FIELD IF NOT EXISTS provenance ON episode TYPE option<string>;
 
         DEFINE INDEX IF NOT EXISTS episode_session ON episode FIELDS session_id;
         DEFINE INDEX IF NOT EXISTS episode_time    ON episode FIELDS timestamp;
@@ -180,11 +213,113 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS timestamp      ON contributed_to TYPE datetime DEFAULT time::now();
 
         DEFINE INDEX IF NOT EXISTS ct_session ON contributed_to FIELDS session_id;
+
+        DEFINE TABLE IF NOT EXISTS meta SCHEMAFULL;
+        DEFINE FIELD IF NOT EXISTS schema_version ON meta TYPE int DEFAULT 0;
         "#,
     )
     .await?
     .check()?;
 
+    Ok(())
+}
+
+/// What one migration pass did. `edges_backfilled` is zero on an already
+/// current store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Schema version the store was at when the pass started.
+    pub from_version: i64,
+    /// Schema version the store is at now.
+    pub to_version: i64,
+    /// Number of edges that gained evidence counts in this pass.
+    pub edges_backfilled: u64,
+}
+
+impl MigrationReport {
+    /// True when this pass actually moved the store forward.
+    #[must_use]
+    pub fn ran(&self) -> bool {
+        self.from_version < self.to_version
+    }
+}
+
+/// Bring the store up to [`SCHEMA_VERSION`].
+///
+/// Crash-only: the backfill runs *before* the version marker is written, and
+/// only touches edges that still lack evidence (`alpha IS NONE`). An
+/// interrupted pass therefore leaves a store that re-opens, finishes the
+/// remaining edges, and never counts an edge twice.
+async fn migrate(db: &Surreal<Db>) -> Result<MigrationReport, GraphError> {
+    let from_version = read_schema_version(db).await?;
+    if from_version >= SCHEMA_VERSION {
+        return Ok(MigrationReport {
+            from_version,
+            to_version: from_version,
+            edges_backfilled: 0,
+        });
+    }
+
+    let edges_backfilled = backfill_edge_evidence(db).await?;
+    write_schema_version(db, SCHEMA_VERSION).await?;
+
+    Ok(MigrationReport {
+        from_version,
+        to_version: SCHEMA_VERSION,
+        edges_backfilled,
+    })
+}
+
+/// Give every evidence-less edge the Beta counts implied by its stored mean.
+///
+/// `alpha = confidence · C`, `beta = (1 − confidence) · C` with
+/// `C = PRIOR_CONCENTRATION`: the mean is preserved exactly, and the edge
+/// gains the honest low concentration of something never actually counted.
+///
+/// A single re-runnable statement — `WHERE alpha IS NONE` makes re-entry a
+/// no-op for edges that already have evidence.
+async fn backfill_edge_evidence(db: &Surreal<Db>) -> Result<u64, GraphError> {
+    let mut response = db
+        .query(
+            r#"
+            UPDATE relates_to SET
+                alpha = confidence * $concentration,
+                beta = (1 - confidence) * $concentration,
+                self_reinforcements = 0
+            WHERE alpha IS NONE
+            RETURN id
+            "#,
+        )
+        .bind(("concentration", PRIOR_CONCENTRATION))
+        .await?;
+
+    let updated: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    Ok(updated.len() as u64)
+}
+
+/// Read the store's schema version. An absent meta record means version 0 —
+/// a store written before versioning existed.
+async fn read_schema_version(db: &Surreal<Db>) -> Result<i64, GraphError> {
+    let mut response = db
+        .query("SELECT schema_version FROM type::record($id)")
+        .bind(("id", META_RECORD.to_string()))
+        .await?;
+
+    #[derive(serde::Deserialize)]
+    struct VersionRow {
+        schema_version: i64,
+    }
+
+    let rows: Vec<VersionRow> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows.first().map(|r| r.schema_version).unwrap_or(0))
+}
+
+async fn write_schema_version(db: &Surreal<Db>, version: i64) -> Result<(), GraphError> {
+    db.query("UPSERT type::record($id) SET schema_version = $version")
+        .bind(("id", META_RECORD.to_string()))
+        .bind(("version", version))
+        .await?
+        .check()?;
     Ok(())
 }
 
