@@ -2,6 +2,7 @@
 
 use surrealdb::Surreal;
 
+use super::confidence::Evidence;
 use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
@@ -180,6 +181,12 @@ pub async fn add_relationship(
     let from_id = from.id_string();
     let to_id = to.id_string();
 
+    // A new edge starts at the prior: its mean is the requested confidence,
+    // its concentration is PRIOR_CONCENTRATION. The mean is stored as
+    // requested rather than re-derived, so creation is bit-for-bit unchanged.
+    let confidence = rel.confidence.unwrap_or(1.0) as f64;
+    let evidence = Evidence::from_prior(confidence);
+
     let mut response = db
         .query(
             r#"
@@ -191,6 +198,9 @@ pub async fn add_relationship(
                 valid_from = time::now(),
                 valid_until = NONE,
                 confidence = $confidence,
+                alpha = $alpha,
+                beta = $beta,
+                self_reinforcements = 0,
                 last_reinforced = time::now(),
                 source = $source
             "#,
@@ -199,7 +209,9 @@ pub async fn add_relationship(
         .bind(("to_id", to_id))
         .bind(("rel_type", rel.rel_type))
         .bind(("description", rel.description))
-        .bind(("confidence", rel.confidence.unwrap_or(1.0) as f64))
+        .bind(("confidence", confidence))
+        .bind(("alpha", evidence.alpha()))
+        .bind(("beta", evidence.beta()))
         .bind(("source", rel.source))
         .await?;
 
@@ -236,34 +248,50 @@ pub async fn get_relationships(
     deserialize_take(&mut response, 0)
 }
 
-/// Update a relationship's confidence score.
+/// Overwrite a relationship's confidence, discarding its accumulated evidence.
+///
+/// This is an assertion of a mean, not an observation: the edge is reset to the
+/// prior concentration around the new value, so the stored counts keep matching
+/// the stored mean. Use [`reinforce_relationship`] to *add* evidence.
 pub async fn update_relationship_confidence(
     db: &Surreal<Db>,
     rel_id: &str,
     confidence: f64,
 ) -> Result<(), GraphError> {
-    db.query("UPDATE type::record($id) SET confidence = $confidence")
+    let evidence = Evidence::from_prior(confidence);
+    db.query("UPDATE type::record($id) SET confidence = $confidence, alpha = $alpha, beta = $beta")
         .bind(("id", rel_id.to_string()))
         .bind(("confidence", confidence))
+        .bind(("alpha", evidence.alpha()))
+        .bind(("beta", evidence.beta()))
         .await?
         .check()?;
     Ok(())
 }
 
-/// Reinforce a relationship: Bayesian update + reset last_reinforced timestamp.
+/// Persist updated evidence for a relationship and reset its decay clock.
 ///
-/// Called when a relationship is corroborated by re-extraction. Updates confidence
-/// via Bayesian posterior and resets the decay clock by setting `last_reinforced = now`.
+/// Called when a relationship is corroborated (or contradicted) by
+/// re-extraction: the caller loads the edge's [`Evidence`], records the
+/// observation, and hands the result here. The stored `confidence` is the
+/// posterior mean of the new counts, and `last_reinforced = now` restarts
+/// temporal decay.
 pub async fn reinforce_relationship(
     db: &Surreal<Db>,
     rel_id: &str,
-    new_confidence: f64,
+    evidence: Evidence,
 ) -> Result<(), GraphError> {
     db.query(
-        "UPDATE type::record($id) SET confidence = $confidence, last_reinforced = time::now()",
+        r#"UPDATE type::record($id) SET
+               confidence = $confidence,
+               alpha = $alpha,
+               beta = $beta,
+               last_reinforced = time::now()"#,
     )
     .bind(("id", rel_id.to_string()))
-    .bind(("confidence", new_confidence))
+    .bind(("confidence", evidence.mean()))
+    .bind(("alpha", evidence.alpha()))
+    .bind(("beta", evidence.beta()))
     .await?
     .check()?;
     Ok(())

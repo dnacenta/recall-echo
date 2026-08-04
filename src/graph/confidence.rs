@@ -1,13 +1,26 @@
 //! Bayesian confidence model for relationship edges.
 //!
-//! Uses Beta-Binomial conjugate prior with pseudocount 10.
-//! Confidence moves slowly per observation but accumulates with repeated evidence.
+//! Uses a Beta-Binomial conjugate prior. The pseudo-counts (`alpha`, `beta`)
+//! are **persisted on the edge**, so evidence accumulates: the posterior after
+//! fifty corroborations is a different distribution from the posterior after
+//! five, and its variance is smaller. The stored `confidence` field is the
+//! posterior mean — a derived value kept in sync with the counts on every
+//! write, so read paths can keep scoring on the mean alone.
+//!
+//! A new edge (or an edge from a store predating evidence persistence) starts
+//! at [`PRIOR_CONCENTRATION`]: the mean is preserved and the concentration is
+//! honestly low.
 
 use serde::{Deserialize, Serialize};
 
-/// Pseudocount total for the Beta-Binomial prior.
+/// Total pseudo-count of the Beta prior an edge starts from.
 /// ~10 observations to overwhelm the prior.
-const PSEUDOCOUNT: f64 = 10.0;
+pub const PRIOR_CONCENTRATION: f64 = 10.0;
+
+/// Evidence weight of a single observation whose provenance is not (yet)
+/// modelled. Provenance-weighted observations arrive in Phase 1 increment 2;
+/// until then every observation counts once.
+pub const DEFAULT_EVIDENCE_WEIGHT: f64 = 1.0;
 
 /// How a relationship was established — determines initial confidence prior.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -46,22 +59,129 @@ impl std::str::FromStr for ExtractionContext {
     }
 }
 
-/// Bayesian update using Beta-Binomial conjugate prior.
+/// The accumulated evidence for one relationship: the pseudo-counts of its
+/// Beta posterior.
 ///
-/// Given a current confidence (interpreted as alpha / (alpha + beta) with
-/// total pseudocount), updates the posterior by adding one observation.
-///
-/// - `corroborate = true`: alpha += 1 (evidence supports the relationship)
-/// - `corroborate = false`: beta += 1 (evidence contradicts the relationship)
-#[must_use]
-pub fn bayesian_update(current_confidence: f64, corroborate: bool) -> f64 {
-    let alpha = current_confidence * PSEUDOCOUNT;
-    let beta = PSEUDOCOUNT - alpha;
+/// `alpha` counts corroboration, `beta` counts contradiction. Both are
+/// weighted sums, not integers — an observation contributes its provenance
+/// weight. Counts are non-negative by construction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Evidence {
+    alpha: f64,
+    beta: f64,
+}
 
-    if corroborate {
-        (alpha + 1.0) / (alpha + beta + 1.0)
+impl Evidence {
+    /// Evidence for an edge that has only a mean: split [`PRIOR_CONCENTRATION`]
+    /// between the two counts so the mean is preserved exactly.
+    ///
+    /// This is the shape a brand-new edge starts in, and the shape the schema
+    /// migration backfills legacy edges into.
+    #[must_use]
+    pub fn from_prior(mean: f64) -> Self {
+        let mean = mean.clamp(0.0, 1.0);
+        Self {
+            alpha: mean * PRIOR_CONCENTRATION,
+            beta: (1.0 - mean) * PRIOR_CONCENTRATION,
+        }
+    }
+
+    /// Evidence from persisted counts. Non-finite or negative counts are
+    /// clamped to zero — a corrupt count must not produce a nonsense mean.
+    #[must_use]
+    pub fn from_counts(alpha: f64, beta: f64) -> Self {
+        Self {
+            alpha: sanitize_count(alpha),
+            beta: sanitize_count(beta),
+        }
+    }
+
+    /// Evidence for an edge as read from the store.
+    ///
+    /// Uses the persisted counts when present; falls back to
+    /// [`Evidence::from_prior`] over the stored mean when they are absent —
+    /// the shape of an edge on a store whose migration has not run yet.
+    #[must_use]
+    pub fn from_stored(alpha: Option<f64>, beta: Option<f64>, confidence: f64) -> Self {
+        match (alpha, beta) {
+            (Some(a), Some(b)) => Self::from_counts(a, b),
+            _ => Self::from_prior(confidence),
+        }
+    }
+
+    /// Record supporting evidence of the given weight.
+    pub fn corroborate(&mut self, weight: f64) {
+        self.alpha += sanitize_weight(weight);
+    }
+
+    /// Record contradicting evidence of the given weight.
+    pub fn contradict(&mut self, weight: f64) {
+        self.beta += sanitize_weight(weight);
+    }
+
+    /// Corroboration pseudo-count.
+    #[must_use]
+    pub fn alpha(self) -> f64 {
+        self.alpha
+    }
+
+    /// Contradiction pseudo-count.
+    #[must_use]
+    pub fn beta(self) -> f64 {
+        self.beta
+    }
+
+    /// Total evidence weight behind this edge (`alpha + beta`).
+    ///
+    /// This is what never grew in the pre-Phase-1 model: it is the difference
+    /// between "believed at 0.9" and "believed at 0.9 for good reason".
+    #[must_use]
+    pub fn concentration(self) -> f64 {
+        self.alpha + self.beta
+    }
+
+    /// Posterior mean — the value stored as the edge's `confidence`.
+    ///
+    /// With no evidence in either direction the mean is 0.5 (maximal ignorance).
+    #[must_use]
+    pub fn mean(self) -> f64 {
+        let total = self.concentration();
+        if total <= 0.0 {
+            return 0.5;
+        }
+        self.alpha / total
+    }
+
+    /// Posterior variance — `αβ / ((α+β)²(α+β+1))`.
+    ///
+    /// Strictly decreasing in the amount of evidence at a fixed mean, which is
+    /// how "corroborated fifty times" is told apart from "corroborated once".
+    #[must_use]
+    pub fn variance(self) -> f64 {
+        let total = self.concentration();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        (self.alpha * self.beta) / (total * total * (total + 1.0))
+    }
+}
+
+/// Clamp a persisted count into the non-negative reals.
+fn sanitize_count(count: f64) -> f64 {
+    if count.is_finite() && count > 0.0 {
+        count
     } else {
-        alpha / (alpha + beta + 1.0)
+        0.0
+    }
+}
+
+/// Clamp an observation weight; non-positive or non-finite weights record
+/// nothing rather than eroding accumulated evidence.
+fn sanitize_weight(weight: f64) -> f64 {
+    if weight.is_finite() && weight > 0.0 {
+        weight
+    } else {
+        0.0
     }
 }
 
@@ -136,39 +256,151 @@ mod tests {
         (a - b).abs() < 0.001
     }
 
+    /// One weighted observation on evidence derived from a bare mean.
+    fn one_observation(mean: f64, corroborate: bool) -> Evidence {
+        let mut evidence = Evidence::from_prior(mean);
+        if corroborate {
+            evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+        } else {
+            evidence.contradict(DEFAULT_EVIDENCE_WEIGHT);
+        }
+        evidence
+    }
+
     #[test]
-    fn bayesian_update_corroborate_0_6() {
-        let result = bayesian_update(0.6, true);
+    fn corroborate_from_prior_0_6() {
+        let result = one_observation(0.6, true).mean();
         // alpha=6, beta=4 -> (6+1)/(10+1) = 7/11 ≈ 0.636
         assert!(approx_eq(result, 0.636), "got {}", result);
     }
 
     #[test]
-    fn bayesian_update_contradict_0_6() {
-        let result = bayesian_update(0.6, false);
+    fn contradict_from_prior_0_6() {
+        let result = one_observation(0.6, false).mean();
         // alpha=6, beta=4 -> 6/(10+1) = 6/11 ≈ 0.545
         assert!(approx_eq(result, 0.545), "got {}", result);
     }
 
     #[test]
-    fn bayesian_update_corroborate_0_9() {
-        let result = bayesian_update(0.9, true);
+    fn corroborate_from_prior_0_9() {
+        let result = one_observation(0.9, true).mean();
         // alpha=9, beta=1 -> (9+1)/(10+1) = 10/11 ≈ 0.909
         assert!(approx_eq(result, 0.909), "got {}", result);
     }
 
     #[test]
-    fn bayesian_update_contradict_0_9() {
-        let result = bayesian_update(0.9, false);
+    fn contradict_from_prior_0_9() {
+        let result = one_observation(0.9, false).mean();
         // alpha=9, beta=1 -> 9/(10+1) = 9/11 ≈ 0.818
         assert!(approx_eq(result, 0.818), "got {}", result);
     }
 
     #[test]
-    fn bayesian_update_corroborate_0_3() {
-        let result = bayesian_update(0.3, true);
+    fn corroborate_from_prior_0_3() {
+        let result = one_observation(0.3, true).mean();
         // alpha=3, beta=7 -> (3+1)/(10+1) = 4/11 ≈ 0.364
         assert!(approx_eq(result, 0.364), "got {}", result);
+    }
+
+    #[test]
+    fn evidence_accumulates_across_observations() {
+        // docs/bayesian-confidence.md, worked example: an Inferred fact (0.6)
+        // corroborated three times, then contradicted once.
+        let mut evidence = Evidence::from_prior(0.6);
+        assert!(approx_eq(evidence.mean(), 0.600));
+
+        evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+        assert!(approx_eq(evidence.mean(), 0.636), "step 1: {evidence:?}");
+        evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+        assert!(approx_eq(evidence.mean(), 0.667), "step 2: {evidence:?}");
+        evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+        assert!(approx_eq(evidence.mean(), 0.692), "step 3: {evidence:?}");
+        evidence.contradict(DEFAULT_EVIDENCE_WEIGHT);
+        assert!(approx_eq(evidence.mean(), 0.643), "step 4: {evidence:?}");
+
+        assert!(approx_eq(evidence.alpha(), 9.0));
+        assert!(approx_eq(evidence.beta(), 5.0));
+        assert!(approx_eq(evidence.concentration(), 14.0));
+    }
+
+    #[test]
+    fn variance_narrows_with_corroboration() {
+        // AC1: more evidence at a comparable mean is a tighter posterior.
+        let after = |n: usize| {
+            let mut evidence = Evidence::from_prior(0.6);
+            for _ in 0..n {
+                evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+            }
+            evidence.variance()
+        };
+
+        assert!(
+            after(5) < after(1),
+            "5 obs: {} vs 1: {}",
+            after(5),
+            after(1)
+        );
+        assert!(
+            after(50) < after(5),
+            "50 obs: {} vs 5: {}",
+            after(50),
+            after(5)
+        );
+    }
+
+    #[test]
+    fn concentration_grows_by_observation_weight() {
+        let mut evidence = Evidence::from_prior(0.5);
+        assert!(approx_eq(evidence.concentration(), PRIOR_CONCENTRATION));
+
+        evidence.corroborate(0.05);
+        evidence.contradict(0.8);
+
+        assert!(approx_eq(evidence.alpha(), 5.05), "got {evidence:?}");
+        assert!(approx_eq(evidence.beta(), 5.8), "got {evidence:?}");
+        assert!(approx_eq(
+            evidence.concentration(),
+            PRIOR_CONCENTRATION + 0.85
+        ));
+    }
+
+    #[test]
+    fn non_positive_weights_record_nothing() {
+        let mut evidence = Evidence::from_prior(0.6);
+        evidence.corroborate(-1.0);
+        evidence.contradict(f64::NAN);
+
+        assert!(approx_eq(evidence.alpha(), 6.0));
+        assert!(approx_eq(evidence.beta(), 4.0));
+    }
+
+    #[test]
+    fn from_stored_prefers_persisted_counts() {
+        let persisted = Evidence::from_stored(Some(56.0), Some(4.0), 0.6);
+        assert!(approx_eq(persisted.concentration(), 60.0));
+        assert!(approx_eq(persisted.mean(), 56.0 / 60.0));
+    }
+
+    #[test]
+    fn from_stored_falls_back_to_prior_when_unmigrated() {
+        let legacy = Evidence::from_stored(None, None, 0.6);
+        assert!(approx_eq(legacy.alpha(), 6.0));
+        assert!(approx_eq(legacy.beta(), 4.0));
+        assert!(approx_eq(legacy.mean(), 0.6));
+    }
+
+    #[test]
+    fn empty_evidence_is_maximally_uncertain() {
+        let empty = Evidence::from_counts(0.0, 0.0);
+        assert!(approx_eq(empty.mean(), 0.5));
+        assert_eq!(empty.variance(), 0.0);
+    }
+
+    #[test]
+    fn corrupt_counts_are_clamped() {
+        let corrupt = Evidence::from_counts(-3.0, f64::INFINITY);
+        assert_eq!(corrupt.alpha(), 0.0);
+        assert_eq!(corrupt.beta(), 0.0);
     }
 
     #[test]

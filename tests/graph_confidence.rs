@@ -9,31 +9,45 @@ fn approx(a: f64, b: f64) -> bool {
     (a - b).abs() < 0.01
 }
 
-// ── Bayesian Update ────────────────────────────────────────────────
+// ── Evidence accumulation ──────────────────────────────────────────
+
+/// Evidence at the prior for `mean`, after `observations` corroborations
+/// (positive count) or contradictions (negative count).
+fn accumulate(mean: f64, observations: i32) -> Evidence {
+    let mut evidence = Evidence::from_prior(mean);
+    for _ in 0..observations.abs() {
+        if observations > 0 {
+            evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+        } else {
+            evidence.contradict(DEFAULT_EVIDENCE_WEIGHT);
+        }
+    }
+    evidence
+}
 
 #[test]
-fn bayesian_update_all_priors() {
+fn single_corroboration_from_all_priors() {
     // Authoritative (1.0): alpha=10, beta=0 -> corroborate: 11/11=1.0
-    let auth = bayesian_update(1.0, true);
+    let auth = accumulate(1.0, 1).mean();
     assert!(auth > 0.99, "authoritative corroborate: {auth}");
 
     // Explicit (0.9): alpha=9, beta=1 -> corroborate: 10/11≈0.909
-    let expl = bayesian_update(0.9, true);
+    let expl = accumulate(0.9, 1).mean();
     assert!(approx(expl, 0.909), "explicit corroborate: {expl}");
 
     // Inferred (0.6): alpha=6, beta=4 -> corroborate: 7/11≈0.636
-    let inf = bayesian_update(0.6, true);
+    let inf = accumulate(0.6, 1).mean();
     assert!(approx(inf, 0.636), "inferred corroborate: {inf}");
 
     // Speculative (0.3): alpha=3, beta=7 -> corroborate: 4/11≈0.364
-    let spec = bayesian_update(0.3, true);
+    let spec = accumulate(0.3, 1).mean();
     assert!(approx(spec, 0.364), "speculative corroborate: {spec}");
 }
 
 #[test]
-fn bayesian_update_contradiction_reduces() {
+fn contradiction_reduces_the_mean() {
     let before = 0.6;
-    let after = bayesian_update(before, false);
+    let after = accumulate(before, -1).mean();
     assert!(
         after < before,
         "contradiction should reduce: {before} -> {after}"
@@ -41,27 +55,57 @@ fn bayesian_update_contradiction_reduces() {
 }
 
 #[test]
-fn bayesian_update_repeated_corroboration_converges() {
-    let mut score = 0.3; // speculative
-    for _ in 0..50 {
-        score = bayesian_update(score, true);
-    }
+fn repeated_corroboration_converges_upward() {
+    // Speculative prior (alpha=3, beta=7). Corroboration only adds to alpha —
+    // the 7 units of prior doubt are never discarded, so convergence toward
+    // 1.0 is bounded by how much evidence has actually accumulated. (The
+    // pre-Phase-1 stateless update re-derived the counts each time and so
+    // reached 0.95 in 50 steps; that speed was an artifact of forgetting.)
+    let fifty = accumulate(0.3, 50).mean();
+    assert!(fifty > 0.85, "50 corroborations: {fifty}");
+    assert!(fifty < 1.0, "doubt is never fully erased: {fifty}");
+
+    let two_hundred = accumulate(0.3, 200).mean();
     assert!(
-        score > 0.95,
-        "50 corroborations should converge near 1.0: {score}"
+        two_hundred > fifty,
+        "more evidence must move further: {two_hundred} vs {fifty}"
     );
+    assert!(two_hundred > 0.95, "200 corroborations: {two_hundred}");
 }
 
 #[test]
-fn bayesian_update_repeated_contradiction_converges() {
-    let mut score = 0.9; // explicit
-    for _ in 0..50 {
-        score = bayesian_update(score, false);
-    }
+fn repeated_contradiction_converges_downward() {
+    let fifty = accumulate(0.9, -50).mean();
+    assert!(fifty < 0.2, "50 contradictions: {fifty}");
+
+    let two_hundred = accumulate(0.9, -200).mean();
     assert!(
-        score < 0.05,
-        "50 contradictions should converge near 0.0: {score}"
+        two_hundred < fifty,
+        "more evidence must move further: {two_hundred} vs {fifty}"
     );
+    assert!(two_hundred < 0.05, "200 contradictions: {two_hundred}");
+}
+
+#[test]
+fn accumulated_evidence_narrows_the_posterior() {
+    // AC1: the property the stateless model could not express.
+    let one = accumulate(0.6, 1);
+    let five = accumulate(0.6, 5);
+    let fifty = accumulate(0.6, 50);
+
+    assert!(
+        five.variance() < one.variance(),
+        "5 obs {} vs 1 obs {}",
+        five.variance(),
+        one.variance()
+    );
+    assert!(
+        fifty.variance() < five.variance(),
+        "50 obs {} vs 5 obs {}",
+        fifty.variance(),
+        five.variance()
+    );
+    assert!(fifty.concentration() > five.concentration());
 }
 
 // ── Temporal Decay ────────────────────────────────────────────────

@@ -167,7 +167,20 @@ pub struct Relationship {
     pub description: Option<String>,
     pub valid_from: serde_json::Value,
     pub valid_until: Option<serde_json::Value>,
+    /// Posterior mean of the edge's Beta distribution — `alpha / (alpha + beta)`.
+    /// Kept in sync with the counts on every write; this is what read paths score on.
     pub confidence: f64,
+    /// Accumulated corroborating evidence (Beta α).
+    /// `None` only on an edge the schema migration has not reached yet.
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    /// Accumulated contradicting evidence (Beta β).
+    #[serde(default)]
+    pub beta: Option<f64>,
+    /// How many corroborations came from the agent itself — counted, never
+    /// laundered into confidence. Populated from Phase 1 increment 2 onward.
+    #[serde(default)]
+    pub self_reinforcements: Option<i64>,
     /// When this relationship was last reinforced (Bayesian corroboration).
     /// Used by temporal decay: effective_confidence = confidence × 0.5^(days_since / half_life).
     #[serde(default)]
@@ -183,6 +196,13 @@ impl Relationship {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         }
+    }
+
+    /// The edge's accumulated evidence, falling back to the prior implied by
+    /// its mean when the counts have not been backfilled yet.
+    #[must_use]
+    pub fn evidence(&self) -> crate::graph::confidence::Evidence {
+        crate::graph::confidence::Evidence::from_stored(self.alpha, self.beta, self.confidence)
     }
 }
 

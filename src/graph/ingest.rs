@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt};
 
-use super::confidence::{bayesian_update, ExtractionContext};
+use super::confidence::{ExtractionContext, DEFAULT_EVIDENCE_WEIGHT};
 use super::crud;
 use super::dedup::{self, ResolvedEntity};
 use super::error::GraphError;
@@ -192,10 +192,12 @@ async fn process_extraction(
         if let Some(existing) =
             find_existing_relationship(gm, from_name, to_name, &rel.rel_type).await
         {
-            // Re-extraction is corroborating evidence — Bayesian update + reset decay clock
-            let updated = bayesian_update(existing.confidence, true);
+            // Re-extraction is corroborating evidence: add weight to the edge's
+            // accumulated counts and reset the decay clock.
+            let mut evidence = existing.evidence();
+            evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
             if let Err(e) =
-                crud::reinforce_relationship(gm.db(), &existing.id_string(), updated).await
+                crud::reinforce_relationship(gm.db(), &existing.id_string(), evidence).await
             {
                 report
                     .errors

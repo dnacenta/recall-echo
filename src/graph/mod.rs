@@ -254,7 +254,8 @@ impl GraphMemory {
         crud::supersede_relationship(&self.db, old_id, new).await
     }
 
-    /// Update relationship confidence (Bayesian posterior).
+    /// Overwrite a relationship's confidence, resetting its evidence to the
+    /// prior around the new mean.
     pub async fn update_relationship_confidence(
         &self,
         rel_id: &str,
@@ -263,16 +264,17 @@ impl GraphMemory {
         crud::update_relationship_confidence(&self.db, rel_id, confidence).await
     }
 
-    /// Reinforce a relationship: Bayesian update + reset decay clock.
+    /// Persist updated evidence for a relationship and reset its decay clock.
     ///
-    /// Called when a relationship is corroborated. Updates confidence and resets
-    /// `last_reinforced` to now, preventing temporal decay from eroding the edge.
+    /// Called when a relationship is corroborated: the new posterior mean is
+    /// stored as `confidence` and `last_reinforced` is set to now, preventing
+    /// temporal decay from eroding the edge.
     pub async fn reinforce_relationship(
         &self,
         rel_id: &str,
-        new_confidence: f64,
+        evidence: confidence::Evidence,
     ) -> Result<(), GraphError> {
-        crud::reinforce_relationship(&self.db, rel_id, new_confidence).await
+        crud::reinforce_relationship(&self.db, rel_id, evidence).await
     }
 
     // --- Episodes ---

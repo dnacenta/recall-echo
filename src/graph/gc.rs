@@ -591,6 +591,9 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.3,
+            alpha: Some(3.0),
+            beta: Some(7.0),
+            self_reinforcements: Some(0),
             last_reinforced: None,
             source: Some("ingest".to_string()),
         }];
@@ -617,6 +620,9 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.8,
+            alpha: Some(8.0),
+            beta: Some(2.0),
+            self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
         }];
@@ -642,6 +648,9 @@ mod tests {
             valid_from: serde_json::Value::String(recent_date),
             valid_until: None,
             confidence: 0.3,
+            alpha: Some(3.0),
+            beta: Some(7.0),
+            self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
         }];
@@ -667,6 +676,9 @@ mod tests {
             valid_from: serde_json::Value::String(old_date.clone()),
             valid_until: Some(serde_json::Value::String(old_date)),
             confidence: 0.3,
+            alpha: Some(3.0),
+            beta: Some(7.0),
+            self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
         }];
@@ -692,6 +704,9 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.1,
+            alpha: Some(1.0),
+            beta: Some(9.0),
+            self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
         }];
@@ -719,6 +734,9 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.1,
+            alpha: Some(1.0),
+            beta: Some(9.0),
+            self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
         }];
@@ -759,7 +777,10 @@ mod tests {
             description: Some("decayed rel".to_string()),
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
-            confidence: 0.6,       // Above stale threshold!
+            confidence: 0.6, // Above stale threshold!
+            alpha: Some(6.0),
+            beta: Some(4.0),
+            self_reinforcements: Some(0),
             last_reinforced: None, // Never reinforced, so decays from valid_from
             source: None,
         }];
@@ -793,6 +814,9 @@ mod tests {
             valid_from: serde_json::Value::String(old_date),
             valid_until: None,
             confidence: 0.6,
+            alpha: Some(6.0),
+            beta: Some(4.0),
+            self_reinforcements: Some(0),
             last_reinforced: Some(serde_json::Value::String(recent_reinforce)),
             source: None,
         }];
