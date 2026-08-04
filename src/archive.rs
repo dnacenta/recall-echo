@@ -443,6 +443,22 @@ pub fn archive_from_jsonl(
 /// Reads hook input from stdin.
 pub fn run_from_hook() -> Result<(), RecallError> {
     let hook_input = crate::jsonl::read_hook_input()?;
+    run_with_hook_input(&hook_input)
+}
+
+/// Archive the session named by a hook input.
+///
+/// Sessions run with --no-session-persistence never write a transcript.
+/// A missing file is a normal no-op for the hook, not an error — failing
+/// here makes the entire `claude -p` invocation exit nonzero.
+pub fn run_with_hook_input(hook_input: &crate::jsonl::HookInput) -> Result<(), RecallError> {
+    if !Path::new(&hook_input.transcript_path).exists() {
+        eprintln!(
+            "recall-echo: no transcript at {} (session not persisted), nothing to archive",
+            hook_input.transcript_path
+        );
+        return Ok(());
+    }
     let base_dir = crate::paths::claude_dir()?;
     archive_from_jsonl(
         &base_dir,
@@ -720,5 +736,17 @@ mod tests {
 
         let result = archive_conversation(memory, &conv, &summary, "test").unwrap();
         assert_eq!(result.log_number, 0);
+    }
+
+    #[test]
+    fn hook_missing_transcript_exits_ok() {
+        let hook_input = crate::jsonl::HookInput {
+            session_id: "no-persist".into(),
+            transcript_path: "/nonexistent/path/transcript.jsonl".into(),
+            _cwd: None,
+            _hook_event_name: None,
+        };
+        // --no-session-persistence sessions have no transcript: must be Ok, not Err.
+        assert!(run_with_hook_input(&hook_input).is_ok());
     }
 }

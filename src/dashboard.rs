@@ -279,7 +279,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
         );
 
         let mut sorted: Vec<_> = memory_stats.sections.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         let top: Vec<String> = sorted
             .iter()
             .take(3)
@@ -749,11 +749,7 @@ pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
 
 fn memory_bar(count: usize, max: usize) -> String {
     let width = 10;
-    let filled = if max > 0 {
-        (count * width / max).min(width)
-    } else {
-        0
-    };
+    let filled = (count * width).checked_div(max).map_or(0, |f| f.min(width));
     let empty = width - filled;
 
     let color = if count > max * 90 / 100 {

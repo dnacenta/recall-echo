@@ -25,7 +25,10 @@ impl TestDb {
     }
 }
 
-// Re-export fixture builders
+// Re-export fixture builders.
+// Each integration-test binary compiles this module independently; not every
+// binary uses every fixture, so unused-code lints don't apply here.
+#[allow(dead_code)]
 pub mod fixtures {
     use recall_echo::graph::types::{EntityType, NewEntity, NewRelationship};
 
