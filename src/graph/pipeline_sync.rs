@@ -197,9 +197,9 @@ async fn cross_reference_episodes(
                 source: Some("pipeline:cross-ref".into()),
             };
 
-            match gm.add_relationship(new_rel).await {
-                Ok(_) => report.relationships_created += 1,
-                Err(_) => {} // Silently skip — entity name might not match graph entity name
+            // Errors silently skipped — entity name might not match graph entity name
+            if gm.add_relationship(new_rel).await.is_ok() {
+                report.relationships_created += 1;
             }
         }
     }
