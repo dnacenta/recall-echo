@@ -30,7 +30,7 @@ use crate::graph::error::GraphError;
 use crate::graph::types::{
     EntityType, NewEntity, NewRelationship, PipelineDocuments, QueryOptions, SearchOptions,
 };
-use crate::graph::GraphMemory;
+use crate::graph::{GraphMemory, IngestContext, Provenance};
 use crate::serve_security::{
     append_private_file, check_peer_uid, current_uid, unlink_socket, PRIVATE_FILE_MODE,
 };
@@ -192,6 +192,10 @@ pub struct IngestArchiveArgs {
     pub session_id: String,
     #[serde(default)]
     pub log_number: Option<u32>,
+    /// Force one provenance class on every episode of this run. Absent — the
+    /// shape older clients send — means infer per chunk from turn roles.
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
 }
 
 /// Pipeline sync needs no LLM provider, so it runs against the daemon like any
@@ -406,9 +410,9 @@ async fn execute_graph(
             serde_json::to_value(relationship)?
         }
         Request::IngestArchive(args) => {
-            let report = graph
-                .ingest_archive(&args.content, &args.session_id, args.log_number, None)
-                .await?;
+            let context = IngestContext::new(args.session_id.clone(), args.log_number)
+                .with_override(args.provenance);
+            let report = graph.ingest_archive(&args.content, &context, None).await?;
             serde_json::to_value(report)?
         }
         Request::SyncPipeline(args) => {
@@ -1065,6 +1069,7 @@ mod tests {
                 content: "# log".into(),
                 session_id: "s1".into(),
                 log_number: Some(7),
+                provenance: Some(Provenance::External),
             }),
             Request::SyncPipeline(SyncPipelineArgs {
                 docs: PipelineDocuments {
@@ -1080,6 +1085,25 @@ mod tests {
             let parsed: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(parsed, request, "round trip failed for {line}");
         }
+    }
+
+    #[test]
+    fn ingest_requests_without_provenance_still_parse() {
+        // The wire shape older clients send: absent means "infer from turn
+        // roles", so a pre-provenance client keeps working unchanged.
+        let parsed: Request = serde_json::from_str(
+            r##"{"op":"ingest_archive","args":{"content":"# log","session_id":"s1"}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Request::IngestArchive(IngestArchiveArgs {
+                content: "# log".into(),
+                session_id: "s1".into(),
+                log_number: None,
+                provenance: None,
+            })
+        );
     }
 
     #[test]

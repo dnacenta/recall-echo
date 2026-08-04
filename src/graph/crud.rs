@@ -2,7 +2,7 @@
 
 use surrealdb::Surreal;
 
-use super::confidence::Evidence;
+use super::confidence::{EdgeEvidence, Evidence, Provenance};
 use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
@@ -272,26 +272,34 @@ pub async fn update_relationship_confidence(
 /// Persist updated evidence for a relationship and reset its decay clock.
 ///
 /// Called when a relationship is corroborated (or contradicted) by
-/// re-extraction: the caller loads the edge's [`Evidence`], records the
-/// observation, and hands the result here. The stored `confidence` is the
-/// posterior mean of the new counts, and `last_reinforced = now` restarts
-/// temporal decay.
+/// re-extraction: the caller loads the edge's [`EdgeEvidence`], records the
+/// observation with its provenance, and hands the result here. The stored
+/// `confidence` is the posterior mean of the new counts, `self_reinforcements`
+/// is the coherence tally kept out of that mean, and `last_reinforced = now`
+/// restarts temporal decay.
+///
+/// The counts are written whole rather than incremented in SurrealQL: the
+/// caller has already read them, and a full write keeps mean and counts from
+/// ever disagreeing.
 pub async fn reinforce_relationship(
     db: &Surreal<Db>,
     rel_id: &str,
-    evidence: Evidence,
+    evidence: EdgeEvidence,
 ) -> Result<(), GraphError> {
+    let counts = evidence.evidence();
     db.query(
         r#"UPDATE type::record($id) SET
                confidence = $confidence,
                alpha = $alpha,
                beta = $beta,
+               self_reinforcements = $self_reinforcements,
                last_reinforced = time::now()"#,
     )
     .bind(("id", rel_id.to_string()))
-    .bind(("confidence", evidence.mean()))
-    .bind(("alpha", evidence.alpha()))
-    .bind(("beta", evidence.beta()))
+    .bind(("confidence", counts.mean()))
+    .bind(("alpha", counts.alpha()))
+    .bind(("beta", counts.beta()))
+    .bind(("self_reinforcements", evidence.self_reinforcements()))
     .await?
     .check()?;
     Ok(())
@@ -397,11 +405,30 @@ pub async fn increment_access_counts(db: &Surreal<Db>, ids: &[String]) -> Result
 
 // ── Episode CRUD ─────────────────────────────────────────────────────
 
-/// Add a new episode to the graph. Embeds the abstract text for vector search.
+/// Add a new episode authored by the agent itself.
+///
+/// The conservative default for callers that cannot say where the text came
+/// from: unattributed text must never be counted as independent evidence.
 pub async fn add_episode(
     db: &Surreal<Db>,
     embedder: &dyn Embedder,
     episode: NewEpisode,
+) -> Result<Episode, GraphError> {
+    add_episode_from(db, embedder, episode, Provenance::SelfGenerated).await
+}
+
+/// Add a new episode stamped with who authored it. Embeds the abstract text
+/// for vector search.
+///
+/// Provenance is an argument rather than a field of [`NewEpisode`] because it
+/// is a property of the *ingestion context*, not of the text: the same chunk
+/// is external when read out of a document and self-authored when the agent
+/// wrote it.
+pub async fn add_episode_from(
+    db: &Surreal<Db>,
+    embedder: &dyn Embedder,
+    episode: NewEpisode,
+    provenance: Provenance,
 ) -> Result<Episode, GraphError> {
     let embedding = embedder.embed_single(&episode.abstract_text)?;
 
@@ -415,7 +442,8 @@ pub async fn add_episode(
                 overview = $overview,
                 content = $content,
                 embedding = $embedding,
-                log_number = $log_number
+                log_number = $log_number,
+                provenance = $provenance
             "#,
         )
         .bind(("session_id", episode.session_id))
@@ -424,6 +452,7 @@ pub async fn add_episode(
         .bind(("content", episode.content))
         .bind(("embedding", embedding))
         .bind(("log_number", episode.log_number.map(|n| n as i64)))
+        .bind(("provenance", provenance.as_str().to_string()))
         .await?;
 
     let created: Option<Episode> = deserialize_take_opt(&mut response, 0)?;

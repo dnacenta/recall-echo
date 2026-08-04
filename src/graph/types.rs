@@ -3,6 +3,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::confidence::{EdgeEvidence, Evidence, Provenance};
+
 /// Node types in the knowledge graph.
 /// Mutable types can be merged/updated. Immutable types are historical facts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -201,8 +203,15 @@ impl Relationship {
     /// The edge's accumulated evidence, falling back to the prior implied by
     /// its mean when the counts have not been backfilled yet.
     #[must_use]
-    pub fn evidence(&self) -> crate::graph::confidence::Evidence {
-        crate::graph::confidence::Evidence::from_stored(self.alpha, self.beta, self.confidence)
+    pub fn evidence(&self) -> Evidence {
+        Evidence::from_stored(self.alpha, self.beta, self.confidence)
+    }
+
+    /// The edge's full evidence state — Beta counts plus coherence tally.
+    /// This is what a confidence-moving observation is applied to.
+    #[must_use]
+    pub fn edge_evidence(&self) -> EdgeEvidence {
+        EdgeEvidence::new(self.evidence(), self.self_reinforcements.unwrap_or(0))
     }
 }
 
@@ -427,6 +436,11 @@ pub struct Episode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     pub log_number: Option<i64>,
+    /// Authorship class as stored. Absent on episodes written before
+    /// provenance existed; read it through [`Episode::provenance`], which
+    /// resolves absent and unrecognised values conservatively.
+    #[serde(default)]
+    pub provenance: Option<String>,
 }
 
 impl Episode {
@@ -436,6 +450,14 @@ impl Episode {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         }
+    }
+
+    /// Who authored this episode. Legacy and unrecognised values resolve to
+    /// [`Provenance::SelfGenerated`] — unlabelled text never earns full
+    /// evidence weight.
+    #[must_use]
+    pub fn provenance(&self) -> Provenance {
+        Provenance::from_stored(self.provenance.as_deref())
     }
 }
 

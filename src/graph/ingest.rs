@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt};
 
-use super::confidence::{ExtractionContext, DEFAULT_EVIDENCE_WEIGHT};
+use super::confidence::{ExtractionContext, Provenance};
 use super::crud;
 use super::dedup::{self, ResolvedEntity};
 use super::error::GraphError;
@@ -16,18 +16,122 @@ use super::GraphMemory;
 /// Maximum number of concurrent LLM calls during extraction and dedup.
 const LLM_CONCURRENCY: usize = 10;
 
+/// Role headings written by the archive pipeline, lower-cased.
+const USER_TURN_HEADING: &str = "### user";
+const ASSISTANT_TURN_HEADING: &str = "### assistant";
+
+/// How one ingestion run assigns a provenance class to what it writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProvenancePolicy {
+    /// Read the class off each chunk's conversation turn roles. Text with no
+    /// visible human-only turn is treated as the agent's own.
+    #[default]
+    FromTurnRoles,
+    /// Stamp every episode in the run with one class — document ingestion
+    /// (`--external`), and any caller that knows better than the heuristic.
+    Fixed(Provenance),
+}
+
+impl ProvenancePolicy {
+    /// The class this policy assigns to one chunk of archive text.
+    #[must_use]
+    pub fn classify(self, chunk: &str) -> Provenance {
+        match self {
+            Self::Fixed(provenance) => provenance,
+            Self::FromTurnRoles => infer_from_turn_roles(chunk),
+        }
+    }
+}
+
+/// Where a run of ingestion is reading from, and what that makes its output.
+///
+/// Carried as one value rather than three parameters because every write the
+/// run performs — episodes and confidence updates alike — must agree on it.
+#[derive(Debug, Clone)]
+pub struct IngestContext {
+    session_id: String,
+    log_number: Option<u32>,
+    provenance: ProvenancePolicy,
+}
+
+impl IngestContext {
+    /// Context for a conversation archive: provenance is read off turn roles.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, log_number: Option<u32>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            log_number,
+            provenance: ProvenancePolicy::default(),
+        }
+    }
+
+    /// Override the class assignment for the whole run.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: ProvenancePolicy) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    /// Force every episode in the run to one class, or infer per chunk when
+    /// `provenance` is `None`. The shape a CLI `--external` flag arrives in.
+    #[must_use]
+    pub fn with_override(self, provenance: Option<Provenance>) -> Self {
+        match provenance {
+            Some(class) => self.with_provenance(ProvenancePolicy::Fixed(class)),
+            None => self,
+        }
+    }
+
+    /// Session this text belongs to.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Archive log number, when the text came from a numbered archive.
+    #[must_use]
+    pub fn log_number(&self) -> Option<u32> {
+        self.log_number
+    }
+}
+
+/// Infer authorship from the role headings the archive pipeline writes.
+///
+/// A chunk is credited to the human only when every role heading in it is a
+/// user turn. Anything else — mixed turns, assistant turns, or text with no
+/// headings at all (pipeline documents, summaries) — is the agent's own, per
+/// the conservative default: never over-credit.
+fn infer_from_turn_roles(chunk: &str) -> Provenance {
+    let mut saw_user = false;
+    for line in chunk.lines() {
+        let heading = line.trim().to_lowercase();
+        if heading == ASSISTANT_TURN_HEADING {
+            return Provenance::SelfGenerated;
+        }
+        if heading == USER_TURN_HEADING {
+            saw_user = true;
+        }
+    }
+
+    if saw_user {
+        Provenance::User
+    } else {
+        Provenance::SelfGenerated
+    }
+}
+
 /// Ingest a conversation archive into the knowledge graph.
 ///
 /// Flow:
 /// 1. Chunk the conversation text
-/// 2. Create an Episode for each chunk (always, even without LLM)
+/// 2. Create an Episode for each chunk, stamped with its provenance (always,
+///    even without LLM)
 /// 3. If LLM provided: extract entities/relationships, dedup, store
 /// 4. Return a report of what was created/merged/skipped
 pub async fn ingest_archive(
     gm: &GraphMemory,
     archive_text: &str,
-    session_id: &str,
-    log_number: Option<u32>,
+    context: &IngestContext,
     llm: Option<&dyn LlmProvider>,
 ) -> Result<IngestionReport, GraphError> {
     let mut report = IngestionReport::default();
@@ -37,18 +141,22 @@ pub async fn ingest_archive(
         return Ok(report);
     }
 
-    // Create episodes for each chunk
+    // Create episodes for each chunk, each stamped with its own authorship —
+    // one archive can hold both the human's words and the agent's.
     for (i, chunk) in chunks.iter().enumerate() {
         let abstract_text = build_episode_abstract(chunk);
         let episode = NewEpisode {
-            session_id: session_id.to_string(),
+            session_id: context.session_id.clone(),
             abstract_text,
             overview: None,
             content: Some(chunk.clone()),
-            log_number,
+            log_number: context.log_number,
         };
 
-        match gm.add_episode(episode).await {
+        match gm
+            .add_episode_from(episode, context.provenance.classify(chunk))
+            .await
+        {
             Ok(_) => report.episodes_created += 1,
             Err(e) => {
                 report.errors.push(format!("episode chunk {i}: {e}"));
@@ -58,7 +166,7 @@ pub async fn ingest_archive(
 
     // If LLM provided, run extraction on all chunks
     if let Some(llm) = llm {
-        process_extraction(gm, &chunks, session_id, log_number, llm, &mut report).await?;
+        process_extraction(gm, &chunks, context, llm, &mut report).await?;
     }
 
     Ok(report)
@@ -71,8 +179,7 @@ pub async fn ingest_archive(
 pub async fn extract_from_archive(
     gm: &GraphMemory,
     archive_text: &str,
-    session_id: &str,
-    log_number: Option<u32>,
+    context: &IngestContext,
     llm: &dyn LlmProvider,
 ) -> Result<IngestionReport, GraphError> {
     let mut report = IngestionReport::default();
@@ -82,7 +189,7 @@ pub async fn extract_from_archive(
         return Ok(report);
     }
 
-    process_extraction(gm, &chunks, session_id, log_number, llm, &mut report).await?;
+    process_extraction(gm, &chunks, context, llm, &mut report).await?;
 
     Ok(report)
 }
@@ -114,11 +221,12 @@ async fn extract_indexed(
 async fn process_extraction(
     gm: &GraphMemory,
     chunks: &[String],
-    session_id: &str,
-    log_number: Option<u32>,
+    context: &IngestContext,
     llm: &dyn LlmProvider,
     report: &mut IngestionReport,
 ) -> Result<(), GraphError> {
+    let session_id = context.session_id.as_str();
+    let log_number = context.log_number;
     // Phase 1: Extract all chunks in parallel.
     // The per-chunk futures are built by the iterator, not by a stream
     // combinator: a closure applied inside the stream would have to be
@@ -135,15 +243,23 @@ async fn process_extraction(
             .collect()
             .await;
 
-    // Collect entities and relationships from successful extractions
+    // Collect entities and relationships from successful extractions. A
+    // relationship keeps the class of the chunk it came out of: the evidence
+    // is only ever as independent as the text that produced it.
     let mut all_entities: Vec<ExtractedEntity> = Vec::new();
-    let mut all_relationships: Vec<ExtractedRelationship> = Vec::new();
+    let mut all_relationships: Vec<(Provenance, ExtractedRelationship)> = Vec::new();
 
     for (i, result) in extraction_results {
         match result {
             Ok(extraction) => {
+                let provenance = context.provenance.classify(&chunks[i]);
                 all_entities.extend(extract::flatten_extraction(&extraction));
-                all_relationships.extend(extraction.relationships);
+                all_relationships.extend(
+                    extraction
+                        .relationships
+                        .into_iter()
+                        .map(|rel| (provenance, rel)),
+                );
                 // Estimate ~2500 tokens per extracted chunk (system prompt + chunk input + output)
                 report.estimated_tokens += 2500;
             }
@@ -184,7 +300,7 @@ async fn process_extraction(
     }
 
     // Phase 4: Create relationships or Bayesian-update existing ones
-    for rel in &all_relationships {
+    for (provenance, rel) in &all_relationships {
         let from_name = name_map.get(&rel.source).unwrap_or(&rel.source);
         let to_name = name_map.get(&rel.target).unwrap_or(&rel.target);
 
@@ -192,10 +308,12 @@ async fn process_extraction(
         if let Some(existing) =
             find_existing_relationship(gm, from_name, to_name, &rel.rel_type).await
         {
-            // Re-extraction is corroborating evidence: add weight to the edge's
-            // accumulated counts and reset the decay clock.
-            let mut evidence = existing.evidence();
-            evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+            // Re-extraction is corroborating evidence — worth what its source
+            // is worth. Self-authored corroboration also lands in the edge's
+            // coherence tally, where it stays visible instead of passing for
+            // independent support.
+            let mut evidence = existing.edge_evidence();
+            evidence.corroborate(*provenance, gm.provenance_weights());
             if let Err(e) =
                 crud::reinforce_relationship(gm.db(), &existing.id_string(), evidence).await
             {
@@ -341,5 +459,65 @@ mod tests {
         let short = "Hello world";
         let abs = build_episode_abstract(short);
         assert_eq!(abs, "Hello world");
+    }
+
+    #[test]
+    fn user_only_chunk_is_credited_to_the_human() {
+        let chunk = "### User\n\nI moved the repo to /opt/recall-echo.";
+        assert_eq!(infer_from_turn_roles(chunk), Provenance::User);
+    }
+
+    #[test]
+    fn assistant_turns_make_a_chunk_self_authored() {
+        let chunk = "### Assistant\n\nThe repo now lives at /opt/recall-echo.";
+        assert_eq!(infer_from_turn_roles(chunk), Provenance::SelfGenerated);
+    }
+
+    #[test]
+    fn mixed_chunk_is_self_authored() {
+        // The conservative half of the rule: a chunk the agent contributed to
+        // cannot be counted as independent testimony.
+        let chunk = "### User\n\nWhere does it live?\n\n---\n\n### Assistant\n\n/opt.";
+        assert_eq!(infer_from_turn_roles(chunk), Provenance::SelfGenerated);
+    }
+
+    #[test]
+    fn text_without_role_headings_is_self_authored() {
+        let chunk = "A pipeline document with no conversation structure at all.";
+        assert_eq!(infer_from_turn_roles(chunk), Provenance::SelfGenerated);
+    }
+
+    #[test]
+    fn heading_matching_is_exact() {
+        // "### Users of the system" is a topic, not a turn.
+        let chunk = "### Users of the system\n\nThey prefer NeoVim.";
+        assert_eq!(infer_from_turn_roles(chunk), Provenance::SelfGenerated);
+    }
+
+    #[test]
+    fn fixed_policy_overrides_turn_roles() {
+        let chunk = "### User\n\nA quote from a paper.";
+        let policy = ProvenancePolicy::Fixed(Provenance::External);
+        assert_eq!(policy.classify(chunk), Provenance::External);
+        assert_eq!(
+            ProvenancePolicy::FromTurnRoles.classify(chunk),
+            Provenance::User
+        );
+    }
+
+    #[test]
+    fn context_override_is_applied_only_when_present() {
+        let context = IngestContext::new("s1", Some(7));
+        assert_eq!(context.session_id(), "s1");
+        assert_eq!(context.log_number(), Some(7));
+
+        let inferring = context.clone().with_override(None);
+        assert_eq!(inferring.provenance, ProvenancePolicy::FromTurnRoles);
+
+        let forced = context.with_override(Some(Provenance::External));
+        assert_eq!(
+            forced.provenance,
+            ProvenancePolicy::Fixed(Provenance::External)
+        );
     }
 }

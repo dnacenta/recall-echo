@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::error::RecallError;
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::*;
+use crate::graph::{IngestContext, Provenance};
 use crate::serve::{
     AddEntityArgs, IngestArchiveArgs, QueryArgs, RelateArgs, Request, SearchArgs, TraverseArgs,
 };
@@ -199,7 +200,15 @@ pub async fn search(
 }
 
 /// Ingest a single archive file into the graph (episodes only, no LLM extraction).
-pub async fn ingest(memory_dir: &Path, archive_path: &Path) -> Result<(), RecallError> {
+///
+/// `provenance` forces an authorship class on every episode of the run — how
+/// `--external` marks genuinely external material. `None` infers per chunk
+/// from conversation turn roles.
+pub async fn ingest(
+    memory_dir: &Path,
+    archive_path: &Path,
+    provenance: Option<Provenance>,
+) -> Result<(), RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -216,14 +225,16 @@ pub async fn ingest(memory_dir: &Path, archive_path: &Path) -> Result<(), Recall
         content,
         session_id,
         log_number,
+        provenance,
     });
     let report: IngestionReport =
         serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
-        "{GREEN}✓{RESET} Ingested {}: {} episodes created",
+        "{GREEN}✓{RESET} Ingested {}: {} episodes created {DIM}(provenance: {}){RESET}",
         archive_path.display(),
-        report.episodes_created
+        report.episodes_created,
+        provenance_label(provenance)
     );
     if !report.errors.is_empty() {
         for err in &report.errors {
@@ -233,8 +244,21 @@ pub async fn ingest(memory_dir: &Path, archive_path: &Path) -> Result<(), Recall
     Ok(())
 }
 
+/// How an ingest run's provenance choice reads in its summary line.
+fn provenance_label(provenance: Option<Provenance>) -> &'static str {
+    match provenance {
+        Some(Provenance::External) => "external",
+        Some(Provenance::User) => "user",
+        Some(Provenance::SelfGenerated) => "self",
+        None => "per turn role",
+    }
+}
+
 /// Ingest all un-ingested archives in conversations/.
-pub async fn ingest_all(memory_dir: &Path) -> Result<(), RecallError> {
+pub async fn ingest_all(
+    memory_dir: &Path,
+    provenance: Option<Provenance>,
+) -> Result<(), RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -278,9 +302,8 @@ pub async fn ingest_all(memory_dir: &Path) -> Result<(), RecallError> {
                 }
             }
 
-            let report = gm
-                .ingest_archive(&content, &session_id, log_number, None)
-                .await?;
+            let context = IngestContext::new(session_id, log_number).with_override(provenance);
+            let report = gm.ingest_archive(&content, &context, None).await?;
 
             total_episodes += report.episodes_created;
             ingested += 1;
@@ -293,7 +316,8 @@ pub async fn ingest_all(memory_dir: &Path) -> Result<(), RecallError> {
         }
 
         println!(
-            "\n{GREEN}✓{RESET} Ingested {ingested} archives ({total_episodes} episodes), skipped {skipped} already ingested"
+            "\n{GREEN}✓{RESET} Ingested {ingested} archives ({total_episodes} episodes), skipped {skipped} already ingested {DIM}(provenance: {}){RESET}",
+            provenance_label(provenance)
         );
         Ok(())
     })
@@ -596,12 +620,10 @@ pub async fn extract(
 
             let content = std::fs::read_to_string(&archive_path)?;
             let (session_id, _) = extract_archive_metadata(&content, &archive_path);
+            let context = IngestContext::new(session_id, Some(*ln));
 
             // Try extraction, retry once on failure, quarantine on second failure
-            let report = match gm
-                .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
-                .await
-            {
+            let report = match gm.extract_from_archive(&content, &context, &*llm).await {
                 Ok(r) => r,
                 Err(e) => {
                     println!(
@@ -609,10 +631,7 @@ pub async fn extract(
                         idx + 1,
                         total_count
                     );
-                    match gm
-                        .extract_from_archive(&content, &session_id, Some(*ln), &*llm)
-                        .await
-                    {
+                    match gm.extract_from_archive(&content, &context, &*llm).await {
                         Ok(r) => r,
                         Err(e2) => {
                             println!(

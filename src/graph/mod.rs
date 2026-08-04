@@ -26,8 +26,10 @@ pub mod vigil_sync;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use confidence::{Provenance, ProvenanceWeights};
 use embed::{FastEmbedder, LazyEmbedder};
 use error::GraphError;
+pub use ingest::{IngestContext, ProvenancePolicy};
 use store::Db;
 pub use store::ServerConfig;
 #[allow(unused_imports)] // Required in scope for SurrealValue derive macro expansion
@@ -62,6 +64,7 @@ pub struct GraphMemory {
     embedder: LazyEmbedder,
     path: PathBuf,
     scoring: crate::config::GraphScoringConfig,
+    provenance: confidence::ProvenanceWeights,
 }
 
 impl GraphMemory {
@@ -98,13 +101,14 @@ impl GraphMemory {
         std::fs::create_dir_all(&models_dir)?;
         let embedder = LazyEmbedder::new(&models_dir);
 
-        let scoring = load_scoring_config(path);
+        let graph_config = load_graph_section(path);
 
         Ok(Self {
             db,
             embedder,
             path: path.to_path_buf(),
-            scoring,
+            scoring: graph_config.scoring,
+            provenance: graph_config.provenance,
         })
     }
 
@@ -140,6 +144,7 @@ impl GraphMemory {
         };
 
         let scoring = graph_section.scoring.clone();
+        let provenance = graph_section.provenance;
         let server_config = store::ServerConfig {
             url: graph_section.url,
             username: graph_section.username,
@@ -151,6 +156,7 @@ impl GraphMemory {
         let models_dir = path.join("models");
         let mut gm = Self::connect(&server_config, &models_dir).await?;
         gm.scoring = scoring;
+        gm.provenance = provenance;
         Ok(gm)
     }
 
@@ -170,12 +176,20 @@ impl GraphMemory {
             embedder,
             path: models_dir.to_path_buf(),
             scoring: crate::config::GraphScoringConfig::default(),
+            provenance: confidence::ProvenanceWeights::default(),
         })
     }
 
     /// Path to the graph store.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Evidence weights this store applies to observations, by provenance
+    /// class (`[graph.provenance]`).
+    #[must_use]
+    pub fn provenance_weights(&self) -> &confidence::ProvenanceWeights {
+        &self.provenance
     }
 
     /// Internal access to the database handle.
@@ -267,21 +281,35 @@ impl GraphMemory {
     /// Persist updated evidence for a relationship and reset its decay clock.
     ///
     /// Called when a relationship is corroborated: the new posterior mean is
-    /// stored as `confidence` and `last_reinforced` is set to now, preventing
-    /// temporal decay from eroding the edge.
+    /// stored as `confidence`, the coherence tally is stored beside it, and
+    /// `last_reinforced` is set to now, preventing temporal decay from eroding
+    /// the edge.
     pub async fn reinforce_relationship(
         &self,
         rel_id: &str,
-        evidence: confidence::Evidence,
+        evidence: confidence::EdgeEvidence,
     ) -> Result<(), GraphError> {
         crud::reinforce_relationship(&self.db, rel_id, evidence).await
     }
 
     // --- Episodes ---
 
-    /// Add a new episode to the graph.
+    /// Add a new episode authored by the agent itself.
+    ///
+    /// The conservative default: a caller that cannot say where the text came
+    /// from must not have it counted as independent evidence. Ingestion, which
+    /// does know, uses [`GraphMemory::add_episode_from`].
     pub async fn add_episode(&self, episode: NewEpisode) -> Result<Episode, GraphError> {
         crud::add_episode(&self.db, self.embedder.get()?, episode).await
+    }
+
+    /// Add a new episode stamped with the class of whoever authored it.
+    pub async fn add_episode_from(
+        &self,
+        episode: NewEpisode,
+        provenance: Provenance,
+    ) -> Result<Episode, GraphError> {
+        crud::add_episode_from(&self.db, self.embedder.get()?, episode, provenance).await
     }
 
     /// Get episodes by session ID.
@@ -303,25 +331,27 @@ impl GraphMemory {
     // --- Ingestion ---
 
     /// Ingest a conversation archive into the knowledge graph.
+    ///
+    /// The [`IngestContext`] carries the provenance policy: conversation
+    /// archives infer per chunk from turn roles, document ingestion forces a
+    /// class.
     pub async fn ingest_archive(
         &self,
         archive_text: &str,
-        session_id: &str,
-        log_number: Option<u32>,
+        context: &IngestContext,
         llm: Option<&dyn llm::LlmProvider>,
     ) -> Result<IngestionReport, GraphError> {
-        ingest::ingest_archive(self, archive_text, session_id, log_number, llm).await
+        ingest::ingest_archive(self, archive_text, context, llm).await
     }
 
     /// Run LLM extraction on an archive without creating episodes.
     pub async fn extract_from_archive(
         &self,
         archive_text: &str,
-        session_id: &str,
-        log_number: Option<u32>,
+        context: &IngestContext,
         llm: &dyn llm::LlmProvider,
     ) -> Result<IngestionReport, GraphError> {
-        ingest::extract_from_archive(self, archive_text, session_id, log_number, llm).await
+        ingest::extract_from_archive(self, archive_text, context, llm).await
     }
 
     /// Mark all episodes with a given log_number as extracted.
@@ -534,14 +564,13 @@ impl GraphMemory {
     }
 }
 
-/// Load `[graph.scoring]` from `.recall-echo.toml` in the memory directory
-/// (the parent of the graph store path). Returns defaults if the config file
-/// or the `[graph.scoring]` section is absent, preserving legacy behavior.
-fn load_scoring_config(graph_path: &Path) -> crate::config::GraphScoringConfig {
+/// Load `[graph]` from `.recall-echo.toml` in the memory directory (the parent
+/// of the graph store path). Returns defaults if the config file or the
+/// section is absent, preserving legacy behavior.
+fn load_graph_section(graph_path: &Path) -> crate::config::GraphSection {
     let memory_dir = graph_path.parent().unwrap_or(graph_path);
     crate::config::load_from_dir(memory_dir)
         .graph
-        .map(|g| g.scoring)
         .unwrap_or_default()
 }
 

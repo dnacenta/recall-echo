@@ -16,7 +16,9 @@
 
 use std::path::Path;
 
-use recall_echo::graph::confidence::{Evidence, DEFAULT_EVIDENCE_WEIGHT, PRIOR_CONCENTRATION};
+use recall_echo::graph::confidence::{
+    Evidence, Provenance, ProvenanceWeights, DEFAULT_EVIDENCE_WEIGHT, PRIOR_CONCENTRATION,
+};
 use recall_echo::graph::crud;
 use recall_echo::graph::store::{self, Db, MigrationReport, SCHEMA_VERSION};
 use recall_echo::graph::types::{NewRelationship, Relationship};
@@ -356,12 +358,13 @@ async fn accumulated_evidence_survives_reopen_and_keeps_narrowing() {
 }
 
 /// Record `times` corroborations on an edge through the write path the
-/// ingest pipeline uses.
+/// ingest pipeline uses, at the provenance-blind reference weight.
 async fn corroborate(db: &Surreal<Db>, rel_type: &str, times: usize) {
+    let weights = ProvenanceWeights::uniform(DEFAULT_EVIDENCE_WEIGHT);
     for _ in 0..times {
         let rel = edge(db, rel_type).await;
-        let mut evidence = rel.evidence();
-        evidence.corroborate(DEFAULT_EVIDENCE_WEIGHT);
+        let mut evidence = rel.edge_evidence();
+        evidence.corroborate(Provenance::External, &weights);
         crud::reinforce_relationship(db, &rel.id_string(), evidence)
             .await
             .expect("failed to reinforce");

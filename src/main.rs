@@ -263,9 +263,18 @@ enum GraphCommands {
     Ingest {
         /// Path to conversation archive file
         archive: PathBuf,
+        /// Treat the file as externally authored (documents, tool output)
+        /// instead of inferring authorship from conversation turn roles
+        #[arg(long)]
+        external: bool,
     },
     /// Scan conversations/ for un-ingested archives and ingest them all
-    IngestAll,
+    IngestAll {
+        /// Treat every file as externally authored instead of inferring
+        /// authorship from conversation turn roles
+        #[arg(long)]
+        external: bool,
+    },
     /// Extract entities from already-ingested archives using an LLM
     #[cfg(feature = "llm")]
     Extract {
@@ -539,10 +548,18 @@ fn main() {
                                 )
                                 .await
                             }
-                            GraphCommands::Ingest { archive } => {
-                                graph_cli::ingest(&memory_dir, &archive).await
+                            GraphCommands::Ingest { archive, external } => {
+                                graph_cli::ingest(
+                                    &memory_dir,
+                                    &archive,
+                                    external_provenance(external),
+                                )
+                                .await
                             }
-                            GraphCommands::IngestAll => graph_cli::ingest_all(&memory_dir).await,
+                            GraphCommands::IngestAll { external } => {
+                                graph_cli::ingest_all(&memory_dir, external_provenance(external))
+                                    .await
+                            }
                             #[cfg(feature = "llm")]
                             GraphCommands::Extract {
                                 log,
@@ -654,6 +671,12 @@ fn run_serve(
 
 fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| paths::entity_root().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// The provenance override a `--external` flag asks for. Without the flag the
+/// class is inferred per chunk from conversation turn roles.
+fn external_provenance(external: bool) -> Option<recall_echo::graph::Provenance> {
+    external.then_some(recall_echo::graph::Provenance::External)
 }
 
 #[cfg(feature = "bench")]

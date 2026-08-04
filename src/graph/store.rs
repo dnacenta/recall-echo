@@ -191,6 +191,12 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS embedding   ON episode TYPE option<array<float>>;
         DEFINE FIELD IF NOT EXISTS log_number  ON episode TYPE option<int>;
         DEFINE FIELD IF NOT EXISTS extracted  ON episode TYPE bool DEFAULT false;
+        -- Authorship class: 'external' | 'user' | 'self'. `option` with no
+        -- default on purpose — an absent value means an episode written
+        -- before provenance existed, and reads resolve that to 'self'. No
+        -- backfill, so no schema version bump: the absent case is already
+        -- the conservative one.
+        DEFINE FIELD IF NOT EXISTS provenance ON episode TYPE option<string>;
 
         DEFINE INDEX IF NOT EXISTS episode_session ON episode FIELDS session_id;
         DEFINE INDEX IF NOT EXISTS episode_time    ON episode FIELDS timestamp;

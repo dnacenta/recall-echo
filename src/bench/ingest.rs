@@ -17,7 +17,7 @@ use crate::conversation::{self, conversation_to_markdown, Conversation, Conversa
 use crate::ephemeral::{self, EphemeralEntry};
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
-use crate::graph::GraphMemory;
+use crate::graph::{GraphMemory, IngestContext};
 use crate::tags;
 
 use super::{BenchConversation, BenchSession};
@@ -76,13 +76,11 @@ pub async fn ingest_conversation(
         stats.sessions_written += 1;
         stats.log_numbers.push(written.log_number);
 
+        // Benchmark sessions are written through the same archive renderer as
+        // real conversations, so turn-role inference applies unchanged.
+        let context = IngestContext::new(&session_id, Some(written.log_number));
         let report = gm
-            .ingest_archive(
-                &written.full_content,
-                &session_id,
-                Some(written.log_number),
-                llm,
-            )
+            .ingest_archive(&written.full_content, &context, llm)
             .await?;
 
         stats.episodes += report.episodes_created as usize;
