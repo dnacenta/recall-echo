@@ -6,6 +6,9 @@ pub enum GraphError {
     #[error("database: {0}")]
     Db(#[from] surrealdb::Error),
 
+    #[error("store locked: {0}")]
+    Locked(String),
+
     #[error("embedding: {0}")]
     Embed(String),
 

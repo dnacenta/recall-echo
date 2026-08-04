@@ -309,6 +309,10 @@ api_base = ""                # Custom API base URL (provider default if empty)
 [pipeline]
 docs_dir = "/path/to/journal"  # Directory containing pipeline documents
 auto_sync = true               # Auto-sync pipeline docs to graph on archive
+
+[graph]
+mode = "embedded"            # Storage backend: "embedded" (default) or "server"
+url = "ws://localhost:8787"  # SurrealDB server URL (server mode only)
 ```
 
 | Section | Key | Default | Description |
@@ -319,8 +323,23 @@ auto_sync = true               # Auto-sync pipeline docs to graph on archive
 | `llm` | `api_base` | provider default | Custom API base URL |
 | `pipeline` | `docs_dir` | — | Path to pipeline documents (LEARNING.md, THOUGHTS.md, etc.) |
 | `pipeline` | `auto_sync` | `false` | Sync pipeline documents to the knowledge graph on archive |
+| `graph` | `mode` | `embedded` | Storage backend: `embedded` (single-process SurrealKV) or `server` (shared SurrealDB) |
+| `graph` | `url` | `ws://localhost:8787` | SurrealDB server URL, `server` mode only |
 
 All settings have sensible defaults. Missing file or invalid values fall back silently.
+
+## Concurrency
+
+The default `embedded` backend (SurrealKV) takes a **process-exclusive file
+lock** on the graph store: one recall-echo process at a time. A second
+process retries briefly with backoff, then fails with a `store locked` error
+naming the holder scenario — it never crashes with a raw LOCK panic.
+
+If you need concurrent access (parallel sessions, benchmarking, other tools
+reading the graph), set `[graph] mode = "server"` and point `url` at a
+running SurrealDB server — the backend is chosen at runtime, no rebuild
+needed. Flat-file layers (MEMORY.md, EPHEMERAL.md, archives) are unaffected
+by any of this.
 
 ## Contributing
 

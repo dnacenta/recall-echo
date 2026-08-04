@@ -1,26 +1,31 @@
-//! SurrealDB store — embedded (kv-surrealkv) or server (WebSocket).
+//! SurrealDB store — embedded (kv-surrealkv) or server (WebSocket), selected
+//! at runtime via the `[graph] mode` config key (`embedded` | `server`).
+//!
+//! Both engines are compiled in by default and dispatched through
+//! `surrealdb::engine::any`, so switching backends is a config change,
+//! not a rebuild.
+//!
+//! Concurrency: the embedded SurrealKV backend takes a process-exclusive
+//! file lock. Concurrent access from a second process fails with
+//! [`GraphError::Locked`] after a bounded retry. Server mode (or the serve
+//! daemon) is the supported way to share one store between processes.
 
-#[cfg(all(feature = "embedded", feature = "server"))]
-compile_error!("Features `embedded` and `server` are mutually exclusive. Choose one.");
+use std::path::Path;
+use std::time::Duration;
 
+use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 
 use super::error::GraphError;
 
-#[cfg(feature = "embedded")]
-use std::path::Path;
+pub type Db = Any;
 
-#[cfg(feature = "embedded")]
-use surrealdb::engine::local::SurrealKv;
-
-#[cfg(feature = "embedded")]
-pub type Db = surrealdb::engine::local::Db;
-
-#[cfg(feature = "server")]
-pub type Db = surrealdb::engine::remote::ws::Client;
+/// How many times to retry opening an embedded store that is locked by
+/// another process, and the base backoff between attempts (doubled each try).
+const LOCK_RETRY_ATTEMPTS: u32 = 4;
+const LOCK_RETRY_BASE: Duration = Duration::from_millis(250);
 
 /// Connection config for server mode.
-#[cfg(feature = "server")]
 #[derive(Clone)]
 pub struct ServerConfig {
     pub url: String,
@@ -30,7 +35,6 @@ pub struct ServerConfig {
     pub database: String,
 }
 
-#[cfg(feature = "server")]
 impl std::fmt::Debug for ServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerConfig")
@@ -43,8 +47,20 @@ impl std::fmt::Debug for ServerConfig {
     }
 }
 
+/// True if a SurrealDB error indicates the embedded store's process-exclusive
+/// file lock is held by another process.
+fn is_lock_error(err: &surrealdb::Error) -> bool {
+    is_lock_message(&err.to_string().to_lowercase())
+}
+
+fn is_lock_message(msg: &str) -> bool {
+    msg.contains("lock") && (msg.contains("already") || msg.contains("held"))
+}
+
 /// Open (or create) a SurrealDB embedded store at the given path.
-#[cfg(feature = "embedded")]
+///
+/// Retries briefly if another process holds the store lock, then fails with
+/// [`GraphError::Locked`] carrying an actionable message.
 pub async fn open(path: &Path) -> Result<Surreal<Db>, GraphError> {
     let surreal_path = path.join("surreal");
     std::fs::create_dir_all(&surreal_path)?;
@@ -55,16 +71,37 @@ pub async fn open(path: &Path) -> Result<Surreal<Db>, GraphError> {
             "graph store path contains non-UTF8 characters",
         ))
     })?;
-    let db: Surreal<Db> = Surreal::new::<SurrealKv>(path_str).await?;
+
+    let endpoint = format!("surrealkv://{path_str}");
+    let mut attempt: u32 = 0;
+    let db: Surreal<Db> = loop {
+        match surrealdb::engine::any::connect(&endpoint).await {
+            Ok(db) => break db,
+            Err(e) if is_lock_error(&e) && attempt < LOCK_RETRY_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(LOCK_RETRY_BASE * 2u32.pow(attempt - 1)).await;
+            }
+            Err(e) if is_lock_error(&e) => {
+                return Err(GraphError::Locked(format!(
+                    "graph store at {} is locked by another process. The embedded \
+                     backend allows one process at a time — retried {} times. \
+                     Another recall-echo command (or the serve daemon) is using it; \
+                     wait for it to finish, or use server mode to share the store.",
+                    surreal_path.display(),
+                    LOCK_RETRY_ATTEMPTS
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     db.use_ns("recall").use_db("graph").await?;
 
     Ok(db)
 }
 
-/// Connect to a SurrealDB server over WebSocket.
-#[cfg(feature = "server")]
+/// Connect to a SurrealDB server (e.g. `ws://localhost:8787`).
 pub async fn connect(config: &ServerConfig) -> Result<Surreal<Db>, GraphError> {
-    let db = Surreal::new::<surrealdb::engine::remote::ws::Ws>(&config.url).await?;
+    let db = surrealdb::engine::any::connect(&config.url).await?;
     db.signin(surrealdb::opt::auth::Database {
         namespace: config.namespace.clone(),
         database: config.database.clone(),
@@ -145,4 +182,24 @@ pub async fn init_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
     .check()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_message_detected() {
+        assert!(is_lock_message(
+            "database: the database at /x/surreal/lock is already locked by another process"
+        ));
+        assert!(is_lock_message("file lock held by another process"));
+    }
+
+    #[test]
+    fn non_lock_messages_pass_through() {
+        assert!(!is_lock_message("connection refused"));
+        assert!(!is_lock_message("lockstep protocol mismatch")); // 'lock' without already/held
+        assert!(!is_lock_message("table entity already exists"));
+    }
 }

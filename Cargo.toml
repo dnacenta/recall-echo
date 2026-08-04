@@ -34,7 +34,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 pulse-system-types = { version = "0.6", optional = true }
 
 [features]
-default = ["embedded"]
+# Both storage backends are compiled in by default; the active one is chosen
+# at runtime via the `[graph] mode` config key (embedded | server).
+default = ["embedded", "server"]
 embedded = ["surrealdb/kv-surrealkv"]
 server = ["surrealdb/protocol-ws"]
 llm = ["reqwest"]

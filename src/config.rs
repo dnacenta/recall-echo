@@ -376,6 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn graph_mode_defaults_to_embedded() {
+        let cfg: Config = toml::from_str("[graph]\n").unwrap();
+        assert_eq!(cfg.graph.unwrap().mode, "embedded");
+    }
+
+    #[test]
+    fn graph_mode_parses_server() {
+        let cfg: Config =
+            toml::from_str("[graph]\nmode = \"server\"\nurl = \"ws://db.local:8787\"\n").unwrap();
+        let g = cfg.graph.unwrap();
+        assert_eq!(g.mode, "server");
+        assert_eq!(g.url, "ws://db.local:8787");
+    }
+
+    #[test]
     fn parse_llm_section() {
         let cfg: Config = toml::from_str(
             "[llm]\nprovider = \"openai\"\nmodel = \"llama3.1\"\napi_base = \"http://myhost:11434/v1\"\n",
