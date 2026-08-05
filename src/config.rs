@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -21,15 +25,34 @@ const DEFAULT_EXTRACTION_IDLE_AFTER_SECS: u64 = 120;
 /// Archives one background batch extracts before yielding.
 const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
 
+/// Seconds a CLI transcript must go untouched before capture treats the session
+/// as over.
+///
+/// Five minutes: longer than any pause inside a working session, short enough
+/// that a session ended at lunchtime is memory by the afternoon.
+const DEFAULT_CAPTURE_SETTLE_SECS: u64 = 300;
+
 // ── Provider enum ────────────────────────────────────────────────────────
 
 /// LLM provider for entity extraction.
+///
+/// Two families. [`Provider::Anthropic`] and [`Provider::Openai`] talk HTTP —
+/// an API key, billed per token (the OpenAI-compatible one also covers Ollama
+/// and any local server that speaks that protocol). Everything else spawns an
+/// agent CLI the user already pays a subscription for; those are all one
+/// implementation driven by a [`CliPreset`], so supporting a new vendor is a
+/// preset — or just a `[llm.cli]` section — rather than a new code path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
     Anthropic,
     Openai,
     ClaudeCode,
+    Gemini,
+    Grok,
+    Codex,
+    /// Any other agent CLI, described entirely by `[llm.cli]`.
+    Cli,
 }
 
 impl Provider {
@@ -38,7 +61,7 @@ impl Provider {
         match self {
             Provider::Anthropic => "claude-haiku-4-5-20251001",
             Provider::Openai => "llama3.2",
-            Provider::ClaudeCode => "",
+            _ => "",
         }
     }
 
@@ -47,17 +70,42 @@ impl Provider {
         match self {
             Provider::Anthropic => "https://api.anthropic.com/v1/messages",
             Provider::Openai => "http://localhost:11434/v1",
-            Provider::ClaudeCode => "",
+            _ => "",
+        }
+    }
+
+    /// True when this provider completes by spawning an agent CLI.
+    #[must_use]
+    pub fn is_cli(&self) -> bool {
+        self.default_cli_preset().is_some()
+    }
+
+    /// The preset a CLI provider starts from, before `[llm.cli]` overrides.
+    /// `None` for the HTTP providers.
+    #[must_use]
+    pub fn default_cli_preset(&self) -> Option<CliPreset> {
+        match self {
+            Provider::Anthropic | Provider::Openai => None,
+            Provider::ClaudeCode => Some(CliPreset::ClaudeCode),
+            Provider::Gemini => Some(CliPreset::Gemini),
+            Provider::Grok => Some(CliPreset::Grok),
+            Provider::Codex => Some(CliPreset::Codex),
+            Provider::Cli => Some(CliPreset::Custom),
         }
     }
 
     pub fn from_str_loose(s: &str) -> Result<Self, crate::error::RecallError> {
         match s.to_lowercase().as_str() {
             "anthropic" | "claude" => Ok(Provider::Anthropic),
-            "openai" | "ollama" => Ok(Provider::Openai),
+            "openai" | "ollama" | "openai-compat" => Ok(Provider::Openai),
             "claude-code" | "claudecode" => Ok(Provider::ClaudeCode),
+            "gemini" | "gemini-cli" | "google" => Ok(Provider::Gemini),
+            "grok" | "grok-cli" | "xai" => Ok(Provider::Grok),
+            "codex" | "codex-cli" => Ok(Provider::Codex),
+            "cli" | "custom" | "custom-cli" => Ok(Provider::Cli),
             other => Err(crate::error::RecallError::Config(format!(
-                "unknown provider: {other} (use 'anthropic', 'ollama', or 'claude-code')"
+                "unknown provider: {other} (use 'anthropic', 'ollama', 'claude-code', \
+                 'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)"
             ))),
         }
     }
@@ -65,12 +113,375 @@ impl Provider {
 
 impl fmt::Display for Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Provider::Anthropic => write!(f, "anthropic"),
-            Provider::Openai => write!(f, "openai"),
-            Provider::ClaudeCode => write!(f, "claude-code"),
+        let name = match self {
+            Provider::Anthropic => "anthropic",
+            Provider::Openai => "openai",
+            Provider::ClaudeCode => "claude-code",
+            Provider::Gemini => "gemini",
+            Provider::Grok => "grok",
+            Provider::Codex => "codex",
+            Provider::Cli => "cli",
+        };
+        f.write_str(name)
+    }
+}
+
+// ── Agent-CLI provider config ────────────────────────────────────────────
+
+/// A known agent CLI's calling convention.
+///
+/// A preset is a set of defaults for [`CliSection`], nothing more: every field
+/// it fills can be overridden per key, and [`CliPreset::Custom`] fills almost
+/// nothing, so an unlisted CLI is configured rather than coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CliPreset {
+    ClaudeCode,
+    Gemini,
+    Grok,
+    Codex,
+    Custom,
+}
+
+impl fmt::Display for CliPreset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            CliPreset::ClaudeCode => "claude-code",
+            CliPreset::Gemini => "gemini",
+            CliPreset::Grok => "grok",
+            CliPreset::Codex => "codex",
+            CliPreset::Custom => "custom",
+        };
+        f.write_str(name)
+    }
+}
+
+impl CliPreset {
+    pub fn from_str_loose(s: &str) -> Result<Self, crate::error::RecallError> {
+        match s.to_lowercase().as_str() {
+            "claude-code" | "claudecode" | "claude" => Ok(CliPreset::ClaudeCode),
+            "gemini" | "gemini-cli" => Ok(CliPreset::Gemini),
+            "grok" | "grok-cli" => Ok(CliPreset::Grok),
+            "codex" | "codex-cli" => Ok(CliPreset::Codex),
+            "custom" | "none" => Ok(CliPreset::Custom),
+            other => Err(crate::error::RecallError::Config(format!(
+                "unknown CLI preset: {other} (use 'claude-code', 'gemini', 'grok', \
+                 'codex', or 'custom')"
+            ))),
         }
     }
+}
+
+/// How the prompt reaches the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptDelivery {
+    /// Written to the process's stdin.
+    Stdin,
+    /// Passed as the value of `prompt_flag`.
+    Flag,
+    /// Passed as the last positional argument.
+    Arg,
+}
+
+impl fmt::Display for PromptDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            PromptDelivery::Stdin => "stdin",
+            PromptDelivery::Flag => "flag",
+            PromptDelivery::Arg => "arg",
+        };
+        f.write_str(name)
+    }
+}
+
+impl PromptDelivery {
+    pub fn from_str_loose(s: &str) -> Result<Self, crate::error::RecallError> {
+        match s.to_lowercase().as_str() {
+            "stdin" | "pipe" => Ok(PromptDelivery::Stdin),
+            "flag" | "option" => Ok(PromptDelivery::Flag),
+            "arg" | "argument" | "positional" => Ok(PromptDelivery::Arg),
+            other => Err(crate::error::RecallError::Config(format!(
+                "unknown prompt delivery: {other} (use 'stdin', 'flag', or 'arg')"
+            ))),
+        }
+    }
+}
+
+/// The shape of a CLI's stdout.
+///
+/// Agent CLIs do not agree on this, and the disagreement is structural rather
+/// than cosmetic: `claude`, `grok` and `gemini` print one JSON object,
+/// `codex --json` prints one object *per line* covering the whole run, and
+/// plenty print prose. A mode plus a path covers all three, so a CLI with a
+/// fourth shape needs a mode — not a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputMode {
+    /// Stdout is the answer.
+    Raw,
+    /// Stdout is one JSON document; `result_json_path` locates the answer.
+    SingleJson,
+    /// Stdout is newline-delimited JSON; `ndjson_match` selects the event and
+    /// `result_json_path` locates the answer inside it.
+    Ndjson,
+}
+
+impl fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            OutputMode::Raw => "raw",
+            OutputMode::SingleJson => "single-json",
+            OutputMode::Ndjson => "ndjson",
+        };
+        f.write_str(name)
+    }
+}
+
+impl OutputMode {
+    pub fn from_str_loose(s: &str) -> Result<Self, crate::error::RecallError> {
+        match s.to_lowercase().as_str() {
+            "raw" | "text" | "plain" => Ok(OutputMode::Raw),
+            "single-json" | "json" => Ok(OutputMode::SingleJson),
+            "ndjson" | "jsonl" | "json-lines" | "streaming-json" => Ok(OutputMode::Ndjson),
+            other => Err(crate::error::RecallError::Config(format!(
+                "unknown output mode: {other} (use 'raw', 'single-json', or 'ndjson')"
+            ))),
+        }
+    }
+}
+
+/// Predicates that pick one line out of an NDJSON stream.
+///
+/// Each entry is `dotted.path=value`; a line qualifies when every entry
+/// matches, and the last qualifying line is the answer — which is what makes
+/// `codex` readable: its final message is
+/// `type=item.completed` plus `item.type=agent_message`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LineMatchers(Vec<String>);
+
+impl LineMatchers {
+    #[must_use]
+    pub fn new(matchers: impl IntoIterator<Item = String>) -> Self {
+        Self(
+            matchers
+                .into_iter()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .collect(),
+        )
+    }
+
+    /// Parse a comma-separated list, as `config set` receives it.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        Self::new(value.split(',').map(str::to_string))
+    }
+
+    /// The predicates, split into path and expected value. Entries without an
+    /// `=` are dropped rather than matching everything.
+    #[must_use]
+    pub fn predicates(&self) -> Vec<(&str, &str)> {
+        self.0
+            .iter()
+            .filter_map(|matcher| matcher.split_once('='))
+            .map(|(path, value)| (path.trim(), value.trim()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Display for LineMatchers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.join(", "))
+    }
+}
+
+/// Where a CLI's answer sits in its JSON output.
+///
+/// A dotted path per candidate — `result`, `response.text`, `messages.0.text`
+/// (numeric segments index arrays). Candidates are tried in order, which is how
+/// a preset covers a CLI whose envelope is not pinned down; an empty list means
+/// "the CLI prints prose, use stdout verbatim". Accepts a bare string or an
+/// array in TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "JsonPathSpec", into = "JsonPathSpec")]
+pub struct JsonPaths(Vec<String>);
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum JsonPathSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl From<JsonPathSpec> for JsonPaths {
+    fn from(spec: JsonPathSpec) -> Self {
+        match spec {
+            JsonPathSpec::One(path) => JsonPaths::new(std::iter::once(path)),
+            JsonPathSpec::Many(paths) => JsonPaths::new(paths),
+        }
+    }
+}
+
+impl From<JsonPaths> for JsonPathSpec {
+    fn from(paths: JsonPaths) -> Self {
+        let mut paths = paths.0;
+        if paths.len() == 1 {
+            JsonPathSpec::One(paths.remove(0))
+        } else {
+            JsonPathSpec::Many(paths)
+        }
+    }
+}
+
+impl JsonPaths {
+    /// Collect non-empty, trimmed paths. Empty entries are dropped, so
+    /// `result_json_path = ""` means "raw stdout".
+    #[must_use]
+    pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        Self(
+            paths
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
+        )
+    }
+
+    /// Parse a comma-separated list, as `config set` receives it.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        Self::new(value.split(',').map(str::to_string))
+    }
+
+    #[must_use]
+    pub fn paths(&self) -> &[String] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Display for JsonPaths {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.join(", "))
+    }
+}
+
+/// Overrides for the spawned agent CLI (`[llm.cli]`).
+///
+/// Every key is optional and every key overrides the same field of the preset
+/// chosen by `[llm] provider` (or by `preset` here). Omitting the whole section
+/// — which every config written before this existed does — leaves the preset
+/// untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliSection {
+    /// Calling convention to start from. Defaults to the one implied by
+    /// `[llm] provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<CliPreset>,
+    /// Binary name or absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Fixed arguments placed before every generated flag (a subcommand, say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// How the prompt reaches the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_delivery: Option<PromptDelivery>,
+    /// Flag carrying the prompt when `prompt_delivery = "flag"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_flag: Option<String>,
+    /// Flag selecting the model. Empty, or an empty model, omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_flag: Option<String>,
+    /// Flag selecting the output format. Empty omits it and its value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format_flag: Option<String>,
+    /// Value for `output_format_flag`. Empty passes the flag on its own, for
+    /// the CLIs whose output switch is a boolean (`codex --json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format_value: Option<String>,
+    /// Shape of the CLI's stdout. Defaults to the preset's; setting
+    /// `result_json_path` on a preset that prints prose implies `single-json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<OutputMode>,
+    /// `dotted.path=value` predicates selecting the answer's line under
+    /// `output_mode = "ndjson"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ndjson_match: Option<LineMatchers>,
+    /// Flag carrying the system prompt. Empty prepends it to the message
+    /// instead — what CLIs without the concept need.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_flag: Option<String>,
+    /// Where the answer sits in the CLI's JSON output; empty means stdout is
+    /// the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_json_path: Option<JsonPaths>,
+    /// Arguments appended after the generated flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_args: Option<Vec<String>>,
+    /// Per-call wall-clock limit. `0` waits forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl CliSection {
+    /// True when nothing is overridden — the section is then left out of a
+    /// saved config entirely.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Set one `llm.cli.*` key, given the part after `llm.cli.`.
+    pub fn set_key(&mut self, key: &str, value: &str) -> Result<(), crate::error::RecallError> {
+        use crate::error::RecallError;
+        match key {
+            "preset" => self.preset = Some(CliPreset::from_str_loose(value)?),
+            "command" => self.command = Some(value.to_string()),
+            "args" => self.args = Some(split_args(value)),
+            "prompt_delivery" => {
+                self.prompt_delivery = Some(PromptDelivery::from_str_loose(value)?)
+            }
+            "prompt_flag" => self.prompt_flag = Some(value.to_string()),
+            "model_flag" => self.model_flag = Some(value.to_string()),
+            "output_format_flag" => self.output_format_flag = Some(value.to_string()),
+            "output_format_value" => self.output_format_value = Some(value.to_string()),
+            "output_mode" => self.output_mode = Some(OutputMode::from_str_loose(value)?),
+            "ndjson_match" => self.ndjson_match = Some(LineMatchers::parse(value)),
+            "system_prompt_flag" => self.system_prompt_flag = Some(value.to_string()),
+            "result_json_path" => self.result_json_path = Some(JsonPaths::parse(value)),
+            "extra_args" => self.extra_args = Some(split_args(value)),
+            "timeout_secs" => {
+                self.timeout_secs = Some(
+                    value
+                        .parse()
+                        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?,
+                );
+            }
+            other => {
+                return Err(RecallError::Config(format!(
+                    "unknown config key: llm.cli.{other}"
+                )))
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Split a whitespace-separated argument list from `config set`.
+fn split_args(value: &str) -> Vec<String> {
+    value.split_whitespace().map(str::to_string).collect()
 }
 
 // ── Config structs ───────────────────────────────────────────────────────
@@ -89,6 +500,8 @@ pub struct Config {
     pub serve: ServeSection,
     #[serde(default)]
     pub extraction: ExtractionSection,
+    #[serde(default)]
+    pub capture: CaptureSection,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,6 +530,10 @@ pub struct LlmSection {
     pub model: String,
     #[serde(default)]
     pub api_base: String,
+    /// Overrides for the spawned agent CLI. Serialized only when non-empty, so
+    /// a config that never touches it stays byte-identical.
+    #[serde(default, skip_serializing_if = "CliSection::is_empty")]
+    pub cli: CliSection,
 }
 
 impl Default for LlmSection {
@@ -125,6 +542,7 @@ impl Default for LlmSection {
             provider: Provider::Anthropic,
             model: String::new(),
             api_base: String::new(),
+            cli: CliSection::default(),
         }
     }
 }
@@ -255,11 +673,11 @@ impl Default for ServeSection {
 /// empty for everyone who did not read the docs closely. What it costs is
 /// bounded by the provider: the daemon is started with a minimal environment
 /// that deliberately excludes API keys (see `serve_client`), so an
-/// auto-started daemon can only ever use the `claude-code` provider, which
-/// bills nothing on a subscription. An API-key provider reaches the daemon
-/// only when a human runs `recall-echo serve --foreground` with the key
-/// exported — an explicit act. Set `background_enabled = false` to turn the
-/// pass off entirely.
+/// auto-started daemon can only ever use a CLI provider whose credentials live
+/// in `$HOME` — `claude-code` and friends — which bills nothing beyond a
+/// subscription. An API-key provider reaches the daemon only when a human runs
+/// `recall-echo serve --foreground` with the key exported — an explicit act.
+/// Set `background_enabled = false` to turn the pass off entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtractionSection {
@@ -297,6 +715,58 @@ impl ExtractionSection {
     #[must_use]
     pub fn effective_batch_size(&self) -> usize {
         self.batch_size.max(1)
+    }
+}
+
+/// Capturing sessions from the agent CLIs on this machine (`[capture]`).
+///
+/// Claude Code archives itself through a `SessionEnd` hook. Every other agent
+/// CLI records its sessions to disk and tells nobody, so recall-echo reads them
+/// instead: `recall-echo ingest` on demand, and the graph daemon on its own
+/// once the machine has been quiet.
+///
+/// ```toml
+/// [capture]
+/// enabled = true
+/// sources = ["claude-code", "codex", "grok"]  # default: whatever is installed
+/// settle_secs = 300
+/// ```
+///
+/// Defaults are on and auto-detecting, for the same reason background
+/// extraction is: memory that only fills up for people who read the docs is
+/// memory on the honor system. Set `enabled = false` to import nothing in the
+/// background — `recall-echo ingest` still works, because that one was asked
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureSection {
+    /// Sweep for new transcripts in the daemon. Default `true`.
+    pub enabled: bool,
+    /// Which CLIs to capture. `None` — the default — means every CLI that has
+    /// recorded sessions on this machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<crate::transcript::Source>>,
+    /// Seconds a transcript must go untouched before it counts as finished.
+    /// Importing a live session would archive half a conversation and then mark
+    /// it captured for good. Default `300`.
+    pub settle_secs: u64,
+}
+
+impl Default for CaptureSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sources: None,
+            settle_secs: DEFAULT_CAPTURE_SETTLE_SECS,
+        }
+    }
+}
+
+impl CaptureSection {
+    /// How long a transcript must have been untouched to count as finished.
+    #[must_use]
+    pub fn settle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.settle_secs)
     }
 }
 
@@ -535,11 +1005,16 @@ impl Config {
         match key {
             "llm.provider" | "provider" => {
                 let provider = Provider::from_str_loose(value)?;
-                // When switching provider, reset model and api_base to defaults
+                // When switching provider, reset model, api_base and the CLI
+                // overrides to defaults: all three describe the old vendor.
                 self.llm.model = String::new();
                 self.llm.api_base = String::new();
+                self.llm.cli = CliSection::default();
                 self.llm.provider = provider;
                 Ok(())
+            }
+            _ if key.starts_with("llm.cli.") => {
+                self.llm.cli.set_key(&key["llm.cli.".len()..], value)
             }
             "llm.model" | "model" => {
                 self.llm.model = value.to_string();
@@ -617,6 +1092,22 @@ impl Config {
                 self.extraction.batch_size = size;
                 Ok(())
             }
+            "capture.enabled" => {
+                self.capture.enabled = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "capture.settle_secs" => {
+                self.capture.settle_secs = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                Ok(())
+            }
+            "capture.sources" => {
+                self.capture.sources = parse_sources(value)?;
+                Ok(())
+            }
             "graph.provenance.weight_external" => {
                 self.graph_section().provenance.weight_external = parse_weight(value)?;
                 Ok(())
@@ -657,6 +1148,28 @@ impl Config {
     fn graph_section(&mut self) -> &mut GraphSection {
         self.graph.get_or_insert_with(GraphSection::default)
     }
+}
+
+/// Parse a comma-separated CLI list. Empty means "auto-detect".
+fn parse_sources(
+    value: &str,
+) -> Result<Option<Vec<crate::transcript::Source>>, crate::error::RecallError> {
+    let names: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut sources = Vec::with_capacity(names.len());
+    for name in names {
+        let source = crate::transcript::Source::from_str_loose(name)?;
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    Ok(Some(sources))
 }
 
 /// Parse an evidence weight: a finite, non-negative number.
@@ -780,7 +1293,7 @@ mod tests {
         let llm = LlmSection {
             provider: Provider::Openai,
             model: "mistral-7b".into(),
-            api_base: String::new(),
+            ..LlmSection::default()
         };
         assert_eq!(llm.resolved_model(), "mistral-7b");
         assert_eq!(llm.resolved_api_base(), "http://localhost:11434/v1");
@@ -794,11 +1307,9 @@ mod tests {
                 provider: Provider::Openai,
                 model: "llama3.2".into(),
                 api_base: "http://localhost:11434/v1".into(),
+                ..LlmSection::default()
             },
-            pipeline: None,
-            graph: None,
-            serve: ServeSection::default(),
-            extraction: ExtractionSection::default(),
+            ..Config::default()
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
@@ -829,6 +1340,218 @@ mod tests {
     }
 
     #[test]
+    fn set_key_cli_overrides() {
+        let mut cfg = Config::default();
+        cfg.set_key("llm.provider", "gemini").unwrap();
+        cfg.set_key("llm.cli.command", "/opt/bin/gemini").unwrap();
+        cfg.set_key("llm.cli.result_json_path", "response, result")
+            .unwrap();
+        cfg.set_key("llm.cli.extra_args", "--yolo --quiet").unwrap();
+        cfg.set_key("llm.cli.prompt_delivery", "stdin").unwrap();
+        cfg.set_key("llm.cli.timeout_secs", "45").unwrap();
+
+        let cli = &cfg.llm.cli;
+        assert_eq!(cli.command.as_deref(), Some("/opt/bin/gemini"));
+        assert_eq!(
+            cli.result_json_path.as_ref().unwrap().paths(),
+            ["response", "result"]
+        );
+        assert_eq!(
+            cli.extra_args.as_deref(),
+            Some(["--yolo".to_string(), "--quiet".to_string()].as_slice())
+        );
+        assert_eq!(cli.prompt_delivery, Some(PromptDelivery::Stdin));
+        assert_eq!(cli.timeout_secs, Some(45));
+
+        assert!(cfg.set_key("llm.cli.nonexistent", "x").is_err());
+        assert!(cfg.set_key("llm.cli.timeout_secs", "soon").is_err());
+        assert!(cfg.set_key("llm.cli.preset", "nonesuch").is_err());
+    }
+
+    /// The overrides describe one vendor's binary; carrying them to the next
+    /// provider would spawn the wrong tool with the right flags.
+    #[test]
+    fn switching_provider_clears_the_cli_overrides() {
+        let mut cfg = Config::default();
+        cfg.set_key("llm.provider", "gemini").unwrap();
+        cfg.set_key("llm.cli.command", "/opt/bin/gemini").unwrap();
+        cfg.set_key("llm.provider", "grok").unwrap();
+
+        assert_eq!(cfg.llm.provider, Provider::Grok);
+        assert!(cfg.llm.cli.is_empty());
+    }
+
+    #[test]
+    fn cli_section_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            "[llm]\nprovider = \"cli\"\n\n[llm.cli]\ncommand = \"mycli\"\n\
+             prompt_delivery = \"flag\"\nprompt_flag = \"--ask\"\n\
+             result_json_path = [\"data.text\", \"text\"]\nargs = [\"chat\"]\n",
+        )
+        .expect("parse [llm.cli]");
+        let cli = cfg.llm.cli;
+        assert_eq!(cfg.llm.provider, Provider::Cli);
+        assert_eq!(cli.command.as_deref(), Some("mycli"));
+        assert_eq!(cli.prompt_delivery, Some(PromptDelivery::Flag));
+        assert_eq!(cli.prompt_flag.as_deref(), Some("--ask"));
+        assert_eq!(
+            cli.result_json_path.as_ref().unwrap().paths(),
+            ["data.text", "text"]
+        );
+        assert_eq!(cli.args.as_deref(), Some(["chat".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn set_key_output_mode_and_ndjson_match() {
+        let mut cfg = Config::default();
+        cfg.set_key("llm.provider", "cli").unwrap();
+        cfg.set_key("llm.cli.output_mode", "ndjson").unwrap();
+        cfg.set_key(
+            "llm.cli.ndjson_match",
+            "type=item.completed, item.type=agent_message",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.llm.cli.output_mode, Some(OutputMode::Ndjson));
+        assert_eq!(
+            cfg.llm.cli.ndjson_match.as_ref().unwrap().predicates(),
+            [("type", "item.completed"), ("item.type", "agent_message")]
+        );
+        assert!(cfg.set_key("llm.cli.output_mode", "yaml").is_err());
+    }
+
+    #[test]
+    fn output_mode_accepts_the_obvious_spellings() {
+        assert_eq!(
+            OutputMode::from_str_loose("jsonl").unwrap(),
+            OutputMode::Ndjson
+        );
+        assert_eq!(
+            OutputMode::from_str_loose("json").unwrap(),
+            OutputMode::SingleJson
+        );
+        assert_eq!(OutputMode::from_str_loose("TEXT").unwrap(), OutputMode::Raw);
+    }
+
+    /// A predicate without a value would match every line; dropping it is
+    /// safer than treating it as a wildcard nobody asked for.
+    #[test]
+    fn line_matchers_drop_entries_without_a_value() {
+        let matchers = LineMatchers::parse("type=item.completed, garbage, ");
+        assert_eq!(matchers.predicates(), [("type", "item.completed")]);
+    }
+
+    #[test]
+    fn result_json_path_accepts_a_bare_string() {
+        let cli: CliSection = toml::from_str("result_json_path = \"result\"\n").expect("parse");
+        assert_eq!(cli.result_json_path.unwrap().paths(), ["result"]);
+    }
+
+    #[test]
+    fn an_empty_result_json_path_means_raw_stdout() {
+        let cli: CliSection = toml::from_str("result_json_path = \"\"\n").expect("parse");
+        assert!(cli.result_json_path.unwrap().is_empty());
+    }
+
+    /// Configs written before `[llm.cli]` existed must keep loading, and keep
+    /// saving without gaining a section their owner never asked for.
+    #[test]
+    fn a_config_without_a_cli_section_round_trips_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.set_key("llm.provider", "claude-code").unwrap();
+        save(tmp.path(), &cfg).unwrap();
+
+        let rendered = fs::read_to_string(config_path(tmp.path())).unwrap();
+        assert!(!rendered.contains("[llm.cli]"), "{rendered}");
+        assert_eq!(load(tmp.path()).llm.provider, Provider::ClaudeCode);
+    }
+
+    #[test]
+    fn cli_overrides_survive_a_save_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.set_key("llm.provider", "cli").unwrap();
+        cfg.set_key("llm.cli.command", "mycli").unwrap();
+        cfg.set_key("llm.cli.result_json_path", "data.text")
+            .unwrap();
+        save(tmp.path(), &cfg).unwrap();
+
+        let loaded = load(tmp.path());
+        assert_eq!(loaded.llm.provider, Provider::Cli);
+        assert_eq!(loaded.llm.cli.command.as_deref(), Some("mycli"));
+        assert_eq!(
+            loaded.llm.cli.result_json_path.unwrap().paths(),
+            ["data.text"]
+        );
+    }
+
+    #[test]
+    fn cli_providers_are_distinguished_from_http_ones() {
+        assert!(Provider::ClaudeCode.is_cli());
+        assert!(Provider::Gemini.is_cli());
+        assert!(Provider::Grok.is_cli());
+        assert!(Provider::Codex.is_cli());
+        assert!(Provider::Cli.is_cli());
+        assert!(!Provider::Anthropic.is_cli());
+        assert!(!Provider::Openai.is_cli());
+    }
+
+    #[test]
+    fn provider_from_str_loose_accepts_the_cli_vendors() {
+        assert_eq!(
+            Provider::from_str_loose("gemini").unwrap(),
+            Provider::Gemini
+        );
+        assert_eq!(
+            Provider::from_str_loose("gemini-cli").unwrap(),
+            Provider::Gemini
+        );
+        assert_eq!(Provider::from_str_loose("Grok").unwrap(), Provider::Grok);
+        assert_eq!(Provider::from_str_loose("xai").unwrap(), Provider::Grok);
+        assert_eq!(Provider::from_str_loose("cli").unwrap(), Provider::Cli);
+        assert_eq!(Provider::from_str_loose("custom").unwrap(), Provider::Cli);
+    }
+
+    #[test]
+    fn codex_resolves_to_its_own_preset() {
+        assert_eq!(Provider::from_str_loose("codex").unwrap(), Provider::Codex);
+        assert_eq!(
+            Provider::Codex.default_cli_preset(),
+            Some(CliPreset::Codex),
+            "codex must not fall through to the custom preset"
+        );
+    }
+
+    /// A vendor with no preset at all gets the generic mechanism, not a dead
+    /// end — the error names it.
+    #[test]
+    fn an_unknown_vendor_is_pointed_at_the_cli_provider() {
+        let err = Provider::from_str_loose("some-new-agent").expect_err("no such preset");
+        assert!(err.to_string().contains("[llm.cli]"), "{err}");
+    }
+
+    #[test]
+    fn provider_display_round_trips_through_from_str_loose() {
+        for provider in [
+            Provider::Anthropic,
+            Provider::Openai,
+            Provider::ClaudeCode,
+            Provider::Gemini,
+            Provider::Grok,
+            Provider::Codex,
+            Provider::Cli,
+        ] {
+            let rendered = provider.to_string();
+            assert_eq!(
+                Provider::from_str_loose(&rendered).unwrap(),
+                provider,
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_from_str_loose() {
         assert_eq!(
             Provider::from_str_loose("ollama").unwrap(),
@@ -852,13 +1575,9 @@ mod tests {
             ephemeral: EphemeralConfig { max_entries: 7 },
             llm: LlmSection {
                 provider: Provider::ClaudeCode,
-                model: String::new(),
-                api_base: String::new(),
+                ..LlmSection::default()
             },
-            pipeline: None,
-            graph: None,
-            serve: ServeSection::default(),
-            extraction: ExtractionSection::default(),
+            ..Config::default()
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path());
@@ -877,13 +1596,73 @@ mod tests {
     fn validate_out_of_range() {
         let cfg = validate(Config {
             ephemeral: EphemeralConfig { max_entries: 100 },
-            llm: LlmSection::default(),
-            pipeline: None,
-            graph: None,
-            serve: ServeSection::default(),
-            extraction: ExtractionSection::default(),
+            ..Config::default()
         });
         assert_eq!(cfg.ephemeral.max_entries, 5);
+    }
+
+    #[test]
+    fn capture_defaults_are_on_and_auto_detecting() {
+        let capture = CaptureSection::default();
+        assert!(capture.enabled);
+        assert!(capture.sources.is_none());
+        assert_eq!(capture.settle(), std::time::Duration::from_secs(300));
+    }
+
+    /// A config written before `[capture]` existed must keep loading, with the
+    /// defaults it would have had.
+    #[test]
+    fn a_config_without_a_capture_section_still_loads() {
+        let cfg: Config = toml::from_str("[ephemeral]\nmax_entries = 3\n").unwrap();
+        assert!(cfg.capture.enabled);
+        assert!(cfg.capture.sources.is_none());
+    }
+
+    #[test]
+    fn capture_section_parses_an_explicit_source_list() {
+        let cfg: Config = toml::from_str(
+            "[capture]\nenabled = false\nsources = [\"codex\", \"grok\"]\nsettle_secs = 60\n",
+        )
+        .expect("parse [capture]");
+        assert!(!cfg.capture.enabled);
+        assert_eq!(cfg.capture.settle_secs, 60);
+        assert_eq!(
+            cfg.capture.sources.as_deref(),
+            Some(
+                [
+                    crate::transcript::Source::Codex,
+                    crate::transcript::Source::Grok
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn set_key_capture_values() {
+        let mut cfg = Config::default();
+        cfg.set_key("capture.enabled", "false").unwrap();
+        cfg.set_key("capture.settle_secs", "30").unwrap();
+        cfg.set_key("capture.sources", "codex, claude").unwrap();
+
+        assert!(!cfg.capture.enabled);
+        assert_eq!(cfg.capture.settle_secs, 30);
+        assert_eq!(
+            cfg.capture.sources.as_deref(),
+            Some(
+                [
+                    crate::transcript::Source::Codex,
+                    crate::transcript::Source::ClaudeCode
+                ]
+                .as_slice()
+            )
+        );
+
+        // An empty list means "back to auto-detect", not "capture nothing".
+        cfg.set_key("capture.sources", "").unwrap();
+        assert!(cfg.capture.sources.is_none());
+        assert!(cfg.set_key("capture.sources", "cursor").is_err());
+        assert!(cfg.set_key("capture.enabled", "maybe").is_err());
     }
 
     #[test]

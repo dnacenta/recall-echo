@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Ownership checks for the daemon's filesystem surface and its socket peers.
 //!
 //! The daemon socket carries unauthenticated command access to a whole graph —

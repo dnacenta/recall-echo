@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! recall-echo — Persistent memory system with knowledge graph.
 //!
 //! A general-purpose persistent memory system for any LLM tool — Claude Code,
@@ -7,18 +11,24 @@
 //! # Architecture
 //!
 //! ```text
-//! Input adapters (JSONL transcripts, pulse-null Messages)
+//! Transcript adapters (Claude Code, Codex, Grok, pulse-null Messages)
 //!     → Conversation (universal internal format)
 //!     → Archive pipeline (markdown + index + ephemeral + graph)
 //! ```
+//!
+//! Sessions arrive either because the CLI told us (Claude Code's `SessionEnd`
+//! hook) or because we read what it wrote ([`capture`], over [`transcript`]).
 //!
 //! # Features
 //!
 //! - `pulse-null` — Plugin integration for pulse-null entities
 //! - `llm` — HTTP-based LLM provider for entity extraction
 
+pub mod agent_cli;
 pub mod archive;
+pub mod capture;
 pub mod checkpoint;
+pub mod cli_provider;
 pub mod config;
 pub mod config_cli;
 pub mod consume;
@@ -34,6 +44,7 @@ pub mod mcp;
 pub mod paths;
 pub mod search;
 pub mod serve;
+pub mod serve_capture;
 pub mod serve_client;
 #[cfg(feature = "llm")]
 pub mod serve_extract;
@@ -41,6 +52,7 @@ mod serve_security;
 pub mod status;
 pub mod summarize;
 pub mod tags;
+pub mod transcript;
 
 pub mod graph;
 pub mod graph_bridge;

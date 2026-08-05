@@ -1,7 +1,12 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! CLI handlers for `recall-echo config show` and `recall-echo config set`.
 
 use std::path::Path;
 
+use crate::cli_provider::CliSpec;
 use crate::config::{self, Provider};
 use crate::error::RecallError;
 
@@ -30,9 +35,8 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
     // LLM
     eprintln!("\n{BOLD}[llm]{RESET}");
     let provider_label = match &cfg.llm.provider {
-        Provider::Anthropic => "anthropic",
-        Provider::Openai => "openai (ollama)",
-        Provider::ClaudeCode => "claude-code",
+        Provider::Openai => "openai (ollama)".to_string(),
+        other => other.to_string(),
     };
     eprintln!("  provider = {provider_label}");
     eprintln!(
@@ -44,15 +48,19 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
             "custom"
         }
     );
-    eprintln!(
-        "  api_base = {} {DIM}({}){RESET}",
-        cfg.llm.resolved_api_base(),
-        if cfg.llm.api_base.is_empty() {
-            "default"
-        } else {
-            "custom"
-        }
-    );
+    if cfg.llm.provider.is_cli() {
+        show_cli_section(&cfg.llm);
+    } else {
+        eprintln!(
+            "  api_base = {} {DIM}({}){RESET}",
+            cfg.llm.resolved_api_base(),
+            if cfg.llm.api_base.is_empty() {
+                "default"
+            } else {
+                "custom"
+            }
+        );
+    }
 
     // Pipeline
     if let Some(ref pipeline) = cfg.pipeline {
@@ -70,6 +78,43 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
     Ok(())
 }
 
+/// Show the resolved agent-CLI call, so a misconfigured vendor is visible
+/// before it is spawned rather than after it fails.
+fn show_cli_section(llm: &config::LlmSection) {
+    eprintln!("\n{BOLD}[llm.cli]{RESET}");
+    match CliSpec::resolve(&llm.provider, &llm.cli) {
+        Ok(spec) => {
+            let preset = llm
+                .cli
+                .preset
+                .or_else(|| llm.provider.default_cli_preset())
+                .map_or_else(|| "custom".to_string(), |p| p.to_string());
+            eprintln!("  preset   = {preset}");
+            eprintln!("  command  = {}", spec.resolve_command());
+            eprintln!(
+                "  timeout  = {}",
+                spec.timeout
+                    .map_or_else(|| "none".to_string(), |t| format!("{}s", t.as_secs()))
+            );
+            eprintln!("  output   = {}", spec.output_mode);
+            let result = if spec.result_json_paths.is_empty() {
+                "raw stdout".to_string()
+            } else {
+                spec.result_json_paths.to_string()
+            };
+            eprintln!("  result   = {result}");
+            if !spec.ndjson_match.is_empty() {
+                eprintln!("  match    = {}", spec.ndjson_match);
+            }
+            eprintln!(
+                "  {DIM}{}{RESET}",
+                spec.argv_preview(&spec.resolve_model(&llm.model))
+            );
+        }
+        Err(err) => eprintln!("  {err}"),
+    }
+}
+
 /// Set a config key and save.
 pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError> {
     let mut cfg = config::load(memory_dir);
@@ -78,10 +123,21 @@ pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError>
 
     eprintln!("{GREEN}✓{RESET} Set {BOLD}{key}{RESET} = {BOLD}{value}{RESET}");
 
-    // Show resolved values after setting provider
+    // Show what the new provider resolves to — a CLI provider has no API base,
+    // and what matters instead is the call it will make.
     if key == "llm.provider" || key == "provider" {
-        eprintln!("  model    → {}", cfg.llm.resolved_model());
-        eprintln!("  api_base → {}", cfg.llm.resolved_api_base());
+        if cfg.llm.provider.is_cli() {
+            match CliSpec::resolve(&cfg.llm.provider, &cfg.llm.cli) {
+                Ok(spec) => eprintln!(
+                    "  command  → {}",
+                    spec.argv_preview(&spec.resolve_model(&cfg.llm.model))
+                ),
+                Err(err) => eprintln!("  {err}"),
+            }
+        } else {
+            eprintln!("  model    → {}", cfg.llm.resolved_model());
+            eprintln!("  api_base → {}", cfg.llm.resolved_api_base());
+        }
     }
 
     Ok(())

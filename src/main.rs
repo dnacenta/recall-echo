@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -67,6 +71,18 @@ enum Commands {
         #[arg(long)]
         all_unarchived: bool,
     },
+    /// Import sessions from an agent CLI's own transcripts (codex, grok, claude-code)
+    Ingest {
+        /// CLI to import from; repeatable. Omit with --all for every configured CLI
+        #[arg(long = "from", value_name = "CLI")]
+        from: Vec<String>,
+        /// Import from every CLI in [capture] sources, or every one installed
+        #[arg(long)]
+        all: bool,
+        /// Memory directory to import into (defaults to the one hooks write to)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Checkpoint during context compaction (PreCompact hook)
     Checkpoint {
         /// Trigger source (e.g., "precompact")
@@ -124,7 +140,7 @@ enum BenchCommands {
         /// Path to a JSON file containing a BenchConversation; omit to read stdin
         #[arg(long)]
         conv_json: Option<PathBuf>,
-        /// Override LLM provider for extraction (anthropic, openai, claude-code)
+        /// Override LLM provider for extraction (anthropic, openai, claude-code, gemini, grok, cli)
         #[arg(long)]
         provider: Option<String>,
         /// Override LLM model for extraction
@@ -145,7 +161,7 @@ enum BenchCommands {
         /// Read the question from stdin
         #[arg(long)]
         question_stdin: bool,
-        /// Override LLM provider (anthropic, openai, claude-code)
+        /// Override LLM provider (anthropic, openai, claude-code, gemini, grok, cli)
         #[arg(long)]
         provider: Option<String>,
         /// Override LLM model
@@ -178,7 +194,7 @@ enum ConfigCommands {
     Show,
     /// Set a config value (e.g., `config set provider ollama`)
     Set {
-        /// Config key (provider, model, api_base, llm.provider, ephemeral.max_entries)
+        /// Config key (provider, model, api_base, llm.cli.*, ephemeral.max_entries)
         key: String,
         /// New value
         value: String,
@@ -302,7 +318,7 @@ enum GraphCommands {
         /// Override model (default from env or claude-haiku-4-5-20251001)
         #[arg(long)]
         model: Option<String>,
-        /// Override provider (anthropic or openai)
+        /// Override provider (anthropic, openai, claude-code, gemini, grok, cli)
         #[arg(long)]
         provider: Option<String>,
         /// Milliseconds delay between archives (default: 100)
@@ -462,6 +478,7 @@ fn main() {
                 Err("Use --all-unarchived to archive all unarchived JSONL transcripts.".into())
             }
         }
+        Some(Commands::Ingest { from, all, dir }) => run_ingest(&from, all, dir),
         Some(Commands::Checkpoint { trigger }) => checkpoint::run_from_hook(&trigger),
         Some(Commands::Config {
             command,
@@ -706,6 +723,52 @@ fn run_serve(
     tokio::runtime::Runtime::new()
         .map_err(recall_echo::error::RecallError::from)
         .and_then(|rt| rt.block_on(run(options)))
+}
+
+/// Import sessions from the agent CLIs the user runs.
+fn run_ingest(
+    from: &[String],
+    all: bool,
+    dir: Option<PathBuf>,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::capture;
+    use recall_echo::config;
+    use recall_echo::error::RecallError;
+    use recall_echo::transcript::Source;
+
+    if from.is_empty() && !all {
+        return Err(RecallError::Config(
+            "name a CLI with --from <codex|grok|claude-code>, or use --all".into(),
+        ));
+    }
+
+    let memory_dir = match dir {
+        Some(dir) => dir,
+        None => capture_memory_dir()?,
+    };
+
+    let sources = if from.is_empty() {
+        capture::configured_sources(&config::load_from_dir(&memory_dir).capture)
+    } else {
+        from.iter()
+            .map(|name| Source::from_str_loose(name))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    capture::ingest(&memory_dir, &sources)
+}
+
+/// The memory directory `ingest` writes into when none is given.
+///
+/// The same one the hooks write into: an entity's `memory/` when
+/// `RECALL_ECHO_HOME` names one, and `~/.claude` otherwise — which is where a
+/// standalone install already keeps `conversations/`, `ARCHIVE.md` and
+/// `EPHEMERAL.md`, whatever CLI the sessions came from.
+fn capture_memory_dir() -> Result<PathBuf, recall_echo::error::RecallError> {
+    match std::env::var("RECALL_ECHO_HOME") {
+        Ok(root) => Ok(PathBuf::from(root).join("memory")),
+        Err(_) => paths::claude_dir(),
+    }
 }
 
 fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {

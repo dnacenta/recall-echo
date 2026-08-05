@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! `recall-echo serve` — the graph daemon.
 //!
 //! One daemon per memory directory owns the embedded graph store and answers
@@ -928,6 +932,7 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
     });
     warm_embedder(Arc::clone(&graph), Arc::clone(&log));
     let worker = start_background_extraction(&options, &graph, &context, &log);
+    let capture = start_background_capture(&options, &graph, &context, &log);
     log.log("ready");
 
     accept_loop(
@@ -943,6 +948,7 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
     // we try to close it.
     context.shutdown.trigger();
     stop_background_extraction(worker, &log).await;
+    stop_background_capture(capture, &log).await;
 
     // Close the store *before* the socket disappears: a client waiting for the
     // socket to go treats that as "the store is free", and would otherwise
@@ -1058,6 +1064,40 @@ fn start_background_extraction(
         .disable("this binary was built without the `llm` feature");
     log.log("background extraction off: built without the `llm` feature");
     None
+}
+
+/// Start the background transcript-capture worker, when this config wants one.
+///
+/// Independent of extraction on purpose: a user with no LLM provider still gets
+/// their Codex and Grok sessions archived, and a user who has turned capture
+/// off still gets entities extracted.
+fn start_background_capture(
+    options: &ServeOptions,
+    graph: &Arc<GraphMemory>,
+    context: &Arc<DaemonContext>,
+    log: &Arc<DaemonLog>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    crate::serve_capture::spawn(crate::serve_capture::Setup {
+        memory_dir: options.memory_dir.clone(),
+        graph: Arc::clone(graph),
+        idle: Arc::clone(&context.idle),
+        shutdown: Arc::clone(&context.shutdown),
+        log: Arc::clone(log),
+    })
+}
+
+/// Wait for the capture worker to finish the transcript in flight.
+async fn stop_background_capture(worker: Option<tokio::task::JoinHandle<()>>, log: &DaemonLog) {
+    let Some(mut worker) = worker else {
+        return;
+    };
+    if tokio::time::timeout(WORKER_STOP_TIMEOUT, &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+        log.log("background capture did not stop in time — abandoned mid-transcript");
+    }
 }
 
 /// Wait for the background worker to let go of the store, then take it away.

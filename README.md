@@ -1,15 +1,59 @@
 # recall-echo
 
-[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green)](https://github.com/dnacenta/recall-echo/tags)
 
-Persistent four-layer memory system for pulse-null entities. Gives AI agents long-term recall across sessions — a knowledge graph with Bayesian confidence, curated facts, recent session context, and searchable conversation archives.
+**Your coding agent forgets everything the moment you close the session.**
 
-## Why
+So you explain it again. The architecture. Why you dropped that library. The deployment quirk that bites every time. The convention you agreed on last Tuesday. You've written it down in a file, and the file is now 400 lines, and it's stale, and you're still explaining.
 
-LLM coding agents start every session from zero. Built-in memory is typically a single flat file with no session continuity, no short-term vs long-term distinction, and no searchable history. Memory management that depends on the agent remembering to save things is circular.
+recall-echo gives your agent an actual memory: it remembers what you told it, gets surer about what's true as you keep working, and can be asked about any of it — without you maintaining a thing.
 
-recall-echo makes the memory lifecycle mechanical. When running as a pulse-null plugin, archival and checkpointing happen automatically. The agent writes to MEMORY.md during sessions. Everything else is handled by the system.
+```bash
+curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.sh | sh
+recall-echo init
+```
+
+That's it. `init` finds the agent CLIs you already have, picks one to extract with (asking only if there's a real choice), installs Claude Code's hooks, registers the MCP server with every client it found, and downloads the embedding model up front. Conversations are then captured when a session ends, turned into knowledge while your machine is idle, and available to your agent the next time it needs them.
+
+## What makes it different
+
+**You don't curate it.** Archiving, checkpointing and extraction are automatic. Memory that depends on the agent remembering to save things is circular — this closes that loop.
+
+**It finds things by meaning.** Ask about "authentication" and it surfaces the session about JWT and login flows, even if nobody used that word.
+
+**It gets surer over time.** Every fact carries confidence that climbs as conversations corroborate it and decays when they don't. Stale claims lose weight on their own. One offhand contradiction won't erase something the graph is confident about — overturning that takes sustained evidence.
+
+**It knows who said what.** What *you* stated outweighs what the agent inferred from its own notes, and an agent repeating itself is counted as repetition, not proof. Memory can't drift into an echo chamber of its own output.
+
+**It runs on your machine.** Embedded database, local embeddings, nothing leaves the box. And it runs on whatever you already pay for — Claude, Grok, Codex, Gemini, or fully local with Ollama. Retrieval costs nothing at all; only learning new things needs a model.
+
+**Your agent can ask it questions.** It speaks MCP, so Claude Code, Codex, Grok, Gemini, Cursor or Zed can query memory mid-conversation, in its own words. `init` registers it with every one of those CLIs it finds, so there is nothing to wire up.
+
+## Does it work
+
+On a LongMemEval subset it went from answering **0 of 9** questions correctly to **7 of 9**, with the right evidence retrieved for every single one. That's a small sample and it's stated as such — the methodology, the regressions we hit along the way, and the honest limitations are all in [`docs/benchmarks/`](docs/benchmarks/).
+
+## Using it
+
+**Day to day, you don't.** That's the point — sessions are captured and turned into knowledge without you doing anything.
+
+When you *do* want to poke at it:
+
+```bash
+recall-echo status                      # is it healthy, what has it got
+recall-echo search "deployment"         # grep your conversation history
+recall-echo graph query "auth flow"     # semantic search + related entities
+recall-echo graph traverse "recall-echo" # what's connected to what, with confidence
+```
+
+And from inside your agent, once the MCP server is registered, it asks for itself:
+
+> **You:** why did we drop the websocket approach?
+> **Agent:** *(calls `recall_query`)* You moved off it in June — the reconnect logic kept
+> dropping messages under load, and you settled on polling with a 30s interval.
+
+No prompting required; the agent decides when it needs to remember something.
 
 ## Architecture
 
@@ -256,7 +300,7 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph relate <from> --rel <type> --target <to>` — Create a relationship between two entities. Supports `--description` and `--source`.
 - `graph ingest <archive>` — Ingest a single archive file (creates episodes, no LLM required).
 - `graph ingest-all` — Scan conversations/ and ingest all un-ingested archives.
-- `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (anthropic or openai), `--delay-ms`. The daemon runs this pass on its own once the machine is quiet (see [Background extraction](#background-extraction)); this command is how you run it *now*, or in `server` mode, or after changing the model.
+- `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (any name from [LLM providers](#llm-providers)), `--delay-ms`. The daemon runs this pass on its own once the machine is quiet (see [Background extraction](#background-extraction)); this command is how you run it *now*, or in `server` mode, or after changing the model.
 
 **Daemon:**
 
@@ -296,10 +340,15 @@ Bayesian confidence, semantic search, provenance weighting and temporal decay
 sit behind a command a human has to type by hand. The MCP server is the read
 path: the agent asks memory the actual question, at the moment it matters.
 
-Add it to Claude Code:
+**You don't have to register it.** `recall-echo init` does that for every agent
+CLI on the machine. To add it by hand, or to a client `init` doesn't know, each
+vendor spells it differently:
 
 ```bash
-claude mcp add recall-echo -- recall-echo mcp --entity-root /path/to/entity
+claude mcp add recall-echo -s user -- recall-echo mcp --entity-root /path/to/entity
+gemini mcp add -s user recall-echo  recall-echo mcp --entity-root /path/to/entity
+grok   mcp add recall-echo -s user -- recall-echo mcp --entity-root /path/to/entity
+codex  mcp add recall-echo -- recall-echo mcp --entity-root /path/to/entity
 ```
 
 Or, equivalently, in a project's `.mcp.json`:
@@ -372,6 +421,110 @@ Summary of the conversation with key outcomes.
 
 Summaries are LLM-generated when a provider is available (via pulse-null), with silent fallback to algorithmic extraction.
 
+## LLM providers
+
+Entity extraction and dedup need a model. recall-echo will use whichever agent
+CLI you already pay a subscription for, or a local model, or an API key — your
+choice, one config key. **Embeddings are always local** (fastembed/ONNX, no
+network after the model downloads once), so semantic search, HNSW indexing and
+graph traversal never cost anything regardless of this setting.
+
+| `provider` | How it runs | What it costs | Verified |
+|---|---|---|---|
+| `claude-code` | spawns `claude` | Claude subscription — no per-token billing | yes, live call (`claude` 2.1.x) |
+| `gemini` | spawns `gemini` | Gemini subscription/free tier — no per-token billing | yes (`gemini` 0.27.x) |
+| `grok` | spawns `grok` | Grok subscription — no per-token billing | yes, live call (`grok`, JSON envelope) |
+| `codex` | spawns `codex exec` | ChatGPT/Codex subscription — no per-token billing | yes, live call (`codex-cli` 0.146.x, NDJSON stream) |
+| `cli` | spawns whatever `[llm.cli]` describes | whatever that CLI costs | n/a — you supply the flags |
+| `ollama` | HTTP to `localhost:11434/v1` | free, fully local | yes |
+| `openai` | HTTP to any OpenAI-compatible endpoint | per token (API key) | yes |
+| `anthropic` | HTTP to the Anthropic API | per token (API key) | yes |
+
+```bash
+recall-echo config set llm.provider grok     # or codex, gemini, claude-code, ollama…
+recall-echo config show                      # prints the exact argv it will run
+```
+
+The five CLI providers are one implementation. A provider name selects a
+*preset* — a set of defaults for the keys in `[llm.cli]` — and every key can be
+overridden, so a CLI with no preset is configuration rather than a new release:
+
+```toml
+[llm]
+provider = "cli"
+
+[llm.cli]
+command = "mycli"                 # binary name or path
+args = ["chat"]                   # fixed args before the generated flags
+prompt_delivery = "flag"          # "stdin" | "flag" | "arg"
+prompt_flag = "--ask"             # used when prompt_delivery = "flag"
+model_flag = "--model"            # omitted when empty, or when no model is set
+output_format_flag = "--format"   # passed alone when output_format_value is empty
+output_format_value = "json"
+system_prompt_flag = ""           # empty prepends the system prompt to the message
+output_mode = "single-json"       # "raw" | "single-json" | "ndjson"
+result_json_path = "data.text"    # dotted path; "" or omitted = stdout is the answer
+ndjson_match = []                 # line selectors, ndjson mode only
+extra_args = ["--quiet"]
+timeout_secs = 300                # 0 waits forever
+```
+
+Output handling is deliberately forgiving: if the JSON cannot be parsed, or the
+path is not there, or it holds something other than a string, the CLI's stdout
+is used verbatim rather than failing the call. A non-zero exit is an error
+carrying the CLI's own stderr, and so is a JSON envelope that reports its own
+failure while exiting zero.
+
+**Presets, exactly as they are called** (`<prompt>` is the message,
+`<system>` the system prompt; `<` means stdin):
+
+```text
+claude-code  claude -p --model <M> --output-format text --system-prompt <system> \
+                    --no-session-persistence  < <prompt>
+gemini       gemini -m <M> -o json -p "<system>\n\n<prompt>"
+grok         grok -m <M> --output-format json -p "<system>\n\n<prompt>"
+codex        codex exec -m <M> --json --skip-git-repo-check  < "<system>\n\n<prompt>"
+```
+
+Only `claude` takes a system prompt as a flag; for the others it is prepended to
+the message. `-m` is omitted entirely when no model is configured, so each CLI
+uses its own default. Set `CLAUDE_BIN`, `GEMINI_BIN`, `GROK_BIN`, `CODEX_BIN` or
+`RECALL_CLI_BIN` to point at a binary somewhere unusual, or set
+`[llm.cli] command`.
+
+**Output shapes differ, so `output_mode` is part of the config.** `claude`
+prints prose (`raw`), `gemini` and `grok` print one JSON document
+(`single-json` plus `result_json_path`), and `codex --json` prints one JSON
+event per line (`ndjson`), where the answer is the last event matching
+`type=item.completed` and `item.type=agent_message`. A future CLI with any of
+those shapes is a config change:
+
+```toml
+[llm.cli]
+output_mode = "ndjson"
+ndjson_match = ["type=item.completed", "item.type=agent_message"]
+result_json_path = "item.text"
+```
+
+Two codex-specific traps are handled by the preset, and matter if you write
+your own `[llm.cli]` for it: `--skip-git-repo-check` is **required**, because
+codex refuses to run outside a trusted git directory and a memory directory
+usually is not one; and codex's `-p` is `--profile`, not the prompt — unlike
+`claude`, `gemini` and `grok` — so the prompt goes in on stdin.
+
+**Caveats, stated plainly.**
+
+- **gemini's result field is unverified.** The flags were checked against
+  `gemini` 0.27.3, but no authenticated call was made, so the preset tries
+  `response`, then `result`, then falls back to raw stdout. If your Gemini
+  wraps the answer in something else, set `[llm.cli] result_json_path`, or
+  clear `output_format_flag` to take plain text instead.
+- **In the background daemon, only file-based CLI auth works.** The daemon is
+  started with an allowlisted environment (`PATH`, `HOME`, …) that excludes API
+  keys, so a CLI that authenticates through `$HOME` keeps working there while
+  one that needs `SOME_API_KEY` exported behaves like the API providers and
+  disables itself. See [Background extraction](#background-extraction).
+
 ## Configuration
 
 Optional `.recall-echo.toml` in the memory directory:
@@ -381,9 +534,15 @@ Optional `.recall-echo.toml` in the memory directory:
 max_entries = 5              # Rolling window size (1-50, default 5)
 
 [llm]
-provider = "claude-code"     # LLM provider: "claude", "claude-code", or "ollama"
+provider = "claude-code"     # See "LLM providers" above for the full list
 model = ""                   # Model name (provider default if empty)
-api_base = ""                # Custom API base URL (provider default if empty)
+api_base = ""                # Custom API base URL (HTTP providers only)
+
+[llm.cli]                    # Spawned-CLI providers only; every key is optional
+command = ""                 # Override the preset's binary
+output_mode = "raw"          # "raw" | "single-json" | "ndjson"
+result_json_path = ""        # Where the answer sits in JSON output ("" = stdout)
+timeout_secs = 300           # Per-call limit (0 waits forever)
 
 [pipeline]
 docs_dir = "/path/to/journal"  # Directory containing pipeline documents
@@ -411,9 +570,22 @@ batch_size = 3               # Archives per batch (the next batch is one quiet p
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | `ephemeral` | `max_entries` | `5` | Rolling window size for session summaries (1-50) |
-| `llm` | `provider` | `claude` | LLM backend for summarization (`claude`, `claude-code`, `ollama`) |
+| `llm` | `provider` | `anthropic` | LLM backend — see [LLM providers](#llm-providers) |
 | `llm` | `model` | provider default | Model name |
-| `llm` | `api_base` | provider default | Custom API base URL |
+| `llm` | `api_base` | provider default | Custom API base URL (HTTP providers) |
+| `llm.cli` | `preset` | from `provider` | Calling convention: `claude-code`, `gemini`, `grok`, `codex`, `custom` |
+| `llm.cli` | `command` | preset binary | Binary name or path to spawn |
+| `llm.cli` | `args` | preset | Fixed arguments before the generated flags |
+| `llm.cli` | `prompt_delivery` | preset | `stdin`, `flag` or `arg` |
+| `llm.cli` | `prompt_flag` | preset | Flag carrying the prompt when delivery is `flag` |
+| `llm.cli` | `model_flag` | preset | Flag selecting the model (omitted when empty) |
+| `llm.cli` | `output_format_flag` / `output_format_value` | preset | Output-format flag and its value (empty value passes the flag alone) |
+| `llm.cli` | `output_mode` | preset | Stdout shape: `raw`, `single-json` or `ndjson` |
+| `llm.cli` | `ndjson_match` | preset | `path=value` predicates selecting the answer's line in `ndjson` mode |
+| `llm.cli` | `system_prompt_flag` | preset | Flag for the system prompt; empty prepends it to the message |
+| `llm.cli` | `result_json_path` | preset | Dotted path(s) to the answer in JSON output; empty = raw stdout |
+| `llm.cli` | `extra_args` | preset | Arguments appended after the generated flags |
+| `llm.cli` | `timeout_secs` | `300` | Per-call wall-clock limit (`0` waits forever) |
 | `pipeline` | `docs_dir` | — | Path to pipeline documents (LEARNING.md, THOUGHTS.md, etc.) |
 | `pipeline` | `auto_sync` | `false` | Sync pipeline documents to the knowledge graph on archive |
 | `graph` | `mode` | `embedded` | Storage backend: `embedded` (single-process SurrealKV) or `server` (shared SurrealDB) |
@@ -510,9 +682,11 @@ drains one batch per quiet period.
 **What it costs.** Extraction calls a model, so this is real money for
 API-key providers. Two things bound it. First, the daemon is started with an
 allowlisted environment that deliberately excludes API keys, so an
-*auto-started* daemon can only ever use the `claude-code` provider, which bills
-nothing beyond a Claude subscription; with `provider = "anthropic"` the worker
-finds no key, disables itself, and says so once in the daemon log. An API
+*auto-started* daemon can only ever use a CLI provider that authenticates
+through `$HOME` — `claude-code`, and any other agent CLI with file-based auth —
+which bills nothing beyond the subscription you already have; with
+`provider = "anthropic"` the worker finds no key, disables itself, and says so
+once in the daemon log. An API
 provider reaches the daemon only if you run `recall-echo serve --foreground`
 with the key exported — an explicit act. Second, `batch_size` bounds any single
 burst. Set `background_enabled = false` to turn the pass off entirely.
@@ -528,4 +702,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, commit conventions, an
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[MPL-2.0](LICENSE) — file-level copyleft. You may use recall-echo inside a
+closed-source product without opening your own code; modifications to
+recall-echo's own files must be published under the MPL.
+
+Versions up to and including v3.13.0 were released under AGPL-3.0 and remain
+available under those terms.
+
+**Dependency note:** the graph store uses SurrealDB 3.x, under the Business
+Source License 1.1 — source-available rather than OSI open source, converting
+to Apache-2.0 on 2030-01-01. Its use grant covers embedding the engine (what
+recall-echo does); it restricts offering SurrealDB itself as a database
+service to third parties.

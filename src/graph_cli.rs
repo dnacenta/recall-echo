@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Graph memory CLI subcommands (behind `graph` feature flag).
 
 use std::path::{Path, PathBuf};
@@ -637,8 +641,15 @@ pub async fn extract(
         } else {
             String::new()
         };
+        // A CLI provider with no configured model uses its own default, and
+        // says so rather than printing "using ".
+        let model_label = if model_name.is_empty() {
+            "the provider default"
+        } else {
+            &model_name
+        };
         println!(
-            "{BOLD}Extracting entities from {total_count} archives using {model_name}{budget_label}{RESET}",
+            "{BOLD}Extracting entities from {total_count} archives using {model_label}{budget_label}{RESET}",
         );
 
         let quarantine_path = graph_dir.join("extraction-quarantine.txt");
