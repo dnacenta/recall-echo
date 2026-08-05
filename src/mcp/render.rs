@@ -359,6 +359,9 @@ mod tests {
         ScoredEntity {
             entity: entity(name),
             score,
+            // Fixtures only need a self-consistent value; the render layer
+            // shows similarity for episodes, not entities.
+            similarity: score,
             source,
         }
     }

@@ -104,6 +104,7 @@ fn scored_entity_typed() -> ScoredEntity {
     ScoredEntity {
         entity: entity_detail(),
         score: 0.842,
+        similarity: 0.913,
         source: MatchSource::Semantic,
     }
 }
