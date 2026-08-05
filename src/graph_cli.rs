@@ -1272,8 +1272,24 @@ pub async fn decay_report(
                 format!("{DIM}≈{RESET}")
             };
 
+            // Evidence behind the score: how much corroboration it rests on,
+            // and how much of that was the agent re-asserting itself.
+            let edge_evidence = rel.edge_evidence();
+            let coherence = edge_evidence.self_reinforcements();
+            let evidence = rel.evidence();
+            let evidence_tag = format!(
+                " {DIM}[n={:.1} ±{:.2}{}]{RESET}",
+                evidence.concentration(),
+                evidence.variance().sqrt(),
+                if coherence > 0 {
+                    format!(", self×{coherence}")
+                } else {
+                    String::new()
+                }
+            );
+
             println!(
-                "  {from_short} {CYAN}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{reinforced_tag}",
+                "  {from_short} {CYAN}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}",
                 rel.rel_type, rel.confidence, effective,
             );
         }

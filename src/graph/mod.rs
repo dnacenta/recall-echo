@@ -95,7 +95,13 @@ impl GraphMemory {
         std::fs::create_dir_all(path)?;
 
         let db = store::open(path).await?;
-        store::init_schema(&db).await?;
+        let migration = store::init_schema(&db).await?;
+        if migration.ran() {
+            eprintln!(
+                "recall-echo: graph schema migrated v{} → v{} ({} edges backfilled)",
+                migration.from_version, migration.to_version, migration.edges_backfilled
+            );
+        }
 
         let models_dir = path.join("models");
         std::fs::create_dir_all(&models_dir)?;
@@ -166,7 +172,13 @@ impl GraphMemory {
         models_dir: &Path,
     ) -> Result<Self, GraphError> {
         let db = store::connect(config).await?;
-        store::init_schema(&db).await?;
+        let migration = store::init_schema(&db).await?;
+        if migration.ran() {
+            eprintln!(
+                "recall-echo: graph schema migrated v{} → v{} ({} edges backfilled)",
+                migration.from_version, migration.to_version, migration.edges_backfilled
+            );
+        }
 
         std::fs::create_dir_all(models_dir)?;
         let embedder = LazyEmbedder::new(models_dir);

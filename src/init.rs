@@ -211,6 +211,16 @@ fn configure_hooks(_entity_root: &Path) -> bool {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "recall-echo".into());
 
+    // A path under target/ is a test harness or a debug build, not something
+    // a user's hooks should be pinned to for the life of the install.
+    if recall_bin.contains("/target/debug/") || recall_bin.contains("/target/release/") {
+        print_status(
+            Status::Exists,
+            "Skipped hook install — running from a build directory",
+        );
+        return false;
+    }
+
     let archive_cmd = format!("{recall_bin} archive-session");
     let checkpoint_cmd = format!("{recall_bin} checkpoint --trigger precompact");
     let consume_cmd = format!("{recall_bin} consume");

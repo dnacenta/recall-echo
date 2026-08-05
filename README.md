@@ -161,9 +161,14 @@ recall-echo graph <subcommand>         # Knowledge graph operations
 ### cargo install
 
 ```bash
-cargo install recall-echo
+cargo install recall-echo --locked
 recall-echo init
 ```
+
+`--locked` installs the exact dependency versions the release was tested
+against. The embedded graph store's on-disk record format is tied to the
+SurrealDB version, so a build that resolves a different SurrealDB may be
+unable to read a store another build wrote.
 
 ### Prebuilt binaries
 

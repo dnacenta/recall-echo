@@ -18,7 +18,13 @@ toml = "0.8"
 dirs = "6"
 
 # Graph — knowledge graph with SurrealDB + fastembed
-surrealdb = { version = "3", default-features = false }
+# Pinned to the 3.2 series: the embedded store's on-disk record format is
+# tied to the surrealdb-core version (3.0/3.1 cannot read a 3.2-written
+# store — "Invalid revision `2` for type `Node`"). `cargo install` resolves
+# dependencies fresh unless `--locked`, so a loose "3" lets a fresh install
+# write a format the pinned build cannot read. Bump deliberately, with a
+# migration note.
+surrealdb = { version = "3.2", default-features = false }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "net", "time", "sync", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
