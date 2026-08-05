@@ -65,6 +65,7 @@ pub struct GraphMemory {
     path: PathBuf,
     scoring: crate::config::GraphScoringConfig,
     provenance: confidence::ProvenanceWeights,
+    dedup: crate::config::GraphDedupConfig,
 }
 
 impl GraphMemory {
@@ -115,6 +116,7 @@ impl GraphMemory {
             path: path.to_path_buf(),
             scoring: graph_config.scoring,
             provenance: graph_config.provenance,
+            dedup: graph_config.dedup,
         })
     }
 
@@ -151,6 +153,7 @@ impl GraphMemory {
 
         let scoring = graph_section.scoring.clone();
         let provenance = graph_section.provenance;
+        let dedup = graph_section.dedup.clone();
         let server_config = store::ServerConfig {
             url: graph_section.url,
             username: graph_section.username,
@@ -163,6 +166,7 @@ impl GraphMemory {
         let mut gm = Self::connect(&server_config, &models_dir).await?;
         gm.scoring = scoring;
         gm.provenance = provenance;
+        gm.dedup = dedup;
         Ok(gm)
     }
 
@@ -189,6 +193,7 @@ impl GraphMemory {
             path: models_dir.to_path_buf(),
             scoring: crate::config::GraphScoringConfig::default(),
             provenance: confidence::ProvenanceWeights::default(),
+            dedup: crate::config::GraphDedupConfig::default(),
         })
     }
 
@@ -202,6 +207,13 @@ impl GraphMemory {
     #[must_use]
     pub fn provenance_weights(&self) -> &confidence::ProvenanceWeights {
         &self.provenance
+    }
+
+    /// Similarity bands this store applies when deduplicating entities
+    /// (`[graph.dedup]`) — which candidates are worth a model call.
+    #[must_use]
+    pub fn dedup_config(&self) -> &crate::config::GraphDedupConfig {
+        &self.dedup
     }
 
     /// Internal access to the database handle.

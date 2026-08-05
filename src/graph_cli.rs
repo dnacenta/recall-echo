@@ -467,6 +467,8 @@ struct ExtractionTotals {
     processed: u32,
     estimated_tokens: u64,
     quarantined: Vec<u32>,
+    dedup_llm_calls: u32,
+    dedup_fast_path: u32,
 }
 
 /// Print a dry-run listing of archives that would be extracted.
@@ -505,6 +507,13 @@ fn print_extract_summary(totals: &ExtractionTotals) {
         "  Estimated tokens: ~{}",
         format_tokens(totals.estimated_tokens)
     );
+    let dedup_total = totals.dedup_llm_calls + totals.dedup_fast_path;
+    if dedup_total > 0 {
+        println!(
+            "  Dedup: {} of {} candidates needed a model call ({} resolved locally)",
+            totals.dedup_llm_calls, dedup_total, totals.dedup_fast_path
+        );
+    }
 
     if !totals.quarantined.is_empty() {
         println!(
@@ -678,6 +687,8 @@ pub async fn extract(
             totals.errors.extend(report.errors);
             totals.processed += 1;
             totals.estimated_tokens += report.estimated_tokens;
+            totals.dedup_llm_calls += report.dedup_llm_calls;
+            totals.dedup_fast_path += report.dedup_fast_path;
 
             // Rate limiting between archives
             if delay_ms > 0 && *ln != *log_numbers.last().unwrap() {

@@ -184,6 +184,12 @@ pub struct GraphSection {
     /// [`ProvenanceWeights`] for details.
     #[serde(default)]
     pub provenance: ProvenanceWeights,
+    /// Similarity bands that decide when entity dedup pays for a model call.
+    ///
+    /// Maps to the `[graph.dedup]` section of `.recall-echo.toml`. See
+    /// [`GraphDedupConfig`] for the bands and their defaults.
+    #[serde(default)]
+    pub dedup: GraphDedupConfig,
 }
 
 impl Default for GraphSection {
@@ -197,6 +203,7 @@ impl Default for GraphSection {
             password_file: String::new(),
             scoring: GraphScoringConfig::default(),
             provenance: ProvenanceWeights::default(),
+            dedup: GraphDedupConfig::default(),
         }
     }
 }
@@ -263,6 +270,87 @@ impl Default for GraphScoringConfig {
             weight_utility: 0.25,
         }
     }
+}
+
+/// Similarity bands that decide when entity dedup pays for a model call.
+///
+/// Dedup asks one question — *is this the same thing?* — and that is a
+/// question about meaning, so the bands are cut on raw cosine similarity
+/// between the candidate's abstract and an existing entity's, never on the
+/// retrieval score (which folds in hotness and utility: a popular unrelated
+/// entity would otherwise buy a model call, and every entity gets more
+/// popular as the graph grows).
+///
+/// ```text
+/// similarity >= certain_similarity   → the same entity; resolved locally
+/// review_similarity ..< certain      → ambiguous; one model call decides
+/// similarity <  review_similarity    → new entity; created locally
+/// ```
+///
+/// Defaults (`0.92` / `0.82` / `3`) are cut from the similarity distribution of
+/// a LongMemEval baseline store (192 entities, 150 sampled candidates, 750
+/// neighbour pairs). BGE-Small puts every same-language pair in a narrow high
+/// band — median neighbour 0.75, median *nearest* neighbour 0.81 — so the cuts
+/// sit at its tail, not at intuitive-looking round numbers: 0.92 is the 96th
+/// percentile of pairs, where abstracts are paraphrases of each other, and 0.82
+/// the ~78th, below which pairs are merely same-topic. Candidates averaged 1.1
+/// neighbours above 0.82, so a cap of three bounds the worst case without
+/// binding the normal one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphDedupConfig {
+    /// At or above this cosine similarity the candidate is treated as the same
+    /// entity and resolved without a model call. Default `0.92`.
+    pub certain_similarity: f64,
+    /// Below this cosine similarity the candidate is treated as new and created
+    /// without a model call. Default `0.82`.
+    pub review_similarity: f64,
+    /// How many existing entities, by similarity rank, dedup may fetch and hand
+    /// to the model. Caps prompt size and comparison count so neither can grow
+    /// with the graph. Default `3`.
+    pub max_candidates: usize,
+}
+
+impl Default for GraphDedupConfig {
+    fn default() -> Self {
+        Self {
+            certain_similarity: 0.92,
+            review_similarity: 0.82,
+            max_candidates: 3,
+        }
+    }
+}
+
+impl GraphDedupConfig {
+    /// The band a candidate's nearest neighbour falls in.
+    #[must_use]
+    pub fn band(&self, similarity: f64) -> DedupBand {
+        if similarity >= self.certain_similarity {
+            DedupBand::SameEntity
+        } else if similarity >= self.review_similarity {
+            DedupBand::Ambiguous
+        } else {
+            DedupBand::NewEntity
+        }
+    }
+
+    /// How many candidates to fetch and consider — at least one, whatever the
+    /// config says, or dedup would be blind.
+    #[must_use]
+    pub fn candidate_limit(&self) -> usize {
+        self.max_candidates.max(1)
+    }
+}
+
+/// Which of the three dedup bands a similarity falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupBand {
+    /// Certainly the same entity — resolve without a model call.
+    SameEntity,
+    /// Genuinely ambiguous — worth a model call.
+    Ambiguous,
+    /// Certainly not the same entity — create without a model call.
+    NewEntity,
 }
 
 fn default_graph_mode() -> String {
@@ -418,6 +506,26 @@ impl Config {
                 self.graph_section().provenance.weight_self = parse_weight(value)?;
                 Ok(())
             }
+            "graph.dedup.certain_similarity" => {
+                self.graph_section().dedup.certain_similarity = parse_similarity(value)?;
+                Ok(())
+            }
+            "graph.dedup.review_similarity" => {
+                self.graph_section().dedup.review_similarity = parse_similarity(value)?;
+                Ok(())
+            }
+            "graph.dedup.max_candidates" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                if n == 0 {
+                    return Err(RecallError::Config(
+                        "max_candidates must be at least 1".into(),
+                    ));
+                }
+                self.graph_section().dedup.max_candidates = n;
+                Ok(())
+            }
             other => Err(RecallError::Config(format!("unknown config key: {other}"))),
         }
     }
@@ -442,6 +550,20 @@ fn parse_weight(value: &str) -> Result<f64, crate::error::RecallError> {
         )));
     }
     Ok(weight)
+}
+
+/// Parse a cosine-similarity threshold: a finite number in `0.0..=1.0`.
+fn parse_similarity(value: &str) -> Result<f64, crate::error::RecallError> {
+    use crate::error::RecallError;
+    let similarity: f64 = value
+        .parse()
+        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+    if !similarity.is_finite() || !(0.0..=1.0).contains(&similarity) {
+        return Err(RecallError::Config(format!(
+            "similarity threshold must be between 0.0 and 1.0, got {value}"
+        )));
+    }
+    Ok(similarity)
 }
 
 #[cfg(test)]
@@ -715,6 +837,69 @@ mod tests {
             parsed.graph.expect("graph section survives").provenance,
             ProvenanceWeights::default()
         );
+    }
+
+    #[test]
+    fn dedup_defaults_leave_a_gap_between_the_bands() {
+        let dedup = GraphDedupConfig::default();
+        assert!((dedup.certain_similarity - 0.92).abs() < f64::EPSILON);
+        assert!((dedup.review_similarity - 0.82).abs() < f64::EPSILON);
+        assert_eq!(dedup.max_candidates, 3);
+        assert!(dedup.review_similarity < dedup.certain_similarity);
+    }
+
+    #[test]
+    fn dedup_bands_are_cut_at_the_thresholds() {
+        let dedup = GraphDedupConfig::default();
+        assert_eq!(dedup.band(0.99), DedupBand::SameEntity);
+        assert_eq!(dedup.band(0.92), DedupBand::SameEntity);
+        assert_eq!(dedup.band(0.9), DedupBand::Ambiguous);
+        assert_eq!(dedup.band(0.82), DedupBand::Ambiguous);
+        assert_eq!(dedup.band(0.8), DedupBand::NewEntity);
+        assert_eq!(dedup.band(0.0), DedupBand::NewEntity);
+    }
+
+    /// A store configured to fetch nothing would resolve every candidate as
+    /// new; the floor of one keeps dedup able to see.
+    #[test]
+    fn dedup_candidate_limit_never_falls_below_one() {
+        let dedup = GraphDedupConfig {
+            max_candidates: 0,
+            ..GraphDedupConfig::default()
+        };
+        assert_eq!(dedup.candidate_limit(), 1);
+    }
+
+    #[test]
+    fn dedup_partial_toml_fills_defaults() {
+        let cfg: Config = toml::from_str("[graph]\n\n[graph.dedup]\ncertain_similarity = 0.95\n")
+            .expect("parse dedup section");
+        let dedup = cfg.graph.expect("graph section present").dedup;
+        assert!((dedup.certain_similarity - 0.95).abs() < f64::EPSILON);
+        assert!((dedup.review_similarity - 0.82).abs() < f64::EPSILON);
+        assert_eq!(dedup.max_candidates, 3);
+    }
+
+    #[test]
+    fn set_key_dedup_thresholds() {
+        let mut cfg = Config::default();
+        cfg.set_key("graph.dedup.certain_similarity", "0.9")
+            .unwrap();
+        cfg.set_key("graph.dedup.review_similarity", "0.6").unwrap();
+        cfg.set_key("graph.dedup.max_candidates", "5").unwrap();
+
+        let dedup = &cfg.graph.as_ref().expect("graph section created").dedup;
+        assert!((dedup.certain_similarity - 0.9).abs() < f64::EPSILON);
+        assert!((dedup.review_similarity - 0.6).abs() < f64::EPSILON);
+        assert_eq!(dedup.max_candidates, 5);
+
+        assert!(cfg
+            .set_key("graph.dedup.certain_similarity", "1.5")
+            .is_err());
+        assert!(cfg
+            .set_key("graph.dedup.review_similarity", "-0.1")
+            .is_err());
+        assert!(cfg.set_key("graph.dedup.max_candidates", "0").is_err());
     }
 
     #[test]

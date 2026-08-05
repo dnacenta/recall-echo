@@ -352,8 +352,23 @@ pub struct QueryResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub entity: Entity,
+    /// Blended retrieval score: semantic similarity plus hotness and utility.
+    /// It answers *how worth returning is this*, not *how alike is this*.
     pub score: f64,
+    /// Cosine distance between the query and the entity's embedding.
     pub distance: f64,
+}
+
+impl SearchResult {
+    /// Raw cosine similarity between the query and this entity — the
+    /// popularity-free half of [`SearchResult::score`].
+    ///
+    /// Callers asking "is this the same thing?" (deduplication) must use this;
+    /// callers asking "is this worth returning?" (retrieval) want the score.
+    #[must_use]
+    pub fn similarity(&self) -> f64 {
+        1.0 - self.distance
+    }
 }
 
 /// A node in a traversal tree.
@@ -659,6 +674,14 @@ pub struct IngestionReport {
     /// applies to. Empty when the run had no LLM to extract with.
     #[serde(default)]
     pub entity_ids: Vec<String>,
+    /// Candidates that reached the ambiguous band and cost one model call each.
+    /// The dedup half of the ingest bill.
+    #[serde(default)]
+    pub dedup_llm_calls: u32,
+    /// Candidates resolved by name match or by a similarity band — decided
+    /// without a model call.
+    #[serde(default)]
+    pub dedup_fast_path: u32,
 }
 
 #[cfg(test)]

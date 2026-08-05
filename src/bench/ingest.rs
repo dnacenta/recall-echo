@@ -34,6 +34,13 @@ pub struct IngestStats {
     /// Non-fatal warnings surfaced during extraction (passed through from
     /// `IngestionReport.errors`).
     pub warnings: Vec<String>,
+    /// Entity candidates that cost a dedup model call — the cost term that
+    /// used to grow with the size of the graph.
+    #[serde(default)]
+    pub dedup_llm_calls: usize,
+    /// Entity candidates dedup resolved without a model call.
+    #[serde(default)]
+    pub dedup_fast_path: usize,
 }
 
 /// Ingest a LoCoMo conversation into the entity at `entity_root`.
@@ -86,6 +93,8 @@ pub async fn ingest_conversation(
         stats.episodes += report.episodes_created as usize;
         stats.entities_extracted += report.entities_created as usize;
         stats.relations_extracted += report.relationships_created as usize;
+        stats.dedup_llm_calls += report.dedup_llm_calls as usize;
+        stats.dedup_fast_path += report.dedup_fast_path as usize;
         stats.warnings.extend(report.errors);
     }
 

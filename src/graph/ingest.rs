@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 
 use super::confidence::{ExtractionContext, Provenance};
 use super::crud;
-use super::dedup::{self, ResolvedEntity};
+use super::dedup::{self, Resolution, ResolvedEntity};
 use super::error::GraphError;
 use super::extract;
 use super::llm::LlmProvider;
@@ -278,23 +278,8 @@ async fn process_extraction(
     let mut name_map: HashMap<String, String> = HashMap::new();
 
     for candidate in &deduplicated {
-        // Estimate ~600 tokens per dedup call (vector search + LLM decision)
-        report.estimated_tokens += 600;
         match dedup::resolve_entity(gm, llm, candidate, session_id).await {
-            Ok(ResolvedEntity::Created(entity)) => {
-                name_map.insert(candidate.name.clone(), entity.name.clone());
-                report.entity_ids.push(entity.id_string());
-                report.entities_created += 1;
-            }
-            Ok(ResolvedEntity::Merged(entity)) => {
-                name_map.insert(candidate.name.clone(), entity.name.clone());
-                report.entity_ids.push(entity.id_string());
-                report.entities_merged += 1;
-            }
-            Ok(ResolvedEntity::Skipped) => {
-                name_map.insert(candidate.name.clone(), candidate.name.clone());
-                report.entities_skipped += 1;
-            }
+            Ok(resolution) => record_resolution(report, &mut name_map, candidate, resolution),
             Err(e) => {
                 report
                     .errors
@@ -365,6 +350,41 @@ async fn process_extraction(
     }
 
     Ok(())
+}
+
+/// Fold one dedup resolution into the run's report: what it decided, and what
+/// deciding it cost.
+fn record_resolution(
+    report: &mut IngestionReport,
+    name_map: &mut HashMap<String, String>,
+    candidate: &ExtractedEntity,
+    resolution: Resolution,
+) {
+    if resolution.path.used_llm() {
+        // Estimate ~600 tokens per dedup call (prompt + decision). The fast
+        // paths make no call, so they add nothing to the bill.
+        report.dedup_llm_calls += 1;
+        report.estimated_tokens += 600;
+    } else {
+        report.dedup_fast_path += 1;
+    }
+
+    match resolution.entity {
+        ResolvedEntity::Created(entity) => {
+            name_map.insert(candidate.name.clone(), entity.name.clone());
+            report.entity_ids.push(entity.id_string());
+            report.entities_created += 1;
+        }
+        ResolvedEntity::Merged(entity) => {
+            name_map.insert(candidate.name.clone(), entity.name.clone());
+            report.entity_ids.push(entity.id_string());
+            report.entities_merged += 1;
+        }
+        ResolvedEntity::Skipped => {
+            name_map.insert(candidate.name.clone(), candidate.name.clone());
+            report.entities_skipped += 1;
+        }
+    }
 }
 
 /// Merge extracted entities that share the same name (case-insensitive).

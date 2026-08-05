@@ -112,6 +112,8 @@ fn ingest_stats_serde_roundtrip() {
         episodes: 7,
         log_numbers: vec![1, 2],
         warnings: vec!["dedup warn".to_string()],
+        dedup_llm_calls: 1,
+        dedup_fast_path: 4,
     };
     let json = serde_json::to_string(&stats).unwrap();
     let back: IngestStats = serde_json::from_str(&json).unwrap();

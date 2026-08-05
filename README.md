@@ -68,7 +68,7 @@ This means the graph handles contradictions, reinforces patterns over time, and 
 
 **Entity types:** person, project, tool, service, preference, decision, event, concept, case, pattern, thread, thought, question, observation, policy, measurement, outcome. Mutable types (person, project, tool, etc.) can be updated; immutable types (decision, event, case, etc.) are append-only.
 
-**Extraction pipeline:** When conversations are archived, an LLM-powered pipeline chunks the text (~500 tokens), extracts entities and relationships in parallel (up to 10 concurrent), then deduplicates sequentially with LLM-assisted skip/create/merge decisions. Re-extracted relationships receive Bayesian corroboration updates weighted by the provenance of the chunk they came from — conversation turn roles are read to tell the human's words from the agent's, and `graph ingest --external` marks genuinely external material — so knowledge confirmed by independent sources gains confidence while the agent repeating itself barely moves the score.
+**Extraction pipeline:** When conversations are archived, an LLM-powered pipeline chunks the text (~500 tokens), extracts entities and relationships in parallel (up to 10 concurrent), then deduplicates sequentially. Dedup escalates to the LLM only for candidates it cannot settle itself: an existing entity of the same name and type is the same entity, a nearest neighbour above `certain_similarity` is the same entity, one below `review_similarity` is a new one, and only the band in between buys an LLM skip/create/merge decision — over a set capped at `max_candidates`. The bands are cut on raw cosine similarity, never on the blended retrieval score, so a popular entity does not read as a likelier duplicate and dedup cost stays flat as the graph grows. Re-extracted relationships receive Bayesian corroboration updates weighted by the provenance of the chunk they came from — conversation turn roles are read to tell the human's words from the agent's, and `graph ingest --external` marks genuinely external material — so knowledge confirmed by independent sources gains confidence while the agent repeating itself barely moves the score.
 
 **Tiered content:** Entities store content at three levels — L0 (abstract, used for embeddings and cheap traversal), L1 (overview, used for reranking), and L2 (full content, pulled on demand). This keeps graph traversal fast.
 
@@ -339,6 +339,11 @@ auto_sync = true               # Auto-sync pipeline docs to graph on archive
 mode = "embedded"            # Storage backend: "embedded" (default) or "server"
 url = "ws://localhost:8787"  # SurrealDB server URL (server mode only)
 
+[graph.dedup]
+certain_similarity = 0.92    # At or above this cosine similarity, the same entity — no model call
+review_similarity = 0.82     # Below this, a new entity — no model call
+max_candidates = 3           # Existing entities compared per candidate
+
 [serve]
 socket_path = ""             # Daemon socket override (default: XDG runtime dir)
 idle_timeout_secs = 3600     # Shut the daemon down after this much inactivity (0 = never)
@@ -354,6 +359,9 @@ idle_timeout_secs = 3600     # Shut the daemon down after this much inactivity (
 | `pipeline` | `auto_sync` | `false` | Sync pipeline documents to the knowledge graph on archive |
 | `graph` | `mode` | `embedded` | Storage backend: `embedded` (single-process SurrealKV) or `server` (shared SurrealDB) |
 | `graph` | `url` | `ws://localhost:8787` | SurrealDB server URL, `server` mode only |
+| `graph.dedup` | `certain_similarity` | `0.92` | Cosine similarity at or above which a candidate is the same entity, resolved without a model call |
+| `graph.dedup` | `review_similarity` | `0.82` | Cosine similarity below which a candidate is a new entity, created without a model call |
+| `graph.dedup` | `max_candidates` | `3` | How many existing entities dedup compares a candidate against |
 | `serve` | `socket_path` | XDG runtime dir | Daemon socket path override |
 | `serve` | `idle_timeout_secs` | `3600` | Daemon idle shutdown timeout (`0` disables) |
 
