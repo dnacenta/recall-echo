@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! recall-echo — Persistent memory system with knowledge graph.
 //!
 //! A general-purpose persistent memory system for any LLM tool — Claude Code,

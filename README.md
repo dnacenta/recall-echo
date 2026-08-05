@@ -1,6 +1,6 @@
 # recall-echo
 
-[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/recall-echo)](LICENSE)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/recall-echo?label=version&color=green)](https://github.com/dnacenta/recall-echo/tags)
 
 Persistent four-layer memory system for pulse-null entities. Gives AI agents long-term recall across sessions — a knowledge graph with Bayesian confidence, curated facts, recent session context, and searchable conversation archives.
@@ -528,4 +528,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, commit conventions, an
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[MPL-2.0](LICENSE) — file-level copyleft. You may use recall-echo inside a
+closed-source product without opening your own code; modifications to
+recall-echo's own files must be published under the MPL.
+
+Versions up to and including v3.13.0 were released under AGPL-3.0 and remain
+available under those terms.
+
+**Dependency note:** the graph store uses SurrealDB 3.x, under the Business
+Source License 1.1 — source-available rather than OSI open source, converting
+to Apache-2.0 on 2030-01-01. Its use grant covers embedding the engine (what
+recall-echo does); it restricts offering SurrealDB itself as a database
+service to third parties.

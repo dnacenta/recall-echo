@@ -262,7 +262,7 @@ The confidence model is ~440 lines of Rust plus ~410 of tests (`src/graph/confid
 - **SurrealDB** (embedded SurrealKV by default, WebSocket server optional) as the graph store and HNSW vector index
 - **FastEmbed** for local 384-dimension cosine embeddings
 - **Tokio** for async, with `futures::future::join_all` for concurrent per-entity feedback updates (`utility.rs:166`)
-- **AGPL-3.0**
+- **MPL-2.0** (through v3.13.0: AGPL-3.0)
 
 A few design choices worth pulling out:
 
@@ -275,7 +275,7 @@ A few design choices worth pulling out:
 
 ## Reproducibility
 
-Source: [`github.com/dnacenta/recall-echo`](https://github.com/dnacenta/recall-echo), AGPL-3.0.
+Source: [`github.com/dnacenta/recall-echo`](https://github.com/dnacenta/recall-echo), MPL-2.0.
 
 Read in this order:
 

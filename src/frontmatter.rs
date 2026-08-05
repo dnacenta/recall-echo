@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 /// YAML frontmatter for conversation archives.
 ///
 /// Parses and renders a minimal subset: log number, date, session_id,
