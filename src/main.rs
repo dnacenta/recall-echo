@@ -91,6 +91,12 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
     },
+    /// Run the MCP server (stdio) so an agent can query its own memory
+    Mcp {
+        /// Entity root directory (defaults to current directory)
+        #[arg(long)]
+        entity_root: Option<PathBuf>,
+    },
     /// Knowledge graph operations
     Graph {
         #[command(subcommand)]
@@ -473,6 +479,12 @@ fn main() {
         Some(Commands::Serve { dir, foreground }) => {
             let memory_dir = dir.unwrap_or_else(|| resolve_entity_root(None).join("memory"));
             run_serve(&memory_dir, foreground)
+        }
+        Some(Commands::Mcp { entity_root }) => {
+            let memory_dir = resolve_entity_root(entity_root).join("memory");
+            client_runtime()
+                .map_err(recall_echo::error::RecallError::from)
+                .and_then(|rt| rt.block_on(recall_echo::mcp::run(&memory_dir)))
         }
         Some(Commands::Graph {
             command,

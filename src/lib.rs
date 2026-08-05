@@ -30,6 +30,7 @@ pub mod error;
 pub mod frontmatter;
 pub mod init;
 pub mod jsonl;
+pub mod mcp;
 pub mod paths;
 pub mod search;
 pub mod serve;

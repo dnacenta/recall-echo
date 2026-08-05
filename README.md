@@ -284,6 +284,59 @@ recall-echo serve --dir /path/to/memory --foreground
 `--foreground` logs to stderr as well as `<memory_dir>/graph/daemon.log` and
 disables idle shutdown, leaving lifetime to systemd.
 
+### `recall-echo mcp`
+
+An MCP server over stdio, so an agent can query its own memory mid-conversation.
+
+**Why it exists.** Without it the knowledge graph is effectively write-only.
+`SessionEnd` ingests episodes and `SessionStart` runs `consume`, which only
+prints EPHEMERAL.md — nothing in a normal session ever reads the graph, so the
+Bayesian confidence, semantic search, provenance weighting and temporal decay
+sit behind a command a human has to type by hand. The MCP server is the read
+path: the agent asks memory the actual question, at the moment it matters.
+
+Add it to Claude Code:
+
+```bash
+claude mcp add recall-echo -- recall-echo mcp --entity-root /path/to/entity
+```
+
+Or, equivalently, in a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "recall-echo": {
+      "command": "recall-echo",
+      "args": ["mcp", "--entity-root", "/path/to/entity"]
+    }
+  }
+}
+```
+
+`--entity-root` defaults to the current directory, so it can be omitted when
+the client is launched from the entity root.
+
+**Tools.** All five are read-only; none can write to the graph.
+
+| Tool | Answers |
+| --- | --- |
+| `recall_query` | The default lookup: semantic search + one hop of graph expansion + the conversation fragments behind it |
+| `recall_search` | Semantic entity search alone — names, types, abstracts, retrieval scores |
+| `recall_episodes` | The raw conversation fragments, for what was actually said |
+| `recall_traverse` | Relationships out of one named entity, as a tree with edge confidence |
+| `recall_status` | Entity, relationship and episode counts — tells an empty memory from a failed lookup |
+
+Every tool runs through the same graph daemon as the CLI, so it inherits the
+daemon's auto-start, locking and concurrency, and starting an MCP client never
+takes the store away from a hook.
+
+**Writing is deliberately absent.** The graph discounts what the agent asserts
+about itself (`[graph.provenance]`), and a tool that let the model create
+entities and edges directly would route around exactly that mechanism. Memory
+is written on the ingest path, where every episode is stamped with its
+authorship.
+
 ## Archive Format
 
 Conversation archives use YAML frontmatter with markdown content:
