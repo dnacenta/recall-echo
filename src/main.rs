@@ -154,6 +154,12 @@ enum BenchCommands {
         /// Archive top-K
         #[arg(long, default_value = "5")]
         archive_top_k: usize,
+        /// Graph episode top-K
+        #[arg(long, default_value = "20")]
+        episode_top_k: usize,
+        /// Character ceiling for the assembled episode section
+        #[arg(long, default_value = "28000")]
+        episode_char_budget: usize,
         /// Exclude episode search
         #[arg(long)]
         no_episodes: bool,
@@ -747,6 +753,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             graph_depth,
             graph_limit,
             archive_top_k,
+            episode_top_k,
+            episode_char_budget,
             no_episodes,
         } => {
             let question_text = match (question, question_stdin) {
@@ -768,6 +776,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 graph_depth,
                 graph_limit,
                 archive_top_k,
+                episode_top_k,
+                episode_char_budget,
                 include_episodes: !no_episodes,
                 provider_override,
                 model_override: model,

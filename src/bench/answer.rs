@@ -19,15 +19,35 @@ use crate::search;
 
 // ── Public types ─────────────────────────────────────────────────────────
 
+/// Share of [`AnswerOpts::episode_char_budget`] reserved for archive snippets,
+/// as a divisor. Graph episodes are assembled first and would otherwise consume
+/// the whole budget, starving a channel that is far cheaper per character.
+const ARCHIVE_BUDGET_DIVISOR: usize = 4;
+
 /// Options for [`answer_question`].
 ///
-/// Defaults mirror the values documented in the benchmark spec:
-/// graph depth 2, graph result limit 20, archive top-K 5, episodes enabled.
+/// Defaults: graph depth 2, graph result limit 20, episode top-K 20, archive
+/// top-K 5, episodes enabled.
 #[derive(Debug, Clone)]
 pub struct AnswerOpts {
     pub graph_depth: usize,
     pub graph_limit: usize,
+    /// How many episodes to pull from graph episode search. Separate from
+    /// [`Self::archive_top_k`]: the two channels have different cost per item
+    /// and different recall curves, and the episode index measurably loses
+    /// results below k=20 (`ef_search` is derived from k).
+    pub episode_top_k: usize,
+    /// How many archive files the ranked keyword search may contribute.
     pub archive_top_k: usize,
+    /// Character ceiling for the assembled `## Recent episodes` section, so
+    /// raising `episode_top_k` cannot grow the prompt without bound.
+    ///
+    /// A backstop, not the operative limit: the default is sized so both
+    /// channels can deliver their full top-K at worst-case item size (20
+    /// episodes at the 1,000-character ingest cap; 5 archive previews at the
+    /// ~1,100 characters measured on the benchmark corpora). It bites only on
+    /// pathologically large items, so `episode_top_k` stays meaningful.
+    pub episode_char_budget: usize,
     pub include_episodes: bool,
     pub provider_override: Option<Provider>,
     pub model_override: Option<String>,
@@ -41,7 +61,9 @@ impl Default for AnswerOpts {
         Self {
             graph_depth: 2,
             graph_limit: 20,
+            episode_top_k: 20,
             archive_top_k: 5,
+            episode_char_budget: 28_000,
             include_episodes: true,
             provider_override: None,
             model_override: None,
@@ -216,50 +238,92 @@ async fn retrieve_episodes(
     question: &str,
     opts: &AnswerOpts,
 ) -> Result<Vec<RetrievedEpisode>, RecallError> {
-    let mut episodes = Vec::new();
+    let archive_budget = opts.episode_char_budget / ARCHIVE_BUDGET_DIVISOR;
+    let graph_budget = opts.episode_char_budget - archive_budget;
 
-    // Graph episodes via semantic search
-    if opts.include_episodes {
-        let graph_dir = memory_dir.join("graph");
-        if graph_dir.exists() {
-            let gm = GraphMemory::open(&graph_dir).await?;
-            let graph_episodes = gm
-                .search_episodes(question, opts.archive_top_k.max(1))
-                .await?;
-            for ep in graph_episodes {
-                episodes.push(RetrievedEpisode {
-                    source: "graph-episode".to_string(),
-                    abstract_text: ep.episode.abstract_text,
-                    session_id: Some(ep.episode.session_id),
-                    log_number: ep.episode.log_number,
-                    score: ep.score,
-                });
-            }
-        }
-    }
-
-    // Archive-level keyword/recency ranked search
-    let conversations_dir = memory_dir.join("conversations");
-    if conversations_dir.exists() {
-        match search::ranked_search(question, memory_dir, opts.archive_top_k) {
-            Ok(ranked) => {
-                for file in ranked {
-                    let preview = file.preview_lines.join(" / ");
-                    episodes.push(RetrievedEpisode {
-                        source: format!("archive:{}", file.file),
-                        abstract_text: preview,
-                        session_id: None,
-                        log_number: None,
-                        score: file.score,
-                    });
-                }
-            }
-            Err(RecallError::NotInitialized(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
+    let mut episodes = fit_within_budget(
+        search_graph_episodes(memory_dir, question, opts).await?,
+        graph_budget,
+    );
+    episodes.extend(fit_within_budget(
+        search_archive(memory_dir, question, opts)?,
+        archive_budget,
+    ));
 
     Ok(episodes)
+}
+
+async fn search_graph_episodes(
+    memory_dir: &Path,
+    question: &str,
+    opts: &AnswerOpts,
+) -> Result<Vec<RetrievedEpisode>, RecallError> {
+    let graph_dir = memory_dir.join("graph");
+    if !opts.include_episodes || !graph_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let gm = GraphMemory::open(&graph_dir).await?;
+    let found = gm
+        .search_episodes(question, opts.episode_top_k.max(1))
+        .await?;
+
+    Ok(found
+        .into_iter()
+        .map(|ep| RetrievedEpisode {
+            source: "graph-episode".to_string(),
+            abstract_text: ep.episode.abstract_text,
+            session_id: Some(ep.episode.session_id),
+            log_number: ep.episode.log_number,
+            score: ep.score,
+        })
+        .collect())
+}
+
+fn search_archive(
+    memory_dir: &Path,
+    question: &str,
+    opts: &AnswerOpts,
+) -> Result<Vec<RetrievedEpisode>, RecallError> {
+    if !memory_dir.join("conversations").exists() {
+        return Ok(Vec::new());
+    }
+
+    let ranked = match search::ranked_search(question, memory_dir, opts.archive_top_k) {
+        Ok(ranked) => ranked,
+        Err(RecallError::NotInitialized(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    Ok(ranked
+        .into_iter()
+        .map(|file| RetrievedEpisode {
+            source: format!("archive:{}", file.file),
+            abstract_text: file.preview_lines.join(" / "),
+            session_id: None,
+            log_number: None,
+            score: file.score,
+        })
+        .collect())
+}
+
+/// Keep the highest-ranked episodes that fit `budget` characters of abstract
+/// text, in order. The first item is always kept — an empty section is worse
+/// than one oversized entry, and per-episode size is bounded at ingest.
+pub(super) fn fit_within_budget(
+    episodes: Vec<RetrievedEpisode>,
+    budget: usize,
+) -> Vec<RetrievedEpisode> {
+    let mut spent = 0usize;
+    episodes
+        .into_iter()
+        .enumerate()
+        .take_while(|(index, ep)| {
+            spent += ep.abstract_text.len();
+            *index == 0 || spent <= budget
+        })
+        .map(|(_, ep)| ep)
+        .collect()
 }
 
 fn read_memory_md(memory_dir: &Path) -> String {
