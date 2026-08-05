@@ -12,6 +12,15 @@ const DEFAULT_MAX_ENTRIES: usize = 5;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
 const CONFIG_FILE: &str = ".recall-echo.toml";
 
+/// Seconds of quiet before the daemon starts extracting in the background.
+///
+/// Two minutes: long enough that a session's burst of hooks and queries is
+/// over, short enough that a conversation archived at the end of a working day
+/// has become entities before the next one starts.
+const DEFAULT_EXTRACTION_IDLE_AFTER_SECS: u64 = 120;
+/// Archives one background batch extracts before yielding.
+const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
+
 // ── Provider enum ────────────────────────────────────────────────────────
 
 /// LLM provider for entity extraction.
@@ -78,6 +87,8 @@ pub struct Config {
     pub graph: Option<GraphSection>,
     #[serde(default)]
     pub serve: ServeSection,
+    #[serde(default)]
+    pub extraction: ExtractionSection,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,6 +195,12 @@ pub struct GraphSection {
     /// [`ProvenanceWeights`] for details.
     #[serde(default)]
     pub provenance: ProvenanceWeights,
+    /// Similarity bands that decide when entity dedup pays for a model call.
+    ///
+    /// Maps to the `[graph.dedup]` section of `.recall-echo.toml`. See
+    /// [`GraphDedupConfig`] for the bands and their defaults.
+    #[serde(default)]
+    pub dedup: GraphDedupConfig,
 }
 
 impl Default for GraphSection {
@@ -197,6 +214,7 @@ impl Default for GraphSection {
             password_file: String::new(),
             scoring: GraphScoringConfig::default(),
             provenance: ProvenanceWeights::default(),
+            dedup: GraphDedupConfig::default(),
         }
     }
 }
@@ -226,6 +244,62 @@ impl Default for ServeSection {
     }
 }
 
+/// Background entity extraction inside the graph daemon (`[extraction]`).
+///
+/// Episodes arrive mechanically on `SessionEnd`; turning them into entities,
+/// relationships and confidence used to require a human to run
+/// `recall-echo graph extract`. The daemon already owns the store and knows
+/// when it is unused, so it does that pass itself once the machine is quiet.
+///
+/// Defaults are on, because the alternative is a knowledge graph that stays
+/// empty for everyone who did not read the docs closely. What it costs is
+/// bounded by the provider: the daemon is started with a minimal environment
+/// that deliberately excludes API keys (see `serve_client`), so an
+/// auto-started daemon can only ever use the `claude-code` provider, which
+/// bills nothing on a subscription. An API-key provider reaches the daemon
+/// only when a human runs `recall-echo serve --foreground` with the key
+/// exported — an explicit act. Set `background_enabled = false` to turn the
+/// pass off entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtractionSection {
+    /// Run entity extraction in the daemon when the machine is quiet.
+    /// Default `true`.
+    pub background_enabled: bool,
+    /// Seconds without a client request before a background batch may start.
+    /// `0` means "as soon as no connection is open". Default `120`.
+    pub idle_after_secs: u64,
+    /// Archives one batch extracts before going back to waiting. Bounds how
+    /// long a burst of background work lasts and how much it can cost in one
+    /// go; the next batch starts one quiet period later. Default `3`.
+    pub batch_size: usize,
+}
+
+impl Default for ExtractionSection {
+    fn default() -> Self {
+        Self {
+            background_enabled: true,
+            idle_after_secs: DEFAULT_EXTRACTION_IDLE_AFTER_SECS,
+            batch_size: DEFAULT_EXTRACTION_BATCH_SIZE,
+        }
+    }
+}
+
+impl ExtractionSection {
+    /// Quiet period before a batch may start.
+    #[must_use]
+    pub fn idle_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_after_secs)
+    }
+
+    /// Archives per batch — at least one, whatever the config says, or the
+    /// worker would wake up only to do nothing.
+    #[must_use]
+    pub fn effective_batch_size(&self) -> usize {
+        self.batch_size.max(1)
+    }
+}
+
 /// Scoring weights for utility-weighted semantic search.
 ///
 /// The final score for a retrieved entity is computed as a linear combination
@@ -244,6 +318,12 @@ impl Default for ServeSection {
 /// Weights are not constrained to sum to 1.0 — the scoring function does not
 /// normalize. Callers that change these should calibrate against their own
 /// retrieval outcomes; see `utility-feedback-loop-spec.md` in pulse-null.
+///
+/// Graph-expanded candidates score through the same three terms; what differs
+/// is where their `similarity` comes from (a parent's similarity discounted by
+/// the edge's effective confidence, rather than a direct measurement against
+/// the query vector). [`GraphScoringConfig::corroboration_boost`] governs the
+/// one case where the two channels meet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphScoringConfig {
@@ -253,6 +333,33 @@ pub struct GraphScoringConfig {
     pub weight_hotness: f64,
     /// Weight applied to the utility score (outcome-feedback EMA). Default `0.25`.
     pub weight_utility: f64,
+    /// How much an entity's measured relevance is raised when the graph
+    /// corroborates a semantic hit — i.e. when the same entity is reached both
+    /// by the query vector and over a surviving edge from one of the expanded
+    /// top hits. Default `0.05`.
+    ///
+    /// ```text
+    /// similarity = min(1.0, similarity * (1 + corroboration_boost * effective_confidence))
+    /// ```
+    ///
+    /// Scaled by the edge's effective (decayed) confidence, so a stale edge
+    /// corroborates weakly, and clamped at the similarity ceiling of `1.0`, so
+    /// no amount of corroboration can push an entity past what a perfect
+    /// direct match would score on the same hotness and utility. `0.0`
+    /// disables corroboration entirely.
+    ///
+    /// The default is cut to the *scale* of the similarity distribution it
+    /// perturbs, measured over four LongMemEval stores (196–1804 entities):
+    /// the top-20 similarity band there is only `0.086` wide, so a boost of
+    /// `0.134` would let corroboration promote an entity from the bottom of
+    /// the band to the top, and structure would outrank similarity outright.
+    /// `0.05` moves a corroborated entity about a third of the band — enough
+    /// to break the near-ties that dominate a dense embedding space (the
+    /// rank-1-to-rank-2 gap in those stores is `0.005`–`0.051`), and not
+    /// enough to overturn a decided ordering. Raise it only with retrieval
+    /// numbers in hand: corroboration amplifies whatever the extractor put in
+    /// the graph, including its mistakes.
+    pub corroboration_boost: f64,
 }
 
 impl Default for GraphScoringConfig {
@@ -261,8 +368,90 @@ impl Default for GraphScoringConfig {
             weight_semantic: 0.45,
             weight_hotness: 0.30,
             weight_utility: 0.25,
+            corroboration_boost: 0.05,
         }
     }
+}
+
+/// Similarity bands that decide when entity dedup pays for a model call.
+///
+/// Dedup asks one question — *is this the same thing?* — and that is a
+/// question about meaning, so the bands are cut on raw cosine similarity
+/// between the candidate's abstract and an existing entity's, never on the
+/// retrieval score (which folds in hotness and utility: a popular unrelated
+/// entity would otherwise buy a model call, and every entity gets more
+/// popular as the graph grows).
+///
+/// ```text
+/// similarity >= certain_similarity   → the same entity; resolved locally
+/// review_similarity ..< certain      → ambiguous; one model call decides
+/// similarity <  review_similarity    → new entity; created locally
+/// ```
+///
+/// Defaults (`0.92` / `0.82` / `3`) are cut from the similarity distribution of
+/// a LongMemEval baseline store (192 entities, 150 sampled candidates, 750
+/// neighbour pairs). BGE-Small puts every same-language pair in a narrow high
+/// band — median neighbour 0.75, median *nearest* neighbour 0.81 — so the cuts
+/// sit at its tail, not at intuitive-looking round numbers: 0.92 is the 96th
+/// percentile of pairs, where abstracts are paraphrases of each other, and 0.82
+/// the ~78th, below which pairs are merely same-topic. Candidates averaged 1.1
+/// neighbours above 0.82, so a cap of three bounds the worst case without
+/// binding the normal one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphDedupConfig {
+    /// At or above this cosine similarity the candidate is treated as the same
+    /// entity and resolved without a model call. Default `0.92`.
+    pub certain_similarity: f64,
+    /// Below this cosine similarity the candidate is treated as new and created
+    /// without a model call. Default `0.82`.
+    pub review_similarity: f64,
+    /// How many existing entities, by similarity rank, dedup may fetch and hand
+    /// to the model. Caps prompt size and comparison count so neither can grow
+    /// with the graph. Default `3`.
+    pub max_candidates: usize,
+}
+
+impl Default for GraphDedupConfig {
+    fn default() -> Self {
+        Self {
+            certain_similarity: 0.92,
+            review_similarity: 0.82,
+            max_candidates: 3,
+        }
+    }
+}
+
+impl GraphDedupConfig {
+    /// The band a candidate's nearest neighbour falls in.
+    #[must_use]
+    pub fn band(&self, similarity: f64) -> DedupBand {
+        if similarity >= self.certain_similarity {
+            DedupBand::SameEntity
+        } else if similarity >= self.review_similarity {
+            DedupBand::Ambiguous
+        } else {
+            DedupBand::NewEntity
+        }
+    }
+
+    /// How many candidates to fetch and consider — at least one, whatever the
+    /// config says, or dedup would be blind.
+    #[must_use]
+    pub fn candidate_limit(&self) -> usize {
+        self.max_candidates.max(1)
+    }
+}
+
+/// Which of the three dedup bands a similarity falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupBand {
+    /// Certainly the same entity — resolve without a model call.
+    SameEntity,
+    /// Genuinely ambiguous — worth a model call.
+    Ambiguous,
+    /// Certainly not the same entity — create without a model call.
+    NewEntity,
 }
 
 fn default_graph_mode() -> String {
@@ -406,6 +595,28 @@ impl Config {
                 };
                 Ok(())
             }
+            "extraction.background_enabled" => {
+                self.extraction.background_enabled = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "extraction.idle_after_secs" => {
+                self.extraction.idle_after_secs = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                Ok(())
+            }
+            "extraction.batch_size" => {
+                let size: usize = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                if size == 0 {
+                    return Err(RecallError::Config("batch_size must be at least 1".into()));
+                }
+                self.extraction.batch_size = size;
+                Ok(())
+            }
             "graph.provenance.weight_external" => {
                 self.graph_section().provenance.weight_external = parse_weight(value)?;
                 Ok(())
@@ -416,6 +627,26 @@ impl Config {
             }
             "graph.provenance.weight_self" => {
                 self.graph_section().provenance.weight_self = parse_weight(value)?;
+                Ok(())
+            }
+            "graph.dedup.certain_similarity" => {
+                self.graph_section().dedup.certain_similarity = parse_similarity(value)?;
+                Ok(())
+            }
+            "graph.dedup.review_similarity" => {
+                self.graph_section().dedup.review_similarity = parse_similarity(value)?;
+                Ok(())
+            }
+            "graph.dedup.max_candidates" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                if n == 0 {
+                    return Err(RecallError::Config(
+                        "max_candidates must be at least 1".into(),
+                    ));
+                }
+                self.graph_section().dedup.max_candidates = n;
                 Ok(())
             }
             other => Err(RecallError::Config(format!("unknown config key: {other}"))),
@@ -442,6 +673,20 @@ fn parse_weight(value: &str) -> Result<f64, crate::error::RecallError> {
         )));
     }
     Ok(weight)
+}
+
+/// Parse a cosine-similarity threshold: a finite number in `0.0..=1.0`.
+fn parse_similarity(value: &str) -> Result<f64, crate::error::RecallError> {
+    use crate::error::RecallError;
+    let similarity: f64 = value
+        .parse()
+        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+    if !similarity.is_finite() || !(0.0..=1.0).contains(&similarity) {
+        return Err(RecallError::Config(format!(
+            "similarity threshold must be between 0.0 and 1.0, got {value}"
+        )));
+    }
+    Ok(similarity)
 }
 
 #[cfg(test)]
@@ -553,6 +798,7 @@ mod tests {
             pipeline: None,
             graph: None,
             serve: ServeSection::default(),
+            extraction: ExtractionSection::default(),
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
@@ -612,6 +858,7 @@ mod tests {
             pipeline: None,
             graph: None,
             serve: ServeSection::default(),
+            extraction: ExtractionSection::default(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path());
@@ -634,6 +881,7 @@ mod tests {
             pipeline: None,
             graph: None,
             serve: ServeSection::default(),
+            extraction: ExtractionSection::default(),
         });
         assert_eq!(cfg.ephemeral.max_entries, 5);
     }
@@ -644,6 +892,7 @@ mod tests {
         assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
         assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
         assert!((scoring.weight_utility - 0.25).abs() < f64::EPSILON);
+        assert!((scoring.corroboration_boost - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -653,6 +902,15 @@ mod tests {
         assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
         assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
         assert!((scoring.weight_utility - 0.5).abs() < f64::EPSILON);
+        assert!((scoring.corroboration_boost - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_scoring_corroboration_boost_is_configurable() {
+        let scoring: GraphScoringConfig =
+            toml::from_str("corroboration_boost = 0.0\n").expect("parse corroboration boost");
+        assert!(scoring.corroboration_boost.abs() < f64::EPSILON);
+        assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -715,6 +973,69 @@ mod tests {
             parsed.graph.expect("graph section survives").provenance,
             ProvenanceWeights::default()
         );
+    }
+
+    #[test]
+    fn dedup_defaults_leave_a_gap_between_the_bands() {
+        let dedup = GraphDedupConfig::default();
+        assert!((dedup.certain_similarity - 0.92).abs() < f64::EPSILON);
+        assert!((dedup.review_similarity - 0.82).abs() < f64::EPSILON);
+        assert_eq!(dedup.max_candidates, 3);
+        assert!(dedup.review_similarity < dedup.certain_similarity);
+    }
+
+    #[test]
+    fn dedup_bands_are_cut_at_the_thresholds() {
+        let dedup = GraphDedupConfig::default();
+        assert_eq!(dedup.band(0.99), DedupBand::SameEntity);
+        assert_eq!(dedup.band(0.92), DedupBand::SameEntity);
+        assert_eq!(dedup.band(0.9), DedupBand::Ambiguous);
+        assert_eq!(dedup.band(0.82), DedupBand::Ambiguous);
+        assert_eq!(dedup.band(0.8), DedupBand::NewEntity);
+        assert_eq!(dedup.band(0.0), DedupBand::NewEntity);
+    }
+
+    /// A store configured to fetch nothing would resolve every candidate as
+    /// new; the floor of one keeps dedup able to see.
+    #[test]
+    fn dedup_candidate_limit_never_falls_below_one() {
+        let dedup = GraphDedupConfig {
+            max_candidates: 0,
+            ..GraphDedupConfig::default()
+        };
+        assert_eq!(dedup.candidate_limit(), 1);
+    }
+
+    #[test]
+    fn dedup_partial_toml_fills_defaults() {
+        let cfg: Config = toml::from_str("[graph]\n\n[graph.dedup]\ncertain_similarity = 0.95\n")
+            .expect("parse dedup section");
+        let dedup = cfg.graph.expect("graph section present").dedup;
+        assert!((dedup.certain_similarity - 0.95).abs() < f64::EPSILON);
+        assert!((dedup.review_similarity - 0.82).abs() < f64::EPSILON);
+        assert_eq!(dedup.max_candidates, 3);
+    }
+
+    #[test]
+    fn set_key_dedup_thresholds() {
+        let mut cfg = Config::default();
+        cfg.set_key("graph.dedup.certain_similarity", "0.9")
+            .unwrap();
+        cfg.set_key("graph.dedup.review_similarity", "0.6").unwrap();
+        cfg.set_key("graph.dedup.max_candidates", "5").unwrap();
+
+        let dedup = &cfg.graph.as_ref().expect("graph section created").dedup;
+        assert!((dedup.certain_similarity - 0.9).abs() < f64::EPSILON);
+        assert!((dedup.review_similarity - 0.6).abs() < f64::EPSILON);
+        assert_eq!(dedup.max_candidates, 5);
+
+        assert!(cfg
+            .set_key("graph.dedup.certain_similarity", "1.5")
+            .is_err());
+        assert!(cfg
+            .set_key("graph.dedup.review_similarity", "-0.1")
+            .is_err());
+        assert!(cfg.set_key("graph.dedup.max_candidates", "0").is_err());
     }
 
     #[test]

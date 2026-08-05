@@ -91,6 +91,12 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
     },
+    /// Run the MCP server (stdio) so an agent can query its own memory
+    Mcp {
+        /// Entity root directory (defaults to current directory)
+        #[arg(long)]
+        entity_root: Option<PathBuf>,
+    },
     /// Knowledge graph operations
     Graph {
         #[command(subcommand)]
@@ -154,6 +160,12 @@ enum BenchCommands {
         /// Archive top-K
         #[arg(long, default_value = "5")]
         archive_top_k: usize,
+        /// Graph episode top-K
+        #[arg(long, default_value = "20")]
+        episode_top_k: usize,
+        /// Character ceiling for the assembled episode section
+        #[arg(long, default_value = "28000")]
+        episode_char_budget: usize,
         /// Exclude episode search
         #[arg(long)]
         no_episodes: bool,
@@ -468,6 +480,12 @@ fn main() {
             let memory_dir = dir.unwrap_or_else(|| resolve_entity_root(None).join("memory"));
             run_serve(&memory_dir, foreground)
         }
+        Some(Commands::Mcp { entity_root }) => {
+            let memory_dir = resolve_entity_root(entity_root).join("memory");
+            client_runtime()
+                .map_err(recall_echo::error::RecallError::from)
+                .and_then(|rt| rt.block_on(recall_echo::mcp::run(&memory_dir)))
+        }
         Some(Commands::Graph {
             command,
             entity_root,
@@ -747,6 +765,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             graph_depth,
             graph_limit,
             archive_top_k,
+            episode_top_k,
+            episode_char_budget,
             no_episodes,
         } => {
             let question_text = match (question, question_stdin) {
@@ -768,6 +788,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 graph_depth,
                 graph_limit,
                 archive_top_k,
+                episode_top_k,
+                episode_char_budget,
                 include_episodes: !no_episodes,
                 provider_override,
                 model_override: model,

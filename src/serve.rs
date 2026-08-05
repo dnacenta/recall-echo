@@ -56,6 +56,9 @@ const MAX_DEPTH: u32 = 8;
 const STORE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval while waiting for connection tasks to release the store.
 const STORE_RELEASE_POLL: Duration = Duration::from_millis(10);
+/// How long the daemon waits for the background extraction worker to stop
+/// before abandoning it and closing up anyway.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Protocol ─────────────────────────────────────────────────────────────
 
@@ -301,6 +304,9 @@ fn error_code(err: &GraphError) -> &'static str {
 }
 
 /// Identity of a running daemon, returned by [`Request::Hello`].
+///
+/// `extraction` is additive: a client talking to a daemon that predates
+/// background extraction simply sees the default (disabled, nothing done).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub version: String,
@@ -308,6 +314,28 @@ pub struct DaemonInfo {
     pub memory_dir: String,
     pub socket_path: String,
     pub uptime_secs: u64,
+    #[serde(default)]
+    pub extraction: ExtractionStatus,
+}
+
+/// What this daemon's background extraction worker has done so far.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtractionStatus {
+    /// Whether background extraction is running in this daemon.
+    pub enabled: bool,
+    /// Why it is not running, when it is not.
+    pub disabled_reason: Option<String>,
+    /// Batches that extracted at least one archive.
+    pub runs: u64,
+    /// Archives extracted since the daemon started.
+    pub archives: u64,
+    /// Seconds since the last batch finished.
+    pub last_run_secs_ago: Option<u64>,
+    /// How long the last batch took.
+    pub last_run_ms: Option<u64>,
+    /// The most recent extraction failure, if any.
+    pub last_error: Option<String>,
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────
@@ -441,15 +469,25 @@ async fn execute_graph(
 
 // ── Idle tracking ────────────────────────────────────────────────────────
 
-/// Tracks daemon activity so an unused daemon shuts itself down.
+/// Tracks daemon activity so an unused daemon shuts itself down, and so
+/// background work only runs while nobody is asking for anything.
 ///
-/// A daemon is idle when no connection is open *and* the last completed
-/// request is older than the configured timeout. `None` disables idle
-/// shutdown entirely (`--foreground`, or `idle_timeout_secs = 0`).
+/// Two different questions are asked of the same clock:
+///
+/// - *quiet* — no connection is open and the last request is older than some
+///   period. Background extraction waits for this.
+/// - *idle* — quiet for the configured shutdown timeout, **and** no background
+///   batch in flight. The accept loop exits on this.
+///
+/// A background batch therefore cannot be cut in half by the idle timeout, and
+/// a hot request always makes the daemon un-quiet immediately. `None` disables
+/// idle shutdown entirely (`--foreground`, or `idle_timeout_secs = 0`) without
+/// disabling quiet, which is what keeps a supervised daemon extracting.
 #[derive(Debug)]
 pub struct IdleTracker {
     timeout: Option<Duration>,
     active: AtomicUsize,
+    background: AtomicUsize,
     last_activity: Mutex<Instant>,
 }
 
@@ -465,6 +503,7 @@ impl IdleTracker {
         Self {
             timeout,
             active: AtomicUsize::new(0),
+            background: AtomicUsize::new(0),
             last_activity: Mutex::new(start),
         }
     }
@@ -482,6 +521,18 @@ impl IdleTracker {
         self.touch_at(Instant::now());
     }
 
+    /// Register a background batch as running. Holds off idle shutdown until
+    /// it finishes, without pretending the daemon is being used.
+    pub fn begin_background(&self) {
+        self.background.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Register a background batch as finished.
+    pub fn end_background(&self) {
+        let previous = self.background.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "IdleTracker::end_background without begin");
+    }
+
     /// Record activity at `now`.
     pub fn touch_at(&self, now: Instant) {
         let mut last = self
@@ -491,20 +542,43 @@ impl IdleTracker {
         *last = now;
     }
 
-    /// True when the daemon has been unused for longer than the timeout.
+    /// True while at least one client connection is open.
     #[must_use]
-    pub fn is_idle_at(&self, now: Instant) -> bool {
-        let Some(timeout) = self.timeout else {
-            return false;
-        };
-        if self.active.load(Ordering::SeqCst) > 0 {
+    pub fn has_connections(&self) -> bool {
+        self.active.load(Ordering::SeqCst) > 0
+    }
+
+    /// True when no connection is open and nothing has been asked of the
+    /// daemon for `quiet`.
+    #[must_use]
+    pub fn is_quiet_at(&self, now: Instant, quiet: Duration) -> bool {
+        if self.has_connections() {
             return false;
         }
         let last = *self
             .last_activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        now.saturating_duration_since(last) >= timeout
+        now.saturating_duration_since(last) >= quiet
+    }
+
+    /// True when the daemon has been unused for longer than the timeout and no
+    /// background batch is in flight.
+    #[must_use]
+    pub fn is_idle_at(&self, now: Instant) -> bool {
+        let Some(timeout) = self.timeout else {
+            return false;
+        };
+        if self.background.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        self.is_quiet_at(now, timeout)
+    }
+
+    /// The configured idle shutdown timeout, if any.
+    #[must_use]
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     /// How often the accept loop should re-check idleness.
@@ -530,6 +604,168 @@ impl ActivityGuard {
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         self.0.idle.end();
+    }
+}
+
+/// RAII background-batch counter for [`IdleTracker`].
+///
+/// Held for exactly one batch, so an interrupted daemon waits for the unit in
+/// flight rather than for the whole backlog.
+pub struct BackgroundGuard(Arc<IdleTracker>);
+
+impl BackgroundGuard {
+    #[must_use]
+    pub fn new(idle: Arc<IdleTracker>) -> Self {
+        idle.begin_background();
+        Self(idle)
+    }
+}
+
+impl Drop for BackgroundGuard {
+    fn drop(&mut self) {
+        self.0.end_background();
+    }
+}
+
+// ── Shutdown ─────────────────────────────────────────────────────────────
+
+/// One-way "stop now" signal, observable by any number of tasks.
+///
+/// A latched flag rather than a bare [`Notify`]: a task that checks after the
+/// signal fired must still see it, or a worker between two units would sleep
+/// through the daemon's exit and hold the store open.
+#[derive(Debug, Default)]
+pub struct ShutdownSignal {
+    triggered: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl ShutdownSignal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask everything watching to stop. Idempotent.
+    pub fn trigger(&self) {
+        self.triggered.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn is_triggered(&self) -> bool {
+        self.triggered.load(Ordering::SeqCst)
+    }
+
+    /// Resolve when shutdown is requested — immediately if it already was.
+    pub async fn wait(&self) {
+        loop {
+            // Register before reading the flag: the reverse order loses a
+            // `trigger` that lands in between, and the waiter never wakes.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_triggered() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Run `future` unless shutdown arrives first. `None` means it did.
+    pub async fn guard<F: std::future::Future>(&self, future: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            () = self.wait() => None,
+            output = future => Some(output),
+        }
+    }
+
+    /// Sleep for `duration`. `true` means shutdown cut it short.
+    pub async fn sleep_until_stopped(&self, duration: Duration) -> bool {
+        self.guard(tokio::time::sleep(duration)).await.is_none()
+    }
+}
+
+// ── Background extraction state ──────────────────────────────────────────
+
+/// What the background extraction worker has done, shared with the connection
+/// tasks that answer [`Request::Hello`].
+#[derive(Debug, Default)]
+pub struct ExtractionState {
+    inner: Mutex<ExtractionProgress>,
+}
+
+#[derive(Debug, Default)]
+struct ExtractionProgress {
+    enabled: bool,
+    disabled_reason: Option<String>,
+    runs: u64,
+    archives: u64,
+    last_run: Option<Instant>,
+    last_run_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl ExtractionState {
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn with<T>(&self, apply: impl FnOnce(&mut ExtractionProgress) -> T) -> T {
+        let mut progress = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        apply(&mut progress)
+    }
+
+    /// Mark the worker as running.
+    pub fn enable(&self) {
+        self.with(|progress| {
+            progress.enabled = true;
+            progress.disabled_reason = None;
+        });
+    }
+
+    /// Mark the worker as not running, and why.
+    pub fn disable(&self, reason: impl Into<String>) {
+        self.with(|progress| {
+            progress.enabled = false;
+            progress.disabled_reason = Some(reason.into());
+        });
+    }
+
+    /// Record a batch that extracted `archives` archives in `elapsed`.
+    pub fn record_batch(&self, archives: u64, elapsed: Duration, finished_at: Instant) {
+        self.with(|progress| {
+            progress.runs += 1;
+            progress.archives += archives;
+            progress.last_run = Some(finished_at);
+            progress.last_run_ms = Some(elapsed.as_millis() as u64);
+        });
+    }
+
+    /// Record the most recent failure, replacing any earlier one.
+    pub fn record_error(&self, error: impl Into<String>) {
+        self.with(|progress| progress.last_error = Some(error.into()));
+    }
+
+    /// Wire-facing snapshot as of `now`.
+    #[must_use]
+    pub fn snapshot(&self, now: Instant) -> ExtractionStatus {
+        self.with(|progress| ExtractionStatus {
+            enabled: progress.enabled,
+            disabled_reason: progress.disabled_reason.clone(),
+            runs: progress.runs,
+            archives: progress.archives,
+            last_run_secs_ago: progress
+                .last_run
+                .map(|at| now.saturating_duration_since(at).as_secs()),
+            last_run_ms: progress.last_run_ms,
+            last_error: progress.last_error.clone(),
+        })
     }
 }
 
@@ -619,8 +855,9 @@ struct DaemonContext {
     socket_path: PathBuf,
     /// Only this uid may use the socket.
     owner_uid: u32,
-    idle: IdleTracker,
-    shutdown: Notify,
+    idle: Arc<IdleTracker>,
+    shutdown: Arc<ShutdownSignal>,
+    extraction: Arc<ExtractionState>,
 }
 
 impl DaemonContext {
@@ -631,6 +868,7 @@ impl DaemonContext {
             memory_dir: self.memory_dir.display().to_string(),
             socket_path: self.socket_path.display().to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
+            extraction: self.extraction.snapshot(Instant::now()),
         }
     }
 }
@@ -678,15 +916,18 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
     };
     write_pidfile(&options.socket_path)?;
 
+    let extraction = ExtractionState::shared();
     let context = Arc::new(DaemonContext {
         started: Instant::now(),
         memory_dir: options.memory_dir.clone(),
         socket_path: options.socket_path.clone(),
         owner_uid,
-        idle: IdleTracker::new(options.idle_timeout),
-        shutdown: Notify::new(),
+        idle: Arc::new(IdleTracker::new(options.idle_timeout)),
+        shutdown: Arc::new(ShutdownSignal::new()),
+        extraction: Arc::clone(&extraction),
     });
     warm_embedder(Arc::clone(&graph), Arc::clone(&log));
+    let worker = start_background_extraction(&options, &graph, &context, &log);
     log.log("ready");
 
     accept_loop(
@@ -696,6 +937,12 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
         Arc::clone(&log),
     )
     .await;
+
+    // Whatever ended the accept loop — a shutdown request, an idle timeout —
+    // ends the background worker too, and it must let go of the store before
+    // we try to close it.
+    context.shutdown.trigger();
+    stop_background_extraction(worker, &log).await;
 
     // Close the store *before* the socket disappears: a client waiting for the
     // socket to go treats that as "the store is free", and would otherwise
@@ -779,6 +1026,58 @@ fn warm_embedder(graph: Arc<GraphMemory>, log: Arc<DaemonLog>) {
     });
 }
 
+/// Start the background extraction worker, when this build and this config
+/// allow one. `None` means no worker runs; the reason is in the log and in
+/// [`ExtractionStatus::disabled_reason`].
+#[cfg(feature = "llm")]
+fn start_background_extraction(
+    options: &ServeOptions,
+    graph: &Arc<GraphMemory>,
+    context: &Arc<DaemonContext>,
+    log: &Arc<DaemonLog>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    crate::serve_extract::spawn(crate::serve_extract::Setup {
+        memory_dir: options.memory_dir.clone(),
+        graph: Arc::clone(graph),
+        idle: Arc::clone(&context.idle),
+        shutdown: Arc::clone(&context.shutdown),
+        state: Arc::clone(&context.extraction),
+        log: Arc::clone(log),
+    })
+}
+
+#[cfg(not(feature = "llm"))]
+fn start_background_extraction(
+    _options: &ServeOptions,
+    _graph: &Arc<GraphMemory>,
+    context: &Arc<DaemonContext>,
+    log: &Arc<DaemonLog>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    context
+        .extraction
+        .disable("this binary was built without the `llm` feature");
+    log.log("background extraction off: built without the `llm` feature");
+    None
+}
+
+/// Wait for the background worker to let go of the store, then take it away.
+///
+/// The worker stops between units on its own; the timeout covers the case
+/// where it is inside a synchronous stretch (the ONNX embedder) that no
+/// cancellation point can interrupt.
+async fn stop_background_extraction(worker: Option<tokio::task::JoinHandle<()>>, log: &DaemonLog) {
+    let Some(mut worker) = worker else {
+        return;
+    };
+    if tokio::time::timeout(WORKER_STOP_TIMEOUT, &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+        log.log("background extraction did not stop in time — abandoned mid-archive");
+    }
+}
+
 fn has_cached_model(models_dir: &Path) -> bool {
     std::fs::read_dir(models_dir).is_ok_and(|mut entries| entries.next().is_some())
 }
@@ -803,7 +1102,7 @@ async fn accept_loop(
                 }
                 Err(err) => log.log(&format!("accept error: {err}")),
             },
-            () = context.shutdown.notified() => {
+            () = context.shutdown.wait() => {
                 log.log("shutdown requested");
                 break;
             }
@@ -893,10 +1192,10 @@ async fn handle_connection(
         context.idle.touch_at(Instant::now());
 
         if stop {
-            // `notify_one` stores a permit when the accept loop happens to be
-            // between `select!` iterations; `notify_waiters` would be lost
-            // there and the daemon would outlive the shutdown request.
-            context.shutdown.notify_one();
+            // The signal latches, so a wakeup that lands while the accept loop
+            // is between `select!` iterations is still seen on the next one:
+            // the daemon can never outlive its own shutdown request.
+            context.shutdown.trigger();
             break;
         }
     }
@@ -1223,6 +1522,114 @@ mod tests {
         tracker.touch_at(start + Duration::from_secs(9));
         assert!(!tracker.is_idle_at(start + Duration::from_secs(18)));
         assert!(tracker.is_idle_at(start + Duration::from_secs(19)));
+    }
+
+    /// A background batch must not be cut in half by the idle timeout — and
+    /// must not postpone shutdown once it is done, or the daemon would never
+    /// exit again.
+    #[test]
+    fn a_batch_in_flight_defers_idle_shutdown() {
+        let start = Instant::now();
+        let tracker = Arc::new(IdleTracker::new_at(Some(Duration::from_secs(60)), start));
+        let later = start + Duration::from_secs(600);
+        assert!(tracker.is_idle_at(later));
+
+        let guard = BackgroundGuard::new(Arc::clone(&tracker));
+        assert!(!tracker.is_idle_at(later), "idle exit cut a batch in half");
+        // Background work is not activity: the daemon is still unused, which
+        // is what lets the *next* batch start.
+        assert!(tracker.is_quiet_at(later, Duration::from_secs(60)));
+
+        drop(guard);
+        assert!(tracker.is_idle_at(later));
+    }
+
+    /// `--foreground` disables idle shutdown, not background work: a
+    /// supervised daemon still has quiet periods to extract in.
+    #[test]
+    fn quiet_is_independent_of_the_idle_timeout() {
+        let start = Instant::now();
+        let tracker = IdleTracker::new_at(None, start);
+        let later = start + Duration::from_secs(300);
+
+        assert!(!tracker.is_idle_at(later));
+        assert!(tracker.is_quiet_at(later, Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn an_open_connection_is_never_quiet() {
+        let start = Instant::now();
+        let tracker = IdleTracker::new_at(Some(Duration::from_secs(60)), start);
+        let later = start + Duration::from_secs(600);
+
+        tracker.begin();
+        assert!(tracker.has_connections());
+        assert!(!tracker.is_quiet_at(later, Duration::from_secs(1)));
+
+        tracker.end();
+        tracker.touch_at(start);
+        assert!(tracker.is_quiet_at(later, Duration::from_secs(1)));
+    }
+
+    /// The signal latches: a task that checks after it fired still sees it.
+    /// Without that, a worker between two units sleeps through the daemon's
+    /// exit and keeps the store open.
+    #[tokio::test]
+    async fn the_shutdown_signal_latches_for_late_waiters() {
+        let signal = ShutdownSignal::new();
+        assert!(!signal.is_triggered());
+        signal.trigger();
+        assert!(signal.is_triggered());
+
+        tokio::time::timeout(Duration::from_secs(5), signal.wait())
+            .await
+            .expect("a waiter that arrives after the trigger still wakes");
+        assert!(signal.guard(std::future::pending::<()>()).await.is_none());
+        assert!(signal.sleep_until_stopped(Duration::from_secs(600)).await);
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_signal_lets_work_finish_when_it_is_not_triggered() {
+        let signal = ShutdownSignal::new();
+        assert_eq!(signal.guard(async { 7 }).await, Some(7));
+        assert!(!signal.sleep_until_stopped(Duration::from_millis(1)).await);
+    }
+
+    #[test]
+    fn extraction_status_reports_progress_and_refusals() {
+        let state = ExtractionState::shared();
+        let now = Instant::now();
+        assert!(!state.snapshot(now).enabled);
+
+        state.enable();
+        state.record_batch(3, Duration::from_millis(250), now);
+        let status = state.snapshot(now + Duration::from_secs(9));
+        assert!(status.enabled);
+        assert_eq!(status.runs, 1);
+        assert_eq!(status.archives, 3);
+        assert_eq!(status.last_run_secs_ago, Some(9));
+        assert_eq!(status.last_run_ms, Some(250));
+
+        state.disable("no usable LLM provider");
+        let status = state.snapshot(now);
+        assert!(!status.enabled);
+        assert_eq!(
+            status.disabled_reason.as_deref(),
+            Some("no usable LLM provider")
+        );
+        // What it managed to do before it stopped is still worth reporting.
+        assert_eq!(status.archives, 3);
+    }
+
+    /// A client built before background extraction sends no `extraction` field.
+    #[test]
+    fn daemon_info_without_extraction_still_parses() {
+        let info: DaemonInfo = serde_json::from_str(
+            r#"{"version":"3.0.0","pid":1,"memory_dir":"/m","socket_path":"/s","uptime_secs":5}"#,
+        )
+        .expect("older daemon info");
+        assert_eq!(info.extraction, ExtractionStatus::default());
+        assert!(!info.extraction.enabled);
     }
 
     #[test]

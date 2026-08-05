@@ -148,6 +148,7 @@ pub async fn search_with_options(
 
             ScoredEntity {
                 entity: row.entity,
+                similarity,
                 score,
                 source: MatchSource::Semantic,
             }
@@ -238,7 +239,11 @@ struct EpisodeWithDistance {
 /// Linear combination of similarity, hotness, and utility using weights
 /// from `scoring`. Defaults (0.45 / 0.30 / 0.25) preserve legacy behavior
 /// so deployments without a `[graph.scoring]` TOML section see no change.
-fn score_with_utility(
+///
+/// Graph expansion scores through this same function (see
+/// [`crate::graph::query`]), so a candidate's channel decides only how its
+/// `similarity` is obtained, never which terms it is allowed to earn.
+pub(crate) fn score_with_utility(
     scoring: &GraphScoringConfig,
     similarity: f64,
     hotness: f64,
@@ -297,11 +302,13 @@ mod tests {
             weight_semantic: 0.45,
             weight_hotness: 0.30,
             weight_utility: 0.25,
+            ..GraphScoringConfig::default()
         };
         let high = GraphScoringConfig {
             weight_semantic: 0.25,
             weight_hotness: 0.25,
             weight_utility: 0.5,
+            ..GraphScoringConfig::default()
         };
         let high_utility = 0.9;
         let low_score = score_with_utility(&low, SIMILARITY, HOTNESS, high_utility);
@@ -319,6 +326,7 @@ mod tests {
             weight_semantic: 0.0,
             weight_hotness: 0.0,
             weight_utility: 0.0,
+            ..GraphScoringConfig::default()
         };
         let score = score_with_utility(&scoring, SIMILARITY, HOTNESS, UTILITY);
         assert!((score - 0.0).abs() < f64::EPSILON);
@@ -330,6 +338,7 @@ mod tests {
             weight_semantic: 0.5,
             weight_hotness: 0.2,
             weight_utility: 0.3,
+            ..GraphScoringConfig::default()
         };
         let expected = 0.5 * SIMILARITY + 0.2 * HOTNESS + 0.3 * UTILITY;
         let actual = score_with_utility(&scoring, SIMILARITY, HOTNESS, UTILITY);

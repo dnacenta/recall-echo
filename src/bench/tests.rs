@@ -18,8 +18,8 @@ use crate::graph::llm::LlmProvider as GraphLlmProvider;
 
 use super::ingest::{ingest_conversation, IngestStats};
 use super::{
-    answer::{answer_with_provider, AnswerOpts, NO_INFO_ANSWER},
-    BenchConversation, BenchSession, BenchTurn,
+    answer::{answer_with_provider, fit_within_budget, AnswerOpts, NO_INFO_ANSWER},
+    BenchConversation, BenchSession, BenchTurn, RetrievedEpisode,
 };
 
 // ── Test fixtures ────────────────────────────────────────────────────────
@@ -112,6 +112,8 @@ fn ingest_stats_serde_roundtrip() {
         episodes: 7,
         log_numbers: vec![1, 2],
         warnings: vec!["dedup warn".to_string()],
+        dedup_llm_calls: 1,
+        dedup_fast_path: 4,
     };
     let json = serde_json::to_string(&stats).unwrap();
     let back: IngestStats = serde_json::from_str(&json).unwrap();
@@ -127,6 +129,54 @@ fn answer_opts_defaults_match_spec() {
     assert!(opts.include_episodes);
     assert!(opts.provider_override.is_none());
     assert!(opts.model_override.is_none());
+}
+
+/// Episode retrieval must not inherit the archive limit: the measured episode
+/// index loses results below k=20, and `archive_top_k` was 5.
+#[test]
+fn episode_top_k_is_decoupled_from_archive_top_k() {
+    let opts = AnswerOpts::default();
+    assert_eq!(opts.episode_top_k, 20);
+    assert!(opts.episode_top_k > opts.archive_top_k);
+    assert_eq!(opts.episode_char_budget, 28_000);
+}
+
+/// The budget is a backstop, not a second cutoff: at the ingest-time abstract
+/// cap, a full `episode_top_k` of episodes must still fit in the graph share.
+#[test]
+fn budget_admits_a_full_episode_top_k_at_the_abstract_cap() {
+    let opts = AnswerOpts::default();
+    let graph_share = opts.episode_char_budget - opts.episode_char_budget / 4;
+    assert!(graph_share >= opts.episode_top_k * 1_003);
+}
+
+fn episode_of(abstract_text: &str) -> RetrievedEpisode {
+    RetrievedEpisode {
+        source: "graph-episode".to_string(),
+        abstract_text: abstract_text.to_string(),
+        session_id: None,
+        log_number: None,
+        score: 0.5,
+    }
+}
+
+#[test]
+fn budget_keeps_episodes_until_the_ceiling_is_reached() {
+    let episodes = vec![episode_of(&"a".repeat(40)); 5];
+    let kept = fit_within_budget(episodes, 100);
+    assert_eq!(kept.len(), 2);
+}
+
+#[test]
+fn budget_never_returns_an_empty_section_for_a_non_empty_input() {
+    let kept = fit_within_budget(vec![episode_of(&"a".repeat(500))], 100);
+    assert_eq!(kept.len(), 1);
+}
+
+#[test]
+fn budget_leaves_a_section_under_the_ceiling_untouched() {
+    let episodes = vec![episode_of("short"); 4];
+    assert_eq!(fit_within_budget(episodes, 28_000).len(), 4);
 }
 
 #[test]

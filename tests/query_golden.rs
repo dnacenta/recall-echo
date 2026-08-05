@@ -1,11 +1,19 @@
 //! Golden-set integration tests for the hybrid recall path (`src/graph/query.rs`).
 //!
 //! The hybrid path is: semantic KNN (`limit * 2` candidates) → 1-hop expansion
-//! from the top 3 candidates scored `parent_score * effective_confidence` →
-//! merge/dedup → sort → truncate. This file pins the behaviors that Phase 2
-//! retrieval work must not silently change: recall@k membership, confidence
-//! weighting (including read-time decay and the `< 0.1` edge drop), scoring
-//! weight sensitivity, and expansion depth.
+//! from the top 3 candidates → merge → sort → truncate. Both channels score
+//! through the same `w_semantic * similarity + w_hotness * hotness +
+//! w_utility * utility`; the channel decides only where `similarity` comes
+//! from (measured against the query vector, or propagated from a parent as
+//! `similarity_parent * effective_confidence`). An entity that arrives on both
+//! channels keeps its measured similarity, raised by
+//! `1 + corroboration_boost * effective_confidence`.
+//!
+//! This file pins the behaviors that Phase 2 retrieval work must not silently
+//! change: recall@k membership, confidence weighting (including read-time
+//! decay and the `< 0.1` edge drop), the parity of the two channels' score
+//! terms, corroboration and its bound, access-count symmetry, scoring weight
+//! sensitivity, and expansion depth.
 //!
 //! These tests drive the graph layer one level below `GraphMemory` (raw
 //! `Surreal<Db>` + `query::query`) for two reasons the higher-level API cannot
@@ -410,6 +418,7 @@ fn semantic_only() -> GraphScoringConfig {
         weight_semantic: 1.0,
         weight_hotness: 0.0,
         weight_utility: 0.0,
+        ..GraphScoringConfig::default()
     }
 }
 
@@ -418,6 +427,16 @@ fn utility_only() -> GraphScoringConfig {
         weight_semantic: 0.0,
         weight_hotness: 0.0,
         weight_utility: 1.0,
+        ..GraphScoringConfig::default()
+    }
+}
+
+/// Default weights with graph corroboration switched off — the control for
+/// measuring what corroboration is worth.
+fn no_corroboration() -> GraphScoringConfig {
+    GraphScoringConfig {
+        corroboration_boost: 0.0,
+        ..GraphScoringConfig::default()
     }
 }
 
@@ -463,8 +482,8 @@ async fn golden_query_recall_at_k_ordering() {
 }
 
 /// Confidence weighting: neighbors reached over a fresh high-confidence edge
-/// outrank neighbors reached over an old one, and the graph score is exactly
-/// `parent_score * effective_confidence` — decay included.
+/// outrank neighbors reached over an old one, and effective confidence — decay
+/// included — is exactly the fraction of the parent's relevance they inherit.
 #[tokio::test]
 async fn golden_query_confidence_weighting_orders_neighbors() {
     let graph = GoldenGraph::seed().await;
@@ -472,23 +491,182 @@ async fn golden_query_confidence_weighting_orders_neighbors() {
     let ranked = names(&result.entities);
 
     let parent = find(&result.entities, BORROW_CHECKER)
-        .unwrap_or_else(|| panic!("anchor missing: {ranked:?}"))
-        .score;
+        .unwrap_or_else(|| panic!("anchor missing: {ranked:?}"));
     let fresh = find(&result.entities, INES)
-        .unwrap_or_else(|| panic!("fresh-edge neighbor missing: {ranked:?}"))
-        .score;
+        .unwrap_or_else(|| panic!("fresh-edge neighbor missing: {ranked:?}"));
     let decayed = find(&result.entities, LUCIA)
-        .unwrap_or_else(|| panic!("decayed-edge neighbor missing: {ranked:?}"))
-        .score;
+        .unwrap_or_else(|| panic!("decayed-edge neighbor missing: {ranked:?}"));
 
     // 0.95, reinforced at creation — no decay yet.
-    assert_close(fresh / parent, 0.95, 1e-6, "fresh edge multiplier");
+    assert_close(
+        fresh.similarity / parent.similarity,
+        0.95,
+        1e-6,
+        "fresh edge multiplier",
+    );
     // 0.90 stored, never reinforced, 180 days old: 0.90 x 0.5^(180/90).
-    assert_close(decayed / parent, 0.225, 1e-3, "decayed edge multiplier");
+    assert_close(
+        decayed.similarity / parent.similarity,
+        0.225,
+        1e-3,
+        "decayed edge multiplier",
+    );
 
     assert!(
         rank(&result.entities, INES) < rank(&result.entities, LUCIA),
         "fresh high-confidence neighbor must outrank the decayed one: {ranked:?}"
+    );
+}
+
+/// Channel parity: confidence discounts a neighbor's *relevance*, and nothing
+/// else. Hotness and utility are read off the neighbor exactly as they are off
+/// a semantic hit, so the non-similarity part of the score is identical for
+/// both channels — no graph candidate has to out-confidence a base that every
+/// semantic candidate gets for free.
+#[tokio::test]
+async fn golden_query_graph_candidates_earn_the_same_score_terms() {
+    let graph = GoldenGraph::seed().await;
+    let result = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
+    let ranked = names(&result.entities);
+
+    let weights = GraphScoringConfig::default();
+    // Every fixture entity is seeded in the same second and unread until this
+    // query, so hotness is equal across them and the remainder is exact.
+    let base = |scored: &ScoredEntity| scored.score - weights.weight_semantic * scored.similarity;
+
+    let parent = find(&result.entities, BORROW_CHECKER)
+        .unwrap_or_else(|| panic!("anchor missing: {ranked:?}"));
+    for neighbor in [INES, LUCIA, OWNERSHIP_MODEL] {
+        let scored =
+            find(&result.entities, neighbor).unwrap_or_else(|| panic!("{neighbor} missing"));
+        assert!(
+            matches!(scored.source, MatchSource::Graph { .. }),
+            "{neighbor} must have arrived over the graph for this test to mean anything"
+        );
+        assert_close(
+            base(scored),
+            base(parent),
+            1e-9,
+            &format!("{neighbor} hotness+utility base"),
+        );
+        assert!(
+            base(scored) > 0.0,
+            "{neighbor} earned no hotness/utility at all: {:?}",
+            scored.score
+        );
+    }
+}
+
+/// Corroboration: an entity the query finds *and* the graph reaches from a top
+/// hit is worth more than the same entity found by the query alone. The lift
+/// is exactly `1 + corroboration_boost * effective_confidence` on the measured
+/// similarity — the measurement stays the base, the graph adds to it.
+#[tokio::test]
+async fn golden_query_graph_corroboration_boosts_a_semantic_hit() {
+    let graph = GoldenGraph::seed().await;
+    let options = QueryOptions {
+        limit: 8,
+        graph_depth: 1,
+        ..Default::default()
+    };
+
+    // MIREIA is a semantic hit for the baking query and also sits one fresh,
+    // 0.95-confidence edge from SOURDOUGH_STARTER, the query's top hit.
+    let uncorroborated = graph
+        .query_scored(BAKING_QUERY, &options, &no_corroboration())
+        .await
+        .entities;
+    let corroborated = graph.query(BAKING_QUERY, &options).await.entities;
+
+    let plain = find(&uncorroborated, MIREIA)
+        .unwrap_or_else(|| panic!("baker missing: {:?}", names(&uncorroborated)));
+    let boosted = find(&corroborated, MIREIA)
+        .unwrap_or_else(|| panic!("baker missing: {:?}", names(&corroborated)));
+
+    assert!(
+        matches!(plain.source, MatchSource::Semantic),
+        "MIREIA must be a semantic hit for this to be corroboration and not expansion"
+    );
+    let expected = 1.0 + GraphScoringConfig::default().corroboration_boost * 0.95;
+    assert_close(
+        boosted.similarity / plain.similarity,
+        expected,
+        1e-6,
+        "corroboration lift",
+    );
+    // Scores are compared across two queries, so only similarity is stable —
+    // the first query warms access counts and moves every hotness term.
+    assert!(
+        boosted.similarity > plain.similarity,
+        "graph corroboration must not be discarded on collision"
+    );
+}
+
+/// Corroboration is bounded: similarity is a `[0, 1]` quantity and stays one
+/// however absurd the boost, so no entity can run away with the ranking by
+/// being well connected.
+#[tokio::test]
+async fn golden_query_corroboration_is_clamped_at_the_similarity_ceiling() {
+    let graph = GoldenGraph::seed().await;
+    let options = QueryOptions {
+        limit: 8,
+        graph_depth: 1,
+        ..Default::default()
+    };
+
+    let runaway = GraphScoringConfig {
+        corroboration_boost: 100.0,
+        ..GraphScoringConfig::default()
+    };
+    let result = graph.query_scored(BAKING_QUERY, &options, &runaway).await;
+
+    for scored in &result.entities {
+        assert!(
+            scored.similarity <= 1.0,
+            "{} exceeded the similarity ceiling: {}",
+            scored.entity.name,
+            scored.similarity
+        );
+    }
+    let ceiling = GraphScoringConfig::default().weight_semantic
+        + GraphScoringConfig::default().weight_hotness
+        + GraphScoringConfig::default().weight_utility;
+    assert!(
+        result.entities.iter().all(|e| e.score <= ceiling),
+        "a corroborated entity outscored a perfect match: {:?}",
+        names(&result.entities)
+    );
+}
+
+/// Access counts are symmetric: an entity that only ever arrives over the
+/// graph warms up exactly like a semantic hit does. Without this the graph
+/// tail can never gain hotness, so it can never rise — a feedback loop that
+/// keeps the graph coldest where the graph is doing the work.
+#[tokio::test]
+async fn golden_query_graph_expanded_results_warm_up() {
+    let graph = GoldenGraph::seed().await;
+
+    let first = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
+    let expanded = find(&first.entities, INES).expect("expanded neighbor missing");
+    assert!(
+        matches!(expanded.source, MatchSource::Graph { .. }),
+        "INES must arrive over the graph"
+    );
+    assert_eq!(expanded.entity.access_count, 0, "unread at first query");
+
+    let second = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
+    let semantic = find(&second.entities, BORROW_CHECKER).expect("anchor missing");
+    let expanded = find(&second.entities, INES).expect("expanded neighbor missing");
+
+    assert_eq!(
+        semantic.entity.access_count, 1,
+        "semantic hit did not warm (baseline behavior)"
+    );
+    assert_eq!(
+        expanded.entity.access_count,
+        1,
+        "graph-expanded result did not warm: {:?}",
+        names(&second.entities)
     );
 }
 

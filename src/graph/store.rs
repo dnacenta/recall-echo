@@ -114,9 +114,32 @@ pub async fn open(path: &Path) -> Result<Surreal<Db>, GraphError> {
     Ok(db)
 }
 
+/// Accept a server URL with or without a scheme.
+///
+/// Before the runtime-backend change, server mode always used the WebSocket
+/// connector, so configs in the wild carry bare `host:port`. `engine::any`
+/// dispatches on the scheme and rejects those with "Invalid URL", which turns
+/// a working config into a hard failure on upgrade. A schemeless value keeps
+/// meaning what it always meant.
+fn normalize_server_url(url: &str) -> String {
+    const SCHEMES: [&str; 6] = [
+        "ws://",
+        "wss://",
+        "http://",
+        "https://",
+        "surrealkv://",
+        "mem://",
+    ];
+    if SCHEMES.iter().any(|s| url.starts_with(s)) {
+        url.to_string()
+    } else {
+        format!("ws://{url}")
+    }
+}
+
 /// Connect to a SurrealDB server (e.g. `ws://localhost:8787`).
 pub async fn connect(config: &ServerConfig) -> Result<Surreal<Db>, GraphError> {
-    let db = surrealdb::engine::any::connect(&config.url).await?;
+    let db = surrealdb::engine::any::connect(normalize_server_url(&config.url)).await?;
     db.signin(surrealdb::opt::auth::Database {
         namespace: config.namespace.clone(),
         database: config.database.clone(),
@@ -340,5 +363,32 @@ mod tests {
         assert!(!is_lock_message("connection refused"));
         assert!(!is_lock_message("lockstep protocol mismatch")); // 'lock' without already/held
         assert!(!is_lock_message("table entity already exists"));
+    }
+}
+
+#[cfg(test)]
+mod url_compat_tests {
+    use super::normalize_server_url;
+
+    #[test]
+    fn schemeless_urls_keep_meaning_websocket() {
+        assert_eq!(
+            normalize_server_url("127.0.0.1:8787"),
+            "ws://127.0.0.1:8787"
+        );
+        assert_eq!(normalize_server_url("db.local:8000"), "ws://db.local:8000");
+    }
+
+    #[test]
+    fn explicit_schemes_pass_through_untouched() {
+        for url in [
+            "ws://127.0.0.1:8787",
+            "wss://db.example:443",
+            "http://localhost:8000",
+            "surrealkv:///var/lib/store",
+            "mem://",
+        ] {
+            assert_eq!(normalize_server_url(url), url);
+        }
     }
 }

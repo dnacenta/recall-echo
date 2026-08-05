@@ -2,9 +2,51 @@
 //!
 //! Pipeline:
 //! 1. **Semantic phase**: HNSW KNN with `limit * 2` to gather candidates
-//! 2. **Graph phase**: 1-hop expansion from top-N results, scored as `parent_score * 0.5`
-//! 3. **Merge + deduplicate** by entity ID, keeping highest score
+//! 2. **Graph phase**: 1-hop expansion from the top 3 candidates
+//! 3. **Merge** by entity ID — corroborating an existing candidate or adding a
+//!    new one
 //! 4. **Episode search** (optional) — separate KNN on episodes
+//!
+//! # Scoring
+//!
+//! Both channels score through [`super::search::score_with_utility`]:
+//!
+//! ```text
+//! score = w_semantic * similarity + w_hotness * hotness + w_utility * utility
+//! ```
+//!
+//! The channel decides only where `similarity` comes from. A semantic
+//! candidate measures it against the query vector; a graph candidate
+//! *propagates* it — the parent's similarity discounted by the edge's
+//! effective (decayed) confidence:
+//!
+//! ```text
+//! similarity_graph = similarity_parent * effective_confidence
+//! ```
+//!
+//! Hotness and utility are read off the neighbor itself, exactly as they are
+//! for a semantic hit. Confidence therefore still orders neighbors — a decayed
+//! edge ranks below a fresh one — without a graph candidate having to overcome
+//! a base every semantic candidate gets for free.
+//!
+//! When an entity arrives on **both** channels the graph corroborates the
+//! query, and its measured relevance is raised — bounded, and proportional to
+//! how much the edge is believed:
+//!
+//! ```text
+//! similarity = min(1.0, similarity_semantic
+//!                       * (1 + corroboration_boost * effective_confidence))
+//! ```
+//!
+//! The measurement stays the base: a direct reading of this entity against
+//! this query outranks an estimate propagated from a neighbor, so
+//! corroboration adds to it rather than replacing it. Two clamps keep it from
+//! running away — the similarity ceiling of `1.0`, and a boost default cut to
+//! the width of the similarity band it perturbs (see
+//! [`GraphScoringConfig::corroboration_boost`]). An entity reachable from
+//! several expanded parents is credited once, over its strongest path: the
+//! parents are the top hits of a single query and are not independent
+//! witnesses. Self-edges corroborate nothing and are skipped.
 
 use std::collections::HashMap;
 
@@ -13,6 +55,7 @@ use surrealdb::Surreal;
 use super::confidence;
 use super::embed::Embedder;
 use super::error::GraphError;
+use super::search::{compute_hotness, score_with_utility};
 use super::store::Db;
 use super::types::*;
 use crate::config::GraphScoringConfig;
@@ -47,53 +90,11 @@ pub async fn query(
         entity_map.insert(result.entity.id_string(), result);
     }
 
-    // Phase 2: Graph expansion — 1-hop from top-N semantic results
+    // Phase 2: Graph expansion — 1-hop from the top semantic results
     if options.graph_depth > 0 {
-        let top_n: Vec<(String, f64)> = {
-            let mut entries: Vec<_> = entity_map
-                .values()
-                .map(|e| (e.entity.id_string(), e.score))
-                .collect();
-            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            entries.truncate(3); // Expand from top 3
-            entries
-        };
-
-        for (parent_id, parent_score) in &top_n {
-            let parent_name = entity_map
-                .get(parent_id)
-                .map(|e| e.entity.name.clone())
-                .unwrap_or_default();
-
-            let neighbors = get_neighbor_details(db, parent_id).await?;
-
-            for (neighbor, rel_type, confidence) in neighbors {
-                let neighbor_id = neighbor.id_string();
-                if entity_map.contains_key(&neighbor_id) {
-                    continue; // Already in results
-                }
-
-                // Apply type filter
-                if let Some(ref et) = options.entity_type {
-                    if neighbor.entity_type.to_string() != *et {
-                        continue;
-                    }
-                }
-
-                let graph_score = parent_score * confidence;
-                entity_map.insert(
-                    neighbor_id,
-                    ScoredEntity {
-                        entity: neighbor,
-                        score: graph_score,
-                        source: MatchSource::Graph {
-                            parent: parent_name.clone(),
-                            rel_type,
-                        },
-                    },
-                );
-            }
-        }
+        let parents = top_expansion_parents(&entity_map);
+        let reached = collect_graph_candidates(db, &parents, options).await?;
+        merge_graph_candidates(&mut entity_map, reached, scoring);
     }
 
     // Sort by score descending, truncate to limit
@@ -105,6 +106,18 @@ pub async fn query(
     });
     entities.truncate(limit);
 
+    // The semantic phase already counted its own results. Counting only that
+    // channel is what keeps the graph tail permanently cold: an entity that is
+    // only ever reached over an edge can never accumulate the accesses that
+    // feed hotness, so it can never rise. Entities corroborated by the graph
+    // kept `MatchSource::Semantic` and are deliberately not counted twice.
+    let expanded_ids: Vec<String> = entities
+        .iter()
+        .filter(|e| matches!(e.source, MatchSource::Graph { .. }))
+        .map(|e| e.entity.id_string())
+        .collect();
+    super::crud::increment_access_counts(db, &expanded_ids).await?;
+
     // Phase 3: Episode search (optional)
     let episodes = if options.include_episodes {
         super::search::search_episodes(db, embedder, query_text, limit).await?
@@ -113,6 +126,158 @@ pub async fn query(
     };
 
     Ok(QueryResult { entities, episodes })
+}
+
+/// How many semantic hits expansion runs from.
+const EXPANSION_PARENTS: usize = 3;
+
+/// A semantic hit that expansion runs from.
+///
+/// Snapshotted before any merging, so a parent that is itself corroborated
+/// mid-merge cannot change what its own neighbors inherit.
+struct ExpansionParent {
+    id: String,
+    name: String,
+    similarity: f64,
+}
+
+/// A neighbor reached by expansion, over the strongest path that reached it.
+struct GraphCandidate {
+    entity: EntityDetail,
+    parent: String,
+    rel_type: String,
+    effective_confidence: f64,
+    /// The parent's similarity, discounted by `effective_confidence`.
+    similarity: f64,
+}
+
+/// The top semantic hits, best score first.
+///
+/// Ties break on entity id: candidates arrive from a `HashMap`, and which of
+/// two equally scored hits gets expanded must not depend on hash order.
+fn top_expansion_parents(entity_map: &HashMap<String, ScoredEntity>) -> Vec<ExpansionParent> {
+    let mut ranked: Vec<&ScoredEntity> = entity_map.values().collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.entity.id_string().cmp(&b.entity.id_string()))
+    });
+    ranked.truncate(EXPANSION_PARENTS);
+    ranked
+        .into_iter()
+        .map(|hit| ExpansionParent {
+            id: hit.entity.id_string(),
+            name: hit.entity.name.clone(),
+            similarity: hit.similarity,
+        })
+        .collect()
+}
+
+/// Walk one hop out of every parent, keeping each neighbor's strongest path.
+async fn collect_graph_candidates(
+    db: &Surreal<Db>,
+    parents: &[ExpansionParent],
+    options: &QueryOptions,
+) -> Result<HashMap<String, GraphCandidate>, GraphError> {
+    let mut reached: HashMap<String, GraphCandidate> = HashMap::new();
+
+    for parent in parents {
+        for (entity, rel_type, effective_confidence) in get_neighbor_details(db, &parent.id).await?
+        {
+            if let Some(ref et) = options.entity_type {
+                if entity.entity_type.to_string() != *et {
+                    continue;
+                }
+            }
+
+            let id = entity.id_string();
+            if id == parent.id {
+                continue; // A self-edge is not a second witness.
+            }
+
+            let similarity = parent.similarity * effective_confidence;
+            if reached
+                .get(&id)
+                .is_some_and(|best| best.similarity >= similarity)
+            {
+                continue;
+            }
+
+            reached.insert(
+                id,
+                GraphCandidate {
+                    entity,
+                    parent: parent.name.clone(),
+                    rel_type,
+                    effective_confidence,
+                    similarity,
+                },
+            );
+        }
+    }
+
+    Ok(reached)
+}
+
+/// Fold the expanded neighborhood into the semantic candidates: corroborate
+/// what is already there, add what is not.
+fn merge_graph_candidates(
+    entity_map: &mut HashMap<String, ScoredEntity>,
+    reached: HashMap<String, GraphCandidate>,
+    scoring: &GraphScoringConfig,
+) {
+    let now = chrono::Utc::now();
+
+    for (id, candidate) in reached {
+        match entity_map.get_mut(&id) {
+            Some(existing) => {
+                let corroborated = corroborated_similarity(
+                    scoring,
+                    existing.similarity,
+                    candidate.effective_confidence,
+                );
+                existing.similarity = corroborated;
+                existing.score = score_entity(scoring, &existing.entity, corroborated, &now);
+            }
+            None => {
+                let score = score_entity(scoring, &candidate.entity, candidate.similarity, &now);
+                entity_map.insert(
+                    id,
+                    ScoredEntity {
+                        entity: candidate.entity,
+                        similarity: candidate.similarity,
+                        score,
+                        source: MatchSource::Graph {
+                            parent: candidate.parent,
+                            rel_type: candidate.rel_type,
+                        },
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Raise a measured relevance that the graph agrees with, bounded by the
+/// similarity ceiling so corroboration can never outrank a perfect match.
+fn corroborated_similarity(
+    scoring: &GraphScoringConfig,
+    similarity: f64,
+    effective_confidence: f64,
+) -> f64 {
+    (similarity * (1.0 + scoring.corroboration_boost * effective_confidence)).min(1.0)
+}
+
+/// Score an entity from a relevance term plus its own hotness and utility.
+fn score_entity(
+    scoring: &GraphScoringConfig,
+    entity: &EntityDetail,
+    similarity: f64,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> f64 {
+    let hotness = compute_hotness(entity.access_count, &entity.updated_at_string(), now);
+    score_with_utility(scoring, similarity, hotness, entity.utility_score)
 }
 
 /// Get 1-hop neighbors as L1 (EntityDetail) with the relationship type and effective confidence.

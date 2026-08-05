@@ -46,11 +46,21 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
     println!("  Episodes:      {}", stats.episode_count);
 
     // Episodes arrive automatically on SessionEnd; turning them into entities
-    // is an explicit, LLM-costing pass. A store with episodes and no entities
-    // is the shape a user gets when nobody told them that.
+    // is an LLM-costing pass. The daemon now runs it once the machine is
+    // quiet, but a store with episodes and no entities is still worth
+    // explaining — the wait, or the opt-out, is the answer either way.
     if stats.episode_count > 0 && stats.entity_count == 0 {
-        println!("\n  {YELLOW}No entities yet.{RESET} Episodes are ingested automatically, but");
-        println!("  entity extraction is a separate pass over them:");
+        let extraction = crate::config::load_from_dir(memory_dir).extraction;
+        println!(
+            "\n  {YELLOW}No entities yet.{RESET} Episodes are ingested automatically; turning"
+        );
+        println!("  them into entities is a separate LLM pass.");
+        if extraction.background_enabled {
+            println!(
+                "  The daemon runs it after {}s of quiet. To run it now:",
+                extraction.idle_after_secs
+            );
+        }
         println!("    {DIM}recall-echo graph extract --all{RESET}");
     }
 
@@ -96,6 +106,7 @@ pub async fn daemon_status(memory_dir: &Path) -> Result<(), RecallError> {
             println!("  Pid:    {}", info.pid);
             println!("  Version: {}", info.version);
             println!("  Uptime: {}s", info.uptime_secs);
+            print_extraction_lines(&info.extraction);
         }
         None if serve_client::graph_mode(memory_dir) == "server" => {
             println!("  State:  not used — [graph] mode = server");
@@ -107,6 +118,28 @@ pub async fn daemon_status(memory_dir: &Path) -> Result<(), RecallError> {
         serve_client::daemon_log_path(memory_dir).display()
     );
     Ok(())
+}
+
+/// Report what the daemon's background extraction worker has done.
+fn print_extraction_lines(status: &crate::serve::ExtractionStatus) {
+    if !status.enabled {
+        let reason = status.disabled_reason.as_deref().unwrap_or("not running");
+        println!("  Extraction: {YELLOW}off{RESET} — {DIM}{reason}{RESET}");
+        return;
+    }
+    match status.last_run_secs_ago {
+        Some(secs) => println!(
+            "  Extraction: {GREEN}on{RESET} — {} archives in {} runs, last {}s ago ({}ms)",
+            status.archives,
+            status.runs,
+            secs,
+            status.last_run_ms.unwrap_or(0)
+        ),
+        None => println!("  Extraction: {GREEN}on{RESET} — nothing extracted yet"),
+    }
+    if let Some(error) = &status.last_error {
+        println!("  {DIM}Last extraction error: {error}{RESET}");
+    }
 }
 
 /// Stop the daemon serving this graph, if one is running.
@@ -334,7 +367,7 @@ pub async fn ingest_all(
 }
 
 /// Extract session_id and log_number from a conversation archive's frontmatter.
-fn extract_archive_metadata(content: &str, path: &Path) -> (String, Option<u32>) {
+pub(crate) fn extract_archive_metadata(content: &str, path: &Path) -> (String, Option<u32>) {
     let mut session_id = "unknown".to_string();
     let mut log_number: Option<u32> = None;
 
@@ -467,6 +500,8 @@ struct ExtractionTotals {
     processed: u32,
     estimated_tokens: u64,
     quarantined: Vec<u32>,
+    dedup_llm_calls: u32,
+    dedup_fast_path: u32,
 }
 
 /// Print a dry-run listing of archives that would be extracted.
@@ -505,6 +540,13 @@ fn print_extract_summary(totals: &ExtractionTotals) {
         "  Estimated tokens: ~{}",
         format_tokens(totals.estimated_tokens)
     );
+    let dedup_total = totals.dedup_llm_calls + totals.dedup_fast_path;
+    if dedup_total > 0 {
+        println!(
+            "  Dedup: {} of {} candidates needed a model call ({} resolved locally)",
+            totals.dedup_llm_calls, dedup_total, totals.dedup_fast_path
+        );
+    }
 
     if !totals.quarantined.is_empty() {
         println!(
@@ -678,6 +720,8 @@ pub async fn extract(
             totals.errors.extend(report.errors);
             totals.processed += 1;
             totals.estimated_tokens += report.estimated_tokens;
+            totals.dedup_llm_calls += report.dedup_llm_calls;
+            totals.dedup_fast_path += report.dedup_fast_path;
 
             // Rate limiting between archives
             if delay_ms > 0 && *ln != *log_numbers.last().unwrap() {
@@ -983,7 +1027,7 @@ fn shellexpand(path: &str) -> String {
 }
 
 /// Find the conversations directory — checks memory_dir/conversations/ then parent/conversations/.
-fn find_conversations_dir(memory_dir: &Path) -> Result<PathBuf, RecallError> {
+pub(crate) fn find_conversations_dir(memory_dir: &Path) -> Result<PathBuf, RecallError> {
     let conv = memory_dir.join("conversations");
     if conv.exists() {
         return Ok(conv);
@@ -1320,7 +1364,10 @@ pub async fn decay_report(
 
 /// Find the archive file for a given log number.
 #[cfg(feature = "llm")]
-fn find_archive_file(conversations_dir: &Path, log_number: u32) -> Result<PathBuf, RecallError> {
+pub(crate) fn find_archive_file(
+    conversations_dir: &Path,
+    log_number: u32,
+) -> Result<PathBuf, RecallError> {
     // Try both naming conventions
     let patterns = [
         format!("conversation-{log_number:03}.md"),

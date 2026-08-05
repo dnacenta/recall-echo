@@ -30,10 +30,13 @@ pub mod error;
 pub mod frontmatter;
 pub mod init;
 pub mod jsonl;
+pub mod mcp;
 pub mod paths;
 pub mod search;
 pub mod serve;
 pub mod serve_client;
+#[cfg(feature = "llm")]
+pub mod serve_extract;
 mod serve_security;
 pub mod status;
 pub mod summarize;

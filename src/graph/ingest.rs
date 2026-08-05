@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 
 use super::confidence::{ExtractionContext, Provenance};
 use super::crud;
-use super::dedup::{self, ResolvedEntity};
+use super::dedup::{self, Resolution, ResolvedEntity};
 use super::error::GraphError;
 use super::extract;
 use super::llm::LlmProvider;
@@ -278,23 +278,8 @@ async fn process_extraction(
     let mut name_map: HashMap<String, String> = HashMap::new();
 
     for candidate in &deduplicated {
-        // Estimate ~600 tokens per dedup call (vector search + LLM decision)
-        report.estimated_tokens += 600;
         match dedup::resolve_entity(gm, llm, candidate, session_id).await {
-            Ok(ResolvedEntity::Created(entity)) => {
-                name_map.insert(candidate.name.clone(), entity.name.clone());
-                report.entity_ids.push(entity.id_string());
-                report.entities_created += 1;
-            }
-            Ok(ResolvedEntity::Merged(entity)) => {
-                name_map.insert(candidate.name.clone(), entity.name.clone());
-                report.entity_ids.push(entity.id_string());
-                report.entities_merged += 1;
-            }
-            Ok(ResolvedEntity::Skipped) => {
-                name_map.insert(candidate.name.clone(), candidate.name.clone());
-                report.entities_skipped += 1;
-            }
+            Ok(resolution) => record_resolution(report, &mut name_map, candidate, resolution),
             Err(e) => {
                 report
                     .errors
@@ -367,6 +352,41 @@ async fn process_extraction(
     Ok(())
 }
 
+/// Fold one dedup resolution into the run's report: what it decided, and what
+/// deciding it cost.
+fn record_resolution(
+    report: &mut IngestionReport,
+    name_map: &mut HashMap<String, String>,
+    candidate: &ExtractedEntity,
+    resolution: Resolution,
+) {
+    if resolution.path.used_llm() {
+        // Estimate ~600 tokens per dedup call (prompt + decision). The fast
+        // paths make no call, so they add nothing to the bill.
+        report.dedup_llm_calls += 1;
+        report.estimated_tokens += 600;
+    } else {
+        report.dedup_fast_path += 1;
+    }
+
+    match resolution.entity {
+        ResolvedEntity::Created(entity) => {
+            name_map.insert(candidate.name.clone(), entity.name.clone());
+            report.entity_ids.push(entity.id_string());
+            report.entities_created += 1;
+        }
+        ResolvedEntity::Merged(entity) => {
+            name_map.insert(candidate.name.clone(), entity.name.clone());
+            report.entity_ids.push(entity.id_string());
+            report.entities_merged += 1;
+        }
+        ResolvedEntity::Skipped => {
+            name_map.insert(candidate.name.clone(), candidate.name.clone());
+            report.entities_skipped += 1;
+        }
+    }
+}
+
 /// Merge extracted entities that share the same name (case-insensitive).
 ///
 /// When multiple chunks extract the same entity, combine their data:
@@ -419,14 +439,55 @@ fn local_merge_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> 
 
 use super::util::merge_json_objects as merge_json;
 
-/// Build a short abstract for an episode chunk.
+/// Maximum length of an episode abstract, in characters.
+///
+/// The abstract is not a label: it is the text that gets embedded, the text
+/// episode search returns, and the text that reaches an answer prompt. The
+/// previous 200 severed facts mid-word and used a tenth of BGE-Small's 512-token
+/// window. 1,000 characters is half the 500-token ingest chunk — still a
+/// summary rather than a copy of the chunk — and about 250 tokens, so the whole
+/// abstract is inside the embedding window instead of being truncated by it.
+const EPISODE_ABSTRACT_MAX_CHARS: usize = 1_000;
+
+/// A boundary earlier than this share of the window discards more text than the
+/// tidiness is worth; fall back to a coarser boundary instead.
+const MIN_BOUNDARY_FRACTION: f64 = 0.6;
+
+/// Build a short abstract for an episode chunk, cut at a sentence or word
+/// boundary so a fact is never severed mid-word.
 fn build_episode_abstract(chunk: &str) -> String {
-    let chars: String = chunk.chars().take(200).collect();
-    if chars.len() < chunk.len() {
-        format!("{}...", chars.trim())
-    } else {
-        chars.trim().to_string()
+    let trimmed = chunk.trim();
+    if trimmed.chars().count() <= EPISODE_ABSTRACT_MAX_CHARS {
+        return trimmed.to_string();
     }
+
+    let window: String = trimmed.chars().take(EPISODE_ABSTRACT_MAX_CHARS).collect();
+    let cut = truncation_point(&window);
+    format!("{}...", window[..cut].trim_end())
+}
+
+/// Byte offset to cut `window` at: just past the last sentence terminator if
+/// one falls late enough to keep most of the window, else the last word
+/// boundary, else the whole window.
+fn truncation_point(window: &str) -> usize {
+    let floor = (window.len() as f64 * MIN_BOUNDARY_FRACTION) as usize;
+
+    let after_sentence = window
+        .char_indices()
+        .rev()
+        .find(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(|(i, c)| i + c.len_utf8());
+    if let Some(cut) = after_sentence.filter(|&cut| cut >= floor) {
+        return cut;
+    }
+
+    window
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .filter(|&cut| cut >= floor)
+        .unwrap_or(window.len())
 }
 
 /// Find an existing relationship of the same type between two entities.
@@ -460,10 +521,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn episode_abstract_truncates() {
-        let long = "x".repeat(500);
+    fn episode_abstract_truncates_at_the_cap() {
+        let long = "x".repeat(EPISODE_ABSTRACT_MAX_CHARS * 2);
         let abs = build_episode_abstract(&long);
-        assert!(abs.len() < 210);
+        assert!(abs.chars().count() <= EPISODE_ABSTRACT_MAX_CHARS + 3);
         assert!(abs.ends_with("..."));
     }
 
@@ -472,6 +533,44 @@ mod tests {
         let short = "Hello world";
         let abs = build_episode_abstract(short);
         assert_eq!(abs, "Hello world");
+    }
+
+    /// A chunk that would have been cut at 200 characters now survives whole.
+    #[test]
+    fn episode_abstract_keeps_text_the_old_cap_would_have_cut() {
+        let chunk = format!(
+            "{} Currently, my favourite is Kansas City Masterpiece.",
+            "Padding sentence about barbecue. ".repeat(8)
+        );
+        assert!(chunk.chars().count() > 200);
+        let abs = build_episode_abstract(&chunk);
+        assert!(abs.contains("Kansas City Masterpiece"));
+    }
+
+    /// The defect this pins: the old cap severed `Kansas City Masterpiece`
+    /// after `Ka`. Cuts must land on a sentence boundary when one is available.
+    #[test]
+    fn episode_abstract_cuts_at_a_sentence_boundary() {
+        let chunk = format!(
+            "{}My favourite is Kansas City Masterpiece and nothing else comes close at all",
+            "The barbecue discussion continued at length. ".repeat(22)
+        );
+        let abs = build_episode_abstract(&chunk);
+        assert!(abs.ends_with("at length...."), "unexpected tail: {abs:?}");
+        assert!(!abs.contains("Kansas"));
+    }
+
+    /// With no sentence terminator in reach, the cut still lands between words.
+    #[test]
+    fn episode_abstract_never_cuts_mid_word() {
+        let chunk = "barbecue ".repeat(300);
+        let abs = build_episode_abstract(&chunk);
+        let body = abs.strip_suffix("...").expect("truncated");
+        assert!(
+            body.ends_with("barbecue"),
+            "cut landed mid-word: {:?}",
+            &body[body.len().saturating_sub(20)..]
+        );
     }
 
     #[test]
