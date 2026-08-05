@@ -42,7 +42,11 @@ pulse-system-types = { version = "0.6", optional = true }
 [features]
 # Both storage backends are compiled in by default; the active one is chosen
 # at runtime via the `[graph] mode` config key (embedded | server).
-default = ["embedded", "server"]
+# `llm` is on by default: without it the `graph extract` subcommand does not
+# exist, so a stock install ingests episodes that can never become entities —
+# the knowledge graph's whole point. Extraction still requires a configured
+# provider at run time; it just stops being unreachable at compile time.
+default = ["embedded", "server", "llm"]
 embedded = ["surrealdb/kv-surrealkv"]
 server = ["surrealdb/protocol-ws"]
 llm = ["reqwest"]

@@ -101,6 +101,15 @@ pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {
         eprintln!("  Archives        {DIM}not initialized{RESET}");
     }
 
+    // Graph — the flat-file status command deliberately does not open the
+    // store (the daemon may hold it); `graph status` reports real counts.
+    let graph_dir = memory.join("graph");
+    if graph_dir.exists() {
+        eprintln!(
+            "  Graph           {DIM}present — run `recall-echo graph status` for counts{RESET}"
+        );
+    }
+
     // Issues
     eprintln!();
     if issues.is_empty() {
