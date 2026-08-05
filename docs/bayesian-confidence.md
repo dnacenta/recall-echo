@@ -119,18 +119,22 @@ path_confidence([0.8, 0.7, 0.9]) = 0.504
 
 This falls naturally out of treating edges as independent probabilities. The practical effect is that the long tail of weak chains is automatically suppressed. Two hops over 0.9 edges is a stronger signal than four hops over 0.7 edges (`0.81` vs `0.24`) — no special-case pruning needed.
 
-The hybrid query in `src/graph/query.rs` applies this directly: after the semantic phase identifies the top candidates, graph expansion adds neighbors scored as `parent_score · effective_confidence` (`query.rs:83`). The effective confidence is computed with temporal decay at read time (`query.rs:158-163`), and edges below 0.1 effective confidence are filtered out (`query.rs:166-168`).
+The hybrid query in `src/graph/query.rs` applies this directly: after the semantic phase identifies the top candidates, graph expansion adds neighbors whose *relevance* is the parent's, discounted by the edge — `similarity_parent · effective_confidence` (`merge_graph_candidates`). Effective confidence is computed with temporal decay at read time, and edges below 0.1 effective confidence are dropped before scoring (`get_neighbor_details`).
+
+Confidence therefore attenuates the same term for both channels rather than scaling a whole score. A graph-sourced candidate is scored by `score_with_utility` exactly as a semantic one is — hotness and utility read off the neighbor itself — so a decayed edge ranks its target lower without the target having to overcome a base that semantic candidates receive for free:
 
 ```
   semantic                graph expansion
   ─────────               ──────────────
-    [E1: 0.84] ──[0.9]──→ [N1: 0.756]
-       │                      │
-       └───────[0.6]───────→  [N2: 0.504]   ← scored, not pruned
-                                            ← attenuates over hops
-    [E2: 0.71] ──[0.4]──→ [N3: 0.284]       ← below filter floor
-                                              after second hop
+    [E1: sim 0.84] ──[0.9]──→ [N1: sim 0.756]  + own hotness/utility
+       │                          │
+       └───────[0.6]──────────→  [N2: sim 0.504]   ← scored, not pruned
+                                                   ← attenuates over hops
+    [E2: sim 0.71] ──[0.4]──→ [N3: sim 0.284]      ← below filter floor
+                                                     after second hop
 ```
+
+When both channels reach the same entity, the graph corroborates a measurement rather than replacing it: the measured similarity is raised by `1 + corroboration_boost · effective_confidence`, clamped at 1.0. The independence precondition below is why the lift is small, why it is credited once per entity over its strongest path rather than accumulated across the expanded parents — those parents are the top hits of a single query, not independent witnesses — and why a self-edge is skipped rather than counted.
 
 Note the honest asymmetry: the multiplicative rule assumes edge independence, and the provenance machinery below exists precisely because *observations* are frequently not independent. Path independence and observation independence are different assumptions; only the second one is modelled.
 
@@ -267,7 +271,7 @@ A few design choices worth pulling out:
 - The `Evidence` counts are private with accessor methods, so nothing outside the model can write a state where the mean and the counts disagree.
 - Half-life of 90 days is a default; the constant lives at `confidence.rs:382` and the `temporal_decay` signature accepts a per-call value, so per-domain tuning is mechanical.
 - The decay floor at 0.05 is deliberate. Edges below it are still queryable but ranked near the bottom. Hard deletion is a GC concern.
-- The hybrid query filters effective confidence below 0.1 during graph expansion (`query.rs:166`). Below this, the multiplicative chain attenuates results to noise.
+- The hybrid query filters effective confidence below 0.1 during graph expansion (`get_neighbor_details`). Below this, the multiplicative chain attenuates results to noise.
 
 ## Reproducibility
 

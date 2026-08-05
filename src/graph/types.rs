@@ -307,6 +307,16 @@ pub enum MatchSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredEntity {
     pub entity: EntityDetail,
+    /// The relevance term that went into `score`, in `[0, 1]`.
+    ///
+    /// For a semantic match this is cosine similarity against the query
+    /// vector. For a graph-expanded match it is the parent's similarity
+    /// discounted by the edge's effective confidence — the same quantity,
+    /// estimated over the graph rather than measured against the query. Kept
+    /// alongside `score` because the blend that produced `score` cannot be
+    /// inverted (any weight may be zero).
+    #[serde(default)]
+    pub similarity: f64,
     pub score: f64,
     pub source: MatchSource,
 }

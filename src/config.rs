@@ -251,6 +251,12 @@ impl Default for ServeSection {
 /// Weights are not constrained to sum to 1.0 — the scoring function does not
 /// normalize. Callers that change these should calibrate against their own
 /// retrieval outcomes; see `utility-feedback-loop-spec.md` in pulse-null.
+///
+/// Graph-expanded candidates score through the same three terms; what differs
+/// is where their `similarity` comes from (a parent's similarity discounted by
+/// the edge's effective confidence, rather than a direct measurement against
+/// the query vector). [`GraphScoringConfig::corroboration_boost`] governs the
+/// one case where the two channels meet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphScoringConfig {
@@ -260,6 +266,33 @@ pub struct GraphScoringConfig {
     pub weight_hotness: f64,
     /// Weight applied to the utility score (outcome-feedback EMA). Default `0.25`.
     pub weight_utility: f64,
+    /// How much an entity's measured relevance is raised when the graph
+    /// corroborates a semantic hit — i.e. when the same entity is reached both
+    /// by the query vector and over a surviving edge from one of the expanded
+    /// top hits. Default `0.05`.
+    ///
+    /// ```text
+    /// similarity = min(1.0, similarity * (1 + corroboration_boost * effective_confidence))
+    /// ```
+    ///
+    /// Scaled by the edge's effective (decayed) confidence, so a stale edge
+    /// corroborates weakly, and clamped at the similarity ceiling of `1.0`, so
+    /// no amount of corroboration can push an entity past what a perfect
+    /// direct match would score on the same hotness and utility. `0.0`
+    /// disables corroboration entirely.
+    ///
+    /// The default is cut to the *scale* of the similarity distribution it
+    /// perturbs, measured over four LongMemEval stores (196–1804 entities):
+    /// the top-20 similarity band there is only `0.086` wide, so a boost of
+    /// `0.134` would let corroboration promote an entity from the bottom of
+    /// the band to the top, and structure would outrank similarity outright.
+    /// `0.05` moves a corroborated entity about a third of the band — enough
+    /// to break the near-ties that dominate a dense embedding space (the
+    /// rank-1-to-rank-2 gap in those stores is `0.005`–`0.051`), and not
+    /// enough to overturn a decided ordering. Raise it only with retrieval
+    /// numbers in hand: corroboration amplifies whatever the extractor put in
+    /// the graph, including its mistakes.
+    pub corroboration_boost: f64,
 }
 
 impl Default for GraphScoringConfig {
@@ -268,6 +301,7 @@ impl Default for GraphScoringConfig {
             weight_semantic: 0.45,
             weight_hotness: 0.30,
             weight_utility: 0.25,
+            corroboration_boost: 0.05,
         }
     }
 }
@@ -766,6 +800,7 @@ mod tests {
         assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
         assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
         assert!((scoring.weight_utility - 0.25).abs() < f64::EPSILON);
+        assert!((scoring.corroboration_boost - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -775,6 +810,15 @@ mod tests {
         assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
         assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
         assert!((scoring.weight_utility - 0.5).abs() < f64::EPSILON);
+        assert!((scoring.corroboration_boost - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn graph_scoring_corroboration_boost_is_configurable() {
+        let scoring: GraphScoringConfig =
+            toml::from_str("corroboration_boost = 0.0\n").expect("parse corroboration boost");
+        assert!(scoring.corroboration_boost.abs() < f64::EPSILON);
+        assert!((scoring.weight_semantic - 0.45).abs() < f64::EPSILON);
     }
 
     #[test]
