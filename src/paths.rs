@@ -71,6 +71,14 @@ pub fn expand_tilde(path: &str) -> String {
 /// Returns Some(~/.claude/) if it exists, None otherwise.
 #[must_use]
 pub fn detect_claude_code() -> Option<PathBuf> {
+    // Overridable so tests (and sandboxed runs) never touch the real
+    // ~/.claude — hook installation writes settings.json unconditionally,
+    // and a test that installs hooks would otherwise repoint the user's
+    // live hooks at the test binary.
+    if let Some(dir) = std::env::var_os(CLAUDE_DIR_ENV) {
+        let claude = PathBuf::from(dir);
+        return claude.exists().then_some(claude);
+    }
     let home = dirs::home_dir()?;
     let claude = home.join(".claude");
     if claude.exists() {
@@ -79,3 +87,6 @@ pub fn detect_claude_code() -> Option<PathBuf> {
         None
     }
 }
+
+/// Overrides the Claude Code configuration directory (`~/.claude`).
+pub const CLAUDE_DIR_ENV: &str = "RECALL_ECHO_CLAUDE_DIR";

@@ -5,3 +5,6 @@
 
 # AI tooling (local only)
 .claude/
+
+# Runtime artifacts from running recall-echo inside the repo
+/memory/
