@@ -45,6 +45,15 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
     println!("  Relationships: {}", stats.relationship_count);
     println!("  Episodes:      {}", stats.episode_count);
 
+    // Episodes arrive automatically on SessionEnd; turning them into entities
+    // is an explicit, LLM-costing pass. A store with episodes and no entities
+    // is the shape a user gets when nobody told them that.
+    if stats.episode_count > 0 && stats.entity_count == 0 {
+        println!("\n  {YELLOW}No entities yet.{RESET} Episodes are ingested automatically, but");
+        println!("  entity extraction is a separate pass over them:");
+        println!("    {DIM}recall-echo graph extract --all{RESET}");
+    }
+
     if !stats.entity_type_counts.is_empty() {
         println!("\n  {DIM}By type:{RESET}");
         let mut types: Vec<_> = stats.entity_type_counts.iter().collect();
