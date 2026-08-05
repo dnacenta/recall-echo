@@ -89,7 +89,7 @@ recall-echo graph add-entity --name <n> --type <t> --abstract <a>   # Add entity
 recall-echo graph relate <from> --rel <type> --target <to>          # Create relationship
 recall-echo graph ingest <archive>              # Ingest single archive (episodes only)
 recall-echo graph ingest-all                    # Ingest all un-ingested archives
-recall-echo graph extract --all                 # LLM entity extraction from archives
+recall-echo graph extract --all                 # LLM entity extraction (the daemon also does this when idle)
 
 # Pipeline & integrations
 recall-echo graph pipeline sync                 # Sync pipeline documents into the graph
@@ -256,7 +256,7 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph relate <from> --rel <type> --target <to>` — Create a relationship between two entities. Supports `--description` and `--source`.
 - `graph ingest <archive>` — Ingest a single archive file (creates episodes, no LLM required).
 - `graph ingest-all` — Scan conversations/ and ingest all un-ingested archives.
-- `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (anthropic or openai), `--delay-ms`.
+- `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (anthropic or openai), `--delay-ms`. The daemon runs this pass on its own once the machine is quiet (see [Background extraction](#background-extraction)); this command is how you run it *now*, or in `server` mode, or after changing the model.
 
 **Daemon:**
 
@@ -282,7 +282,8 @@ recall-echo serve --dir /path/to/memory --foreground
 ```
 
 `--foreground` logs to stderr as well as `<memory_dir>/graph/daemon.log` and
-disables idle shutdown, leaving lifetime to systemd.
+disables idle shutdown, leaving lifetime to systemd. Background extraction
+still runs — it waits for quiet, not for an idle timeout.
 
 ### `recall-echo mcp`
 
@@ -400,6 +401,11 @@ max_candidates = 3           # Existing entities compared per candidate
 [serve]
 socket_path = ""             # Daemon socket override (default: XDG runtime dir)
 idle_timeout_secs = 3600     # Shut the daemon down after this much inactivity (0 = never)
+
+[extraction]
+background_enabled = true    # Let the daemon extract entities when the machine is quiet
+idle_after_secs = 120        # Quiet period before a background batch starts
+batch_size = 3               # Archives per batch (the next batch is one quiet period later)
 ```
 
 | Section | Key | Default | Description |
@@ -417,6 +423,9 @@ idle_timeout_secs = 3600     # Shut the daemon down after this much inactivity (
 | `graph.dedup` | `max_candidates` | `3` | How many existing entities dedup compares a candidate against |
 | `serve` | `socket_path` | XDG runtime dir | Daemon socket path override |
 | `serve` | `idle_timeout_secs` | `3600` | Daemon idle shutdown timeout (`0` disables) |
+| `extraction` | `background_enabled` | `true` | Extract entities in the daemon once it has been quiet |
+| `extraction` | `idle_after_secs` | `120` | Seconds without a request before a background batch may start (`0` = as soon as no connection is open) |
+| `extraction` | `batch_size` | `3` | Archives per background batch |
 
 All settings have sensible defaults. Missing file or invalid values fall back silently.
 
@@ -464,6 +473,54 @@ If the embedded store is locked by a foreign process, the daemon retries with
 backoff and then fails with a named `store locked` error — never a raw LOCK
 panic. Flat-file layers (MEMORY.md, EPHEMERAL.md, archives) are unaffected by
 any of this.
+
+## Background extraction
+
+Episodes arrive mechanically: the `SessionEnd` hook ingests every conversation
+without anyone remembering to. Turning those episodes into **entities,
+relationships, confidence and provenance** used to be a command a human had to
+type — so semantic search and Bayesian confidence, the features this project is
+actually about, stayed empty for anyone who did not read the docs closely.
+
+The daemon does that pass itself. It already owns the store and already knows
+when nobody is using it, so once the memory directory has been quiet for
+`[extraction] idle_after_secs` (default two minutes) it takes `batch_size`
+un-extracted archives (default three) and runs exactly what
+`recall-echo graph extract` runs. Then it goes back to waiting. A backlog
+drains one batch per quiet period.
+
+- **A client request always wins.** Nothing is locked for the length of a
+  batch: the worker shares the store like any other task, and it stops at the
+  next archive boundary as soon as a connection is open.
+- **Interruption is safe.** The `extracted` flag flips per archive, after that
+  archive succeeded — never per batch. A daemon killed mid-batch simply leaves
+  work to do.
+- **Idle shutdown waits for the batch, not for the backlog.** The daemon will
+  not exit with an archive in flight, and a finished batch restarts the idle
+  clock — so a daemon working through a backlog stays up, and one with nothing
+  left to do exits after `[serve] idle_timeout_secs` as always.
+- **It gives up rather than loops.** An archive that fails twice is written to
+  `graph/extraction-quarantine.txt` and skipped; three failures in a row
+  disable the worker until the daemon restarts. There is no retry storm and no
+  runaway bill.
+- **It says what it did.** Every batch logs its count and duration to
+  `<memory_dir>/graph/daemon.log`, and `graph daemon status` reports whether
+  the worker is on, what it has extracted, and — when it is off — why.
+
+**What it costs.** Extraction calls a model, so this is real money for
+API-key providers. Two things bound it. First, the daemon is started with an
+allowlisted environment that deliberately excludes API keys, so an
+*auto-started* daemon can only ever use the `claude-code` provider, which bills
+nothing beyond a Claude subscription; with `provider = "anthropic"` the worker
+finds no key, disables itself, and says so once in the daemon log. An API
+provider reaches the daemon only if you run `recall-echo serve --foreground`
+with the key exported — an explicit act. Second, `batch_size` bounds any single
+burst. Set `background_enabled = false` to turn the pass off entirely.
+
+**Not in `server` mode.** With `[graph] mode = "server"` clients bypass the
+daemon completely, so a daemon's "quiet" measures a socket nobody connects to
+rather than anything about you, and other processes may be writing to the same
+store. Background extraction stays off there; `graph extract` is the way.
 
 ## Contributing
 

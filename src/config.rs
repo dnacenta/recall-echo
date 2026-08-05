@@ -12,6 +12,15 @@ const DEFAULT_MAX_ENTRIES: usize = 5;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
 const CONFIG_FILE: &str = ".recall-echo.toml";
 
+/// Seconds of quiet before the daemon starts extracting in the background.
+///
+/// Two minutes: long enough that a session's burst of hooks and queries is
+/// over, short enough that a conversation archived at the end of a working day
+/// has become entities before the next one starts.
+const DEFAULT_EXTRACTION_IDLE_AFTER_SECS: u64 = 120;
+/// Archives one background batch extracts before yielding.
+const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
+
 // ── Provider enum ────────────────────────────────────────────────────────
 
 /// LLM provider for entity extraction.
@@ -78,6 +87,8 @@ pub struct Config {
     pub graph: Option<GraphSection>,
     #[serde(default)]
     pub serve: ServeSection,
+    #[serde(default)]
+    pub extraction: ExtractionSection,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,6 +241,62 @@ impl Default for ServeSection {
             socket_path: None,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
         }
+    }
+}
+
+/// Background entity extraction inside the graph daemon (`[extraction]`).
+///
+/// Episodes arrive mechanically on `SessionEnd`; turning them into entities,
+/// relationships and confidence used to require a human to run
+/// `recall-echo graph extract`. The daemon already owns the store and knows
+/// when it is unused, so it does that pass itself once the machine is quiet.
+///
+/// Defaults are on, because the alternative is a knowledge graph that stays
+/// empty for everyone who did not read the docs closely. What it costs is
+/// bounded by the provider: the daemon is started with a minimal environment
+/// that deliberately excludes API keys (see `serve_client`), so an
+/// auto-started daemon can only ever use the `claude-code` provider, which
+/// bills nothing on a subscription. An API-key provider reaches the daemon
+/// only when a human runs `recall-echo serve --foreground` with the key
+/// exported — an explicit act. Set `background_enabled = false` to turn the
+/// pass off entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtractionSection {
+    /// Run entity extraction in the daemon when the machine is quiet.
+    /// Default `true`.
+    pub background_enabled: bool,
+    /// Seconds without a client request before a background batch may start.
+    /// `0` means "as soon as no connection is open". Default `120`.
+    pub idle_after_secs: u64,
+    /// Archives one batch extracts before going back to waiting. Bounds how
+    /// long a burst of background work lasts and how much it can cost in one
+    /// go; the next batch starts one quiet period later. Default `3`.
+    pub batch_size: usize,
+}
+
+impl Default for ExtractionSection {
+    fn default() -> Self {
+        Self {
+            background_enabled: true,
+            idle_after_secs: DEFAULT_EXTRACTION_IDLE_AFTER_SECS,
+            batch_size: DEFAULT_EXTRACTION_BATCH_SIZE,
+        }
+    }
+}
+
+impl ExtractionSection {
+    /// Quiet period before a batch may start.
+    #[must_use]
+    pub fn idle_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_after_secs)
+    }
+
+    /// Archives per batch — at least one, whatever the config says, or the
+    /// worker would wake up only to do nothing.
+    #[must_use]
+    pub fn effective_batch_size(&self) -> usize {
+        self.batch_size.max(1)
     }
 }
 
@@ -528,6 +595,28 @@ impl Config {
                 };
                 Ok(())
             }
+            "extraction.background_enabled" => {
+                self.extraction.background_enabled = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "extraction.idle_after_secs" => {
+                self.extraction.idle_after_secs = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                Ok(())
+            }
+            "extraction.batch_size" => {
+                let size: usize = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                if size == 0 {
+                    return Err(RecallError::Config("batch_size must be at least 1".into()));
+                }
+                self.extraction.batch_size = size;
+                Ok(())
+            }
             "graph.provenance.weight_external" => {
                 self.graph_section().provenance.weight_external = parse_weight(value)?;
                 Ok(())
@@ -709,6 +798,7 @@ mod tests {
             pipeline: None,
             graph: None,
             serve: ServeSection::default(),
+            extraction: ExtractionSection::default(),
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
@@ -768,6 +858,7 @@ mod tests {
             pipeline: None,
             graph: None,
             serve: ServeSection::default(),
+            extraction: ExtractionSection::default(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path());
@@ -790,6 +881,7 @@ mod tests {
             pipeline: None,
             graph: None,
             serve: ServeSection::default(),
+            extraction: ExtractionSection::default(),
         });
         assert_eq!(cfg.ephemeral.max_entries, 5);
     }
