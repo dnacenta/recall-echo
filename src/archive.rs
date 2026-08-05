@@ -494,7 +494,13 @@ pub fn archive_all_with_base(base: &Path) -> Result<(), RecallError> {
     Ok(())
 }
 
-fn collect_archived_sessions(conversations_dir: &Path) -> std::collections::HashSet<String> {
+/// Session ids that already have an archive in `conversations/`.
+///
+/// The archives themselves are the record of what has been captured — there is
+/// no separate ledger to fall out of step with them. Every importer checks this
+/// set before parsing anything, which is what makes re-running an import safe.
+#[must_use]
+pub fn collect_archived_sessions(conversations_dir: &Path) -> std::collections::HashSet<String> {
     let mut sessions = std::collections::HashSet::new();
     if let Ok(entries) = fs::read_dir(conversations_dir) {
         for entry in entries.flatten() {

@@ -168,7 +168,10 @@ pub fn extract_topics(conv: &Conversation, max: usize) -> Vec<String> {
                 .unwrap_or(input_summary)
                 .trim_matches('`')
                 .to_lowercase();
-            if target.len() >= 3 && !target.contains('(') {
+            // A tool whose arguments are a JSON object or a snippet of code has
+            // no "target" to boost — taking one anyway makes the whole blob a
+            // topic. Paths and bare commands do; those are what this boosts.
+            if target.len() >= 3 && !target.contains(['(', '{', '}', '"']) {
                 let stem = target.split('.').next().unwrap_or(&target);
                 if !stem.is_empty() {
                     *freq.entry(stem.to_string()).or_default() += 2;
@@ -421,6 +424,25 @@ mod tests {
         let topics = extract_topics(&conv, 5);
         assert!(!topics.is_empty());
         assert!(topics.iter().any(|t| t.contains("auth")));
+    }
+
+    /// Codex and Grok record tool arguments as JSON. Boosting that as a topic
+    /// would file the conversation under `{"command":"ls -la"}`.
+    #[test]
+    fn structured_tool_arguments_are_not_topics() {
+        let conv = make_conv(vec![
+            ConversationEntry::UserMessage("check the socket permissions".to_string()),
+            ConversationEntry::ToolUse {
+                name: "run_terminal_command".to_string(),
+                input_summary: r#"{"command":"ls -la","description":"List files"}"#.to_string(),
+            },
+        ]);
+        let topics = extract_topics(&conv, 5);
+        assert!(
+            topics.iter().all(|topic| !topic.contains('{')),
+            "{topics:?}"
+        );
+        assert!(topics.contains(&"socket".to_string()), "{topics:?}");
     }
 
     #[test]

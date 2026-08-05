@@ -4,26 +4,32 @@
 
 //! LLM providers implementing crate::graph::LlmProvider.
 //!
-//! Three backends:
-//! - **Anthropic** — Claude API via HTTP (x-api-key)
-//! - **OpenAI-compat** — Ollama / any OpenAI-compatible endpoint via HTTP
-//! - **Claude Code** — Spawns `claude -p` subprocess (no API key needed)
+//! Two families:
+//! - **HTTP** — Anthropic (x-api-key) or any OpenAI-compatible endpoint,
+//!   Ollama included. Billed per token, or free when the endpoint is local.
+//! - **Agent CLI** — spawns the tool the user already subscribes to
+//!   (`claude`, `gemini`, `grok`, `codex`, or anything described in
+//!   `[llm.cli]`). No API key, no per-token billing. See
+//!   [`crate::cli_provider`].
 //!
 //! Provider/model/api_base loaded from `.recall-echo.toml` config.
 //! API keys read from environment variables (never stored in config).
 
 use std::env;
 use std::path::Path;
-use std::process::Stdio;
 
 use crate::graph::error::GraphError;
 use crate::graph::llm::LlmProvider;
 
+use crate::cli_provider::{CliProvider, CliSpec};
 use crate::config::{self, Provider};
 
 // ── Factory ──────────────────────────────────────────────────────────────
 
 /// Create the appropriate LlmProvider from config, with optional CLI overrides.
+///
+/// Returns the provider and the model name it settled on (empty when the CLI
+/// picks its own default).
 pub fn create_provider(
     memory_dir: &Path,
     provider_override: Option<&str>,
@@ -38,39 +44,38 @@ pub fn create_provider(
         cfg.model = m.to_string();
     }
 
-    match cfg.provider {
-        Provider::ClaudeCode => {
-            let model = if cfg.model.is_empty() {
-                model_override.unwrap_or("sonnet").to_string()
-            } else {
-                cfg.model.clone()
-            };
-            let provider = ClaudeCodeProvider::new(model.clone());
-            Ok((Box::new(provider), model))
-        }
-        Provider::Anthropic | Provider::Openai => {
-            let config = HttpConfig::from_config_section(&cfg)?;
-            let model = config.model.clone();
-            let provider = HttpLlmProvider::new(config);
-            Ok((Box::new(provider), model))
-        }
+    if cfg.provider.is_cli() {
+        let spec = CliSpec::resolve(&cfg.provider, &cfg.cli)?;
+        let model = spec.resolve_model(&cfg.model);
+        let provider = CliProvider::new(spec, model.clone());
+        return Ok((Box::new(provider), model));
     }
+
+    let config = HttpConfig::from_config_section(&cfg)?;
+    let model = config.model.clone();
+    let provider = HttpLlmProvider::new(config);
+    Ok((Box::new(provider), model))
 }
 
 // ── Claude Code provider (subprocess) ────────────────────────────────────
 
 /// LLM provider that shells out to `claude -p` for completions.
 /// No API key needed — uses the user's Claude Code subscription.
+///
+/// A thin front for [`CliProvider`] on the `claude-code` preset, which builds
+/// the same argv this type always built.
 pub struct ClaudeCodeProvider {
-    model: String,
-    claude_bin: String,
+    inner: CliProvider,
 }
 
 impl ClaudeCodeProvider {
+    #[must_use]
     pub fn new(model: String) -> Self {
-        // Find claude binary
-        let claude_bin = env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-        Self { model, claude_bin }
+        let spec = CliSpec::preset(config::CliPreset::ClaudeCode);
+        let model = spec.resolve_model(&model);
+        Self {
+            inner: CliProvider::new(spec, model),
+        }
     }
 }
 
@@ -80,56 +85,11 @@ impl LlmProvider for ClaudeCodeProvider {
         &self,
         system_prompt: &str,
         user_message: &str,
-        _max_tokens: u32,
+        max_tokens: u32,
     ) -> Result<String, GraphError> {
-        let mut cmd = tokio::process::Command::new(&self.claude_bin);
-        cmd.arg("-p")
-            .arg("--model")
-            .arg(&self.model)
-            .arg("--output-format")
-            .arg("text")
-            .arg("--system-prompt")
-            .arg(system_prompt)
-            .arg("--no-session-persistence")
-            .env_remove("CLAUDECODE") // Allow spawning from within a Claude Code session
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| GraphError::Llm(format!("failed to spawn claude: {e}")))?;
-
-        // Write user message to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(user_message.as_bytes())
-                .await
-                .map_err(|e| GraphError::Llm(format!("write to claude stdin: {e}")))?;
-            drop(stdin);
-        }
-
-        let output = child
-            .wait_with_output()
+        self.inner
+            .complete(system_prompt, user_message, max_tokens)
             .await
-            .map_err(|e| GraphError::Llm(format!("claude process failed: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GraphError::Llm(format!(
-                "claude -p exited {}: {}",
-                output.status,
-                truncate_str(&stderr, 300)
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        if stdout.trim().is_empty() {
-            return Err(GraphError::Llm("claude -p returned empty output".into()));
-        }
-
-        Ok(stdout)
     }
 }
 
@@ -158,13 +118,13 @@ impl HttpConfig {
     pub fn from_config_section(
         llm: &config::LlmSection,
     ) -> Result<Self, crate::error::RecallError> {
-        let api_style = match llm.provider {
+        let api_style = match &llm.provider {
             Provider::Anthropic => ApiStyle::Anthropic,
             Provider::Openai => ApiStyle::OpenAiCompat,
-            Provider::ClaudeCode => {
-                return Err(crate::error::RecallError::Config(
-                    "Use create_provider() for claude-code provider".into(),
-                ))
+            other => {
+                return Err(crate::error::RecallError::Config(format!(
+                    "provider {other} spawns a CLI — use create_provider()"
+                )))
             }
         };
 
