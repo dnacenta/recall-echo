@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use recall_echo::error::RecallError;
+use recall_echo::graph::edge_view::EdgeView;
+use recall_echo::graph::inspect::{ConfidenceSummary, KnownEntity, MemoryOverview, TypeGroup};
 use recall_echo::graph::types::{
     EntityDetail, EntitySummary, EntityType, Episode, EpisodeSearchResult, GraphStats, MatchSource,
     QueryResult, ScoredEntity, TraversalEdge, TraversalNode,
@@ -78,14 +80,57 @@ fn canned_payload(request: &Request) -> Value {
         .unwrap(),
         Request::SearchEpisodes(_) => json!([episode()]),
         Request::Traverse(_) => serde_json::to_value(traversal_tree()).unwrap(),
-        Request::Status => serde_json::to_value(GraphStats {
-            entity_count: 12,
-            relationship_count: 30,
-            episode_count: 400,
-            entity_type_counts: HashMap::from([("project".to_string(), 7)]),
-        })
-        .unwrap(),
+        Request::Status => serde_json::to_value(graph_stats()).unwrap(),
+        Request::Overview(_) => serde_json::to_value(memory_overview()).unwrap(),
         other => panic!("no MCP tool builds a {} request", other.op_name()),
+    }
+}
+
+fn graph_stats() -> GraphStats {
+    GraphStats {
+        entity_count: 12,
+        relationship_count: 30,
+        episode_count: 400,
+        entity_type_counts: HashMap::from([("project".to_string(), 7)]),
+    }
+}
+
+fn memory_overview() -> MemoryOverview {
+    MemoryOverview {
+        stats: graph_stats(),
+        groups: vec![TypeGroup {
+            entity_type: "project".into(),
+            count: 7,
+            top: vec![KnownEntity {
+                id: "entity:recall-echo".into(),
+                name: "recall-echo".into(),
+                entity_type: "project".into(),
+                abstract_text: "Persistent memory system with a knowledge graph.".into(),
+                access_count: 12,
+                utility_score: 0.81,
+            }],
+        }],
+        confidence: ConfidenceSummary {
+            strong: 20,
+            uncertain: 7,
+            doubtful: 3,
+        },
+        uncertain: vec![edge_view("PREFERS", 0.31, 0)],
+        self_reinforced: vec![edge_view("USES", 0.88, 23)],
+    }
+}
+
+fn edge_view(rel_type: &str, confidence: f64, self_reinforcements: i64) -> EdgeView {
+    EdgeView {
+        id: format!("relates_to:{rel_type}"),
+        from: "Echo".into(),
+        to: "NixOS".into(),
+        rel_type: rel_type.into(),
+        description: None,
+        confidence,
+        evidence: 14.0,
+        self_reinforcements,
+        superseded: false,
     }
 }
 
@@ -324,6 +369,7 @@ async fn tools_list_describes_every_tool() {
             "recall_search",
             "recall_episodes",
             "recall_traverse",
+            "recall_overview",
             "recall_status"
         ]
     );
@@ -383,7 +429,7 @@ async fn every_advertised_tool_can_be_called() {
         let name = tool["name"].as_str().unwrap();
         let arguments = match name {
             "recall_traverse" => json!({ "entity": "Rust" }),
-            "recall_status" => json!({}),
+            "recall_status" | "recall_overview" => json!({}),
             _ => json!({ "query": "release pipeline" }),
         };
         let response = answer(&server, call(9, name, arguments)).await;
@@ -486,6 +532,45 @@ async fn recall_status_reports_counts() {
     assert!(text.contains("12 entities"), "{text}");
     assert!(text.contains("400 conversation episodes"), "{text}");
     assert!(text.contains("project 7"), "{text}");
+}
+
+#[tokio::test]
+async fn recall_overview_reports_the_content_and_its_uncertainty() {
+    let server = server(Outcome::Canned);
+    let response = answer(&server, call(1, "recall_overview", json!({}))).await;
+    let text = text_of(&response["result"]);
+
+    // The content, not just the counts recall_status already gives.
+    assert!(text.contains("project (7)"), "{text}");
+    assert!(text.contains("recall-echo"), "{text}");
+    // And an honest account of how much of it is settled.
+    assert!(
+        text.contains("20 of 30 relationships firmly held"),
+        "{text}"
+    );
+    assert!(text.contains("Least certain"), "{text}");
+    assert!(
+        text.contains("Echo —[USES]→ NixOS (88%, self×23)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("kept out of the confidence above"),
+        "the tally means nothing without the explanation: {text}"
+    );
+}
+
+#[tokio::test]
+async fn recall_overview_takes_no_arguments_and_tolerates_any() {
+    let server = server(Outcome::Canned);
+    let response = answer(&server, call(1, "recall_overview", json!({ "noise": 1 }))).await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(
+        server.backend_calls(),
+        vec![Request::Overview(recall_echo::serve::OverviewArgs {
+            per_type: 0
+        })],
+        "the daemon's own default listing size is the right one"
+    );
 }
 
 #[tokio::test]
@@ -740,7 +825,7 @@ async fn no_tool_can_write_to_the_graph() {
         let name = tool["name"].as_str().unwrap();
         let arguments = match name {
             "recall_traverse" => json!({ "entity": "Rust" }),
-            "recall_status" => json!({}),
+            "recall_status" | "recall_overview" => json!({}),
             _ => json!({ "query": "anything" }),
         };
         answer(&server, call(2, name, arguments)).await;

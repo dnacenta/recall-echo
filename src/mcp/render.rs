@@ -18,6 +18,8 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
+use crate::graph::edge_view::EdgeView;
+use crate::graph::inspect::{MemoryOverview, DOUBTFUL_CONFIDENCE, STRONG_CONFIDENCE};
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::{
     EntityDetail, EpisodeSearchResult, GraphStats, MatchSource, QueryResult, ScoredEntity,
@@ -194,6 +196,116 @@ pub fn status(stats: &GraphStats) -> String {
     }
 
     budget(out)
+}
+
+/// What memory holds, unprompted.
+///
+/// The uncertainty is the point. An agent reading this should be able to tell
+/// a settled fact from one the graph is holding onto out of habit, and say so
+/// to the user instead of presenting both the same way.
+#[must_use]
+pub fn overview(overview: &MemoryOverview) -> String {
+    let stats = &overview.stats;
+    if stats.entity_count == 0 && stats.episode_count == 0 {
+        return "Memory is empty: no sessions have been ingested, so there is nothing known \
+                about this user or their work yet.\n"
+            .to_string();
+    }
+
+    let mut out = format!(
+        "Memory holds {} {}, {} {} and {} conversation {}.\n",
+        stats.entity_count,
+        plural(stats.entity_count as usize, "entity", "entities"),
+        stats.relationship_count,
+        plural(
+            stats.relationship_count as usize,
+            "relationship",
+            "relationships"
+        ),
+        stats.episode_count,
+        plural(stats.episode_count as usize, "episode", "episodes"),
+    );
+
+    if stats.entity_count == 0 {
+        out.push_str(
+            "Nothing has been distilled from those conversations yet, so only recall_episodes \
+             will find anything.\n",
+        );
+        return budget(out);
+    }
+
+    for group in &overview.groups {
+        let _ = writeln!(out, "\n{} ({}):", group.entity_type, group.count);
+        for entity in &group.top {
+            let _ = writeln!(
+                out,
+                "- {} — {}",
+                entity.name,
+                clip(&entity.abstract_text, MAX_ABSTRACT_CHARS)
+            );
+        }
+        let listed = group.top.len() as u64;
+        if group.count > listed {
+            let _ = writeln!(out, "- … and {} more", group.count - listed);
+        }
+    }
+
+    let confidence = &overview.confidence;
+    if confidence.total() == 0 {
+        out.push_str(
+            "\nNo relationships are recorded: these entities are known but unconnected.\n",
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\nConfidence: {} of {} relationships firmly held (at or above {:.0}%), {} uncertain, \
+             {} doubtful (below {:.0}%).",
+            confidence.strong,
+            confidence.total(),
+            STRONG_CONFIDENCE * 100.0,
+            confidence.uncertain,
+            confidence.doubtful,
+            DOUBTFUL_CONFIDENCE * 100.0,
+        );
+    }
+
+    write_edge_list(
+        &mut out,
+        "Least certain",
+        &overview.uncertain,
+        "Treat these as open questions rather than facts.",
+    );
+    write_edge_list(
+        &mut out,
+        "Resting on repetition",
+        &overview.self_reinforced,
+        "self×N counts corroborations the agent authored itself. That tally is deliberately \
+         kept out of the confidence above, so a high one means the belief rests on being \
+         restated rather than on independent evidence — say so rather than asserting it.",
+    );
+
+    budget(out)
+}
+
+fn write_edge_list(out: &mut String, heading: &str, edges: &[EdgeView], note: &str) {
+    if edges.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n{heading}:");
+    for edge in edges {
+        let coherence = if edge.self_reinforcements > 0 {
+            format!(", self×{}", edge.self_reinforcements)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "- {} ({:.0}%{coherence})",
+            edge.arrow(),
+            edge.confidence * 100.0
+        );
+    }
+    let _ = writeln!(out, "{note}");
 }
 
 // ── Pieces ───────────────────────────────────────────────────────────────

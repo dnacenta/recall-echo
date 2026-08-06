@@ -8,13 +8,16 @@
 //! Used by recall-echo (pulse-null entities) and recall-claude (Claude Code users).
 
 pub mod confidence;
+pub mod correct;
 pub mod crud;
 pub mod dedup;
+pub mod edge_view;
 pub mod embed;
 pub mod error;
 pub mod extract;
 pub mod gc;
 pub mod ingest;
+pub mod inspect;
 pub mod llm;
 pub mod pipeline;
 pub mod pipeline_sync;
@@ -318,6 +321,38 @@ impl GraphMemory {
         evidence: confidence::EdgeEvidence,
     ) -> Result<(), GraphError> {
         crud::reinforce_relationship(&self.db, rel_id, evidence).await
+    }
+
+    // --- Human correction ---
+
+    /// Apply a human correction, or report why it was refused.
+    ///
+    /// Contradiction enters the Bayesian model as an observation at
+    /// [`Provenance::User`] weight rather than overwriting a number — see
+    /// [`correct`] for why, and for what correcting an *entity* means.
+    pub async fn correct(
+        &self,
+        target: &correct::CorrectTarget,
+        correction: correct::Correction,
+    ) -> Result<correct::CorrectionReport, GraphError> {
+        correct::correct(&self.db, &self.provenance, target, correction).await
+    }
+
+    // --- Inspection ---
+
+    /// Summarise what the graph holds, listing `per_type` entities of each type.
+    pub async fn overview(&self, per_type: usize) -> Result<inspect::MemoryOverview, GraphError> {
+        let stats = self.stats().await?;
+        inspect::overview(&self.db, stats, per_type).await
+    }
+
+    /// What the graph holds about one subject, over the ordinary hybrid query.
+    pub async fn about(
+        &self,
+        topic: &str,
+        limit: usize,
+    ) -> Result<inspect::TopicReport, GraphError> {
+        inspect::about(&self.db, self.embedder.get()?, &self.scoring, topic, limit).await
     }
 
     // --- Episodes ---

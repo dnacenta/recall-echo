@@ -30,6 +30,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::error::RecallError;
+use crate::graph::correct::{CorrectTarget, Correction};
 use crate::graph::error::GraphError;
 use crate::graph::types::{
     EntityType, NewEntity, NewRelationship, PipelineDocuments, QueryOptions, SearchOptions,
@@ -55,6 +56,11 @@ const MAX_LIMIT: usize = 1000;
 /// Deepest graph expansion a request may ask for. Expansion is exponential in
 /// the branching factor.
 const MAX_DEPTH: u32 = 8;
+/// Entities an overview lists per type when the client does not say.
+const DEFAULT_PER_TYPE: usize = 3;
+/// Most entities an overview will list per type. An overview a person cannot
+/// read in ten seconds is not an overview.
+const MAX_PER_TYPE: usize = 20;
 /// How long the daemon waits for its own store to close before giving up and
 /// unlinking the socket anyway.
 const STORE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -92,6 +98,12 @@ pub enum Request {
     SyncPipeline(SyncPipelineArgs),
     /// Apply an outcome to the entities a session touched.
     Feedback(FeedbackArgs),
+    /// Tell memory that something it learned is wrong.
+    Correct(CorrectArgs),
+    /// Summarise what the graph holds.
+    Overview(OverviewArgs),
+    /// Summarise what the graph holds about one subject.
+    About(AboutArgs),
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -112,6 +124,9 @@ impl Request {
             Request::IngestArchive(_) => "ingest_archive",
             Request::SyncPipeline(_) => "sync_pipeline",
             Request::Feedback(_) => "feedback",
+            Request::Correct(_) => "correct",
+            Request::Overview(_) => "overview",
+            Request::About(_) => "about",
             Request::Shutdown => "shutdown",
         }
     }
@@ -135,8 +150,15 @@ impl Request {
             | Request::SyncPipeline(_)
             // Outcome records replace per (entity, session) — reruns correct.
             | Request::Feedback(_)
+            | Request::Overview(_)
+            | Request::About(_)
             | Request::Shutdown => true,
-            Request::AddEntity(_) | Request::Relate(_) | Request::IngestArchive(_) => false,
+            // A repeated contradiction is a second observation, not the same
+            // one: replaying it would record evidence the human never gave.
+            Request::AddEntity(_)
+            | Request::Relate(_)
+            | Request::IngestArchive(_)
+            | Request::Correct(_) => false,
         }
     }
 }
@@ -222,6 +244,28 @@ pub struct SyncPipelineArgs {
 pub struct FeedbackArgs {
     pub session_id: String,
     pub outcome: OutcomeKind,
+}
+
+/// One human correction: what it is aimed at, and what to do to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrectArgs {
+    pub target: CorrectTarget,
+    pub correction: Correction,
+}
+
+/// How much of the graph an overview lists per entity type. Absent — the shape
+/// a client that does not care sends — takes the default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverviewArgs {
+    #[serde(default)]
+    pub per_type: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AboutArgs {
+    pub topic: String,
+    #[serde(default)]
+    pub limit: usize,
 }
 
 /// A daemon response. Wire form is `{"ok": true, "data": ...}` or
@@ -372,6 +416,15 @@ fn clamp_depth(depth: u32) -> u32 {
     depth.clamp(1, MAX_DEPTH)
 }
 
+/// Clamp a wire-supplied per-type listing size. Zero — what a client that
+/// omits the field sends — means "take the default".
+fn clamp_per_type(per_type: usize) -> usize {
+    if per_type == 0 {
+        return DEFAULT_PER_TYPE;
+    }
+    per_type.clamp(1, MAX_PER_TYPE)
+}
+
 /// `Ok(None)` means "not a graph operation".
 async fn execute_graph(
     graph: &GraphMemory,
@@ -467,6 +520,15 @@ async fn execute_graph(
                 .record_session_outcome(&args.session_id, args.outcome)
                 .await?,
         )?,
+        Request::Correct(args) => {
+            serde_json::to_value(graph.correct(&args.target, args.correction).await?)?
+        }
+        Request::Overview(args) => {
+            serde_json::to_value(graph.overview(clamp_per_type(args.per_type)).await?)?
+        }
+        Request::About(args) => {
+            serde_json::to_value(graph.about(&args.topic, clamp_limit(args.limit)).await?)?
+        }
     };
     Ok(Some(data))
 }
@@ -1437,6 +1499,23 @@ mod tests {
                 session_id: "s1".into(),
                 outcome: OutcomeKind::Success,
             }),
+            Request::Correct(CorrectArgs {
+                target: CorrectTarget::Edge {
+                    from: "D".into(),
+                    rel_type: "USES".into(),
+                    to: "Vim".into(),
+                },
+                correction: Correction::Wrong { all_edges: false },
+            }),
+            Request::Correct(CorrectArgs {
+                target: CorrectTarget::Entity { name: "Vim".into() },
+                correction: Correction::Forget { confirmed: true },
+            }),
+            Request::Overview(OverviewArgs { per_type: 3 }),
+            Request::About(AboutArgs {
+                topic: "rust".into(),
+                limit: 5,
+            }),
             Request::Shutdown,
         ];
 
@@ -1733,6 +1812,57 @@ mod tests {
         // and asks SurrealDB for an unbounded scan.
         assert_eq!(clamp_limit(usize::MAX), MAX_LIMIT);
         assert_eq!(clamp_limit(0), 1);
+    }
+
+    /// A correction is an observation. Replaying one because a connection
+    /// dropped would record evidence the human never gave.
+    #[test]
+    fn a_correction_is_never_replayed() {
+        assert!(!Request::Correct(CorrectArgs {
+            target: CorrectTarget::Entity { name: "Vim".into() },
+            correction: Correction::Wrong { all_edges: false },
+        })
+        .is_retryable());
+        assert!(Request::Overview(OverviewArgs { per_type: 0 }).is_retryable());
+        assert!(Request::About(AboutArgs {
+            topic: "rust".into(),
+            limit: 0,
+        })
+        .is_retryable());
+    }
+
+    /// The shape a client that does not care about listing size sends.
+    #[test]
+    fn inspection_args_may_be_omitted_on_the_wire() {
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"overview","args":{}}"#).unwrap(),
+            Request::Overview(OverviewArgs { per_type: 0 })
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"about","args":{"topic":"rust"}}"#).unwrap(),
+            Request::About(AboutArgs {
+                topic: "rust".into(),
+                limit: 0,
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"op":"correct","args":{"target":{"kind":"entity","name":"Vim"},
+                    "correction":{"kind":"wrong"}}}"#
+            )
+            .unwrap(),
+            Request::Correct(CorrectArgs {
+                target: CorrectTarget::Entity { name: "Vim".into() },
+                correction: Correction::Wrong { all_edges: false },
+            })
+        );
+    }
+
+    #[test]
+    fn an_absent_per_type_takes_the_default() {
+        assert_eq!(clamp_per_type(0), DEFAULT_PER_TYPE);
+        assert_eq!(clamp_per_type(5), 5);
+        assert_eq!(clamp_per_type(usize::MAX), MAX_PER_TYPE);
     }
 
     #[test]

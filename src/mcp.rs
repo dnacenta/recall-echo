@@ -32,6 +32,13 @@
 //! the mechanism that keeps self-generated claims from becoming evidence.
 //! Writing stays on the ingest path, where every episode is stamped with its
 //! authorship.
+//!
+//! That applies to correction too, and for the same reason inverted:
+//! `graph correct` enters a contradiction at *user* authority, which is only
+//! true while a human is the one typing it. A model calling a correction tool
+//! would be recording its own judgement as the human's — the loudest possible
+//! version of the failure provenance weighting exists to prevent. Corrections
+//! stay on the CLI.
 
 pub mod render;
 pub mod tools;
@@ -43,6 +50,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::RecallError;
+use crate::graph::inspect::MemoryOverview;
 use crate::graph::types::{
     EpisodeSearchResult, GraphStats, QueryResult, ScoredEntity, TraversalNode,
 };
@@ -410,6 +418,10 @@ fn render(request: &Request, data: Value) -> Result<String, serde_json::Error> {
         Request::Status => {
             let stats: GraphStats = serde_json::from_value(data)?;
             render::status(&stats)
+        }
+        Request::Overview(_) => {
+            let overview: MemoryOverview = serde_json::from_value(data)?;
+            render::overview(&overview)
         }
         // No tool builds any other request; a payload we cannot name is
         // still better returned than dropped.

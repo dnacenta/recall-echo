@@ -113,6 +113,18 @@ enum Commands {
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
+    /// Show what memory holds — everything, or one subject
+    WhatDoYouKnow {
+        /// Narrow it to one subject
+        #[arg(long = "about", value_name = "TOPIC")]
+        about: Option<String>,
+        /// Entities listed per type (or results, with --about)
+        #[arg(long, default_value = "3")]
+        limit: usize,
+        /// Entity root directory (defaults to current directory)
+        #[arg(long)]
+        entity_root: Option<PathBuf>,
+    },
     /// Knowledge graph operations
     Graph {
         #[command(subcommand)]
@@ -382,6 +394,31 @@ enum GraphCommands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Tell memory that something it learned is wrong
+    ///
+    /// `--wrong` records contradicting evidence at your authority, which is how
+    /// confidence is supposed to move. `--forget` removes outright and leaves
+    /// no trace — prefer `--wrong` unless the memory should never have existed.
+    Correct {
+        /// Entity name, or the source entity of a relationship
+        subject: String,
+        /// Relationship type — with a target, corrects that one relationship
+        rel_type: Option<String>,
+        /// Target entity of the relationship
+        object: Option<String>,
+        /// Record that it is mistaken: confidence falls with real evidence
+        #[arg(long)]
+        wrong: bool,
+        /// Remove it and its relationships outright
+        #[arg(long)]
+        forget: bool,
+        /// With --wrong on an entity: contradict every one of its relationships
+        #[arg(long)]
+        all_edges: bool,
+        /// Skip the confirmation --forget otherwise requires
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show relationship decay report — stored vs effective confidence
     DecayReport {
         /// Show only relationships for a specific entity
@@ -502,6 +539,22 @@ fn main() {
             client_runtime()
                 .map_err(recall_echo::error::RecallError::from)
                 .and_then(|rt| rt.block_on(recall_echo::mcp::run(&memory_dir)))
+        }
+        Some(Commands::WhatDoYouKnow {
+            about,
+            limit,
+            entity_root,
+        }) => {
+            let memory_dir = resolve_entity_root(entity_root).join("memory");
+            client_runtime()
+                .map_err(recall_echo::error::RecallError::from)
+                .and_then(|rt| {
+                    rt.block_on(recall_echo::inspect_cli::run(
+                        &memory_dir,
+                        about.as_deref(),
+                        limit,
+                    ))
+                })
         }
         Some(Commands::Graph {
             command,
@@ -674,6 +727,26 @@ fn main() {
                                 }
                                 DaemonCommands::Stop => graph_cli::daemon_stop(&memory_dir).await,
                             },
+                            GraphCommands::Correct {
+                                subject,
+                                rel_type,
+                                object,
+                                wrong,
+                                forget,
+                                all_edges,
+                                yes,
+                            } => {
+                                let options = graph_cli::CorrectOptions {
+                                    subject,
+                                    rel_type,
+                                    object,
+                                    wrong,
+                                    forget,
+                                    all_edges,
+                                    yes,
+                                };
+                                graph_cli::correct(&memory_dir, &options).await
+                            }
                             GraphCommands::DecayReport { entity, all } => {
                                 graph_cli::decay_report(&memory_dir, entity.as_deref(), all).await
                             }

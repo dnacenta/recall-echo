@@ -41,10 +41,19 @@ On a LongMemEval subset it went from answering **0 of 9** questions correctly to
 When you *do* want to poke at it:
 
 ```bash
+recall-echo what-do-you-know            # everything it thinks it knows, and how sure it is
+recall-echo what-do-you-know --about D  # …on one subject
 recall-echo status                      # is it healthy, what has it got
 recall-echo search "deployment"         # grep your conversation history
 recall-echo graph query "auth flow"     # semantic search + related entities
 recall-echo graph traverse "recall-echo" # what's connected to what, with confidence
+```
+
+And when it has something wrong — which it will — you tell it so:
+
+```bash
+recall-echo graph correct "D" "USES" "Vim" --wrong   # that claim is mistaken
+recall-echo graph correct "Vim" --forget             # that memory should not exist
 ```
 
 And from inside your agent, once the MCP server is registered, it asks for itself:
@@ -127,6 +136,11 @@ recall-echo graph status                        # Show graph statistics
 recall-echo graph search <query>                # Semantic search across entities
 recall-echo graph query <query>                 # Hybrid: semantic + graph expansion + episodes
 recall-echo graph traverse <entity>             # Graph traversal from entity (shows confidence)
+
+# Reading and correcting it
+recall-echo what-do-you-know                    # What memory holds, and how sure it is
+recall-echo graph correct <from> <REL> <to> --wrong   # That claim is mistaken
+recall-echo graph correct <entity> --forget           # Remove it outright (asks first)
 
 # Data management
 recall-echo graph add-entity --name <n> --type <t> --abstract <a>   # Add entity manually
@@ -302,6 +316,20 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph ingest-all` — Scan conversations/ and ingest all un-ingested archives.
 - `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (any name from [LLM providers](#llm-providers)), `--delay-ms`. The daemon runs this pass on its own once the machine is quiet (see [Background extraction](#background-extraction)); this command is how you run it *now*, or in `server` mode, or after changing the model.
 
+**Correction:**
+
+- `graph correct <entity> --wrong` — Record that what memory claims about an entity is mistaken. Claims live on relationships, so this contradicts the entity's relationship — and if it has several, it lists them and asks which rather than guessing. `--all-edges` contradicts every one of them deliberately.
+- `graph correct <from> <REL> <to> --wrong` — Contradict one specific claim. Direction does not have to match how the graph stored it.
+- `graph correct <name> --forget` — Remove an entity and its relationships, or with a `<from> <REL> <to>` triple, one relationship. Prints what would go and asks before doing it; `--yes` skips the prompt, and a non-interactive stdin is never taken as consent.
+
+A correction is *evidence*, not an override. `--wrong` records one contradicting
+observation at your authority ([`weight_user`](#configuration), 0.8 by default) and
+lets the Beta posterior move: a claim resting on twenty independent
+observations survives one correction with reduced confidence, a claim resting
+on one collapses. Say it twice and it counts twice. `--forget` is the escape
+hatch for memory that should not exist at all — it leaves no trace and cannot
+be re-weighed, so prefer `--wrong`.
+
 **Daemon:**
 
 - `graph daemon status` — Socket path, pid, version and uptime of the daemon serving this graph.
@@ -314,6 +342,27 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph pipeline flow <entity>` — Trace an entity's lineage through the pipeline stages.
 - `graph pipeline stale` — List stale pipeline entities. Supports `--days` (threshold, default 7).
 - `graph vigil-sync` — Sync vigil-pulse metacognitive signals and caliber outcomes into the graph as Measurement and Outcome entities. Supports `--signals-path` and `--outcomes-path`.
+
+### `recall-echo what-do-you-know`
+
+What memory actually holds, written for a person rather than a program.
+
+```bash
+recall-echo what-do-you-know                 # everything, grouped by entity type
+recall-echo what-do-you-know --about "rust"  # one subject, with its relationships
+recall-echo what-do-you-know --limit 5       # entities listed per type (default 3)
+```
+
+Without `--about` it lists the strongest entities of each type, then how firmly
+the relationships between them are held, then the two things a confidence
+number cannot tell you on its own: which relationships it is least sure of, and
+which ones it believes largely because it kept repeating them (`self×N` — the
+coherence tally, deliberately kept out of confidence). With `--about` it runs
+the ordinary hybrid query and renders each hit with the claims it takes part in
+and how sure it is of each.
+
+Everything it prints ends in the same place: if a line is wrong, `graph correct`
+is how you say so.
 
 ### `recall-echo serve`
 
@@ -367,7 +416,7 @@ Or, equivalently, in a project's `.mcp.json`:
 `--entity-root` defaults to the current directory, so it can be omitted when
 the client is launched from the entity root.
 
-**Tools.** All five are read-only; none can write to the graph.
+**Tools.** All six are read-only; none can write to the graph.
 
 | Tool | Answers |
 | --- | --- |
@@ -375,6 +424,7 @@ the client is launched from the entity root.
 | `recall_search` | Semantic entity search alone — names, types, abstracts, retrieval scores |
 | `recall_episodes` | The raw conversation fragments, for what was actually said |
 | `recall_traverse` | Relationships out of one named entity, as a tree with edge confidence |
+| `recall_overview` | What memory holds without being asked for anything in particular — the content, and where it is unsure |
 | `recall_status` | Entity, relationship and episode counts — tells an empty memory from a failed lookup |
 
 Every tool runs through the same graph daemon as the CLI, so it inherits the
@@ -386,6 +436,11 @@ about itself (`[graph.provenance]`), and a tool that let the model create
 entities and edges directly would route around exactly that mechanism. Memory
 is written on the ingest path, where every episode is stamped with its
 authorship.
+
+**So is correction.** `graph correct` enters a contradiction at *user*
+authority, which is only true while a human is the one typing it — a model
+calling a correction tool would be recording its own judgement as yours.
+Corrections stay on the CLI.
 
 ## Archive Format
 

@@ -309,6 +309,41 @@ pub async fn reinforce_relationship(
     Ok(())
 }
 
+/// Persist updated evidence for a relationship **without** restarting its
+/// decay clock.
+///
+/// The write path for contradiction. [`reinforce_relationship`] sets
+/// `last_reinforced = now`, which is right for corroboration — the belief was
+/// just observed again, so it should stop decaying. Applying that to a
+/// contradiction would let "this is wrong" *raise* an edge's effective
+/// confidence: a stale edge stored at 0.6 and decayed to 0.3 would come back
+/// at 0.545 undecayed, more visible after the correction than before it.
+///
+/// Leaving the anchor alone makes the effect of a contradiction monotone: the
+/// posterior mean falls, and every decay already applied to it stays applied.
+pub async fn contradict_relationship(
+    db: &Surreal<Db>,
+    rel_id: &str,
+    evidence: EdgeEvidence,
+) -> Result<(), GraphError> {
+    let counts = evidence.evidence();
+    db.query(
+        r#"UPDATE type::record($id) SET
+               confidence = $confidence,
+               alpha = $alpha,
+               beta = $beta,
+               self_reinforcements = $self_reinforcements"#,
+    )
+    .bind(("id", rel_id.to_string()))
+    .bind(("confidence", counts.mean()))
+    .bind(("alpha", counts.alpha()))
+    .bind(("beta", counts.beta()))
+    .bind(("self_reinforcements", evidence.self_reinforcements()))
+    .await?
+    .check()?;
+    Ok(())
+}
+
 /// Supersede an existing relationship: set valid_until on the old one, create a new one.
 pub async fn supersede_relationship(
     db: &Surreal<Db>,
