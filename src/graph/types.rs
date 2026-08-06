@@ -250,7 +250,7 @@ impl EntitySummary {
 }
 
 /// L1 — Search result detail. Everything except content and embedding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntityDetail {
     pub id: serde_json::Value,
     pub name: String,
@@ -296,7 +296,7 @@ pub struct SearchOptions {
 }
 
 /// How an entity was found.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchSource {
     /// Found via semantic similarity.
@@ -431,7 +431,7 @@ impl EdgeRow {
 }
 
 /// Graph-level statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphStats {
     pub entity_count: u64,
     pub relationship_count: u64,

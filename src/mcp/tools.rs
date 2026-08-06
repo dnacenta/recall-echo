@@ -14,7 +14,9 @@
 
 use serde_json::{json, Value};
 
-use crate::serve::{QueryArgs, Request, SearchArgs, SearchEpisodesArgs, TraverseArgs};
+use crate::serve::{
+    OverviewArgs, QueryArgs, Request, SearchArgs, SearchEpisodesArgs, TraverseArgs,
+};
 
 /// Result limits an agent may ask for. The daemon clamps far higher; these
 /// bounds keep a single tool result inside a sane share of the context window.
@@ -56,6 +58,8 @@ pub enum Tool {
     Traverse,
     /// Episode (conversation-fragment) search.
     Episodes,
+    /// What memory holds, without being asked about anything in particular.
+    Overview,
     /// Graph counts.
     Status,
 }
@@ -64,11 +68,12 @@ pub enum Tool {
 ///
 /// The order is fixed: clients cache the tool list, and a stable order keeps
 /// their prompt caches warm.
-pub const ALL: [Tool; 5] = [
+pub const ALL: [Tool; 6] = [
     Tool::Query,
     Tool::Search,
     Tool::Episodes,
     Tool::Traverse,
+    Tool::Overview,
     Tool::Status,
 ];
 
@@ -87,6 +92,7 @@ impl Tool {
             Tool::Query => "recall_query",
             Tool::Traverse => "recall_traverse",
             Tool::Episodes => "recall_episodes",
+            Tool::Overview => "recall_overview",
             Tool::Status => "recall_status",
         }
     }
@@ -99,6 +105,7 @@ impl Tool {
             Tool::Query => "Recall from memory",
             Tool::Traverse => "Explore an entity's relationships",
             Tool::Episodes => "Search past conversations",
+            Tool::Overview => "What memory holds",
             Tool::Status => "Memory graph status",
         }
     }
@@ -147,6 +154,18 @@ impl Tool {
                  annotated with a percentage are ones the graph is not fully certain of — that \
                  number is accumulated Bayesian evidence, not a guess — and edges marked \
                  [superseded] describe something that was true once and no longer is."
+            }
+            Tool::Overview => {
+                "Read out what memory actually holds, without querying for anything in \
+                 particular: the strongest entities of each type, how firmly the relationships \
+                 between them are believed, the least certain of those relationships, and the \
+                 ones whose confidence rests largely on the agent having repeated itself. Use it \
+                 at the start of working with a user you have no context on, when the user asks \
+                 what you remember about them, or before assuming memory is empty. Unlike \
+                 recall_status, which only counts rows, this returns the content — and it is the \
+                 only tool that surfaces where memory is unsure, which is worth saying out loud \
+                 rather than presenting an uncertain fact as settled. Takes no arguments; ask \
+                 recall_query instead when you have a specific subject in mind."
             }
             Tool::Status => {
                 "Report the size and shape of the memory graph: how many entities, relationships \
@@ -232,7 +251,7 @@ impl Tool {
                 }),
                 &["entity"],
             ),
-            Tool::Status => json!({
+            Tool::Overview | Tool::Status => json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
@@ -283,6 +302,9 @@ impl Tool {
                     as u32,
                 type_filter: None,
             }),
+            // An overview an agent has to page through is not an overview:
+            // the daemon's default listing size is the right one, always.
+            Tool::Overview => Request::Overview(OverviewArgs { per_type: 0 }),
             Tool::Status => Request::Status,
         };
         Ok(request)

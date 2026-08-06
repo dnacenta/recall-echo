@@ -62,6 +62,10 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
         );
     }
 
+    show_capture_section(&cfg.capture);
+    show_extraction_section(&cfg.extraction);
+    show_serve_section(&cfg.serve);
+
     // Pipeline
     if let Some(ref pipeline) = cfg.pipeline {
         eprintln!("\n{BOLD}[pipeline]{RESET}");
@@ -76,6 +80,61 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
     }
 
     Ok(())
+}
+
+/// Which agent CLIs the daemon sweeps transcripts from.
+///
+/// Shown even at its defaults: "sessions are being imported from every CLI on
+/// this machine" is a thing a user debugging their setup needs to know, and it
+/// is invisible in a config file that never mentions it.
+fn show_capture_section(capture: &config::CaptureSection) {
+    eprintln!("\n{BOLD}[capture]{RESET}");
+    eprintln!("  enabled     = {}", capture.enabled);
+    let sources = match &capture.sources {
+        Some(sources) if !sources.is_empty() => sources
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "(every CLI with sessions on this machine)".to_string(),
+    };
+    eprintln!("  sources     = {sources}");
+    eprintln!(
+        "  settle_secs = {} {DIM}(a transcript must be this quiet to count as finished){RESET}",
+        capture.settle_secs
+    );
+}
+
+/// Background entity extraction inside the graph daemon.
+fn show_extraction_section(extraction: &config::ExtractionSection) {
+    eprintln!("\n{BOLD}[extraction]{RESET}");
+    eprintln!("  background_enabled = {}", extraction.background_enabled);
+    eprintln!(
+        "  idle_after_secs    = {} {DIM}(quiet period before a batch starts){RESET}",
+        extraction.idle_after_secs
+    );
+    eprintln!(
+        "  batch_size         = {} {DIM}(archives per batch){RESET}",
+        extraction.batch_size
+    );
+}
+
+/// Where the graph daemon listens and how long it lives.
+fn show_serve_section(serve: &config::ServeSection) {
+    eprintln!("\n{BOLD}[serve]{RESET}");
+    let socket = serve
+        .socket_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty());
+    match socket {
+        Some(path) => eprintln!("  socket_path       = {path}"),
+        None => eprintln!("  socket_path       = {DIM}(derived from the memory directory){RESET}"),
+    }
+    let idle = match serve.idle_timeout_secs {
+        0 => "0 (never idle-shuts-down)".to_string(),
+        secs => format!("{secs}"),
+    };
+    eprintln!("  idle_timeout_secs = {idle}");
 }
 
 /// Show the resolved agent-CLI call, so a misconfigured vendor is visible

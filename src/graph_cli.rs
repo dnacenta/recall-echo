@@ -7,11 +7,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::RecallError;
+use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport, EdgeCorrection, Removal};
+use crate::graph::edge_view::EdgeView;
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::*;
 use crate::graph::{IngestContext, Provenance};
 use crate::serve::{
-    AddEntityArgs, IngestArchiveArgs, QueryArgs, RelateArgs, Request, SearchArgs, TraverseArgs,
+    AddEntityArgs, CorrectArgs, IngestArchiveArgs, QueryArgs, RelateArgs, Request, SearchArgs,
+    TraverseArgs,
 };
 use crate::serve_client;
 
@@ -1255,6 +1258,324 @@ pub async fn feedback(
     }
 
     Ok(())
+}
+
+// ── Correction ───────────────────────────────────────────────────────────
+
+/// One `graph correct` invocation, as the flags were given.
+///
+/// A struct rather than seven positional arguments, and unvalidated on purpose:
+/// turning it into a [`CorrectTarget`] and a [`Correction`] is where the
+/// contradictory combinations are named and refused.
+#[derive(Debug, Clone)]
+pub struct CorrectOptions {
+    /// Entity name, or the source entity of a relationship.
+    pub subject: String,
+    /// Relationship type — only for a relationship target.
+    pub rel_type: Option<String>,
+    /// Target entity — only for a relationship target.
+    pub object: Option<String>,
+    /// Record contradicting evidence at user authority.
+    pub wrong: bool,
+    /// Remove outright.
+    pub forget: bool,
+    /// Contradict every relationship of an entity rather than being asked which.
+    pub all_edges: bool,
+    /// Skip the confirmation a removal otherwise requires.
+    pub yes: bool,
+}
+
+impl CorrectOptions {
+    /// What the correction is aimed at.
+    fn target(&self) -> Result<CorrectTarget, RecallError> {
+        match (&self.rel_type, &self.object) {
+            (None, None) => Ok(CorrectTarget::Entity {
+                name: self.subject.clone(),
+            }),
+            (Some(rel_type), Some(object)) => Ok(CorrectTarget::Edge {
+                from: self.subject.clone(),
+                rel_type: rel_type.clone(),
+                to: object.clone(),
+            }),
+            _ => Err(RecallError::Other(
+                "a relationship needs all three names: \
+                 `graph correct <from> <REL> <to> --wrong`"
+                    .into(),
+            )),
+        }
+    }
+
+    /// What to do to it.
+    fn correction(&self) -> Result<Correction, RecallError> {
+        match (self.wrong, self.forget) {
+            (true, false) => Ok(Correction::Wrong {
+                all_edges: self.all_edges,
+            }),
+            (false, true) => Ok(Correction::Forget { confirmed: false }),
+            (true, true) => Err(RecallError::Other(
+                "--wrong and --forget are different corrections; pass one".into(),
+            )),
+            (false, false) => Err(RecallError::Other(
+                "say what to do: --wrong records that it is mistaken (confidence falls with \
+                 evidence), --forget removes it outright"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// Tell memory that something it learned is wrong.
+///
+/// A hot operation: it goes through the daemon like search and ingest, so a
+/// correction lands while a session is still using the store.
+pub async fn correct(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
+    let target = options.target()?;
+    let report = send_correction(memory_dir, &target, options.correction()?).await?;
+
+    match report {
+        // A removal is planned before it is applied, so the human sees what
+        // goes before anything does.
+        CorrectionReport::Planned { removal } => {
+            print_removal_plan(&removal);
+            if !options.yes && !confirm_removal(&removal)? {
+                println!("{YELLOW}Nothing removed.{RESET}");
+                return Ok(());
+            }
+            let applied =
+                send_correction(memory_dir, &target, Correction::Forget { confirmed: true })
+                    .await?;
+            // Still through `refusal`: the graph can have moved between the
+            // plan and the confirmation, and a removal that found nothing to
+            // remove must not exit as though it had.
+            print_correction(&applied);
+            refusal(&applied)
+        }
+        other => {
+            print_correction(&other);
+            refusal(&other)
+        }
+    }
+}
+
+async fn send_correction(
+    memory_dir: &Path,
+    target: &CorrectTarget,
+    correction: Correction,
+) -> Result<CorrectionReport, RecallError> {
+    let request = Request::Correct(CorrectArgs {
+        target: target.clone(),
+        correction,
+    });
+    Ok(serde_json::from_value(
+        serve_client::execute(memory_dir, &request).await?,
+    )?)
+}
+
+/// A correction that changed nothing exits non-zero: the user asked for a
+/// change and did not get one, and a script must be able to tell.
+fn refusal(report: &CorrectionReport) -> Result<(), RecallError> {
+    match report {
+        CorrectionReport::UnknownEntity { query, .. } => Err(RecallError::Other(format!(
+            "no entity named \"{query}\" — nothing was changed"
+        ))),
+        CorrectionReport::NoSuchEdge {
+            from, rel_type, to, ..
+        } => Err(RecallError::Other(format!(
+            "no {rel_type} relationship between \"{from}\" and \"{to}\" — nothing was changed"
+        ))),
+        CorrectionReport::Ambiguous { entity, .. } => Err(RecallError::Other(format!(
+            "\"{entity}\" takes part in several relationships — name the one that is wrong"
+        ))),
+        CorrectionReport::NothingToCorrect { entity } => Err(RecallError::Other(format!(
+            "\"{entity}\" has no relationships to contradict"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn print_correction(report: &CorrectionReport) {
+    match report {
+        CorrectionReport::UnknownEntity { query, candidates } => {
+            println!("{YELLOW}No entity named{RESET} {BOLD}{query}{RESET}.");
+            if candidates.is_empty() {
+                println!("  {DIM}Nothing stored is close to that name.{RESET}");
+            } else {
+                println!("\n  {DIM}Closest names in memory:{RESET}");
+                for candidate in candidates {
+                    println!(
+                        "    {BOLD}{}{RESET} {DIM}({}){RESET}",
+                        candidate.name, candidate.entity_type
+                    );
+                }
+            }
+        }
+        CorrectionReport::NoSuchEdge {
+            from,
+            rel_type,
+            to,
+            existing,
+        } => {
+            println!(
+                "{YELLOW}Memory holds no{RESET} {BOLD}{rel_type}{RESET} \
+                 {YELLOW}relationship between{RESET} {BOLD}{from}{RESET} \
+                 {YELLOW}and{RESET} {BOLD}{to}{RESET}."
+            );
+            if existing.is_empty() {
+                println!("  {DIM}They are not connected at all.{RESET}");
+            } else {
+                println!("\n  {DIM}What does connect them:{RESET}");
+                print_edges(existing);
+            }
+        }
+        CorrectionReport::Ambiguous { entity, edges } => {
+            println!(
+                "{BOLD}{entity}{RESET} takes part in {} relationships. Which one is wrong?\n",
+                edges.len()
+            );
+            print_edges(edges);
+            println!("\n  {DIM}Name it:{RESET}");
+            if let Some(edge) = edges.first() {
+                println!(
+                    "    {DIM}recall-echo graph correct \"{}\" \"{}\" \"{}\" --wrong{RESET}",
+                    edge.from, edge.rel_type, edge.to
+                );
+            }
+            println!("  {DIM}Or contradict every one of them:{RESET}");
+            println!("    {DIM}recall-echo graph correct \"{entity}\" --wrong --all-edges{RESET}");
+        }
+        CorrectionReport::NothingToCorrect { entity } => {
+            println!(
+                "{BOLD}{entity}{RESET} is in memory but takes part in no relationships, \
+                 so there is no claim to contradict."
+            );
+            println!(
+                "  {DIM}To remove the entity itself: \
+                 recall-echo graph correct \"{entity}\" --forget{RESET}"
+            );
+        }
+        CorrectionReport::Contradicted { edges } => print_contradictions(edges),
+        CorrectionReport::Planned { removal } => print_removal_plan(removal),
+        CorrectionReport::Removed { removal } => {
+            let entity = removal
+                .entity
+                .as_ref()
+                .map(|entity| format!("{BOLD}{}{RESET} and ", entity.name))
+                .unwrap_or_default();
+            println!(
+                "{GREEN}✓{RESET} Removed {entity}{} {}.",
+                removal.edges.len(),
+                plural(removal.edges.len(), "relationship", "relationships")
+            );
+        }
+    }
+}
+
+fn print_contradictions(edges: &[EdgeCorrection]) {
+    println!(
+        "{GREEN}✓{RESET} Recorded your correction on {} {}.\n",
+        edges.len(),
+        plural(edges.len(), "relationship", "relationships")
+    );
+    for correction in edges {
+        let edge = &correction.edge;
+        println!(
+            "  {} {CYAN}—[{}]→{RESET} {}",
+            edge.from, edge.rel_type, edge.to
+        );
+        println!(
+            "    confidence {YELLOW}{:.2} → {:.2}{RESET}   {DIM}evidence {:.1} → {:.1}{RESET}",
+            correction.confidence_before,
+            edge.confidence,
+            correction.evidence_before,
+            edge.evidence,
+        );
+    }
+    println!(
+        "\n  {DIM}Your correction is evidence, not a decree: confidence falls by the weight of \
+         one observation you authored. Say it again if memory is still wrong.{RESET}"
+    );
+}
+
+fn print_removal_plan(removal: &Removal) {
+    println!("{BOLD}{YELLOW}This would remove:{RESET}\n");
+    if let Some(entity) = &removal.entity {
+        println!(
+            "  {BOLD}{}{RESET} {DIM}({}){RESET}",
+            entity.name, entity.entity_type
+        );
+    }
+    if removal.edges.is_empty() {
+        println!("  {DIM}and no relationships.{RESET}");
+    } else {
+        println!(
+            "  {} {}:",
+            removal.edges.len(),
+            plural(removal.edges.len(), "relationship", "relationships")
+        );
+        print_edges(&removal.edges);
+    }
+    println!(
+        "\n  {DIM}Removal is not evidence — it leaves no trace and cannot be re-weighed. \
+         Prefer --wrong unless the memory should never have existed.{RESET}"
+    );
+}
+
+fn print_edges(edges: &[EdgeView]) {
+    for edge in edges {
+        let superseded = if edge.superseded {
+            format!(" {DIM}[superseded]{RESET}")
+        } else {
+            String::new()
+        };
+        let coherence = if edge.self_reinforcements > 0 {
+            format!(" {YELLOW}self×{}{RESET}", edge.self_reinforcements)
+        } else {
+            String::new()
+        };
+        println!(
+            "    {} {CYAN}—[{}]→{RESET} {}  {:.0}%{coherence}{superseded}",
+            edge.from,
+            edge.rel_type,
+            edge.to,
+            edge.confidence * 100.0,
+        );
+    }
+}
+
+/// Ask before destroying anything.
+///
+/// A non-interactive stdin is never taken as consent: a script that pipes into
+/// this command must say `--yes` in the script, where a reader can see it.
+///
+/// The read blocks the runtime, which is what we want — there is nothing else
+/// in flight, and the daemon connection was closed with the planning request.
+fn confirm_removal(removal: &Removal) -> Result<bool, RecallError> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return Err(RecallError::Other(
+            "refusing to remove memory without confirmation — re-run with --yes".into(),
+        ));
+    }
+
+    let what = removal
+        .entity
+        .as_ref()
+        .map_or_else(|| "these relationships".to_string(), |e| e.name.clone());
+    print!("{BOLD}Remove {what}?{RESET} [y/N] ");
+    std::io::stdout().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 {
+        one
+    } else {
+        many
+    }
 }
 
 /// Show relationship decay report — lists all relationships with their stored vs effective confidence.

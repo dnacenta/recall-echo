@@ -39,6 +39,7 @@ pub mod ephemeral;
 pub mod error;
 pub mod frontmatter;
 pub mod init;
+pub mod inspect_cli;
 pub mod jsonl;
 pub mod mcp;
 pub mod paths;
