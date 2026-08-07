@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use recall_echo::graph::confidence::{
-    EdgeEvidence, Evidence, Provenance, ProvenanceWeights, DEFAULT_EVIDENCE_WEIGHT,
+    EdgeEvidence, Evidence, Observation, Provenance, ProvenanceWeights, DEFAULT_EVIDENCE_WEIGHT,
     PRIOR_CONCENTRATION,
 };
 use recall_echo::graph::crud;
@@ -140,18 +140,23 @@ async fn seed_claim(db: &Surreal<Db>) {
 }
 
 /// Apply one observation to the fixture edge through the real write path.
+///
+/// The direction reaches the write as a value, so a contradiction here is
+/// stored the way ingestion stores one — counts down, decay anchor untouched.
+/// See `tests/decay_anchor.rs` for why that separation exists.
 async fn observe(db: &Surreal<Db>, provenance: Provenance, corroborates: bool) {
     let weights = ProvenanceWeights::default();
+    let observation = if corroborates {
+        Observation::Corroborating
+    } else {
+        Observation::Contradicting
+    };
     let existing = edge(db).await;
     let mut evidence = existing.edge_evidence();
-    if corroborates {
-        evidence.corroborate(provenance, &weights);
-    } else {
-        evidence.contradict(provenance, &weights);
-    }
-    crud::reinforce_relationship(db, &existing.id_string(), evidence)
+    evidence.record(observation, provenance, &weights);
+    crud::record_observation(db, &existing.id_string(), evidence, observation)
         .await
-        .expect("failed to reinforce");
+        .expect("failed to record observation");
 }
 
 async fn corroborate(db: &Surreal<Db>, provenance: Provenance, times: usize) {

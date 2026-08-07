@@ -395,14 +395,67 @@ pub fn archive_from_jsonl(
     transcript_path: &str,
 ) -> Result<u32, RecallError> {
     let conv = crate::jsonl::parse_transcript(transcript_path, session_id)?;
-    let summary = summarize::algorithmic_summary(&conv);
-    let result = archive_conversation(base_dir, &conv, &summary, "jsonl")?;
+    archive_and_ingest(base_dir, &conv, "jsonl")
+}
+
+/// Summarise, archive, and hand the result to the graph.
+///
+/// The tail every input path shares, whichever CLI's transcript it started as.
+fn archive_and_ingest(
+    base_dir: &Path,
+    conv: &Conversation,
+    source: &str,
+) -> Result<u32, RecallError> {
+    let summary = summarize::algorithmic_summary(conv);
+    let result = archive_conversation(base_dir, conv, &summary, source)?;
     let log_number = result.log_number;
 
     graph_ingest(base_dir, &result);
     pipeline_sync_on_archive(base_dir);
 
     Ok(log_number)
+}
+
+/// What a hook pointed `archive-session` at.
+///
+/// Deciding this is separate from acting on it because the decision is the part
+/// worth testing: which transcripts are read, which are declined, and which are
+/// simply absent.
+#[derive(Debug)]
+enum HookTarget {
+    /// The payload named no transcript at all.
+    Unnamed,
+    /// A path with nothing at it — a session that was never persisted.
+    Absent,
+    /// Claude Code's JSON Lines, to be streamed from the path.
+    ClaudeJsonl,
+    /// A Gemini chat session document, already read.
+    GeminiSession(Box<Conversation>),
+    /// A file in neither format.
+    Unreadable,
+}
+
+/// Work out what is at the transcript path, reading it only as far as needed.
+fn classify(transcript_path: &str, session_id: &str) -> HookTarget {
+    if transcript_path.is_empty() {
+        return HookTarget::Unnamed;
+    }
+    if !Path::new(transcript_path).exists() {
+        return HookTarget::Absent;
+    }
+    // Sniffed rather than assumed: a migrated Gemini hook hands this command a
+    // JSON document, and every line of one fails the JSON Lines parser.
+    if crate::jsonl::is_jsonl_transcript(transcript_path) {
+        return HookTarget::ClaudeJsonl;
+    }
+
+    fs::read_to_string(transcript_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|document| crate::transcript::gemini::parse_session(&document, session_id))
+        .map_or(HookTarget::Unreadable, |conv| {
+            HookTarget::GeminiSession(Box::new(conv))
+        })
 }
 
 /// Main archive-session flow, called from the SessionEnd hook.
@@ -414,23 +467,60 @@ pub fn run_from_hook() -> Result<(), RecallError> {
 
 /// Archive the session named by a hook input.
 ///
-/// Sessions run with --no-session-persistence never write a transcript.
-/// A missing file is a normal no-op for the hook, not an error — failing
-/// here makes the entire `claude -p` invocation exit nonzero.
+/// # Why nothing here returns an error
+///
+/// A hook that exits nonzero fails the invocation that ran it, every time. So
+/// the three ways this can have nothing to do all report themselves and exit
+/// zero:
+///
+/// - **No transcript path.** Some other harness's payload, spelled some other
+///   way. Named, with what to do about it.
+/// - **No file at the path.** Sessions run with `--no-session-persistence`
+///   never write one. Normal, and silent about anything but the fact.
+/// - **A transcript we cannot read.** Gemini's `hooks migrate --from-claude`
+///   copies this command into Gemini's own settings, where it is handed a JSON
+///   session document rather than Claude Code's JSON Lines. That shape is
+///   [read](crate::transcript::gemini) when it is recognisable; when it is not,
+///   the message says which file and which format, because a user who ran a
+///   migration command deserves to know it half-worked.
+///
+/// Everything written here goes to **stderr**: Gemini requires a hook's stdout
+/// to be JSON and nothing else, and stray prose there is swallowed at best.
 pub fn run_with_hook_input(hook_input: &crate::jsonl::HookInput) -> Result<(), RecallError> {
-    if !Path::new(&hook_input.transcript_path).exists() {
-        eprintln!(
-            "recall-echo: no transcript at {} (session not persisted), nothing to archive",
-            hook_input.transcript_path
-        );
-        return Ok(());
+    let transcript_path = hook_input.transcript_path.trim();
+
+    match classify(transcript_path, &hook_input.session_id) {
+        HookTarget::Unnamed => {
+            eprintln!(
+                "recall-echo: the hook payload names no transcript, so there is nothing to \
+                 archive. `archive-session` expects a SessionEnd payload on stdin, shaped \
+                 {{\"session_id\": …, \"transcript_path\": …}}."
+            );
+        }
+        HookTarget::Absent => {
+            eprintln!(
+                "recall-echo: no transcript at {transcript_path} (session not persisted), \
+                 nothing to archive"
+            );
+        }
+        HookTarget::ClaudeJsonl => {
+            let base_dir = crate::paths::claude_dir()?;
+            archive_from_jsonl(&base_dir, &hook_input.session_id, transcript_path)?;
+        }
+        HookTarget::GeminiSession(conv) => {
+            let base_dir = crate::paths::claude_dir()?;
+            archive_and_ingest(&base_dir, &conv, "gemini")?;
+        }
+        HookTarget::Unreadable => {
+            eprintln!(
+                "recall-echo: {transcript_path} is neither a Claude Code JSONL transcript nor \
+                 a Gemini chat session, so nothing was archived. If this hook came from \
+                 `gemini hooks migrate --from-claude`, recall-echo reads Gemini sessions at \
+                 ~/.gemini/tmp/<hash>/chats/session-*.json — please report this file's shape \
+                 at https://github.com/dnacenta/recall-echo/issues so it can be read too."
+            );
+        }
     }
-    let base_dir = crate::paths::claude_dir()?;
-    archive_from_jsonl(
-        &base_dir,
-        &hook_input.session_id,
-        &hook_input.transcript_path,
-    )?;
     Ok(())
 }
 
@@ -720,5 +810,84 @@ mod tests {
         };
         // --no-session-persistence sessions have no transcript: must be Ok, not Err.
         assert!(run_with_hook_input(&hook_input).is_ok());
+    }
+
+    /// A payload from a harness that spells its fields differently must not
+    /// fail the session it is attached to.
+    #[test]
+    fn hook_without_a_transcript_path_exits_ok() {
+        let hook_input = crate::jsonl::HookInput::default();
+        assert!(run_with_hook_input(&hook_input).is_ok());
+        assert!(matches!(classify("", ""), HookTarget::Unnamed));
+    }
+
+    fn written(name: &str, body: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        fs::write(&path, body).unwrap();
+        let path = path.to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    const CLAUDE_JSONL: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+        "\n",
+    );
+
+    /// The format recall-echo has always read, still read the same way.
+    #[test]
+    fn a_claude_code_transcript_is_recognised() {
+        let (_dir, path) = written("session.jsonl", CLAUDE_JSONL);
+        assert!(matches!(classify(&path, "sess"), HookTarget::ClaudeJsonl));
+    }
+
+    /// The defect: `gemini hooks migrate --from-claude` points this command at
+    /// a JSON *document*, which the JSON Lines parser reads as nothing at all.
+    #[test]
+    fn a_gemini_session_document_is_read_rather_than_skipped() {
+        let document = serde_json::json!({
+            "sessionId": "sess-1",
+            "startTime": "2026-08-06T10:00:00Z",
+            "messages": [
+                {"type": "user", "content": "Where does recall-echo live?"},
+                {"type": "gemini", "content": "Under /opt/recall-echo."},
+            ],
+        });
+
+        // Pretty-printed and single-line are the same document.
+        for body in [
+            serde_json::to_string_pretty(&document).unwrap(),
+            serde_json::to_string(&document).unwrap(),
+        ] {
+            let (_dir, path) = written("session-1.json", &body);
+            let HookTarget::GeminiSession(conv) = classify(&path, "hook-session") else {
+                panic!("not recognised as a Gemini session: {body}");
+            };
+            assert_eq!(conv.user_message_count, 1);
+            assert_eq!(conv.assistant_message_count, 1);
+        }
+    }
+
+    /// Anything else is declined by name, not archived as an empty session.
+    #[test]
+    fn a_transcript_in_no_known_format_is_declined() {
+        let (_dir, path) = written("notes.txt", "not a transcript at all\n");
+        assert!(matches!(classify(&path, "sess"), HookTarget::Unreadable));
+
+        let (_dir, path) = written("empty.jsonl", "");
+        assert!(matches!(classify(&path, "sess"), HookTarget::Unreadable));
+
+        let hook_input = crate::jsonl::HookInput {
+            session_id: "sess".into(),
+            transcript_path: path,
+            _cwd: None,
+            _hook_event_name: None,
+        };
+        assert!(
+            run_with_hook_input(&hook_input).is_ok(),
+            "an unreadable transcript must not fail the session"
+        );
     }
 }

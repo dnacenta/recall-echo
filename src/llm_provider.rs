@@ -19,7 +19,7 @@ use std::env;
 use std::path::Path;
 
 use crate::graph::error::GraphError;
-use crate::graph::llm::LlmProvider;
+use crate::graph::llm::{Completion, LlmProvider, TokenUsage};
 
 use crate::cli_provider::{CliProvider, CliSpec};
 use crate::config::{self, Provider};
@@ -89,6 +89,17 @@ impl LlmProvider for ClaudeCodeProvider {
     ) -> Result<String, GraphError> {
         self.inner
             .complete(system_prompt, user_message, max_tokens)
+            .await
+    }
+
+    async fn complete_measured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
+        self.inner
+            .complete_measured(system_prompt, user_message, max_tokens)
             .await
     }
 }
@@ -185,7 +196,7 @@ impl HttpLlmProvider {
         system_prompt: &str,
         user_message: &str,
         max_tokens: u32,
-    ) -> Result<String, GraphError> {
+    ) -> Result<Completion, GraphError> {
         match &self.config.api_style {
             ApiStyle::Anthropic => {
                 self.complete_anthropic(system_prompt, user_message, max_tokens)
@@ -203,7 +214,7 @@ impl HttpLlmProvider {
         system_prompt: &str,
         user_message: &str,
         max_tokens: u32,
-    ) -> Result<String, GraphError> {
+    ) -> Result<Completion, GraphError> {
         let body = serde_json::json!({
             "model": self.config.model,
             "max_tokens": max_tokens,
@@ -239,10 +250,10 @@ impl HttpLlmProvider {
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| GraphError::Llm(format!("parse: {e}")))?;
 
-        json["content"][0]["text"]
+        let text = json["content"][0]["text"]
             .as_str()
-            .map(String::from)
-            .ok_or_else(|| GraphError::Llm("no text in anthropic response".into()))
+            .ok_or_else(|| GraphError::Llm("no text in anthropic response".into()))?;
+        Ok(Completion::measured(text, anthropic_usage(&json)))
     }
 
     async fn complete_openai(
@@ -250,7 +261,7 @@ impl HttpLlmProvider {
         system_prompt: &str,
         user_message: &str,
         max_tokens: u32,
-    ) -> Result<String, GraphError> {
+    ) -> Result<Completion, GraphError> {
         let body = serde_json::json!({
             "model": self.config.model,
             "max_tokens": max_tokens,
@@ -292,10 +303,10 @@ impl HttpLlmProvider {
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| GraphError::Llm(format!("parse: {e}")))?;
 
-        json["choices"][0]["message"]["content"]
+        let text = json["choices"][0]["message"]["content"]
             .as_str()
-            .map(String::from)
-            .ok_or_else(|| GraphError::Llm("no text in openai response".into()))
+            .ok_or_else(|| GraphError::Llm("no text in openai response".into()))?;
+        Ok(Completion::measured(text, openai_usage(&json)))
     }
 
     fn is_retryable(err: &GraphError) -> bool {
@@ -315,6 +326,21 @@ impl LlmProvider for HttpLlmProvider {
         user_message: &str,
         max_tokens: u32,
     ) -> Result<String, GraphError> {
+        Ok(self
+            .complete_measured(system_prompt, user_message, max_tokens)
+            .await?
+            .text)
+    }
+
+    /// Both API styles report their own token counts, so an HTTP call is
+    /// always measured — including the retried ones, whose counts are those of
+    /// the attempt that succeeded.
+    async fn complete_measured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -329,7 +355,7 @@ impl LlmProvider for HttpLlmProvider {
                 .try_complete(system_prompt, user_message, max_tokens)
                 .await
             {
-                Ok(text) => return Ok(text),
+                Ok(completion) => return Ok(completion),
                 Err(e) => {
                     if !Self::is_retryable(&e) || attempt == self.config.max_retries {
                         return Err(e);
@@ -345,6 +371,23 @@ impl LlmProvider for HttpLlmProvider {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// Anthropic's counts: `usage.input_tokens` / `usage.output_tokens`.
+fn anthropic_usage(json: &serde_json::Value) -> Option<TokenUsage> {
+    TokenUsage::from_counts(
+        json["usage"]["input_tokens"].as_u64(),
+        json["usage"]["output_tokens"].as_u64(),
+    )
+}
+
+/// The OpenAI-compatible counts. Ollama and the other compatible servers use
+/// the same two keys; one that omits them is simply estimated.
+fn openai_usage(json: &serde_json::Value) -> Option<TokenUsage> {
+    TokenUsage::from_counts(
+        json["usage"]["prompt_tokens"].as_u64(),
+        json["usage"]["completion_tokens"].as_u64(),
+    )
+}
+
 fn truncate_str(text: &str, max: usize) -> &str {
     let end = text.len().min(max);
     let mut i = end;
@@ -352,4 +395,41 @@ fn truncate_str(text: &str, max: usize) -> &str {
         i -= 1;
     }
     &text[..i]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both HTTP styles report counts; recording them is what keeps an API
+    /// user's bill from being a length heuristic.
+    #[test]
+    fn the_anthropic_envelope_is_measured() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "OK"}],
+            "usage": {"input_tokens": 1_200, "output_tokens": 48},
+        });
+        assert_eq!(
+            anthropic_usage(&json).map(TokenUsage::total),
+            Some(1_248),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn the_openai_envelope_is_measured() {
+        let json = serde_json::json!({
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {"prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100},
+        });
+        assert_eq!(openai_usage(&json).map(TokenUsage::total), Some(100));
+    }
+
+    /// A compatible server that omits the counts is estimated, not guessed at.
+    #[test]
+    fn an_envelope_without_counts_measures_nothing() {
+        let json = serde_json::json!({"choices": [{"message": {"content": "OK"}}]});
+        assert_eq!(openai_usage(&json), None);
+        assert_eq!(anthropic_usage(&json), None);
+    }
 }

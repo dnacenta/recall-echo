@@ -35,6 +35,10 @@
 
 pub mod claude_code;
 pub mod codex;
+/// A reader with no discovery half, and so no [`Source`] of its own — the
+/// shape is unverified, which is fine for a file a hook hands us and not fine
+/// for an unattended sweep. See the module docs.
+pub mod gemini;
 pub mod grok;
 
 use std::fmt;

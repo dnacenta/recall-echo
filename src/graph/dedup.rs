@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 
 use super::error::GraphError;
-use super::llm::LlmProvider;
+use super::llm::{LlmProvider, TokenUsage};
 use super::types::*;
 use super::GraphMemory;
 use crate::config::DedupBand;
@@ -71,11 +71,20 @@ impl ResolutionPath {
 pub struct Resolution {
     pub entity: ResolvedEntity,
     pub path: ResolutionPath,
+    /// Tokens the model reported for the call this resolution paid for.
+    /// `None` on every fast path — there was no call — and on a model that
+    /// reports no usage, where the caller estimates instead.
+    pub usage: Option<TokenUsage>,
 }
 
 impl Resolution {
-    fn new(entity: ResolvedEntity, path: ResolutionPath) -> Self {
-        Self { entity, path }
+    /// A resolution decided without a model call.
+    fn free(entity: ResolvedEntity, path: ResolutionPath) -> Self {
+        Self {
+            entity,
+            path,
+            usage: None,
+        }
     }
 }
 
@@ -101,7 +110,7 @@ pub async fn resolve_entity(
 
     if let Some(existing) = same_named_entity(gm, candidate).await? {
         let resolved = absorb(gm, &existing, candidate, session_id).await?;
-        return Ok(Resolution::new(resolved, ResolutionPath::NameMatch));
+        return Ok(Resolution::free(resolved, ResolutionPath::NameMatch));
     }
 
     // Ordered by distance ascending — nearest first. The limit is the cap:
@@ -111,7 +120,7 @@ pub async fn resolve_entity(
         .await?;
 
     let Some(closest) = nearest.first() else {
-        return Ok(Resolution::new(
+        return Ok(Resolution::free(
             create(gm, candidate, session_id).await?,
             ResolutionPath::NewEntityBand,
         ));
@@ -121,17 +130,22 @@ pub async fn resolve_entity(
         // Same meaning and same kind of thing: nothing for a model to weigh.
         DedupBand::SameEntity if closest.entity.entity_type == candidate.entity_type => {
             let resolved = absorb(gm, &closest.entity, candidate, session_id).await?;
-            Ok(Resolution::new(resolved, ResolutionPath::SameEntityBand))
+            Ok(Resolution::free(resolved, ResolutionPath::SameEntityBand))
         }
-        DedupBand::NewEntity => Ok(Resolution::new(
+        DedupBand::NewEntity => Ok(Resolution::free(
             create(gm, candidate, session_id).await?,
             ResolutionPath::NewEntityBand,
         )),
         // Ambiguous, or near-identical text under a different type — the one
         // case worth paying for.
         _ => {
-            let resolved = resolve_with_llm(gm, llm, candidate, session_id, &nearest).await?;
-            Ok(Resolution::new(resolved, ResolutionPath::LlmDecision))
+            let (entity, usage) =
+                resolve_with_llm(gm, llm, candidate, session_id, &nearest).await?;
+            Ok(Resolution {
+                entity,
+                path: ResolutionPath::LlmDecision,
+                usage,
+            })
         }
     }
 }
@@ -143,7 +157,7 @@ async fn resolve_with_llm(
     candidate: &ExtractedEntity,
     session_id: &str,
     nearest: &[SearchResult],
-) -> Result<ResolvedEntity, GraphError> {
+) -> Result<(ResolvedEntity, Option<TokenUsage>), GraphError> {
     let config = gm.dedup_config();
     let comparable: Vec<&SearchResult> = nearest
         .iter()
@@ -151,21 +165,22 @@ async fn resolve_with_llm(
         .collect();
 
     let user_message = build_dedup_message(candidate, &comparable);
-    let response = llm
-        .complete(DEDUP_SYSTEM_PROMPT, &user_message, 300)
+    let completion = llm
+        .complete_measured(DEDUP_SYSTEM_PROMPT, &user_message, 300)
         .await?;
 
-    match parse_dedup_response(&response)? {
-        DedupDecision::Skip => Ok(ResolvedEntity::Skipped),
+    let resolved = match parse_dedup_response(&completion.text)? {
+        DedupDecision::Skip => ResolvedEntity::Skipped,
 
-        DedupDecision::Create => create(gm, candidate, session_id).await,
+        DedupDecision::Create => create(gm, candidate, session_id).await?,
 
         DedupDecision::Merge { target } => match gm.get_entity(&target).await? {
-            Some(target_entity) => absorb(gm, &target_entity, candidate, session_id).await,
+            Some(target_entity) => absorb(gm, &target_entity, candidate, session_id).await?,
             // Hallucinated target — create rather than lose the candidate.
-            None => create(gm, candidate, session_id).await,
+            None => create(gm, candidate, session_id).await?,
         },
-    }
+    };
+    Ok((resolved, completion.usage))
 }
 
 /// An existing entity with the same name and type as the candidate.

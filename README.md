@@ -207,7 +207,7 @@ recall-echo search <query>             # Line-level archive search
 recall-echo search <query> --ranked    # File-ranked relevance search
 recall-echo distill [entity_root]      # Analyze MEMORY.md, suggest cleanup
 recall-echo consume [entity_root]      # Output EPHEMERAL.md content
-recall-echo archive-session            # Archive a Claude Code session from JSONL transcript
+recall-echo archive-session            # Archive a session from its transcript (Claude Code or Gemini)
 recall-echo archive --all-unarchived   # Batch archive all missed sessions
 recall-echo checkpoint                 # Save checkpoint before context compression
 recall-echo config                     # View or modify configuration
@@ -292,7 +292,25 @@ Output EPHEMERAL.md content wrapped in memory markers. Used by hooks or scripts 
 
 ### `recall-echo archive-session`
 
-Archive a Claude Code session from a JSONL transcript. Extracts messages, generates a summary (LLM-powered when available, algorithmic fallback), updates ARCHIVE.md, and appends to EPHEMERAL.md. Designed to run as a SessionEnd hook.
+Archive a session from its transcript. Extracts messages, generates a summary (LLM-powered when available, algorithmic fallback), updates ARCHIVE.md, and appends to EPHEMERAL.md. Designed to run as a SessionEnd hook.
+
+It reads Claude Code's JSONL transcripts and Gemini CLI's JSON chat sessions,
+sniffing the file rather than trusting its extension. A hook that hands it
+neither says so and exits zero — a hook that exits nonzero fails the session it
+is attached to, which is never the right trade for "nothing to archive". All of
+its output goes to stderr, because Gemini requires a hook's stdout to be JSON
+and nothing else.
+
+**If you run `gemini hooks migrate --from-claude`:** it copies this command
+into Gemini's own hooks, where it is handed a Gemini chat session
+(`~/.gemini/tmp/<hash>/chats/session-*.json`) instead of Claude Code's JSONL.
+That is read, so migrated hooks archive rather than silently doing nothing —
+but the format was implemented from Gemini's type declarations, not verified
+against a real file. If your sessions are not being archived, the message names
+the file; please [open an issue](https://github.com/dnacenta/recall-echo/issues)
+with its shape. Note also that `consume` (the `SessionStart` half) prints
+markdown, which Gemini's JSON-only stdout contract will swallow — use it there
+at your own risk.
 
 ### `recall-echo checkpoint`
 
@@ -574,6 +592,15 @@ usually is not one; and codex's `-p` is `--profile`, not the prompt — unlike
   `response`, then `result`, then falls back to raw stdout. If your Gemini
   wraps the answer in something else, set `[llm.cli] result_json_path`, or
   clear `output_format_flag` to take plain text instead.
+- **Token counts are measured where the CLI reports them, estimated where it
+  does not.** `codex` and `grok` print a `usage` object, and the Anthropic and
+  OpenAI-compatible APIs return one, so `graph extract` quotes their numbers
+  ("`14K measured`"). `claude-code` answers in prose with no envelope to carry
+  counts, so its calls are a length heuristic and are labelled `~ estimated`; a
+  run that did some of each prints both rather than adding a measurement to a
+  guess. `config show` says which you will get before you spend anything, and
+  any CLI can be measured by pointing `[llm.cli] usage_input_path` and
+  `usage_output_path` at its counters.
 - **In the background daemon, only file-based CLI auth works.** The daemon is
   started with an allowlisted environment (`PATH`, `HOME`, …) that excludes API
   keys, so a CLI that authenticates through `$HOME` keeps working there while
@@ -639,6 +666,7 @@ batch_size = 3               # Archives per batch (the next batch is one quiet p
 | `llm.cli` | `ndjson_match` | preset | `path=value` predicates selecting the answer's line in `ndjson` mode |
 | `llm.cli` | `system_prompt_flag` | preset | Flag for the system prompt; empty prepends it to the message |
 | `llm.cli` | `result_json_path` | preset | Dotted path(s) to the answer in JSON output; empty = raw stdout |
+| `llm.cli` | `usage_input_path` / `usage_output_path` | preset | Dotted path(s) to the prompt/completion token counts the CLI reports; empty = its calls are estimated |
 | `llm.cli` | `extra_args` | preset | Arguments appended after the generated flags |
 | `llm.cli` | `timeout_secs` | `300` | Per-call wall-clock limit (`0` waits forever) |
 | `pipeline` | `docs_dir` | — | Path to pipeline documents (LEARNING.md, THOUGHTS.md, etc.) |

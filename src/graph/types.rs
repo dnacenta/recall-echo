@@ -682,7 +682,15 @@ pub struct IngestionReport {
     pub relationships_created: u32,
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
+    /// Tokens *estimated* for the calls whose provider reported nothing —
+    /// claude-code's prose output, a bridge with no counters, any custom CLI
+    /// without `[llm.cli] usage_input_path`.
     pub estimated_tokens: u64,
+    /// Tokens the providers actually reported, summed over the calls that
+    /// reported them. Kept apart from the estimate so a displayed number never
+    /// has to claim more precision than it has.
+    #[serde(default)]
+    pub measured_tokens: u64,
     /// Record IDs of the entities this run created or merged into — the
     /// entities the session touched, and so the ones a session outcome
     /// applies to. Empty when the run had no LLM to extract with.
@@ -696,6 +704,15 @@ pub struct IngestionReport {
     /// without a model call.
     #[serde(default)]
     pub dedup_fast_path: u32,
+}
+
+impl IngestionReport {
+    /// Every token this run is believed to have spent, measured and estimated
+    /// alike. The number to budget against; the two parts are what to display.
+    #[must_use]
+    pub fn total_tokens(&self) -> u64 {
+        self.measured_tokens + self.estimated_tokens
+    }
 }
 
 #[cfg(test)]

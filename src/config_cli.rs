@@ -165,6 +165,14 @@ fn show_cli_section(llm: &config::LlmSection) {
             if !spec.ndjson_match.is_empty() {
                 eprintln!("  match    = {}", spec.ndjson_match);
             }
+            // Whether this CLI's token bill will be measured or estimated —
+            // worth knowing before the number is read, not after.
+            let usage = if spec.usage_input_paths.is_empty() && spec.usage_output_paths.is_empty() {
+                format!("{DIM}estimated (this CLI reports no token counts){RESET}")
+            } else {
+                format!("{} / {}", spec.usage_input_paths, spec.usage_output_paths)
+            };
+            eprintln!("  usage    = {usage}");
             eprintln!(
                 "  {DIM}{}{RESET}",
                 spec.argv_preview(&spec.resolve_model(&llm.model))

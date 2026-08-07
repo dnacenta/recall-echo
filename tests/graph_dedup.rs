@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use recall_echo::graph::dedup::{self, ResolutionPath, ResolvedEntity};
 use recall_echo::graph::error::GraphError;
-use recall_echo::graph::llm::LlmProvider;
+use recall_echo::graph::llm::{Completion, LlmProvider, TokenUsage};
 use recall_echo::graph::types::{EntityType, ExtractedEntity, NewEntity};
 use recall_echo::graph::{GraphMemory, IngestContext};
 use tempfile::TempDir;
@@ -186,6 +186,39 @@ impl LlmProvider for ScriptedModel {
             return Ok(self.dedup_decision.clone());
         }
         Ok(self.extraction.clone())
+    }
+}
+
+/// A provider that reports its own token counts, the way codex, grok and the
+/// HTTP APIs do.
+struct MeteredModel {
+    extraction: String,
+    dedup_decision: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+#[async_trait]
+impl LlmProvider for MeteredModel {
+    async fn complete(&self, system: &str, user: &str, max: u32) -> Result<String, GraphError> {
+        Ok(self.complete_measured(system, user, max).await?.text)
+    }
+
+    async fn complete_measured(
+        &self,
+        system: &str,
+        _user: &str,
+        _max: u32,
+    ) -> Result<Completion, GraphError> {
+        let text = if system.contains("deduplication system") {
+            self.dedup_decision.clone()
+        } else {
+            self.extraction.clone()
+        };
+        Ok(Completion::measured(
+            text,
+            TokenUsage::from_counts(Some(self.input_tokens), Some(self.output_tokens)),
+        ))
     }
 }
 
@@ -440,6 +473,53 @@ async fn ingest_reports_dedup_resolved_without_a_model() {
     assert_eq!(second.dedup_llm_calls, 0);
     assert_eq!(second.dedup_fast_path, 1);
     assert_eq!(model.dedup_calls(), 0, "no dedup decision needed a model");
+}
+
+/// A provider that reports usage is believed instead of guessed at: the run's
+/// bill is measured, and the length heuristic contributes nothing.
+#[tokio::test]
+async fn ingest_bills_reported_usage_instead_of_the_estimate() {
+    let fixture = Fixture::new().await;
+    let model = MeteredModel {
+        extraction: EXTRACTION.to_string(),
+        dedup_decision: r#"{"decision": "skip", "reason": "dup"}"#.to_string(),
+        input_tokens: 1_337,
+        output_tokens: 42,
+    };
+    let context = IngestContext::new(SESSION, Some(1));
+
+    let report = fixture
+        .graph
+        .ingest_archive(ARCHIVE, &context, Some(&model))
+        .await
+        .expect("ingest");
+
+    // One extraction call, resolved by dedup's fast path: one measurement.
+    assert_eq!(report.measured_tokens, 1_337 + 42);
+    assert_eq!(
+        report.estimated_tokens, 0,
+        "a reported call must not also be estimated"
+    );
+    assert_eq!(report.total_tokens(), 1_379);
+}
+
+/// The other half: a provider that reports nothing is estimated, and the two
+/// numbers never blur into one.
+#[tokio::test]
+async fn ingest_estimates_only_what_no_provider_measured() {
+    let fixture = Fixture::new().await;
+    let model = ScriptedModel::new(EXTRACTION, r#"{"decision": "skip", "reason": "dup"}"#);
+    let context = IngestContext::new(SESSION, Some(1));
+
+    let report = fixture
+        .graph
+        .ingest_archive(ARCHIVE, &context, Some(&model))
+        .await
+        .expect("ingest");
+
+    assert_eq!(report.measured_tokens, 0);
+    assert_eq!(report.estimated_tokens, 2_500);
+    assert_eq!(report.total_tokens(), 2_500);
 }
 
 /// And when a candidate does land in the ambiguous band, the counter says so.

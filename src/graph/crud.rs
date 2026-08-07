@@ -6,7 +6,7 @@
 
 use surrealdb::Surreal;
 
-use super::confidence::{EdgeEvidence, Evidence, Provenance};
+use super::confidence::{EdgeEvidence, Evidence, Observation, Provenance};
 use super::embed::Embedder;
 use super::error::GraphError;
 use super::store::Db;
@@ -273,32 +273,39 @@ pub async fn update_relationship_confidence(
     Ok(())
 }
 
-/// Persist updated evidence for a relationship and reset its decay clock.
+/// Persist updated evidence for a relationship, moving its decay clock only if
+/// the observation earned it.
 ///
-/// Called when a relationship is corroborated (or contradicted) by
-/// re-extraction: the caller loads the edge's [`EdgeEvidence`], records the
-/// observation with its provenance, and hands the result here. The stored
-/// `confidence` is the posterior mean of the new counts, `self_reinforcements`
-/// is the coherence tally kept out of that mean, and `last_reinforced = now`
-/// restarts temporal decay.
+/// The caller loads the edge's [`EdgeEvidence`], records an [`Observation`]
+/// with its provenance, and hands both here — the same value that moved the
+/// counts also decides the anchor, so the two can never disagree. Corroboration
+/// sets `last_reinforced = now` because the belief was just seen again;
+/// contradiction leaves the anchor alone, which keeps the effect of "this is
+/// wrong" monotone: the posterior mean falls, and every day of decay already
+/// applied to the edge stays applied.
 ///
 /// The counts are written whole rather than incremented in SurrealQL: the
 /// caller has already read them, and a full write keeps mean and counts from
 /// ever disagreeing.
-pub async fn reinforce_relationship(
+pub async fn record_observation(
     db: &Surreal<Db>,
     rel_id: &str,
     evidence: EdgeEvidence,
+    observation: Observation,
 ) -> Result<(), GraphError> {
     let counts = evidence.evidence();
-    db.query(
+    let anchor = if observation.renews_decay_anchor() {
+        ",\n               last_reinforced = time::now()"
+    } else {
+        ""
+    };
+    db.query(format!(
         r#"UPDATE type::record($id) SET
                confidence = $confidence,
                alpha = $alpha,
                beta = $beta,
-               self_reinforcements = $self_reinforcements,
-               last_reinforced = time::now()"#,
-    )
+               self_reinforcements = $self_reinforcements{anchor}"#
+    ))
     .bind(("id", rel_id.to_string()))
     .bind(("confidence", counts.mean()))
     .bind(("alpha", counts.alpha()))
@@ -309,39 +316,32 @@ pub async fn reinforce_relationship(
     Ok(())
 }
 
-/// Persist updated evidence for a relationship **without** restarting its
+/// Persist corroborating evidence for a relationship and reset its decay clock.
+///
+/// [`record_observation`] under [`Observation::Corroborating`], named for the
+/// one thing it may be used for.
+pub async fn reinforce_relationship(
+    db: &Surreal<Db>,
+    rel_id: &str,
+    evidence: EdgeEvidence,
+) -> Result<(), GraphError> {
+    record_observation(db, rel_id, evidence, Observation::Corroborating).await
+}
+
+/// Persist contradicting evidence for a relationship **without** restarting its
 /// decay clock.
 ///
-/// The write path for contradiction. [`reinforce_relationship`] sets
-/// `last_reinforced = now`, which is right for corroboration — the belief was
-/// just observed again, so it should stop decaying. Applying that to a
-/// contradiction would let "this is wrong" *raise* an edge's effective
-/// confidence: a stale edge stored at 0.6 and decayed to 0.3 would come back
-/// at 0.545 undecayed, more visible after the correction than before it.
-///
-/// Leaving the anchor alone makes the effect of a contradiction monotone: the
-/// posterior mean falls, and every decay already applied to it stays applied.
+/// [`record_observation`] under [`Observation::Contradicting`]. Reaching for
+/// [`reinforce_relationship`] here instead would let a correction *raise* an
+/// edge's effective confidence: a stale edge stored at 0.6 and decayed to 0.3
+/// would come back at 0.545 undecayed, more visible after being denied than
+/// before it.
 pub async fn contradict_relationship(
     db: &Surreal<Db>,
     rel_id: &str,
     evidence: EdgeEvidence,
 ) -> Result<(), GraphError> {
-    let counts = evidence.evidence();
-    db.query(
-        r#"UPDATE type::record($id) SET
-               confidence = $confidence,
-               alpha = $alpha,
-               beta = $beta,
-               self_reinforcements = $self_reinforcements"#,
-    )
-    .bind(("id", rel_id.to_string()))
-    .bind(("confidence", counts.mean()))
-    .bind(("alpha", counts.alpha()))
-    .bind(("beta", counts.beta()))
-    .bind(("self_reinforcements", evidence.self_reinforcements()))
-    .await?
-    .check()?;
-    Ok(())
+    record_observation(db, rel_id, evidence, Observation::Contradicting).await
 }
 
 /// Supersede an existing relationship: set valid_until on the old one, create a new one.

@@ -19,9 +19,25 @@ use crate::conversation::{Conversation, ConversationEntry};
 // Hook input (stdin from Claude Code)
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Debug)]
+/// What a SessionEnd hook tells us about the session that just ended.
+///
+/// Claude Code's payload is the reference shape. The camelCase aliases and the
+/// defaults are for the other harnesses that can end up invoking this command —
+/// Gemini's `hooks migrate --from-claude` copies our hook straight into its own
+/// settings, and a payload that spells a field differently, or omits it, must
+/// produce a clear message rather than a deserialization error on every single
+/// session. What is missing is reported by
+/// [`crate::archive::run_with_hook_input`], which can say what to do about it.
+#[derive(Deserialize, Debug, Default)]
 pub struct HookInput {
+    #[serde(default, alias = "sessionId")]
     pub session_id: String,
+    #[serde(
+        default,
+        alias = "transcriptPath",
+        alias = "transcript",
+        alias = "transcript_file"
+    )]
     pub transcript_path: String,
     #[serde(rename = "cwd")]
     pub _cwd: Option<String>,
@@ -71,6 +87,29 @@ enum ContentValue {
 // ---------------------------------------------------------------------------
 // JSONL parsing
 // ---------------------------------------------------------------------------
+
+/// Whether a file is a JSON *Lines* transcript, as Claude Code writes them.
+///
+/// A JSON document — Gemini's chat sessions, say — is one object, so its first
+/// line either fails to parse (pretty-printed) or parses into something a
+/// transcript entry never is. Only the first non-empty line is read: sniffing
+/// must not cost a pass over a multi-megabyte transcript.
+#[must_use]
+pub fn is_jsonl_transcript(path: &str) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .is_some_and(|value| {
+            // A whole session document on one line is not a transcript entry,
+            // however well-formed it is.
+            value.is_object() && !crate::transcript::gemini::is_session_document(&value)
+        })
+}
 
 /// Parse a Claude Code JSONL transcript into a Conversation.
 pub fn parse_transcript(
@@ -356,6 +395,55 @@ mod tests {
         let truncated = crate::conversation::truncate(&long_content, 2000);
         assert!(truncated.len() < 3000);
         assert!(truncated.contains("[truncated, 3000 chars total]"));
+    }
+
+    /// The sniff that keeps a migrated Gemini hook from feeding a JSON
+    /// document to a JSON Lines parser.
+    #[test]
+    fn only_json_lines_reads_as_a_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_jsonl(dir.path());
+        assert!(is_jsonl_transcript(&path));
+
+        let session = serde_json::json!({
+            "sessionId": "s",
+            "messages": [{"type": "user", "content": "hi"}],
+        });
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path.to_string_lossy().to_string()
+        };
+
+        assert!(!is_jsonl_transcript(&write(
+            "one-line.json",
+            &serde_json::to_string(&session).unwrap()
+        )));
+        assert!(!is_jsonl_transcript(&write(
+            "pretty.json",
+            &serde_json::to_string_pretty(&session).unwrap()
+        )));
+        assert!(!is_jsonl_transcript(&write("empty.jsonl", "")));
+        assert!(!is_jsonl_transcript(&write("prose.txt", "hello\nthere")));
+        assert!(!is_jsonl_transcript("/nonexistent/transcript.jsonl"));
+    }
+
+    #[test]
+    fn a_hook_payload_survives_a_renamed_field() {
+        let claude = r#"{"session_id":"a","transcript_path":"/tmp/a.jsonl"}"#;
+        let parsed: HookInput = serde_json::from_str(claude).unwrap();
+        assert_eq!(parsed.session_id, "a");
+        assert_eq!(parsed.transcript_path, "/tmp/a.jsonl");
+
+        // camelCase, and a payload that carries neither: both must parse, so
+        // the command can explain itself instead of dying on every session.
+        let other = r#"{"sessionId":"b","transcriptPath":"/tmp/b.json"}"#;
+        let parsed: HookInput = serde_json::from_str(other).unwrap();
+        assert_eq!(parsed.session_id, "b");
+        assert_eq!(parsed.transcript_path, "/tmp/b.json");
+
+        let bare: HookInput = serde_json::from_str("{}").unwrap();
+        assert!(bare.transcript_path.is_empty());
     }
 
     #[test]

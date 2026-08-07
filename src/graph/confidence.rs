@@ -327,6 +327,33 @@ fn sanitize_weight(weight: f64) -> f64 {
     }
 }
 
+/// What one observation says about a claim.
+///
+/// The two directions differ by more than the sign of a count. Corroboration is
+/// the belief being *seen again*, so it restarts temporal decay; a
+/// contradiction is not, so it must leave the decay anchor exactly where it
+/// stands. Carrying that as a value — rather than leaving each write site to
+/// remember it — is what stops "this is wrong" from making a stale edge more
+/// visible than it was: an edge stored at 0.6 and decayed to 0.3 would
+/// otherwise come back at 0.545, undecayed, *because* it was corrected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observation {
+    /// The claim was stated again.
+    Corroborating,
+    /// The claim was denied.
+    Contradicting,
+}
+
+impl Observation {
+    /// Whether recording this observation restarts temporal decay.
+    ///
+    /// Only corroboration does. This is the single place that rule lives.
+    #[must_use]
+    pub fn renews_decay_anchor(self) -> bool {
+        matches!(self, Self::Corroborating)
+    }
+}
+
 /// Everything one edge persists about why it is believed: the Beta counts
 /// that move confidence, and the coherence counter that must not.
 ///
@@ -349,6 +376,23 @@ impl EdgeEvidence {
         Self {
             evidence,
             self_reinforcements: self_reinforcements.max(0),
+        }
+    }
+
+    /// Record one observation authored by `provenance`.
+    ///
+    /// The direction is a value here for the same reason it is one at the write
+    /// path: the caller decides it once, and both the counts and the decay
+    /// anchor follow from that single decision.
+    pub fn record(
+        &mut self,
+        observation: Observation,
+        provenance: Provenance,
+        weights: &ProvenanceWeights,
+    ) {
+        match observation {
+            Observation::Corroborating => self.corroborate(provenance, weights),
+            Observation::Contradicting => self.contradict(provenance, weights),
         }
     }
 
@@ -719,6 +763,31 @@ mod tests {
             "one external contradiction must undo the whole coherence run: {} vs {before}",
             edge.evidence().mean()
         );
+    }
+
+    /// Only being seen again stops an edge decaying. Denial is not sighting.
+    #[test]
+    fn only_corroboration_renews_the_decay_anchor() {
+        assert!(Observation::Corroborating.renews_decay_anchor());
+        assert!(!Observation::Contradicting.renews_decay_anchor());
+    }
+
+    #[test]
+    fn recording_an_observation_matches_its_named_direction() {
+        let weights = ProvenanceWeights::default();
+        let apply = |observation| {
+            let mut edge = EdgeEvidence::new(Evidence::from_prior(0.6), 0);
+            edge.record(observation, Provenance::User, &weights);
+            edge
+        };
+
+        let mut corroborated = EdgeEvidence::new(Evidence::from_prior(0.6), 0);
+        corroborated.corroborate(Provenance::User, &weights);
+        assert_eq!(apply(Observation::Corroborating), corroborated);
+
+        let mut contradicted = EdgeEvidence::new(Evidence::from_prior(0.6), 0);
+        contradicted.contradict(Provenance::User, &weights);
+        assert_eq!(apply(Observation::Contradicting), contradicted);
     }
 
     #[test]
