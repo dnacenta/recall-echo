@@ -336,7 +336,7 @@ enum GraphCommands {
         /// Milliseconds delay between archives (default: 100)
         #[arg(long, default_value = "100")]
         delay_ms: u64,
-        /// Maximum estimated tokens to spend (0 = unlimited, default: 5000000)
+        /// Maximum tokens to spend, measured and estimated alike (0 = unlimited, default: 5000000)
         #[arg(long, default_value = "5000000")]
         max_tokens: u64,
     },

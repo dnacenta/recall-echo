@@ -8,12 +8,12 @@ use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt};
 
-use super::confidence::{ExtractionContext, Provenance};
+use super::confidence::{ExtractionContext, Observation, Provenance};
 use super::crud;
 use super::dedup::{self, Resolution, ResolvedEntity};
 use super::error::GraphError;
 use super::extract;
-use super::llm::LlmProvider;
+use super::llm::{LlmProvider, TokenUsage};
 use super::types::*;
 use super::utility;
 use super::GraphMemory;
@@ -211,10 +211,21 @@ async fn extract_indexed(
     session_id: &str,
     log_number: Option<u32>,
     index: usize,
-) -> (usize, Result<ExtractionResult, GraphError>) {
+) -> (usize, Result<ChunkExtraction, GraphError>) {
     let result = extract::extract_from_chunk(llm, chunk, session_id, log_number).await;
     (index, result)
 }
+
+/// What one extraction call produced, and what it reported spending.
+type ChunkExtraction = (ExtractionResult, Option<TokenUsage>);
+
+/// Tokens assumed for one extraction call when the provider reports none:
+/// system prompt + chunk input + output.
+const ESTIMATED_EXTRACTION_TOKENS: u64 = 2_500;
+
+/// Tokens assumed for one dedup call when the provider reports none:
+/// prompt + decision.
+const ESTIMATED_DEDUP_TOKENS: u64 = 600;
 
 /// Shared extraction logic — parallel extraction, sequential dedup.
 ///
@@ -243,7 +254,7 @@ async fn process_extraction(
         .enumerate()
         .map(|(i, chunk)| extract_indexed(llm, chunk, session_id, log_number, i))
         .collect();
-    let extraction_results: Vec<(usize, Result<ExtractionResult, GraphError>)> =
+    let extraction_results: Vec<(usize, Result<ChunkExtraction, GraphError>)> =
         stream::iter(pending)
             .buffer_unordered(LLM_CONCURRENCY)
             .collect()
@@ -257,7 +268,7 @@ async fn process_extraction(
 
     for (i, result) in extraction_results {
         match result {
-            Ok(extraction) => {
+            Ok((extraction, usage)) => {
                 let provenance = context.provenance.classify(&chunks[i]);
                 all_entities.extend(extract::flatten_extraction(&extraction));
                 all_relationships.extend(
@@ -266,8 +277,7 @@ async fn process_extraction(
                         .into_iter()
                         .map(|rel| (provenance, rel)),
                 );
-                // Estimate ~2500 tokens per extracted chunk (system prompt + chunk input + output)
-                report.estimated_tokens += 2500;
+                bill(report, usage, ESTIMATED_EXTRACTION_TOKENS);
             }
             Err(e) => {
                 report.errors.push(format!("extraction chunk {i}: {e}"));
@@ -301,15 +311,7 @@ async fn process_extraction(
         if let Some(existing) =
             find_existing_relationship(gm, from_name, to_name, &rel.rel_type).await
         {
-            // Re-extraction is corroborating evidence — worth what its source
-            // is worth. Self-authored corroboration also lands in the edge's
-            // coherence tally, where it stays visible instead of passing for
-            // independent support.
-            let mut evidence = existing.edge_evidence();
-            evidence.corroborate(*provenance, gm.provenance_weights());
-            if let Err(e) =
-                crud::reinforce_relationship(gm.db(), &existing.id_string(), evidence).await
-            {
+            if let Err(e) = record_reextraction(gm, &existing, *provenance).await {
                 report
                     .errors
                     .push(format!("confidence update {from_name} -> {to_name}: {e}"));
@@ -356,6 +358,29 @@ async fn process_extraction(
     Ok(())
 }
 
+/// Fold a re-extracted claim into the edge that already holds it.
+///
+/// Extraction restates claims rather than denying them, so the observation is
+/// corroborating — worth what its source is worth, and tallied as coherence
+/// when the agent is restating itself, where it stays visible instead of
+/// passing for independent support.
+///
+/// The direction is passed as a value rather than assumed by the write, because
+/// the same value decides whether the decay clock moves. An extractor taught to
+/// emit negations would then lower the mean *and* keep every day of decay the
+/// edge had already accrued, instead of the denied claim coming back fresher
+/// than it went in.
+async fn record_reextraction(
+    gm: &GraphMemory,
+    existing: &Relationship,
+    provenance: Provenance,
+) -> Result<(), GraphError> {
+    let observation = Observation::Corroborating;
+    let mut evidence = existing.edge_evidence();
+    evidence.record(observation, provenance, gm.provenance_weights());
+    crud::record_observation(gm.db(), &existing.id_string(), evidence, observation).await
+}
+
 /// Fold one dedup resolution into the run's report: what it decided, and what
 /// deciding it cost.
 fn record_resolution(
@@ -365,10 +390,9 @@ fn record_resolution(
     resolution: Resolution,
 ) {
     if resolution.path.used_llm() {
-        // Estimate ~600 tokens per dedup call (prompt + decision). The fast
-        // paths make no call, so they add nothing to the bill.
+        // The fast paths make no call, so they add nothing to the bill.
         report.dedup_llm_calls += 1;
-        report.estimated_tokens += 600;
+        bill(report, resolution.usage, ESTIMATED_DEDUP_TOKENS);
     } else {
         report.dedup_fast_path += 1;
     }
@@ -388,6 +412,19 @@ fn record_resolution(
             name_map.insert(candidate.name.clone(), candidate.name.clone());
             report.entities_skipped += 1;
         }
+    }
+}
+
+/// Charge one model call to the run: the provider's own count when it reported
+/// one, the caller's estimate when it did not.
+///
+/// The two never mix in a single number. A run that measured half its calls
+/// must be able to say so, because "13.7K measured" and "~13.7K estimated" are
+/// answers to different questions.
+fn bill(report: &mut IngestionReport, usage: Option<TokenUsage>, estimate: u64) {
+    match usage {
+        Some(usage) => report.measured_tokens += usage.total(),
+        None => report.estimated_tokens += estimate,
     }
 }
 

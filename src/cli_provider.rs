@@ -27,7 +27,7 @@ use crate::config::{
 };
 use crate::error::RecallError;
 use crate::graph::error::GraphError;
-use crate::graph::llm::LlmProvider;
+use crate::graph::llm::{Completion, LlmProvider, TokenUsage};
 
 /// Bytes of a failing CLI's stderr carried into the error.
 const STDERR_EXCERPT: usize = 300;
@@ -67,6 +67,11 @@ pub struct CliSpec {
     /// Candidate paths to the answer inside JSON output; empty means stdout is
     /// the answer.
     pub result_json_paths: JsonPaths,
+    /// Candidate paths to the prompt-token count the CLI reports; empty means
+    /// it reports none.
+    pub usage_input_paths: JsonPaths,
+    /// Candidate paths to the completion-token count the CLI reports.
+    pub usage_output_paths: JsonPaths,
     /// Predicates selecting the answer's line under [`OutputMode::Ndjson`].
     pub ndjson_match: LineMatchers,
     /// Arguments after the generated flags.
@@ -114,6 +119,10 @@ impl CliSpec {
                 system_prompt_flag: "--system-prompt".into(),
                 output_mode: OutputMode::Raw,
                 result_json_paths: JsonPaths::default(),
+                // `--output-format text` is prose: there is no envelope to
+                // carry counts, so claude-code calls are estimated.
+                usage_input_paths: JsonPaths::default(),
+                usage_output_paths: JsonPaths::default(),
                 ndjson_match: LineMatchers::default(),
                 extra_args: vec!["--no-session-persistence".into()],
                 timeout: default_timeout(),
@@ -136,6 +145,19 @@ impl CliSpec {
                 system_prompt_flag: String::new(),
                 output_mode: OutputMode::SingleJson,
                 result_json_paths: JsonPaths::new(["response".into(), "result".into()]),
+                // Unverified, like the result field: both the snake_case
+                // spelling and the Gemini API's own camelCase are tried, and a
+                // miss costs an estimate rather than a wrong number.
+                usage_input_paths: JsonPaths::new([
+                    "usage.input_tokens".into(),
+                    "usage.promptTokenCount".into(),
+                    "stats.promptTokenCount".into(),
+                ]),
+                usage_output_paths: JsonPaths::new([
+                    "usage.output_tokens".into(),
+                    "usage.candidatesTokenCount".into(),
+                    "stats.candidatesTokenCount".into(),
+                ]),
                 ndjson_match: LineMatchers::default(),
                 extra_args: Vec::new(),
                 timeout: default_timeout(),
@@ -158,6 +180,16 @@ impl CliSpec {
                 system_prompt_flag: String::new(),
                 output_mode: OutputMode::SingleJson,
                 result_json_paths: JsonPaths::new(["text".into()]),
+                // grok reports a `usage` object; the two spellings the vendors
+                // use for the same two numbers are both accepted.
+                usage_input_paths: JsonPaths::new([
+                    "usage.input_tokens".into(),
+                    "usage.prompt_tokens".into(),
+                ]),
+                usage_output_paths: JsonPaths::new([
+                    "usage.output_tokens".into(),
+                    "usage.completion_tokens".into(),
+                ]),
                 ndjson_match: LineMatchers::default(),
                 extra_args: Vec::new(),
                 timeout: default_timeout(),
@@ -184,6 +216,10 @@ impl CliSpec {
                 system_prompt_flag: String::new(),
                 output_mode: OutputMode::Ndjson,
                 result_json_paths: JsonPaths::new(["item.text".into()]),
+                // Read off the same live run as the answer path: the counts
+                // arrive on the `turn.completed` event, not on the message.
+                usage_input_paths: JsonPaths::new(["usage.input_tokens".into()]),
+                usage_output_paths: JsonPaths::new(["usage.output_tokens".into()]),
                 ndjson_match: LineMatchers::new([
                     "type=item.completed".into(),
                     "item.type=agent_message".into(),
@@ -206,6 +242,8 @@ impl CliSpec {
                 system_prompt_flag: String::new(),
                 output_mode: OutputMode::Raw,
                 result_json_paths: JsonPaths::default(),
+                usage_input_paths: JsonPaths::default(),
+                usage_output_paths: JsonPaths::default(),
                 ndjson_match: LineMatchers::default(),
                 extra_args: Vec::new(),
                 timeout: default_timeout(),
@@ -268,6 +306,12 @@ impl CliSpec {
             if self.output_mode == OutputMode::Raw && !paths.is_empty() {
                 self.output_mode = OutputMode::SingleJson;
             }
+        }
+        if let Some(paths) = &section.usage_input_path {
+            self.usage_input_paths = paths.clone();
+        }
+        if let Some(paths) = &section.usage_output_path {
+            self.usage_output_paths = paths.clone();
         }
         if let Some(matchers) = &section.ndjson_match {
             self.ndjson_match = matchers.clone();
@@ -428,13 +472,31 @@ impl LlmProvider for CliProvider {
         &self,
         system_prompt: &str,
         user_message: &str,
-        _max_tokens: u32,
+        max_tokens: u32,
     ) -> Result<String, GraphError> {
+        Ok(self
+            .complete_measured(system_prompt, user_message, max_tokens)
+            .await?
+            .text)
+    }
+
+    /// One spawn, read twice: for the answer, and for the counts the CLI
+    /// printed beside it. Nothing is spawned to measure a call.
+    async fn complete_measured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        _max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
         let invocation = self
             .spec
             .invocation(&self.model, system_prompt, user_message);
         let output = self.run(&invocation).await?;
-        extract_answer(&output, &self.spec)
+        let usage = extract_usage(&output, &self.spec);
+        Ok(Completion::measured(
+            extract_answer(&output, &self.spec)?,
+            usage,
+        ))
     }
 }
 
@@ -569,6 +631,50 @@ fn extract_from_ndjson(stdout: &str, spec: &CliSpec) -> Result<String, GraphErro
         (None, Some(err)) => Err(err),
         (None, None) => Ok(stdout.to_string()),
     }
+}
+
+/// The token counts a CLI printed for this call, if it printed any.
+///
+/// Never inferred from the text: a spec with no usage paths, a CLI that renamed
+/// its counters, or prose output all return `None`, and the caller falls back
+/// to estimating — an honest estimate beats a fabricated measurement.
+///
+/// Under [`OutputMode::Ndjson`] the counts live on their own event, separate
+/// from the answer (codex reports them on `turn.completed`, never on the
+/// message), so every line is searched rather than only the matched one, and
+/// the last event carrying counts wins — the same rule the answer follows.
+fn extract_usage(stdout: &str, spec: &CliSpec) -> Option<TokenUsage> {
+    if spec.usage_input_paths.is_empty() && spec.usage_output_paths.is_empty() {
+        return None;
+    }
+    match spec.output_mode {
+        // Prose has no envelope to carry counts.
+        OutputMode::Raw => None,
+        OutputMode::SingleJson => {
+            let json = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()?;
+            usage_in(&json, spec)
+        }
+        OutputMode::Ndjson => stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+            .filter_map(|event| usage_in(&event, spec))
+            .next_back(),
+    }
+}
+
+/// The counts inside one JSON document, under this spec's usage paths.
+fn usage_in(json: &serde_json::Value, spec: &CliSpec) -> Option<TokenUsage> {
+    TokenUsage::from_counts(
+        first_count(json, spec.usage_input_paths.paths()),
+        first_count(json, spec.usage_output_paths.paths()),
+    )
+}
+
+/// The first configured path that resolves to a non-negative whole number.
+fn first_count(json: &serde_json::Value, paths: &[String]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|path| lookup(json, path).and_then(serde_json::Value::as_u64))
 }
 
 /// The first configured path that resolves to a string.
@@ -1006,6 +1112,161 @@ mod tests {
         let stream = r#"{"type":"error","error":{"message":"model overloaded"}}"#;
         let err = extract_answer(stream, &spec).expect_err("error event");
         assert!(err.to_string().contains("model overloaded"), "{err}");
+    }
+
+    // ── Usage extraction ─────────────────────────────────────────────────
+
+    /// codex prints its counts on `turn.completed`, a different event from the
+    /// one carrying the answer — so usage is read from the whole stream, not
+    /// from the matched line.
+    #[test]
+    fn codex_usage_is_read_off_the_turn_event() {
+        let spec = spec_for(Provider::Codex);
+        assert_eq!(
+            extract_usage(CODEX_STREAM, &spec),
+            Some(TokenUsage {
+                input_tokens: 13_658,
+                output_tokens: 5,
+            })
+        );
+    }
+
+    /// A stream that never reports usage is estimated, not invented.
+    #[test]
+    fn a_stream_without_counts_measures_nothing() {
+        let spec = spec_for(Provider::Codex);
+        let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}"#;
+        assert_eq!(extract_usage(stream, &spec), None);
+    }
+
+    /// Later events supersede earlier ones here too.
+    #[test]
+    fn the_last_reported_usage_wins() {
+        let spec = spec_for(Provider::Codex);
+        let stream = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":2}}"#,
+        );
+        assert_eq!(
+            extract_usage(stream, &spec).map(TokenUsage::total),
+            Some(22)
+        );
+    }
+
+    #[test]
+    fn grok_usage_is_read_from_its_envelope() {
+        let spec = spec_for(Provider::Grok);
+        let stdout = r#"{"text":"OK","usage":{"input_tokens":900,"output_tokens":30}}"#;
+        assert_eq!(
+            extract_usage(stdout, &spec).map(TokenUsage::total),
+            Some(930)
+        );
+    }
+
+    /// The vendors spell the same two numbers two ways; both presets accept
+    /// both, because the alternative is a wrong bill on a rename.
+    #[test]
+    fn the_openai_spelling_of_the_counts_is_accepted_too() {
+        let spec = spec_for(Provider::Grok);
+        let stdout = r#"{"text":"OK","usage":{"prompt_tokens":900,"completion_tokens":30}}"#;
+        assert_eq!(
+            extract_usage(stdout, &spec).map(TokenUsage::total),
+            Some(930)
+        );
+    }
+
+    /// claude-code answers in prose: there is no envelope, so its calls are
+    /// estimated rather than measured. This is the case the display must own.
+    #[test]
+    fn a_prose_cli_reports_no_usage() {
+        let spec = spec_for(Provider::ClaudeCode);
+        assert!(spec.usage_input_paths.is_empty());
+        assert_eq!(extract_usage("plain prose", &spec), None);
+    }
+
+    #[test]
+    fn a_renamed_usage_field_falls_back_to_no_measurement() {
+        let spec = spec_for(Provider::Grok);
+        let stdout = r#"{"text":"OK","tokenCounts":{"in":900,"out":30}}"#;
+        assert_eq!(extract_usage(stdout, &spec), None);
+    }
+
+    /// One side reported is still a measurement — half a real number beats a
+    /// whole invented one.
+    #[test]
+    fn a_half_reported_envelope_is_still_measured() {
+        let spec = spec_for(Provider::Grok);
+        let stdout = r#"{"text":"OK","usage":{"output_tokens":30}}"#;
+        assert_eq!(
+            extract_usage(stdout, &spec),
+            Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 30,
+            })
+        );
+    }
+
+    /// Usage paths are config, like everything else about a vendor.
+    #[test]
+    fn usage_paths_can_be_set_by_hand() {
+        let section = CliSection {
+            command: Some("mycli".into()),
+            result_json_path: Some(JsonPaths::parse("data.text")),
+            usage_input_path: Some(JsonPaths::parse("meta.tokens.in")),
+            usage_output_path: Some(JsonPaths::parse("meta.tokens.out")),
+            ..CliSection::default()
+        };
+        let spec = CliSpec::resolve(&Provider::Cli, &section).expect("resolves");
+        let stdout = r#"{"data":{"text":"OK"},"meta":{"tokens":{"in":7,"out":3}}}"#;
+        assert_eq!(
+            extract_usage(stdout, &spec).map(TokenUsage::total),
+            Some(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_measured_call_carries_its_counts_back_from_the_process() {
+        let mock = MockCli::new(
+            "printf '%s\\n' \
+             '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"OK\"}}' \
+             '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}'",
+        );
+        let provider = mock.provider(
+            CliSection {
+                preset: Some(CliPreset::Codex),
+                ..CliSection::default()
+            },
+            "",
+        );
+
+        let completion = provider
+            .complete_measured(SYSTEM, USER, 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(completion.text, "OK");
+        assert_eq!(completion.usage.map(TokenUsage::total), Some(13));
+    }
+
+    #[tokio::test]
+    async fn a_prose_call_comes_back_unmeasured() {
+        let mock = MockCli::new("printf 'answer from stdin'");
+        let provider = mock.provider(
+            CliSection {
+                preset: Some(CliPreset::ClaudeCode),
+                ..CliSection::default()
+            },
+            "sonnet",
+        );
+
+        let completion = provider
+            .complete_measured(SYSTEM, USER, 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(completion.text, "answer from stdin");
+        assert_eq!(completion.usage, None);
     }
 
     /// Predicates address any dotted path, so the mode serves the next

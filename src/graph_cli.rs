@@ -506,6 +506,7 @@ struct ExtractionTotals {
     errors: Vec<String>,
     processed: u32,
     estimated_tokens: u64,
+    measured_tokens: u64,
     quarantined: Vec<u32>,
     dedup_llm_calls: u32,
     dedup_fast_path: u32,
@@ -544,8 +545,8 @@ fn print_extract_summary(totals: &ExtractionTotals) {
         totals.relationships,
     );
     println!(
-        "  Estimated tokens: ~{}",
-        format_tokens(totals.estimated_tokens)
+        "  Tokens: {}",
+        format_token_bill(totals.measured_tokens, totals.estimated_tokens)
     );
     let dedup_total = totals.dedup_llm_calls + totals.dedup_fast_path;
     if dedup_total > 0 {
@@ -570,6 +571,26 @@ fn print_extract_summary(totals: &ExtractionTotals) {
         if totals.errors.len() > 10 {
             println!("  {DIM}... and {} more{RESET}", totals.errors.len() - 10);
         }
+    }
+}
+
+/// State a token bill without overstating it.
+///
+/// A provider that reports usage (codex, grok, the HTTP APIs) is quoted; one
+/// that does not (claude-code's prose output, any CLI without usage paths) is
+/// estimated, and the `~` says so. A run that did some of each prints both
+/// rather than adding a measurement to a guess and calling the sum measured.
+#[cfg(feature = "llm")]
+fn format_token_bill(measured: u64, estimated: u64) -> String {
+    match (measured, estimated) {
+        (0, 0) => "0".to_string(),
+        (measured, 0) => format!("{} measured", format_tokens(measured)),
+        (0, estimated) => format!("~{} estimated", format_tokens(estimated)),
+        (measured, estimated) => format!(
+            "{} measured + ~{} estimated",
+            format_tokens(measured),
+            format_tokens(estimated)
+        ),
     }
 }
 
@@ -659,11 +680,13 @@ pub async fn extract(
         let mut totals = ExtractionTotals::default();
 
         for (idx, ln) in log_numbers.iter().enumerate() {
-            // Budget check
-            if max_tokens > 0 && totals.estimated_tokens >= max_tokens {
+            // Budget check. Measured and estimated tokens are both spent
+            // tokens, so the budget is charged the sum of the two.
+            let spent = totals.measured_tokens + totals.estimated_tokens;
+            if max_tokens > 0 && spent >= max_tokens {
                 println!(
-                    "\n{YELLOW}⚠ Token budget exhausted (~{} / {}). Stopping.{RESET}",
-                    format_tokens(totals.estimated_tokens),
+                    "\n{YELLOW}⚠ Token budget exhausted ({} of {}). Stopping.{RESET}",
+                    format_token_bill(totals.measured_tokens, totals.estimated_tokens),
                     format_tokens(max_tokens),
                 );
                 println!("  Re-run to continue — resume is automatic via unextracted log numbers.");
@@ -715,14 +738,14 @@ pub async fn extract(
             };
 
             println!(
-                "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels (~{})",
+                "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({})",
                 idx + 1,
                 total_count,
                 report.entities_created,
                 report.entities_merged,
                 report.entities_skipped,
                 report.relationships_created,
-                format_tokens(report.estimated_tokens),
+                format_token_bill(report.measured_tokens, report.estimated_tokens),
             );
 
             gm.mark_extracted(*ln).await?;
@@ -734,6 +757,7 @@ pub async fn extract(
             totals.errors.extend(report.errors);
             totals.processed += 1;
             totals.estimated_tokens += report.estimated_tokens;
+            totals.measured_tokens += report.measured_tokens;
             totals.dedup_llm_calls += report.dedup_llm_calls;
             totals.dedup_fast_path += report.dedup_fast_path;
 
@@ -1718,4 +1742,26 @@ pub(crate) fn find_archive_file(
     Err(RecallError::Other(format!(
         "no archive file for log {log_number:03}",
     )))
+}
+
+#[cfg(all(test, feature = "llm"))]
+mod tests {
+    use super::*;
+
+    /// The line a user reads must not claim a measurement it does not have.
+    #[test]
+    fn a_bill_says_which_of_its_numbers_were_measured() {
+        assert_eq!(format_token_bill(13_663, 0), "14K measured");
+        assert_eq!(format_token_bill(0, 2_500), "~2K estimated");
+        assert_eq!(
+            format_token_bill(13_663, 2_500),
+            "14K measured + ~2K estimated"
+        );
+    }
+
+    /// A run that made no model calls has no bill to qualify.
+    #[test]
+    fn a_run_that_spent_nothing_says_zero() {
+        assert_eq!(format_token_bill(0, 0), "0");
+    }
 }

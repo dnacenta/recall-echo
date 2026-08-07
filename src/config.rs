@@ -427,6 +427,13 @@ pub struct CliSection {
     /// the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_json_path: Option<JsonPaths>,
+    /// Where the CLI reports prompt tokens. Empty means it reports none, and
+    /// the token bill for its calls is estimated instead of measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_input_path: Option<JsonPaths>,
+    /// Where the CLI reports completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_output_path: Option<JsonPaths>,
     /// Arguments appended after the generated flags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_args: Option<Vec<String>>,
@@ -461,6 +468,8 @@ impl CliSection {
             "ndjson_match" => self.ndjson_match = Some(LineMatchers::parse(value)),
             "system_prompt_flag" => self.system_prompt_flag = Some(value.to_string()),
             "result_json_path" => self.result_json_path = Some(JsonPaths::parse(value)),
+            "usage_input_path" => self.usage_input_path = Some(JsonPaths::parse(value)),
+            "usage_output_path" => self.usage_output_path = Some(JsonPaths::parse(value)),
             "extra_args" => self.extra_args = Some(split_args(value)),
             "timeout_secs" => {
                 self.timeout_secs = Some(
