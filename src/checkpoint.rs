@@ -23,8 +23,8 @@ use crate::tags;
 
 /// Checkpoint from a JSONL transcript (Claude Code hook).
 /// Reads hook input from stdin.
-pub fn run_from_hook(trigger: &str) -> Result<(), RecallError> {
-    run_from_hook_with_paths(trigger, &crate::paths::claude_dir()?)
+pub fn run_from_hook(trigger: &str, entity_root: Option<&Path>) -> Result<(), RecallError> {
+    run_from_hook_with_paths(trigger, &crate::paths::hook_base_dir(entity_root)?)
 }
 
 pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), RecallError> {

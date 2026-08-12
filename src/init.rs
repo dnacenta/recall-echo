@@ -408,7 +408,7 @@ fn is_build_dir(exe: &str) -> bool {
 /// Auto-configure Claude Code hooks (settings.json).
 /// Returns true if hooks were configured.
 /// Hooks always go in ~/.claude/settings.json regardless of where entity_root is.
-fn configure_hooks(_entity_root: &Path) -> bool {
+fn configure_hooks(entity_root: &Path) -> bool {
     let claude_dir = match paths::detect_claude_code() {
         Some(dir) => dir,
         None => return false,
@@ -427,10 +427,6 @@ fn configure_hooks(_entity_root: &Path) -> bool {
         return false;
     }
 
-    let archive_cmd = format!("{recall_bin} archive-session");
-    let checkpoint_cmd = format!("{recall_bin} checkpoint --trigger precompact");
-    let consume_cmd = format!("{recall_bin} consume");
-
     // Load existing settings or start fresh
     let mut settings: serde_json::Value = if settings_path.exists() {
         fs::read_to_string(&settings_path)
@@ -441,67 +437,14 @@ fn configure_hooks(_entity_root: &Path) -> bool {
         serde_json::json!({})
     };
 
-    let hooks = settings.as_object_mut().and_then(|o| {
-        o.entry("hooks")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-    });
-
-    let hooks = match hooks {
-        Some(h) => h,
+    let root = fs::canonicalize(entity_root).unwrap_or_else(|_| entity_root.to_path_buf());
+    let changed = match upsert_recall_hooks(&mut settings, &recall_bin, &root) {
+        Some(changed) => changed,
         None => {
             print_status(Status::Error, "Could not parse settings.json hooks");
             return false;
         }
     };
-
-    let mut changed = false;
-
-    // Add SessionStart hook if not already present
-    // Fires once per session (on startup or resume) — injects EPHEMERAL.md
-    // into context via stdout. Skips `clear` (user reset) and `compact`
-    // (we just recovered from a compaction, no prior session to surface).
-    if !hook_exists(hooks, "SessionStart", &consume_cmd) {
-        let arr = hooks
-            .entry("SessionStart")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(arr) = arr {
-            arr.push(serde_json::json!({
-                "matcher": "startup|resume",
-                "hooks": [{"type": "command", "command": consume_cmd}]
-            }));
-            changed = true;
-        }
-    }
-
-    // Add SessionEnd hook if not already present
-    if !hook_exists(hooks, "SessionEnd", &archive_cmd) {
-        let arr = hooks
-            .entry("SessionEnd")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(arr) = arr {
-            arr.push(serde_json::json!({
-                "hooks": [{"type": "command", "command": archive_cmd}]
-            }));
-            changed = true;
-        }
-    }
-
-    // Add PreCompact hook if not already present
-    if !hook_exists(hooks, "PreCompact", &checkpoint_cmd) {
-        let arr = hooks
-            .entry("PreCompact")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(arr) = arr {
-            arr.push(serde_json::json!({
-                "hooks": [{"type": "command", "command": checkpoint_cmd}]
-            }));
-            changed = true;
-        }
-    }
 
     if changed {
         match serde_json::to_string_pretty(&settings) {
@@ -528,34 +471,123 @@ fn configure_hooks(_entity_root: &Path) -> bool {
     false
 }
 
-/// Check if a hook command already exists in a hook event array.
-fn hook_exists(
-    hooks: &serde_json::Map<String, serde_json::Value>,
+/// Quote a path for use inside a shell hook command line.
+fn shell_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.contains(char::is_whitespace) {
+        format!("\"{s}\"")
+    } else {
+        s
+    }
+}
+
+/// Install or repair the three recall-echo hooks in a settings.json value.
+///
+/// The entity root is baked into every command: hooks run with the harness's
+/// cwd, which is wherever the user happens to be working, and a bare
+/// `recall-echo archive-session` resolves against that — capture then only
+/// works when the shell sits in the entity root. MCP registration already
+/// bakes the root for reads; this is the write-side counterpart.
+///
+/// A hook whose command matches a known recall-echo subcommand but not the
+/// expected command line — the bare pre-4.2 form, or a different root — is
+/// rewritten in place, so re-running `init` repairs a broken install instead
+/// of declaring it present. Hooks that are not recall-echo's are never
+/// touched.
+///
+/// Returns `Some(changed)`, or `None` when the settings shape is unusable.
+fn upsert_recall_hooks(
+    settings: &mut serde_json::Value,
+    recall_bin: &str,
+    entity_root: &Path,
+) -> Option<bool> {
+    let root = shell_path(entity_root);
+    // SessionStart fires once per session (startup or resume) — injects
+    // EPHEMERAL.md into context via stdout. Skips `clear` (user reset) and
+    // `compact` (we just recovered from a compaction, no prior session to
+    // surface). `consume` takes the root positionally.
+    let plan: [(&str, Option<&str>, &str, String); 3] = [
+        (
+            "SessionStart",
+            Some("startup|resume"),
+            "recall-echo consume",
+            format!("{recall_bin} consume {root}"),
+        ),
+        (
+            "SessionEnd",
+            None,
+            "recall-echo archive-session",
+            format!("{recall_bin} archive-session --entity-root {root}"),
+        ),
+        (
+            "PreCompact",
+            None,
+            "recall-echo checkpoint",
+            format!("{recall_bin} checkpoint --trigger precompact --entity-root {root}"),
+        ),
+    ];
+
+    let hooks = settings.as_object_mut().and_then(|o| {
+        o.entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    })?;
+
+    let mut changed = false;
+    for (event, matcher, marker, expected) in plan {
+        if upsert_hook(hooks, event, matcher, marker, &expected) {
+            changed = true;
+        }
+    }
+    Some(changed)
+}
+
+/// Ensure one event carries the expected recall-echo hook command.
+///
+/// Rewrites an existing recall-echo hook whose command differs; appends a new
+/// hook group when none is found. Returns true when anything changed.
+fn upsert_hook(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
     event: &str,
-    command: &str,
+    matcher: Option<&str>,
+    marker: &str,
+    expected: &str,
 ) -> bool {
-    if let Some(arr) = hooks.get(event).and_then(|v| v.as_array()) {
-        for group in arr {
-            if let Some(inner) = group.get("hooks").and_then(|h| h.as_array()) {
-                for hook in inner {
-                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                        // Match on the base command name, not the full path
-                        if cmd.contains("recall-echo archive-session")
-                            && command.contains("archive-session")
-                        {
-                            return true;
-                        }
-                        if cmd.contains("recall-echo checkpoint") && command.contains("checkpoint")
-                        {
-                            return true;
-                        }
-                        if cmd.contains("recall-echo consume") && command.contains("consume") {
-                            return true;
-                        }
-                    }
+    if let Some(arr) = hooks.get_mut(event).and_then(|v| v.as_array_mut()) {
+        for group in arr.iter_mut() {
+            let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            for hook in inner.iter_mut() {
+                let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                // Match on the base command name, not the full path.
+                if !cmd.contains(marker) {
+                    continue;
                 }
+                if cmd == expected {
+                    return false;
+                }
+                hook["command"] = serde_json::Value::String(expected.to_string());
+                return true;
             }
         }
+    }
+
+    let arr = hooks
+        .entry(event)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(arr) = arr {
+        let mut group = serde_json::json!({
+            "hooks": [{"type": "command", "command": expected}]
+        });
+        if let Some(m) = matcher {
+            group["matcher"] = serde_json::Value::String(m.to_string());
+        }
+        arr.push(group);
+        return true;
     }
     false
 }
@@ -949,31 +981,110 @@ mod tests {
     }
 
     #[test]
-    fn hook_exists_recognizes_consume_command() {
-        let hooks_json: serde_json::Value = serde_json::json!({
-            "SessionStart": [{
-                "matcher": "startup|resume",
-                "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume"}]
-            }]
+    fn hooks_carry_the_entity_root() {
+        let mut settings = serde_json::json!({});
+        let changed = upsert_recall_hooks(
+            &mut settings,
+            "/usr/local/bin/recall-echo",
+            Path::new("/home/d/.wiseferry"),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let text = settings.to_string();
+        assert!(text.contains("archive-session --entity-root /home/d/.wiseferry"));
+        assert!(text.contains("checkpoint --trigger precompact --entity-root /home/d/.wiseferry"));
+        assert!(text.contains("consume /home/d/.wiseferry"));
+    }
+
+    /// The pre-4.2 bare hook is exactly what left capture broken outside the
+    /// entity root. A re-run of `init` must repair it, not declare it present.
+    #[test]
+    fn a_legacy_bare_hook_is_rewritten_not_skipped() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup|resume",
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume"}]
+                }],
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session"}]
+                }],
+                "PreCompact": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact"}]
+                }]
+            }
         });
-        let hooks = hooks_json.as_object().unwrap();
-        assert!(hook_exists(hooks, "SessionStart", "recall-echo consume"));
-        assert!(!hook_exists(hooks, "SessionEnd", "recall-echo consume"));
+        let changed = upsert_recall_hooks(
+            &mut settings,
+            "/usr/local/bin/recall-echo",
+            Path::new("/home/d/.wiseferry"),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let text = settings.to_string();
+        assert!(text.contains("archive-session --entity-root /home/d/.wiseferry"));
+        // Rewritten in place, not duplicated alongside the bare form.
+        assert_eq!(text.matches("archive-session").count(), 1);
+        assert_eq!(text.matches("checkpoint").count(), 1);
+        assert_eq!(text.matches("consume").count(), 1);
     }
 
     #[test]
-    fn hook_exists_distinguishes_archive_from_consume() {
-        let hooks_json: serde_json::Value = serde_json::json!({
-            "SessionEnd": [{
-                "hooks": [{"type": "command", "command": "recall-echo archive-session"}]
-            }]
+    fn a_correct_hook_set_is_left_unchanged() {
+        let mut settings = serde_json::json!({});
+        upsert_recall_hooks(
+            &mut settings,
+            "/usr/local/bin/recall-echo",
+            Path::new("/home/d/.wiseferry"),
+        )
+        .unwrap();
+
+        let before = settings.clone();
+        let changed = upsert_recall_hooks(
+            &mut settings,
+            "/usr/local/bin/recall-echo",
+            Path::new("/home/d/.wiseferry"),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn foreign_hooks_are_never_touched() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "notify-send done"}]
+                }]
+            }
         });
-        let hooks = hooks_json.as_object().unwrap();
-        assert!(hook_exists(
-            hooks,
-            "SessionEnd",
-            "recall-echo archive-session"
-        ));
+        upsert_recall_hooks(
+            &mut settings,
+            "/usr/local/bin/recall-echo",
+            Path::new("/home/d/.wiseferry"),
+        )
+        .unwrap();
+
+        let text = settings.to_string();
+        assert!(text.contains("notify-send done"));
+        assert!(text.contains("archive-session --entity-root /home/d/.wiseferry"));
+    }
+
+    #[test]
+    fn a_root_with_spaces_is_quoted() {
+        let mut settings = serde_json::json!({});
+        upsert_recall_hooks(
+            &mut settings,
+            "/usr/local/bin/recall-echo",
+            Path::new("/Users/d/My Files/.wiseferry"),
+        )
+        .unwrap();
+
+        let text = settings.to_string();
+        assert!(text.contains(r#"--entity-root \"/Users/d/My Files/.wiseferry\""#));
     }
 
     #[test]

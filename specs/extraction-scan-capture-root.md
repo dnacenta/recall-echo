@@ -114,14 +114,17 @@ absent-`log_number` fully live.
 
 `configure_hooks(_entity_root: &Path)` deliberately discards the entity root. The three hook
 commands are written bare (`src/init.rs:430-432`): `recall-echo archive-session`,
-`recall-echo checkpoint --trigger precompact`, `recall-echo consume`. At runtime the root resolves
-via `paths::entity_root()` (`src/paths.rs:20-25`): `$RECALL_ECHO_HOME`, else **the current working
-directory**.
+`recall-echo checkpoint --trigger precompact`, `recall-echo consume`. At runtime,
+`archive-session` and `checkpoint` hardcode `~/.claude` as their base directory
+(`src/archive.rs`, `src/checkpoint.rs` via `paths::claude_dir()`), while `consume` resolves via
+`paths::entity_root()` (`src/paths.rs:20-25`): `$RECALL_ECHO_HOME`, else the current working
+directory.
 
 **Consequence.** MCP registration bakes `--entity-root` into its command, so *reads* work from
-anywhere. Hooks don't, so *writes* only work when the shell happens to be sitting in the entity
-root. A user who runs `recall-echo init` in `~` and then codes in `~/Code/project` loses every
-session — the failure appears only in the hook error stream, which nobody watches.
+anywhere. Hooks don't: an install whose entity root is anywhere other than `~/.claude` itself
+(e.g. `recall-echo init ~/.wiseferry`, data at `~/.wiseferry/memory/`) has its write hooks
+pointed at a `~/.claude/conversations/` that init never created — every session's capture fails,
+and the failure appears only in the hook error stream, which nobody watches.
 
 **Fix.**
 1. Add `--entity-root <PATH>` to `archive-session` and `checkpoint`. (`consume` already accepts it
