@@ -502,9 +502,12 @@ fn main() {
             distill::run_with_base(&root)
         }
         Some(Commands::Consume { entity_root }) => {
+            // Same layout resolution as archive-session and checkpoint: the
+            // file consume reads must be the file the SessionEnd hook wrote,
+            // on both the entity layout and a claude-style root.
             let root = resolve_entity_root(entity_root);
-            let ephemeral = root.join("memory").join("EPHEMERAL.md");
-            recall_echo::consume::run(&ephemeral)
+            paths::hook_base_dir(Some(&root))
+                .and_then(|base| recall_echo::consume::run(&base.join("EPHEMERAL.md")))
         }
         Some(Commands::Dashboard { entity_root }) => {
             let root = resolve_entity_root(entity_root);
