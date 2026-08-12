@@ -460,9 +460,10 @@ fn classify(transcript_path: &str, session_id: &str) -> HookTarget {
 
 /// Main archive-session flow, called from the SessionEnd hook.
 /// Reads hook input from stdin.
-pub fn run_from_hook() -> Result<(), RecallError> {
+pub fn run_from_hook(entity_root: Option<&Path>) -> Result<(), RecallError> {
     let hook_input = crate::jsonl::read_hook_input()?;
-    run_with_hook_input(&hook_input)
+    let base_dir = crate::paths::hook_base_dir(entity_root)?;
+    run_with_hook_input(&hook_input, &base_dir)
 }
 
 /// Archive the session named by a hook input.
@@ -486,7 +487,10 @@ pub fn run_from_hook() -> Result<(), RecallError> {
 ///
 /// Everything written here goes to **stderr**: Gemini requires a hook's stdout
 /// to be JSON and nothing else, and stray prose there is swallowed at best.
-pub fn run_with_hook_input(hook_input: &crate::jsonl::HookInput) -> Result<(), RecallError> {
+pub fn run_with_hook_input(
+    hook_input: &crate::jsonl::HookInput,
+    base_dir: &Path,
+) -> Result<(), RecallError> {
     let transcript_path = hook_input.transcript_path.trim();
 
     match classify(transcript_path, &hook_input.session_id) {
@@ -504,12 +508,10 @@ pub fn run_with_hook_input(hook_input: &crate::jsonl::HookInput) -> Result<(), R
             );
         }
         HookTarget::ClaudeJsonl => {
-            let base_dir = crate::paths::claude_dir()?;
-            archive_from_jsonl(&base_dir, &hook_input.session_id, transcript_path)?;
+            archive_from_jsonl(base_dir, &hook_input.session_id, transcript_path)?;
         }
         HookTarget::GeminiSession(conv) => {
-            let base_dir = crate::paths::claude_dir()?;
-            archive_and_ingest(&base_dir, &conv, "gemini")?;
+            archive_and_ingest(base_dir, &conv, "gemini")?;
         }
         HookTarget::Unreadable => {
             eprintln!(
@@ -809,7 +811,7 @@ mod tests {
             _hook_event_name: None,
         };
         // --no-session-persistence sessions have no transcript: must be Ok, not Err.
-        assert!(run_with_hook_input(&hook_input).is_ok());
+        assert!(run_with_hook_input(&hook_input, Path::new("/nonexistent-base")).is_ok());
     }
 
     /// A payload from a harness that spells its fields differently must not
@@ -817,7 +819,7 @@ mod tests {
     #[test]
     fn hook_without_a_transcript_path_exits_ok() {
         let hook_input = crate::jsonl::HookInput::default();
-        assert!(run_with_hook_input(&hook_input).is_ok());
+        assert!(run_with_hook_input(&hook_input, Path::new("/nonexistent-base")).is_ok());
         assert!(matches!(classify("", ""), HookTarget::Unnamed));
     }
 
@@ -886,7 +888,7 @@ mod tests {
             _hook_event_name: None,
         };
         assert!(
-            run_with_hook_input(&hook_input).is_ok(),
+            run_with_hook_input(&hook_input, Path::new("/nonexistent-base")).is_ok(),
             "an unreadable transcript must not fail the session"
         );
     }

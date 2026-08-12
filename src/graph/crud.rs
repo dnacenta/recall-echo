@@ -549,9 +549,15 @@ pub async fn mark_episodes_extracted(db: &Surreal<Db>, log_number: u32) -> Resul
 }
 
 /// Get distinct log numbers of episodes that have NOT been extracted.
+///
+/// Episodes written before the `extracted` field existed have no value at
+/// all — `DEFAULT` applies at creation, not retroactively — and in SurrealDB
+/// `NONE ≠ false`, so a bare `extracted = false` can never match them. Absent
+/// resolves to "not extracted", the conservative default, same as
+/// `access_count` and `provenance` on this table.
 pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, GraphError> {
     let mut response = db
-        .query("SELECT log_number FROM episode WHERE extracted = false AND log_number IS NOT NONE GROUP BY log_number ORDER BY log_number")
+        .query("SELECT log_number FROM episode WHERE (extracted ?? false) != true AND log_number IS NOT NONE GROUP BY log_number ORDER BY log_number")
         .await?;
 
     #[derive(serde::Deserialize)]
@@ -561,6 +567,30 @@ pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, G
 
     let rows: Vec<Row> = super::deserialize_take(&mut response, 0)?;
     Ok(rows.into_iter().map(|r| r.log_number).collect())
+}
+
+/// Count episodes missing the `extracted` flag and missing a `log_number`,
+/// in one pass over the table — `count(expr)` counts truthy values, so both
+/// diagnostics share the scan. Returns `(extracted_absent, log_number_absent)`.
+pub async fn episode_absent_field_counts(db: &Surreal<Db>) -> Result<(u64, u64), GraphError> {
+    #[derive(serde::Deserialize)]
+    struct AbsentCounts {
+        extracted_absent: u64,
+        log_number_absent: u64,
+    }
+
+    let mut response = db
+        .query(
+            "SELECT count(extracted IS NONE) AS extracted_absent, \
+             count(log_number IS NONE) AS log_number_absent \
+             FROM episode GROUP ALL",
+        )
+        .await?;
+    let rows: Vec<AbsentCounts> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .first()
+        .map(|r| (r.extracted_absent, r.log_number_absent))
+        .unwrap_or((0, 0)))
 }
 
 /// Get episode by log number.
@@ -574,4 +604,78 @@ pub async fn get_episode_by_log_number(
         .await?;
 
     deserialize_take_opt(&mut response, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::store;
+
+    /// A legacy episode row — written before the `extracted` field existed —
+    /// must still be found by the unextracted scan. Replays the real-world
+    /// sequence: old schema, insert, schema upgrade, scan.
+    #[tokio::test]
+    async fn scan_finds_episodes_with_absent_extracted_field() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = store::open(dir.path()).await.expect("open store");
+
+        // The episode table as it existed before `extracted` was defined.
+        db.query(
+            r#"
+            DEFINE TABLE episode SCHEMAFULL;
+            DEFINE FIELD session_id ON episode TYPE string;
+            DEFINE FIELD timestamp  ON episode TYPE datetime DEFAULT time::now();
+            DEFINE FIELD abstract   ON episode TYPE string;
+            DEFINE FIELD log_number ON episode TYPE option<int>;
+            "#,
+        )
+        .await
+        .expect("legacy schema")
+        .check()
+        .expect("legacy schema check");
+
+        db.query("CREATE episode SET session_id = 'legacy', abstract = 'old row', log_number = 7")
+            .await
+            .expect("legacy insert")
+            .check()
+            .expect("legacy insert check");
+
+        // Upgrade to the current schema. `IF NOT EXISTS` adds `extracted`
+        // with its DEFAULT — which applies at creation, not retroactively.
+        store::init_schema(&db).await.expect("schema upgrade");
+
+        db.query("CREATE episode SET session_id = 'modern', abstract = 'new row', log_number = 9")
+            .await
+            .expect("modern insert")
+            .check()
+            .expect("modern insert check");
+
+        // A modern row with no log_number — not tied to any archive, so the
+        // scan can never reach it; only the diagnostics can see it.
+        db.query("CREATE episode SET session_id = 'orphan', abstract = 'no archive'")
+            .await
+            .expect("orphan insert")
+            .check()
+            .expect("orphan insert check");
+
+        let logs = get_unextracted_log_numbers(&db).await.expect("scan");
+        assert_eq!(
+            logs,
+            vec![7, 9],
+            "legacy and modern rows must both be visible"
+        );
+
+        // The diagnostics run against the same store: the legacy row is the
+        // one missing `extracted` (created before the field existed), the
+        // orphan row is the one missing `log_number`.
+        let (extracted_absent, log_number_absent) =
+            episode_absent_field_counts(&db).await.expect("diagnostics");
+        assert_eq!(extracted_absent, 1);
+        assert_eq!(log_number_absent, 1);
+
+        // Marking extracted removes a log from the scan either way.
+        mark_episodes_extracted(&db, 7).await.expect("mark");
+        let logs = get_unextracted_log_numbers(&db).await.expect("rescan");
+        assert_eq!(logs, vec![9]);
+    }
 }

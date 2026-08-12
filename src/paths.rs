@@ -60,6 +60,32 @@ pub fn claude_dir() -> Result<PathBuf, RecallError> {
     Ok(home.join(".claude"))
 }
 
+/// Base directory for hook-driven writes (`archive-session`, `checkpoint`).
+///
+/// With an explicit entity root, data lives in the entity layout at
+/// `<root>/memory` — unless the root itself carries a claude-style layout
+/// (`<root>/conversations` with no `<root>/memory/conversations`), which is
+/// what a standalone `~/.claude` install looks like. Without a root, the
+/// legacy behavior: `~/.claude` itself. Mirrors the read-side resolution in
+/// `graph_cli::find_conversations_dir`.
+pub fn hook_base_dir(entity_root: Option<&std::path::Path>) -> Result<PathBuf, RecallError> {
+    match entity_root {
+        Some(root) => {
+            let memory = root.join("memory");
+            if memory.join("conversations").exists() {
+                Ok(memory)
+            } else if root.join("conversations").exists() {
+                Ok(root.to_path_buf())
+            } else {
+                // Nothing initialized yet — name the entity layout, so the
+                // "run init first" error points where init would write.
+                Ok(memory)
+            }
+        }
+        None => claude_dir(),
+    }
+}
+
 /// Expand a leading `~/` to the home directory. Other paths pass through.
 #[must_use]
 pub fn expand_tilde(path: &str) -> String {
@@ -94,3 +120,31 @@ pub fn detect_claude_code() -> Option<PathBuf> {
 
 /// Overrides the Claude Code configuration directory (`~/.claude`).
 pub const CLAUDE_DIR_ENV: &str = "RECALL_ECHO_CLAUDE_DIR";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_base_prefers_the_entity_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("memory/conversations")).unwrap();
+        let base = hook_base_dir(Some(tmp.path())).unwrap();
+        assert_eq!(base, tmp.path().join("memory"));
+    }
+
+    #[test]
+    fn hook_base_accepts_a_claude_style_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        let base = hook_base_dir(Some(tmp.path())).unwrap();
+        assert_eq!(base, tmp.path());
+    }
+
+    #[test]
+    fn hook_base_names_the_entity_layout_when_uninitialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = hook_base_dir(Some(tmp.path())).unwrap();
+        assert_eq!(base, tmp.path().join("memory"));
+    }
+}

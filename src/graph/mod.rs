@@ -653,11 +653,31 @@ impl GraphMemory {
             .map(|r| (r.entity_type, r.count))
             .collect();
 
+        // Extraction-side diagnostics — the only way a status caller can
+        // tell "extraction hasn't run yet" apart from "extraction can never
+        // run". None of these fields is indexed, so each query is a full
+        // episode scan; they run only in the state that reads them (episodes
+        // and no entities) and report zero everywhere else. Status and
+        // overview are agent-hot paths, and a healthy store must not pay for
+        // a diagnosis it does not need.
+        let (unextracted_log_count, extracted_absent, log_number_absent) =
+            if entity_count == 0 && episode_count > 0 {
+                let unextracted = crud::get_unextracted_log_numbers(&self.db).await?.len() as u64;
+                let (extracted_absent, log_number_absent) =
+                    crud::episode_absent_field_counts(&self.db).await?;
+                (unextracted, extracted_absent, log_number_absent)
+            } else {
+                (0, 0, 0)
+            };
+
         Ok(GraphStats {
             entity_count,
             relationship_count,
             episode_count,
             entity_type_counts,
+            unextracted_log_count,
+            extracted_absent,
+            log_number_absent,
         })
     }
 }

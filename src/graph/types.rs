@@ -431,12 +431,32 @@ impl EdgeRow {
 }
 
 /// Graph-level statistics.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphStats {
     pub entity_count: u64,
     pub relationship_count: u64,
     pub episode_count: u64,
     pub entity_type_counts: HashMap<String, u64>,
+    /// Distinct log numbers the unextracted scan would process. Defaulted so
+    /// a status response from an older daemon still deserializes.
+    ///
+    /// The three diagnostic fields below (this one included) are full
+    /// episode-table scans, so `stats()` computes them **only** when the
+    /// store has episodes and no entities — the state being diagnosed. On a
+    /// healthy store they are always zero, not a measurement.
+    #[serde(default)]
+    pub unextracted_log_count: u64,
+    /// Episodes with no `extracted` field at all — written before the field
+    /// existed. The scan resolves absent to "not extracted", so these are
+    /// pending work, not lost; the count sizes a first `extract --all` run.
+    /// Only computed in the zero-entity state; see `unextracted_log_count`.
+    #[serde(default)]
+    pub extracted_absent: u64,
+    /// Episodes with no `log_number` — not tied to an archive file, so the
+    /// extraction scan cannot reach them by construction.
+    /// Only computed in the zero-entity state; see `unextracted_log_count`.
+    #[serde(default)]
+    pub log_number_absent: u64,
 }
 
 // ── Ingestion types (Phase 2) ────────────────────────────────────────

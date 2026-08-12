@@ -329,6 +329,7 @@ mod tests {
             relationship_count: relationships,
             episode_count: episodes,
             entity_type_counts: Default::default(),
+            ..Default::default()
         }
     }
 

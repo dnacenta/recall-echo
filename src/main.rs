@@ -64,7 +64,11 @@ enum Commands {
         entity_root: Option<PathBuf>,
     },
     /// Archive a Claude Code session from JSONL transcript (SessionEnd hook)
-    ArchiveSession,
+    ArchiveSession {
+        /// Entity root directory (defaults to ~/.claude for legacy hooks)
+        #[arg(long)]
+        entity_root: Option<PathBuf>,
+    },
     /// Archive JSONL transcripts
     Archive {
         /// Archive all unarchived JSONL transcripts under ~/.claude/projects/
@@ -88,6 +92,9 @@ enum Commands {
         /// Trigger source (e.g., "precompact")
         #[arg(long)]
         trigger: String,
+        /// Entity root directory (defaults to ~/.claude for legacy hooks)
+        #[arg(long)]
+        entity_root: Option<PathBuf>,
     },
     /// View or modify configuration
     Config {
@@ -495,9 +502,12 @@ fn main() {
             distill::run_with_base(&root)
         }
         Some(Commands::Consume { entity_root }) => {
+            // Same layout resolution as archive-session and checkpoint: the
+            // file consume reads must be the file the SessionEnd hook wrote,
+            // on both the entity layout and a claude-style root.
             let root = resolve_entity_root(entity_root);
-            let ephemeral = root.join("memory").join("EPHEMERAL.md");
-            recall_echo::consume::run(&ephemeral)
+            paths::hook_base_dir(Some(&root))
+                .and_then(|base| recall_echo::consume::run(&base.join("EPHEMERAL.md")))
         }
         Some(Commands::Dashboard { entity_root }) => {
             let root = resolve_entity_root(entity_root);
@@ -507,7 +517,9 @@ fn main() {
             Ok(())
         }
         // JSONL commands (ported from recall-claude)
-        Some(Commands::ArchiveSession) => archive::run_from_hook(),
+        Some(Commands::ArchiveSession { entity_root }) => {
+            archive::run_from_hook(entity_root.as_deref())
+        }
         Some(Commands::Archive { all_unarchived }) => {
             if all_unarchived {
                 archive::archive_all_unarchived()
@@ -516,7 +528,10 @@ fn main() {
             }
         }
         Some(Commands::Ingest { from, all, dir }) => run_ingest(&from, all, dir),
-        Some(Commands::Checkpoint { trigger }) => checkpoint::run_from_hook(&trigger),
+        Some(Commands::Checkpoint {
+            trigger,
+            entity_root,
+        }) => checkpoint::run_from_hook(&trigger, entity_root.as_deref()),
         Some(Commands::Config {
             command,
             entity_root,

