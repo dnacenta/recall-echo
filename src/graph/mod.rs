@@ -653,11 +653,22 @@ impl GraphMemory {
             .map(|r| (r.entity_type, r.count))
             .collect();
 
+        // Extraction-side diagnostics. Cheap counts, and the only way a
+        // status caller can tell "extraction hasn't run yet" apart from
+        // "extraction can never run" — the two states print identically
+        // without them.
+        let unextracted_log_count = crud::get_unextracted_log_numbers(&self.db).await?.len() as u64;
+        let extracted_absent = db_count_where(&self.db, "episode", "extracted IS NONE").await?;
+        let log_number_absent = db_count_where(&self.db, "episode", "log_number IS NONE").await?;
+
         Ok(GraphStats {
             entity_count,
             relationship_count,
             episode_count,
             entity_type_counts,
+            unextracted_log_count,
+            extracted_absent,
+            log_number_absent,
         })
     }
 }
@@ -674,6 +685,15 @@ fn load_graph_section(graph_path: &Path) -> crate::config::GraphSection {
 
 async fn db_count(db: &Surreal<Db>, table: &str) -> Result<u64, GraphError> {
     let query = format!("SELECT count() AS count FROM {table} GROUP ALL");
+    let mut response = db.query(&query).await?;
+    let rows: Vec<CountRow> = response.take(0)?;
+    Ok(rows.first().map(|r| r.count).unwrap_or(0))
+}
+
+/// Count rows matching a static condition. `cond` is compiled-in SQL, never
+/// user input.
+async fn db_count_where(db: &Surreal<Db>, table: &str, cond: &str) -> Result<u64, GraphError> {
+    let query = format!("SELECT count() AS count FROM {table} WHERE {cond} GROUP ALL");
     let mut response = db.query(&query).await?;
     let rows: Vec<CountRow> = response.take(0)?;
     Ok(rows.first().map(|r| r.count).unwrap_or(0))

@@ -92,6 +92,7 @@ fn graph_stats() -> GraphStats {
         relationship_count: 30,
         episode_count: 400,
         entity_type_counts: HashMap::from([("project".to_string(), 7)]),
+        ..Default::default()
     }
 }
 

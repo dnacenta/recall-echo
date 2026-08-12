@@ -55,20 +55,19 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
     // Episodes arrive automatically on SessionEnd; turning them into entities
     // is an LLM-costing pass. The daemon now runs it once the machine is
     // quiet, but a store with episodes and no entities is still worth
-    // explaining — the wait, or the opt-out, is the answer either way.
+    // explaining — and "the pass is pending" and "the pass can never run"
+    // print identically without consulting the scan, so it decides which
+    // explanation is true.
     if stats.episode_count > 0 && stats.entity_count == 0 {
         let extraction = crate::config::load_from_dir(memory_dir).extraction;
-        println!(
-            "\n  {YELLOW}No entities yet.{RESET} Episodes are ingested automatically; turning"
-        );
-        println!("  them into entities is a separate LLM pass.");
-        if extraction.background_enabled {
-            println!(
-                "  The daemon runs it after {}s of quiet. To run it now:",
+        print!(
+            "{}",
+            zero_entity_explanation(
+                &stats,
+                extraction.background_enabled,
                 extraction.idle_after_secs
-            );
-        }
-        println!("    {DIM}recall-echo graph extract --all{RESET}");
+            )
+        );
     }
 
     if !stats.entity_type_counts.is_empty() {
@@ -82,6 +81,88 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
 
     print_daemon_line(memory_dir).await;
     Ok(())
+}
+
+/// Explain a store with episodes and no entities.
+///
+/// Two very different states print the same two zeros. When the scan has
+/// work, extraction simply hasn't run — say how much is pending and how to
+/// run it. When the scan is *also* empty, no amount of waiting will ever
+/// produce an entity: report the shape of the breakage (which field the
+/// episodes are missing) instead of promising a daemon pass that will no-op.
+fn zero_entity_explanation(
+    stats: &crate::graph::types::GraphStats,
+    background_enabled: bool,
+    idle_after_secs: u64,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    if stats.unextracted_log_count > 0 {
+        let _ = writeln!(
+            out,
+            "\n  {YELLOW}No entities yet.{RESET} Episodes are ingested automatically; turning"
+        );
+        let _ = writeln!(out, "  them into entities is a separate LLM pass.");
+        let _ = writeln!(
+            out,
+            "  {} archive{} pending extraction.",
+            stats.unextracted_log_count,
+            if stats.unextracted_log_count == 1 {
+                " is"
+            } else {
+                "s are"
+            }
+        );
+        if background_enabled {
+            let _ = writeln!(
+                out,
+                "  The daemon runs it after {idle_after_secs}s of quiet. To run it now:"
+            );
+        }
+        let _ = writeln!(out, "    {DIM}recall-echo graph extract --all{RESET}");
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "\n  {YELLOW}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
+    );
+    let _ = writeln!(
+        out,
+        "  nothing to process — waiting for the daemon will not help."
+    );
+    let _ = writeln!(
+        out,
+        "    episodes missing the extracted flag: {}",
+        stats.extracted_absent
+    );
+    let _ = writeln!(
+        out,
+        "    episodes missing a log_number:       {}",
+        stats.log_number_absent
+    );
+    if stats.log_number_absent > 0 {
+        let _ = writeln!(
+            out,
+            "  Episodes without a log_number cannot be matched to an archive file,"
+        );
+        let _ = writeln!(
+            out,
+            "  so extraction cannot reach them. To rebuild episodes from archives:"
+        );
+        let _ = writeln!(out, "    {DIM}recall-echo graph ingest-all{RESET}");
+    } else {
+        let _ = writeln!(
+            out,
+            "  This state should not be reachable on this version — please report it:"
+        );
+        let _ = writeln!(
+            out,
+            "    {DIM}https://github.com/dnacenta/recall-echo/issues{RESET}"
+        );
+    }
+    out
 }
 
 /// Print the identity of the daemon serving this graph, or why there is none.
@@ -1763,5 +1844,49 @@ mod tests {
     #[test]
     fn a_run_that_spent_nothing_says_zero() {
         assert_eq!(format_token_bill(0, 0), "0");
+    }
+
+    fn zero_entity_stats(
+        unextracted: u64,
+        log_number_absent: u64,
+    ) -> crate::graph::types::GraphStats {
+        crate::graph::types::GraphStats {
+            episode_count: 5118,
+            unextracted_log_count: unextracted,
+            log_number_absent,
+            ..Default::default()
+        }
+    }
+
+    /// Work pending: the wait message, with the size of the wait.
+    #[test]
+    fn a_pending_store_explains_the_wait_and_its_size() {
+        let text = zero_entity_explanation(&zero_entity_stats(1900, 0), true, 120);
+        assert!(text.contains("No entities yet"), "{text}");
+        assert!(text.contains("1900 archives are pending"), "{text}");
+        assert!(text.contains("extract --all"), "{text}");
+    }
+
+    /// Episodes exist, the scan is empty: waiting can never help, and the
+    /// old message must not promise that it will.
+    #[test]
+    fn an_unscannable_store_reports_breakage_not_patience() {
+        let text = zero_entity_explanation(&zero_entity_stats(0, 5118), true, 120);
+        assert!(text.contains("Inconsistent store"), "{text}");
+        assert!(!text.contains("No entities yet"), "{text}");
+        assert!(
+            text.contains("episodes missing a log_number:       5118"),
+            "{text}"
+        );
+        assert!(text.contains("ingest-all"), "{text}");
+    }
+
+    /// The shape this version should have made impossible gets a report
+    /// pointer, not a repair suggestion that would no-op.
+    #[test]
+    fn an_impossible_shape_asks_for_a_bug_report() {
+        let text = zero_entity_explanation(&zero_entity_stats(0, 0), false, 120);
+        assert!(text.contains("Inconsistent store"), "{text}");
+        assert!(text.contains("issues"), "{text}");
     }
 }

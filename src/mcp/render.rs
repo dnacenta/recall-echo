@@ -653,6 +653,7 @@ mod tests {
             relationship_count: 0,
             episode_count: 0,
             entity_type_counts: Default::default(),
+            ..Default::default()
         };
         let text = status(&empty);
         assert!(text.contains("0 entities"), "{text}");
@@ -666,6 +667,7 @@ mod tests {
             relationship_count: 0,
             episode_count: 120,
             entity_type_counts: Default::default(),
+            ..Default::default()
         };
         let text = status(&stats);
         assert!(text.contains("never distilled"), "{text}");
@@ -682,6 +684,7 @@ mod tests {
             relationship_count: 4,
             episode_count: 1,
             entity_type_counts: counts,
+            ..Default::default()
         };
         let text = status(&stats);
         assert!(text.contains("By type: project 9, tool 3."), "{text}");
