@@ -158,14 +158,19 @@ pub async fn extract_from_chunk(
 
 /// Whether a failed-to-parse response was most likely cut off at the cap.
 ///
-/// With reported usage, hitting (nearly) the cap is the signal — a response
-/// well under it was not truncated no matter how unbalanced its braces, and
-/// retrying it terser would just fail again at double the cost. Without
-/// usage, fall back to the unbalanced-JSON shape.
+/// With a reported output count, hitting (nearly) the cap is the signal — a
+/// response well under it was not truncated no matter how unbalanced its
+/// braces, and retrying it terser would just fail again at double the cost.
+/// A zero output count is treated as unreported, not as evidence: providers
+/// that report only input tokens (`TokenUsage::from_counts` synthesizes the
+/// missing side as zero) would otherwise silently lose the retry entirely.
+/// Without a usable count, fall back to the unbalanced-JSON shape.
 fn looks_output_capped(completion: &super::llm::Completion) -> bool {
     match &completion.usage {
-        Some(usage) => usage.output_tokens + 32 >= u64::from(MAX_OUTPUT_TOKENS),
-        None => super::util::is_truncated_json(&completion.text),
+        Some(usage) if usage.output_tokens > 0 => {
+            usage.output_tokens + 32 >= u64::from(MAX_OUTPUT_TOKENS)
+        }
+        _ => super::util::is_truncated_json(&completion.text),
     }
 }
 
@@ -419,17 +424,35 @@ mod tests {
 
     /// With usage reported, a response far under the cap was not truncated —
     /// unbalanced braces or not, retrying it terser would fail identically
-    /// at double the cost.
+    /// at double the cost. The body deliberately *is* truncation-shaped, so
+    /// this test fails if the usage gate is ever removed.
     #[tokio::test]
     async fn an_uncapped_unbalanced_response_is_not_retried() {
         let llm = MeasuredModel {
-            text: "prose with a stray { brace".into(),
+            text: "{\"entities\": [".into(),
             output_tokens: 100,
             calls: AtomicUsize::new(0),
         };
         let err = extract_from_chunk(&llm, "chunk", "sess", Some(1)).await;
         assert!(err.is_err());
         assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A provider that reports only input tokens synthesizes output as zero.
+    /// Zero means "unreported", not "tiny response" — the shape heuristic
+    /// must take over, or that provider class silently loses the retry.
+    #[tokio::test]
+    async fn a_zero_output_count_falls_back_to_the_shape_heuristic() {
+        let llm = MeasuredModel {
+            text: "{\"entities\": [".into(),
+            output_tokens: 0,
+            calls: AtomicUsize::new(0),
+        };
+        let err = extract_from_chunk(&llm, "chunk", "sess", Some(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("terse retry failed"), "{err}");
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
     }
 
     /// With usage at the cap, the retry fires regardless of response shape.
