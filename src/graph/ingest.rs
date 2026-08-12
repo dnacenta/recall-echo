@@ -216,8 +216,9 @@ async fn extract_indexed(
     (index, result)
 }
 
-/// What one extraction call produced, and what it reported spending.
-type ChunkExtraction = (ExtractionResult, Option<TokenUsage>);
+/// What one extraction produced, what it reported spending, and how many
+/// model calls that took (the truncation retry makes it two).
+type ChunkExtraction = (ExtractionResult, Option<TokenUsage>, u32);
 
 /// Tokens assumed for one extraction call when the provider reports none:
 /// system prompt + chunk input + output.
@@ -268,7 +269,7 @@ async fn process_extraction(
 
     for (i, result) in extraction_results {
         match result {
-            Ok((extraction, usage)) => {
+            Ok((extraction, usage, attempts)) => {
                 let provenance = context.provenance.classify(&chunks[i]);
                 all_entities.extend(extract::flatten_extraction(&extraction));
                 all_relationships.extend(
@@ -277,7 +278,11 @@ async fn process_extraction(
                         .into_iter()
                         .map(|rel| (provenance, rel)),
                 );
-                bill(report, usage, ESTIMATED_EXTRACTION_TOKENS);
+                bill(
+                    report,
+                    usage,
+                    ESTIMATED_EXTRACTION_TOKENS * u64::from(attempts),
+                );
             }
             Err(e) => {
                 report.errors.push(format!("extraction chunk {i}: {e}"));

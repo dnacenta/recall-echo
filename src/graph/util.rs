@@ -40,7 +40,10 @@ pub fn strip_markdown_fencing(text: &str) -> String {
 #[must_use]
 pub fn is_truncated_json(text: &str) -> bool {
     let cleaned = strip_markdown_fencing(text);
-    cleaned.contains('{') && extract_json_object(&cleaned).is_none()
+    // A truncated extraction *starts* as JSON and never closes. Prose that
+    // merely mentions a brace somewhere is not a size problem, and retrying
+    // it terser would fail identically at double the cost.
+    cleaned.trim_start().starts_with('{') && extract_json_object(&cleaned).is_none()
 }
 
 /// Extract the first balanced JSON object from a string.

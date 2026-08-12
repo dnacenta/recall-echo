@@ -569,6 +569,30 @@ pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, G
     Ok(rows.into_iter().map(|r| r.log_number).collect())
 }
 
+/// Count episodes missing the `extracted` flag and missing a `log_number`,
+/// in one pass over the table — `count(expr)` counts truthy values, so both
+/// diagnostics share the scan. Returns `(extracted_absent, log_number_absent)`.
+pub async fn episode_absent_field_counts(db: &Surreal<Db>) -> Result<(u64, u64), GraphError> {
+    #[derive(serde::Deserialize)]
+    struct AbsentCounts {
+        extracted_absent: u64,
+        log_number_absent: u64,
+    }
+
+    let mut response = db
+        .query(
+            "SELECT count(extracted IS NONE) AS extracted_absent, \
+             count(log_number IS NONE) AS log_number_absent \
+             FROM episode GROUP ALL",
+        )
+        .await?;
+    let rows: Vec<AbsentCounts> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .first()
+        .map(|r| (r.extracted_absent, r.log_number_absent))
+        .unwrap_or((0, 0)))
+}
+
 /// Get episode by log number.
 pub async fn get_episode_by_log_number(
     db: &Surreal<Db>,
@@ -626,12 +650,28 @@ mod tests {
             .check()
             .expect("modern insert check");
 
+        // A modern row with no log_number — not tied to any archive, so the
+        // scan can never reach it; only the diagnostics can see it.
+        db.query("CREATE episode SET session_id = 'orphan', abstract = 'no archive'")
+            .await
+            .expect("orphan insert")
+            .check()
+            .expect("orphan insert check");
+
         let logs = get_unextracted_log_numbers(&db).await.expect("scan");
         assert_eq!(
             logs,
             vec![7, 9],
             "legacy and modern rows must both be visible"
         );
+
+        // The diagnostics run against the same store: the legacy row is the
+        // one missing `extracted` (created before the field existed), the
+        // orphan row is the one missing `log_number`.
+        let (extracted_absent, log_number_absent) =
+            episode_absent_field_counts(&db).await.expect("diagnostics");
+        assert_eq!(extracted_absent, 1);
+        assert_eq!(log_number_absent, 1);
 
         // Marking extracted removes a log from the scan either way.
         mark_episodes_extracted(&db, 7).await.expect("mark");

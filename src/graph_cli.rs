@@ -124,25 +124,25 @@ fn zero_entity_explanation(
         return out;
     }
 
-    let _ = writeln!(
-        out,
-        "\n  {YELLOW}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
-    );
-    let _ = writeln!(
-        out,
-        "  nothing to process — waiting for the daemon will not help."
-    );
-    let _ = writeln!(
-        out,
-        "    episodes missing the extracted flag: {}",
-        stats.extracted_absent
-    );
-    let _ = writeln!(
-        out,
-        "    episodes missing a log_number:       {}",
-        stats.log_number_absent
-    );
     if stats.log_number_absent > 0 {
+        let _ = writeln!(
+            out,
+            "\n  {YELLOW}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
+        );
+        let _ = writeln!(
+            out,
+            "  nothing to process — waiting for the daemon will not help."
+        );
+        let _ = writeln!(
+            out,
+            "    episodes missing the extracted flag: {}",
+            stats.extracted_absent
+        );
+        let _ = writeln!(
+            out,
+            "    episodes missing a log_number:       {}",
+            stats.log_number_absent
+        );
         let _ = writeln!(
             out,
             "  Episodes without a log_number cannot be matched to an archive file,"
@@ -153,14 +153,26 @@ fn zero_entity_explanation(
         );
         let _ = writeln!(out, "    {DIM}recall-echo graph ingest-all{RESET}");
     } else {
+        // Every episode has been through extraction and none yielded an
+        // entity. Legitimate for short or trivial sessions, or after a gc
+        // pass swept the graph — not a breakage, and not a bug report.
         let _ = writeln!(
             out,
-            "  This state should not be reachable on this version — please report it:"
+            "\n  {YELLOW}Extraction is up to date but produced no entities.{RESET}"
         );
         let _ = writeln!(
             out,
-            "    {DIM}https://github.com/dnacenta/recall-echo/issues{RESET}"
+            "  Every archive has been processed. That can be legitimate (short or"
         );
+        let _ = writeln!(
+            out,
+            "  trivial sessions, or a gc pass); if it seems wrong, check the"
+        );
+        let _ = writeln!(
+            out,
+            "  extraction provider in .recall-echo.toml and any quarantined"
+        );
+        let _ = writeln!(out, "  archives in graph/extraction-quarantine.txt.");
     }
     out
 }
@@ -1893,12 +1905,14 @@ mod tests {
         assert!(text.contains("ingest-all"), "{text}");
     }
 
-    /// The shape this version should have made impossible gets a report
-    /// pointer, not a repair suggestion that would no-op.
+    /// A store where every archive was extracted and none yielded entities is
+    /// a legitimate outcome — trivial sessions, or a gc sweep — not a
+    /// breakage. It must not be called inconsistent or sent to file a bug.
     #[test]
-    fn an_impossible_shape_asks_for_a_bug_report() {
+    fn an_extracted_but_empty_store_is_not_called_broken() {
         let text = zero_entity_explanation(&zero_entity_stats(0, 0), false, 120);
-        assert!(text.contains("Inconsistent store"), "{text}");
-        assert!(text.contains("issues"), "{text}");
+        assert!(!text.contains("Inconsistent"), "{text}");
+        assert!(text.contains("produced no entities"), "{text}");
+        assert!(text.contains("quarantine"), "{text}");
     }
 }
