@@ -818,8 +818,20 @@ pub async fn extract(
                 }
             };
 
+            // A chunk that failed inside an otherwise successful archive is
+            // partial yield, not success — say so on the line itself, not
+            // only in the trailing warnings.
+            let warn_label = if report.errors.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {YELLOW}{} warning{}{RESET}",
+                    report.errors.len(),
+                    if report.errors.len() == 1 { "" } else { "s" }
+                )
+            };
             println!(
-                "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({})",
+                "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({}){warn_label}",
                 idx + 1,
                 total_count,
                 report.entities_created,

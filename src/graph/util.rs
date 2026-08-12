@@ -31,6 +31,18 @@ pub fn strip_markdown_fencing(text: &str) -> String {
     stripped.trim().to_string()
 }
 
+/// Whether an LLM response looks like JSON that was cut off mid-object.
+///
+/// A response truncated against the output cap starts an object it never
+/// closes: there is a `{`, and no balanced object to extract. Distinct from
+/// "no JSON at all" (a refusal, prose, a hijacked format), which should not
+/// be retried as a size problem.
+#[must_use]
+pub fn is_truncated_json(text: &str) -> bool {
+    let cleaned = strip_markdown_fencing(text);
+    cleaned.contains('{') && extract_json_object(&cleaned).is_none()
+}
+
 /// Extract the first balanced JSON object from a string.
 ///
 /// Finds the first `{` and returns the substring up to the matching `}`.
@@ -160,5 +172,27 @@ mod tests {
         let base = serde_json::json!("string");
         let overlay = serde_json::json!(42);
         assert_eq!(merge_json_objects(&base, &overlay), serde_json::json!(42));
+    }
+
+    /// The real failure shape: an output-capped response opens a fence and an
+    /// object and closes neither.
+    #[test]
+    fn a_response_cut_off_mid_object_is_truncated() {
+        assert!(is_truncated_json(
+            "```json\n{\n  \"entities\": [ { \"name\": \"PR #2399\","
+        ));
+        assert!(is_truncated_json("{ \"entities\": [ { \"name\": \"x\""));
+    }
+
+    #[test]
+    fn complete_or_json_free_responses_are_not_truncated() {
+        // Balanced object, fenced or bare.
+        assert!(!is_truncated_json("```json\n{\"entities\": []}\n```"));
+        assert!(!is_truncated_json("{\"entities\": []}"));
+        // No JSON at all — a hijacked or refused response is not a size
+        // problem, and must not trigger the terse retry.
+        assert!(!is_truncated_json(
+            "VERDICT: REQUEST_CHANGES\nSUMMARY: Requesting changes"
+        ));
     }
 }
