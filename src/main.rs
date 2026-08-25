@@ -505,8 +505,7 @@ fn main() {
             // Same layout resolution as archive-session and checkpoint: the
             // file consume reads must be the file the SessionEnd hook wrote,
             // on both the entity layout and a claude-style root.
-            let root = resolve_entity_root(entity_root);
-            paths::hook_base_dir(Some(&root))
+            paths::resolved_hook_base_dir(entity_root.as_deref())
                 .and_then(|base| recall_echo::consume::run(&base.join("EPHEMERAL.md")))
         }
         Some(Commands::Dashboard { entity_root }) => {
@@ -848,15 +847,13 @@ fn run_ingest(
 
 /// The memory directory `ingest` writes into when none is given.
 ///
-/// The same one the hooks write into: an entity's `memory/` when
-/// `RECALL_ECHO_HOME` names one, and `~/.claude` otherwise — which is where a
-/// standalone install already keeps `conversations/`, `ARCHIVE.md` and
-/// `EPHEMERAL.md`, whatever CLI the sessions came from.
+/// The same one the hooks write into, via the same resolution
+/// (`RECALL_ECHO_HOME`, an initialized cwd, then the root `init` persisted),
+/// with `~/.claude` as the legacy fallback — which is where a standalone
+/// install already keeps `conversations/`, `ARCHIVE.md` and `EPHEMERAL.md`,
+/// whatever CLI the sessions came from.
 fn capture_memory_dir() -> Result<PathBuf, recall_echo::error::RecallError> {
-    match std::env::var("RECALL_ECHO_HOME") {
-        Ok(root) => Ok(PathBuf::from(root).join("memory")),
-        Err(_) => paths::claude_dir(),
-    }
+    paths::resolved_hook_base_dir(None)
 }
 
 fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {
