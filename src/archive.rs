@@ -462,7 +462,7 @@ fn classify(transcript_path: &str, session_id: &str) -> HookTarget {
 /// Reads hook input from stdin.
 pub fn run_from_hook(entity_root: Option<&Path>) -> Result<(), RecallError> {
     let hook_input = crate::jsonl::read_hook_input()?;
-    let base_dir = crate::paths::hook_base_dir(entity_root)?;
+    let base_dir = crate::paths::resolved_hook_base_dir(entity_root)?;
     run_with_hook_input(&hook_input, &base_dir)
 }
 

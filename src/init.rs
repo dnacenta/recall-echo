@@ -1035,6 +1035,19 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
     ensure_dir(&conversations_dir);
     notice_legacy_conversations(entity_root, &conversations_dir);
 
+    // Pin this root for flagless hook invocations (#46): capture must land in
+    // the store the MCP server serves, not wherever the session's cwd is.
+    match paths::persist_entity_root(entity_root) {
+        Ok(file) => print_status(
+            Status::Created,
+            &format!("Entity root persisted to {}", file.display()),
+        ),
+        Err(e) => print_status(
+            Status::Error,
+            &format!("Could not persist entity root: {e}"),
+        ),
+    }
+
     // Write MEMORY.md (never overwrite)
     write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
 
