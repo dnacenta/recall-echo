@@ -529,12 +529,29 @@ fn extract_binary(archive_path: &Path, dest: &Path) -> Result<(), RecallError> {
 #[doc(hidden)]
 pub fn self_check(binary: &Path, expected_version: &str) -> Result<(), RecallError> {
     // env_clear: the not-yet-trusted binary runs without inheriting tokens
-    // or provider keys from our environment.
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .map_err(|e| RecallError::Other(format!("cannot run {}: {e}", binary.display())))?;
+    // or provider keys from our environment. The ETXTBSY retry covers the
+    // Linux fork/exec race where another thread's short-lived writable fd
+    // (inherited across fork) makes exec of a freshly written file fail.
+    let mut attempts = 0;
+    let output = loop {
+        match std::process::Command::new(binary)
+            .arg("--version")
+            .env_clear()
+            .output()
+        {
+            Ok(output) => break output,
+            Err(e) if e.raw_os_error() == Some(26) && attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(RecallError::Other(format!(
+                    "cannot run {}: {e}",
+                    binary.display()
+                )))
+            }
+        }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.success()
         && stdout
