@@ -39,6 +39,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Pulse-null integration (optional) — plugin system for pulse-null entities
 pulse-system-types = { version = "0.6", optional = true }
 
+# Self-update (optional) — unpack the release tar.gz the `update` command downloads
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+
 [features]
 # Both storage backends are compiled in by default; the active one is chosen
 # at runtime via the `[graph] mode` config key (embedded | server).
@@ -46,10 +50,12 @@ pulse-system-types = { version = "0.6", optional = true }
 # exist, so a stock install ingests episodes that can never become entities —
 # the knowledge graph's whole point. Extraction still requires a configured
 # provider at run time; it just stops being unreachable at compile time.
-default = ["embedded", "server", "llm"]
+default = ["embedded", "server", "llm", "self-update"]
 embedded = ["surrealdb/kv-surrealkv"]
 server = ["surrealdb/protocol-ws"]
 llm = ["reqwest"]
+# `recall-echo update` — self-update from GitHub releases
+self-update = ["reqwest", "dep:flate2", "dep:tar"]
 pulse-null = ["pulse-system-types"]
 # LoCoMo benchmark harness — exposes ingest/answer primitives via library API
 # and a `bench` CLI subcommand. Requires the `llm` feature to answer questions.
