@@ -257,9 +257,11 @@ cargo build --release
 recall-echo update
 ```
 
-Downloads the latest release binary for your platform, verifies it, and swaps
-it in place — the installed copy is only replaced after the new binary proves
-it answers `--version` correctly. `--check` reports whether an update exists
+Downloads the latest release binary for your platform and swaps it in place —
+the installed copy is only replaced after the new binary proves it answers
+`--version` correctly. (That is a liveness check on top of HTTPS to GitHub,
+not a cryptographic verification; checksummed releases are a planned
+follow-up.) `--check` reports whether an update exists
 without touching anything (exit 10 when one does), `--version vX.Y.Z` pins a
 specific release, `--force` reinstalls. `install.sh` remains the first-install
 bootstrap; `update` covers every install after that. Cargo installs can keep
