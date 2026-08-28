@@ -219,7 +219,7 @@ fn resolve_install_path() -> Result<PathBuf, RecallError> {
 /// Fail before downloading anything if the install directory can't be
 /// written. Probes with a real file create — permission bits alone lie under
 /// ACLs and read-only mounts.
-fn preflight_writable(dir: &Path) -> Result<(), RecallError> {
+pub fn preflight_writable(dir: &Path) -> Result<(), RecallError> {
     let probe = dir.join(format!(".recall-echo-update-probe.{}", std::process::id()));
     match std::fs::write(&probe, b"") {
         Ok(()) => {
@@ -233,16 +233,169 @@ fn preflight_writable(dir: &Path) -> Result<(), RecallError> {
     }
 }
 
+/// Download, extract, verify, swap. All temp files live in the install
+/// directory itself — same filesystem, so the final renames are atomic — and
+/// are removed on every exit path by the guard.
 async fn install(
-    _client: &reqwest::Client,
-    _asset_url: &str,
-    _install_path: &Path,
-    _current_version: &str,
-    _target_version: &str,
+    client: &reqwest::Client,
+    asset_url: &str,
+    install_path: &Path,
+    current_version: &str,
+    target_version: &str,
 ) -> Result<(), RecallError> {
+    let install_dir = install_path
+        .parent()
+        .expect("validated by caller: install path has a parent");
+    let pid = std::process::id();
+    let archive_path = install_dir.join(format!(".recall-echo-update.{pid}.tar.gz"));
+    let new_bin_path = install_dir.join(format!(".recall-echo-update.{pid}.bin"));
+    let _guard = TempGuard(vec![archive_path.clone(), new_bin_path.clone()]);
+
+    download(client, asset_url, &archive_path).await?;
+    extract_binary(&archive_path, &new_bin_path)?;
+    self_check(&new_bin_path, target_version)?;
+    swap(install_path, &new_bin_path, current_version, target_version)
+}
+
+/// Removes whatever temp files still exist when the update flow exits.
+struct TempGuard(Vec<PathBuf>);
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Stream the release asset to disk. Deliberately built without any auth
+/// header: the download 302s off api.github.com, and a `GITHUB_TOKEN` must
+/// never travel to the redirect target.
+async fn download(client: &reqwest::Client, url: &str, dest: &Path) -> Result<(), RecallError> {
+    use std::io::Write;
+
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| RecallError::Other(format!("download: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RecallError::Other(format!(
+            "download returned {} for {url}",
+            resp.status()
+        )));
+    }
+
+    let mut file = std::fs::File::create(dest)?;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| RecallError::Other(format!("download: {e}")))?
+    {
+        file.write_all(&chunk)?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// Pull the single binary out of the release tar.gz.
+fn extract_binary(archive_path: &Path, dest: &Path) -> Result<(), RecallError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+
+    for entry in archive
+        .entries()
+        .map_err(|e| RecallError::Other(format!("release archive: {e}")))?
+    {
+        let mut entry = entry.map_err(|e| RecallError::Other(format!("release archive: {e}")))?;
+        if entry.header().entry_type().is_file() {
+            entry
+                .unpack(dest)
+                .map_err(|e| RecallError::Other(format!("release archive: {e}")))?;
+            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+            return Ok(());
+        }
+    }
     Err(RecallError::Other(
-        "download and swap are not implemented yet (next increment)".into(),
+        "release archive contains no regular file".into(),
     ))
+}
+
+/// A binary that can't report the version it is supposed to be is not
+/// installed. Runs `<binary> --version` and requires the expected version to
+/// appear as a whitespace-delimited word of its stdout.
+pub fn self_check(binary: &Path, expected_version: &str) -> Result<(), RecallError> {
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| RecallError::Other(format!("cannot run {}: {e}", binary.display())))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success()
+        && stdout
+            .split_whitespace()
+            .any(|word| word == expected_version)
+    {
+        return Ok(());
+    }
+    Err(RecallError::Other(format!(
+        "{} --version reported {:?}, expected {expected_version}",
+        binary.display(),
+        stdout.trim()
+    )))
+}
+
+/// Atomically replace `install` with `new_bin`. The running binary keeps its
+/// inode, so this is safe while a daemon or the updater itself is executing
+/// the old file. The old binary survives as `.old.<version>` until the swap
+/// verifies; any failure after the first rename restores it.
+pub fn swap(
+    install: &Path,
+    new_bin: &Path,
+    current_version: &str,
+    target_version: &str,
+) -> Result<(), RecallError> {
+    let name = install
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RecallError::Other(format!("bad install path {}", install.display())))?;
+    let old = install.with_file_name(format!("{name}.old.{current_version}"));
+
+    std::fs::rename(install, &old)
+        .map_err(|e| RecallError::Other(format!("cannot move current binary aside: {e}")))?;
+
+    if let Err(e) = std::fs::rename(new_bin, install) {
+        let _ = std::fs::rename(&old, install);
+        return Err(RecallError::Other(format!(
+            "cannot move new binary into place ({e}); previous version restored"
+        )));
+    }
+
+    match self_check(install, target_version) {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_file(&old) {
+                eprintln!(
+                    "warning: could not remove backup {} ({e}) — safe to delete",
+                    old.display()
+                );
+            }
+            Ok(())
+        }
+        Err(check_err) => {
+            let _ = std::fs::remove_file(install);
+            match std::fs::rename(&old, install) {
+                Ok(()) => Err(RecallError::Other(format!(
+                    "installed binary failed verification ({check_err}); previous version restored"
+                ))),
+                Err(restore_err) => Err(RecallError::Other(format!(
+                    "installed binary failed verification ({check_err}) and restoring failed \
+                     ({restore_err}) — previous binary preserved at {}",
+                    old.display()
+                ))),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
