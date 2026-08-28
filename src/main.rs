@@ -146,6 +146,19 @@ enum Commands {
         #[command(subcommand)]
         command: BenchCommands,
     },
+    /// Update recall-echo to the latest GitHub release
+    #[cfg(feature = "self-update")]
+    Update {
+        /// Only report current vs latest; exit 10 when an update is available
+        #[arg(long)]
+        check: bool,
+        /// Install a specific release tag (e.g. v4.3.0) instead of the latest
+        #[arg(long)]
+        version: Option<String>,
+        /// Reinstall even when already on the requested version
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[cfg(feature = "bench")]
@@ -544,6 +557,25 @@ fn main() {
         }
         #[cfg(feature = "bench")]
         Some(Commands::Bench { command }) => run_bench(command),
+        #[cfg(feature = "self-update")]
+        Some(Commands::Update {
+            check,
+            version,
+            force,
+        }) => client_runtime()
+            .map_err(recall_echo::error::RecallError::from)
+            .and_then(|rt| {
+                rt.block_on(recall_echo::update::run(recall_echo::update::UpdateOpts {
+                    check,
+                    version,
+                    force,
+                }))
+            })
+            .map(|code| {
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }),
         Some(Commands::Serve { dir, foreground }) => {
             let memory_dir = dir.unwrap_or_else(|| resolve_entity_root(None).join("memory"));
             run_serve(&memory_dir, foreground)

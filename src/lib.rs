@@ -67,6 +67,9 @@ pub mod pulse_null;
 #[cfg(feature = "bench")]
 pub mod bench;
 
+#[cfg(feature = "self-update")]
+pub mod update;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
