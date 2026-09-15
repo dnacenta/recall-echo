@@ -192,13 +192,13 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
     for (i, logo_line) in logo_lines.iter().enumerate() {
         if i < meta_lines.len() {
             println!(
-                "  {GOOD}{:<width$}{RESET}  {}",
+                "  {ACCENT}{:<width$}{RESET}  {}",
                 logo_line,
                 meta_lines[i],
                 width = logo_width,
             );
         } else {
-            println!("  {GOOD}{logo_line}{RESET}");
+            println!("  {ACCENT}{logo_line}{RESET}");
         }
     }
 
