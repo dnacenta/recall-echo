@@ -9,10 +9,7 @@ use std::path::Path;
 use crate::error::RecallError;
 use crate::paths;
 
-const BOLD: &str = "\x1b[1m";
-const YELLOW: &str = "\x1b[33m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+use crate::theme::{BOLD, DIM, RESET, WARN};
 
 /// Analyze MEMORY.md and suggest distillation actions.
 pub fn run() -> Result<(), RecallError> {
@@ -47,7 +44,7 @@ pub fn run_with_base(base: &Path) -> Result<(), RecallError> {
         return Ok(());
     }
 
-    eprintln!("\n  {YELLOW}Suggestions:{RESET}\n");
+    eprintln!("\n  {WARN}Suggestions:{RESET}\n");
     for (i, suggestion) in suggestions.iter().enumerate() {
         eprintln!("  {}. {}", i + 1, suggestion);
     }

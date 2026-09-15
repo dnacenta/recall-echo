@@ -7,17 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::RecallError;
+use crate::theme::{Paint, ACCENT, BAD, BOLD, DIM, GOOD, RESET, WARN};
 use crate::RecallEcho;
-
-// ── ANSI colors ─────────────────────────────────────────────────────────
-
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const CYAN: &str = "\x1b[36m";
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
-const RESET: &str = "\x1b[0m";
 
 const LOGO: &str = r#"
 ╦═╗╔═╗╔═╗╔═╗╦  ╦
@@ -44,9 +35,9 @@ impl HealthAssessment {
     #[must_use]
     pub fn display(&self) -> String {
         match self.level {
-            HealthLevel::Healthy => format!("{GREEN}HEALTHY{RESET}"),
-            HealthLevel::Watch => format!("{YELLOW}WATCH{RESET}"),
-            HealthLevel::Alert => format!("{RED}ALERT{RESET}"),
+            HealthLevel::Healthy => format!("{GOOD}HEALTHY{RESET}"),
+            HealthLevel::Watch => format!("{WARN}WATCH{RESET}"),
+            HealthLevel::Alert => format!("{BAD}ALERT{RESET}"),
         }
     }
 }
@@ -179,7 +170,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
     // Logo + metadata side by side
     let logo_lines: Vec<&str> = LOGO.lines().skip(1).collect();
     let meta_lines = [
-        format!("entity    {CYAN}{entity_name}{RESET}"),
+        format!("entity    {ACCENT}{entity_name}{RESET}"),
         format!(
             "memory    {}/{}  {}  {}",
             memory_stats.line_count,
@@ -201,13 +192,13 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
     for (i, logo_line) in logo_lines.iter().enumerate() {
         if i < meta_lines.len() {
             println!(
-                "  {GREEN}{:<width$}{RESET}  {}",
+                "  {GOOD}{:<width$}{RESET}  {}",
                 logo_line,
                 meta_lines[i],
                 width = logo_width,
             );
         } else {
-            println!("  {GREEN}{logo_line}{RESET}");
+            println!("  {GOOD}{logo_line}{RESET}");
         }
     }
 
@@ -217,7 +208,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
     }
 
     println!("  v{version}");
-    println!("{SEPARATOR}");
+    println!("{DIM}{SEPARATOR}{RESET}");
 
     // Memory Health
     println!();
@@ -249,7 +240,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
 
     // Warnings
     for warning in &health.warnings {
-        println!("  {YELLOW}!{RESET} {warning}");
+        println!("  {WARN}!{RESET} {warning}");
     }
 
     // Recent Sessions
@@ -328,7 +319,7 @@ pub fn search_lines(recall: &RecallEcho, query: &str) -> Result<(), RecallError>
         }
 
         if !file_matches.is_empty() {
-            println!("\n  {CYAN}{filename}{RESET}");
+            println!("\n  {ACCENT}{filename}{RESET}");
             for (line_num, line) in file_matches.iter().take(5) {
                 let display = if line.len() > 100 {
                     format!("{}...", &line[..97])
@@ -436,7 +427,7 @@ pub fn search_ranked(recall: &RecallEcho, query: &str) -> Result<(), RecallError
 
     for (score, file, previews) in scored.iter().take(10) {
         let filename = file.file_name().unwrap_or_default().to_string_lossy();
-        println!("  {CYAN}{filename}{RESET}  {DIM}(score: {score:.1}){RESET}");
+        println!("  {ACCENT}{filename}{RESET}  {DIM}(score: {score:.1}){RESET}");
         for preview in previews {
             println!("    {DIM}{preview}{RESET}");
         }
@@ -465,12 +456,12 @@ pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), RecallE
     println!();
     if line_count > (max_lines * 85 / 100) {
         println!(
-            "  {YELLOW}!{RESET} MEMORY.md at {line_count}/{max_lines} lines ({}%) — cleanup recommended",
+            "  {WARN}!{RESET} MEMORY.md at {line_count}/{max_lines} lines ({}%) — cleanup recommended",
             line_count * 100 / max_lines,
         );
     } else {
         println!(
-            "  MEMORY.md at {line_count}/{max_lines} lines ({}%) — {GREEN}healthy{RESET}",
+            "  MEMORY.md at {line_count}/{max_lines} lines ({}%) — {GOOD}healthy{RESET}",
             line_count * 100 / max_lines,
         );
         println!();
@@ -562,7 +553,7 @@ pub fn auto_distill(recall: &RecallEcho, max_lines: usize) -> Result<(), RecallE
     println!();
     for (name, size, path) in &extractions {
         let rel = path.file_name().unwrap_or_default().to_string_lossy();
-        println!("  {GREEN}→{RESET} {name} ({size} lines) → memory/{rel}");
+        println!("  {GOOD}→{RESET} {name} ({size} lines) → memory/{rel}");
     }
 
     let new_line_count = new_content.lines().count();
@@ -751,22 +742,25 @@ pub fn parse_ephemeral_entries(recall: &RecallEcho) -> Vec<EphemeralEntry> {
         .collect()
 }
 
+/// Which token the memory bar wears: red past 90 %, yellow past 75 %.
+fn bar_paint(count: usize, max: usize) -> Paint {
+    if count > max * 90 / 100 {
+        BAD
+    } else if count > max * 75 / 100 {
+        WARN
+    } else {
+        GOOD
+    }
+}
+
 fn memory_bar(count: usize, max: usize) -> String {
     let width = 10;
     let filled = (count * width).checked_div(max).map_or(0, |f| f.min(width));
     let empty = width - filled;
 
-    let color = if count > max * 90 / 100 {
-        RED
-    } else if count > max * 75 / 100 {
-        YELLOW
-    } else {
-        GREEN
-    };
-
     format!(
         "{}{}{}{}",
-        color,
+        bar_paint(count, max),
         "\u{2588}".repeat(filled),
         "\u{2591}".repeat(empty),
         RESET
@@ -910,14 +904,18 @@ mod tests {
 
     #[test]
     fn memory_bar_colors() {
+        assert_eq!(bar_paint(50, 200), GOOD);
+        assert_eq!(bar_paint(150, 200), GOOD);
+        assert_eq!(bar_paint(160, 200), WARN);
+        assert_eq!(bar_paint(180, 200), WARN);
+        assert_eq!(bar_paint(190, 200), BAD);
+    }
+
+    #[test]
+    fn memory_bar_fill_is_proportional() {
         let bar = memory_bar(50, 200);
-        assert!(bar.contains(GREEN));
-
-        let bar = memory_bar(160, 200);
-        assert!(bar.contains(YELLOW));
-
-        let bar = memory_bar(190, 200);
-        assert!(bar.contains(RED));
+        assert_eq!(bar.matches('\u{2588}').count(), 2);
+        assert_eq!(bar.matches('\u{2591}').count(), 8);
     }
 
     #[test]

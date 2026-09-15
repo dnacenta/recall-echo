@@ -50,15 +50,8 @@ use crate::agent_cli::{self, AgentCli, McpReport, McpStatus};
 use crate::config::{self, Config, LlmSection, Provider};
 use crate::error::RecallError;
 use crate::paths;
+use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
 use crate::transcript::Source;
-
-// ANSI color helpers
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
 
 const MEMORY_TEMPLATE: &str = "# Memory\n\n\
 <!-- recall-echo: Curated memory. Distilled facts, preferences, patterns. -->\n\
@@ -80,9 +73,9 @@ enum Status {
 
 fn print_status(status: Status, msg: &str) {
     match status {
-        Status::Created => eprintln!("  {GREEN}✓{RESET} {msg}"),
-        Status::Exists => eprintln!("  {YELLOW}~{RESET} {msg}"),
-        Status::Error => eprintln!("  {RED}✗{RESET} {msg}"),
+        Status::Created => eprintln!("  {GOOD}✓{RESET} {msg}"),
+        Status::Exists => eprintln!("  {WARN}~{RESET} {msg}"),
+        Status::Error => eprintln!("  {BAD}✗{RESET} {msg}"),
     }
 }
 
@@ -157,7 +150,7 @@ fn select_provider(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Option<Pr
         }
         [] => {
             eprintln!(
-                "\n  {YELLOW}~{RESET} No agent CLI found. Extraction needs a model provider — \
+                "\n  {WARN}~{RESET} No agent CLI found. Extraction needs a model provider — \
                  {BOLD}ollama{RESET} is the free, local option."
             );
             prompt_any_provider(reader)
@@ -239,7 +232,7 @@ fn prompt_installed_cli(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Opti
     if let Some(cli) = detected.iter().find(|cli| cli.label() == answer) {
         return Some(cli.provider());
     }
-    eprintln!("  {YELLOW}~{RESET} Unknown choice, defaulting to {default}");
+    eprintln!("  {WARN}~{RESET} Unknown choice, defaulting to {default}");
     Some(default.provider())
 }
 
@@ -283,7 +276,7 @@ fn prompt_any_provider(reader: &mut dyn BufRead) -> Option<Provider> {
         "6" | "codex" => Some(Provider::Codex),
         "7" | "skip" => None,
         _ => {
-            eprintln!("  {YELLOW}~{RESET} Unknown choice, defaulting to anthropic");
+            eprintln!("  {WARN}~{RESET} Unknown choice, defaulting to anthropic");
             Some(Provider::Anthropic)
         }
     }

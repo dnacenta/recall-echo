@@ -300,3 +300,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod source_scan {
+    use std::path::Path;
+
+    fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `src/theme.rs` is the only file allowed to spell out an escape.
+    #[test]
+    fn no_raw_escapes_outside_theme() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        assert!(files.len() > 30, "scan found only {} files", files.len());
+        let offenders: Vec<_> = files
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n != "theme.rs"))
+            .filter(|p| std::fs::read_to_string(p).expect("read").contains("\\x1b["))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "raw ANSI escapes outside theme.rs: {offenders:?}"
+        );
+    }
+}

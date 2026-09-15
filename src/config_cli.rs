@@ -10,10 +10,7 @@ use crate::cli_provider::CliSpec;
 use crate::config::{self, Provider};
 use crate::error::RecallError;
 
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[32m";
-const RESET: &str = "\x1b[0m";
+use crate::theme::{BOLD, DIM, GOOD, RESET};
 
 /// Display current configuration.
 pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
@@ -188,7 +185,7 @@ pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError>
     cfg.set_key(key, value)?;
     config::save(memory_dir, &cfg)?;
 
-    eprintln!("{GREEN}✓{RESET} Set {BOLD}{key}{RESET} = {BOLD}{value}{RESET}");
+    eprintln!("{GOOD}✓{RESET} Set {BOLD}{key}{RESET} = {BOLD}{value}{RESET}");
 
     // Show what the new provider resolves to — a CLI provider has no API base,
     // and what matters instead is the call it will make.

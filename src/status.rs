@@ -15,12 +15,7 @@ use crate::ephemeral;
 use crate::error::RecallError;
 use crate::paths;
 
-const BOLD: &str = "\x1b[1m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
 
 pub fn run() -> Result<(), RecallError> {
     run_with_base(&paths::entity_root()?)
@@ -41,10 +36,10 @@ pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {
         && memory.join("EPHEMERAL.md").exists()
         && memory.join("MEMORY.md").exists()
     {
-        format!("{GREEN}healthy{RESET}")
+        format!("{GOOD}healthy{RESET}")
     } else {
         issues.push("Run `recall-echo init` to complete setup".to_string());
-        format!("{YELLOW}incomplete{RESET}")
+        format!("{WARN}incomplete{RESET}")
     };
 
     eprintln!("\n{BOLD}recall-echo{RESET} — {overall}\n");
@@ -59,11 +54,11 @@ pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {
         let pct = (lines as f32 / 200.0 * 100.0) as u32;
         let bar = progress_bar(pct, 4);
         let color = if pct > 90 {
-            RED
+            BAD
         } else if pct > 70 {
-            YELLOW
+            WARN
         } else {
-            GREEN
+            GOOD
         };
         eprintln!("  MEMORY.md       {color}{lines}/200 lines ({pct}%){RESET}  {bar}");
         if pct > 70 {
@@ -117,10 +112,10 @@ pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {
     // Issues
     eprintln!();
     if issues.is_empty() {
-        eprintln!("  {GREEN}No issues detected.{RESET}");
+        eprintln!("  {GOOD}No issues detected.{RESET}");
     } else {
         for issue in &issues {
-            eprintln!("  {YELLOW}!{RESET} {issue}");
+            eprintln!("  {WARN}!{RESET} {issue}");
         }
     }
     eprintln!();
