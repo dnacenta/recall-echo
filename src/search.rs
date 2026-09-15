@@ -8,7 +8,6 @@ use std::path::Path;
 
 use crate::error::RecallError;
 use crate::paths;
-
 use crate::theme::{ACCENT, BOLD, DIM, RESET, WARN};
 
 /// Query tokens shorter than this never qualify a file on their own. They are
@@ -368,16 +367,17 @@ fn highlight_match(line: &str, query: &str) -> String {
     let lower_line = line.to_lowercase();
     let lower_query = query.to_lowercase();
 
-    let mut result = String::new();
+    let mode = crate::theme::mode();
+    let mut result = String::with_capacity(line.len() + 32);
     let mut pos = 0;
 
     while let Some(found) = lower_line[pos..].find(&lower_query) {
         let abs_pos = pos + found;
         result.push_str(&line[pos..abs_pos]);
-        result.push_str(&WARN.to_string());
-        result.push_str(&BOLD.to_string());
+        result.push_str(WARN.in_mode(mode));
+        result.push_str(BOLD.in_mode(mode));
         result.push_str(&line[abs_pos..abs_pos + query.len()]);
-        result.push_str(&RESET.to_string());
+        result.push_str(RESET.in_mode(mode));
         pos = abs_pos + query.len();
     }
     result.push_str(&line[pos..]);

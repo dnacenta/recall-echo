@@ -9,7 +9,6 @@ use std::path::Path;
 use crate::cli_provider::CliSpec;
 use crate::config::{self, Provider};
 use crate::error::RecallError;
-
 use crate::theme::{BOLD, DIM, GOOD, RESET};
 
 /// Display current configuration.

@@ -17,7 +17,6 @@ use crate::serve::{
     TraverseArgs,
 };
 use crate::serve_client;
-
 use crate::theme::{ACCENT, BAD, BOLD, DIM, GOOD, RESET, WARN};
 
 /// Initialize the graph store at {memory_dir}/graph/.

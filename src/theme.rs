@@ -15,9 +15,11 @@
 //! background and the default text color; recall-echo is line-oriented
 //! output inside the user's shell, not a full-screen app.
 //!
-//! This module is the only place in `src/` allowed to contain a raw
-//! `\x1b[` escape — a test enforces it.
+//! This module is the only place in `src/` allowed to spell out an escape
+//! (`\x1b[` or `\u{1b}[`) — a test enforces it. The one exception is
+//! `agent_cli.rs`, which strips escapes from captured CLI output.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
@@ -36,18 +38,22 @@ pub enum Mode {
 /// Decide the color mode from environment and stream state.
 ///
 /// Pure — `env` is injected so the precedence table can be unit tested
-/// without touching the process environment or a real tty. Precedence,
-/// first match wins:
+/// without touching the process environment or a real tty. It yields the
+/// raw `OsString` so that a non-UTF-8 value still counts as *set*: an
+/// unreadable `NO_COLOR` must fail closed (plain), not open. An empty
+/// value counts as unset for every variable, per no-color.org ("present
+/// and not an empty string"). Precedence, first match wins:
 ///
-/// 1. `CLICOLOR_FORCE` set and not `"0"` → color regardless of tty/NO_COLOR
-/// 2. `NO_COLOR` set (any value, including empty) → [`Mode::Plain`]
-/// 3. `TERM` unset or `"dumb"` → [`Mode::Plain`]
-/// 4. stdout not a tty → [`Mode::Plain`]
+/// 1. `CLICOLOR_FORCE` non-empty and not `"0"` → color regardless of tty/NO_COLOR
+/// 2. `NO_COLOR` non-empty (any bytes) → [`Mode::Plain`]
+/// 3. `TERM` unset, empty or `"dumb"` → [`Mode::Plain`]
+/// 4. stdout or stderr not a tty → [`Mode::Plain`]
 /// 5. `COLORTERM` is `truecolor` / `24bit` → [`Mode::Truecolor`]
 /// 6. otherwise → [`Mode::Ansi256`]
-pub fn resolve(env: impl Fn(&str) -> Option<String>, stdout_is_tty: bool) -> Mode {
+pub fn resolve(env: impl Fn(&str) -> Option<OsString>, both_streams_tty: bool) -> Mode {
+    let env = |k: &str| env(k).filter(|v| !v.is_empty());
     let colored = || {
-        if env("COLORTERM").is_some_and(|v| matches!(v.as_str(), "truecolor" | "24bit")) {
+        if env("COLORTERM").is_some_and(|v| matches!(v.to_str(), Some("truecolor" | "24bit"))) {
             Mode::Truecolor
         } else {
             Mode::Ansi256
@@ -65,17 +71,24 @@ pub fn resolve(env: impl Fn(&str) -> Option<String>, stdout_is_tty: bool) -> Mod
         Some(t) if t == "dumb" => return Mode::Plain,
         Some(_) => {}
     }
-    if !stdout_is_tty {
+    if !both_streams_tty {
         return Mode::Plain;
     }
     colored()
 }
 
-/// The process-wide mode, resolved once from the real environment and
-/// stdout on first use.
+/// The process-wide mode, resolved once from the real environment on
+/// first use. Color needs both stdout and stderr to be terminals: painted
+/// text goes to either stream, and a redirected one must never receive
+/// escapes.
 pub fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| resolve(|k| std::env::var(k).ok(), std::io::stdout().is_terminal()))
+    *MODE.get_or_init(|| {
+        resolve(
+            |k| std::env::var_os(k),
+            std::io::stdout().is_terminal() && std::io::stderr().is_terminal(),
+        )
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,15 +120,6 @@ pub static DIM: Paint = Paint(Token::Dim);
 pub static BOLD: Paint = Paint(Token::Bold);
 /// Back to the terminal's defaults.
 pub static RESET: Paint = Paint(Token::Reset);
-
-/// Gruvbox Dark hex values, byte-identical to pulse-null's `GRUVBOX_DARK`.
-pub const GRUVBOX_HEX: [(&str, u32); 5] = [
-    ("GOOD", 0xb8bb26),
-    ("WARN", 0xfabd2f),
-    ("BAD", 0xfb4934),
-    ("ACCENT", 0x8ec07c),
-    ("DIM", 0x928374),
-];
 
 impl Paint {
     /// The escape this token writes in `mode`. [`Mode::Plain`] is always `""`.
@@ -150,12 +154,21 @@ mod tests {
     use super::*;
 
     const ALL: [Paint; 7] = [GOOD, WARN, BAD, ACCENT, DIM, BOLD, RESET];
+
+    /// Gruvbox Dark hex values, byte-identical to pulse-null's `GRUVBOX_DARK`.
+    const GRUVBOX_HEX: [(&str, u32); 5] = [
+        ("GOOD", 0xb8bb26),
+        ("WARN", 0xfabd2f),
+        ("BAD", 0xfb4934),
+        ("ACCENT", 0x8ec07c),
+        ("DIM", 0x928374),
+    ];
     const COLORS: [Paint; 5] = [GOOD, WARN, BAD, ACCENT, DIM];
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let owned: Vec<(String, String)> = pairs
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let owned: Vec<(String, OsString)> = pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
             .collect();
         move |k| {
             owned
@@ -165,15 +178,41 @@ mod tests {
         }
     }
 
+    /// `NO_COLOR` holding bytes that are not UTF-8 is still *set*.
+    #[test]
+    fn resolve_no_color_non_utf8_is_plain() {
+        use std::os::unix::ffi::OsStringExt;
+        let env = |k: &str| match k {
+            "NO_COLOR" => Some(OsString::from_vec(vec![0xff])),
+            "TERM" => Some(OsString::from("xterm")),
+            "COLORTERM" => Some(OsString::from("truecolor")),
+            _ => None,
+        };
+        assert_eq!(resolve(env, true), Mode::Plain);
+    }
+
     // ── resolve() precedence table ──────────────────────────────────
 
+    /// no-color.org: an empty `NO_COLOR` is "not set".
     #[test]
-    fn resolve_no_color_empty_is_plain() {
+    fn resolve_no_color_empty_is_unset() {
         let env = env_of(&[
             ("TERM", "xterm"),
             ("COLORTERM", "truecolor"),
             ("NO_COLOR", ""),
         ]);
+        assert_eq!(resolve(env, true), Mode::Truecolor);
+    }
+
+    #[test]
+    fn resolve_clicolor_force_empty_is_unset() {
+        let env = env_of(&[("CLICOLOR_FORCE", ""), ("TERM", "xterm")]);
+        assert_eq!(resolve(env, false), Mode::Plain);
+    }
+
+    #[test]
+    fn resolve_term_empty_is_plain() {
+        let env = env_of(&[("TERM", ""), ("COLORTERM", "truecolor")]);
         assert_eq!(resolve(env, true), Mode::Plain);
     }
 
@@ -316,17 +355,34 @@ mod source_scan {
         }
     }
 
-    /// `src/theme.rs` is the only file allowed to spell out an escape.
+    /// `src/theme.rs` is the only file allowed to spell out an escape, in
+    /// any Rust spelling or as a literal ESC byte. `agent_cli.rs` is exempt: it strips escapes
+    /// from captured output and carries a fixture to prove it.
     #[test]
     fn no_raw_escapes_outside_theme() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         rs_files(&src, &mut files);
-        assert!(files.len() > 30, "scan found only {} files", files.len());
+        assert!(
+            !files.is_empty(),
+            "scan walked nothing — CARGO_MANIFEST_DIR wrong?"
+        );
+        let exempt = [src.join("theme.rs"), src.join("agent_cli.rs")];
+        let needles = [
+            "\\x1b[",
+            "\\x1B[",
+            "\\u{1b}[",
+            "\\u{1B}[",
+            "\\u{001b}[",
+            "\u{1b}[",
+        ];
         let offenders: Vec<_> = files
             .iter()
-            .filter(|p| p.file_name().is_some_and(|n| n != "theme.rs"))
-            .filter(|p| std::fs::read_to_string(p).expect("read").contains("\\x1b["))
+            .filter(|p| !exempt.contains(p))
+            .filter(|p| {
+                let src = std::fs::read_to_string(p).expect("read");
+                needles.iter().any(|needle| src.contains(needle))
+            })
             .collect();
         assert!(
             offenders.is_empty(),

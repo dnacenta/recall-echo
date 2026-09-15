@@ -14,7 +14,6 @@ use crate::config;
 use crate::ephemeral;
 use crate::error::RecallError;
 use crate::paths;
-
 use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
 
 pub fn run() -> Result<(), RecallError> {

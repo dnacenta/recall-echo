@@ -8,7 +8,6 @@ use std::path::Path;
 
 use crate::error::RecallError;
 use crate::paths;
-
 use crate::theme::{BOLD, DIM, RESET, WARN};
 
 /// Analyze MEMORY.md and suggest distillation actions.

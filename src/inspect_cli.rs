@@ -28,7 +28,6 @@ use crate::graph::inspect::{
 use crate::graph::types::MatchSource;
 use crate::serve::{AboutArgs, OverviewArgs, Request};
 use crate::serve_client;
-
 use crate::theme::{ACCENT, BOLD, DIM, RESET, WARN};
 
 /// Longest abstract shown whole. Anything longer is a paragraph, and this is a
