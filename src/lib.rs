@@ -53,6 +53,7 @@ mod serve_security;
 pub mod status;
 pub mod summarize;
 pub mod tags;
+pub mod theme;
 pub mod transcript;
 
 pub mod graph;
