@@ -8,7 +8,7 @@
 //! 1. **Entity mode** (pulse-null) — entity_root/memory/ layout
 //! 2. **Claude mode** (standalone) — ~/.claude/ layout for Claude Code hooks
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::RecallError;
 
@@ -144,34 +144,89 @@ fn looks_initialized(root: &std::path::Path) -> bool {
     root.join("memory").join("conversations").exists() || root.join("conversations").exists()
 }
 
+/// Which arm of the flagless root resolution won.
+///
+/// Shared by the commands (`entity_root`) and the capture hooks
+/// (`hook_entity_root`) so both answer "where is the store?" the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pin {
+    /// `RECALL_ECHO_HOME` — taken as given, no existence check.
+    Env(PathBuf),
+    /// The cwd carries an initialised layout (pulse-null entities run with
+    /// cwd = entity home).
+    Cwd(PathBuf),
+    /// The root a previous `init` persisted, and it still looks initialised.
+    Persisted(PathBuf),
+    /// Nothing pinned. `stale` names a persisted root that failed the
+    /// initialised check, so the caller can say so instead of silently
+    /// reading a directory `init` never wrote to (#59 leaves `/tmp` paths).
+    None { stale: Option<PathBuf> },
+}
+
+/// The pure resolution behind [`entity_root`] and [`hook_entity_root`]:
+///
+/// 1. `env_home` (`RECALL_ECHO_HOME`) when non-blank,
+/// 2. `cwd` when `initialised(cwd)`,
+/// 3. `persisted` when `initialised(persisted)`,
+/// 4. otherwise [`Pin::None`], carrying a stale `persisted` if there was one.
+///
+/// Takes every input as a parameter so tests never read the real
+/// environment or the real persisted file.
+pub(crate) fn entity_root_from(
+    env_home: Option<&str>,
+    cwd: Option<&Path>,
+    persisted: Option<&Path>,
+    initialised: impl Fn(&Path) -> bool,
+) -> Pin {
+    if let Some(home) = env_home {
+        if !home.trim().is_empty() {
+            return Pin::Env(PathBuf::from(home));
+        }
+    }
+    if let Some(dir) = cwd {
+        if initialised(dir) {
+            return Pin::Cwd(dir.to_path_buf());
+        }
+    }
+    match persisted {
+        Some(root) if initialised(root) => Pin::Persisted(root.to_path_buf()),
+        Some(root) => Pin::None {
+            stale: Some(root.to_path_buf()),
+        },
+        None => Pin::None { stale: None },
+    }
+}
+
+/// [`entity_root_from`] over the real environment, cwd and persisted file.
+fn pin_from_environment() -> Pin {
+    let env_home = std::env::var("RECALL_ECHO_HOME").ok();
+    let cwd = std::env::current_dir().ok();
+    let persisted = persisted_entity_root();
+    entity_root_from(
+        env_home.as_deref(),
+        cwd.as_deref(),
+        persisted.as_deref(),
+        looks_initialized,
+    )
+}
+
 /// Entity root for a capture hook (`archive-session`, `checkpoint`,
 /// `consume`) that may not have received an explicit `--entity-root`.
 ///
-/// Resolution order:
-/// 1. the explicit flag,
-/// 2. `RECALL_ECHO_HOME`,
-/// 3. the cwd, when it is an initialized root (pulse-null entities run
-///    with cwd = entity home),
-/// 4. the root persisted by `recall-echo init`.
-///
-/// `None` means nothing is pinned anywhere — the caller falls back to the
-/// legacy `~/.claude` and should say so out loud rather than no-op silently.
+/// Resolution order: the explicit flag, then [`entity_root_from`] — the
+/// same chain the commands use. `None` means nothing is pinned anywhere —
+/// the caller falls back to the legacy `~/.claude` and should say so out
+/// loud rather than no-op silently. A persisted root that no longer looks
+/// initialised counts as nothing pinned.
 #[must_use]
-pub fn hook_entity_root(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+pub fn hook_entity_root(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
-    if let Ok(p) = std::env::var("RECALL_ECHO_HOME") {
-        if !p.trim().is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    match pin_from_environment() {
+        Pin::Env(p) | Pin::Cwd(p) | Pin::Persisted(p) => Some(p),
+        Pin::None { .. } => None,
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if looks_initialized(&cwd) {
-            return Some(cwd);
-        }
-    }
-    persisted_entity_root()
 }
 
 /// `hook_base_dir` behind the full flagless resolution, warning loudly on the
@@ -292,5 +347,62 @@ mod tests {
         let claude = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(claude.path().join("conversations")).unwrap();
         assert!(looks_initialized(claude.path()));
+    }
+
+    fn initialised_if(target: &Path) -> impl Fn(&Path) -> bool + '_ {
+        move |p| p == target
+    }
+
+    #[test]
+    fn env_home_wins_over_everything() {
+        let cwd = Path::new("/cwd");
+        let persisted = Path::new("/persisted");
+        let pin = entity_root_from(Some("/env"), Some(cwd), Some(persisted), |_| true);
+        assert_eq!(pin, Pin::Env(PathBuf::from("/env")));
+    }
+
+    #[test]
+    fn empty_env_home_is_unset() {
+        let cwd = Path::new("/cwd");
+        let pin = entity_root_from(Some("  "), Some(cwd), None, |_| true);
+        assert_eq!(pin, Pin::Cwd(cwd.to_path_buf()));
+    }
+
+    #[test]
+    fn initialised_cwd_beats_persisted() {
+        let cwd = Path::new("/cwd");
+        let persisted = Path::new("/persisted");
+        let pin = entity_root_from(None, Some(cwd), Some(persisted), |_| true);
+        assert_eq!(pin, Pin::Cwd(cwd.to_path_buf()));
+    }
+
+    #[test]
+    fn persisted_root_used_when_cwd_not_initialised() {
+        let cwd = Path::new("/cwd");
+        let persisted = Path::new("/persisted");
+        let pin = entity_root_from(None, Some(cwd), Some(persisted), initialised_if(persisted));
+        assert_eq!(pin, Pin::Persisted(persisted.to_path_buf()));
+    }
+
+    #[test]
+    fn stale_persisted_root_is_reported_not_used() {
+        let cwd = Path::new("/cwd");
+        let persisted = Path::new("/tmp/.tmpGone");
+        let pin = entity_root_from(None, Some(cwd), Some(persisted), |_| false);
+        assert_eq!(
+            pin,
+            Pin::None {
+                stale: Some(persisted.to_path_buf())
+            }
+        );
+    }
+
+    #[test]
+    fn nothing_pinned_is_none() {
+        let cwd = Path::new("/cwd");
+        let pin = entity_root_from(None, Some(cwd), None, |_| false);
+        assert_eq!(pin, Pin::None { stale: None });
+        let pin = entity_root_from(None, None, None, |_| true);
+        assert_eq!(pin, Pin::None { stale: None });
     }
 }
