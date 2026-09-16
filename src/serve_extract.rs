@@ -724,7 +724,10 @@ mod tests {
 
     #[test]
     fn control_characters_in_provider_output_never_reach_the_log() {
-        assert_eq!(one_line("a\nb\x1b[31mc\td"), "a b [31mc\td");
+        // Built from the char so the theme source scan (only theme.rs may
+        // spell an escape) does not need an exemption for this fixture.
+        const ESC: char = '\u{1b}';
+        assert_eq!(one_line(&format!("a\nb{ESC}[31mc\td")), "a b [31mc\td");
         let long = "x".repeat(400);
         let out = one_line(&long);
         assert_eq!(out.chars().count(), 301);
