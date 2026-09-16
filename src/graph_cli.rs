@@ -17,20 +17,14 @@ use crate::serve::{
     TraverseArgs,
 };
 use crate::serve_client;
-
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+use crate::theme::{ACCENT, BAD, BOLD, DIM, GOOD, RESET, WARN};
 
 /// Initialize the graph store at {memory_dir}/graph/.
 pub async fn init(memory_dir: &Path) -> Result<(), RecallError> {
     let graph_dir = memory_dir.join("graph");
     serve_client::exclusive(memory_dir, |_graph| async { Ok(()) }).await?;
     println!(
-        "{GREEN}✓{RESET} Graph store initialized at {}",
+        "{GOOD}✓{RESET} Graph store initialized at {}",
         graph_dir.display()
     );
     Ok(())
@@ -101,7 +95,7 @@ fn zero_entity_explanation(
     if stats.unextracted_log_count > 0 {
         let _ = writeln!(
             out,
-            "\n  {YELLOW}No entities yet.{RESET} Episodes are ingested automatically; turning"
+            "\n  {WARN}No entities yet.{RESET} Episodes are ingested automatically; turning"
         );
         let _ = writeln!(out, "  them into entities is a separate LLM pass.");
         let _ = writeln!(
@@ -127,7 +121,7 @@ fn zero_entity_explanation(
     if stats.log_number_absent > 0 {
         let _ = writeln!(
             out,
-            "\n  {YELLOW}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
+            "\n  {WARN}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
         );
         let _ = writeln!(
             out,
@@ -158,7 +152,7 @@ fn zero_entity_explanation(
         // pass swept the graph — not a breakage, and not a bug report.
         let _ = writeln!(
             out,
-            "\n  {YELLOW}Extraction is up to date but produced no entities.{RESET}"
+            "\n  {WARN}Extraction is up to date but produced no entities.{RESET}"
         );
         let _ = writeln!(
             out,
@@ -202,7 +196,7 @@ pub async fn daemon_status(memory_dir: &Path) -> Result<(), RecallError> {
     );
     match serve_client::daemon_info(memory_dir).await? {
         Some(info) => {
-            println!("  State:  {GREEN}running{RESET}");
+            println!("  State:  {GOOD}running{RESET}");
             println!("  Pid:    {}", info.pid);
             println!("  Version: {}", info.version);
             println!("  Uptime: {}s", info.uptime_secs);
@@ -211,7 +205,7 @@ pub async fn daemon_status(memory_dir: &Path) -> Result<(), RecallError> {
         None if serve_client::graph_mode(memory_dir) == "server" => {
             println!("  State:  not used — [graph] mode = server");
         }
-        None => println!("  State:  {YELLOW}not running{RESET}"),
+        None => println!("  State:  {WARN}not running{RESET}"),
     }
     println!(
         "  Log:    {}",
@@ -224,18 +218,18 @@ pub async fn daemon_status(memory_dir: &Path) -> Result<(), RecallError> {
 fn print_extraction_lines(status: &crate::serve::ExtractionStatus) {
     if !status.enabled {
         let reason = status.disabled_reason.as_deref().unwrap_or("not running");
-        println!("  Extraction: {YELLOW}off{RESET} — {DIM}{reason}{RESET}");
+        println!("  Extraction: {WARN}off{RESET} — {DIM}{reason}{RESET}");
         return;
     }
     match status.last_run_secs_ago {
         Some(secs) => println!(
-            "  Extraction: {GREEN}on{RESET} — {} archives in {} runs, last {}s ago ({}ms)",
+            "  Extraction: {GOOD}on{RESET} — {} archives in {} runs, last {}s ago ({}ms)",
             status.archives,
             status.runs,
             secs,
             status.last_run_ms.unwrap_or(0)
         ),
-        None => println!("  Extraction: {GREEN}on{RESET} — nothing extracted yet"),
+        None => println!("  Extraction: {GOOD}on{RESET} — nothing extracted yet"),
     }
     if let Some(error) = &status.last_error {
         println!("  {DIM}Last extraction error: {error}{RESET}");
@@ -245,9 +239,9 @@ fn print_extraction_lines(status: &crate::serve::ExtractionStatus) {
 /// Stop the daemon serving this graph, if one is running.
 pub async fn daemon_stop(memory_dir: &Path) -> Result<(), RecallError> {
     if serve_client::stop_daemon(memory_dir).await? {
-        println!("{GREEN}✓{RESET} Graph daemon stopped");
+        println!("{GOOD}✓{RESET} Graph daemon stopped");
     } else {
-        println!("{YELLOW}No graph daemon running.{RESET}");
+        println!("{WARN}No graph daemon running.{RESET}");
     }
     Ok(())
 }
@@ -272,7 +266,7 @@ pub async fn add_entity(
         serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
-        "{GREEN}✓{RESET} Created entity: {BOLD}{}{RESET} ({}) [{}]",
+        "{GOOD}✓{RESET} Created entity: {BOLD}{}{RESET} ({}) [{}]",
         entity.name,
         entity.entity_type,
         entity.id_string()
@@ -300,7 +294,7 @@ pub async fn relate(
         serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
-        "{GREEN}✓{RESET} {from} {CYAN}—[{rel_type}]→{RESET} {to} [{}]",
+        "{GOOD}✓{RESET} {from} {ACCENT}—[{rel_type}]→{RESET} {to} [{}]",
         rel.id_string()
     );
     Ok(())
@@ -324,7 +318,7 @@ pub async fn search(
         serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     if results.is_empty() {
-        println!("{YELLOW}No results.{RESET}");
+        println!("{WARN}No results.{RESET}");
         return Ok(());
     }
 
@@ -373,14 +367,14 @@ pub async fn ingest(
         serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     println!(
-        "{GREEN}✓{RESET} Ingested {}: {} episodes created {DIM}(provenance: {}){RESET}",
+        "{GOOD}✓{RESET} Ingested {}: {} episodes created {DIM}(provenance: {}){RESET}",
         archive_path.display(),
         report.episodes_created,
         provenance_label(provenance)
     );
     if !report.errors.is_empty() {
         for err in &report.errors {
-            println!("  {YELLOW}warning:{RESET} {err}");
+            println!("  {WARN}warning:{RESET} {err}");
         }
     }
     Ok(())
@@ -421,7 +415,7 @@ pub async fn ingest_all(
     files.sort_by_key(|e| e.file_name());
 
     if files.is_empty() {
-        println!("{YELLOW}No conversation archives found.{RESET}");
+        println!("{WARN}No conversation archives found.{RESET}");
         return Ok(());
     }
 
@@ -451,14 +445,14 @@ pub async fn ingest_all(
             ingested += 1;
 
             println!(
-                "  {GREEN}✓{RESET} {} — {} episodes",
+                "  {GOOD}✓{RESET} {} — {} episodes",
                 path.file_name().unwrap_or_default().to_string_lossy(),
                 report.episodes_created
             );
         }
 
         println!(
-            "\n{GREEN}✓{RESET} Ingested {ingested} archives ({total_episodes} episodes), skipped {skipped} already ingested {DIM}(provenance: {}){RESET}",
+            "\n{GOOD}✓{RESET} Ingested {ingested} archives ({total_episodes} episodes), skipped {skipped} already ingested {DIM}(provenance: {}){RESET}",
             provenance_label(provenance)
         );
         Ok(())
@@ -541,7 +535,7 @@ pub async fn hybrid_query(
         serde_json::from_value(serve_client::execute(memory_dir, &request).await?)?;
 
     if result.entities.is_empty() && result.episodes.is_empty() {
-        println!("{YELLOW}No results.{RESET}");
+        println!("{WARN}No results.{RESET}");
         return Ok(());
     }
 
@@ -643,9 +637,9 @@ fn print_extract_summary(totals: &ExtractionTotals) {
     let nothing_done = totals.processed == 0
         && (!totals.left_pending.is_empty() || !totals.quarantined.is_empty());
     let mark = if nothing_done {
-        format!("{YELLOW}✗{RESET}")
+        format!("{WARN}✗{RESET}")
     } else {
-        format!("{GREEN}✓{RESET}")
+        format!("{GOOD}✓{RESET}")
     };
     println!(
         "\n{mark} Done: {} archives — +{} created, ~{} merged, -{} skipped, {} relationships",
@@ -669,19 +663,19 @@ fn print_extract_summary(totals: &ExtractionTotals) {
 
     if !totals.quarantined.is_empty() {
         println!(
-            "  {YELLOW}Quarantined: {} archives{RESET}",
+            "  {WARN}Quarantined: {} archives{RESET}",
             totals.quarantined.len()
         );
     }
     if !totals.left_pending.is_empty() {
         println!(
-            "  {YELLOW}Left pending (every chunk failed): {} archives{RESET} — fix the provider and re-run",
+            "  {WARN}Left pending (every chunk failed): {} archives{RESET} — fix the provider and re-run",
             totals.left_pending.len()
         );
     }
 
     if !totals.errors.is_empty() {
-        println!("\n{YELLOW}Warnings ({}):{RESET}", totals.errors.len());
+        println!("\n{WARN}Warnings ({}):{RESET}", totals.errors.len());
         for err in totals.errors.iter().take(10) {
             println!("  {DIM}{err}{RESET}");
         }
@@ -758,7 +752,7 @@ pub async fn extract(
         };
 
         if log_numbers.is_empty() {
-            println!("{YELLOW}No unextracted archives found.{RESET}");
+            println!("{WARN}No unextracted archives found.{RESET}");
             return Ok(());
         }
 
@@ -803,7 +797,7 @@ pub async fn extract(
             let spent = totals.measured_tokens + totals.estimated_tokens;
             if max_tokens > 0 && spent >= max_tokens {
                 println!(
-                    "\n{YELLOW}⚠ Token budget exhausted ({} of {}). Stopping.{RESET}",
+                    "\n{WARN}⚠ Token budget exhausted ({} of {}). Stopping.{RESET}",
                     format_token_bill(totals.measured_tokens, totals.estimated_tokens),
                     format_tokens(max_tokens),
                 );
@@ -815,7 +809,7 @@ pub async fn extract(
                 Ok(p) => p,
                 Err(e) => {
                     println!(
-                        "  {YELLOW}⚠{RESET} [{}/{}] log {ln:03}: {e}",
+                        "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: {e}",
                         idx + 1,
                         total_count
                     );
@@ -833,7 +827,7 @@ pub async fn extract(
                 Ok(r) => r,
                 Err(e) => {
                     println!(
-                        "  {YELLOW}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
+                        "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
                         idx + 1,
                         total_count
                     );
@@ -841,7 +835,7 @@ pub async fn extract(
                         Ok(r) => r,
                         Err(e2) => {
                             println!(
-                                "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
+                                "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
                                 idx + 1,
                                 total_count
                             );
@@ -868,7 +862,7 @@ pub async fn extract(
             // own ladder. Three in a row and we stop burning spawns.
             if report.is_total_failure() {
                 println!(
-                    "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
+                    "  {WARN}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
                     idx + 1,
                     total_count,
                     report.chunks_failed,
@@ -879,7 +873,7 @@ pub async fn extract(
                 consecutive_total_failures += 1;
                 if consecutive_total_failures >= MAX_CONSECUTIVE_TOTAL_FAILURES {
                     println!(
-                        "\n{YELLOW}✗ {MAX_CONSECUTIVE_TOTAL_FAILURES} archives failed outright in a row — the provider looks broken. Stopping.{RESET}"
+                        "\n{WARN}✗ {MAX_CONSECUTIVE_TOTAL_FAILURES} archives failed outright in a row — the provider looks broken. Stopping.{RESET}"
                     );
                     break;
                 }
@@ -894,13 +888,13 @@ pub async fn extract(
                 String::new()
             } else {
                 format!(
-                    ", {YELLOW}{} warning{}{RESET}",
+                    ", {WARN}{} warning{}{RESET}",
                     report.errors.len(),
                     if report.errors.len() == 1 { "" } else { "s" }
                 )
             };
             println!(
-                "  {GREEN}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({}){warn_label}",
+                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({}){warn_label}",
                 idx + 1,
                 total_count,
                 report.entities_created,
@@ -936,7 +930,7 @@ pub async fn extract(
                 writeln!(file, "{ln:03}")?;
             }
             println!(
-                "\n  {YELLOW}Quarantined {} archives → {}{RESET}",
+                "\n  {WARN}Quarantined {} archives → {}{RESET}",
                 totals.quarantined.len(),
                 quarantine_path.display()
             );
@@ -982,7 +976,7 @@ pub async fn vigil_sync(
         println!("  Skipped:       {}", report.skipped);
 
         if !report.errors.is_empty() {
-            println!("\n  {YELLOW}Warnings:{RESET}");
+            println!("\n  {WARN}Warnings:{RESET}");
             for err in &report.errors {
                 println!("    {DIM}{err}{RESET}");
             }
@@ -1050,7 +1044,7 @@ pub async fn pipeline_sync(
     );
 
     if !report.errors.is_empty() {
-        println!("\n  {YELLOW}Warnings:{RESET}");
+        println!("\n  {WARN}Warnings:{RESET}");
         for err in &report.errors {
             println!("    {DIM}{err}{RESET}");
         }
@@ -1092,7 +1086,7 @@ pub async fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(
         let stage_order = ["learning", "thoughts", "curiosity", "reflections", "praxis"];
         for stage in &stage_order {
             if let Some(statuses) = stats.by_stage.get(*stage) {
-                println!("\n  {CYAN}{}{RESET}", stage.to_uppercase());
+                println!("\n  {ACCENT}{}{RESET}", stage.to_uppercase());
                 let mut items: Vec<_> = statuses.iter().collect();
                 items.sort_by_key(|(s, _)| (*s).clone());
                 for (status, count) in items {
@@ -1102,7 +1096,7 @@ pub async fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(
         }
 
         if !stats.stale_thoughts.is_empty() {
-            println!("\n  {YELLOW}Stale thoughts (>{staleness_days}d):{RESET}");
+            println!("\n  {WARN}Stale thoughts (>{staleness_days}d):{RESET}");
             for entity in &stats.stale_thoughts {
                 println!("    {DIM}•{RESET} {}", entity.name);
             }
@@ -1110,7 +1104,7 @@ pub async fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(
 
         if !stats.stale_questions.is_empty() {
             println!(
-                "\n  {YELLOW}Stale questions (>{}d):{RESET}",
+                "\n  {WARN}Stale questions (>{}d):{RESET}",
                 staleness_days * 2
             );
             for entity in &stats.stale_questions {
@@ -1140,14 +1134,14 @@ pub async fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), R
         let chain = gm.pipeline_flow(entity_name).await?;
 
         if chain.is_empty() {
-            println!("{YELLOW}No pipeline relationships found for \"{entity_name}\".{RESET}");
+            println!("{WARN}No pipeline relationships found for \"{entity_name}\".{RESET}");
             return Ok(());
         }
 
         println!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n");
         for (source, rel_type, target) in &chain {
             println!(
-                "  {} ({}) {CYAN}—[{rel_type}]→{RESET} {} ({})",
+                "  {} ({}) {ACCENT}—[{rel_type}]→{RESET} {} ({})",
                 source.name, source.entity_type, target.name, target.entity_type
             );
         }
@@ -1171,21 +1165,21 @@ pub async fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<()
 
         let total_stale = stats.stale_thoughts.len() + stats.stale_questions.len();
         if total_stale == 0 {
-            println!("{GREEN}✓{RESET} No stale pipeline entities.");
+            println!("{GOOD}✓{RESET} No stale pipeline entities.");
             return Ok(());
         }
 
         println!("{BOLD}Stale Pipeline Entities{RESET}\n");
 
         if !stats.stale_thoughts.is_empty() {
-            println!("  {YELLOW}Thoughts (>{staleness_days} days):{RESET}");
+            println!("  {WARN}Thoughts (>{staleness_days} days):{RESET}");
             for entity in &stats.stale_thoughts {
                 println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
             }
         }
 
         if !stats.stale_questions.is_empty() {
-            println!("  {YELLOW}Questions (>{} days):{RESET}", staleness_days * 2);
+            println!("  {WARN}Questions (>{} days):{RESET}", staleness_days * 2);
             for entity in &stats.stale_questions {
                 println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
             }
@@ -1331,10 +1325,10 @@ pub async fn gc(memory_dir: &Path, options: &GcOptions) -> Result<(), RecallErro
         // Header
         if report.dry_run {
             println!(
-                "{BOLD}{YELLOW}GC Dry Run{RESET} {DIM}(pass --execute to actually delete){RESET}"
+                "{BOLD}{WARN}GC Dry Run{RESET} {DIM}(pass --execute to actually delete){RESET}"
             );
         } else {
-            println!("{BOLD}{GREEN}GC Executed{RESET}");
+            println!("{BOLD}{GOOD}GC Executed{RESET}");
         }
 
         println!("\n{BOLD}Scan{RESET}");
@@ -1364,10 +1358,10 @@ pub async fn gc(memory_dir: &Path, options: &GcOptions) -> Result<(), RecallErro
             println!("\n{BOLD}Actions{RESET}");
             for action in &report.actions {
                 let icon = match action.kind {
-                    GcActionKind::StaleRelationship => format!("{YELLOW}⚠{RESET}"),
-                    GcActionKind::DeadRelationship => format!("{YELLOW}✗{RESET}"),
-                    GcActionKind::OrphanedEntity => format!("{CYAN}○{RESET}"),
-                    GcActionKind::SpentEpisode => format!("{CYAN}◌{RESET}"),
+                    GcActionKind::StaleRelationship => format!("{WARN}⚠{RESET}"),
+                    GcActionKind::DeadRelationship => format!("{WARN}✗{RESET}"),
+                    GcActionKind::OrphanedEntity => format!("{ACCENT}○{RESET}"),
+                    GcActionKind::SpentEpisode => format!("{ACCENT}◌{RESET}"),
                 };
                 println!(
                     "  {icon} [{kind}] {name}",
@@ -1381,7 +1375,7 @@ pub async fn gc(memory_dir: &Path, options: &GcOptions) -> Result<(), RecallErro
         if !report.errors.is_empty() {
             println!("\n{BOLD}Errors{RESET}");
             for err in &report.errors {
-                println!("  \x1b[31m✗\x1b[0m {err}");
+                println!("  {BAD}✗{RESET} {err}");
             }
         }
 
@@ -1413,27 +1407,27 @@ pub async fn feedback(
 
     if report.entities_updated == 0 && report.utilities.is_empty() {
         println!(
-            "{YELLOW}No entities recorded for session {session_id}.{RESET} \
+            "{WARN}No entities recorded for session {session_id}.{RESET} \
              {DIM}Nothing to apply the outcome to.{RESET}"
         );
         return Ok(());
     }
 
     println!(
-        "{GREEN}✓{RESET} Session {BOLD}{session_id}{RESET} recorded as {BOLD}{outcome}{RESET} \
+        "{GOOD}✓{RESET} Session {BOLD}{session_id}{RESET} recorded as {BOLD}{outcome}{RESET} \
          — {} entities updated",
         report.entities_updated
     );
 
     for entity in &report.utilities {
         println!(
-            "  {DIM}{}{RESET} utility {CYAN}{:.3}{RESET}",
+            "  {DIM}{}{RESET} utility {ACCENT}{:.3}{RESET}",
             entity.entity_id, entity.utility_score
         );
     }
 
     if !report.errors.is_empty() {
-        println!("\n{YELLOW}Warnings:{RESET}");
+        println!("\n{WARN}Warnings:{RESET}");
         for err in &report.errors {
             println!("  {DIM}{err}{RESET}");
         }
@@ -1520,7 +1514,7 @@ pub async fn correct(memory_dir: &Path, options: &CorrectOptions) -> Result<(), 
         CorrectionReport::Planned { removal } => {
             print_removal_plan(&removal);
             if !options.yes && !confirm_removal(&removal)? {
-                println!("{YELLOW}Nothing removed.{RESET}");
+                println!("{WARN}Nothing removed.{RESET}");
                 return Ok(());
             }
             let applied =
@@ -1578,7 +1572,7 @@ fn refusal(report: &CorrectionReport) -> Result<(), RecallError> {
 fn print_correction(report: &CorrectionReport) {
     match report {
         CorrectionReport::UnknownEntity { query, candidates } => {
-            println!("{YELLOW}No entity named{RESET} {BOLD}{query}{RESET}.");
+            println!("{WARN}No entity named{RESET} {BOLD}{query}{RESET}.");
             if candidates.is_empty() {
                 println!("  {DIM}Nothing stored is close to that name.{RESET}");
             } else {
@@ -1598,9 +1592,9 @@ fn print_correction(report: &CorrectionReport) {
             existing,
         } => {
             println!(
-                "{YELLOW}Memory holds no{RESET} {BOLD}{rel_type}{RESET} \
-                 {YELLOW}relationship between{RESET} {BOLD}{from}{RESET} \
-                 {YELLOW}and{RESET} {BOLD}{to}{RESET}."
+                "{WARN}Memory holds no{RESET} {BOLD}{rel_type}{RESET} \
+                 {WARN}relationship between{RESET} {BOLD}{from}{RESET} \
+                 {WARN}and{RESET} {BOLD}{to}{RESET}."
             );
             if existing.is_empty() {
                 println!("  {DIM}They are not connected at all.{RESET}");
@@ -1644,7 +1638,7 @@ fn print_correction(report: &CorrectionReport) {
                 .map(|entity| format!("{BOLD}{}{RESET} and ", entity.name))
                 .unwrap_or_default();
             println!(
-                "{GREEN}✓{RESET} Removed {entity}{} {}.",
+                "{GOOD}✓{RESET} Removed {entity}{} {}.",
                 removal.edges.len(),
                 plural(removal.edges.len(), "relationship", "relationships")
             );
@@ -1654,18 +1648,18 @@ fn print_correction(report: &CorrectionReport) {
 
 fn print_contradictions(edges: &[EdgeCorrection]) {
     println!(
-        "{GREEN}✓{RESET} Recorded your correction on {} {}.\n",
+        "{GOOD}✓{RESET} Recorded your correction on {} {}.\n",
         edges.len(),
         plural(edges.len(), "relationship", "relationships")
     );
     for correction in edges {
         let edge = &correction.edge;
         println!(
-            "  {} {CYAN}—[{}]→{RESET} {}",
+            "  {} {ACCENT}—[{}]→{RESET} {}",
             edge.from, edge.rel_type, edge.to
         );
         println!(
-            "    confidence {YELLOW}{:.2} → {:.2}{RESET}   {DIM}evidence {:.1} → {:.1}{RESET}",
+            "    confidence {WARN}{:.2} → {:.2}{RESET}   {DIM}evidence {:.1} → {:.1}{RESET}",
             correction.confidence_before,
             edge.confidence,
             correction.evidence_before,
@@ -1679,7 +1673,7 @@ fn print_contradictions(edges: &[EdgeCorrection]) {
 }
 
 fn print_removal_plan(removal: &Removal) {
-    println!("{BOLD}{YELLOW}This would remove:{RESET}\n");
+    println!("{BOLD}{WARN}This would remove:{RESET}\n");
     if let Some(entity) = &removal.entity {
         println!(
             "  {BOLD}{}{RESET} {DIM}({}){RESET}",
@@ -1710,12 +1704,12 @@ fn print_edges(edges: &[EdgeView]) {
             String::new()
         };
         let coherence = if edge.self_reinforcements > 0 {
-            format!(" {YELLOW}self×{}{RESET}", edge.self_reinforcements)
+            format!(" {WARN}self×{}{RESET}", edge.self_reinforcements)
         } else {
             String::new()
         };
         println!(
-            "    {} {CYAN}—[{}]→{RESET} {}  {:.0}%{coherence}{superseded}",
+            "    {} {ACCENT}—[{}]→{RESET} {}  {:.0}%{coherence}{superseded}",
             edge.from,
             edge.rel_type,
             edge.to,
@@ -1786,7 +1780,7 @@ pub async fn decay_report(
         };
 
         if rels.is_empty() {
-            println!("{YELLOW}No relationships found.{RESET}");
+            println!("{WARN}No relationships found.{RESET}");
             return Ok(());
         }
 
@@ -1832,9 +1826,9 @@ pub async fn decay_report(
             };
 
             let decay_indicator = if decay_amount > 0.2 {
-                format!("\x1b[31m↓{:.0}%\x1b[0m", decay_amount * 100.0)
+                format!("{BAD}↓{:.0}%{RESET}", decay_amount * 100.0)
             } else if decay_amount > 0.05 {
-                format!("{YELLOW}↓{:.0}%{RESET}", decay_amount * 100.0)
+                format!("{WARN}↓{:.0}%{RESET}", decay_amount * 100.0)
             } else {
                 format!("{DIM}≈{RESET}")
             };
@@ -1856,7 +1850,7 @@ pub async fn decay_report(
             );
 
             println!(
-                "  {from_short} {CYAN}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}",
+                "  {from_short} {ACCENT}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}",
                 rel.rel_type, rel.confidence, effective,
             );
         }

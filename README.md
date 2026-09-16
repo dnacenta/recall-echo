@@ -275,7 +275,7 @@ Create the memory directory structure under entity_root. Creates `memory/` with 
 
 ### `recall-echo status`
 
-Health check with a dashboard showing memory usage, ephemeral state, archive count, recent sessions, and health assessment. Color-coded bars show MEMORY.md capacity (green → yellow → red at 75% / 90%).
+Health check with a dashboard showing memory usage, ephemeral state, archive count, recent sessions, and health assessment. Output is painted in Gruvbox Dark (truecolor when `COLORTERM` says so, 256-color otherwise); the MEMORY.md line turns yellow past 70% and red past 90%. The palette is fixed rather than mapped through your terminal's scheme; color is dropped entirely when either stdout or stderr is not a terminal, `NO_COLOR` is set, or `TERM` is `dumb`, and `CLICOLOR_FORCE=1` forces it back on.
 
 ```
 recall-echo — healthy

@@ -8,12 +8,7 @@ use std::path::Path;
 
 use crate::error::RecallError;
 use crate::paths;
-
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const RESET: &str = "\x1b[0m";
+use crate::theme::{ACCENT, BOLD, DIM, RESET, WARN};
 
 /// Query tokens shorter than this never qualify a file on their own. They are
 /// almost always function words, and because matching is substring-based they
@@ -69,7 +64,7 @@ pub fn run(query: &str, context_lines: usize) -> Result<(), RecallError> {
     let mut current_file = String::new();
     for result in &results {
         if result.file != current_file {
-            eprintln!("{CYAN}{}{RESET}", result.file);
+            eprintln!("{ACCENT}{}{RESET}", result.file);
             current_file = result.file.clone();
         }
         eprintln!("  {DIM}{:>4}{RESET}  {}", result.line_num, result.line);
@@ -286,7 +281,7 @@ pub fn run_ranked(query: &str, max_results: usize) -> Result<(), RecallError> {
 
     for (i, result) in results.iter().enumerate() {
         eprintln!(
-            "  {CYAN}{}. {}{RESET}  {DIM}({} matches, score {:.1}){RESET}",
+            "  {ACCENT}{}. {}{RESET}  {DIM}({} matches, score {:.1}){RESET}",
             i + 1,
             result.file,
             result.match_count,
@@ -372,16 +367,17 @@ fn highlight_match(line: &str, query: &str) -> String {
     let lower_line = line.to_lowercase();
     let lower_query = query.to_lowercase();
 
-    let mut result = String::new();
+    let mode = crate::theme::mode();
+    let mut result = String::with_capacity(line.len() + 32);
     let mut pos = 0;
 
     while let Some(found) = lower_line[pos..].find(&lower_query) {
         let abs_pos = pos + found;
         result.push_str(&line[pos..abs_pos]);
-        result.push_str(YELLOW);
-        result.push_str(BOLD);
+        result.push_str(WARN.in_mode(mode));
+        result.push_str(BOLD.in_mode(mode));
         result.push_str(&line[abs_pos..abs_pos + query.len()]);
-        result.push_str(RESET);
+        result.push_str(RESET.in_mode(mode));
         pos = abs_pos + query.len();
     }
     result.push_str(&line[pos..]);

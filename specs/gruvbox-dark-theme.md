@@ -1,6 +1,6 @@
 # Spec — Gruvbox Dark palette for all CLI output
 
-**Status:** draft (awaiting D's approval)
+**Status:** implemented (RE-58, PR pending)
 **Target version:** 4.3.0 → 4.4.0 (visible output change, no CLI surface change)
 **Drafted:** 2026-09-15
 **Baseline:** `main` @ `26e4407` (v4.3.0)
@@ -56,19 +56,20 @@ Resolved **once per process** from environment + stream, by a pure function that
 tested with injected inputs:
 
 ```
-resolve(env, stdout_is_tty) -> Mode
+resolve(env, both_streams_tty) -> Mode
   CLICOLOR_FORCE set and not "0"        → Truecolor if COLORTERM∈{truecolor,24bit} else Ansi256
-  NO_COLOR set (any value, incl. "")    → Plain
+  NO_COLOR set (any value, incl. non-UTF-8) → Plain
   TERM == "dumb" or TERM unset          → Plain
-  !stdout_is_tty                        → Plain
+  !(stdout_is_tty && stderr_is_tty)     → Plain
   COLORTERM ∈ {truecolor, 24bit}        → Truecolor   (\x1b[38;2;r;g;bm)
   otherwise                             → Ansi256     (\x1b[38;5;Nm)
 ```
 
 `Plain` emits empty strings for every token including `BOLD` and `RESET`, so the text is
-byte-clean. The mode is keyed on **stdout** only: the 29 stderr call sites (init prompts,
-error line in `main`) are all interactive flows where stdout is the same terminal, and one
-global decision keeps the module trivial. No `--color` flag in this spec; the front-door
+byte-clean. Painted text goes to both streams (`search` and `init` are stderr-only, most of
+the rest is stdout), so color requires **both** stdout and stderr to be terminals: a redirect
+of either one fails closed to plain, and one global decision keeps the module trivial. Env
+values are read as `OsString` so a non-UTF-8 `NO_COLOR` still counts as set. No `--color` flag in this spec; the front-door
 work (RE-54) owns CLI surface and can add one on top of the same `Mode` later.
 
 ### Module
@@ -77,8 +78,8 @@ New `src/theme.rs`:
 
 ```rust
 pub enum Mode { Plain, Ansi256, Truecolor }
-pub fn resolve(env: impl Fn(&str) -> Option<String>, stdout_is_tty: bool) -> Mode
-pub fn mode() -> Mode            // OnceLock, initialised from the real env on first use
+pub fn resolve(env: impl Fn(&str) -> Option<OsString>, both_streams_tty: bool) -> Mode
+pub fn mode() -> Mode            // OnceLock: var_os + stdout&&stderr is_terminal, on first use
 
 pub struct Paint(Token);          // impl Display: writes the escape for mode(), or ""
 pub static GOOD: Paint;  pub static WARN: Paint;  pub static BAD: Paint;
@@ -100,7 +101,7 @@ nil and no explicit init call is needed in `main`.
 3. Fold the three inline literals (`graph_cli.rs:1331`, `graph_cli.rs:1782`, `main.rs:820`)
    into `BAD`.
 4. Paint the dashboard `SEPARATOR` and the section rules `DIM`.
-5. A `scripts/`-free grep gate in tests: no `\x1b[` literal outside `src/theme.rs`.
+5. A test scans `src/` for `\x1b[` / `\u{1b}[` / `\u{001b}[` literals; only `theme.rs` (and `agent_cli.rs`, which strips escapes from captured output) may contain them.
 
 Out of scope: any layout, wording, or structural change to what is printed; background
 painting; per-stream (stderr) mode; a `--color` flag; theme selection or config — Gruvbox
@@ -118,18 +119,18 @@ the rename.
 ## Acceptance Criteria
 
 ### Happy
-- AC1: `src/theme.rs` is the only file in `src/` containing the byte sequence `\x1b[`; a test enforces it.
+- AC1: `src/theme.rs` is the only file in `src/` spelling an escape (`\x1b[`, `\u{1b}[`, `\u{001b}[`), `agent_cli.rs` excepted; a test enforces it.
 - AC2: With `COLORTERM=truecolor` on a tty, every colored span uses a 24-bit escape whose RGB is one of the six Gruvbox values above; no `\x1b[3Xm` basic-color escapes remain.
 - AC3: With `COLORTERM` unset on a tty, every colored span uses `\x1b[38;5;Nm` with N ∈ {142, 214, 167, 108, 245}.
 - AC4: `recall-echo status`, `dashboard`, `search`, `graph status`, `config show`, `inspect`, `distill --dry-run`, `init` (non-interactive) print byte-for-byte the same text as before once escapes are stripped — no wording or layout drift.
 - AC5: `DIM` spans render in gray `#928374` / 245, not the SGR faint attribute.
 
 ### Edge
-- AC6: `NO_COLOR=` (empty) and `NO_COLOR=1` both yield plain output on a tty.
+- AC6: `NO_COLOR=` (empty), `NO_COLOR=1` and a non-UTF-8 `NO_COLOR` all yield plain output on a tty.
 - AC7: `TERM=dumb` yields plain output regardless of `COLORTERM`.
 - AC8: `CLICOLOR_FORCE=1` yields colored output when stdout is a pipe.
 - AC9: `resolve()` is pure and covered by unit tests for each row of the resolution table, without touching process env or a real tty.
 
 ### Failure
-- AC10: Any command with stdout piped (`| cat`) emits zero escape bytes on stdout and stderr, unless `CLICOLOR_FORCE` is set.
+- AC10: Any command with stdout or stderr redirected (`| cat`, `2>file`) emits zero escape bytes on either stream, unless `CLICOLOR_FORCE` is set.
 - AC11: Existing test suite passes unchanged in count (tests run non-tty → `Plain`, so no test may depend on escapes being present).

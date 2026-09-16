@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use recall_echo::graph_cli;
+use recall_echo::theme::{BAD, RESET};
 use recall_echo::{
     archive, checkpoint, config_cli, dashboard, distill, init, paths, search, status, RecallEcho,
 };
@@ -817,7 +818,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("\x1b[31m\u{2717}\x1b[0m {e}");
+        eprintln!("{BAD}\u{2717}{RESET} {e}");
         std::process::exit(1);
     }
 }

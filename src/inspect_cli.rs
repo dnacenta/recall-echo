@@ -28,12 +28,7 @@ use crate::graph::inspect::{
 use crate::graph::types::MatchSource;
 use crate::serve::{AboutArgs, OverviewArgs, Request};
 use crate::serve_client;
-
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+use crate::theme::{ACCENT, BOLD, DIM, RESET, WARN};
 
 /// Longest abstract shown whole. Anything longer is a paragraph, and this is a
 /// summary.
@@ -87,7 +82,7 @@ pub fn render_overview(overview: &MemoryOverview) -> String {
     let mut out = format!("{BOLD}What I know{RESET}\n");
 
     if stats.entity_count == 0 && stats.episode_count == 0 {
-        let _ = writeln!(out, "\n  {YELLOW}Nothing yet.{RESET}");
+        let _ = writeln!(out, "\n  {WARN}Nothing yet.{RESET}");
         let _ = writeln!(
             out,
             "  {DIM}Memory fills when sessions end. Once conversations are archived, \
@@ -105,7 +100,7 @@ pub fn render_overview(overview: &MemoryOverview) -> String {
     if stats.entity_count == 0 {
         let _ = writeln!(
             out,
-            "\n  {YELLOW}Conversations are stored but nothing has been distilled from them \
+            "\n  {WARN}Conversations are stored but nothing has been distilled from them \
              yet.{RESET}"
         );
         let _ = writeln!(out, "  {DIM}recall-echo graph extract --all{RESET}");
@@ -158,7 +153,7 @@ fn write_confidence(out: &mut String, summary: &ConfidenceSummary) {
     if summary.total() == 0 {
         let _ = writeln!(
             out,
-            "\n  {YELLOW}No relationships yet{RESET} — I know these things but have not \
+            "\n  {WARN}No relationships yet{RESET} — I know these things but have not \
              connected them."
         );
         return;
@@ -206,7 +201,7 @@ fn write_edge_section(out: &mut String, heading: &str, edges: &[EdgeView], note:
 fn write_edge_line(out: &mut String, edge: &EdgeView) {
     let _ = writeln!(
         out,
-        "    {} {CYAN}—[{}]→{RESET} {}  {} {DIM}({:.0}%, evidence {:.1}){RESET}{}",
+        "    {} {ACCENT}—[{}]→{RESET} {}  {} {DIM}({:.0}%, evidence {:.1}){RESET}{}",
         edge.from,
         edge.rel_type,
         edge.to,
@@ -225,7 +220,7 @@ pub fn render_topic(report: &TopicReport) -> String {
     let mut out = format!("{BOLD}What I know about \"{}\"{RESET}\n", report.topic);
 
     if report.entities.is_empty() {
-        let _ = writeln!(out, "\n  {YELLOW}Nothing distilled about that.{RESET}");
+        let _ = writeln!(out, "\n  {WARN}Nothing distilled about that.{RESET}");
         let _ = writeln!(
             out,
             "  {DIM}The raw conversations may still hold it: \
@@ -301,7 +296,7 @@ pub fn certainty(confidence: f64) -> &'static str {
 /// The "some of this is me agreeing with myself" marker, when there is one.
 fn coherence_tag(edge: &EdgeView) -> String {
     if edge.self_reinforcements > 0 {
-        format!(" {YELLOW}self×{}{RESET}", edge.self_reinforcements)
+        format!(" {WARN}self×{}{RESET}", edge.self_reinforcements)
     } else {
         String::new()
     }
