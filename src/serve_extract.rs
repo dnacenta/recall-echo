@@ -536,8 +536,10 @@ pub fn spawn(setup: Setup) -> Option<tokio::task::JoinHandle<()>> {
         }
     }
 
+    let binary = crate::llm_provider::cli_binary_path(&setup.memory_dir)
+        .map_or_else(String::new, |p| format!(" ({})", p.display()));
     setup.log.log(&format!(
-        "background extraction on: {} provider, model {}, every {}s of quiet, {} archives per batch",
+        "background extraction on: {} provider{binary}, model {}, every {}s of quiet, {} archives per batch",
         config.llm.provider,
         if model.is_empty() { "default" } else { &model },
         schedule.idle_after.as_secs(),

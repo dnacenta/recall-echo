@@ -19,6 +19,7 @@
 //! What the vendors do *not* agree on is stdout: one JSON object, one JSON
 //! object per line, or prose. That is an [`OutputMode`], not a code path.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -353,6 +354,26 @@ impl CliSpec {
             .unwrap_or_else(|| self.command.clone())
     }
 
+    /// Where the CLI binary actually is, as an absolute path — or why it
+    /// cannot be found.
+    ///
+    /// The daemon that runs extraction in the background is started with a
+    /// minimal environment whose `PATH` is whatever launched it (a Claude Code
+    /// hook, an MCP server), not the user's shell. A bare `claude` that the
+    /// shell finds in `~/.local/bin` is invisible there, and a spawn failure
+    /// inside extraction used to surface as "+0 entities". Locating once, up
+    /// front, turns that into one refusal that names the command, the `PATH`
+    /// searched and the directories tried.
+    pub fn locate_command(&self) -> Result<PathBuf, RecallError> {
+        let command = self.resolve_command();
+        locate_in(
+            &command,
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        )
+        .map_err(RecallError::Config)
+    }
+
     /// The model this spec uses, given what the config asked for.
     #[must_use]
     pub fn resolve_model(&self, configured: &str) -> String {
@@ -436,6 +457,95 @@ fn fold_system_prompt(system_prompt: &str, user_message: &str) -> String {
     } else {
         format!("{system_prompt}\n\n{user_message}")
     }
+}
+
+/// Per-user directories the agent CLIs install into, relative to `$HOME`, in
+/// the order they are tried after `PATH`. `.claude/local` is Claude Code's own
+/// local install; `.local/bin` is the native installer's default and where
+/// recall-echo itself lands.
+const WELL_KNOWN_BIN_DIRS_UNDER_HOME: [&str; 5] = [
+    ".local/bin",
+    ".claude/local",
+    ".npm-global/bin",
+    ".cargo/bin",
+    "bin",
+];
+/// System directories tried last.
+const WELL_KNOWN_SYSTEM_BIN_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// Find `command` the way [`CliSpec::locate_command`] does, with the
+/// environment injected so it can be tested against a tempdir.
+///
+/// A command with a path separator is a path: it must be an executable file,
+/// and nothing else is searched. A bare name is looked up on `path`, then in
+/// the well-known directories. The error names everything that was tried.
+pub(crate) fn locate_in(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("CLI command is empty".into());
+    }
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        let candidate = PathBuf::from(command);
+        return if is_executable(&candidate) {
+            Ok(candidate)
+        } else {
+            Err(format!(
+                "{command} is not an executable file (set [llm.cli] command or the \
+                 provider's *_BIN variable to the binary's real path)"
+            ))
+        };
+    }
+
+    let on_path = path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable(candidate));
+    if let Some(found) = on_path {
+        return Ok(found);
+    }
+
+    let fallbacks: Vec<PathBuf> = home
+        .into_iter()
+        .flat_map(|home| {
+            WELL_KNOWN_BIN_DIRS_UNDER_HOME
+                .iter()
+                .map(move |d| home.join(d))
+        })
+        .chain(WELL_KNOWN_SYSTEM_BIN_DIRS.iter().map(PathBuf::from))
+        .collect();
+    if let Some(found) = fallbacks
+        .iter()
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable(candidate))
+    {
+        return Ok(found);
+    }
+
+    let searched: Vec<String> = fallbacks.iter().map(|p| p.display().to_string()).collect();
+    Err(format!(
+        "{command} not found on PATH ({}) or in {} — install it, add it to PATH, or set \
+         [llm.cli] command to its path",
+        path.map_or_else(|| "unset".to_string(), |p| p.to_string_lossy().into_owned()),
+        searched.join(", "),
+    ))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn default_timeout() -> Option<Duration> {
@@ -736,6 +846,117 @@ fn truncate_str(text: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── locate_in ──────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    fn executable_at(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_finds_a_bare_name_on_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = executable_at(&tmp.path().join("bin"), "claude");
+        let path =
+            std::env::join_paths([tmp.path().join("nowhere"), tmp.path().join("bin")]).unwrap();
+        assert_eq!(locate_in("claude", Some(&path), None).unwrap(), bin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_falls_back_to_the_home_install_dirs_when_path_lacks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bin = executable_at(&home.join(".local/bin"), "claude");
+        let bare_path = std::ffi::OsString::from("/usr/bin:/bin");
+        assert_eq!(
+            locate_in("claude", Some(&bare_path), Some(&home)).unwrap(),
+            bin
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_tries_claude_codes_own_local_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bin = executable_at(&home.join(".claude/local"), "claude");
+        assert_eq!(locate_in("claude", None, Some(&home)).unwrap(), bin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_prefers_path_over_the_fallback_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        executable_at(&home.join(".local/bin"), "claude");
+        let on_path = executable_at(&tmp.path().join("bin"), "claude");
+        let path = std::env::join_paths([tmp.path().join("bin")]).unwrap();
+        assert_eq!(
+            locate_in("claude", Some(&path), Some(&home)).unwrap(),
+            on_path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_error_names_the_command_the_path_and_the_dirs_tried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let path = std::ffi::OsString::from("/nonexistent-a:/nonexistent-b");
+        // A name that exists nowhere: the system fallback dirs are real.
+        let err = locate_in("no-such-agent-cli", Some(&path), Some(&home)).unwrap_err();
+        assert!(
+            err.starts_with("no-such-agent-cli not found on PATH (/nonexistent-a:/nonexistent-b)"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&home.join(".local/bin").display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains("/opt/homebrew/bin"), "{err}");
+        assert!(err.contains("[llm.cli] command"), "{err}");
+    }
+
+    #[test]
+    fn locate_with_no_path_and_no_home_still_reports_cleanly() {
+        let err = locate_in("definitely-not-a-real-cli-xyz", None, None).unwrap_err();
+        assert!(err.contains("PATH (unset)"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_treats_a_command_with_a_separator_as_a_path_not_a_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = executable_at(tmp.path(), "gemini");
+        let abs = bin.display().to_string();
+        assert_eq!(locate_in(&abs, None, None).unwrap(), bin);
+
+        let missing = tmp.path().join("nope").display().to_string();
+        let err = locate_in(&missing, None, None).unwrap_err();
+        assert!(err.contains("is not an executable file"), "{err}");
+
+        // A file that exists but is not executable is refused too.
+        let plain = tmp.path().join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        let err = locate_in(&plain.display().to_string(), None, None).unwrap_err();
+        assert!(err.contains("is not an executable file"), "{err}");
+    }
+
+    #[test]
+    fn locate_rejects_an_empty_command() {
+        assert_eq!(
+            locate_in("  ", None, None).unwrap_err(),
+            "CLI command is empty"
+        );
+    }
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

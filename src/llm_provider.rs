@@ -16,7 +16,7 @@
 //! API keys read from environment variables (never stored in config).
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::graph::error::GraphError;
 use crate::graph::llm::{Completion, LlmProvider, TokenUsage};
@@ -45,7 +45,12 @@ pub fn create_provider(
     }
 
     if cfg.provider.is_cli() {
-        let spec = CliSpec::resolve(&cfg.provider, &cfg.cli)?;
+        let mut spec = CliSpec::resolve(&cfg.provider, &cfg.cli)?;
+        // Spawn by absolute path. The bare name only works where PATH says so,
+        // and the background daemon's PATH is not the user's shell's.
+        let binary = spec.locate_command()?;
+        spec.command = binary.display().to_string();
+        spec.command_env = None;
         let model = spec.resolve_model(&cfg.model);
         let provider = CliProvider::new(spec, model.clone());
         return Ok((Box::new(provider), model));
@@ -55,6 +60,21 @@ pub fn create_provider(
     let model = config.model.clone();
     let provider = HttpLlmProvider::new(config);
     Ok((Box::new(provider), model))
+}
+
+/// The absolute path a CLI provider configured in `memory_dir` would spawn,
+/// for saying so in a log line. `None` for HTTP providers or when the binary
+/// cannot be found — the caller has already failed loudly in that case.
+#[must_use]
+pub fn cli_binary_path(memory_dir: &Path) -> Option<PathBuf> {
+    let cfg = config::load(memory_dir).llm;
+    if !cfg.provider.is_cli() {
+        return None;
+    }
+    CliSpec::resolve(&cfg.provider, &cfg.cli)
+        .ok()?
+        .locate_command()
+        .ok()
 }
 
 // ── Claude Code provider (subprocess) ────────────────────────────────────
