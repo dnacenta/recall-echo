@@ -56,7 +56,7 @@ enum Commands {
     },
     /// Output EPHEMERAL.md content
     Consume {
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
+        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
         entity_root: Option<PathBuf>,
     },
     /// Memory dashboard with health, stats, and recent sessions
@@ -66,7 +66,7 @@ enum Commands {
     },
     /// Archive a Claude Code session from JSONL transcript (SessionEnd hook)
     ArchiveSession {
-        /// Entity root directory (defaults to ~/.claude for legacy hooks)
+        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -93,7 +93,7 @@ enum Commands {
         /// Trigger source (e.g., "precompact")
         #[arg(long)]
         trigger: String,
-        /// Entity root directory (defaults to ~/.claude for legacy hooks)
+        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -495,10 +495,10 @@ fn main() {
             let root = resolve_init_root(entity_root);
             init::run(&root)
         }
-        Some(Commands::Status { entity_root }) => {
-            let root = resolve_entity_root(entity_root);
-            status::run_with_base(&root)
-        }
+        Some(Commands::Status {
+            entity_root: Some(root),
+        }) => status::run_with_base(&root),
+        Some(Commands::Status { entity_root: None }) => status::run(),
         Some(Commands::Search {
             query,
             ranked,

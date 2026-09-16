@@ -1,6 +1,6 @@
 # Spec — Flagless root resolution: every command finds the store `init` pinned
 
-**Status:** draft
+**Status:** implemented (RE-63, PR pending)
 **Target version:** 4.4.0 → 4.4.1 (bug fix, no surface change)
 **Drafted:** 2026-09-16
 **Baseline:** `main` @ `0a760e4` (v4.4.0)
@@ -50,31 +50,49 @@ same chain.
    (memory/conversations or conversations)
         │ no
         ▼
- persisted root exists AND looks initialised ──▶ persisted root
-        │ absent / not initialised
+ persisted root is trusted                 ──▶ persisted root (canonical)
+   (absolute, exists, a directory this user
+    owns, not writable by other users)
+        │ absent / not trusted
         ▼
  cwd                                        ──▶ legacy: existing "run init first" errors
                                                 keep naming the directory the user is in
 ```
 
-Implementation: `entity_root()` becomes `hook_entity_root(None)` filtered by
-`looks_initialized`, falling back to cwd. `hook_entity_root` is unchanged for the hooks
-except that the persisted-root arm also gains the `looks_initialized` filter (see below);
-`resolved_hook_base_dir`'s loud `~/.claude` fallback is untouched.
+Implementation: one pure resolver (`resolve_root_source`) returns which arm won; `entity_root()`
+maps that to a path with the cwd fallback, `hook_entity_root()` maps it to `Option` with no
+fallback. `resolved_hook_base_dir`'s loud `~/.claude` fallback is untouched.
+
+The persisted arm is gated on **trust, not layout** (audit finding, 2026-09-16): the pointer
+file is plain text that `init` writes unconditionally and the test suite has overwritten with
+`/tmp` paths (#59), so "a `conversations/` dir exists there" proves nothing — anyone can create
+one. A trusted root is absolute, resolves, is a directory owned by the current uid, and is not
+group- or world-writable; the canonical path is what gets used. A trusted root whose `memory/`
+was deleted behaves exactly as 4.4.0: commands say "run init first", hooks recreate the layout.
 
 ### Stale persisted root
 
-A persisted root that no longer looks initialised (deleted directory, or a `/tmp` path left by
-the #59 test pollution) is **ignored, with one stderr line**:
+A persisted root that is not trusted is **ignored, with one stderr line per process**, on both
+the command and the hook path:
 
 ```
-recall-echo: persisted entity root <path> is not initialised — ignoring it; re-run `recall-echo init`
+recall-echo: ignoring persisted entity root "<path>": it <reason>; re-run `recall-echo init`
 ```
 
-Without this, honouring the persisted root everywhere would turn #59 from "hooks broken" into
-"every command silently reads a temp dir". The warning goes to stderr only when the fallback
-is actually taken, so scripted output on stdout is unaffected. `hook_entity_root` applies the
-same filter so hooks and commands agree on what "pinned" means.
+The path is printed escaped (`{:?}`) because it comes from a file. Without this, honouring the
+persisted root everywhere would turn #59 from "hooks broken" into "every command silently reads
+a temp dir". The warning goes to stderr only when the fallback is actually taken.
+
+### Provenance
+
+`recall-echo status` (flagless) prints one dim stderr line naming the resolved root and the
+arm that chose it (`root /root/.claude — persisted by \`recall-echo init\``), so a store that is
+not the directory the user stands in is visible on screen.
+
+### Persisted file permissions
+
+`init` writes `~/.config/recall-echo/` as 0700 and `entity-root` as 0600. The file steers
+every flagless command; nobody else gets to read where the store is.
 
 ### `--help` text
 
@@ -88,7 +106,9 @@ The positional `entity_root` help on `status`, `distill`, `consume`, `dashboard`
 - Directory walk-up (#51) and the registry (#53). No ancestor search is added.
 - A claude-style root without `memory/` (`~/.claude/conversations` only): `status` still
   requires `memory/`; unchanged, same as with an explicit root today.
-- `init`'s own root choice (`resolve_init_root`) and the #59 persist guard.
+- `init`'s own root choice (`resolve_init_root`: env → `~/.claude` → cwd, no initialised-cwd
+  check) and the #59 persist guard. `init` is a third chain; noted on #53 as a follow-up.
+- `RECALL_ECHO_HOME` existence/ownership checks (explicit is consent, as today; #53 §1).
 
 ---
 
@@ -105,21 +125,28 @@ Happy path
 - AC4: `RECALL_ECHO_HOME` set wins over both cwd and the persisted root, as today.
 
 Edge
-- AC5: Persisted root points at a directory that does not look initialised → it is ignored,
-  one stderr warning naming the path, and resolution falls back to cwd. The resulting
-  `NotInitialized` error names cwd, as before.
+- AC5: Persisted root is not trusted (missing, relative, not a directory, owned by another
+  uid, or writable by other users) → it is ignored, one stderr warning naming the path and the
+  reason, and resolution falls back to cwd. The resulting `NotInitialized` error is the 4.4.0
+  one. Hooks print the same warning before their `~/.claude` fallback notice.
 - AC6: No persisted file, cwd not initialised → cwd, identical error text to 4.4.0.
 - AC7: `consume`, `archive-session` and `checkpoint` (the hook path) resolve to the same root
-  as `status` in every case above — one chain, tested through both entry points.
+  as `status` in every case above — one chain, one resolver.
+- AC9: Flagless `status` names the resolved root and which arm chose it.
+- AC10: `init` writes the persisted file 0600 in a 0700 directory.
 
 Failure
 - AC8: Persisted file unreadable or empty → treated as absent (existing behaviour of
   `persisted_entity_root`), no panic.
 
 Tests
-- Unit tests in `paths.rs` drive `entity_root_from(env, cwd, persisted)` (a pure inner
-  function; the public `entity_root()` wires the real env/cwd/file) through AC3–AC6/AC8.
-  `XDG_CONFIG_HOME` is never touched by the tests: the inner function takes the persisted
-  path as a parameter, so the suite cannot rewrite the developer's real file.
-- One test asserts `hook_entity_root` and `entity_root` return the same root for the same
-  inputs (AC7).
+- Unit tests in `paths.rs` drive `resolve_root_source(env, cwd, persisted, initialised,
+  trusted)` — pure, every input a parameter, the persisted root a lazy closure — through
+  AC3–AC6/AC8, plus `trusted_root` against real temp dirs and the persisted-file modes (AC10).
+- One test asserts the command and hook mappings agree on the root whenever the hook side is
+  pinned (AC7).
+- `tests/flagless_root.rs` runs the real binary from a directory that is not the root, with
+  `XDG_CONFIG_HOME` and `HOME` pointed at a temp dir: bare/`status`/`config show` hit the
+  persisted store (AC1, AC2, AC9); a missing and a world-writable persisted root are named and
+  refused (AC5); `RECALL_ECHO_HOME` wins (AC4). The developer's real persisted file and
+  `~/.claude` are never read or written by the suite.

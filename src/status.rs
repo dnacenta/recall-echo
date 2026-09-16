@@ -17,7 +17,9 @@ use crate::paths;
 use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
 
 pub fn run() -> Result<(), RecallError> {
-    run_with_base(&paths::entity_root()?)
+    let (root, source) = paths::entity_root_described()?;
+    eprintln!("{DIM}root {} — {source}{RESET}", root.display());
+    run_with_base(&root)
 }
 
 pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {

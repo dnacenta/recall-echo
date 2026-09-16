@@ -447,8 +447,9 @@ Or, equivalently, in a project's `.mcp.json`:
 }
 ```
 
-`--entity-root` defaults to the current directory, so it can be omitted when
-the client is launched from the entity root.
+`--entity-root` defaults to the current directory when it is an initialised
+entity root, then to the root `recall-echo init` persisted, so it can usually
+be omitted.
 
 **Tools.** All six are read-only; none can write to the graph.
 
