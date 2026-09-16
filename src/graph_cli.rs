@@ -830,6 +830,25 @@ pub async fn extract(
                 }
             };
 
+            // Every step failed: nothing reached the graph and the errors say
+            // why. Leave the archive pending — marking it would hide a broken
+            // provider behind "extracted, empty" — and move on.
+            if report.failed_outright() {
+                println!(
+                    "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: nothing extracted, {} error{} — left pending ({})",
+                    idx + 1,
+                    total_count,
+                    report.errors.len(),
+                    if report.errors.len() == 1 { "" } else { "s" },
+                    report.errors.first().map_or("", String::as_str),
+                );
+                totals
+                    .errors
+                    .push(format!("log {ln:03}: nothing extracted, left pending"));
+                totals.errors.extend(report.errors);
+                continue;
+            }
+
             // A chunk that failed inside an otherwise successful archive is
             // partial yield, not success — say so on the line itself, not
             // only in the trailing warnings.
