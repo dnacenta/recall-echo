@@ -12,16 +12,57 @@ use std::path::{Path, PathBuf};
 
 use crate::error::RecallError;
 
-/// Returns the default entity root directory.
+/// Returns the default entity root directory for a flagless command.
 ///
-/// Resolution order:
-/// 1. RECALL_ECHO_HOME env var (explicit override)
-/// 2. Current working directory (for pulse-null entities)
+/// Resolution order (the same chain the capture hooks use, see
+/// [`entity_root_from`]):
+/// 1. `RECALL_ECHO_HOME` (explicit override)
+/// 2. the cwd, when it carries an initialised layout (pulse-null entities)
+/// 3. the root `recall-echo init` persisted, when it still looks initialised
+/// 4. the cwd — so the existing "run init first" errors keep naming the
+///    directory the user is in
+///
+/// A persisted root that no longer looks initialised is ignored with one
+/// stderr warning per process.
 pub fn entity_root() -> Result<PathBuf, RecallError> {
-    if let Ok(p) = std::env::var("RECALL_ECHO_HOME") {
-        return Ok(PathBuf::from(p));
+    let cwd = std::env::current_dir().map_err(RecallError::from);
+    let (root, stale) = pin_to_command_root(pin_from_environment(), cwd)?;
+    if let Some(stale) = stale {
+        warn_stale_persisted_root(&stale);
     }
-    std::env::current_dir().map_err(RecallError::from)
+    Ok(root)
+}
+
+/// Map a [`Pin`] to the root a command uses, plus the stale persisted root
+/// to warn about, if any. Pure, so the mapping is testable against the hook
+/// mapping (they must agree whenever the hook side is pinned).
+fn pin_to_command_root(
+    pin: Pin,
+    cwd: Result<PathBuf, RecallError>,
+) -> Result<(PathBuf, Option<PathBuf>), RecallError> {
+    match pin {
+        Pin::Env(p) | Pin::Cwd(p) | Pin::Persisted(p) => Ok((p, None)),
+        Pin::None { stale } => Ok((cwd?, stale)),
+    }
+}
+
+/// The hook-side mapping of a [`Pin`]: pinned or not, no fallback.
+fn pin_to_hook_root(pin: Pin) -> Option<PathBuf> {
+    match pin {
+        Pin::Env(p) | Pin::Cwd(p) | Pin::Persisted(p) => Some(p),
+        Pin::None { .. } => None,
+    }
+}
+
+fn warn_stale_persisted_root(stale: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "recall-echo: persisted entity root {} is not initialised — ignoring it; \
+             re-run `recall-echo init`",
+            stale.display()
+        );
+    });
 }
 
 /// Returns the memory directory: {entity_root}/memory/
@@ -223,10 +264,7 @@ pub fn hook_entity_root(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
-    match pin_from_environment() {
-        Pin::Env(p) | Pin::Cwd(p) | Pin::Persisted(p) => Some(p),
-        Pin::None { .. } => None,
-    }
+    pin_to_hook_root(pin_from_environment())
 }
 
 /// `hook_base_dir` behind the full flagless resolution, warning loudly on the
@@ -404,5 +442,49 @@ mod tests {
         assert_eq!(pin, Pin::None { stale: None });
         let pin = entity_root_from(None, None, None, |_| true);
         assert_eq!(pin, Pin::None { stale: None });
+    }
+
+    #[test]
+    fn hooks_and_commands_agree_on_the_root() {
+        let cwd = Path::new("/cwd");
+        let persisted = Path::new("/persisted");
+        type Case<'a> = (
+            Option<&'a str>,
+            Option<&'a Path>,
+            Option<&'a Path>,
+            fn(&Path) -> bool,
+        );
+        let cases: Vec<Case> = vec![
+            (Some("/env"), Some(cwd), Some(persisted), |_| true),
+            (None, Some(cwd), Some(persisted), |_| true),
+            (None, Some(cwd), Some(persisted), |p| {
+                p == Path::new("/persisted")
+            }),
+            (None, Some(cwd), Some(persisted), |_| false),
+            (None, Some(cwd), None, |_| false),
+        ];
+        for (env, dir, file, init) in cases {
+            let pin = entity_root_from(env, dir, file, init);
+            let hook = pin_to_hook_root(pin.clone());
+            let (command, stale) = pin_to_command_root(pin, Ok(cwd.to_path_buf())).unwrap();
+            match hook {
+                Some(root) => {
+                    assert_eq!(command, root);
+                    assert!(stale.is_none());
+                }
+                None => assert_eq!(command, cwd),
+            }
+        }
+    }
+
+    #[test]
+    fn stale_persisted_root_falls_back_to_cwd_and_is_named() {
+        let cwd = Path::new("/cwd");
+        let pin = Pin::None {
+            stale: Some(PathBuf::from("/tmp/.tmpGone")),
+        };
+        let (root, stale) = pin_to_command_root(pin, Ok(cwd.to_path_buf())).unwrap();
+        assert_eq!(root, cwd);
+        assert_eq!(stale, Some(PathBuf::from("/tmp/.tmpGone")));
     }
 }
