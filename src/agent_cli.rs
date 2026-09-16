@@ -254,32 +254,30 @@ pub fn capturing() -> Vec<Source> {
 
 // ── Binary resolution ────────────────────────────────────────────────────
 
-/// Find `command` the way a shell would: as a path if it looks like one,
-/// otherwise by walking `PATH`.
+/// Find `command` the way the extraction provider will run it: as a path if
+/// it looks like one, otherwise on `PATH`, then in the well-known install
+/// directories. One resolver, so "is claude installed?" in `init` and "can
+/// extraction spawn claude?" in the daemon give the same answer.
 #[must_use]
 pub fn resolve_binary(command: &str) -> Option<PathBuf> {
-    let command = command.trim();
-    if command.is_empty() {
-        return None;
-    }
-    if command.contains(std::path::MAIN_SEPARATOR) {
-        let path = PathBuf::from(command);
-        return is_executable(&path).then_some(path);
-    }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join(command))
-        .find(|candidate| is_executable(candidate))
+    crate::cli_provider::locate_in(
+        command,
+        std::env::var_os("PATH").as_deref(),
+        crate::cli_provider::owned_home().as_deref(),
+    )
+    .ok()
 }
 
+/// A regular file with an execute bit.
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -320,7 +318,13 @@ pub async fn register_mcp(cli: AgentCli, exe: &str, entity_root: &Path) -> McpRe
         };
     };
 
-    let mut process = tokio::process::Command::new(binary);
+    // Spawn what the resolver found, not the bare name: `init` may itself be
+    // running under a minimal PATH (a hook, an installer), and the daemon's
+    // extraction locates the binary the same way.
+    let located = cli
+        .binary_path()
+        .map_or_else(|| binary.clone(), |p| p.display().to_string());
+    let mut process = tokio::process::Command::new(&located);
     process
         .args(args)
         .stdin(Stdio::null())

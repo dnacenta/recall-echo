@@ -51,6 +51,14 @@ const DAEMON_ENV_ALLOWLIST: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "RECALL_ECHO_HOME",
     DAEMON_BIN_ENV,
+    // Where the agent CLIs live when the user says so. Paths, not credentials
+    // — and the daemon's extraction has to be able to find the same binary
+    // the user's shell does.
+    "CLAUDE_BIN",
+    "CODEX_BIN",
+    "GROK_BIN",
+    "GEMINI_BIN",
+    "RECALL_CLI_BIN",
     // fastembed downloads the ONNX model over TLS on first use.
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",

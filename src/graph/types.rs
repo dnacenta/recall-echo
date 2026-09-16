@@ -702,6 +702,15 @@ pub struct IngestionReport {
     pub relationships_created: u32,
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
+    /// Chunks the archive was split into for extraction.
+    #[serde(default)]
+    pub chunks_total: u32,
+    /// Chunks whose extraction call failed (spawn, exit status, empty output,
+    /// unparseable answer). Together with `chunks_total` this is what says
+    /// "the provider is down" — graph yield cannot, because an archive that
+    /// only restates known facts yields nothing and is still a success.
+    #[serde(default)]
+    pub chunks_failed: u32,
     /// Tokens *estimated* for the calls whose provider reported nothing —
     /// claude-code's prose output, a bridge with no counters, any custom CLI
     /// without `[llm.cli] usage_input_path`.
@@ -733,11 +742,64 @@ impl IngestionReport {
     pub fn total_tokens(&self) -> u64 {
         self.measured_tokens + self.estimated_tokens
     }
+
+    /// Every extraction call failed: the provider could not spawn, exited
+    /// non-zero, answered nothing, or answered garbage — for *each* chunk.
+    ///
+    /// This is the run that must not be recorded as done. Marking it would
+    /// make a broken provider look like an empty archive, and nothing would
+    /// ever retry it. A partial failure (some chunks parsed) is a success
+    /// with warnings, and an archive with no chunks is simply empty.
+    #[must_use]
+    pub fn is_total_failure(&self) -> bool {
+        self.chunks_total > 0 && self.chunks_failed == self.chunks_total
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chunks(total: u32, failed: u32) -> IngestionReport {
+        IngestionReport {
+            chunks_total: total,
+            chunks_failed: failed,
+            errors: (0..failed)
+                .map(|i| format!("extraction chunk {i}: boom"))
+                .collect(),
+            ..IngestionReport::default()
+        }
+    }
+
+    #[test]
+    fn every_chunk_failing_is_a_total_failure() {
+        assert!(chunks(1, 1).is_total_failure());
+        assert!(chunks(7, 7).is_total_failure());
+    }
+
+    #[test]
+    fn one_surviving_chunk_makes_it_a_partial_success() {
+        assert!(!chunks(7, 6).is_total_failure());
+        assert!(!chunks(2, 0).is_total_failure());
+    }
+
+    #[test]
+    fn an_archive_that_restated_known_facts_is_not_a_failure() {
+        // Every entity resolved as Skipped, one dedup call timed out: the
+        // provider answered every chunk, so this is success with a warning.
+        let report = IngestionReport {
+            entities_skipped: 5,
+            relationships_skipped: 2,
+            errors: vec!["dedup 'x': timeout".into()],
+            ..chunks(3, 0)
+        };
+        assert!(!report.is_total_failure());
+    }
+
+    #[test]
+    fn an_archive_with_no_chunks_is_not_a_failure() {
+        assert!(!chunks(0, 0).is_total_failure());
+    }
 
     fn episode_with(embedding: Option<Vec<f32>>) -> Episode {
         Episode {

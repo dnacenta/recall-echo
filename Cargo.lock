@@ -3959,6 +3959,7 @@ dependencies = [
  "fastembed",
  "flate2",
  "futures",
+ "libc",
  "pulse-system-types",
  "regex",
  "reqwest",

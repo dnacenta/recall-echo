@@ -16,7 +16,7 @@
 //! API keys read from environment variables (never stored in config).
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::graph::error::GraphError;
 use crate::graph::llm::{Completion, LlmProvider, TokenUsage};
@@ -35,6 +35,26 @@ pub fn create_provider(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn LlmProvider>, String), crate::error::RecallError> {
+    let handle = create_provider_with_binary(memory_dir, provider_override, model_override)?;
+    Ok((handle.llm, handle.model))
+}
+
+/// A provider plus what it was built from — for the caller that wants to
+/// say which binary it is running.
+pub struct ProviderHandle {
+    pub llm: Box<dyn LlmProvider>,
+    /// The model it settled on; empty when the CLI picks its own default.
+    pub model: String,
+    /// Absolute path of the CLI binary it will spawn; `None` for HTTP.
+    pub binary: Option<PathBuf>,
+}
+
+/// [`create_provider`], keeping the resolved binary path.
+pub fn create_provider_with_binary(
+    memory_dir: &Path,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<ProviderHandle, crate::error::RecallError> {
     let mut cfg = config::load(memory_dir).llm;
 
     if let Some(p) = provider_override {
@@ -45,16 +65,28 @@ pub fn create_provider(
     }
 
     if cfg.provider.is_cli() {
-        let spec = CliSpec::resolve(&cfg.provider, &cfg.cli)?;
+        let mut spec = CliSpec::resolve(&cfg.provider, &cfg.cli)?;
+        // Spawn by absolute path. The bare name only works where PATH says so,
+        // and the background daemon's PATH is not the user's shell's.
+        let binary = spec.locate_command()?;
+        spec.use_located_command(&binary)?;
         let model = spec.resolve_model(&cfg.model);
         let provider = CliProvider::new(spec, model.clone());
-        return Ok((Box::new(provider), model));
+        return Ok(ProviderHandle {
+            llm: Box::new(provider),
+            model,
+            binary: Some(binary),
+        });
     }
 
     let config = HttpConfig::from_config_section(&cfg)?;
     let model = config.model.clone();
     let provider = HttpLlmProvider::new(config);
-    Ok((Box::new(provider), model))
+    Ok(ProviderHandle {
+        llm: Box::new(provider),
+        model,
+        binary: None,
+    })
 }
 
 // ── Claude Code provider (subprocess) ────────────────────────────────────
