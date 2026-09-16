@@ -35,6 +35,26 @@ pub fn create_provider(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn LlmProvider>, String), crate::error::RecallError> {
+    let handle = create_provider_with_binary(memory_dir, provider_override, model_override)?;
+    Ok((handle.llm, handle.model))
+}
+
+/// A provider plus what it was built from — for the caller that wants to
+/// say which binary it is running.
+pub struct ProviderHandle {
+    pub llm: Box<dyn LlmProvider>,
+    /// The model it settled on; empty when the CLI picks its own default.
+    pub model: String,
+    /// Absolute path of the CLI binary it will spawn; `None` for HTTP.
+    pub binary: Option<PathBuf>,
+}
+
+/// [`create_provider`], keeping the resolved binary path.
+pub fn create_provider_with_binary(
+    memory_dir: &Path,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<ProviderHandle, crate::error::RecallError> {
     let mut cfg = config::load(memory_dir).llm;
 
     if let Some(p) = provider_override {
@@ -49,32 +69,24 @@ pub fn create_provider(
         // Spawn by absolute path. The bare name only works where PATH says so,
         // and the background daemon's PATH is not the user's shell's.
         let binary = spec.locate_command()?;
-        spec.command = binary.display().to_string();
-        spec.command_env = None;
+        spec.use_located_command(&binary)?;
         let model = spec.resolve_model(&cfg.model);
         let provider = CliProvider::new(spec, model.clone());
-        return Ok((Box::new(provider), model));
+        return Ok(ProviderHandle {
+            llm: Box::new(provider),
+            model,
+            binary: Some(binary),
+        });
     }
 
     let config = HttpConfig::from_config_section(&cfg)?;
     let model = config.model.clone();
     let provider = HttpLlmProvider::new(config);
-    Ok((Box::new(provider), model))
-}
-
-/// The absolute path a CLI provider configured in `memory_dir` would spawn,
-/// for saying so in a log line. `None` for HTTP providers or when the binary
-/// cannot be found — the caller has already failed loudly in that case.
-#[must_use]
-pub fn cli_binary_path(memory_dir: &Path) -> Option<PathBuf> {
-    let cfg = config::load(memory_dir).llm;
-    if !cfg.provider.is_cli() {
-        return None;
-    }
-    CliSpec::resolve(&cfg.provider, &cfg.cli)
-        .ok()?
-        .locate_command()
-        .ok()
+    Ok(ProviderHandle {
+        llm: Box::new(provider),
+        model,
+        binary: None,
+    })
 }
 
 // ── Claude Code provider (subprocess) ────────────────────────────────────

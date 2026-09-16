@@ -286,10 +286,11 @@ impl ExtractionWorker {
                     ));
                     if let Some(first) = report.warnings.first() {
                         self.context.log.log(&format!(
-                            "extracted log {log_number:03} in the background: \
-                             {} warning{}; first: {first}",
+                            "extraction warnings on log {log_number:03}: \
+                             {} warning{}; first: {}",
                             report.warnings.len(),
                             if report.warnings.len() == 1 { "" } else { "s" },
+                            one_line(first),
                         ));
                     }
                 }
@@ -434,19 +435,10 @@ impl ExtractionUnit for GraphExtractionUnit {
             .graph
             .extract_from_archive(&content, &context, self.llm.as_ref())
             .await?;
-        // Every step failed: that is the provider's failure, not an empty
-        // archive. Leave it pending so the worker retries, quarantines, and
-        // — if it keeps happening — says so and stops.
-        if report.failed_outright() {
-            return Err(GraphError::Llm(all_failed_message(&report)));
-        }
+        // Decide before marking: a total failure is an Err and stays pending.
+        let outcome = unit_outcome(report)?;
         self.graph.mark_extracted(log_number).await?;
-
-        Ok(UnitReport {
-            entities: report.entities_created + report.entities_merged,
-            relationships: report.relationships_created,
-            warnings: report.errors,
-        })
+        Ok(outcome)
     }
 
     async fn quarantine(&self, log_number: u32, _reason: &str) {
@@ -462,16 +454,51 @@ impl ExtractionUnit for GraphExtractionUnit {
     }
 }
 
-/// The one line the daemon log gets for an archive that yielded nothing but
-/// errors. Names the count and the first error, which is the one that says
-/// what is wrong with the provider.
+/// What an archive's report means to the worker.
+///
+/// A total failure — every chunk's extraction call failed — is the
+/// provider's failure, not an empty archive: it becomes an `Err`, so the
+/// caller never marks the archive and the worker retries, quarantines, and
+/// — if it keeps happening — says so and stops. Anything else is a report,
+/// carrying the steps that failed as warnings.
+fn unit_outcome(report: crate::graph::types::IngestionReport) -> Result<UnitReport, GraphError> {
+    if report.is_total_failure() {
+        return Err(GraphError::Llm(all_failed_message(&report)));
+    }
+    Ok(UnitReport {
+        entities: report.entities_created + report.entities_merged,
+        relationships: report.relationships_created,
+        warnings: report.errors,
+    })
+}
+
+/// The one line the daemon log gets for an archive whose every chunk failed.
+/// Names the count and the first error, which is the one that says what is
+/// wrong with the provider.
 fn all_failed_message(report: &crate::graph::types::IngestionReport) -> String {
     let first = report.errors.first().map_or("", String::as_str);
     format!(
-        "all {} extraction step{} failed, nothing extracted; first: {first}",
-        report.errors.len(),
-        if report.errors.len() == 1 { "" } else { "s" },
+        "all {} extraction chunk{} failed, nothing extracted; first: {}",
+        report.chunks_failed,
+        if report.chunks_failed == 1 { "" } else { "s" },
+        one_line(first),
     )
+}
+
+/// Provider stderr goes into the daemon log and `graph status`: keep it on
+/// one line, free of control characters, and short. A CLI that prints a
+/// newline or an escape sequence must not forge a log line or repaint the
+/// terminal of whoever reads the status.
+fn one_line(text: &str) -> String {
+    const MAX: usize = 300;
+    let mut out: String = text
+        .chars()
+        .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+        .collect();
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX).collect::<String>() + "…";
+    }
+    out
 }
 
 /// Log numbers a previous run set aside. Absent or unreadable means none.
@@ -520,10 +547,12 @@ pub fn spawn(setup: Setup) -> Option<tokio::task::JoinHandle<()>> {
     // point: an auto-started daemon can only spend what a subscription already
     // covers. Running `serve --foreground` with a key exported is the explicit
     // way to opt an API provider in.
-    let (llm, model) = match crate::llm_provider::create_provider(&setup.memory_dir, None, None) {
-        Ok(provider) => provider,
-        Err(err) => return refuse(&setup, &format!("no usable LLM provider ({err})")),
-    };
+    let handle =
+        match crate::llm_provider::create_provider_with_binary(&setup.memory_dir, None, None) {
+            Ok(handle) => handle,
+            Err(err) => return refuse(&setup, &format!("no usable LLM provider ({err})")),
+        };
+    let (llm, model, binary) = (handle.llm, handle.model, handle.binary);
 
     if let Some(timeout) = setup.idle.timeout() {
         if schedule.idle_after >= timeout {
@@ -536,8 +565,7 @@ pub fn spawn(setup: Setup) -> Option<tokio::task::JoinHandle<()>> {
         }
     }
 
-    let binary = crate::llm_provider::cli_binary_path(&setup.memory_dir)
-        .map_or_else(String::new, |p| format!(" ({})", p.display()));
+    let binary = binary.map_or_else(String::new, |p| format!(" ({})", p.display()));
     setup.log.log(&format!(
         "background extraction on: {} provider{binary}, model {}, every {}s of quiet, {} archives per batch",
         config.llm.provider,
@@ -580,6 +608,7 @@ fn refuse(setup: &Setup, reason: &str) -> Option<tokio::task::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn config(background_enabled: bool) -> ExtractionSection {
         ExtractionSection {
@@ -638,10 +667,80 @@ mod tests {
         assert_eq!(schedule.batch_size, 1);
     }
 
+    // ── Outcome of a report ──────────────────────────────────────────
+
+    fn report_with(
+        total: u32,
+        failed: u32,
+        errors: &[&str],
+    ) -> crate::graph::types::IngestionReport {
+        crate::graph::types::IngestionReport {
+            chunks_total: total,
+            chunks_failed: failed,
+            entities_created: 2,
+            relationships_created: 1,
+            errors: errors.iter().map(|e| (*e).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_total_failure_is_an_err_that_names_the_first_error() {
+        let mut report = report_with(
+            3,
+            3,
+            &[
+                "extraction chunk 0: failed to spawn claude: No such file",
+                "x",
+                "y",
+            ],
+        );
+        report.entities_created = 0;
+        report.relationships_created = 0;
+        let err = unit_outcome(report).expect_err("total failure");
+        assert_eq!(
+            err.to_string(),
+            "llm error: all 3 extraction chunks failed, nothing extracted; first: extraction chunk 0: failed to spawn claude: No such file"
+        );
+    }
+
+    #[test]
+    fn a_partial_failure_is_a_report_with_warnings() {
+        let outcome = unit_outcome(report_with(3, 1, &["extraction chunk 2: empty output"]))
+            .expect("partial");
+        assert_eq!(outcome.entities, 2);
+        assert_eq!(outcome.relationships, 1);
+        assert_eq!(
+            outcome.warnings,
+            vec!["extraction chunk 2: empty output".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_clean_report_has_no_warnings() {
+        let outcome = unit_outcome(report_with(3, 0, &[])).expect("clean");
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn control_characters_in_provider_output_never_reach_the_log() {
+        assert_eq!(one_line("a\nb\x1b[31mc\td"), "a b [31mc\td");
+        let long = "x".repeat(400);
+        let out = one_line(&long);
+        assert_eq!(out.chars().count(), 301);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn a_single_failed_chunk_reads_in_the_singular() {
+        let mut report = report_with(1, 1, &["e"]);
+        report.entities_created = 0;
+        report.relationships_created = 0;
+        assert!(all_failed_message(&report).starts_with("all 1 extraction chunk failed"));
+    }
+
     // ── Warnings line, with a fake unit. The retry/quarantine/wedged
     // ladder itself is covered in tests/serve_extract.rs. ─────────────
-
-    use std::sync::Mutex;
 
     /// A unit whose `extract` answers are scripted per call.
     struct FakeUnit {
@@ -697,14 +796,14 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn harness(batch_size: usize) -> Harness {
+    fn harness() -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("daemon.log");
         let long_ago = Instant::now() - Duration::from_secs(3600);
         let worker = ExtractionWorker::new(
             Schedule {
                 idle_after: Duration::from_secs(1),
-                batch_size,
+                batch_size: 1,
                 poll_interval: MIN_POLL,
             },
             WorkerContext {
@@ -739,44 +838,29 @@ mod tests {
                 ],
             })],
         );
-        let mut h = harness(1);
+        let mut h = harness();
         assert_eq!(h.worker.run_batch(&unit).await, BatchOutcome::Worked);
         let log = log_text(&h);
         assert!(log.contains("extracted log 012 in the background: +4 entities, 1 relationships"));
         assert!(log.contains(
-            "extracted log 012 in the background: 2 warnings; first: extraction chunk 2: claude returned empty output"
+            "extraction warnings on log 012: 2 warnings; first: extraction chunk 2: claude returned empty output"
         ));
+        assert_eq!(
+            log.matches("extracted log 012").count(),
+            1,
+            "one yield line per archive"
+        );
         assert!(unit.quarantined().is_empty());
     }
 
     #[tokio::test]
     async fn a_clean_archive_logs_no_warning_line() {
         let unit = FakeUnit::new(vec![5], vec![Ok(UnitReport::default())]);
-        let mut h = harness(1);
+        let mut h = harness();
         h.worker.run_batch(&unit).await;
         let log = log_text(&h);
         assert!(log.contains("extracted log 005 in the background: +0 entities, 0 relationships"));
         assert!(!log.contains("warning"));
-    }
-
-    #[test]
-    fn all_failed_message_names_count_and_first_error() {
-        let report = crate::graph::types::IngestionReport {
-            errors: vec![
-                "extraction chunk 0: failed to spawn claude: No such file".into(),
-                "x".into(),
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            all_failed_message(&report),
-            "all 2 extraction steps failed, nothing extracted; first: extraction chunk 0: failed to spawn claude: No such file"
-        );
-        let one = crate::graph::types::IngestionReport {
-            errors: vec!["e".into()],
-            ..Default::default()
-        };
-        assert!(all_failed_message(&one).starts_with("all 1 extraction step failed"));
     }
 
     #[test]

@@ -702,6 +702,15 @@ pub struct IngestionReport {
     pub relationships_created: u32,
     pub relationships_skipped: u32,
     pub errors: Vec<String>,
+    /// Chunks the archive was split into for extraction.
+    #[serde(default)]
+    pub chunks_total: u32,
+    /// Chunks whose extraction call failed (spawn, exit status, empty output,
+    /// unparseable answer). Together with `chunks_total` this is what says
+    /// "the provider is down" — graph yield cannot, because an archive that
+    /// only restates known facts yields nothing and is still a success.
+    #[serde(default)]
+    pub chunks_failed: u32,
     /// Tokens *estimated* for the calls whose provider reported nothing —
     /// claude-code's prose output, a bridge with no counters, any custom CLI
     /// without `[llm.cli] usage_input_path`.
@@ -734,23 +743,16 @@ impl IngestionReport {
         self.measured_tokens + self.estimated_tokens
     }
 
-    /// Everything this run put into the graph: entities created or merged,
-    /// plus relationships created.
-    #[must_use]
-    pub fn total_yield(&self) -> u32 {
-        self.entities_created + self.entities_merged + self.relationships_created
-    }
-
-    /// Nothing reached the graph and at least one step said why.
+    /// Every extraction call failed: the provider could not spawn, exited
+    /// non-zero, answered nothing, or answered garbage — for *each* chunk.
     ///
-    /// This is the run that must not be recorded as done: a provider that
-    /// could not spawn, exited non-zero, or answered nothing fails every
-    /// chunk, and the archive looks "extracted, empty" unless someone reads
-    /// `errors`. A run with no yield *and* no errors is a genuinely empty
-    /// archive and is not a failure.
+    /// This is the run that must not be recorded as done. Marking it would
+    /// make a broken provider look like an empty archive, and nothing would
+    /// ever retry it. A partial failure (some chunks parsed) is a success
+    /// with warnings, and an archive with no chunks is simply empty.
     #[must_use]
-    pub fn failed_outright(&self) -> bool {
-        self.total_yield() == 0 && !self.errors.is_empty()
+    pub fn is_total_failure(&self) -> bool {
+        self.chunks_total > 0 && self.chunks_failed == self.chunks_total
     }
 }
 
@@ -758,38 +760,45 @@ impl IngestionReport {
 mod tests {
     use super::*;
 
-    fn report(created: u32, merged: u32, rels: u32, errors: &[&str]) -> IngestionReport {
+    fn chunks(total: u32, failed: u32) -> IngestionReport {
         IngestionReport {
-            entities_created: created,
-            entities_merged: merged,
-            relationships_created: rels,
-            errors: errors.iter().map(|e| (*e).to_string()).collect(),
+            chunks_total: total,
+            chunks_failed: failed,
+            errors: (0..failed)
+                .map(|i| format!("extraction chunk {i}: boom"))
+                .collect(),
             ..IngestionReport::default()
         }
     }
 
     #[test]
-    fn no_yield_with_errors_is_an_outright_failure() {
-        assert!(report(0, 0, 0, &["extraction chunk 0: claude exited 1"]).failed_outright());
-        assert!(report(0, 0, 0, &["a", "b", "c"]).failed_outright());
+    fn every_chunk_failing_is_a_total_failure() {
+        assert!(chunks(1, 1).is_total_failure());
+        assert!(chunks(7, 7).is_total_failure());
     }
 
     #[test]
-    fn any_yield_is_not_an_outright_failure_even_with_errors() {
-        assert!(!report(1, 0, 0, &["extraction chunk 2: parse"]).failed_outright());
-        assert!(!report(0, 1, 0, &["dedup 'x': timeout"]).failed_outright());
-        assert!(!report(0, 0, 1, &["extraction chunk 0: empty output"]).failed_outright());
+    fn one_surviving_chunk_makes_it_a_partial_success() {
+        assert!(!chunks(7, 6).is_total_failure());
+        assert!(!chunks(2, 0).is_total_failure());
     }
 
     #[test]
-    fn an_empty_archive_with_no_errors_is_not_a_failure() {
-        assert!(!report(0, 0, 0, &[]).failed_outright());
-        assert_eq!(report(0, 0, 0, &[]).total_yield(), 0);
+    fn an_archive_that_restated_known_facts_is_not_a_failure() {
+        // Every entity resolved as Skipped, one dedup call timed out: the
+        // provider answered every chunk, so this is success with a warning.
+        let report = IngestionReport {
+            entities_skipped: 5,
+            relationships_skipped: 2,
+            errors: vec!["dedup 'x': timeout".into()],
+            ..chunks(3, 0)
+        };
+        assert!(!report.is_total_failure());
     }
 
     #[test]
-    fn total_yield_counts_created_merged_and_relationships() {
-        assert_eq!(report(2, 3, 4, &[]).total_yield(), 9);
+    fn an_archive_with_no_chunks_is_not_a_failure() {
+        assert!(!chunks(0, 0).is_total_failure());
     }
 
     fn episode_with(embedding: Option<Vec<f32>>) -> Episode {

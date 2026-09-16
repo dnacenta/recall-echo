@@ -601,9 +601,18 @@ struct ExtractionTotals {
     estimated_tokens: u64,
     measured_tokens: u64,
     quarantined: Vec<u32>,
+    /// Archives whose every chunk failed. Not marked extracted, not retried
+    /// here: the user is watching and will re-run.
+    left_pending: Vec<u32>,
     dedup_llm_calls: u32,
     dedup_fast_path: u32,
 }
+
+/// Archives that fail outright in a row before `graph extract` stops. Mirrors
+/// the daemon's rule: three is a broken provider, not three unlucky archives,
+/// and every further attempt is N more spawns for nothing.
+#[cfg(feature = "llm")]
+const MAX_CONSECUTIVE_TOTAL_FAILURES: u32 = 3;
 
 /// Print a dry-run listing of archives that would be extracted.
 #[cfg(feature = "llm")]
@@ -629,8 +638,17 @@ fn print_extract_dry_run(conversations_dir: &Path, log_numbers: &[u32]) {
 /// Print the final extraction summary.
 #[cfg(feature = "llm")]
 fn print_extract_summary(totals: &ExtractionTotals) {
+    // A run that extracted nothing and left archives behind is not a green
+    // tick — that is the shape of failure this summary exists to expose.
+    let nothing_done = totals.processed == 0
+        && (!totals.left_pending.is_empty() || !totals.quarantined.is_empty());
+    let mark = if nothing_done {
+        format!("{YELLOW}✗{RESET}")
+    } else {
+        format!("{GREEN}✓{RESET}")
+    };
     println!(
-        "\n{GREEN}✓{RESET} Done: {} archives — +{} created, ~{} merged, -{} skipped, {} relationships",
+        "\n{mark} Done: {} archives — +{} created, ~{} merged, -{} skipped, {} relationships",
         totals.processed,
         totals.entities_created,
         totals.entities_merged,
@@ -653,6 +671,12 @@ fn print_extract_summary(totals: &ExtractionTotals) {
         println!(
             "  {YELLOW}Quarantined: {} archives{RESET}",
             totals.quarantined.len()
+        );
+    }
+    if !totals.left_pending.is_empty() {
+        println!(
+            "  {YELLOW}Left pending (every chunk failed): {} archives{RESET} — fix the provider and re-run",
+            totals.left_pending.len()
         );
     }
 
@@ -771,6 +795,7 @@ pub async fn extract(
 
         let quarantine_path = graph_dir.join("extraction-quarantine.txt");
         let mut totals = ExtractionTotals::default();
+    let mut consecutive_total_failures: u32 = 0;
 
         for (idx, ln) in log_numbers.iter().enumerate() {
             // Budget check. Measured and estimated tokens are both spent
@@ -830,24 +855,37 @@ pub async fn extract(
                 }
             };
 
-            // Every step failed: nothing reached the graph and the errors say
-            // why. Leave the archive pending — marking it would hide a broken
-            // provider behind "extracted, empty" — and move on.
-            if report.failed_outright() {
+            // Whatever happened, the tokens were spent: keep the budget honest.
+            totals.estimated_tokens += report.estimated_tokens;
+            totals.measured_tokens += report.measured_tokens;
+            totals.dedup_llm_calls += report.dedup_llm_calls;
+            totals.dedup_fast_path += report.dedup_fast_path;
+
+            // Every chunk failed: the provider is the problem, not the archive.
+            // Leave it pending — marking it would hide a broken provider behind
+            // "extracted, empty". Deliberately no retry here, unlike an Err
+            // above: the user is watching and will re-run; the daemon has its
+            // own ladder. Three in a row and we stop burning spawns.
+            if report.is_total_failure() {
                 println!(
-                    "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: nothing extracted, {} error{} — left pending ({})",
+                    "  {YELLOW}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
                     idx + 1,
                     total_count,
-                    report.errors.len(),
-                    if report.errors.len() == 1 { "" } else { "s" },
+                    report.chunks_failed,
                     report.errors.first().map_or("", String::as_str),
                 );
-                totals
-                    .errors
-                    .push(format!("log {ln:03}: nothing extracted, left pending"));
+                totals.left_pending.push(*ln);
                 totals.errors.extend(report.errors);
+                consecutive_total_failures += 1;
+                if consecutive_total_failures >= MAX_CONSECUTIVE_TOTAL_FAILURES {
+                    println!(
+                        "\n{YELLOW}✗ {MAX_CONSECUTIVE_TOTAL_FAILURES} archives failed outright in a row — the provider looks broken. Stopping.{RESET}"
+                    );
+                    break;
+                }
                 continue;
             }
+            consecutive_total_failures = 0;
 
             // A chunk that failed inside an otherwise successful archive is
             // partial yield, not success — say so on the line itself, not
@@ -880,10 +918,6 @@ pub async fn extract(
             totals.relationships += report.relationships_created;
             totals.errors.extend(report.errors);
             totals.processed += 1;
-            totals.estimated_tokens += report.estimated_tokens;
-            totals.measured_tokens += report.measured_tokens;
-            totals.dedup_llm_calls += report.dedup_llm_calls;
-            totals.dedup_fast_path += report.dedup_fast_path;
 
             // Rate limiting between archives
             if delay_ms > 0 && *ln != *log_numbers.last().unwrap() {

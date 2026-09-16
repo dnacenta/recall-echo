@@ -369,9 +369,25 @@ impl CliSpec {
         locate_in(
             &command,
             std::env::var_os("PATH").as_deref(),
-            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+            owned_home().as_deref(),
         )
         .map_err(RecallError::Config)
+    }
+
+    /// Spawn `binary` from now on, by that exact path. Clears the `*_BIN`
+    /// override so a later invocation cannot re-read the environment and
+    /// undo the resolution. A path that is not UTF-8 is refused by name
+    /// rather than mangled into a command that does not exist.
+    pub fn use_located_command(&mut self, binary: &Path) -> Result<(), RecallError> {
+        let command = binary.to_str().ok_or_else(|| {
+            RecallError::Config(format!(
+                "CLI binary path {} is not valid UTF-8 — set [llm.cli] command to a UTF-8 path",
+                binary.display()
+            ))
+        })?;
+        self.command = command.to_string();
+        self.command_env = None;
+        Ok(())
     }
 
     /// The model this spec uses, given what the config asked for.
@@ -463,7 +479,7 @@ fn fold_system_prompt(system_prompt: &str, user_message: &str) -> String {
 /// the order they are tried after `PATH`. `.claude/local` is Claude Code's own
 /// local install; `.local/bin` is the native installer's default and where
 /// recall-echo itself lands.
-const WELL_KNOWN_BIN_DIRS_UNDER_HOME: [&str; 5] = [
+const WELL_KNOWN_BIN_DIRS_UNDER_HOME: &[&str] = &[
     ".local/bin",
     ".claude/local",
     ".npm-global/bin",
@@ -471,39 +487,94 @@ const WELL_KNOWN_BIN_DIRS_UNDER_HOME: [&str; 5] = [
     "bin",
 ];
 /// System directories tried last.
-const WELL_KNOWN_SYSTEM_BIN_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+const WELL_KNOWN_SYSTEM_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
+
+const REMEDY: &str =
+    "set [llm.cli] command or the provider's *_BIN variable to the binary's real path";
+
+/// `$HOME`, but only when this process owns it.
+///
+/// The search under `$HOME` runs binaries that `PATH` did not vouch for. That
+/// is fine for a user running their own tools; it is not fine for root with
+/// someone else's `HOME` (sudo with `env_reset`, a service unit pointing at
+/// an unprivileged account's home), where `~/bin/claude` would be executed
+/// with the higher privilege. When the owner differs, there is no home to
+/// search.
+#[must_use]
+pub(crate) fn owned_home() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let owner = std::fs::metadata(&home).ok()?.uid();
+        if owner != euid {
+            return None;
+        }
+    }
+    Some(home)
+}
+
+/// A candidate found outside `PATH` must not be writable by anyone but its
+/// owner: a group- or world-writable binary in `~/bin` is a planted binary
+/// waiting to happen. `PATH` entries are the user's own responsibility, as
+/// they always were.
+#[cfg(unix)]
+fn safe_fallback(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    crate::agent_cli::is_executable(path)
+        && std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o022 == 0)
+}
+
+#[cfg(not(unix))]
+fn safe_fallback(path: &Path) -> bool {
+    crate::agent_cli::is_executable(path)
+}
 
 /// Find `command` the way [`CliSpec::locate_command`] does, with the
 /// environment injected so it can be tested against a tempdir.
 ///
-/// A command with a path separator is a path: it must be an executable file,
-/// and nothing else is searched. A bare name is looked up on `path`, then in
-/// the well-known directories. The error names everything that was tried.
+/// A command with a path separator is a path: it must be an absolute,
+/// executable file, and nothing else is searched. A bare name is looked up
+/// on the absolute entries of `path`, then in the well-known directories
+/// under `home` (which the caller has already vouched for — see
+/// [`owned_home`]) and the two system ones. The result is always absolute,
+/// and the error names everything that was tried.
 pub(crate) fn locate_in(
     command: &str,
     path: Option<&std::ffi::OsStr>,
     home: Option<&Path>,
 ) -> Result<PathBuf, String> {
+    use crate::agent_cli::is_executable;
+
     let command = command.trim();
     if command.is_empty() {
         return Err("CLI command is empty".into());
     }
     if command.contains(std::path::MAIN_SEPARATOR) {
         let candidate = PathBuf::from(command);
+        if !candidate.is_absolute() {
+            return Err(format!(
+                "{command} is a relative path — it would resolve against whatever the current \
+                 directory happens to be ({REMEDY})"
+            ));
+        }
         return if is_executable(&candidate) {
             Ok(candidate)
         } else {
-            Err(format!(
-                "{command} is not an executable file (set [llm.cli] command or the \
-                 provider's *_BIN variable to the binary's real path)"
-            ))
+            Err(format!("{command} is not an executable file ({REMEDY})"))
         };
     }
 
+    // Relative PATH entries (an empty element from a trailing `:`, a bare
+    // `.`) would resolve against the cwd. A shell tolerates that; a daemon
+    // caching the answer for an hour must not.
     let on_path = path
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(command))
         .find(|candidate| is_executable(candidate));
     if let Some(found) = on_path {
@@ -522,30 +593,17 @@ pub(crate) fn locate_in(
     if let Some(found) = fallbacks
         .iter()
         .map(|dir| dir.join(command))
-        .find(|candidate| is_executable(candidate))
+        .find(|candidate| safe_fallback(candidate))
     {
         return Ok(found);
     }
 
     let searched: Vec<String> = fallbacks.iter().map(|p| p.display().to_string()).collect();
     Err(format!(
-        "{command} not found on PATH ({}) or in {} — install it, add it to PATH, or set \
-         [llm.cli] command to its path",
+        "{command} not found on PATH ({}) or in {} — install it, add it to PATH, or {REMEDY}",
         path.map_or_else(|| "unset".to_string(), |p| p.to_string_lossy().into_owned()),
         searched.join(", "),
     ))
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 fn default_timeout() -> Option<Duration> {
@@ -846,17 +904,85 @@ fn truncate_str(text: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     // ── locate_in ──────────────────────────────────────────────────────
 
     #[cfg(unix)]
     fn executable_at(dir: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(dir).unwrap();
+        fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
-        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_ignores_relative_path_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = executable_at(&tmp.path().join("real"), "no-such-agent-cli");
+        let path =
+            std::ffi::OsString::from(format!("bin::.:{}", tmp.path().join("real").display()));
+        assert_eq!(
+            locate_in("no-such-agent-cli", Some(&path), None).unwrap(),
+            real
+        );
+        let only_relative = std::ffi::OsString::from("bin::.");
+        assert!(locate_in("no-such-agent-cli", Some(&only_relative), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_refuses_a_group_or_world_writable_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        // A name that exists nowhere else: the system fallback dirs are real.
+        let bin = executable_at(&home.join("bin"), "no-such-agent-cli");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = locate_in("no-such-agent-cli", None, Some(&home)).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            locate_in("no-such-agent-cli", None, Some(&home)).unwrap(),
+            bin
+        );
+    }
+
+    #[test]
+    fn locate_refuses_a_relative_command_with_a_separator() {
+        let err = locate_in("./claude", None, None).unwrap_err();
+        assert!(err.contains("relative path"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn use_located_command_pins_the_path_and_drops_the_env_override() {
+        let mut spec = CliSpec::preset(CliPreset::ClaudeCode);
+        assert_eq!(spec.command_env.as_deref(), Some("CLAUDE_BIN"));
+        spec.use_located_command(Path::new("/opt/x/claude"))
+            .unwrap();
+        assert_eq!(spec.command, "/opt/x/claude");
+        assert_eq!(spec.command_env, None);
+        assert_eq!(spec.resolve_command(), "/opt/x/claude");
+
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"/opt/\xff/claude"));
+        let err = spec.use_located_command(bad).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn owned_home_never_returns_a_home_the_process_does_not_own() {
+        if let Some(home) = owned_home() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let euid = unsafe { libc::geteuid() };
+                assert_eq!(std::fs::metadata(&home).unwrap().uid(), euid);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -957,9 +1083,6 @@ mod tests {
             "CLI command is empty"
         );
     }
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
     const SYSTEM: &str = "You extract entities.";
     const USER: &str = "Dani uses NeoVim.";

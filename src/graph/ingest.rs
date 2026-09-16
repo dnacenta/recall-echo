@@ -245,6 +245,7 @@ async fn process_extraction(
 ) -> Result<(), GraphError> {
     let session_id = context.session_id.as_str();
     let log_number = context.log_number;
+    report.chunks_total += u32::try_from(chunks.len()).unwrap_or(u32::MAX);
     // Phase 1: Extract all chunks in parallel.
     // The per-chunk futures are built by the iterator, not by a stream
     // combinator: a closure applied inside the stream would have to be
@@ -285,6 +286,7 @@ async fn process_extraction(
                 );
             }
             Err(e) => {
+                report.chunks_failed += 1;
                 report.errors.push(format!("extraction chunk {i}: {e}"));
             }
         }
