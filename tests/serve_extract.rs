@@ -192,6 +192,7 @@ impl ExtractionUnit for FakeUnit {
         Ok(UnitReport {
             entities: 2,
             relationships: 1,
+            warnings: Vec::new(),
         })
     }
 

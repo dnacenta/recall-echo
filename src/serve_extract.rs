@@ -75,10 +75,14 @@ impl Clock for SystemClock {
 // ── The unit of work ─────────────────────────────────────────────────────
 
 /// What one background batch did to one archive.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnitReport {
     pub entities: u32,
     pub relationships: u32,
+    /// Steps that failed inside an archive that still yielded something. An
+    /// archive where *every* step failed is not a report — it is an `Err`
+    /// from [`ExtractionUnit::extract`], so it is retried and never marked.
+    pub warnings: Vec<String>,
 }
 
 /// One archive's worth of extraction, as the scheduler sees it.
@@ -280,6 +284,14 @@ impl ExtractionWorker {
                          +{} entities, {} relationships",
                         report.entities, report.relationships
                     ));
+                    if let Some(first) = report.warnings.first() {
+                        self.context.log.log(&format!(
+                            "extracted log {log_number:03} in the background: \
+                             {} warning{}; first: {first}",
+                            report.warnings.len(),
+                            if report.warnings.len() == 1 { "" } else { "s" },
+                        ));
+                    }
                 }
                 Some(Err(err)) => {
                     if self.record_failure(unit, log_number, &err).await {
@@ -422,11 +434,18 @@ impl ExtractionUnit for GraphExtractionUnit {
             .graph
             .extract_from_archive(&content, &context, self.llm.as_ref())
             .await?;
+        // Every step failed: that is the provider's failure, not an empty
+        // archive. Leave it pending so the worker retries, quarantines, and
+        // — if it keeps happening — says so and stops.
+        if report.failed_outright() {
+            return Err(GraphError::Llm(all_failed_message(&report)));
+        }
         self.graph.mark_extracted(log_number).await?;
 
         Ok(UnitReport {
             entities: report.entities_created + report.entities_merged,
             relationships: report.relationships_created,
+            warnings: report.errors,
         })
     }
 
@@ -441,6 +460,18 @@ impl ExtractionUnit for GraphExtractionUnit {
             .open(&self.quarantine_path)
             .and_then(|mut file| writeln!(file, "{log_number:03}"));
     }
+}
+
+/// The one line the daemon log gets for an archive that yielded nothing but
+/// errors. Names the count and the first error, which is the one that says
+/// what is wrong with the provider.
+fn all_failed_message(report: &crate::graph::types::IngestionReport) -> String {
+    let first = report.errors.first().map_or("", String::as_str);
+    format!(
+        "all {} extraction step{} failed, nothing extracted; first: {first}",
+        report.errors.len(),
+        if report.errors.len() == 1 { "" } else { "s" },
+    )
 }
 
 /// Log numbers a previous run set aside. Absent or unreadable means none.
@@ -603,6 +634,147 @@ mod tests {
             ..ExtractionSection::default()
         });
         assert_eq!(schedule.batch_size, 1);
+    }
+
+    // ── Warnings line, with a fake unit. The retry/quarantine/wedged
+    // ladder itself is covered in tests/serve_extract.rs. ─────────────
+
+    use std::sync::Mutex;
+
+    /// A unit whose `extract` answers are scripted per call.
+    struct FakeUnit {
+        pending: Vec<u32>,
+        answers: Mutex<Vec<Result<UnitReport, GraphError>>>,
+        quarantined: Mutex<Vec<(u32, String)>>,
+    }
+
+    impl FakeUnit {
+        fn new(pending: Vec<u32>, answers: Vec<Result<UnitReport, GraphError>>) -> Self {
+            Self {
+                pending,
+                answers: Mutex::new(answers),
+                quarantined: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn quarantined(&self) -> Vec<u32> {
+            self.quarantined
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(n, _)| *n)
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ExtractionUnit for FakeUnit {
+        async fn pending(&self, limit: usize) -> Result<Vec<u32>, GraphError> {
+            Ok(self.pending.iter().copied().take(limit).collect())
+        }
+
+        async fn extract(&self, _log_number: u32) -> Result<UnitReport, GraphError> {
+            let mut answers = self.answers.lock().unwrap();
+            if answers.is_empty() {
+                return Err(GraphError::Llm("script exhausted".into()));
+            }
+            answers.remove(0)
+        }
+
+        async fn quarantine(&self, log_number: u32, reason: &str) {
+            self.quarantined
+                .lock()
+                .unwrap()
+                .push((log_number, reason.to_string()));
+        }
+    }
+
+    struct Harness {
+        worker: ExtractionWorker,
+        log_path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn harness(batch_size: usize) -> Harness {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("daemon.log");
+        let long_ago = Instant::now() - Duration::from_secs(3600);
+        let worker = ExtractionWorker::new(
+            Schedule {
+                idle_after: Duration::from_secs(1),
+                batch_size,
+                poll_interval: MIN_POLL,
+            },
+            WorkerContext {
+                idle: Arc::new(IdleTracker::new_at(None, long_ago)),
+                shutdown: Arc::new(ShutdownSignal::new()),
+                state: ExtractionState::shared(),
+                log: Arc::new(DaemonLog::open(&log_path, false)),
+                clock: Arc::new(SystemClock),
+            },
+        );
+        Harness {
+            worker,
+            log_path,
+            _dir: dir,
+        }
+    }
+
+    fn log_text(h: &Harness) -> String {
+        std::fs::read_to_string(&h.log_path).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn warnings_on_a_yielding_archive_get_their_own_log_line() {
+        let unit = FakeUnit::new(
+            vec![12],
+            vec![Ok(UnitReport {
+                entities: 4,
+                relationships: 1,
+                warnings: vec![
+                    "extraction chunk 2: claude returned empty output".into(),
+                    "dedup 'x': timeout".into(),
+                ],
+            })],
+        );
+        let mut h = harness(1);
+        assert_eq!(h.worker.run_batch(&unit).await, BatchOutcome::Worked);
+        let log = log_text(&h);
+        assert!(log.contains("extracted log 012 in the background: +4 entities, 1 relationships"));
+        assert!(log.contains(
+            "extracted log 012 in the background: 2 warnings; first: extraction chunk 2: claude returned empty output"
+        ));
+        assert!(unit.quarantined().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_clean_archive_logs_no_warning_line() {
+        let unit = FakeUnit::new(vec![5], vec![Ok(UnitReport::default())]);
+        let mut h = harness(1);
+        h.worker.run_batch(&unit).await;
+        let log = log_text(&h);
+        assert!(log.contains("extracted log 005 in the background: +0 entities, 0 relationships"));
+        assert!(!log.contains("warning"));
+    }
+
+    #[test]
+    fn all_failed_message_names_count_and_first_error() {
+        let report = crate::graph::types::IngestionReport {
+            errors: vec![
+                "extraction chunk 0: failed to spawn claude: No such file".into(),
+                "x".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            all_failed_message(&report),
+            "all 2 extraction steps failed, nothing extracted; first: extraction chunk 0: failed to spawn claude: No such file"
+        );
+        let one = crate::graph::types::IngestionReport {
+            errors: vec!["e".into()],
+            ..Default::default()
+        };
+        assert!(all_failed_message(&one).starts_with("all 1 extraction step failed"));
     }
 
     #[test]

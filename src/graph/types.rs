@@ -733,11 +733,64 @@ impl IngestionReport {
     pub fn total_tokens(&self) -> u64 {
         self.measured_tokens + self.estimated_tokens
     }
+
+    /// Everything this run put into the graph: entities created or merged,
+    /// plus relationships created.
+    #[must_use]
+    pub fn total_yield(&self) -> u32 {
+        self.entities_created + self.entities_merged + self.relationships_created
+    }
+
+    /// Nothing reached the graph and at least one step said why.
+    ///
+    /// This is the run that must not be recorded as done: a provider that
+    /// could not spawn, exited non-zero, or answered nothing fails every
+    /// chunk, and the archive looks "extracted, empty" unless someone reads
+    /// `errors`. A run with no yield *and* no errors is a genuinely empty
+    /// archive and is not a failure.
+    #[must_use]
+    pub fn failed_outright(&self) -> bool {
+        self.total_yield() == 0 && !self.errors.is_empty()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(created: u32, merged: u32, rels: u32, errors: &[&str]) -> IngestionReport {
+        IngestionReport {
+            entities_created: created,
+            entities_merged: merged,
+            relationships_created: rels,
+            errors: errors.iter().map(|e| (*e).to_string()).collect(),
+            ..IngestionReport::default()
+        }
+    }
+
+    #[test]
+    fn no_yield_with_errors_is_an_outright_failure() {
+        assert!(report(0, 0, 0, &["extraction chunk 0: claude exited 1"]).failed_outright());
+        assert!(report(0, 0, 0, &["a", "b", "c"]).failed_outright());
+    }
+
+    #[test]
+    fn any_yield_is_not_an_outright_failure_even_with_errors() {
+        assert!(!report(1, 0, 0, &["extraction chunk 2: parse"]).failed_outright());
+        assert!(!report(0, 1, 0, &["dedup 'x': timeout"]).failed_outright());
+        assert!(!report(0, 0, 1, &["extraction chunk 0: empty output"]).failed_outright());
+    }
+
+    #[test]
+    fn an_empty_archive_with_no_errors_is_not_a_failure() {
+        assert!(!report(0, 0, 0, &[]).failed_outright());
+        assert_eq!(report(0, 0, 0, &[]).total_yield(), 0);
+    }
+
+    #[test]
+    fn total_yield_counts_created_merged_and_relationships() {
+        assert_eq!(report(2, 3, 4, &[]).total_yield(), 9);
+    }
 
     fn episode_with(embedding: Option<Vec<f32>>) -> Episode {
         Episode {
