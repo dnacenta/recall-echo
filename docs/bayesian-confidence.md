@@ -76,7 +76,7 @@ The mean column is identical to what the old stateless model produced — that w
 
 **Convergence is slower than the old artifact suggested, and that is the point.** The stateless model recomputed α from the mean each time, which made every update a step of `c' = (10c + 1)/11` — geometric convergence to 1.0 that erased its own history. From a `Speculative` prior of 0.3 it reached 0.994 after fifty corroborations. The stateful model reaches **0.883** at fifty (α=53, β=7) and crosses 0.95 only at about **130**, reaching 0.967 at two hundred. The difference is entirely the seven units of contradiction mass in the prior, which now *persist* instead of being recomputed away. An edge that started life speculative carries that skepticism until real evidence buries it. Slower is the honest answer.
 
-**Migration.** The store carries a `schema_version` on a singleton `meta:schema` record; this build writes version 1 (`store.rs:29`). `init_schema` defines the tables and then runs `migrate` on every open (`store.rs:132-135`), which is a no-op once the version marker is current. The backfill itself is one re-runnable statement (`backfill_edge_evidence`, `store.rs:277-294`):
+**Migration.** The store carries a `schema_version` on a singleton `meta:schema` record; persisted edge evidence is version 1 (later builds write a higher version — RE-44 added a version-2 episode backfill — and each backfill is gated on the version that introduced it, so a version-0 store runs them all in one pass). `init_schema` defines the tables and then runs `migrate` on every open (`store.rs:132-135`), which is a no-op once the version marker is current. The backfill itself is one re-runnable statement (`backfill_edge_evidence`, `store.rs:277-294`):
 
 ```sql
 UPDATE relates_to SET

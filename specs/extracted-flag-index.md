@@ -128,6 +128,11 @@ count. Doc comments on `GraphStats::extracted_absent` and
 - Changing `serve_extract`'s poll cadence or `pending()` itself — the predicate lives one
   layer down.
 - Re-extraction of archives that yielded nothing (#42/#55).
+- Widening `stats()`'s diagnostic window. `extracted_absent` is still computed only when
+  the store has episodes and no entities, so a store that has *both* entities and an
+  unfinished migration will not show the count — unchanged from 4.4.0, and deliberate: the
+  diagnostic is a full table scan and `stats()` is an agent-hot path. The loud failure of
+  the backfill is the primary guard; the count is the backstop.
 - A version bump: 4.4.1 is already unreleased on `main`.
 
 ## Acceptance criteria
@@ -166,17 +171,53 @@ Measurement
 
 ## Measurements
 
-Synthetic store, 5,000 episodes across 250 log numbers, all `extracted = true` (the quiet
-steady state the daemon polls), SurrealKV embedded in a tempdir on the VPS, debug build.
+Measured 2026-09-21 on the VPS (Hostinger, SurrealKV embedded in a tempdir): 5,000
+episodes across 250 log numbers, every one `extracted = true` — the quiet steady state the
+daemon polls, where the scan returns nothing and the whole cost is the looking. Scans are
+the mean of 20 runs, best run in brackets.
+
+Release build (what a user runs):
 
 | step | time |
 |---|---|
-| backfill of 5,000 absent `extracted` values | (filled in by the harness) |
-| scan, `(extracted ?? false) != true` (pre-RE-44 predicate) | (filled in) |
-| scan, `extracted = false`, index removed | (filled in) |
-| scan, `extracted = false`, index present | (filled in) |
+| backfill of 5,000 absent `extracted` values (`init_schema`: define + migrate) | **1054 ms** |
+| build of the `episode_extracted` index over 5,000 episodes | 234 ms |
+| scan, `(extracted ?? false) != true` (pre-RE-44) | **11.97 ms** [11.01] |
+| scan, `extracted = false`, index removed | 4.37 ms [2.98] |
+| scan, `extracted = false`, index present | **0.67 ms** [0.53] |
 
-Run with `RE44_BENCH=1 cargo test --test extracted_index_bench -- --ignored --nocapture`.
+Debug build, same store, for anyone reproducing it with a plain `cargo test`:
+
+| step | time |
+|---|---|
+| backfill | 6078 ms |
+| index build | 546 ms |
+| scan, pre-RE-44 | 71.46 ms [60.89] |
+| scan, `extracted = false`, index removed | 30.33 ms [25.97] |
+| scan, `extracted = false`, index present | 5.99 ms [4.90] |
+
+Reading:
+
+- The recurring scan drops **~18×** at 5,000 episodes, and the shape of the cost changes:
+  the old predicate is O(episodes) forever, the new one is O(rows that actually match),
+  which in the steady state is zero. The gap widens with every archive a user accumulates
+  — the 12 ms is not the point, the slope is.
+- Half of the remaining win is the index and half is the expression: `extracted = false`
+  without any index is already 2.7× faster than `(extracted ?? false) != true`, because
+  the `??` is evaluated per row.
+- The backfill is a **one-time ~1 s** cost on the first open of a 5,000-episode store that
+  predates the field, and 0 ms on every open after: it runs once, before the version
+  marker is written. A store created by any build since the field existed backfills
+  nothing at all. The index build is an additional ~230 ms, once.
+
+Reproduce with:
+
+```
+RE44_BENCH=1 cargo test --release --test extracted_index_bench -- --ignored --nocapture
+```
+
+`RE44_BENCH_EPISODES` and `RE44_BENCH_LOGS` override the fixture size. The harness builds
+its store in a `TempDir` and never opens a real one.
 
 ## Tests
 
