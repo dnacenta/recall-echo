@@ -1142,6 +1142,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     /// An entity root and a sandbox for everything `init` writes outside it.
     ///
@@ -1567,6 +1568,112 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("/tmp/a;b"), "{text}");
+    }
+
+    /// The hook writer, driven with a production-looking binary path, writes
+    /// into the injected Claude directory — and only there.
+    #[test]
+    fn hooks_are_written_into_the_injected_claude_dir() {
+        let sandbox = Sandbox::new();
+        let real = real_config_paths();
+        let before: Vec<Snapshot> = real.iter().cloned().map(Snapshot::take).collect();
+
+        let settings = sandbox.roots.claude_dir().unwrap().join("settings.json");
+        assert!(install_hooks(
+            &settings,
+            &sandbox.entity_root(),
+            "/usr/local/bin/recall-echo"
+        ));
+
+        let written = fs::read_to_string(&settings).expect("hooks landed in the sandbox");
+        assert!(
+            written.contains("/usr/local/bin/recall-echo archive-session"),
+            "{written}"
+        );
+        assert!(
+            written.contains("/usr/local/bin/recall-echo checkpoint"),
+            "{written}"
+        );
+        assert!(
+            written.contains("/usr/local/bin/recall-echo consume"),
+            "{written}"
+        );
+        for snapshot in before {
+            snapshot.assert_unchanged();
+        }
+    }
+
+    /// The fence, proven rather than assumed: the whole init flow runs, and
+    /// the three files a real user's setup lives in — resolved from the real
+    /// `HOME`, with no override in effect — are byte- and mtime-identical
+    /// afterwards, or still absent (#59).
+    #[test]
+    fn the_real_config_is_untouched_by_the_init_flow() {
+        let before: Vec<Snapshot> = real_config_paths()
+            .into_iter()
+            .map(Snapshot::take)
+            .collect();
+
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+
+        // The flow really did run and really did write — otherwise this test
+        // would pass on a no-op.
+        assert!(sandbox.entity_root().join("memory/MEMORY.md").exists());
+        assert!(sandbox
+            .dir
+            .path()
+            .join(".config/recall-echo/entity-root")
+            .exists());
+
+        for snapshot in before {
+            snapshot.assert_unchanged();
+        }
+    }
+
+    /// The global files `init` would write to on a real machine.
+    fn real_config_paths() -> Vec<PathBuf> {
+        let home = dirs::home_dir().expect("a home directory");
+        let mut paths = vec![
+            home.join(".claude").join("settings.json"),
+            home.join(".claude.json"),
+        ];
+        paths.extend(paths::entity_root_state_file());
+        paths
+    }
+
+    /// Existence, bytes and mtime of one path, for an after-the-fact
+    /// comparison. A file that did not exist must not come into being either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Snapshot {
+        path: PathBuf,
+        bytes: Option<Vec<u8>>,
+        mtime: Option<SystemTime>,
+    }
+
+    impl Snapshot {
+        fn take(path: PathBuf) -> Self {
+            let bytes = fs::read(&path).ok();
+            let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+            Self { path, bytes, mtime }
+        }
+
+        fn assert_unchanged(&self) {
+            let now = Snapshot::take(self.path.clone());
+            assert_eq!(
+                now.bytes.is_some(),
+                self.bytes.is_some(),
+                "{} came into being (or vanished)",
+                self.path.display()
+            );
+            assert_eq!(
+                now.bytes,
+                self.bytes,
+                "{} was rewritten",
+                self.path.display()
+            );
+            assert_eq!(now.mtime, self.mtime, "{} was touched", self.path.display());
+        }
     }
 
     #[test]
