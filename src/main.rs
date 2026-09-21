@@ -27,12 +27,12 @@ struct Cli {
 enum Commands {
     /// Initialize the memory system for an entity
     Init {
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to ~/.claude when Claude Code is installed, else the current directory)
         entity_root: Option<PathBuf>,
     },
     /// Memory system health check
     Status {
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         entity_root: Option<PathBuf>,
     },
     /// Search conversation archives
@@ -51,22 +51,22 @@ enum Commands {
     },
     /// Analyze MEMORY.md and suggest distillation
     Distill {
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         entity_root: Option<PathBuf>,
     },
     /// Output EPHEMERAL.md content
     Consume {
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
         entity_root: Option<PathBuf>,
     },
     /// Memory dashboard with health, stats, and recent sessions
     Dashboard {
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         entity_root: Option<PathBuf>,
     },
     /// Archive a Claude Code session from JSONL transcript (SessionEnd hook)
     ArchiveSession {
-        /// Entity root directory (defaults to ~/.claude for legacy hooks)
+        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -93,7 +93,7 @@ enum Commands {
         /// Trigger source (e.g., "precompact")
         #[arg(long)]
         trigger: String,
-        /// Entity root directory (defaults to ~/.claude for legacy hooks)
+        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -101,7 +101,7 @@ enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -117,7 +117,7 @@ enum Commands {
     },
     /// Run the MCP server (stdio) so an agent can query its own memory
     Mcp {
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -129,7 +129,7 @@ enum Commands {
         /// Entities listed per type (or results, with --about)
         #[arg(long, default_value = "3")]
         limit: usize,
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -137,7 +137,7 @@ enum Commands {
     Graph {
         #[command(subcommand)]
         command: GraphCommands,
-        /// Entity root directory (defaults to current directory)
+        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
         #[arg(long)]
         entity_root: Option<PathBuf>,
     },
@@ -495,10 +495,10 @@ fn main() {
             let root = resolve_init_root(entity_root);
             init::run(&root)
         }
-        Some(Commands::Status { entity_root }) => {
-            let root = resolve_entity_root(entity_root);
-            status::run_with_base(&root)
-        }
+        Some(Commands::Status {
+            entity_root: Some(root),
+        }) => status::run_with_base(&root),
+        Some(Commands::Status { entity_root: None }) => status::run(),
         Some(Commands::Search {
             query,
             ranked,

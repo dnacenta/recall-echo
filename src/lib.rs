@@ -100,7 +100,7 @@ impl RecallEcho {
     }
 
     /// Create a RecallEcho using the default path resolution
-    /// (RECALL_ECHO_HOME env var or current working directory).
+    /// (RECALL_ECHO_HOME, an initialised cwd, or the root `init` persisted).
     pub fn from_default() -> Result<Self, error::RecallError> {
         Ok(Self::new(paths::entity_root()?))
     }
