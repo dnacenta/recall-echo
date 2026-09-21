@@ -63,6 +63,7 @@ use std::time::Duration;
 
 use crate::cli_provider::CliSpec;
 use crate::config::{CliPreset, Provider};
+use crate::paths::ConfigRoots;
 use crate::transcript::Source;
 
 /// Name recall-echo registers its MCP server under, in every client.
@@ -307,7 +308,17 @@ pub struct McpReport {
 ///
 /// Never fails the caller: a client that is missing, broken or unrecognisable
 /// yields [`McpStatus::Failed`] carrying the command to run by hand.
-pub async fn register_mcp(cli: AgentCli, exe: &str, entity_root: &Path) -> McpReport {
+///
+/// `roots` decides *whose* config the client writes: these CLIs keep their MCP
+/// registrations in their own user files (`~/.claude.json`,
+/// `~/.codex/config.toml`) and find them through the environment, so a
+/// sandboxed [`ConfigRoots`] is applied to the child (#59).
+pub async fn register_mcp(
+    cli: AgentCli,
+    exe: &str,
+    entity_root: &Path,
+    roots: &ConfigRoots,
+) -> McpReport {
     let argv = cli.mcp_add_argv(exe, entity_root);
     let command = shell_line(&argv);
     let Some((binary, args)) = argv.split_first() else {
@@ -324,13 +335,7 @@ pub async fn register_mcp(cli: AgentCli, exe: &str, entity_root: &Path) -> McpRe
     let located = cli
         .binary_path()
         .map_or_else(|| binary.clone(), |p| p.display().to_string());
-    let mut process = tokio::process::Command::new(&located);
-    process
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut process = mcp_add_command(&located, args, roots);
 
     let status = match tokio::time::timeout(MCP_ADD_TIMEOUT, process.output()).await {
         Err(_) => McpStatus::Failed(format!(
@@ -350,6 +355,23 @@ pub async fn register_mcp(cli: AgentCli, exe: &str, entity_root: &Path) -> McpRe
         status,
         command,
     }
+}
+
+/// The child process one `mcp add` runs as.
+///
+/// Built apart from the spawn so the environment it carries can be asserted:
+/// a sandboxed [`ConfigRoots`] must reach the client, or the client writes the
+/// real user's `~/.claude.json` (#59).
+fn mcp_add_command(located: &str, args: &[String], roots: &ConfigRoots) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(located);
+    process
+        .args(args)
+        .envs(roots.agent_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    process
 }
 
 /// Read one client's answer to `mcp add`.
@@ -431,6 +453,55 @@ mod tests {
 
     fn argv_of(cli: AgentCli) -> Vec<String> {
         cli.mcp_add_argv("/usr/local/bin/recall-echo", Path::new("/home/d/entity"))
+    }
+
+    /// A client writes its MCP registration into its own user config, which it
+    /// finds through the environment. Under a sandboxed `ConfigRoots` every
+    /// one of those variables must point inside the sandbox (#59).
+    #[test]
+    fn mcp_registration_env_points_at_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = crate::paths::ConfigRoots::sandboxed(tmp.path()).unwrap();
+        let command = mcp_add_command("/usr/bin/true", &["mcp".to_string()], &roots);
+
+        let env: Vec<(String, String)> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.unwrap_or_default().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "HOME" && Path::new(v) == tmp.path()),
+            "{env:?}"
+        );
+        for key in ["XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
+            let value = env
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("{key} not set: {env:?}"));
+            assert!(
+                Path::new(&value.1).starts_with(tmp.path()),
+                "{key} escapes the sandbox: {}",
+                value.1
+            );
+        }
+    }
+
+    /// The production roots add nothing: a real `mcp add` inherits the user's
+    /// own environment, exactly as before #59.
+    #[test]
+    fn mcp_registration_inherits_the_environment_in_production() {
+        let command = mcp_add_command(
+            "/usr/bin/true",
+            &["mcp".to_string()],
+            &crate::paths::ConfigRoots::from_env(), // sanctioned: read-only from_env (RE-59)
+        );
+        assert_eq!(command.as_std().get_envs().count(), 0);
     }
 
     /// Verified against `claude mcp add --help` and a real registration:

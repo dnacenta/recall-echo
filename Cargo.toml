@@ -67,6 +67,9 @@ bench = ["llm"]
 
 [dev-dependencies]
 tempfile = "3"
+# Digests for the #59 fence test: it proves the real ~/.claude was not touched
+# without ever printing what is in it. Already in the lock (transitive).
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "macros"] }
 
 # The release binary is what `update` downloads on every upgrade; unstripped

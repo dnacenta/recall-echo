@@ -147,13 +147,194 @@ fn persisted_entity_root_from(file: &std::path::Path) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
-/// Persist `root` as the default entity root for flagless hook invocations.
-/// Returns the file written, for the init status line.
-pub fn persist_entity_root(root: &std::path::Path) -> Result<PathBuf, RecallError> {
-    let file = entity_root_state_file()
-        .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
-    persist_entity_root_to(&file, root)?;
-    Ok(file)
+// ── Where `init` writes outside the store ────────────────────────────────
+
+/// The recall-echo binary that hooks and MCP registrations should point at.
+#[must_use]
+pub(crate) fn recall_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "recall-echo".into())
+}
+
+/// True when `exe` sits in a Cargo build directory.
+///
+/// Such a binary is a test harness or a working copy: pinning a user's hooks,
+/// MCP registrations or global entity-root pointer to it would break the
+/// moment the tree is cleaned.
+///
+/// The test is the *shape* Cargo produces, not the string `target`, because
+/// `CARGO_TARGET_DIR` renames that directory freely (#59): the binary's parent
+/// is `debug`/`release`, or `deps` inside one. A substring match would both
+/// miss `/home/d/build/debug/recall-echo` and libel
+/// `/opt/apps/release/deps/bin/recall-echo`.
+#[must_use]
+pub(crate) fn is_build_dir(exe: &str) -> bool {
+    fn dir_name(dir: Option<&Path>) -> Option<&str> {
+        dir?.file_name()?.to_str()
+    }
+    let parent = Path::new(exe).parent();
+    match dir_name(parent) {
+        Some("debug" | "release") => true,
+        Some("deps") => matches!(
+            dir_name(parent.and_then(Path::parent)),
+            Some("debug" | "release")
+        ),
+        _ => false,
+    }
+}
+
+/// Environment variables an agent CLI reads to find its own user config, and
+/// where each one sits relative to a home directory (`None` = the home itself).
+///
+/// `claude mcp add` writes `~/.claude.json`, `codex mcp add` writes
+/// `~/.codex/config.toml`: recall-echo never opens those files, so the only
+/// way to redirect them is the child's environment.
+const AGENT_CONFIG_ENV: [(&str, Option<&str>); 4] = [
+    ("HOME", None),
+    ("XDG_CONFIG_HOME", Some(".config")),
+    ("CLAUDE_CONFIG_DIR", Some(".claude")),
+    ("CODEX_HOME", Some(".codex")),
+];
+
+/// What became of the persisted entity-root pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistOutcome {
+    /// Written to this file.
+    Written(PathBuf),
+    /// Deliberately not written, and why — phrased to follow "Skipped … — ".
+    Skipped(&'static str),
+}
+
+/// The global destinations `init` writes to, resolved once and passed down.
+///
+/// `init` touches three things nobody named on the command line: the Claude
+/// Code hook file (`~/.claude/settings.json`), the persisted entity root
+/// (`$XDG_CONFIG_HOME/recall-echo/entity-root`), and — through the agent CLIs
+/// it shells out to — their own user config. Resolving those paths inside each
+/// writer left a caller no way to redirect them, and the test suite rewrote the
+/// developer's real configuration on every run (#59). They are an input now,
+/// together with the binary path those files are written to point at.
+///
+/// Construct with [`ConfigRoots::from_env`] in production and
+/// [`ConfigRoots::sandboxed`] anywhere the writes must not escape a directory.
+#[derive(Debug, Clone)]
+pub struct ConfigRoots {
+    claude_dir: Option<PathBuf>,
+    /// The persisted-pointer destination, or why there is none.
+    entity_root_file: Result<PathBuf, &'static str>,
+    agent_home: Option<PathBuf>,
+    recall_bin: String,
+    spawns_agents: bool,
+}
+
+impl ConfigRoots {
+    /// The real user's configuration: `~/.claude` when Claude Code is
+    /// installed (or `RECALL_ECHO_CLAUDE_DIR` when set), the XDG state file,
+    /// and the ambient environment for spawned agent CLIs.
+    ///
+    /// A binary in a build directory persists no pointer: `cargo run -- init
+    /// /tmp/scratch` from a checkout would otherwise repoint every flagless
+    /// command at `/tmp/scratch` for good.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let recall_bin = recall_binary();
+        let entity_root_file = if is_build_dir(&recall_bin) {
+            Err("running from a build directory")
+        } else {
+            entity_root_state_file().ok_or("there is no home directory to persist into")
+        };
+        Self {
+            claude_dir: detect_claude_code(),
+            entity_root_file,
+            agent_home: None,
+            recall_bin,
+            spawns_agents: true,
+        }
+    }
+
+    /// Every destination under `dir`, which is created if it does not exist.
+    ///
+    /// `<dir>/.claude` is created 0700, so hook installation is exercised
+    /// rather than skipped for want of a Claude Code install to detect, and
+    /// the hooks point at `<dir>/bin/recall-echo` — a production-shaped path,
+    /// so no guard fires and the writers really run. Nothing here spawns an
+    /// agent CLI or downloads a model (see [`ConfigRoots::spawns_agents`]).
+    pub fn sandboxed(dir: &Path) -> Result<Self, RecallError> {
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir)?;
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o700))?;
+        Ok(Self {
+            claude_dir: Some(claude_dir),
+            entity_root_file: Ok(dir.join(".config").join("recall-echo").join("entity-root")),
+            agent_home: Some(dir.to_path_buf()),
+            recall_bin: dir.join("bin").join("recall-echo").display().to_string(),
+            spawns_agents: false,
+        })
+    }
+
+    /// The same roots with no Claude Code installed — the branch where hooks
+    /// have nowhere to go.
+    #[must_use]
+    pub fn without_claude_code(mut self) -> Self {
+        self.claude_dir = None;
+        self
+    }
+
+    /// The Claude Code directory hooks belong in, when there is one.
+    #[must_use]
+    pub fn claude_dir(&self) -> Option<&Path> {
+        self.claude_dir.as_deref()
+    }
+
+    /// The file the entity-root pointer is written to, when one is written.
+    #[must_use]
+    pub fn entity_root_file(&self) -> Option<&Path> {
+        self.entity_root_file.as_deref().ok()
+    }
+
+    /// The binary path written into hooks and MCP registrations.
+    #[must_use]
+    pub fn recall_bin(&self) -> &str {
+        &self.recall_bin
+    }
+
+    /// Whether this configuration may reach out to the machine: run an agent
+    /// CLI's `mcp add`, or download the embedding model. False for a sandbox,
+    /// where the point is that nothing outside `dir` happens at all.
+    #[must_use]
+    pub fn spawns_agents(&self) -> bool {
+        self.spawns_agents
+    }
+
+    /// Environment an agent CLI must run under to keep its config writes
+    /// inside these roots. Empty for [`ConfigRoots::from_env`]: a real
+    /// registration wants the user's real config.
+    #[must_use]
+    pub fn agent_env(&self) -> Vec<(&'static str, PathBuf)> {
+        let Some(home) = &self.agent_home else {
+            return Vec::new();
+        };
+        AGENT_CONFIG_ENV
+            .iter()
+            .map(|(key, subdir)| {
+                let value = subdir.map_or_else(|| home.clone(), |sub| home.join(sub));
+                (*key, value)
+            })
+            .collect()
+    }
+
+    /// Persist `root` as the default entity root for flagless invocations.
+    pub fn persist_entity_root(&self, root: &Path) -> Result<PersistOutcome, RecallError> {
+        match &self.entity_root_file {
+            Ok(file) => {
+                persist_entity_root_to(file, root)?;
+                Ok(PersistOutcome::Written(file.clone()))
+            }
+            Err(why) => Ok(PersistOutcome::Skipped(why)),
+        }
+    }
 }
 
 fn persist_entity_root_to(
@@ -645,6 +826,135 @@ mod tests {
             trusted_root(&mine).unwrap(),
             std::fs::canonicalize(&mine).unwrap()
         );
+    }
+
+    /// Every destination a sandboxed `init` can write to lives under the
+    /// directory handed in — the property the whole of #59 rests on.
+    #[test]
+    fn sandboxed_roots_point_at_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = ConfigRoots::sandboxed(tmp.path()).unwrap();
+
+        for path in [roots.claude_dir(), roots.entity_root_file()] {
+            let path = path.expect("a destination inside the sandbox");
+            assert!(path.starts_with(tmp.path()), "{}", path.display());
+        }
+        for (key, value) in roots.agent_env() {
+            assert!(
+                value.starts_with(tmp.path()),
+                "{key} escapes the sandbox: {}",
+                value.display()
+            );
+        }
+        assert_eq!(roots.agent_env().len(), AGENT_CONFIG_ENV.len());
+        assert!(
+            Path::new(roots.recall_bin()).starts_with(tmp.path()),
+            "{}",
+            roots.recall_bin()
+        );
+        assert!(!roots.spawns_agents(), "a sandbox runs nothing");
+        assert!(roots.claude_dir().unwrap().is_dir(), "created eagerly");
+        assert_eq!(
+            std::fs::metadata(roots.claude_dir().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    /// The persisted-root writer takes its destination from the roots, so a
+    /// test cannot reach `~/.config/recall-echo/entity-root` even by accident.
+    #[test]
+    fn persisting_through_sandboxed_roots_leaves_the_real_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = entity_root_state_file().expect("a real state file path");
+        let before = std::fs::read(&real).ok();
+
+        let root = tmp.path().join("entity");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = ConfigRoots::sandboxed(tmp.path()).unwrap();
+        let written = roots.persist_entity_root(&root).unwrap();
+
+        let file = roots
+            .entity_root_file()
+            .expect("a destination")
+            .to_path_buf();
+        assert_eq!(written, PersistOutcome::Written(file.clone()));
+        assert!(file.starts_with(tmp.path()), "{}", file.display());
+        assert_eq!(
+            persisted_entity_root_from(&file).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&real).ok(),
+            before,
+            "{} changed",
+            real.display()
+        );
+    }
+
+    /// A binary in a build directory is a working copy: `cargo run -- init`
+    /// must not repoint the pointer every flagless command resolves through.
+    /// The test binary is itself such a path, so this also proves the suite
+    /// cannot reach the real file through `from_env`.
+    #[test]
+    fn from_env_in_a_build_directory_persists_nowhere() {
+        let roots = ConfigRoots::from_env(); // sanctioned: read-only from_env (RE-59)
+        assert!(
+            is_build_dir(roots.recall_bin()),
+            "test binary is not build-shaped: {}",
+            roots.recall_bin()
+        );
+        assert_eq!(roots.entity_root_file(), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            roots.persist_entity_root(tmp.path()).unwrap(),
+            PersistOutcome::Skipped("running from a build directory")
+        );
+        assert!(roots.spawns_agents(), "production roots still reach out");
+        assert!(
+            roots.agent_env().is_empty(),
+            "a real registration inherits the user's environment"
+        );
+    }
+
+    /// The shape Cargo produces, whatever `CARGO_TARGET_DIR` calls the
+    /// directory — and nothing that merely contains those words.
+    #[test]
+    fn build_directories_are_recognised_by_shape() {
+        for exe in [
+            "/opt/recall-echo/target/debug/recall-echo",
+            "/opt/recall-echo/target/release/recall-echo",
+            "/opt/shared/target/debug/deps/recall_echo-1a2b3c",
+            "/home/d/.cache/rust/release/deps/recall_echo-1a2b3c",
+            "/home/d/build/debug/recall-echo",
+        ] {
+            assert!(is_build_dir(exe), "{exe}");
+        }
+        for exe in [
+            "/usr/local/bin/recall-echo",
+            "/home/d/.cargo/bin/recall-echo",
+            "/opt/apps/release/deps/bin/recall-echo",
+            "/home/d/debug/bin/recall-echo",
+            "/tmp/.tmpAbC123/bin/recall-echo",
+            "recall-echo",
+        ] {
+            assert!(!is_build_dir(exe), "{exe}");
+        }
+    }
+
+    /// Hooks have nowhere to go when Claude Code is not installed.
+    #[test]
+    fn roots_without_claude_code_name_no_hook_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = ConfigRoots::sandboxed(tmp.path())
+            .unwrap()
+            .without_claude_code();
+        assert_eq!(roots.claude_dir(), None);
+        assert!(roots.entity_root_file().is_some(), "the pointer still goes");
     }
 
     #[test]
