@@ -84,6 +84,12 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
 /// run it. When the scan is *also* empty, no amount of waiting will ever
 /// produce an entity: report the shape of the breakage (which field the
 /// episodes are missing) instead of promising a daemon pass that will no-op.
+///
+/// Each missing-field count is printed only when it is non-zero. Since RE-44
+/// `extracted_absent` is zero on every store this binary has opened — the
+/// schema-version-2 backfill gives every episode a value — so a non-zero
+/// count is a finding in its own right, not a line item, and it is enough on
+/// its own to call the store inconsistent.
 fn zero_entity_explanation(
     stats: &crate::graph::types::GraphStats,
     background_enabled: bool,
@@ -118,7 +124,7 @@ fn zero_entity_explanation(
         return out;
     }
 
-    if stats.log_number_absent > 0 {
+    if stats.log_number_absent > 0 || stats.extracted_absent > 0 {
         let _ = writeln!(
             out,
             "\n  {WARN}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
@@ -127,24 +133,39 @@ fn zero_entity_explanation(
             out,
             "  nothing to process — waiting for the daemon will not help."
         );
-        let _ = writeln!(
-            out,
-            "    episodes missing the extracted flag: {}",
-            stats.extracted_absent
-        );
-        let _ = writeln!(
-            out,
-            "    episodes missing a log_number:       {}",
-            stats.log_number_absent
-        );
-        let _ = writeln!(
-            out,
-            "  Episodes without a log_number cannot be matched to an archive file,"
-        );
-        let _ = writeln!(
-            out,
-            "  so extraction cannot reach them. To rebuild episodes from archives:"
-        );
+        if stats.extracted_absent > 0 {
+            let _ = writeln!(
+                out,
+                "    episodes missing the extracted flag: {}",
+                stats.extracted_absent
+            );
+        }
+        if stats.log_number_absent > 0 {
+            let _ = writeln!(
+                out,
+                "    episodes missing a log_number:       {}",
+                stats.log_number_absent
+            );
+        }
+        if stats.extracted_absent > 0 {
+            let _ = writeln!(
+                out,
+                "  Episodes with no extracted flag are invisible to the indexed scan. The"
+            );
+            let _ = writeln!(
+                out,
+                "  schema marker says the backfill already ran, so re-opening the store will"
+            );
+            let _ = writeln!(out, "  not repair them.");
+        }
+        if stats.log_number_absent > 0 {
+            let _ = writeln!(
+                out,
+                "  Episodes without a log_number cannot be matched to an archive file,"
+            );
+            let _ = writeln!(out, "  so extraction cannot reach them.");
+        }
+        let _ = writeln!(out, "  To rebuild episodes from archives:");
         let _ = writeln!(out, "    {DIM}recall-echo graph ingest-all{RESET}");
     } else {
         // Every episode has been through extraction and none yielded an
@@ -1949,6 +1970,28 @@ mod tests {
             text.contains("episodes missing a log_number:       5118"),
             "{text}"
         );
+        assert!(text.contains("ingest-all"), "{text}");
+        // The extracted-flag count is zero here and must not be listed: after
+        // RE-44 a zero is the expected state, not a diagnosis.
+        assert!(!text.contains("missing the extracted flag"), "{text}");
+    }
+
+    /// A migration that did not reach every episode is its own breakage, and
+    /// the only one where the count is non-zero after RE-44. It must be
+    /// reported even when every episode has a log_number.
+    #[test]
+    fn an_unmigrated_store_names_the_missing_extracted_flag() {
+        let mut stats = zero_entity_stats(0, 0);
+        stats.extracted_absent = 12;
+
+        let text = zero_entity_explanation(&stats, true, 120);
+        assert!(text.contains("Inconsistent store"), "{text}");
+        assert!(
+            text.contains("episodes missing the extracted flag: 12"),
+            "{text}"
+        );
+        assert!(text.contains("invisible to the indexed scan"), "{text}");
+        assert!(!text.contains("missing a log_number"), "{text}");
         assert!(text.contains("ingest-all"), "{text}");
     }
 

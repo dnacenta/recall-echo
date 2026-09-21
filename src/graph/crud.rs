@@ -548,17 +548,28 @@ pub async fn mark_episodes_extracted(db: &Surreal<Db>, log_number: u32) -> Resul
     Ok(())
 }
 
-/// Get distinct log numbers of episodes that have NOT been extracted.
+/// The extraction scan, as one statement so the plan test explains exactly
+/// what the daemon runs.
 ///
-/// Episodes written before the `extracted` field existed have no value at
-/// all — `DEFAULT` applies at creation, not retroactively — and in SurrealDB
-/// `NONE ≠ false`, so a bare `extracted = false` can never match them. Absent
-/// resolves to "not extracted", the conservative default, same as
-/// `access_count` and `provenance` on this table.
+/// `extracted = false` is a plain field comparison, which the planner serves
+/// from the `episode_extracted` index; the background worker polls this on a
+/// 100ms–30s backoff for the life of the daemon, so a full table scan here is
+/// a permanent tax. `log_number IS NOT NONE` cannot be indexed and does not
+/// need to be: it filters the *output* of the index scan, which in the
+/// steady state is empty.
+///
+/// This predicate is only correct because schema version 2 backfilled every
+/// absent `extracted` to `false` (`store::backfill_episode_extracted`) and
+/// that backfill fails the open rather than leaving a row behind. An episode
+/// with no value at all is invisible here — which is what
+/// [`episode_absent_field_counts`] exists to catch.
+const UNEXTRACTED_SCAN: &str = "SELECT log_number FROM episode \
+     WHERE extracted = false AND log_number IS NOT NONE \
+     GROUP BY log_number ORDER BY log_number";
+
+/// Get distinct log numbers of episodes that have NOT been extracted.
 pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, GraphError> {
-    let mut response = db
-        .query("SELECT log_number FROM episode WHERE (extracted ?? false) != true AND log_number IS NOT NONE GROUP BY log_number ORDER BY log_number")
-        .await?;
+    let mut response = db.query(UNEXTRACTED_SCAN).await?;
 
     #[derive(serde::Deserialize)]
     struct Row {
@@ -572,6 +583,12 @@ pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, G
 /// Count episodes missing the `extracted` flag and missing a `log_number`,
 /// in one pass over the table — `count(expr)` counts truthy values, so both
 /// diagnostics share the scan. Returns `(extracted_absent, log_number_absent)`.
+///
+/// `extracted_absent` is zero on every store schema version 2 has opened, by
+/// design: the migration gives every episode a value. It is kept because it
+/// is the assertion that the migration landed — the extraction scan matches
+/// `extracted = false`, so an episode that still has no value is not merely
+/// slow to find, it can never be found, and nothing else would say so.
 pub async fn episode_absent_field_counts(db: &Surreal<Db>) -> Result<(u64, u64), GraphError> {
     #[derive(serde::Deserialize)]
     struct AbsentCounts {
@@ -682,5 +699,40 @@ mod tests {
         mark_episodes_extracted(&db, 7).await.expect("mark");
         let logs = get_unextracted_log_numbers(&db).await.expect("rescan");
         assert_eq!(logs, vec![9]);
+    }
+
+    /// The whole point of RE-44: the statement the daemon polls must be
+    /// served by the `episode_extracted` index. Nothing else in the suite
+    /// can tell a correct index scan from a correct full-table scan, so a
+    /// future edit to the predicate would silently reinstate the tax this
+    /// issue removed.
+    #[tokio::test]
+    async fn the_extraction_scan_is_served_by_the_index() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = store::open(dir.path()).await.expect("open store");
+        store::init_schema(&db).await.expect("schema");
+
+        db.query("CREATE episode SET session_id = 's', abstract = 'a', log_number = 1")
+            .await
+            .expect("insert")
+            .check()
+            .expect("insert check");
+
+        let mut response = db
+            .query(format!("{UNEXTRACTED_SCAN} EXPLAIN FULL"))
+            .await
+            .expect("explain");
+        let plan: Vec<serde_json::Value> =
+            super::super::deserialize_take(&mut response, 0).expect("explain rows");
+        let plan = serde_json::to_string(&plan).expect("plan json");
+
+        assert!(
+            plan.contains("\"operator\":\"IndexScan\""),
+            "the extraction scan must not be a table scan: {plan}"
+        );
+        assert!(
+            plan.contains("\"index\":\"episode_extracted\""),
+            "the scan must use the extracted index: {plan}"
+        );
     }
 }
