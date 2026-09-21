@@ -422,25 +422,42 @@ fn recall_binary() -> String {
 ///
 /// Such a path is a test harness or a working copy, and pinning a user's hooks
 /// or MCP config to it would break the moment the tree is cleaned.
+///
+/// `target/` is only the *default* directory name: with `CARGO_TARGET_DIR` set
+/// the same artifacts land anywhere, which is how the suite came to rewrite a
+/// developer's real hooks (#59). Both shapes are recognised, and under the
+/// crate's own tests the answer is unconditional. The guard is belt and braces
+/// — every global write now goes through an injected [`paths::ConfigRoots`] —
+/// but it still stops `cargo run -- init` from pinning a user to a binary that
+/// `cargo clean` deletes.
 fn is_build_dir(exe: &str) -> bool {
-    exe.contains("/target/debug/") || exe.contains("/target/release/")
+    cfg!(test) || path_is_build_dir(exe)
+}
+
+/// The path half of [`is_build_dir`], so the shapes can be asserted from
+/// inside the crate's own tests, where `cfg!(test)` answers first.
+fn path_is_build_dir(exe: &str) -> bool {
+    exe.contains("/target/debug/")
+        || exe.contains("/target/release/")
+        || exe.contains("/debug/deps/")
+        || exe.contains("/release/deps/")
 }
 
 /// Auto-configure Claude Code hooks (settings.json).
 /// Returns true if hooks were configured.
-/// Hooks always go in ~/.claude/settings.json regardless of where entity_root is.
-fn configure_hooks(entity_root: &Path) -> bool {
-    let claude_dir = match paths::detect_claude_code() {
-        Some(dir) => dir,
-        None => return false,
+///
+/// The file is `<roots.claude_dir()>/settings.json` — `~/.claude/settings.json`
+/// in production, a sandbox under test — regardless of where entity_root is.
+/// `recall_bin` is the binary the hooks will invoke, passed in so a caller can
+/// exercise this writer without the process's own path deciding the outcome.
+fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path, recall_bin: &str) -> bool {
+    let Some(claude_dir) = roots.claude_dir() else {
+        return false;
     };
 
-    let settings_path = claude_dir.join("settings.json");
-    let recall_bin = recall_binary();
-
-    // A path under target/ is a test harness or a debug build, not something
-    // a user's hooks should be pinned to for the life of the install.
-    if is_build_dir(&recall_bin) {
+    // A path under a build directory is a test harness or a debug build, not
+    // something a user's hooks should be pinned to for the life of the install.
+    if is_build_dir(recall_bin) {
         print_status(
             Status::Exists,
             "Skipped hook install — running from a build directory",
@@ -448,12 +465,21 @@ fn configure_hooks(entity_root: &Path) -> bool {
         return false;
     }
 
+    install_hooks(&claude_dir.join("settings.json"), entity_root, recall_bin)
+}
+
+/// Install or repair the three hooks in the settings file at `settings_path`.
+///
+/// Split from [`configure_hooks`] so the writer can be exercised against a
+/// named file with a named binary: where it writes is an argument, never a
+/// path this process resolves for itself (#59).
+fn install_hooks(settings_path: &Path, entity_root: &Path, recall_bin: &str) -> bool {
     // Absent means a fresh install. Unreadable or unparseable means the
     // user's existing configuration — falling back to `{}` there would
     // overwrite everything they have (permissions, MCP servers, env) with a
     // file containing nothing but these hooks.
     let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = match fs::read_to_string(&settings_path) {
+        let content = match fs::read_to_string(settings_path) {
             Ok(c) => c,
             Err(e) => {
                 print_status(
@@ -506,7 +532,7 @@ fn configure_hooks(entity_root: &Path) -> bool {
         );
         return false;
     }
-    if !is_shell_safe_bin(&recall_bin) {
+    if !is_shell_safe_bin(recall_bin) {
         print_status(
             Status::Error,
             &format!(
@@ -518,7 +544,7 @@ fn configure_hooks(entity_root: &Path) -> bool {
     }
 
     let mut notes: Vec<String> = Vec::new();
-    let changed = match upsert_recall_hooks(&mut settings, &recall_bin, &root, &mut notes) {
+    let changed = match upsert_recall_hooks(&mut settings, recall_bin, &root, &mut notes) {
         Ok(changed) => changed,
         Err(why) => {
             print_status(
@@ -534,7 +560,7 @@ fn configure_hooks(entity_root: &Path) -> bool {
 
     if changed {
         match serde_json::to_string_pretty(&settings) {
-            Ok(content) => match write_settings_atomically(&settings_path, &content) {
+            Ok(content) => match write_settings_atomically(settings_path, &content) {
                 Ok(()) => {
                     print_status(
                         Status::Created,
@@ -863,6 +889,7 @@ fn register_mcp_clients(
     runtime: &tokio::runtime::Runtime,
     detected: &[AgentCli],
     entity_root: &Path,
+    roots: &paths::ConfigRoots,
 ) -> Vec<McpReport> {
     if detected.is_empty() {
         return Vec::new();
@@ -881,7 +908,7 @@ fn register_mcp_clients(
     let reports: Vec<McpReport> = runtime.block_on(async {
         let mut reports = Vec::with_capacity(detected.len());
         for cli in detected {
-            reports.push(agent_cli::register_mcp(*cli, &exe, &root).await);
+            reports.push(agent_cli::register_mcp(*cli, &exe, &root, roots).await);
         }
         reports
     });
@@ -1011,8 +1038,21 @@ pub fn run(entity_root: &Path) -> Result<(), RecallError> {
     run_with_reader(entity_root, &mut reader)
 }
 
-/// Testable init with injectable reader.
+/// Init with an injectable reader, against the real user configuration.
 pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(), RecallError> {
+    run_with(entity_root, reader, &paths::ConfigRoots::from_env())
+}
+
+/// Init with both the reader and the global destinations injected.
+///
+/// `roots` decides where the hook file, the persisted entity root and any
+/// agent-CLI config land. Pass [`paths::ConfigRoots::sandboxed`] and nothing
+/// outside that directory can be written, whatever this binary's path is (#59).
+pub fn run_with(
+    entity_root: &Path,
+    reader: &mut dyn BufRead,
+    roots: &paths::ConfigRoots,
+) -> Result<(), RecallError> {
     if !entity_root.exists() {
         return Err(RecallError::NotInitialized(format!(
             "Directory not found: {}\n  Create the directory first, or run from a valid path.",
@@ -1030,7 +1070,7 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
 
     // Pin this root for flagless hook invocations (#46): capture must land in
     // the store the MCP server serves, not wherever the session's cwd is.
-    match paths::persist_entity_root(entity_root) {
+    match roots.persist_entity_root(entity_root) {
         Ok(file) => print_status(
             Status::Created,
             &format!("Entity root persisted to {}", file.display()),
@@ -1076,10 +1116,10 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
     // extraction provider: a user who extracts with grok still wants their
     // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
     // is not installed.
-    configure_hooks(entity_root);
+    configure_hooks(roots, entity_root, &recall_binary());
 
     let mcp = match &runtime {
-        Some(runtime) => register_mcp_clients(runtime, &detected, entity_root),
+        Some(runtime) => register_mcp_clients(runtime, &detected, entity_root, roots),
         None => Vec::new(),
     };
 
@@ -1101,11 +1141,42 @@ pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
-    /// Init under `cargo test` runs from `target/debug/deps/…`, which is what
-    /// keeps these tests off the developer's real hooks, MCP configs and
-    /// network. Assert it, so a change in harness layout fails here rather
-    /// than by rewriting someone's settings.json.
+    /// An entity root and a sandbox for everything `init` writes outside it.
+    ///
+    /// Every test here runs the real writers; none of them may reach the
+    /// developer's `~/.claude`, `~/.claude.json` or persisted entity root
+    /// (#59). The destinations are an argument, not an environment variable,
+    /// so this is safe under a parallel test runner.
+    struct Sandbox {
+        dir: tempfile::TempDir,
+        roots: paths::ConfigRoots,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let entity = dir.path().join("entity");
+            fs::create_dir_all(&entity).unwrap();
+            let roots = paths::ConfigRoots::sandboxed(dir.path()).unwrap();
+            Self { dir, roots }
+        }
+
+        fn entity_root(&self) -> PathBuf {
+            self.dir.path().join("entity")
+        }
+
+        fn init(&self, input: &str) -> Result<(), RecallError> {
+            let mut reader = Cursor::new(input.as_bytes());
+            run_with(&self.entity_root(), &mut reader, &self.roots)
+        }
+    }
+
+    /// The guard that keeps a `cargo run -- init` from pinning a user's hooks
+    /// to a binary `cargo clean` deletes. `target/` is only the default target
+    /// directory name, so the `deps` shapes any `CARGO_TARGET_DIR` produces
+    /// count too, and under the crate's own tests the answer is unconditional.
     #[test]
     fn the_test_binary_is_recognised_as_a_build_directory() {
         assert!(
@@ -1113,35 +1184,58 @@ mod tests {
             "test binary should be treated as a build directory: {}",
             recall_binary()
         );
-        assert!(!is_build_dir("/usr/local/bin/recall-echo"));
-        assert!(!is_build_dir("/home/d/.cargo/bin/recall-echo"));
+        for exe in [
+            "/opt/recall-echo/target/debug/recall-echo",
+            "/opt/recall-echo/target/release/recall-echo",
+            "/opt/shared/target/debug/deps/recall_echo-1a2b3c",
+            "/home/d/.cache/rust/release/deps/recall_echo-1a2b3c",
+        ] {
+            assert!(is_build_dir(exe), "{exe}");
+        }
+        // cfg!(test) is true in here, so the negative cases are asserted
+        // against the same predicate the binary compiles with.
+        assert!(!path_is_build_dir("/usr/local/bin/recall-echo"));
+        assert!(!path_is_build_dir("/home/d/.cargo/bin/recall-echo"));
+        assert!(!path_is_build_dir("/home/d/debug/bin/recall-echo"));
     }
 
     #[test]
     fn init_creates_directories_and_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let mut reader = Cursor::new(b"skip\n" as &[u8]); // skip provider prompt
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap(); // skip provider prompt
 
-        run_with_reader(&root, &mut reader).unwrap();
-
+        let root = sandbox.entity_root();
         assert!(root.join("memory/MEMORY.md").exists());
         assert!(root.join("memory/EPHEMERAL.md").exists());
         assert!(root.join("memory/ARCHIVE.md").exists());
         assert!(root.join("memory/conversations").exists());
     }
 
+    /// Everything `init` writes outside the entity root lands in the sandbox:
+    /// the persisted pointer exists there, and it names the entity root.
+    #[test]
+    fn init_persists_the_entity_root_inside_the_sandbox() {
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+
+        let persisted = sandbox.dir.path().join(".config/recall-echo/entity-root");
+        let pinned = fs::read_to_string(&persisted).expect("persisted inside the sandbox");
+        assert_eq!(
+            pinned.trim(),
+            fs::canonicalize(sandbox.entity_root())
+                .unwrap()
+                .to_string_lossy()
+        );
+    }
+
     #[test]
     fn init_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let mut reader = Cursor::new(b"skip\n" as &[u8]);
-
-        run_with_reader(&root, &mut reader).unwrap();
+        let sandbox = Sandbox::new();
+        let root = sandbox.entity_root();
+        sandbox.init("skip\n").unwrap();
         fs::write(root.join("memory/MEMORY.md"), "custom content").unwrap();
 
-        let mut reader2 = Cursor::new(b"skip\n" as &[u8]);
-        run_with_reader(&root, &mut reader2).unwrap();
+        sandbox.init("skip\n").unwrap();
         let content = fs::read_to_string(root.join("memory/MEMORY.md")).unwrap();
         assert_eq!(content, "custom content");
     }
@@ -1173,8 +1267,9 @@ mod tests {
 
     #[test]
     fn init_fails_if_root_missing() {
+        let sandbox = Sandbox::new();
         let mut reader = Cursor::new(b"" as &[u8]);
-        let result = run_with_reader(Path::new("/nonexistent/path"), &mut reader);
+        let result = run_with(Path::new("/nonexistent/path"), &mut reader, &sandbox.roots);
         assert!(result.is_err());
     }
 
@@ -1476,10 +1571,9 @@ mod tests {
 
     #[test]
     fn archive_template_has_header() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut reader = Cursor::new(b"skip\n" as &[u8]);
-        run_with_reader(tmp.path(), &mut reader).unwrap();
-        let content = fs::read_to_string(tmp.path().join("memory/ARCHIVE.md")).unwrap();
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+        let content = fs::read_to_string(sandbox.entity_root().join("memory/ARCHIVE.md")).unwrap();
         assert!(content.contains("# Conversation Archive"));
         assert!(content.contains("| # | Date"));
     }

@@ -187,12 +187,18 @@ fn progress_bar(pct: u32, width: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Init writes hooks and a persisted root pointer outside the store, so
+    /// it runs here against a sandbox: the suite never touches the real
+    /// configuration (#59).
     #[test]
     fn status_on_initialized_env() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        crate::init::run(root).unwrap();
-        assert!(run_with_base(root).is_ok());
+        let root = tmp.path().join("entity");
+        fs::create_dir_all(&root).unwrap();
+        let roots = crate::paths::ConfigRoots::sandboxed(tmp.path()).unwrap();
+        let mut reader = std::io::Cursor::new(b"skip\n" as &[u8]);
+        crate::init::run_with(&root, &mut reader, &roots).unwrap();
+        assert!(run_with_base(&root).is_ok());
     }
 
     #[test]

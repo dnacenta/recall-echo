@@ -127,7 +127,7 @@ pub fn hook_base_dir(entity_root: Option<&std::path::Path>) -> Result<PathBuf, R
 /// invoked without `--entity-root` still find the store the MCP server was
 /// registered with (#46): `$XDG_CONFIG_HOME/recall-echo/entity-root`,
 /// defaulting to `~/.config/recall-echo/entity-root`.
-fn entity_root_state_file() -> Option<PathBuf> {
+pub(crate) fn entity_root_state_file() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => dirs::home_dir()?.join(".config"),
@@ -147,13 +147,98 @@ fn persisted_entity_root_from(file: &std::path::Path) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
-/// Persist `root` as the default entity root for flagless hook invocations.
-/// Returns the file written, for the init status line.
-pub fn persist_entity_root(root: &std::path::Path) -> Result<PathBuf, RecallError> {
-    let file = entity_root_state_file()
-        .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
-    persist_entity_root_to(&file, root)?;
-    Ok(file)
+// ── Where `init` writes outside the store ────────────────────────────────
+
+/// Environment variables an agent CLI reads to find its own user config.
+///
+/// `claude mcp add` writes `~/.claude.json`, `codex mcp add` writes
+/// `~/.codex/config.toml`: recall-echo never opens those files, so the only
+/// way to redirect them is the child's environment.
+const AGENT_CONFIG_ENV: [&str; 4] = ["HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
+/// The global destinations `init` writes to, resolved once and passed down.
+///
+/// `init` touches three things nobody named on the command line: the Claude
+/// Code hook file (`~/.claude/settings.json`), the persisted entity root
+/// (`$XDG_CONFIG_HOME/recall-echo/entity-root`), and — through the agent CLIs
+/// it shells out to — their own user config. Resolving those paths inside each
+/// writer left a caller no way to redirect them, and the test suite rewrote the
+/// developer's real configuration on every run (#59). They are an input now.
+///
+/// Construct with [`ConfigRoots::from_env`] in production and
+/// [`ConfigRoots::sandboxed`] anywhere the writes must not escape a directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigRoots {
+    claude_dir: Option<PathBuf>,
+    entity_root_file: Option<PathBuf>,
+    agent_home: Option<PathBuf>,
+}
+
+impl ConfigRoots {
+    /// The real user's configuration: `~/.claude` when Claude Code is
+    /// installed (or `RECALL_ECHO_CLAUDE_DIR` when set), the XDG state file,
+    /// and the ambient environment for spawned agent CLIs.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            claude_dir: detect_claude_code(),
+            entity_root_file: entity_root_state_file(),
+            agent_home: None,
+        }
+    }
+
+    /// Every destination under `dir`, which must already exist.
+    ///
+    /// `<dir>/.claude` is created, so hook installation is exercised rather
+    /// than skipped for want of a Claude Code install to detect.
+    pub fn sandboxed(dir: &Path) -> Result<Self, RecallError> {
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir)?;
+        Ok(Self {
+            claude_dir: Some(claude_dir),
+            entity_root_file: Some(dir.join(".config").join("recall-echo").join("entity-root")),
+            agent_home: Some(dir.to_path_buf()),
+        })
+    }
+
+    /// The Claude Code directory hooks belong in, when there is one.
+    #[must_use]
+    pub fn claude_dir(&self) -> Option<&Path> {
+        self.claude_dir.as_deref()
+    }
+
+    /// Environment an agent CLI must run under to keep its config writes
+    /// inside these roots. Empty for [`ConfigRoots::from_env`]: a real
+    /// registration wants the user's real config.
+    #[must_use]
+    pub fn agent_env(&self) -> Vec<(&'static str, PathBuf)> {
+        let Some(home) = &self.agent_home else {
+            return Vec::new();
+        };
+        AGENT_CONFIG_ENV
+            .iter()
+            .map(|key| {
+                let value = match *key {
+                    "XDG_CONFIG_HOME" => home.join(".config"),
+                    "CLAUDE_CONFIG_DIR" => home.join(".claude"),
+                    "CODEX_HOME" => home.join(".codex"),
+                    _ => home.clone(),
+                };
+                (*key, value)
+            })
+            .collect()
+    }
+
+    /// Persist `root` as the default entity root for flagless invocations.
+    /// Returns the file written, for the init status line.
+    pub fn persist_entity_root(&self, root: &Path) -> Result<PathBuf, RecallError> {
+        let file = self
+            .entity_root_file
+            .clone()
+            .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
+        persist_entity_root_to(&file, root)?;
+        Ok(file)
+    }
 }
 
 fn persist_entity_root_to(
@@ -644,6 +729,70 @@ mod tests {
         assert_eq!(
             trusted_root(&mine).unwrap(),
             std::fs::canonicalize(&mine).unwrap()
+        );
+    }
+
+    /// Every destination a sandboxed `init` can write to lives under the
+    /// directory handed in — the property the whole of #59 rests on.
+    #[test]
+    fn sandboxed_roots_point_at_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = ConfigRoots::sandboxed(tmp.path()).unwrap();
+
+        assert_eq!(
+            roots.claude_dir(),
+            Some(tmp.path().join(".claude").as_path())
+        );
+        assert!(roots.claude_dir().unwrap().is_dir(), "created eagerly");
+        for (key, value) in roots.agent_env() {
+            assert!(
+                value.starts_with(tmp.path()),
+                "{key} escapes the sandbox: {}",
+                value.display()
+            );
+        }
+        assert_eq!(roots.agent_env().len(), AGENT_CONFIG_ENV.len());
+    }
+
+    /// The persisted-root writer takes its destination from the roots, so a
+    /// test cannot reach `~/.config/recall-echo/entity-root` even by accident.
+    #[test]
+    fn persisting_through_sandboxed_roots_leaves_the_real_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = entity_root_state_file().expect("a real state file path");
+        let before = std::fs::read(&real).ok();
+
+        let root = tmp.path().join("entity");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = ConfigRoots::sandboxed(tmp.path()).unwrap();
+        let written = roots.persist_entity_root(&root).unwrap();
+
+        assert_eq!(
+            written,
+            tmp.path().join(".config/recall-echo/entity-root"),
+            "persisted outside the sandbox"
+        );
+        assert_eq!(
+            persisted_entity_root_from(&written).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&real).ok(),
+            before,
+            "{} changed",
+            real.display()
+        );
+    }
+
+    /// Production resolution is unchanged, and the documented override still
+    /// steers it (the pattern #59 generalises).
+    #[test]
+    fn roots_from_env_agree_with_the_ambient_environment() {
+        let roots = ConfigRoots::from_env();
+        assert_eq!(roots.claude_dir(), detect_claude_code().as_deref());
+        assert!(
+            roots.agent_env().is_empty(),
+            "a real registration inherits the user's environment"
         );
     }
 

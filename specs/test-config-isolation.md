@@ -83,7 +83,9 @@ override that works is the child's env, so that is what `ConfigRoots` carries.
 
 `run_with` is public; `run` and `run_with_reader` keep their signatures and pass
 `ConfigRoots::from_env()`. `configure_hooks` takes the binary path as a parameter instead of
-calling `recall_binary()` itself, so a test can drive the real writer with a production-looking
+calling `recall_binary()` itself, and splits into two: the dispatcher (resolve the Claude
+directory, apply the build-directory guard) and `install_hooks(settings_path, root, bin)`,
+the writer. A test can then drive the writer against a named file with a production-looking
 binary path and prove the write lands in the sandbox.
 
 `paths::persist_entity_root` (free function, env-resolved) is removed in favour of
@@ -137,9 +139,11 @@ nothing to race and no serial-test lock to remember.
 
 - **AC1**: `init::run_with(root, reader, &ConfigRoots::sandboxed(dir))` writes hooks,
   the persisted entity-root file, and any MCP config strictly under `dir`.
-- **AC2**: Every in-crate test that calls `init::run*`, `configure_hooks` or MCP registration
-  passes a sandboxed `ConfigRoots`. No test calls `init::run`, `init::run_with_reader` or
-  `ConfigRoots::from_env()`.
+- **AC2**: Every in-crate test that calls `init::run*`, `configure_hooks`/`install_hooks` or
+  MCP registration passes a sandboxed `ConfigRoots`. No test calls `init::run` or
+  `init::run_with_reader` (the two entry points that resolve the real roots for themselves).
+  `ConfigRoots::from_env()` may only be *read* by a test asserting production resolution
+  (AC7) — never handed to a writer.
 - **AC3**: A sentinel test snapshots the real `~/.claude/settings.json`, `~/.claude.json` and
   `$XDG_CONFIG_HOME/recall-echo/entity-root` (existence + bytes + mtime, resolved from the
   real `HOME` with no override in effect), runs the full init flow against a sandbox, and
