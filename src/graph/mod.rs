@@ -105,10 +105,7 @@ impl GraphMemory {
         let db = store::open(path).await?;
         let migration = store::init_schema(&db).await?;
         if migration.ran() {
-            eprintln!(
-                "recall-echo: graph schema migrated v{} → v{} ({} edges backfilled)",
-                migration.from_version, migration.to_version, migration.edges_backfilled
-            );
+            eprintln!("recall-echo: {}", migration.summary());
         }
 
         let models_dir = path.join("models");
@@ -185,10 +182,7 @@ impl GraphMemory {
         let db = store::connect(config).await?;
         let migration = store::init_schema(&db).await?;
         if migration.ran() {
-            eprintln!(
-                "recall-echo: graph schema migrated v{} → v{} ({} edges backfilled)",
-                migration.from_version, migration.to_version, migration.edges_backfilled
-            );
+            eprintln!("recall-echo: {}", migration.summary());
         }
 
         std::fs::create_dir_all(models_dir)?;

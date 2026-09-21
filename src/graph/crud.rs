@@ -613,7 +613,9 @@ mod tests {
 
     /// A legacy episode row — written before the `extracted` field existed —
     /// must still be found by the unextracted scan. Replays the real-world
-    /// sequence: old schema, insert, schema upgrade, scan.
+    /// sequence: old schema, insert, schema upgrade, scan. Since RE-44 the
+    /// upgrade backfills the absent value, so the scan sees the row through
+    /// the `episode_extracted` index rather than through a `??`.
     #[tokio::test]
     async fn scan_finds_episodes_with_absent_extracted_field() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -641,8 +643,10 @@ mod tests {
             .expect("legacy insert check");
 
         // Upgrade to the current schema. `IF NOT EXISTS` adds `extracted`
-        // with its DEFAULT — which applies at creation, not retroactively.
-        store::init_schema(&db).await.expect("schema upgrade");
+        // with its DEFAULT — which applies at creation, not retroactively —
+        // and the version-2 migration backfills the row that predates it.
+        let migration = store::init_schema(&db).await.expect("schema upgrade");
+        assert_eq!(migration.episodes_backfilled, 1, "{migration:?}");
 
         db.query("CREATE episode SET session_id = 'modern', abstract = 'new row', log_number = 9")
             .await
@@ -665,12 +669,13 @@ mod tests {
             "legacy and modern rows must both be visible"
         );
 
-        // The diagnostics run against the same store: the legacy row is the
-        // one missing `extracted` (created before the field existed), the
-        // orphan row is the one missing `log_number`.
+        // The diagnostics run against the same store. `extracted_absent` is
+        // zero by design after RE-44: the migration gave the legacy row a
+        // value, and any non-zero count would mean it had not. The orphan row
+        // is still the one missing `log_number`.
         let (extracted_absent, log_number_absent) =
             episode_absent_field_counts(&db).await.expect("diagnostics");
-        assert_eq!(extracted_absent, 1);
+        assert_eq!(extracted_absent, 0, "the migration reached every episode");
         assert_eq!(log_number_absent, 1);
 
         // Marking extracted removes a log from the scan either way.

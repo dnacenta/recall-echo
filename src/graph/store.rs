@@ -30,7 +30,9 @@ pub type Db = Any;
 /// - `0` — pre-Phase-1: edges carry a bare `confidence` mean.
 /// - `1` — edges carry persisted Beta evidence (`alpha`, `beta`) and a
 ///   `self_reinforcements` coherence counter.
-pub const SCHEMA_VERSION: i64 = 1;
+/// - `2` — every episode carries a concrete `extracted` value, so the
+///   extraction scan can be served by the `episode_extracted` index.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Record ID of the singleton row holding graph-wide metadata.
 const META_RECORD: &str = "meta:schema";
@@ -231,6 +233,10 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
 
         DEFINE INDEX IF NOT EXISTS episode_session ON episode FIELDS session_id;
         DEFINE INDEX IF NOT EXISTS episode_time    ON episode FIELDS timestamp;
+        -- Serves the extraction scan's `extracted = false`, which the
+        -- background worker polls every 100ms-30s. Defined before the
+        -- version-2 backfill runs; the backfill's UPDATE maintains it.
+        DEFINE INDEX IF NOT EXISTS episode_extracted ON episode FIELDS extracted;
         DEFINE INDEX IF NOT EXISTS episode_vector  ON episode FIELDS embedding HNSW DIMENSION 384 DIST COSINE;
 
         DEFINE TABLE IF NOT EXISTS contributed_to SCHEMAFULL TYPE RELATION;
@@ -251,8 +257,8 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
     Ok(())
 }
 
-/// What one migration pass did. `edges_backfilled` is zero on an already
-/// current store.
+/// What one migration pass did. Both counts are zero on an already current
+/// store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MigrationReport {
     /// Schema version the store was at when the pass started.
@@ -261,6 +267,8 @@ pub struct MigrationReport {
     pub to_version: i64,
     /// Number of edges that gained evidence counts in this pass.
     pub edges_backfilled: u64,
+    /// Number of episodes that gained an `extracted` value in this pass.
+    pub episodes_backfilled: u64,
 }
 
 impl MigrationReport {
@@ -269,14 +277,35 @@ impl MigrationReport {
     pub fn ran(&self) -> bool {
         self.from_version < self.to_version
     }
+
+    /// One line naming the version step and what each backfill touched, for
+    /// the notice every entry point prints after a pass that [`ran`].
+    ///
+    /// [`ran`]: MigrationReport::ran
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "graph schema migrated v{} → v{} ({} edges, {} episodes backfilled)",
+            self.from_version, self.to_version, self.edges_backfilled, self.episodes_backfilled
+        )
+    }
 }
 
 /// Bring the store up to [`SCHEMA_VERSION`].
 ///
-/// Crash-only: the backfill runs *before* the version marker is written, and
-/// only touches edges that still lack evidence (`alpha IS NONE`). An
-/// interrupted pass therefore leaves a store that re-opens, finishes the
-/// remaining edges, and never counts an edge twice.
+/// Crash-only: every backfill runs *before* the version marker is written and
+/// only touches rows that still lack the value it writes (`alpha IS NONE`,
+/// `extracted IS NONE`). An interrupted pass therefore leaves a store that
+/// re-opens, finishes the remainder, and never counts a row twice.
+///
+/// Each backfill is gated on the version that introduced it rather than on
+/// `from_version` being exactly the previous one, so a version-0 store runs
+/// both passes in a single open.
+///
+/// An error here is not swallowed: with the version-2 backfill unfinished,
+/// an episode whose `extracted` is still absent is invisible to the
+/// extraction scan, so the store must refuse to open rather than silently
+/// drop pending archives.
 async fn migrate(db: &Surreal<Db>) -> Result<MigrationReport, GraphError> {
     let from_version = read_schema_version(db).await?;
     if from_version >= SCHEMA_VERSION {
@@ -284,17 +313,47 @@ async fn migrate(db: &Surreal<Db>) -> Result<MigrationReport, GraphError> {
             from_version,
             to_version: from_version,
             edges_backfilled: 0,
+            episodes_backfilled: 0,
         });
     }
 
-    let edges_backfilled = backfill_edge_evidence(db).await?;
+    let edges_backfilled = if from_version < 1 {
+        backfill_edge_evidence(db).await?
+    } else {
+        0
+    };
+    let episodes_backfilled = if from_version < 2 {
+        backfill_episode_extracted(db).await?
+    } else {
+        0
+    };
     write_schema_version(db, SCHEMA_VERSION).await?;
 
     Ok(MigrationReport {
         from_version,
         to_version: SCHEMA_VERSION,
         edges_backfilled,
+        episodes_backfilled,
     })
+}
+
+/// Give every episode written before the `extracted` field existed the value
+/// its absence already meant: not extracted.
+///
+/// `DEFAULT` applies at creation, not retroactively, so those rows carry no
+/// value at all, and in SurrealDB `NONE != false`. Resolving that in the
+/// query — `(extracted ?? false) != true` — is correct but un-indexable, and
+/// the background worker runs it on every poll tick. One `UPDATE` turns a
+/// permanent full-table scan into an index lookup.
+///
+/// Re-runnable: `WHERE extracted IS NONE` makes a second pass a no-op.
+async fn backfill_episode_extracted(db: &Surreal<Db>) -> Result<u64, GraphError> {
+    let mut response = db
+        .query("UPDATE episode SET extracted = false WHERE extracted IS NONE RETURN id")
+        .await?;
+
+    let updated: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    Ok(updated.len() as u64)
 }
 
 /// Give every evidence-less edge the Beta counts implied by its stored mean.
@@ -353,6 +412,21 @@ async fn write_schema_version(db: &Surreal<Db>, version: i64) -> Result<(), Grap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_names_both_backfills() {
+        let report = MigrationReport {
+            from_version: 0,
+            to_version: 2,
+            edges_backfilled: 3,
+            episodes_backfilled: 5000,
+        };
+        assert_eq!(
+            report.summary(),
+            "graph schema migrated v0 → v2 (3 edges, 5000 episodes backfilled)"
+        );
+        assert!(report.ran());
+    }
 
     #[test]
     fn lock_message_detected() {

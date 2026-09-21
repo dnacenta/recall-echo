@@ -9,6 +9,10 @@
 //! - **AC3** — opening a pre-Phase-1 store backfills `alpha`/`beta` from the
 //!   stored mean without changing a single mean, and a second open migrates
 //!   nothing.
+//! - **RE-44 AC2–AC6** — opening a store whose episodes predate the
+//!   `extracted` field gives every one of them `false` and nothing else, a
+//!   version-0 store runs both backfills in one pass, and an interrupted
+//!   episode backfill resumes without double counting.
 //! - **AC10** — a backfill interrupted part-way (the process dies between the
 //!   `UPDATE` and the version marker) completes on the next open, and the
 //!   edges it already reached are not counted twice.
@@ -116,6 +120,49 @@ async fn strip_version_marker(db: &Surreal<Db>) {
         .await
         .and_then(surrealdb::IndexedResults::check)
         .expect("failed to strip version marker");
+}
+
+/// Take the episode table back to the shape it had before the `extracted`
+/// field existed, so rows created afterwards carry no value for it —
+/// SCHEMAFULL drops what is not defined.
+async fn drop_extracted_field(db: &Surreal<Db>) {
+    db.query(
+        r#"
+        REMOVE INDEX IF EXISTS episode_extracted ON episode;
+        REMOVE FIELD IF EXISTS extracted ON episode;
+        "#,
+    )
+    .await
+    .and_then(surrealdb::IndexedResults::check)
+    .expect("failed to downgrade the episode table");
+}
+
+async fn create_episode(db: &Surreal<Db>, session: &str, log_number: i64) {
+    db.query("CREATE episode SET session_id = $s, abstract = $a, log_number = $ln")
+        .bind(("s", session.to_string()))
+        .bind(("a", format!("episode {log_number}")))
+        .bind(("ln", log_number))
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .unwrap_or_else(|e| panic!("failed to create episode {log_number}: {e}"));
+}
+
+/// Every episode as `(log_number, extracted)`, with `None` for an episode
+/// that carries no value at all.
+async fn episodes_by_log(db: &Surreal<Db>) -> Vec<(i64, Option<bool>)> {
+    let mut response = db
+        .query("SELECT log_number, extracted FROM episode ORDER BY log_number")
+        .await
+        .expect("failed to read episodes");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("failed to read episode rows");
+    rows.into_iter()
+        .map(|row| {
+            let log_number = row["log_number"]
+                .as_i64()
+                .expect("episode has a log_number");
+            (log_number, row["extracted"].as_bool())
+        })
+        .collect()
 }
 
 /// Apply the backfill formula to one edge by hand — the state a migration
@@ -243,6 +290,7 @@ async fn reopening_a_migrated_store_migrates_nothing() {
     assert!(!second.ran(), "second open must be a no-op: {second:?}");
     assert_eq!(second.from_version, SCHEMA_VERSION);
     assert_eq!(second.edges_backfilled, 0);
+    assert_eq!(second.episodes_backfilled, 0);
 
     let after: Vec<_> = edges_by_type(&db)
         .await
@@ -264,6 +312,10 @@ async fn fresh_store_is_current_after_first_open() {
     assert_eq!(first.to_version, SCHEMA_VERSION);
     assert_eq!(
         first.edges_backfilled, 0,
+        "nothing to backfill on an empty store"
+    );
+    assert_eq!(
+        first.episodes_backfilled, 0,
         "nothing to backfill on an empty store"
     );
     close(db).await;
@@ -415,6 +467,164 @@ async fn new_edges_are_created_with_evidence() {
     assert_eq!(created.self_reinforcements, Some(0));
     assert!((created.evidence().alpha() - 6.0).abs() < 1e-6);
     assert!((created.evidence().beta() - 4.0).abs() < 1e-6);
+
+    close(db).await;
+}
+
+// ── RE-44 AC2-AC6: the episode `extracted` backfill ──────────────────
+
+/// A closed store holding three episodes written before `extracted` existed
+/// and one written after, still at schema version 1.
+async fn legacy_episode_store() -> (TempDir, std::path::PathBuf) {
+    let (dir, graph_path) = new_graph_dir();
+
+    let (db, _) = open_store(&graph_path).await;
+    create_episode(&db, "modern", 1).await;
+    drop_extracted_field(&db).await;
+    for log_number in [2, 3, 4] {
+        create_episode(&db, "legacy", log_number).await;
+    }
+    write_version(&db, 1).await;
+    close(db).await;
+
+    (dir, graph_path)
+}
+
+async fn write_version(db: &Surreal<Db>, version: i64) {
+    db.query("UPSERT type::record($id) SET schema_version = $v")
+        .bind(("id", META_RECORD.to_string()))
+        .bind(("v", version))
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .expect("failed to write version marker");
+}
+
+#[tokio::test]
+async fn legacy_episodes_gain_an_extracted_value() {
+    let (_dir, graph_path) = legacy_episode_store().await;
+
+    let (db, report) = open_store(&graph_path).await;
+
+    assert!(report.ran(), "migration should have run: {report:?}");
+    assert_eq!(report.from_version, 1);
+    assert_eq!(report.to_version, SCHEMA_VERSION);
+    assert_eq!(
+        report.episodes_backfilled, 3,
+        "only the three legacy episodes: {report:?}"
+    );
+    assert_eq!(
+        report.edges_backfilled, 0,
+        "a version-1 store has no evidence-less edges left: {report:?}"
+    );
+
+    assert_eq!(
+        episodes_by_log(&db).await,
+        vec![
+            (1, Some(false)),
+            (2, Some(false)),
+            (3, Some(false)),
+            (4, Some(false)),
+        ],
+        "every episode now carries a concrete value"
+    );
+
+    // AC3: the second open migrates nothing and touches nothing.
+    close(db).await;
+    let (db, second) = open_store(&graph_path).await;
+    assert!(!second.ran(), "second open must be a no-op: {second:?}");
+    assert_eq!(second.episodes_backfilled, 0);
+    assert_eq!(episodes_by_log(&db).await.len(), 4);
+    close(db).await;
+}
+
+#[tokio::test]
+async fn an_extracted_episode_is_left_alone() {
+    let (_dir, graph_path) = legacy_episode_store().await;
+
+    let (db, _) = open_store(&graph_path).await;
+    crud::mark_episodes_extracted(&db, 2)
+        .await
+        .expect("failed to mark episode extracted");
+    close(db).await;
+
+    // Re-open with the marker stripped: the backfill runs again and must see
+    // nothing, because `WHERE extracted IS NONE` excludes both true and false.
+    let (db, _) = open_store(&graph_path).await;
+    strip_version_marker(&db).await;
+    close(db).await;
+
+    let (db, report) = open_store(&graph_path).await;
+    assert_eq!(
+        report.episodes_backfilled, 0,
+        "a value already present is never overwritten: {report:?}"
+    );
+    assert_eq!(
+        episodes_by_log(&db).await,
+        vec![
+            (1, Some(false)),
+            (2, Some(true)),
+            (3, Some(false)),
+            (4, Some(false)),
+        ]
+    );
+    close(db).await;
+}
+
+#[tokio::test]
+async fn version_zero_store_runs_both_backfills_in_one_pass() {
+    let (_dir, graph_path) = new_graph_dir();
+
+    let (db, _) = open_store(&graph_path).await;
+    seed_legacy_edges(&db).await;
+    drop_extracted_field(&db).await;
+    for log_number in [5, 6] {
+        create_episode(&db, "legacy", log_number).await;
+    }
+    strip_version_marker(&db).await;
+    close(db).await;
+
+    let (db, report) = open_store(&graph_path).await;
+
+    assert_eq!(report.from_version, 0);
+    assert_eq!(report.to_version, SCHEMA_VERSION);
+    assert_eq!(report.edges_backfilled, 3, "{report:?}");
+    assert_eq!(report.episodes_backfilled, 2, "{report:?}");
+    assert_eq!(
+        episodes_by_log(&db).await,
+        vec![(5, Some(false)), (6, Some(false))]
+    );
+
+    close(db).await;
+}
+
+#[tokio::test]
+async fn interrupted_episode_backfill_completes_without_double_counting() {
+    let (_dir, graph_path) = legacy_episode_store().await;
+
+    // A process killed mid-backfill: one legacy episode already has a value,
+    // the other two do not, and the version marker still says 1.
+    let (db, _) = open_store(&graph_path).await;
+    strip_version_marker(&db).await;
+    drop_extracted_field(&db).await;
+    for log_number in [7, 8] {
+        create_episode(&db, "legacy", log_number).await;
+    }
+    close(db).await;
+
+    let (db, report) = open_store(&graph_path).await;
+
+    assert!(report.ran(), "migration must resume: {report:?}");
+    assert_eq!(
+        report.episodes_backfilled, 2,
+        "only the rows the first pass never reached: {report:?}"
+    );
+    assert!(
+        episodes_by_log(&db)
+            .await
+            .iter()
+            .all(|(_, extracted)| *extracted == Some(false)),
+        "every episode ends up false exactly once"
+    );
 
     close(db).await;
 }
