@@ -381,10 +381,12 @@ enum WarmOutcome {
 /// Interruptible: nothing after this point is required, so Ctrl-C leaves a
 /// working install and the model downloads on first use instead. Failure is
 /// reported and never fatal, so an offline install still succeeds.
-fn warm_embedding_model(memory_dir: &Path) -> WarmOutcome {
-    let exe = recall_binary();
-    if is_build_dir(&exe) {
+fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOutcome {
+    if paths::is_build_dir(roots.recall_bin()) {
         return WarmOutcome::Skipped("running from a build directory");
+    }
+    if !roots.spawns_agents() {
+        return WarmOutcome::Skipped("sandboxed configuration roots");
     }
 
     let models_dir = memory_dir.join("graph").join("models");
@@ -410,54 +412,21 @@ fn warm_embedding_model(memory_dir: &Path) -> WarmOutcome {
 
 // ── Claude Code hooks ────────────────────────────────────────────────────
 
-/// The recall-echo binary that hooks and MCP registrations should point at.
-fn recall_binary() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "recall-echo".into())
-}
-
-/// True when this binary lives in a Cargo build directory.
-///
-/// Such a path is a test harness or a working copy, and pinning a user's hooks
-/// or MCP config to it would break the moment the tree is cleaned.
-///
-/// `target/` is only the *default* directory name: with `CARGO_TARGET_DIR` set
-/// the same artifacts land anywhere, which is how the suite came to rewrite a
-/// developer's real hooks (#59). Both shapes are recognised, and under the
-/// crate's own tests the answer is unconditional. The guard is belt and braces
-/// — every global write now goes through an injected [`paths::ConfigRoots`] —
-/// but it still stops `cargo run -- init` from pinning a user to a binary that
-/// `cargo clean` deletes.
-fn is_build_dir(exe: &str) -> bool {
-    cfg!(test) || path_is_build_dir(exe)
-}
-
-/// The path half of [`is_build_dir`], so the shapes can be asserted from
-/// inside the crate's own tests, where `cfg!(test)` answers first.
-fn path_is_build_dir(exe: &str) -> bool {
-    exe.contains("/target/debug/")
-        || exe.contains("/target/release/")
-        || exe.contains("/debug/deps/")
-        || exe.contains("/release/deps/")
-}
-
 /// Auto-configure Claude Code hooks (settings.json).
 /// Returns true if hooks were configured.
 ///
 /// The file is `<roots.claude_dir()>/settings.json` — `~/.claude/settings.json`
 /// in production, a sandbox under test — regardless of where entity_root is.
-/// `recall_bin` is the binary the hooks will invoke, passed in so a caller can
-/// exercise this writer without the process's own path deciding the outcome.
-fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path, recall_bin: &str) -> bool {
+/// The binary the hooks will invoke comes from `roots` too, so nothing here is
+/// decided by the path this process happens to be running from.
+fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path) -> bool {
     let Some(claude_dir) = roots.claude_dir() else {
         return false;
     };
 
     // A path under a build directory is a test harness or a debug build, not
     // something a user's hooks should be pinned to for the life of the install.
-    if is_build_dir(recall_bin) {
+    if paths::is_build_dir(roots.recall_bin()) {
         print_status(
             Status::Exists,
             "Skipped hook install — running from a build directory",
@@ -465,7 +434,11 @@ fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path, recall_bin: &
         return false;
     }
 
-    install_hooks(&claude_dir.join("settings.json"), entity_root, recall_bin)
+    install_hooks(
+        &claude_dir.join("settings.json"),
+        entity_root,
+        roots.recall_bin(),
+    )
 }
 
 /// Install or repair the three hooks in the settings file at `settings_path`.
@@ -895,8 +868,15 @@ fn register_mcp_clients(
         return Vec::new();
     }
 
-    let exe = recall_binary();
-    if is_build_dir(&exe) {
+    if !roots.spawns_agents() {
+        print_status(
+            Status::Exists,
+            "Skipped MCP registration — sandboxed configuration roots",
+        );
+        return Vec::new();
+    }
+    let exe = roots.recall_bin().to_string();
+    if paths::is_build_dir(&exe) {
         print_status(
             Status::Exists,
             "Skipped MCP registration — running from a build directory",
@@ -1071,9 +1051,13 @@ pub fn run_with(
     // Pin this root for flagless hook invocations (#46): capture must land in
     // the store the MCP server serves, not wherever the session's cwd is.
     match roots.persist_entity_root(entity_root) {
-        Ok(file) => print_status(
+        Ok(paths::PersistOutcome::Written(file)) => print_status(
             Status::Created,
             &format!("Entity root persisted to {}", file.display()),
+        ),
+        Ok(paths::PersistOutcome::Skipped(why)) => print_status(
+            Status::Exists,
+            &format!("Skipped persisting the entity root — {why}"),
         ),
         Err(e) => print_status(
             Status::Error,
@@ -1116,7 +1100,7 @@ pub fn run_with(
     // extraction provider: a user who extracts with grok still wants their
     // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
     // is not installed.
-    configure_hooks(roots, entity_root, &recall_binary());
+    configure_hooks(roots, entity_root);
 
     let mcp = match &runtime {
         Some(runtime) => register_mcp_clients(runtime, &detected, entity_root, roots),
@@ -1124,7 +1108,7 @@ pub fn run_with(
     };
 
     // Last, so an interrupted download costs nothing already done.
-    let embedder = warm_embedding_model(&memory_dir);
+    let embedder = warm_embedding_model(&memory_dir, roots);
 
     print_summary(&Summary {
         memory_dir,
@@ -1174,32 +1158,6 @@ mod tests {
         }
     }
 
-    /// The guard that keeps a `cargo run -- init` from pinning a user's hooks
-    /// to a binary `cargo clean` deletes. `target/` is only the default target
-    /// directory name, so the `deps` shapes any `CARGO_TARGET_DIR` produces
-    /// count too, and under the crate's own tests the answer is unconditional.
-    #[test]
-    fn the_test_binary_is_recognised_as_a_build_directory() {
-        assert!(
-            is_build_dir(&recall_binary()),
-            "test binary should be treated as a build directory: {}",
-            recall_binary()
-        );
-        for exe in [
-            "/opt/recall-echo/target/debug/recall-echo",
-            "/opt/recall-echo/target/release/recall-echo",
-            "/opt/shared/target/debug/deps/recall_echo-1a2b3c",
-            "/home/d/.cache/rust/release/deps/recall_echo-1a2b3c",
-        ] {
-            assert!(is_build_dir(exe), "{exe}");
-        }
-        // cfg!(test) is true in here, so the negative cases are asserted
-        // against the same predicate the binary compiles with.
-        assert!(!path_is_build_dir("/usr/local/bin/recall-echo"));
-        assert!(!path_is_build_dir("/home/d/.cargo/bin/recall-echo"));
-        assert!(!path_is_build_dir("/home/d/debug/bin/recall-echo"));
-    }
-
     #[test]
     fn init_creates_directories_and_files() {
         let sandbox = Sandbox::new();
@@ -1219,8 +1177,8 @@ mod tests {
         let sandbox = Sandbox::new();
         sandbox.init("skip\n").unwrap();
 
-        let persisted = sandbox.dir.path().join(".config/recall-echo/entity-root");
-        let pinned = fs::read_to_string(&persisted).expect("persisted inside the sandbox");
+        let persisted = sandbox.roots.entity_root_file().expect("a destination");
+        let pinned = fs::read_to_string(persisted).expect("persisted inside the sandbox");
         assert_eq!(
             pinned.trim(),
             fs::canonicalize(sandbox.entity_root())
@@ -1570,49 +1528,25 @@ mod tests {
         assert!(!text.contains("/tmp/a;b"), "{text}");
     }
 
-    /// The hook writer, driven with a production-looking binary path, writes
-    /// into the injected Claude directory — and only there.
+    /// No Claude Code, no hooks — and nothing written anywhere looking for it.
     #[test]
-    fn hooks_are_written_into_the_injected_claude_dir() {
+    fn hooks_are_skipped_when_claude_code_is_absent() {
         let sandbox = Sandbox::new();
-        let real = real_config_paths();
-        let before: Vec<Snapshot> = real.iter().cloned().map(Snapshot::take).collect();
-
-        let settings = sandbox.roots.claude_dir().unwrap().join("settings.json");
-        assert!(install_hooks(
-            &settings,
-            &sandbox.entity_root(),
-            "/usr/local/bin/recall-echo"
-        ));
-
-        let written = fs::read_to_string(&settings).expect("hooks landed in the sandbox");
-        assert!(
-            written.contains("/usr/local/bin/recall-echo archive-session"),
-            "{written}"
-        );
-        assert!(
-            written.contains("/usr/local/bin/recall-echo checkpoint"),
-            "{written}"
-        );
-        assert!(
-            written.contains("/usr/local/bin/recall-echo consume"),
-            "{written}"
-        );
-        for snapshot in before {
-            snapshot.assert_unchanged();
-        }
+        let roots = sandbox.roots.clone().without_claude_code();
+        assert!(!configure_hooks(&roots, &sandbox.entity_root()));
+        assert!(!sandbox.dir.path().join(".claude/settings.json").exists());
     }
 
-    /// The fence, proven rather than assumed: the whole init flow runs, and
-    /// the three files a real user's setup lives in — resolved from the real
-    /// `HOME`, with no override in effect — are byte- and mtime-identical
-    /// afterwards, or still absent (#59).
+    /// The whole init flow, run against a sandbox, writes the hooks into the
+    /// sandbox's `settings.json` — through the real `configure_hooks`
+    /// dispatcher, with no guard short-circuiting it — and leaves the real
+    /// configuration exactly as it found it (#59).
+    ///
+    /// The real paths are computed here rather than asked of the code under
+    /// test: a sentinel that trusts the thing it is watching is not a sentinel.
     #[test]
     fn the_real_config_is_untouched_by_the_init_flow() {
-        let before: Vec<Snapshot> = real_config_paths()
-            .into_iter()
-            .map(Snapshot::take)
-            .collect();
+        let before = RealConfig::snapshot();
 
         let sandbox = Sandbox::new();
         sandbox.init("skip\n").unwrap();
@@ -1621,58 +1555,198 @@ mod tests {
         // would pass on a no-op.
         assert!(sandbox.entity_root().join("memory/MEMORY.md").exists());
         assert!(sandbox
-            .dir
-            .path()
-            .join(".config/recall-echo/entity-root")
-            .exists());
-
-        for snapshot in before {
-            snapshot.assert_unchanged();
+            .roots
+            .entity_root_file()
+            .is_some_and(std::path::Path::exists));
+        let hooks = fs::read_to_string(sandbox.roots.claude_dir().unwrap().join("settings.json"))
+            .expect("hooks landed in the sandbox");
+        for command in ["archive-session", "checkpoint", "consume"] {
+            assert!(
+                hooks.contains(&format!("{} {command}", sandbox.roots.recall_bin())),
+                "{command} missing from the sandboxed settings.json: {hooks}"
+            );
         }
+
+        before.assert_unchanged();
     }
 
-    /// The global files `init` would write to on a real machine.
-    fn real_config_paths() -> Vec<PathBuf> {
-        let home = dirs::home_dir().expect("a home directory");
-        let mut paths = vec![
-            home.join(".claude").join("settings.json"),
-            home.join(".claude.json"),
-        ];
-        paths.extend(paths::entity_root_state_file());
-        paths
+    /// The three files a real user's setup lives in, as digests.
+    ///
+    /// Never their contents: this runs on a developer's machine, and a failure
+    /// message that dumps `~/.claude.json` would publish every project path and
+    /// MCP credential on it. Existence, length and SHA-256 say "changed"
+    /// without saying what.
+    struct RealConfig {
+        entries: Vec<Digest>,
+        /// Hook commands mentioning recall-echo, and the MCP server names, as
+        /// they stood before: the shapes *this* code writes.
+        hook_commands: Vec<String>,
+        mcp_servers: Vec<String>,
     }
 
-    /// Existence, bytes and mtime of one path, for an after-the-fact
-    /// comparison. A file that did not exist must not come into being either.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct Snapshot {
-        path: PathBuf,
-        bytes: Option<Vec<u8>>,
-        mtime: Option<SystemTime>,
-    }
-
-    impl Snapshot {
-        fn take(path: PathBuf) -> Self {
-            let bytes = fs::read(&path).ok();
-            let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-            Self { path, bytes, mtime }
+    impl RealConfig {
+        fn snapshot() -> Self {
+            Self {
+                entries: vec![
+                    Digest::take(real_settings_file(), Strictness::Exact),
+                    Digest::take(real_claude_json(), Strictness::WhenUntouched),
+                    Digest::take(real_entity_root_file(), Strictness::Exact),
+                ],
+                hook_commands: recall_hook_commands(&real_settings_file()),
+                mcp_servers: mcp_server_names(&real_claude_json()),
+            }
         }
 
         fn assert_unchanged(&self) {
-            let now = Snapshot::take(self.path.clone());
+            for entry in &self.entries {
+                entry.assert_unchanged();
+            }
             assert_eq!(
-                now.bytes.is_some(),
-                self.bytes.is_some(),
-                "{} came into being (or vanished)",
-                self.path.display()
+                recall_hook_commands(&real_settings_file()),
+                self.hook_commands,
+                "a recall-echo hook was added to or removed from the real settings.json"
             );
             assert_eq!(
-                now.bytes,
-                self.bytes,
-                "{} was rewritten",
-                self.path.display()
+                mcp_server_names(&real_claude_json()),
+                self.mcp_servers,
+                "an MCP server was added to or removed from the real ~/.claude.json"
             );
-            assert_eq!(now.mtime, self.mtime, "{} was touched", self.path.display());
+        }
+    }
+
+    /// `~/.claude/settings.json`, computed independently of `paths`.
+    fn real_settings_file() -> PathBuf {
+        real_home().join(".claude").join("settings.json")
+    }
+
+    fn real_claude_json() -> PathBuf {
+        real_home().join(".claude.json")
+    }
+
+    fn real_entity_root_file() -> PathBuf {
+        let base = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => real_home().join(".config"),
+        };
+        base.join("recall-echo").join("entity-root")
+    }
+
+    fn real_home() -> PathBuf {
+        dirs::home_dir().expect("a home directory")
+    }
+
+    /// Every hook command in `settings.json` that mentions recall-echo.
+    fn recall_hook_commands(settings: &Path) -> Vec<String> {
+        let Some(value) = read_json(settings) else {
+            return Vec::new();
+        };
+        let mut found: Vec<String> = Vec::new();
+        collect_hook_commands(&value, &mut found);
+        found.retain(|command| command.contains("recall-echo"));
+        found.sort();
+        found
+    }
+
+    fn collect_hook_commands(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(command)) = map.get("command") {
+                    out.push(command.clone());
+                }
+                for nested in map.values() {
+                    collect_hook_commands(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_hook_commands(nested, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The names under `mcpServers` in `~/.claude.json`.
+    fn mcp_server_names(claude_json: &Path) -> Vec<String> {
+        let Some(value) = read_json(claude_json) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = value
+            .get("mcpServers")
+            .and_then(serde_json::Value::as_object)
+            .map(|servers| servers.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn read_json(path: &Path) -> Option<serde_json::Value> {
+        serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    }
+
+    /// How much of a file's sameness this suite is entitled to assert.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Strictness {
+        /// Nothing else writes this file while the suite runs: every byte and
+        /// the mtime must be identical afterwards.
+        Exact,
+        /// Claude Code rewrites `~/.claude.json` continuously during a live
+        /// session — which is exactly when this suite runs. The mtime is a
+        /// witness rather than an assertion here: an unchanged mtime means
+        /// nobody else wrote, so the bytes must match too; a newer one means
+        /// somebody did, and only the shape assertions (no new `mcpServers`
+        /// entry) can speak. Comparing bytes unconditionally would be a test
+        /// that fails on other people's writes.
+        WhenUntouched,
+    }
+
+    /// Existence, length and SHA-256 of one path — enough to prove "unchanged",
+    /// never enough to leak what is in it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Digest {
+        path: PathBuf,
+        exists: bool,
+        len: u64,
+        sha256: String,
+        mtime: Option<SystemTime>,
+        strictness: Strictness,
+    }
+
+    impl Digest {
+        fn take(path: PathBuf, strictness: Strictness) -> Self {
+            use sha2::{Digest as _, Sha256};
+            let bytes = fs::read(&path).ok();
+            let sha256 = bytes
+                .as_ref()
+                .map_or_else(String::new, |bytes| format!("{:x}", Sha256::digest(bytes)));
+            Self {
+                exists: bytes.is_some(),
+                len: bytes.map_or(0, |bytes| bytes.len() as u64),
+                sha256,
+                mtime: fs::metadata(&path).ok().and_then(|m| m.modified().ok()),
+                path,
+                strictness,
+            }
+        }
+
+        fn assert_unchanged(&self) {
+            let now = Digest::take(self.path.clone(), self.strictness);
+            let path = self.path.display();
+            assert_eq!(
+                now.exists, self.exists,
+                "{path} came into being or vanished"
+            );
+            let compare_bytes = match self.strictness {
+                Strictness::Exact => {
+                    assert_eq!(now.mtime, self.mtime, "{path} was touched");
+                    true
+                }
+                Strictness::WhenUntouched => now.mtime == self.mtime,
+            };
+            if compare_bytes {
+                assert_eq!(now.len, self.len, "{path} changed length");
+                assert_eq!(now.sha256, self.sha256, "{path} was rewritten");
+            }
         }
     }
 
@@ -1683,5 +1757,84 @@ mod tests {
         let content = fs::read_to_string(sandbox.entity_root().join("memory/ARCHIVE.md")).unwrap();
         assert!(content.contains("# Conversation Archive"));
         assert!(content.contains("| # | Date"));
+    }
+}
+
+/// The suite's own fence: no test may call an `init` entry point that resolves
+/// the real configuration for itself.
+///
+/// [`run_with_reader`] and [`run`] build [`paths::ConfigRoots::from_env`], and
+/// that is the whole of #59 — a test calling either rewrites the developer's
+/// hooks and global entity-root pointer. Tests take `run_with` and a sandbox.
+/// Reading `from_env` to assert production resolution is allowed on a line
+/// marked `sanctioned:`.
+#[cfg(test)]
+mod suite_fence {
+    use std::path::{Path, PathBuf};
+
+    const FORBIDDEN: [&str; 3] = [
+        "run_with_reader(",        // sanctioned: the needle itself
+        "init::run(",              // sanctioned: the needle itself
+        "ConfigRoots::from_env()", // sanctioned: the needle itself
+    ];
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The test-only region of a source file: everything from its first
+    /// `#[cfg(test)]` on. Integration tests under `tests/` are test-only whole.
+    fn test_region(source: &str, whole_file: bool) -> &str {
+        if whole_file {
+            return source;
+        }
+        source
+            .find("#[cfg(test)]")
+            .map_or("", |start| &source[start..])
+    }
+
+    #[test]
+    fn no_test_reaches_the_real_configuration() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rs_files(&manifest.join("src"), &mut files);
+        let src_count = files.len();
+        rs_files(&manifest.join("tests"), &mut files);
+        assert!(
+            src_count > 0 && files.len() > src_count,
+            "scan walked nothing — CARGO_MANIFEST_DIR wrong?"
+        );
+
+        let offenders: Vec<String> = files
+            .iter()
+            .flat_map(|path| {
+                let source = std::fs::read_to_string(path).expect("read");
+                let whole_file = path.starts_with(manifest.join("tests"));
+                let region = test_region(&source, whole_file).to_string();
+                let path = path.clone();
+                region
+                    .lines()
+                    .filter(|line| !line.contains("sanctioned:"))
+                    .filter(|line| FORBIDDEN.iter().any(|needle| line.contains(needle)))
+                    .map(|line| format!("{}: {}", path.display(), line.trim()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "tests must take `init::run_with` with sandboxed ConfigRoots:\n{}",
+            offenders.join("\n")
+        );
     }
 }

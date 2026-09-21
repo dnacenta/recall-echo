@@ -499,7 +499,7 @@ mod tests {
         let command = mcp_add_command(
             "/usr/bin/true",
             &["mcp".to_string()],
-            &crate::paths::ConfigRoots::from_env(),
+            &crate::paths::ConfigRoots::from_env(), // sanctioned: read-only from_env (RE-59)
         );
         assert_eq!(command.as_std().get_envs().count(), 0);
     }
