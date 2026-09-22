@@ -539,26 +539,70 @@ pub async fn increment_episode_access_counts(
     Ok(())
 }
 
+/// Mark every episode of one archive extracted — run once per archive by
+/// both the daemon and `graph extract`, so on a backlog drain it is paid as
+/// many times as there are archives. Served by the `episode_log` index.
+const MARK_EXTRACTED: &str = "UPDATE episode SET extracted = true WHERE log_number = $ln";
+
 /// Mark all episodes with a given log_number as extracted.
 pub async fn mark_episodes_extracted(db: &Surreal<Db>, log_number: u32) -> Result<(), GraphError> {
-    db.query("UPDATE episode SET extracted = true WHERE log_number = $ln")
+    db.query(MARK_EXTRACTED)
         .bind(("ln", log_number as i64))
         .await?
         .check()?;
     Ok(())
 }
 
-/// Get distinct log numbers of episodes that have NOT been extracted.
+/// The rows the extraction scan is looking for, as a literal fragment shared
+/// by the scan and its count so the two can never disagree.
+macro_rules! unextracted_source {
+    () => {
+        "FROM episode WHERE extracted = false AND log_number IS NOT NONE"
+    };
+}
+
+/// The extraction scan, as one statement so the plan test explains exactly
+/// what the daemon runs.
 ///
-/// Episodes written before the `extracted` field existed have no value at
-/// all — `DEFAULT` applies at creation, not retroactively — and in SurrealDB
-/// `NONE ≠ false`, so a bare `extracted = false` can never match them. Absent
-/// resolves to "not extracted", the conservative default, same as
-/// `access_count` and `provenance` on this table.
+/// `extracted = false` is a plain field comparison, which the planner serves
+/// from the `episode_extracted` index. The background worker runs this once
+/// per poll interval — fixed per daemon at `(idle_after_secs / 4)` clamped to
+/// 100ms–30s, so 30s at the default — for as long as the machine stays quiet,
+/// which is exactly when there is least to find. A full table scan here is a
+/// permanent tax. `log_number IS NOT NONE` cannot be indexed and does not
+/// need to be: it filters the *output* of the index scan.
+///
+/// The index makes this cheaper, not free, and not O(pending): SurrealKV
+/// keeps superseded entries in the `= false` range until compaction, so an
+/// episode that has been extracted still costs the scan something until then
+/// — measured ~15× below the unindexed predicate at 40k episodes, growing
+/// with each extraction cycle and partly reclaimed on reopen. Truly bounding
+/// it by the pending set would take a separate table keyed by log number with
+/// rows deleted on extraction; out of scope here.
+///
+/// This predicate is only correct because schema version 2 backfilled every
+/// absent `extracted` to `false` (`store::backfill_episode_extracted`) and
+/// that backfill fails the open rather than leaving a row behind. An episode
+/// with no value at all is invisible here — which is what
+/// [`crate::graph::store::count_absent_extracted`] exists to catch.
+const UNEXTRACTED_SCAN: &str = concat!(
+    "SELECT log_number ",
+    unextracted_source!(),
+    " GROUP BY log_number ORDER BY log_number"
+);
+
+/// How many distinct archives the scan would process, counted by the store
+/// rather than by collecting every log number into a `Vec` to call `.len()`
+/// on it. Same grouped source as [`UNEXTRACTED_SCAN`], one integer back.
+const UNEXTRACTED_COUNT: &str = concat!(
+    "SELECT count() AS count FROM (SELECT log_number ",
+    unextracted_source!(),
+    " GROUP BY log_number) GROUP ALL"
+);
+
+/// Get distinct log numbers of episodes that have NOT been extracted.
 pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, GraphError> {
-    let mut response = db
-        .query("SELECT log_number FROM episode WHERE (extracted ?? false) != true AND log_number IS NOT NONE GROUP BY log_number ORDER BY log_number")
-        .await?;
+    let mut response = db.query(UNEXTRACTED_SCAN).await?;
 
     #[derive(serde::Deserialize)]
     struct Row {
@@ -569,9 +613,27 @@ pub async fn get_unextracted_log_numbers(db: &Surreal<Db>) -> Result<Vec<i64>, G
     Ok(rows.into_iter().map(|r| r.log_number).collect())
 }
 
+/// How many distinct archives are pending extraction.
+pub async fn count_unextracted_logs(db: &Surreal<Db>) -> Result<u64, GraphError> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        count: u64,
+    }
+
+    let mut response = db.query(UNEXTRACTED_COUNT).await?;
+    let rows: Vec<CountRow> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows.first().map(|r| r.count).unwrap_or(0))
+}
+
 /// Count episodes missing the `extracted` flag and missing a `log_number`,
 /// in one pass over the table — `count(expr)` counts truthy values, so both
 /// diagnostics share the scan. Returns `(extracted_absent, log_number_absent)`.
+///
+/// `extracted_absent` is zero on every store schema version 2 has opened, by
+/// design: the migration gives every episode a value. It is kept because it
+/// is the assertion that the migration landed — the extraction scan matches
+/// `extracted = false`, so an episode that still has no value is not merely
+/// slow to find, it can never be found, and nothing else would say so.
 pub async fn episode_absent_field_counts(db: &Surreal<Db>) -> Result<(u64, u64), GraphError> {
     #[derive(serde::Deserialize)]
     struct AbsentCounts {
@@ -613,7 +675,9 @@ mod tests {
 
     /// A legacy episode row — written before the `extracted` field existed —
     /// must still be found by the unextracted scan. Replays the real-world
-    /// sequence: old schema, insert, schema upgrade, scan.
+    /// sequence: old schema, insert, schema upgrade, scan. Since RE-44 the
+    /// upgrade backfills the absent value, so the scan sees the row through
+    /// the `episode_extracted` index rather than through a `??`.
     #[tokio::test]
     async fn scan_finds_episodes_with_absent_extracted_field() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -641,8 +705,10 @@ mod tests {
             .expect("legacy insert check");
 
         // Upgrade to the current schema. `IF NOT EXISTS` adds `extracted`
-        // with its DEFAULT — which applies at creation, not retroactively.
-        store::init_schema(&db).await.expect("schema upgrade");
+        // with its DEFAULT — which applies at creation, not retroactively —
+        // and the version-2 migration backfills the row that predates it.
+        let migration = store::init_schema(&db).await.expect("schema upgrade");
+        assert_eq!(migration.episodes_backfilled, 1, "{migration:?}");
 
         db.query("CREATE episode SET session_id = 'modern', abstract = 'new row', log_number = 9")
             .await
@@ -665,17 +731,181 @@ mod tests {
             "legacy and modern rows must both be visible"
         );
 
-        // The diagnostics run against the same store: the legacy row is the
-        // one missing `extracted` (created before the field existed), the
-        // orphan row is the one missing `log_number`.
+        // The diagnostics run against the same store. `extracted_absent` is
+        // zero by design after RE-44: the migration gave the legacy row a
+        // value, and any non-zero count would mean it had not. The orphan row
+        // is still the one missing `log_number`.
         let (extracted_absent, log_number_absent) =
             episode_absent_field_counts(&db).await.expect("diagnostics");
-        assert_eq!(extracted_absent, 1);
+        assert_eq!(extracted_absent, 0, "the migration reached every episode");
         assert_eq!(log_number_absent, 1);
 
         // Marking extracted removes a log from the scan either way.
         mark_episodes_extracted(&db, 7).await.expect("mark");
         let logs = get_unextracted_log_numbers(&db).await.expect("rescan");
         assert_eq!(logs, vec![9]);
+    }
+
+    /// The whole point of RE-44: the statement the daemon polls must be
+    /// served by the `episode_extracted` index. Nothing else in the suite
+    /// can tell a correct index scan from a correct full-table scan, so a
+    /// future edit to the predicate would silently reinstate the tax this
+    /// issue removed.
+    /// `EXPLAIN FULL` of `sql`, as a JSON tree.
+    async fn plan_of(db: &Surreal<Db>, sql: &str) -> serde_json::Value {
+        let mut response = db
+            .query(format!("{sql} EXPLAIN FULL"))
+            .bind(("ln", 1i64))
+            .await
+            .expect("explain");
+        let rows: Vec<serde_json::Value> =
+            super::super::deserialize_take(&mut response, 0).expect("explain rows");
+        serde_json::Value::Array(rows)
+    }
+
+    async fn store_with_one_episode(dir: &std::path::Path) -> Surreal<Db> {
+        let db = store::open(dir).await.expect("open store");
+        store::init_schema(&db).await.expect("schema");
+        db.query("CREATE episode SET session_id = 's', abstract = 'a', log_number = 1")
+            .await
+            .expect("insert")
+            .check()
+            .expect("insert check");
+        db
+    }
+
+    #[tokio::test]
+    async fn the_extraction_scan_is_served_by_the_index() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = store_with_one_episode(dir.path()).await;
+
+        let plan = plan_of(&db, UNEXTRACTED_SCAN).await;
+        assert!(
+            plan_uses_index(&plan, "episode_extracted"),
+            "the extraction scan must read the episode_extracted index \
+             (SurrealDB 3.2.4), not scan the table. Plan: {plan:#}"
+        );
+
+        // The count the status path runs shares the scan's source, so it must
+        // reach the same index.
+        let plan = plan_of(&db, UNEXTRACTED_COUNT).await;
+        assert!(
+            plan_uses_index(&plan, "episode_extracted"),
+            "the pending count must use the same index (SurrealDB 3.2.4). \
+             Plan: {plan:#}"
+        );
+    }
+
+    /// Marking one archive extracted runs once per archive — on a backlog
+    /// drain, as many times as there are archives — so it has to be served by
+    /// the `episode_log` index rather than scanning the episode table.
+    #[tokio::test]
+    async fn marking_an_archive_extracted_is_served_by_the_log_index() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = store_with_one_episode(dir.path()).await;
+
+        let plan = plan_of(&db, MARK_EXTRACTED).await;
+        assert!(
+            plan_uses_index(&plan, "episode_log"),
+            "marking must read the episode_log index (SurrealDB 3.2.4), not \
+             scan the table. Plan: {plan:#}"
+        );
+    }
+
+    /// The count and the scan must always agree about which archives are
+    /// pending — they share a source fragment precisely so they cannot drift.
+    #[tokio::test]
+    async fn the_pending_count_agrees_with_the_pending_scan() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = store::open(dir.path()).await.expect("open store");
+        store::init_schema(&db).await.expect("schema");
+
+        assert_eq!(count_unextracted_logs(&db).await.expect("count"), 0);
+
+        for log_number in [3, 3, 4, 9] {
+            db.query("CREATE episode SET session_id = 's', abstract = 'a', log_number = $ln")
+                .bind(("ln", log_number as i64))
+                .await
+                .expect("insert")
+                .check()
+                .expect("insert check");
+        }
+        mark_episodes_extracted(&db, 4).await.expect("mark");
+
+        let scanned = get_unextracted_log_numbers(&db).await.expect("scan");
+        assert_eq!(scanned, vec![3, 9], "distinct, extracted excluded");
+        assert_eq!(
+            count_unextracted_logs(&db).await.expect("count"),
+            scanned.len() as u64,
+            "the count is the length of the scan, computed by the store"
+        );
+    }
+
+    /// Walk an `EXPLAIN FULL` plan tree for a step that *reads* a named
+    /// index. Structural rather than a substring match on serialized JSON, so
+    /// an index named in a predicate string — or a plan whose fields move —
+    /// cannot pass for a plan that actually uses it.
+    ///
+    /// SurrealDB 3.2.4 prints two plan shapes: `SELECT` gives an operator
+    /// tree (`{"operator": "IndexScan", "attributes": {"index": …}}`) and
+    /// `UPDATE` gives the older flat form (`{"operation": "Iterate Index",
+    /// "detail": {"plan": {"index": …}}}`). Both count; a table scan in
+    /// either shape does not.
+    fn plan_uses_index(node: &serde_json::Value, index: &str) -> bool {
+        match node {
+            serde_json::Value::Array(items) => items.iter().any(|i| plan_uses_index(i, index)),
+            serde_json::Value::Object(map) => {
+                let named = |value: Option<&serde_json::Value>| {
+                    value.and_then(|v| v.as_str()) == Some(index)
+                };
+                let operator_tree = matches!(
+                    map.get("operator").and_then(|o| o.as_str()),
+                    Some("IndexScan" | "IndexCountScan")
+                ) && named(map.get("attributes").and_then(|a| a.get("index")));
+                let iterate_index = map.get("operation").and_then(|o| o.as_str())
+                    == Some("Iterate Index")
+                    && named(
+                        map.get("detail")
+                            .and_then(|d| d.get("plan"))
+                            .and_then(|p| p.get("index")),
+                    );
+
+                operator_tree
+                    || iterate_index
+                    || map
+                        .get("children")
+                        .is_some_and(|c| plan_uses_index(c, index))
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn plan_walker_finds_both_shapes_and_nothing_else() {
+        // SELECT: nested operator tree.
+        let select = serde_json::json!([{
+            "operator": "Sort",
+            "children": [{
+                "operator": "IndexScan",
+                "attributes": { "index": "episode_extracted", "access": "= false" }
+            }]
+        }]);
+        assert!(plan_uses_index(&select, "episode_extracted"));
+        assert!(!plan_uses_index(&select, "episode_time"));
+
+        // UPDATE: flat legacy form.
+        let update = serde_json::json!([{
+            "operation": "Iterate Index",
+            "detail": { "table": "episode", "plan": { "index": "episode_log", "operator": "=" } }
+        }]);
+        assert!(plan_uses_index(&update, "episode_log"));
+        assert!(!plan_uses_index(&update, "episode_extracted"));
+
+        // A table scan that merely mentions the index is not a use of it.
+        let table_scan = serde_json::json!([
+            { "operator": "TableScan", "attributes": { "predicate": "episode_extracted = false" } },
+            { "operation": "Iterate Table", "detail": { "table": "episode" } }
+        ]);
+        assert!(!plan_uses_index(&table_scan, "episode_extracted"));
     }
 }

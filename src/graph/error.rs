@@ -39,4 +39,7 @@ pub enum GraphError {
 
     #[error("immutable entity cannot be merged: {0}")]
     ImmutableMerge(String),
+
+    #[error("schema migration: {0}")]
+    Migration(String),
 }

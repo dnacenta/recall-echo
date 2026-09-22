@@ -30,6 +30,34 @@ pub async fn init(memory_dir: &Path) -> Result<(), RecallError> {
     Ok(())
 }
 
+/// Re-run schema migrations against the store, taking it exclusively.
+///
+/// Normally a no-op with a line saying so — opening the store migrates it.
+/// `--force` forgets which migrations have run and runs them all again, which
+/// is the repair for a marker that claims work that did not land.
+pub async fn migrate(memory_dir: &Path, force: bool) -> Result<(), RecallError> {
+    let report = serve_client::exclusive(memory_dir, |graph| async move {
+        Ok(graph.run_migrations(force).await?)
+    })
+    .await?;
+
+    if report.ran() {
+        println!("{GOOD}✓{RESET} {}", report.summary());
+    } else {
+        println!(
+            "{GOOD}✓{RESET} Graph schema is already at v{}; nothing to migrate.",
+            report.to_version
+        );
+        if !force {
+            println!(
+                "  {DIM}If episodes are still missing their extracted flag, \
+                 re-run with --force.{RESET}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Show graph stats.
 pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
     let graph_dir = memory_dir.join("graph");
@@ -52,6 +80,14 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
     // explaining — and "the pass is pending" and "the pass can never run"
     // print identically without consulting the scan, so it decides which
     // explanation is true.
+    // Printed on every status, not only the zero-entity one: an episode with
+    // no extracted flag is invisible to the scan whether or not the store has
+    // entities, and the zero-entity gate would make the only detector for an
+    // unfinished migration unreachable the moment one entity exists.
+    if stats.extracted_absent > 0 {
+        print!("{}", unmigrated_episodes_warning(stats.extracted_absent));
+    }
+
     if stats.episode_count > 0 && stats.entity_count == 0 {
         let extraction = crate::config::load_from_dir(memory_dir).extraction;
         print!(
@@ -77,6 +113,69 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
     Ok(())
 }
 
+/// Explain episodes that carry no `extracted` value.
+///
+/// The extraction scan matches `extracted = false`, so an episode without the
+/// field is not slow to find — it cannot be found at all, and no amount of
+/// extracting, ingesting or waiting will reach it. Schema version 2 gives
+/// every episode a value on open, so a non-zero count means that migration
+/// did not land: the marker claims it ran, which is exactly why re-opening
+/// will not repair it and `graph migrate --force` will.
+///
+/// `graph ingest-all` is deliberately *not* offered here: it skips every
+/// archive that already has an episode, which is precisely this set.
+fn unmigrated_episodes_warning(count: u64) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "\n  {WARN}Unfinished schema migration.{RESET} {count} episode{} no extracted flag,",
+        if count == 1 { " has" } else { "s have" }
+    );
+    let _ = writeln!(
+        out,
+        "  so the extraction scan cannot see {} at all. The version marker says the",
+        if count == 1 { "it" } else { "them" }
+    );
+    let _ = writeln!(
+        out,
+        "  migration already ran, so re-opening the store will not repair this:"
+    );
+    let _ = writeln!(out, "    {DIM}recall-echo graph migrate --force{RESET}");
+    out
+}
+
+/// Explain episodes with no `log_number`: real, and unreachable by
+/// extraction, which finds its work by archive number.
+fn unreachable_episodes_explanation(log_number_absent: u64) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "\n  {WARN}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
+    );
+    let _ = writeln!(
+        out,
+        "  nothing to process — waiting for the daemon will not help."
+    );
+    let _ = writeln!(
+        out,
+        "    episodes missing a log_number:       {log_number_absent}"
+    );
+    let _ = writeln!(
+        out,
+        "  Episodes without a log_number cannot be matched to an archive file,"
+    );
+    let _ = writeln!(
+        out,
+        "  so extraction cannot reach them. To rebuild episodes from archives:"
+    );
+    let _ = writeln!(out, "    {DIM}recall-echo graph ingest-all{RESET}");
+    out
+}
+
 /// Explain a store with episodes and no entities.
 ///
 /// Two very different states print the same two zeros. When the scan has
@@ -84,6 +183,11 @@ pub async fn graph_status(memory_dir: &Path) -> Result<(), RecallError> {
 /// run it. When the scan is *also* empty, no amount of waiting will ever
 /// produce an entity: report the shape of the breakage (which field the
 /// episodes are missing) instead of promising a daemon pass that will no-op.
+///
+/// The other way a store can be unscannable — episodes with no `extracted`
+/// value at all — is not diagnosed here: it is reported by
+/// [`unmigrated_episodes_warning`] on every status, zero entities or not,
+/// because the indexed scan cannot see those episodes on any store.
 fn zero_entity_explanation(
     stats: &crate::graph::types::GraphStats,
     background_enabled: bool,
@@ -119,33 +223,7 @@ fn zero_entity_explanation(
     }
 
     if stats.log_number_absent > 0 {
-        let _ = writeln!(
-            out,
-            "\n  {WARN}Inconsistent store.{RESET} Episodes exist but the extraction scan finds"
-        );
-        let _ = writeln!(
-            out,
-            "  nothing to process — waiting for the daemon will not help."
-        );
-        let _ = writeln!(
-            out,
-            "    episodes missing the extracted flag: {}",
-            stats.extracted_absent
-        );
-        let _ = writeln!(
-            out,
-            "    episodes missing a log_number:       {}",
-            stats.log_number_absent
-        );
-        let _ = writeln!(
-            out,
-            "  Episodes without a log_number cannot be matched to an archive file,"
-        );
-        let _ = writeln!(
-            out,
-            "  so extraction cannot reach them. To rebuild episodes from archives:"
-        );
-        let _ = writeln!(out, "    {DIM}recall-echo graph ingest-all{RESET}");
+        out.push_str(&unreachable_episodes_explanation(stats.log_number_absent));
     } else {
         // Every episode has been through extraction and none yielded an
         // entity. Legitimate for short or trivial sessions, or after a gc
@@ -1950,6 +2028,50 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ingest-all"), "{text}");
+        // The extracted-flag count is zero here and must not be listed: after
+        // RE-44 a zero is the expected state, not a diagnosis.
+        assert!(!text.contains("missing the extracted flag"), "{text}");
+    }
+
+    /// A migration that did not reach every episode is its own breakage, told
+    /// apart from every other one and given the only remedy that works.
+    #[test]
+    fn an_unmigrated_store_names_the_missing_extracted_flag() {
+        let text = unmigrated_episodes_warning(12);
+
+        assert!(text.contains("Unfinished schema migration"), "{text}");
+        assert!(
+            text.contains("12 episodes have no extracted flag"),
+            "{text}"
+        );
+        assert!(text.contains("graph migrate --force"), "{text}");
+        // `ingest-all` skips every archive that already has an episode —
+        // exactly this set — so it must not be offered as the fix.
+        assert!(!text.contains("ingest-all"), "{text}");
+    }
+
+    /// One episode reads as one episode.
+    #[test]
+    fn the_unmigrated_warning_agrees_with_itself_about_number() {
+        let one = unmigrated_episodes_warning(1);
+        assert!(one.contains("1 episode has no extracted flag"), "{one}");
+        assert!(one.contains("cannot see it at all"), "{one}");
+
+        let many = unmigrated_episodes_warning(2);
+        assert!(many.contains("2 episodes have no extracted flag"), "{many}");
+        assert!(many.contains("cannot see them at all"), "{many}");
+    }
+
+    /// The zero-entity explanation no longer owns this diagnosis: it is
+    /// printed on every status, so repeating it here would double it.
+    #[test]
+    fn the_zero_entity_explanation_leaves_the_migration_alone() {
+        let mut stats = zero_entity_stats(0, 0);
+        stats.extracted_absent = 12;
+
+        let text = zero_entity_explanation(&stats, true, 120);
+        assert!(!text.contains("extracted flag"), "{text}");
+        assert!(!text.contains("migrate"), "{text}");
     }
 
     /// A store where every archive was extracted and none yielded entities is

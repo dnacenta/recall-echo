@@ -105,10 +105,7 @@ impl GraphMemory {
         let db = store::open(path).await?;
         let migration = store::init_schema(&db).await?;
         if migration.ran() {
-            eprintln!(
-                "recall-echo: graph schema migrated v{} → v{} ({} edges backfilled)",
-                migration.from_version, migration.to_version, migration.edges_backfilled
-            );
+            eprintln!("recall-echo: {}", migration.summary());
         }
 
         let models_dir = path.join("models");
@@ -185,10 +182,7 @@ impl GraphMemory {
         let db = store::connect(config).await?;
         let migration = store::init_schema(&db).await?;
         if migration.ran() {
-            eprintln!(
-                "recall-echo: graph schema migrated v{} → v{} ({} edges backfilled)",
-                migration.from_version, migration.to_version, migration.edges_backfilled
-            );
+            eprintln!("recall-echo: {}", migration.summary());
         }
 
         std::fs::create_dir_all(models_dir)?;
@@ -227,6 +221,22 @@ impl GraphMemory {
     #[allow(dead_code)]
     pub(crate) fn db(&self) -> &Surreal<Db> {
         &self.db
+    }
+
+    /// Re-run schema migrations against the open store.
+    ///
+    /// Opening already migrates, so on a healthy store this reports a no-op.
+    /// It exists for the one state opening cannot repair: a version marker
+    /// claiming work that did not actually land, which leaves rows the new
+    /// read paths cannot see and no migration willing to run. `force` clears
+    /// the marker first, so every migration runs again from version 0 — safe
+    /// because each one only touches rows that still lack the value it
+    /// writes.
+    pub async fn run_migrations(&self, force: bool) -> Result<store::MigrationReport, GraphError> {
+        if force {
+            store::clear_schema_version(&self.db).await?;
+        }
+        store::init_schema(&self.db).await
     }
 
     /// Internal access to the embedder (initializes it on first use).
@@ -653,22 +663,27 @@ impl GraphMemory {
             .map(|r| (r.entity_type, r.count))
             .collect();
 
-        // Extraction-side diagnostics — the only way a status caller can
-        // tell "extraction hasn't run yet" apart from "extraction can never
-        // run". None of these fields is indexed, so each query is a full
-        // episode scan; they run only in the state that reads them (episodes
-        // and no entities) and report zero everywhere else. Status and
-        // overview are agent-hot paths, and a healthy store must not pay for
-        // a diagnosis it does not need.
-        let (unextracted_log_count, extracted_absent, log_number_absent) =
-            if entity_count == 0 && episode_count > 0 {
-                let unextracted = crud::get_unextracted_log_numbers(&self.db).await?.len() as u64;
-                let (extracted_absent, log_number_absent) =
-                    crud::episode_absent_field_counts(&self.db).await?;
-                (unextracted, extracted_absent, log_number_absent)
-            } else {
-                (0, 0, 0)
-            };
+        // An episode with no `extracted` value is invisible to the extraction
+        // scan, which matches `extracted = false` — so this is not a nice-to-
+        // have diagnostic, it is the only thing that would ever report an
+        // unfinished migration, and a store that has extracted even one
+        // entity needs it as much as an empty one. It is cheap enough to run
+        // unconditionally: the `episode_extracted` index answers it with a
+        // count scan, not a table scan.
+        let extracted_absent = store::count_absent_extracted(&self.db).await?;
+
+        // The other two extraction-side diagnostics are full episode scans,
+        // and they answer a question only the zero-entity state asks: has
+        // extraction not run yet, or can it never run? Status and overview
+        // are agent-hot paths, so a healthy store does not pay for a
+        // diagnosis it does not need.
+        let (unextracted_log_count, log_number_absent) = if entity_count == 0 && episode_count > 0 {
+            let unextracted = crud::count_unextracted_logs(&self.db).await?;
+            let (_, log_number_absent) = crud::episode_absent_field_counts(&self.db).await?;
+            (unextracted, log_number_absent)
+        } else {
+            (0, 0)
+        };
 
         Ok(GraphStats {
             entity_count,
