@@ -329,6 +329,17 @@ enum GraphCommands {
         #[arg(long)]
         external: bool,
     },
+    /// Re-run schema migrations against the graph store
+    ///
+    /// Opening the store already migrates it, so this normally reports that
+    /// there is nothing to do. It repairs the one state opening cannot:
+    /// a version marker claiming a migration that did not finish, which
+    /// leaves rows the current read paths cannot see.
+    Migrate {
+        /// Clear the version marker first, so every migration runs again
+        #[arg(long)]
+        force: bool,
+    },
     /// Scan conversations/ for un-ingested archives and ingest them all
     IngestAll {
         /// Treat every file as externally authored instead of inferring
@@ -708,6 +719,9 @@ fn main() {
                             GraphCommands::IngestAll { external } => {
                                 graph_cli::ingest_all(&memory_dir, external_provenance(external))
                                     .await
+                            }
+                            GraphCommands::Migrate { force } => {
+                                graph_cli::migrate(&memory_dir, force).await
                             }
                             #[cfg(feature = "llm")]
                             GraphCommands::Extract {

@@ -440,16 +440,20 @@ pub struct GraphStats {
     /// Distinct log numbers the unextracted scan would process. Defaulted so
     /// a status response from an older daemon still deserializes.
     ///
-    /// The three diagnostic fields below (this one included) are full
-    /// episode-table scans, so `stats()` computes them **only** when the
-    /// store has episodes and no entities — the state being diagnosed. On a
-    /// healthy store they are always zero, not a measurement.
+    /// This field and `log_number_absent` are full episode-table scans, so
+    /// `stats()` computes them **only** when the store has episodes and no
+    /// entities — the state being diagnosed. On a healthy store they are
+    /// always zero, not a measurement. `extracted_absent` is the exception;
+    /// see its own note.
     #[serde(default)]
     pub unextracted_log_count: u64,
-    /// Episodes with no `extracted` field at all — written before the field
-    /// existed. The scan resolves absent to "not extracted", so these are
-    /// pending work, not lost; the count sizes a first `extract --all` run.
-    /// Only computed in the zero-entity state; see `unextracted_log_count`.
+    /// Episodes with no `extracted` field at all. Schema version 2 gives
+    /// every episode a value on open, so this is zero on a migrated store and
+    /// a non-zero value means that migration did not land. These episodes are
+    /// **not** pending work: the scan matches `extracted = false`, so it
+    /// cannot see them at all, and only `graph migrate --force` will reach
+    /// them. Unlike the other two fields this one is always computed — the
+    /// `episode_extracted` index answers it with a count scan.
     #[serde(default)]
     pub extracted_absent: u64,
     /// Episodes with no `log_number` — not tied to an archive file, so the

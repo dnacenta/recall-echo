@@ -148,6 +148,7 @@ recall-echo graph relate <from> --rel <type> --target <to>          # Create rel
 recall-echo graph ingest <archive>              # Ingest single archive (episodes only)
 recall-echo graph ingest-all                    # Ingest all un-ingested archives
 recall-echo graph extract --all                 # LLM entity extraction (the daemon also does this when idle)
+recall-echo graph migrate                       # Re-run schema migrations (normally a no-op)
 
 # Pipeline & integrations
 recall-echo graph pipeline sync                 # Sync pipeline documents into the graph
@@ -348,6 +349,7 @@ Knowledge graph operations. See the Architecture section above for the full comm
 - `graph relate <from> --rel <type> --target <to>` — Create a relationship between two entities. Supports `--description` and `--source`.
 - `graph ingest <archive>` — Ingest a single archive file (creates episodes, no LLM required).
 - `graph ingest-all` — Scan conversations/ and ingest all un-ingested archives.
+- `graph migrate` — Re-run schema migrations against the store. Opening it already migrates, so this normally reports there is nothing to do; it exists for the one state opening cannot repair, a version marker claiming a migration that did not finish. `--force` clears the marker so every migration runs again, which is safe because each one only touches rows that still lack the value it writes. If `graph status` reports episodes with no extracted flag, this is the fix.
 - `graph extract` — LLM-powered entity extraction. Supports `--log <N>` (single archive), `--all` (all un-extracted), `--dry-run`, `--model`, `--provider` (any name from [LLM providers](#llm-providers)), `--delay-ms`. The daemon runs this pass on its own once the machine is quiet (see [Background extraction](#background-extraction)); this command is how you run it *now*, or in `server` mode, or after changing the model.
 
 **Correction:**

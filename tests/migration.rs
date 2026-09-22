@@ -9,10 +9,13 @@
 //! - **AC3** — opening a pre-Phase-1 store backfills `alpha`/`beta` from the
 //!   stored mean without changing a single mean, and a second open migrates
 //!   nothing.
-//! - **RE-44 AC2–AC6** — opening a store whose episodes predate the
-//!   `extracted` field gives every one of them `false` and nothing else, a
-//!   version-0 store runs both backfills in one pass, and an interrupted
-//!   episode backfill resumes without double counting.
+//! - **RE-44 AC2–AC6, AC11–AC14** — opening a store whose episodes predate
+//!   the `extracted` field gives every one of them `false` and nothing else,
+//!   a version-0 store runs both backfills in one pass, an interrupted
+//!   episode backfill resumes without double counting, the backfill spans
+//!   more than one batch, a store from a newer build is refused, a row that
+//!   cannot be coerced fails the open with the marker unwritten, and
+//!   `--force` re-runs a migration the marker claims is done.
 //! - **AC10** — a backfill interrupted part-way (the process dies between the
 //!   `UPDATE` and the version marker) completes on the next open, and the
 //!   edges it already reached are not counted twice.
@@ -145,6 +148,27 @@ async fn create_episode(db: &Surreal<Db>, session: &str, log_number: i64) {
         .await
         .and_then(surrealdb::IndexedResults::check)
         .unwrap_or_else(|e| panic!("failed to create episode {log_number}: {e}"));
+}
+
+/// Every field a backfill has no business touching, keyed by record id, so a
+/// pass can be compared against itself across the migration (AC2).
+async fn episode_fields(db: &Surreal<Db>) -> Vec<(String, String, String, String)> {
+    let mut response = db
+        .query("SELECT id, session_id, abstract, timestamp, log_number FROM episode ORDER BY log_number")
+        .await
+        .expect("failed to read episodes");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("failed to read episode rows");
+    rows.into_iter()
+        .map(|row| {
+            let text = |key: &str| row[key].to_string();
+            (
+                text("id"),
+                text("session_id"),
+                text("abstract"),
+                text("timestamp"),
+            )
+        })
+        .collect()
 }
 
 /// Every episode as `(log_number, extracted)`, with `None` for an episode
@@ -490,6 +514,18 @@ async fn legacy_episode_store() -> (TempDir, std::path::PathBuf) {
     (dir, graph_path)
 }
 
+async fn read_version(db: &Surreal<Db>) -> i64 {
+    let mut response = db
+        .query("SELECT schema_version FROM type::record($id)")
+        .bind(("id", META_RECORD.to_string()))
+        .await
+        .expect("failed to read version marker");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("version rows");
+    rows.first()
+        .and_then(|r| r["schema_version"].as_i64())
+        .unwrap_or(0)
+}
+
 async fn write_version(db: &Surreal<Db>, version: i64) {
     db.query("UPSERT type::record($id) SET schema_version = $v")
         .bind(("id", META_RECORD.to_string()))
@@ -502,6 +538,14 @@ async fn write_version(db: &Surreal<Db>, version: i64) {
 #[tokio::test]
 async fn legacy_episodes_gain_an_extracted_value() {
     let (_dir, graph_path) = legacy_episode_store().await;
+
+    // Snapshot every field the backfill must not touch, through a read that
+    // does not run a migration of its own.
+    let db = store::open(&graph_path)
+        .await
+        .expect("failed to open store");
+    let before = episode_fields(&db).await;
+    close(db).await;
 
     let (db, report) = open_store(&graph_path).await;
 
@@ -526,6 +570,11 @@ async fn legacy_episodes_gain_an_extracted_value() {
             (4, Some(false)),
         ],
         "every episode now carries a concrete value"
+    );
+    assert_eq!(
+        episode_fields(&db).await,
+        before,
+        "the backfill must change nothing but `extracted`"
     );
 
     // AC3: the second open migrates nothing and touches nothing.
@@ -626,5 +675,201 @@ async fn interrupted_episode_backfill_completes_without_double_counting() {
         "every episode ends up false exactly once"
     );
 
+    close(db).await;
+}
+
+// ── RE-44 AC11-AC14: batching, refusal, repair ───────────────────────
+
+/// More episodes than one backfill batch, so the loop has to run twice.
+/// `BACKFILL_BATCH` is 1000; 1200 rows means two statements, two
+/// transactions, and a count that spans both.
+#[tokio::test]
+async fn a_backfill_larger_than_one_batch_completes_and_counts_every_row() {
+    const ROWS: usize = 1_200;
+
+    let (_dir, graph_path) = new_graph_dir();
+    let (db, _) = open_store(&graph_path).await;
+    drop_extracted_field(&db).await;
+    let rows: Vec<String> = (0..ROWS)
+        .map(|i| format!("{{ session_id: 'bulk', abstract: 'e{i}', log_number: {i} }}"))
+        .collect();
+    for chunk in rows.chunks(400) {
+        db.query(format!("INSERT INTO episode [{}]", chunk.join(",")))
+            .await
+            .and_then(surrealdb::IndexedResults::check)
+            .expect("bulk insert");
+    }
+    strip_version_marker(&db).await;
+    close(db).await;
+
+    let (db, report) = open_store(&graph_path).await;
+
+    assert_eq!(
+        report.episodes_backfilled, ROWS as u64,
+        "every row across every batch is counted once: {report:?}"
+    );
+    assert!(
+        episodes_by_log(&db)
+            .await
+            .iter()
+            .all(|(_, extracted)| *extracted == Some(false)),
+        "no row is left behind by the batch boundary"
+    );
+
+    // The post-condition the loop exits on, asserted directly.
+    let mut response = db
+        .query("SELECT count() AS n FROM episode WHERE extracted IS NONE GROUP ALL")
+        .await
+        .expect("absent count");
+    let counts: Vec<serde_json::Value> = response.take(0).expect("absent count rows");
+    assert!(
+        counts.is_empty() || counts[0]["n"].as_u64() == Some(0),
+        "no episode may be left without a value: {counts:?}"
+    );
+
+    close(db).await;
+}
+
+/// A store written by a build that knows more migrations than this one must
+/// be refused, not reshaped — the marker is what decides which migrations
+/// have run.
+#[tokio::test]
+async fn a_store_from_a_newer_build_is_refused_by_name() {
+    let (_dir, graph_path) = new_graph_dir();
+    let (db, _) = open_store(&graph_path).await;
+    write_version(&db, SCHEMA_VERSION + 7).await;
+    close(db).await;
+
+    let db = store::open(&graph_path)
+        .await
+        .expect("failed to open store");
+    let err = store::init_schema(&db)
+        .await
+        .expect_err("a newer store must not open");
+    let message = err.to_string();
+
+    assert!(
+        message.contains(&(SCHEMA_VERSION + 7).to_string()),
+        "the error names the store's version: {message}"
+    );
+    assert!(
+        message.contains(&SCHEMA_VERSION.to_string()),
+        "the error names this build's version: {message}"
+    );
+    close(db).await;
+}
+
+/// An episode that cannot survive SCHEMAFULL coercion fails the backfill, and
+/// a failed backfill must leave the marker alone so the next open tries
+/// again. The alternative — writing the marker anyway — would strand the row
+/// forever behind a scan that cannot see it.
+#[tokio::test]
+async fn an_uncoercible_row_fails_the_open_and_leaves_the_marker_alone() {
+    let (_dir, graph_path) = new_graph_dir();
+
+    // The episode table as it was before `abstract` was mandatory, holding a
+    // row with no abstract at all.
+    let db = store::open(&graph_path)
+        .await
+        .expect("failed to open store");
+    db.query(
+        r#"
+        DEFINE TABLE episode SCHEMAFULL;
+        DEFINE FIELD session_id ON episode TYPE string;
+        DEFINE FIELD timestamp  ON episode TYPE datetime DEFAULT time::now();
+        DEFINE FIELD log_number ON episode TYPE option<int>;
+        "#,
+    )
+    .await
+    .and_then(surrealdb::IndexedResults::check)
+    .expect("pre-abstract schema");
+    db.query("CREATE episode SET session_id = 'ancient', log_number = 1")
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .expect("ancient insert");
+    close(db).await;
+
+    for attempt in 1..=2 {
+        let db = store::open(&graph_path)
+            .await
+            .expect("failed to open store");
+        let err = match store::init_schema(&db).await {
+            Ok(report) => panic!("attempt {attempt}: expected failure, got {report:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("abstract"),
+            "attempt {attempt}: the error names the field: {err}"
+        );
+        assert_eq!(
+            read_version(&db).await,
+            0,
+            "attempt {attempt}: a failed migration must not claim to have run"
+        );
+        close(db).await;
+    }
+}
+
+/// The state opening cannot repair: the marker says the migration ran, and
+/// episodes still have no value. `--force` is the way out.
+#[tokio::test]
+async fn force_reruns_a_migration_the_marker_claims_is_done() {
+    let (_dir, graph_path) = new_graph_dir();
+
+    let (db, _) = open_store(&graph_path).await;
+    drop_extracted_field(&db).await;
+    for log_number in [1, 2, 3] {
+        create_episode(&db, "stranded", log_number).await;
+    }
+    // The marker already claims version 2 — exactly the shape a backfill that
+    // reported success without finishing would leave.
+    write_version(&db, SCHEMA_VERSION).await;
+    close(db).await;
+
+    // A plain open migrates nothing: there is nothing it believes to do.
+    let (db, report) = open_store(&graph_path).await;
+    assert!(
+        !report.ran(),
+        "an open cannot see past the marker: {report:?}"
+    );
+    assert!(
+        episodes_by_log(&db)
+            .await
+            .iter()
+            .all(|(_, extracted)| extracted.is_none()),
+        "the rows are still stranded"
+    );
+
+    close(db).await;
+
+    // The embedded store takes one process at a time, so the repair runs on
+    // its own handle.
+    let graph = recall_echo::graph::GraphMemory::open_embedded(&graph_path)
+        .await
+        .expect("open graph");
+    let forced = graph
+        .run_migrations(true)
+        .await
+        .expect("forced migration must run");
+    assert_eq!(
+        forced.from_version, 0,
+        "--force forgets the marker: {forced:?}"
+    );
+    assert_eq!(forced.episodes_backfilled, 3, "{forced:?}");
+    drop(graph);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (db, after) = open_store(&graph_path).await;
+    assert!(
+        !after.ran(),
+        "the repair left the marker current: {after:?}"
+    );
+    assert!(
+        episodes_by_log(&db)
+            .await
+            .iter()
+            .all(|(_, extracted)| *extracted == Some(false)),
+        "every stranded row now has a value"
+    );
     close(db).await;
 }

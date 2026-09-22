@@ -348,6 +348,7 @@ fn error_code(err: &GraphError) -> &'static str {
         GraphError::Io(_) => "io",
         GraphError::Json(_) => "json",
         GraphError::ImmutableMerge(_) => "immutable_merge",
+        GraphError::Migration(_) => "migration",
     }
 }
 
