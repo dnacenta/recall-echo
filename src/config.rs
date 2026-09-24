@@ -599,10 +599,10 @@ pub struct GraphSection {
     /// SurrealDB namespace
     #[serde(default = "default_graph_namespace")]
     pub namespace: String,
-    /// SurrealDB database name (typically the entity name)
+    /// SurrealDB database name (typically the pulse name)
     #[serde(default)]
     pub database: String,
-    /// SurrealDB username (typically the entity name)
+    /// SurrealDB username (typically the pulse name)
     #[serde(default)]
     pub username: String,
     /// Path to file containing the database password

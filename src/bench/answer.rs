@@ -5,7 +5,7 @@
 //! LoCoMo answer pipeline — hybrid retrieval (graph + archive) → LLM → answer.
 //!
 //! Wraps [`GraphMemory::query`] and [`search::ranked_search`] in exactly the
-//! shape an entity uses at runtime, so benchmark scores reflect production
+//! shape a pulse uses at runtime, so benchmark scores reflect production
 //! retrieval behavior.
 
 use std::fs;
@@ -115,14 +115,14 @@ pub const NO_INFO_ANSWER: &str = "I don't have enough information to answer.";
 
 // ── Entry point ──────────────────────────────────────────────────────────
 
-/// Answer a question for an entity, with a real LLM provider resolved from the
-/// entity's config (plus optional overrides from [`AnswerOpts`]).
+/// Answer a question for a pulse, with a real LLM provider resolved from the
+/// pulse's config (plus optional overrides from [`AnswerOpts`]).
 pub async fn answer_question(
-    entity_root: &Path,
+    pulse_root: &Path,
     question: &str,
     opts: AnswerOpts,
 ) -> Result<BenchAnswer, RecallError> {
-    let memory_dir = entity_root.join("memory");
+    let memory_dir = pulse_root.join("memory");
     let (provider, model) = crate::llm_provider::create_provider(
         &memory_dir,
         opts.provider_override
@@ -139,7 +139,7 @@ pub async fn answer_question(
         .to_string();
 
     answer_with_provider(
-        entity_root,
+        pulse_root,
         question,
         &opts,
         provider.as_ref(),
@@ -153,14 +153,14 @@ pub async fn answer_question(
 /// avoid network calls, and by the harness when it wants to pin a specific
 /// provider/model pair outside of recall-echo's config resolution.
 pub async fn answer_with_provider(
-    entity_root: &Path,
+    pulse_root: &Path,
     question: &str,
     opts: &AnswerOpts,
     llm: &dyn GraphLlmProvider,
     model: String,
     provider_label: String,
 ) -> Result<BenchAnswer, RecallError> {
-    let memory_dir = entity_root.join("memory");
+    let memory_dir = pulse_root.join("memory");
     let started = Instant::now();
 
     let facts = retrieve_facts(&memory_dir, question, opts).await?;

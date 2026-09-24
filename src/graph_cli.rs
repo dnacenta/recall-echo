@@ -1035,11 +1035,11 @@ pub async fn vigil_sync(
         ));
     }
 
-    // Default paths: look for vigil/ and caliber/ relative to memory_dir's parent (entity root)
-    let entity_root = memory_dir.parent().unwrap_or(memory_dir);
+    // Default paths: look for vigil/ and caliber/ relative to memory_dir's parent (pulse root)
+    let pulse_root = memory_dir.parent().unwrap_or(memory_dir);
 
-    let default_signals = entity_root.join("vigil").join("signals.json");
-    let default_outcomes = entity_root.join("caliber").join("outcomes.json");
+    let default_signals = pulse_root.join("vigil").join("signals.json");
+    let default_outcomes = pulse_root.join("caliber").join("outcomes.json");
 
     let sig_path = signals_path.unwrap_or(&default_signals);
     let out_path = outcomes_path.unwrap_or(&default_outcomes);

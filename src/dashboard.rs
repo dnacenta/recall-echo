@@ -161,7 +161,7 @@ impl ArchiveStats {
 // ── Dashboard rendering ─────────────────────────────────────────────────
 
 /// Render the neofetch-style memory dashboard to stdout.
-pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_lines: usize) {
+pub fn render(recall: &RecallEcho, pulse_name: &str, version: &str, max_memory_lines: usize) {
     let memory_stats = MemoryStats::collect(recall);
     let ephemeral_entries = parse_ephemeral_entries(recall);
     let archive_stats = ArchiveStats::collect(recall);
@@ -170,7 +170,7 @@ pub fn render(recall: &RecallEcho, entity_name: &str, version: &str, max_memory_
     // Logo + metadata side by side
     let logo_lines: Vec<&str> = LOGO.lines().skip(1).collect();
     let meta_lines = [
-        format!("entity    {ACCENT}{entity_name}{RESET}"),
+        format!("pulse     {ACCENT}{pulse_name}{RESET}"),
         format!(
             "memory    {}/{}  {}  {}",
             memory_stats.line_count,

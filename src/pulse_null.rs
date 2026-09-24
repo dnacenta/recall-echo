@@ -6,7 +6,7 @@
 //!
 //! This module is gated behind the `pulse-null` feature flag.
 //! It bridges pulse-system-types::Message → conversation::Conversation,
-//! allowing recall-echo to work inside pulse-null entities.
+//! allowing recall-echo to work inside pulse-null pulses.
 
 use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role};
 

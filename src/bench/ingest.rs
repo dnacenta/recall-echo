@@ -8,7 +8,7 @@
 //! Reuses the same primitives the runtime archive pipeline uses
 //! ([`Frontmatter`], [`conversation_to_markdown`], [`tags`], [`append_index`],
 //! [`ephemeral::append_entry`]) so the artifacts on disk are bit-for-bit what
-//! a real entity would produce — only the *date* is back-stamped to the
+//! a real pulse would produce — only the *date* is back-stamped to the
 //! session's LoCoMo timestamp instead of `now()`.
 
 use std::fs;
@@ -47,7 +47,7 @@ pub struct IngestStats {
     pub dedup_fast_path: usize,
 }
 
-/// Ingest a LoCoMo conversation into the entity at `entity_root`.
+/// Ingest a LoCoMo conversation into the pulse at `pulse_root`.
 ///
 /// Writes one archive per session, with the frontmatter `date` set from the
 /// session's `date_time` so temporal queries make sense. Then drives graph
@@ -58,11 +58,11 @@ pub struct IngestStats {
 /// relationship extraction). The benchmark harness will normally pass a
 /// provider so the graph is fully populated.
 pub async fn ingest_conversation(
-    entity_root: &Path,
+    pulse_root: &Path,
     conv: &BenchConversation,
     llm: Option<&dyn crate::graph::llm::LlmProvider>,
 ) -> Result<IngestStats, RecallError> {
-    let memory_dir = entity_root.join("memory");
+    let memory_dir = pulse_root.join("memory");
     ensure_layout(&memory_dir)?;
 
     let graph_dir = memory_dir.join("graph");
@@ -137,6 +137,7 @@ fn write_session_archive(
         message_count,
         duration: "session".to_string(),
         source: "locomo".to_string(),
+        pulse: None,
         topics: topics.clone(),
     };
 

@@ -158,10 +158,10 @@ recall-echo graph pipeline stale                # List stale pipeline entities
 recall-echo graph vigil-sync                    # Sync vigil-pulse signals into the graph
 ```
 
-All paths are relative to an entity root directory:
+All paths are relative to a pulse root directory — the home of the agent (a *pulse*) whose memory this is:
 
 ```
-{entity_root}/memory/
+{pulse_root}/memory/
 ├── MEMORY.md                 # Layer 1 — curated facts (≤200 lines)
 ├── EPHEMERAL.md              # Layer 2 — rolling session window (default 5)
 ├── ARCHIVE.md                # Layer 3 — conversation index
@@ -181,12 +181,12 @@ recall-echo operates in two modes:
 
 ### As a pulse-null Plugin
 
-recall-echo is a native pulse-null plugin implementing the `Plugin` trait from pulse-system-types. It fills the required **Memory** role (exactly one per entity).
+recall-echo is a native pulse-null plugin implementing the `Plugin` trait from pulse-system-types. It fills the required **Memory** role (exactly one per pulse).
 
 - pulse-null calls `archive::archive_session()` at session end — creates a conversation archive with LLM-generated summary, updates ARCHIVE.md index, appends to EPHEMERAL.md
 - pulse-null calls `checkpoint::create_checkpoint()` before context compaction — preserves conversation state before details are lost
 - Health checks report memory directory state (Healthy / Degraded / Down)
-- Setup wizard prompts for entity_root during `pulse-null init`
+- Setup wizard prompts for `pulse_root` during `pulse-null init` (a config still carrying the pre-4.6.0 `entity_root` key is read too)
 
 ```rust
 use recall_echo::RecallEcho;
@@ -201,13 +201,13 @@ let plugin = recall_echo::create(&config, &ctx).await?;
 For administration and use outside pulse-null:
 
 ```bash
-recall-echo init [entity_root]         # Create memory directory structure
-recall-echo status [entity_root]       # Health check with dashboard
-recall-echo dashboard [entity_root]    # Full dashboard with health, stats, recent sessions
+recall-echo init [pulse_root]          # Create memory directory structure
+recall-echo status [pulse_root]        # Health check with dashboard
+recall-echo dashboard [pulse_root]     # Full dashboard with health, stats, recent sessions
 recall-echo search <query>             # Line-level archive search
 recall-echo search <query> --ranked    # File-ranked relevance search
-recall-echo distill [entity_root]      # Analyze MEMORY.md, suggest cleanup
-recall-echo consume [entity_root]      # Output EPHEMERAL.md content
+recall-echo distill [pulse_root]       # Analyze MEMORY.md, suggest cleanup
+recall-echo consume [pulse_root]       # Output EPHEMERAL.md content
 recall-echo archive-session            # Archive a session from its transcript (Claude Code or Gemini)
 recall-echo archive --all-unarchived   # Batch archive all missed sessions
 recall-echo checkpoint                 # Save checkpoint before context compression
@@ -430,10 +430,10 @@ CLI on the machine. To add it by hand, or to a client `init` doesn't know, each
 vendor spells it differently:
 
 ```bash
-claude mcp add recall-echo -s user -- recall-echo mcp --entity-root /path/to/entity
-gemini mcp add -s user recall-echo  recall-echo mcp --entity-root /path/to/entity
-grok   mcp add recall-echo -s user -- recall-echo mcp --entity-root /path/to/entity
-codex  mcp add recall-echo -- recall-echo mcp --entity-root /path/to/entity
+claude mcp add recall-echo -s user -- recall-echo mcp --pulse-root /path/to/pulse
+gemini mcp add -s user recall-echo  recall-echo mcp --pulse-root /path/to/pulse
+grok   mcp add recall-echo -s user -- recall-echo mcp --pulse-root /path/to/pulse
+codex  mcp add recall-echo -- recall-echo mcp --pulse-root /path/to/pulse
 ```
 
 Or, equivalently, in a project's `.mcp.json`:
@@ -443,15 +443,21 @@ Or, equivalently, in a project's `.mcp.json`:
   "mcpServers": {
     "recall-echo": {
       "command": "recall-echo",
-      "args": ["mcp", "--entity-root", "/path/to/entity"]
+      "args": ["mcp", "--pulse-root", "/path/to/pulse"]
     }
   }
 }
 ```
 
-`--entity-root` defaults to the current directory when it is an initialised
-entity root, then to the root `recall-echo init` persisted, so it can usually
+`--pulse-root` defaults to the current directory when it is an initialised
+pulse root, then to the root `recall-echo init` persisted, so it can usually
 be omitted.
+
+Before 4.6.0 the flag was `--entity-root`. It is still accepted by every
+command, so existing hooks and MCP registrations keep working; re-running
+`recall-echo init` rewrites plain hooks to `--pulse-root` and persists the
+root to `~/.config/recall-echo/pulse-root` (the old `entity-root` file is
+still read while no `pulse-root` exists).
 
 **Tools.** All six are read-only; none can write to the graph.
 
@@ -738,7 +744,7 @@ embedding model, which also removes the per-command ONNX model reload. After
 - Inspect it with `graph daemon status`; stop it with `graph daemon stop`.
 
 **External SurrealDB (advanced).** For deployments that already run a
-SurrealDB server (benchmark rigs, shared entity hosts), set
+SurrealDB server (benchmark rigs, shared pulse hosts), set
 `[graph] mode = "server"` and point `url` at it. Commands then connect
 directly and no daemon is involved. The backend is chosen at runtime — no
 rebuild needed.

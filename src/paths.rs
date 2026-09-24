@@ -5,7 +5,7 @@
 //! Path resolution utilities for recall-echo.
 //!
 //! Supports two modes:
-//! 1. **Entity mode** (pulse-null) — entity_root/memory/ layout
+//! 1. **Pulse mode** (pulse-null) — pulse_root/memory/ layout
 //! 2. **Claude mode** (standalone) — ~/.claude/ layout for Claude Code hooks
 
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 
 use crate::error::RecallError;
 
-/// Returns the default entity root directory for a flagless command.
+/// Returns the default pulse root directory for a flagless command.
 ///
 /// Resolution order (the same chain the capture hooks use, see
 /// [`resolve_root_source`]):
 /// 1. `RECALL_ECHO_HOME` (explicit override)
-/// 2. the cwd, when it carries an initialised layout (pulse-null entities)
+/// 2. the cwd, when it carries an initialised layout (pulse-null pulses)
 /// 3. the root `recall-echo init` persisted, when it is still trusted:
 ///    absolute, exists, a directory this user owns that nobody else can
 ///    write into (see [`trusted_root`])
@@ -27,13 +27,13 @@ use crate::error::RecallError;
 ///
 /// A persisted root that is no longer trusted is ignored with one stderr
 /// warning per process naming the path and the reason.
-pub fn entity_root() -> Result<PathBuf, RecallError> {
-    Ok(entity_root_described()?.0)
+pub fn pulse_root() -> Result<PathBuf, RecallError> {
+    Ok(pulse_root_described()?.0)
 }
 
-/// [`entity_root`] plus a short label saying which arm chose it, for
+/// [`pulse_root`] plus a short label saying which arm chose it, for
 /// commands that should tell the user which store they are looking at.
-pub fn entity_root_described() -> Result<(PathBuf, &'static str), RecallError> {
+pub fn pulse_root_described() -> Result<(PathBuf, &'static str), RecallError> {
     let (source, cwd) = resolve_from_environment();
     let label = source.label();
     let (root, stale) = source.into_command_root(cwd)?;
@@ -41,6 +41,18 @@ pub fn entity_root_described() -> Result<(PathBuf, &'static str), RecallError> {
         warn_stale_persisted_root(&stale);
     }
     Ok((root, label))
+}
+
+/// [`pulse_root`] under its pre-4.6.0 name.
+#[deprecated(since = "4.6.0", note = "renamed to `pulse_root`")]
+pub fn entity_root() -> Result<PathBuf, RecallError> {
+    pulse_root()
+}
+
+/// [`pulse_root_described`] under its pre-4.6.0 name.
+#[deprecated(since = "4.6.0", note = "renamed to `pulse_root_described`")]
+pub fn entity_root_described() -> Result<(PathBuf, &'static str), RecallError> {
+    pulse_root_described()
 }
 
 /// A persisted root that was refused, and why.
@@ -55,15 +67,15 @@ fn warn_stale_persisted_root(stale: &StaleRoot) {
     ONCE.call_once(|| {
         // `{:?}` escapes control characters: the path comes from a file.
         eprintln!(
-            "recall-echo: ignoring persisted entity root {:?}: it {}; re-run `recall-echo init`",
+            "recall-echo: ignoring persisted pulse root {:?}: it {}; re-run `recall-echo init`",
             stale.path, stale.reason
         );
     });
 }
 
-/// Returns the memory directory: {entity_root}/memory/
+/// Returns the memory directory: {pulse_root}/memory/
 pub fn memory_dir() -> Result<PathBuf, RecallError> {
-    Ok(entity_root()?.join("memory"))
+    Ok(pulse_root()?.join("memory"))
 }
 
 pub fn memory_file() -> Result<PathBuf, RecallError> {
@@ -89,7 +101,7 @@ pub fn config_file() -> Result<PathBuf, RecallError> {
 /// Returns the Claude Code base directory (~/.claude/).
 ///
 /// Used when recall-echo is invoked as a Claude Code hook (archive-session,
-/// checkpoint). The memory layout inside ~/.claude/ mirrors the entity layout:
+/// checkpoint). The memory layout inside ~/.claude/ mirrors the pulse layout:
 /// ~/.claude/conversations/, ~/.claude/ARCHIVE.md, ~/.claude/EPHEMERAL.md, etc.
 pub fn claude_dir() -> Result<PathBuf, RecallError> {
     let home = dirs::home_dir()
@@ -99,14 +111,14 @@ pub fn claude_dir() -> Result<PathBuf, RecallError> {
 
 /// Base directory for hook-driven writes (`archive-session`, `checkpoint`).
 ///
-/// With an explicit entity root, data lives in the entity layout at
+/// With an explicit pulse root, data lives in the pulse layout at
 /// `<root>/memory` — unless the root itself carries a claude-style layout
 /// (`<root>/conversations` with no `<root>/memory/conversations`), which is
 /// what a standalone `~/.claude` install looks like. Without a root, the
 /// legacy behavior: `~/.claude` itself. Mirrors the read-side resolution in
 /// `graph_cli::find_conversations_dir`.
-pub fn hook_base_dir(entity_root: Option<&std::path::Path>) -> Result<PathBuf, RecallError> {
-    match entity_root {
+pub fn hook_base_dir(pulse_root: Option<&std::path::Path>) -> Result<PathBuf, RecallError> {
+    match pulse_root {
         Some(root) => {
             let memory = root.join("memory");
             if memory.join("conversations").exists() {
@@ -114,7 +126,7 @@ pub fn hook_base_dir(entity_root: Option<&std::path::Path>) -> Result<PathBuf, R
             } else if root.join("conversations").exists() {
                 Ok(root.to_path_buf())
             } else {
-                // Nothing initialized yet — name the entity layout, so the
+                // Nothing initialized yet — name the pulse layout, so the
                 // "run init first" error points where init would write.
                 Ok(memory)
             }
@@ -123,28 +135,96 @@ pub fn hook_base_dir(entity_root: Option<&std::path::Path>) -> Result<PathBuf, R
     }
 }
 
-/// The user-level file `init` persists the entity root into, so capture hooks
-/// invoked without `--entity-root` still find the store the MCP server was
-/// registered with (#46): `$XDG_CONFIG_HOME/recall-echo/entity-root`,
-/// defaulting to `~/.config/recall-echo/entity-root`.
-fn entity_root_state_file() -> Option<PathBuf> {
+/// The file `init` persists the pulse root into.
+const POINTER_FILE: &str = "pulse-root";
+
+/// The name the pointer file had before 4.6.0. Still read when
+/// [`POINTER_FILE`] is absent, never written.
+const LEGACY_POINTER_FILE: &str = "entity-root";
+
+/// The user-level directory holding the persisted pointer:
+/// `$XDG_CONFIG_HOME/recall-echo`, defaulting to `~/.config/recall-echo`.
+fn state_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => dirs::home_dir()?.join(".config"),
     };
-    Some(base.join("recall-echo").join("entity-root"))
+    Some(base.join("recall-echo"))
 }
 
-/// The entity root a previous `init` persisted, if any.
+/// The user-level file `init` persists the pulse root into, so capture hooks
+/// invoked without `--pulse-root` still find the store the MCP server was
+/// registered with (#46): `$XDG_CONFIG_HOME/recall-echo/pulse-root`,
+/// defaulting to `~/.config/recall-echo/pulse-root`.
+fn pulse_root_state_file() -> Option<PathBuf> {
+    Some(state_dir()?.join(POINTER_FILE))
+}
+
+/// Which pointer file a persisted root was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerFile {
+    /// `pulse-root`, written by `init` since 4.6.0.
+    Current,
+    /// `entity-root`, written by `init` before 4.6.0.
+    Legacy,
+}
+
+/// A root some `init` persisted, and the file it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedPointer {
+    root: PathBuf,
+    file: PointerFile,
+}
+
+/// Read the persisted pointer from `dir`: `pulse-root` when it names a root,
+/// otherwise the pre-4.6.0 `entity-root`, so an install initialised by an
+/// older release keeps resolving until `init` is re-run.
+fn read_pointer(dir: &Path) -> Option<PersistedPointer> {
+    if let Some(root) = persisted_pulse_root_from(&dir.join(POINTER_FILE)) {
+        return Some(PersistedPointer {
+            root,
+            file: PointerFile::Current,
+        });
+    }
+    persisted_pulse_root_from(&dir.join(LEGACY_POINTER_FILE)).map(|root| PersistedPointer {
+        root,
+        file: PointerFile::Legacy,
+    })
+}
+
+/// The pulse root a previous `init` persisted, if any — from `pulse-root`,
+/// or the legacy `entity-root` file when that is all there is.
+#[must_use]
+pub fn persisted_pulse_root() -> Option<PathBuf> {
+    read_pointer(&state_dir()?).map(|pointer| pointer.root)
+}
+
+/// [`persisted_pulse_root`] under its pre-4.6.0 name.
+#[deprecated(since = "4.6.0", note = "renamed to `persisted_pulse_root`")]
 #[must_use]
 pub fn persisted_entity_root() -> Option<PathBuf> {
-    persisted_entity_root_from(&entity_root_state_file()?)
+    persisted_pulse_root()
 }
 
-fn persisted_entity_root_from(file: &std::path::Path) -> Option<PathBuf> {
+fn persisted_pulse_root_from(file: &std::path::Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(file).ok()?;
     let trimmed = contents.trim();
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Say, once per process, that the root came from the pre-4.6.0 file name.
+fn note_legacy_pointer() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let file = state_dir().map_or_else(
+            || LEGACY_POINTER_FILE.to_string(),
+            |dir| dir.join(LEGACY_POINTER_FILE).display().to_string(),
+        );
+        eprintln!(
+            "recall-echo: pulse root read from the legacy pointer {file:?}; \
+             re-run `recall-echo init` to write {POINTER_FILE}"
+        );
+    });
 }
 
 // ── Where `init` writes outside the store ────────────────────────────────
@@ -161,7 +241,7 @@ pub(crate) fn recall_binary() -> String {
 /// True when `exe` sits in a Cargo build directory.
 ///
 /// Such a binary is a test harness or a working copy: pinning a user's hooks,
-/// MCP registrations or global entity-root pointer to it would break the
+/// MCP registrations or global pulse-root pointer to it would break the
 /// moment the tree is cleaned.
 ///
 /// The test is the *shape* Cargo produces, not the string `target`, because
@@ -198,7 +278,7 @@ const AGENT_CONFIG_ENV: [(&str, Option<&str>); 4] = [
     ("CODEX_HOME", Some(".codex")),
 ];
 
-/// What became of the persisted entity-root pointer.
+/// What became of the persisted pulse-root pointer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistOutcome {
     /// Written to this file.
@@ -210,8 +290,8 @@ pub enum PersistOutcome {
 /// The global destinations `init` writes to, resolved once and passed down.
 ///
 /// `init` touches three things nobody named on the command line: the Claude
-/// Code hook file (`~/.claude/settings.json`), the persisted entity root
-/// (`$XDG_CONFIG_HOME/recall-echo/entity-root`), and — through the agent CLIs
+/// Code hook file (`~/.claude/settings.json`), the persisted pulse root
+/// (`$XDG_CONFIG_HOME/recall-echo/pulse-root`), and — through the agent CLIs
 /// it shells out to — their own user config. Resolving those paths inside each
 /// writer left a caller no way to redirect them, and the test suite rewrote the
 /// developer's real configuration on every run (#59). They are an input now,
@@ -223,7 +303,7 @@ pub enum PersistOutcome {
 pub struct ConfigRoots {
     claude_dir: Option<PathBuf>,
     /// The persisted-pointer destination, or why there is none.
-    entity_root_file: Result<PathBuf, &'static str>,
+    pulse_root_file: Result<PathBuf, &'static str>,
     agent_home: Option<PathBuf>,
     recall_bin: String,
     spawns_agents: bool,
@@ -240,14 +320,14 @@ impl ConfigRoots {
     #[must_use]
     pub fn from_env() -> Self {
         let recall_bin = recall_binary();
-        let entity_root_file = if is_build_dir(&recall_bin) {
+        let pulse_root_file = if is_build_dir(&recall_bin) {
             Err("running from a build directory")
         } else {
-            entity_root_state_file().ok_or("there is no home directory to persist into")
+            pulse_root_state_file().ok_or("there is no home directory to persist into")
         };
         Self {
             claude_dir: detect_claude_code(),
-            entity_root_file,
+            pulse_root_file,
             agent_home: None,
             recall_bin,
             spawns_agents: true,
@@ -267,7 +347,7 @@ impl ConfigRoots {
         std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o700))?;
         Ok(Self {
             claude_dir: Some(claude_dir),
-            entity_root_file: Ok(dir.join(".config").join("recall-echo").join("entity-root")),
+            pulse_root_file: Ok(dir.join(".config").join("recall-echo").join("pulse-root")),
             agent_home: Some(dir.to_path_buf()),
             recall_bin: dir.join("bin").join("recall-echo").display().to_string(),
             spawns_agents: false,
@@ -288,10 +368,17 @@ impl ConfigRoots {
         self.claude_dir.as_deref()
     }
 
-    /// The file the entity-root pointer is written to, when one is written.
+    /// The file the pulse-root pointer is written to, when one is written.
+    #[must_use]
+    pub fn pulse_root_file(&self) -> Option<&Path> {
+        self.pulse_root_file.as_deref().ok()
+    }
+
+    /// [`ConfigRoots::pulse_root_file`] under its pre-4.6.0 name.
+    #[deprecated(since = "4.6.0", note = "renamed to `pulse_root_file`")]
     #[must_use]
     pub fn entity_root_file(&self) -> Option<&Path> {
-        self.entity_root_file.as_deref().ok()
+        self.pulse_root_file()
     }
 
     /// The binary path written into hooks and MCP registrations.
@@ -325,19 +412,25 @@ impl ConfigRoots {
             .collect()
     }
 
-    /// Persist `root` as the default entity root for flagless invocations.
-    pub fn persist_entity_root(&self, root: &Path) -> Result<PersistOutcome, RecallError> {
-        match &self.entity_root_file {
+    /// Persist `root` as the default pulse root for flagless invocations.
+    pub fn persist_pulse_root(&self, root: &Path) -> Result<PersistOutcome, RecallError> {
+        match &self.pulse_root_file {
             Ok(file) => {
-                persist_entity_root_to(file, root)?;
+                persist_pulse_root_to(file, root)?;
                 Ok(PersistOutcome::Written(file.clone()))
             }
             Err(why) => Ok(PersistOutcome::Skipped(why)),
         }
     }
+
+    /// [`ConfigRoots::persist_pulse_root`] under its pre-4.6.0 name.
+    #[deprecated(since = "4.6.0", note = "renamed to `persist_pulse_root`")]
+    pub fn persist_entity_root(&self, root: &Path) -> Result<PersistOutcome, RecallError> {
+        self.persist_pulse_root(root)
+    }
 }
 
-fn persist_entity_root_to(
+fn persist_pulse_root_to(
     file: &std::path::Path,
     root: &std::path::Path,
 ) -> Result<(), RecallError> {
@@ -368,7 +461,7 @@ fn persist_entity_root_to(
     Ok(())
 }
 
-/// Whether `root` carries a layout some `init` (entity or claude-style)
+/// Whether `root` carries a layout some `init` (pulse or claude-style)
 /// already created — the same two shapes `hook_base_dir` routes between.
 fn looks_initialized(root: &std::path::Path) -> bool {
     root.join("memory").join("conversations").exists() || root.join("conversations").exists()
@@ -376,17 +469,20 @@ fn looks_initialized(root: &std::path::Path) -> bool {
 
 /// Which arm of the flagless root resolution won.
 ///
-/// Shared by the commands (`entity_root`) and the capture hooks
-/// (`hook_entity_root`) so both answer "where is the store?" the same way.
+/// Shared by the commands (`pulse_root`) and the capture hooks
+/// (`hook_pulse_root`) so both answer "where is the store?" the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootSource {
     /// `RECALL_ECHO_HOME` — taken as given, no existence check.
     Env(PathBuf),
-    /// The cwd carries an initialised layout (pulse-null entities run with
-    /// cwd = entity home).
+    /// The cwd carries an initialised layout (pulse-null pulses run with
+    /// cwd = pulse home).
     Cwd(PathBuf),
     /// The root a previous `init` persisted, canonical, and still trusted.
     Persisted(PathBuf),
+    /// The same, read from the pre-4.6.0 `entity-root` pointer because no
+    /// `pulse-root` exists yet.
+    PersistedLegacy(PathBuf),
     /// Nothing pinned. `stale` names a persisted root that was refused, so
     /// the caller can say so instead of silently reading a directory `init`
     /// never wrote to (#59 leaves `/tmp` paths behind).
@@ -402,7 +498,9 @@ impl RootSource {
         cwd: Option<PathBuf>,
     ) -> Result<(PathBuf, Option<StaleRoot>), RecallError> {
         match self {
-            Self::Env(p) | Self::Cwd(p) | Self::Persisted(p) => Ok((p, None)),
+            Self::Env(p) | Self::Cwd(p) | Self::Persisted(p) | Self::PersistedLegacy(p) => {
+                Ok((p, None))
+            }
             Self::Unpinned { stale } => {
                 let cwd = cwd.ok_or_else(|| {
                     RecallError::Other("Could not determine the current directory".into())
@@ -416,7 +514,9 @@ impl RootSource {
     /// "nothing pinned" means — plus the stale root to warn about.
     fn into_hook_root(self) -> (Option<PathBuf>, Option<StaleRoot>) {
         match self {
-            Self::Env(p) | Self::Cwd(p) | Self::Persisted(p) => (Some(p), None),
+            Self::Env(p) | Self::Cwd(p) | Self::Persisted(p) | Self::PersistedLegacy(p) => {
+                (Some(p), None)
+            }
             Self::Unpinned { stale } => (None, stale),
         }
     }
@@ -426,16 +526,20 @@ impl RootSource {
             Self::Env(_) => "from RECALL_ECHO_HOME",
             Self::Cwd(_) => "the current directory",
             Self::Persisted(_) => "persisted by `recall-echo init`",
+            Self::PersistedLegacy(_) => {
+                "persisted by `recall-echo init` (legacy entity-root file — re-run init)"
+            }
             Self::Unpinned { .. } => "the current directory (nothing pinned)",
         }
     }
 }
 
-/// The pure resolution behind [`entity_root`] and [`hook_entity_root`]:
+/// The pure resolution behind [`pulse_root`] and [`hook_pulse_root`]:
 ///
 /// 1. `env_home` (`RECALL_ECHO_HOME`) when non-blank,
 /// 2. `cwd` when `initialised(cwd)`,
-/// 3. `persisted()` when `trusted` accepts it (yielding its canonical path),
+/// 3. `persisted()` when `trusted` accepts it (yielding its canonical path,
+///    labelled legacy when it came from the pre-4.6.0 `entity-root` file),
 /// 4. otherwise [`RootSource::Unpinned`], carrying the refused persisted
 ///    root and the reason if there was one.
 ///
@@ -445,7 +549,7 @@ impl RootSource {
 fn resolve_root_source(
     env_home: Option<&str>,
     cwd: Option<&Path>,
-    persisted: impl FnOnce() -> Option<PathBuf>,
+    persisted: impl FnOnce() -> Option<PersistedPointer>,
     initialised: impl Fn(&Path) -> bool,
     trusted: impl Fn(&Path) -> Result<PathBuf, String>,
 ) -> RootSource {
@@ -460,8 +564,11 @@ fn resolve_root_source(
         }
     }
     match persisted() {
-        Some(root) => match trusted(&root) {
-            Ok(canonical) => RootSource::Persisted(canonical),
+        Some(PersistedPointer { root, file }) => match trusted(&root) {
+            Ok(canonical) => match file {
+                PointerFile::Current => RootSource::Persisted(canonical),
+                PointerFile::Legacy => RootSource::PersistedLegacy(canonical),
+            },
             Err(reason) => RootSource::Unpinned {
                 stale: Some(StaleRoot { path: root, reason }),
             },
@@ -509,15 +616,18 @@ fn resolve_from_environment() -> (RootSource, Option<PathBuf>) {
     let source = resolve_root_source(
         env_home.as_deref(),
         cwd.as_deref(),
-        persisted_entity_root,
+        || read_pointer(&state_dir()?),
         looks_initialized,
         trusted_root,
     );
+    if matches!(source, RootSource::PersistedLegacy(_)) {
+        note_legacy_pointer();
+    }
     (source, cwd)
 }
 
-/// Entity root for a capture hook (`archive-session`, `checkpoint`,
-/// `consume`) that may not have received an explicit `--entity-root`.
+/// Pulse root for a capture hook (`archive-session`, `checkpoint`,
+/// `consume`) that may not have received an explicit `--pulse-root`.
 ///
 /// Resolution order: the explicit flag, then [`resolve_root_source`] — the
 /// same chain the commands use. `None` means nothing is pinned anywhere —
@@ -525,7 +635,7 @@ fn resolve_from_environment() -> (RootSource, Option<PathBuf>) {
 /// loud rather than no-op silently. A persisted root that is no longer
 /// trusted counts as nothing pinned, and is named on stderr.
 #[must_use]
-pub fn hook_entity_root(explicit: Option<&Path>) -> Option<PathBuf> {
+pub fn hook_pulse_root(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
@@ -537,15 +647,22 @@ pub fn hook_entity_root(explicit: Option<&Path>) -> Option<PathBuf> {
     root
 }
 
+/// [`hook_pulse_root`] under its pre-4.6.0 name.
+#[deprecated(since = "4.6.0", note = "renamed to `hook_pulse_root`")]
+#[must_use]
+pub fn hook_entity_root(explicit: Option<&Path>) -> Option<PathBuf> {
+    hook_pulse_root(explicit)
+}
+
 /// `hook_base_dir` behind the full flagless resolution, warning loudly on the
 /// legacy `~/.claude` fallback instead of silently capturing to the wrong
 /// store (#46).
 pub fn resolved_hook_base_dir(explicit: Option<&std::path::Path>) -> Result<PathBuf, RecallError> {
-    match hook_entity_root(explicit) {
+    match hook_pulse_root(explicit) {
         Some(root) => hook_base_dir(Some(&root)),
         None => {
             eprintln!(
-                "recall-echo: no entity root pinned (no --entity-root, RECALL_ECHO_HOME unset, \
+                "recall-echo: no pulse root pinned (no --pulse-root, RECALL_ECHO_HOME unset, \
                  nothing usable persisted by `recall-echo init`) — falling back to ~/.claude. \
                  Re-run `recall-echo init` to persist one."
             );
@@ -594,7 +711,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hook_base_prefers_the_entity_layout() {
+    fn hook_base_prefers_the_pulse_layout() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("memory/conversations")).unwrap();
         let base = hook_base_dir(Some(tmp.path())).unwrap();
@@ -610,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_base_names_the_entity_layout_when_uninitialized() {
+    fn hook_base_names_the_pulse_layout_when_uninitialized() {
         let tmp = tempfile::tempdir().unwrap();
         let base = hook_base_dir(Some(tmp.path())).unwrap();
         assert_eq!(base, tmp.path().join("memory"));
@@ -621,26 +738,106 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("entity");
         std::fs::create_dir_all(&root).unwrap();
-        let file = tmp.path().join("config").join("entity-root");
-        persist_entity_root_to(&file, &root).unwrap();
-        let read = persisted_entity_root_from(&file).unwrap();
+        let file = tmp.path().join("config").join("pulse-root");
+        persist_pulse_root_to(&file, &root).unwrap();
+        let read = persisted_pulse_root_from(&file).unwrap();
         assert_eq!(read, std::fs::canonicalize(&root).unwrap());
     }
 
     #[test]
     fn persisted_root_ignores_missing_and_blank_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("entity-root");
-        assert_eq!(persisted_entity_root_from(&file), None);
+        let file = tmp.path().join("pulse-root");
+        assert_eq!(persisted_pulse_root_from(&file), None);
         std::fs::write(&file, "  \n").unwrap();
-        assert_eq!(persisted_entity_root_from(&file), None);
+        assert_eq!(persisted_pulse_root_from(&file), None);
+    }
+
+    #[test]
+    fn pointer_prefers_the_pulse_root_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pulse-root"), "/new\n").unwrap();
+        std::fs::write(tmp.path().join("entity-root"), "/old\n").unwrap();
+        assert_eq!(
+            read_pointer(tmp.path()),
+            Some(PersistedPointer {
+                root: PathBuf::from("/new"),
+                file: PointerFile::Current,
+            })
+        );
+    }
+
+    /// An install `init`-ed before 4.6.0 only has `entity-root`.
+    #[test]
+    fn pointer_falls_back_to_the_legacy_entity_root_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("entity-root"), "/old\n").unwrap();
+        let legacy = Some(PersistedPointer {
+            root: PathBuf::from("/old"),
+            file: PointerFile::Legacy,
+        });
+        assert_eq!(read_pointer(tmp.path()), legacy);
+
+        std::fs::write(tmp.path().join("pulse-root"), " \n").unwrap();
+        assert_eq!(
+            read_pointer(tmp.path()),
+            legacy,
+            "a blank pulse-root names nothing"
+        );
+    }
+
+    #[test]
+    fn pointer_is_absent_when_neither_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_pointer(tmp.path()), None);
+    }
+
+    #[test]
+    fn a_trusted_legacy_pointer_resolves_and_says_where_it_came_from() {
+        let source = resolve_root_source(
+            None,
+            Some(Path::new("/cwd")),
+            || {
+                Some(PersistedPointer {
+                    root: PathBuf::from("/old"),
+                    file: PointerFile::Legacy,
+                })
+            },
+            |_| false,
+            trust_all,
+        );
+        assert_eq!(source, RootSource::PersistedLegacy(PathBuf::from("/old")));
+        assert!(source.label().contains("legacy entity-root file"));
+        let (root, stale) = source.into_hook_root();
+        assert_eq!(root, Some(PathBuf::from("/old")));
+        assert_eq!(stale, None);
+    }
+
+    #[test]
+    fn an_untrusted_legacy_pointer_is_stale_like_any_other() {
+        let source = resolve_root_source(
+            None,
+            Some(Path::new("/cwd")),
+            || {
+                Some(PersistedPointer {
+                    root: PathBuf::from("/tmp/.tmpGone"),
+                    file: PointerFile::Legacy,
+                })
+            },
+            |_| false,
+            trust_none,
+        );
+        assert!(
+            matches!(source, RootSource::Unpinned { stale: Some(_) }),
+            "{source:?}"
+        );
     }
 
     #[test]
     fn explicit_flag_wins_hook_resolution() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            hook_entity_root(Some(tmp.path())),
+            hook_pulse_root(Some(tmp.path())),
             Some(tmp.path().to_path_buf())
         );
     }
@@ -657,12 +854,17 @@ mod tests {
         assert!(looks_initialized(claude.path()));
     }
 
-    fn no_persisted() -> Option<PathBuf> {
+    fn no_persisted() -> Option<PersistedPointer> {
         None
     }
 
-    fn persisted(p: &Path) -> impl FnOnce() -> Option<PathBuf> + '_ {
-        move || Some(p.to_path_buf())
+    fn persisted(p: &Path) -> impl FnOnce() -> Option<PersistedPointer> + '_ {
+        move || {
+            Some(PersistedPointer {
+                root: p.to_path_buf(),
+                file: PointerFile::Current,
+            })
+        }
     }
 
     fn trust_all(p: &Path) -> Result<PathBuf, String> {
@@ -772,6 +974,7 @@ mod tests {
             RootSource::Env(PathBuf::from("/env")),
             RootSource::Cwd(cwd.to_path_buf()),
             RootSource::Persisted(PathBuf::from("/persisted")),
+            RootSource::PersistedLegacy(PathBuf::from("/legacy")),
             RootSource::Unpinned { stale: None },
             RootSource::Unpinned {
                 stale: Some(StaleRoot {
@@ -835,7 +1038,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roots = ConfigRoots::sandboxed(tmp.path()).unwrap();
 
-        for path in [roots.claude_dir(), roots.entity_root_file()] {
+        for path in [roots.claude_dir(), roots.pulse_root_file()] {
             let path = path.expect("a destination inside the sandbox");
             assert!(path.starts_with(tmp.path()), "{}", path.display());
         }
@@ -865,26 +1068,26 @@ mod tests {
     }
 
     /// The persisted-root writer takes its destination from the roots, so a
-    /// test cannot reach `~/.config/recall-echo/entity-root` even by accident.
+    /// test cannot reach `~/.config/recall-echo/pulse-root` even by accident.
     #[test]
     fn persisting_through_sandboxed_roots_leaves_the_real_file_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let real = entity_root_state_file().expect("a real state file path");
+        let real = pulse_root_state_file().expect("a real state file path");
         let before = std::fs::read(&real).ok();
 
         let root = tmp.path().join("entity");
         std::fs::create_dir_all(&root).unwrap();
         let roots = ConfigRoots::sandboxed(tmp.path()).unwrap();
-        let written = roots.persist_entity_root(&root).unwrap();
+        let written = roots.persist_pulse_root(&root).unwrap();
 
         let file = roots
-            .entity_root_file()
+            .pulse_root_file()
             .expect("a destination")
             .to_path_buf();
         assert_eq!(written, PersistOutcome::Written(file.clone()));
         assert!(file.starts_with(tmp.path()), "{}", file.display());
         assert_eq!(
-            persisted_entity_root_from(&file).unwrap(),
+            persisted_pulse_root_from(&file).unwrap(),
             std::fs::canonicalize(&root).unwrap()
         );
         assert_eq!(
@@ -907,11 +1110,11 @@ mod tests {
             "test binary is not build-shaped: {}",
             roots.recall_bin()
         );
-        assert_eq!(roots.entity_root_file(), None);
+        assert_eq!(roots.pulse_root_file(), None);
 
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            roots.persist_entity_root(tmp.path()).unwrap(),
+            roots.persist_pulse_root(tmp.path()).unwrap(),
             PersistOutcome::Skipped("running from a build directory")
         );
         assert!(roots.spawns_agents(), "production roots still reach out");
@@ -954,7 +1157,7 @@ mod tests {
             .unwrap()
             .without_claude_code();
         assert_eq!(roots.claude_dir(), None);
-        assert!(roots.entity_root_file().is_some(), "the pointer still goes");
+        assert!(roots.pulse_root_file().is_some(), "the pointer still goes");
     }
 
     #[test]
@@ -962,8 +1165,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("entity");
         std::fs::create_dir_all(&root).unwrap();
-        let file = tmp.path().join("config").join("entity-root");
-        persist_entity_root_to(&file, &root).unwrap();
+        let file = tmp.path().join("config").join("pulse-root");
+        persist_pulse_root_to(&file, &root).unwrap();
         let dir_mode = std::fs::metadata(file.parent().unwrap())
             .unwrap()
             .permissions()

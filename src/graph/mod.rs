@@ -5,7 +5,7 @@
 //! recall-graph — Knowledge graph with semantic search for AI memory systems.
 //!
 //! Provides a structured graph layer (Layer 0) underneath flat-file memory systems.
-//! Used by recall-echo (pulse-null entities) and recall-claude (Claude Code users).
+//! Used by recall-echo (pulse-null pulses) and recall-claude (Claude Code users).
 
 pub mod confidence;
 pub mod correct;
@@ -138,9 +138,9 @@ impl GraphMemory {
             let pw_path = if graph_section.password_file.starts_with('/') {
                 std::path::PathBuf::from(&graph_section.password_file)
             } else {
-                // Relative to entity root (memory_dir's parent)
-                let entity_root = memory_dir.parent().unwrap_or(memory_dir);
-                entity_root.join(&graph_section.password_file)
+                // Relative to pulse root (memory_dir's parent)
+                let pulse_root = memory_dir.parent().unwrap_or(memory_dir);
+                pulse_root.join(&graph_section.password_file)
             };
             std::fs::read_to_string(&pw_path)
                 .map(|s| s.trim().to_string())

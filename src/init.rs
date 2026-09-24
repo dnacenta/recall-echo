@@ -82,11 +82,11 @@ fn print_status(status: Status, msg: &str) {
 /// Point at a stranded pre-4.2 archive before it strands.
 ///
 /// A claude-style install archived at `<root>/conversations`. Init creates
-/// the entity layout, which hooks and reads will now prefer — a populated
+/// the pulse layout, which hooks and reads will now prefer — a populated
 /// legacy directory would otherwise be left behind silently: invisible to
 /// search and the graph, with numbering restarting at 001 in the new place.
-fn notice_legacy_conversations(entity_root: &Path, new_dir: &Path) {
-    let legacy = entity_root.join("conversations");
+fn notice_legacy_conversations(pulse_root: &Path, new_dir: &Path) {
+    let legacy = pulse_root.join("conversations");
     let legacy_count = fs::read_dir(&legacy).map(|d| d.count()).unwrap_or(0);
     let new_count = fs::read_dir(new_dir).map(|d| d.count()).unwrap_or(0);
     if legacy_count > 0 && new_count == 0 {
@@ -102,7 +102,7 @@ fn notice_legacy_conversations(entity_root: &Path, new_dir: &Path) {
         eprintln!("      mv {}/* {}/", legacy.display(), new_dir.display());
         eprintln!(
             "      {DIM}(and review {}/ARCHIVE.md against the one in memory/){RESET}",
-            entity_root.display()
+            pulse_root.display()
         );
     }
 }
@@ -416,10 +416,10 @@ fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOu
 /// Returns true if hooks were configured.
 ///
 /// The file is `<roots.claude_dir()>/settings.json` — `~/.claude/settings.json`
-/// in production, a sandbox under test — regardless of where entity_root is.
+/// in production, a sandbox under test — regardless of where pulse_root is.
 /// The binary the hooks will invoke comes from `roots` too, so nothing here is
 /// decided by the path this process happens to be running from.
-fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path) -> bool {
+fn configure_hooks(roots: &paths::ConfigRoots, pulse_root: &Path) -> bool {
     let Some(claude_dir) = roots.claude_dir() else {
         return false;
     };
@@ -436,7 +436,7 @@ fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path) -> bool {
 
     install_hooks(
         &claude_dir.join("settings.json"),
-        entity_root,
+        pulse_root,
         roots.recall_bin(),
     )
 }
@@ -446,7 +446,7 @@ fn configure_hooks(roots: &paths::ConfigRoots, entity_root: &Path) -> bool {
 /// Split from [`configure_hooks`] so the writer can be exercised against a
 /// named file with a named binary: where it writes is an argument, never a
 /// path this process resolves for itself (#59).
-fn install_hooks(settings_path: &Path, entity_root: &Path, recall_bin: &str) -> bool {
+fn install_hooks(settings_path: &Path, pulse_root: &Path, recall_bin: &str) -> bool {
     // Absent means a fresh install. Unreadable or unparseable means the
     // user's existing configuration — falling back to `{}` there would
     // overwrite everything they have (permissions, MCP servers, env) with a
@@ -483,13 +483,13 @@ fn install_hooks(settings_path: &Path, entity_root: &Path, recall_bin: &str) -> 
         serde_json::json!({})
     };
 
-    let root = fs::canonicalize(entity_root).unwrap_or_else(|_| entity_root.to_path_buf());
+    let root = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
     // A control character (a newline especially) inside a shell command line
     // is unrecoverable for the user reading settings.json later.
     if root.display().to_string().chars().any(char::is_control) {
         print_status(
             Status::Error,
-            "Entity root contains control characters — refusing to write it into a shell hook",
+            "Pulse root contains control characters — refusing to write it into a shell hook",
         );
         return false;
     }
@@ -604,7 +604,7 @@ fn shell_path(path: &Path) -> String {
 ///
 /// The binary path is the one interpolated value that cannot be quoted: the
 /// existing-hook matcher recognizes our commands by their literal shape, and
-/// quoting would change it. Unlike the entity root — arbitrary user data —
+/// quoting would change it. Unlike the pulse root — arbitrary user data —
 /// an install path is conventional, so a conservative character set covers
 /// every real install and anything outside it is refused with a message
 /// rather than baked into a broken or dangerous command line.
@@ -627,7 +627,7 @@ fn is_shell_safe_bin(path: &str) -> bool {
 const SHELL_OPERATORS: [&str; 8] = [";", "&", "|", ">", "<", "$", "`", "\n"];
 
 /// The command text with single-quoted spans removed — the only part where a
-/// shell operator means anything. The entity root recall-echo itself quotes
+/// shell operator means anything. The pulse root recall-echo itself quotes
 /// may legally contain `;` or `$`; scanning through the quotes would make our
 /// own canonical hooks look customized and permanently unrepairable.
 fn strip_single_quoted(cmd: &str) -> String {
@@ -667,10 +667,10 @@ fn is_bare_recall_invocation(cmd: &str, subcommand: &str) -> bool {
 
 /// Install or repair the three recall-echo hooks in a settings.json value.
 ///
-/// The entity root is baked into every command: hooks run with the harness's
+/// The pulse root is baked into every command: hooks run with the harness's
 /// cwd, which is wherever the user happens to be working, and a bare
 /// `recall-echo archive-session` resolves against that — capture then only
-/// works when the shell sits in the entity root. MCP registration already
+/// works when the shell sits in the pulse root. MCP registration already
 /// bakes the root for reads; this is the write-side counterpart.
 ///
 /// A plain recall-echo hook whose command differs from the expected line —
@@ -688,10 +688,10 @@ fn is_bare_recall_invocation(cmd: &str, subcommand: &str) -> bool {
 fn upsert_recall_hooks(
     settings: &mut serde_json::Value,
     recall_bin: &str,
-    entity_root: &Path,
+    pulse_root: &Path,
     notes: &mut Vec<String>,
 ) -> Result<bool, String> {
-    let root = shell_path(entity_root);
+    let root = shell_path(pulse_root);
     // SessionStart fires once per session (startup or resume) — injects
     // EPHEMERAL.md into context via stdout. Skips `clear` (user reset) and
     // `compact` (we just recovered from a compaction, no prior session to
@@ -707,13 +707,13 @@ fn upsert_recall_hooks(
             "SessionEnd",
             None,
             "archive-session",
-            format!("{recall_bin} archive-session --entity-root {root}"),
+            format!("{recall_bin} archive-session --pulse-root {root}"),
         ),
         (
             "PreCompact",
             None,
             "checkpoint",
-            format!("{recall_bin} checkpoint --trigger precompact --entity-root {root}"),
+            format!("{recall_bin} checkpoint --trigger precompact --pulse-root {root}"),
         ),
     ];
 
@@ -733,6 +733,20 @@ fn upsert_recall_hooks(
         }
     }
     Ok(changed)
+}
+
+/// The flag hooks written before 4.6.0 carried the pulse root under.
+const LEGACY_ROOT_FLAG: &str = "--entity-root";
+
+/// What rewriting a plain recall-echo hook to the canonical command did, in
+/// the words the user needs: a rename of the pre-4.6.0 flag, or a root the
+/// hook did not carry (or carried stale).
+fn rewrite_note(event: &str, previous: &str) -> String {
+    if previous.contains(LEGACY_ROOT_FLAG) {
+        format!("{event}: renamed {LEGACY_ROOT_FLAG} to --pulse-root in the recall-echo hook")
+    } else {
+        format!("{event}: updated recall-echo hook to carry the pulse root")
+    }
 }
 
 /// Ensure one event carries exactly one canonical recall-echo hook command.
@@ -793,15 +807,13 @@ fn upsert_hook(
                     have_canonical = true;
                 } else if repairable {
                     inner[i]["command"] = serde_json::Value::String(expected.to_string());
-                    notes.push(format!(
-                        "{event}: updated recall-echo hook to carry the entity root"
-                    ));
+                    notes.push(rewrite_note(event, &cmd));
                     have_canonical = true;
                     changed = true;
                 } else {
                     notes.push(format!(
                         "{event}: left a customized recall-echo hook unchanged: {cmd} — note it \
-                         does not carry the entity root; the canonical command is: {expected}"
+                         does not carry the pulse root; the canonical command is: {expected}"
                     ));
                 }
                 i += 1;
@@ -861,7 +873,7 @@ fn upsert_hook(
 fn register_mcp_clients(
     runtime: &tokio::runtime::Runtime,
     detected: &[AgentCli],
-    entity_root: &Path,
+    pulse_root: &Path,
     roots: &paths::ConfigRoots,
 ) -> Vec<McpReport> {
     if detected.is_empty() {
@@ -884,7 +896,7 @@ fn register_mcp_clients(
         return Vec::new();
     }
 
-    let root = fs::canonicalize(entity_root).unwrap_or_else(|_| entity_root.to_path_buf());
+    let root = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
     let reports: Vec<McpReport> = runtime.block_on(async {
         let mut reports = Vec::with_capacity(detected.len());
         for cli in detected {
@@ -1000,11 +1012,11 @@ fn atty_check() -> bool {
 
 // ── Entry point ──────────────────────────────────────────────────────────
 
-/// Initialize memory structure at the given entity root.
+/// Initialize memory structure at the given pulse root.
 ///
 /// Creates:
 /// ```text
-/// {entity_root}/memory/
+/// {pulse_root}/memory/
 /// ├── MEMORY.md
 /// ├── EPHEMERAL.md
 /// ├── ARCHIVE.md
@@ -1012,57 +1024,54 @@ fn atty_check() -> bool {
 /// ├── graph/
 /// └── conversations/
 /// ```
-pub fn run(entity_root: &Path) -> Result<(), RecallError> {
+pub fn run(pulse_root: &Path) -> Result<(), RecallError> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    run_with_reader(entity_root, &mut reader)
+    run_with_reader(pulse_root, &mut reader)
 }
 
 /// Init with an injectable reader, against the real user configuration.
-pub fn run_with_reader(entity_root: &Path, reader: &mut dyn BufRead) -> Result<(), RecallError> {
-    run_with(entity_root, reader, &paths::ConfigRoots::from_env())
+pub fn run_with_reader(pulse_root: &Path, reader: &mut dyn BufRead) -> Result<(), RecallError> {
+    run_with(pulse_root, reader, &paths::ConfigRoots::from_env())
 }
 
 /// Init with both the reader and the global destinations injected.
 ///
-/// `roots` decides where the hook file, the persisted entity root and any
+/// `roots` decides where the hook file, the persisted pulse root and any
 /// agent-CLI config land. Pass [`paths::ConfigRoots::sandboxed`] and nothing
 /// outside that directory can be written, whatever this binary's path is (#59).
 pub fn run_with(
-    entity_root: &Path,
+    pulse_root: &Path,
     reader: &mut dyn BufRead,
     roots: &paths::ConfigRoots,
 ) -> Result<(), RecallError> {
-    if !entity_root.exists() {
+    if !pulse_root.exists() {
         return Err(RecallError::NotInitialized(format!(
             "Directory not found: {}\n  Create the directory first, or run from a valid path.",
-            entity_root.display()
+            pulse_root.display()
         )));
     }
 
     eprintln!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");
 
-    let memory_dir = entity_root.join("memory");
+    let memory_dir = pulse_root.join("memory");
     let conversations_dir = memory_dir.join("conversations");
     ensure_dir(&memory_dir);
     ensure_dir(&conversations_dir);
-    notice_legacy_conversations(entity_root, &conversations_dir);
+    notice_legacy_conversations(pulse_root, &conversations_dir);
 
     // Pin this root for flagless hook invocations (#46): capture must land in
     // the store the MCP server serves, not wherever the session's cwd is.
-    match roots.persist_entity_root(entity_root) {
+    match roots.persist_pulse_root(pulse_root) {
         Ok(paths::PersistOutcome::Written(file)) => print_status(
             Status::Created,
-            &format!("Entity root persisted to {}", file.display()),
+            &format!("Pulse root persisted to {}", file.display()),
         ),
         Ok(paths::PersistOutcome::Skipped(why)) => print_status(
             Status::Exists,
-            &format!("Skipped persisting the entity root — {why}"),
+            &format!("Skipped persisting the pulse root — {why}"),
         ),
-        Err(e) => print_status(
-            Status::Error,
-            &format!("Could not persist entity root: {e}"),
-        ),
+        Err(e) => print_status(Status::Error, &format!("Could not persist pulse root: {e}")),
     }
 
     // Write MEMORY.md (never overwrite)
@@ -1100,10 +1109,10 @@ pub fn run_with(
     // extraction provider: a user who extracts with grok still wants their
     // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
     // is not installed.
-    configure_hooks(roots, entity_root);
+    configure_hooks(roots, pulse_root);
 
     let mcp = match &runtime {
-        Some(runtime) => register_mcp_clients(runtime, &detected, entity_root, roots),
+        Some(runtime) => register_mcp_clients(runtime, &detected, pulse_root, roots),
         None => Vec::new(),
     };
 
@@ -1128,10 +1137,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
-    /// An entity root and a sandbox for everything `init` writes outside it.
+    /// A pulse root and a sandbox for everything `init` writes outside it.
     ///
     /// Every test here runs the real writers; none of them may reach the
-    /// developer's `~/.claude`, `~/.claude.json` or persisted entity root
+    /// developer's `~/.claude`, `~/.claude.json` or persisted pulse root
     /// (#59). The destinations are an argument, not an environment variable,
     /// so this is safe under a parallel test runner.
     struct Sandbox {
@@ -1148,13 +1157,13 @@ mod tests {
             Self { dir, roots }
         }
 
-        fn entity_root(&self) -> PathBuf {
+        fn pulse_root(&self) -> PathBuf {
             self.dir.path().join("entity")
         }
 
         fn init(&self, input: &str) -> Result<(), RecallError> {
             let mut reader = Cursor::new(input.as_bytes());
-            run_with(&self.entity_root(), &mut reader, &self.roots)
+            run_with(&self.pulse_root(), &mut reader, &self.roots)
         }
     }
 
@@ -1163,25 +1172,25 @@ mod tests {
         let sandbox = Sandbox::new();
         sandbox.init("skip\n").unwrap(); // skip provider prompt
 
-        let root = sandbox.entity_root();
+        let root = sandbox.pulse_root();
         assert!(root.join("memory/MEMORY.md").exists());
         assert!(root.join("memory/EPHEMERAL.md").exists());
         assert!(root.join("memory/ARCHIVE.md").exists());
         assert!(root.join("memory/conversations").exists());
     }
 
-    /// Everything `init` writes outside the entity root lands in the sandbox:
-    /// the persisted pointer exists there, and it names the entity root.
+    /// Everything `init` writes outside the pulse root lands in the sandbox:
+    /// the persisted pointer exists there, and it names the pulse root.
     #[test]
-    fn init_persists_the_entity_root_inside_the_sandbox() {
+    fn init_persists_the_pulse_root_inside_the_sandbox() {
         let sandbox = Sandbox::new();
         sandbox.init("skip\n").unwrap();
 
-        let persisted = sandbox.roots.entity_root_file().expect("a destination");
+        let persisted = sandbox.roots.pulse_root_file().expect("a destination");
         let pinned = fs::read_to_string(persisted).expect("persisted inside the sandbox");
         assert_eq!(
             pinned.trim(),
-            fs::canonicalize(sandbox.entity_root())
+            fs::canonicalize(sandbox.pulse_root())
                 .unwrap()
                 .to_string_lossy()
         );
@@ -1190,7 +1199,7 @@ mod tests {
     #[test]
     fn init_is_idempotent() {
         let sandbox = Sandbox::new();
-        let root = sandbox.entity_root();
+        let root = sandbox.pulse_root();
         sandbox.init("skip\n").unwrap();
         fs::write(root.join("memory/MEMORY.md"), "custom content").unwrap();
 
@@ -1320,20 +1329,20 @@ mod tests {
     }
 
     #[test]
-    fn hooks_carry_the_entity_root() {
+    fn hooks_carry_the_pulse_root() {
         let mut settings = serde_json::json!({});
         let (changed, skipped) = upsert(&mut settings, "/home/d/.wiseferry");
         assert!(changed);
         assert!(skipped.is_empty());
 
         let text = settings.to_string();
-        assert!(text.contains("archive-session --entity-root '/home/d/.wiseferry'"));
-        assert!(text.contains("checkpoint --trigger precompact --entity-root '/home/d/.wiseferry'"));
+        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
+        assert!(text.contains("checkpoint --trigger precompact --pulse-root '/home/d/.wiseferry'"));
         assert!(text.contains("consume '/home/d/.wiseferry'"));
     }
 
     /// The pre-4.2 bare hook is exactly what left capture broken outside the
-    /// entity root. A re-run of `init` must repair it, not declare it present.
+    /// pulse root. A re-run of `init` must repair it, not declare it present.
     #[test]
     fn a_legacy_bare_hook_is_rewritten_not_skipped() {
         let mut settings = serde_json::json!({
@@ -1358,11 +1367,74 @@ mod tests {
         assert!(notes.iter().all(|n| n.contains("updated")), "{notes:?}");
 
         let text = settings.to_string();
-        assert!(text.contains("archive-session --entity-root '/home/d/.wiseferry'"));
+        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
         // Rewritten in place, not duplicated alongside the bare form.
         assert_eq!(text.matches("archive-session").count(), 1);
         assert_eq!(text.matches("checkpoint").count(), 1);
         assert_eq!(text.matches("consume").count(), 1);
+    }
+
+    /// The canonical 4.2–4.5 hooks spell the root flag `--entity-root`.
+    /// Re-running `init` renames it in place, and a second run finds nothing
+    /// left to do.
+    #[test]
+    fn a_pre_4_6_entity_root_hook_is_rewritten_to_pulse_root() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup|resume",
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume '/home/d/.wiseferry'"}]
+                }],
+                "SessionEnd": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --entity-root '/home/d/.wiseferry'"}]
+                }],
+                "PreCompact": [{
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact --entity-root '/home/d/.wiseferry'"}]
+                }]
+            }
+        });
+        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(changed);
+        assert_eq!(
+            notes.len(),
+            2,
+            "consume takes the root positionally: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.contains("renamed --entity-root to --pulse-root")),
+            "{notes:?}"
+        );
+
+        let text = settings.to_string();
+        assert!(!text.contains("--entity-root"), "{text}");
+        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
+        assert!(text.contains("checkpoint --trigger precompact --pulse-root '/home/d/.wiseferry'"));
+        assert_eq!(text.matches("archive-session").count(), 1);
+        assert_eq!(text.matches("checkpoint").count(), 1);
+
+        let after_first = settings.clone();
+        let (changed_again, notes_again) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(!changed_again, "{notes_again:?}");
+        assert_eq!(settings, after_first);
+    }
+
+    /// A guarded hook still spelling `--entity-root` is the user's; it keeps
+    /// working through the flag alias, and is reported rather than rewritten.
+    #[test]
+    fn a_guarded_entity_root_hook_is_left_to_the_alias() {
+        let guarded =
+            "/usr/local/bin/recall-echo archive-session --entity-root '/home/d/pulse' || true";
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{"hooks": [{"type": "command", "command": guarded}]}]
+            }
+        });
+        let (_, notes) = upsert(&mut settings, "/home/d/pulse");
+        assert!(settings.to_string().contains(guarded));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("left a customized"), "{notes:?}");
     }
 
     #[test]
@@ -1389,7 +1461,7 @@ mod tests {
 
         let text = settings.to_string();
         assert!(text.contains("notify-send done"));
-        assert!(text.contains("archive-session --entity-root '/home/d/.wiseferry'"));
+        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
     }
 
     /// A recall-echo hook the user wrapped or guarded — the `|| true`
@@ -1436,7 +1508,7 @@ mod tests {
             // None of these roots contain characters JSON escapes, so a
             // plain substring check sees exactly what the shell will.
             assert!(
-                text.contains(&format!("--entity-root {quoted}")),
+                text.contains(&format!("--pulse-root {quoted}")),
                 "{root}: {text}"
             );
         }
@@ -1475,7 +1547,7 @@ mod tests {
         );
 
         let expected =
-            "/usr/local/bin/recall-echo archive-session --entity-root '/home/d/.wiseferry'";
+            "/usr/local/bin/recall-echo archive-session --pulse-root '/home/d/.wiseferry'";
         let text = settings.to_string();
         assert_eq!(text.matches(expected).count(), 1, "{text}");
         assert_eq!(text.matches("archive-session").count(), 1, "{text}");
@@ -1513,7 +1585,7 @@ mod tests {
         let mut settings = serde_json::json!({
             "hooks": {
                 "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --entity-root '/tmp/a;b'"}]
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --pulse-root '/tmp/a;b'"}]
                 }]
             }
         });
@@ -1521,10 +1593,7 @@ mod tests {
         assert!(changed, "{notes:?}");
 
         let text = settings.to_string();
-        assert!(
-            text.contains("--entity-root '/home/d/.wiseferry'"),
-            "{text}"
-        );
+        assert!(text.contains("--pulse-root '/home/d/.wiseferry'"), "{text}");
         assert!(!text.contains("/tmp/a;b"), "{text}");
     }
 
@@ -1533,7 +1602,7 @@ mod tests {
     fn hooks_are_skipped_when_claude_code_is_absent() {
         let sandbox = Sandbox::new();
         let roots = sandbox.roots.clone().without_claude_code();
-        assert!(!configure_hooks(&roots, &sandbox.entity_root()));
+        assert!(!configure_hooks(&roots, &sandbox.pulse_root()));
         assert!(!sandbox.dir.path().join(".claude/settings.json").exists());
     }
 
@@ -1553,10 +1622,10 @@ mod tests {
 
         // The flow really did run and really did write — otherwise this test
         // would pass on a no-op.
-        assert!(sandbox.entity_root().join("memory/MEMORY.md").exists());
+        assert!(sandbox.pulse_root().join("memory/MEMORY.md").exists());
         assert!(sandbox
             .roots
-            .entity_root_file()
+            .pulse_root_file()
             .is_some_and(std::path::Path::exists));
         let hooks = fs::read_to_string(sandbox.roots.claude_dir().unwrap().join("settings.json"))
             .expect("hooks landed in the sandbox");
@@ -1570,7 +1639,7 @@ mod tests {
         before.assert_unchanged();
     }
 
-    /// The three files a real user's setup lives in, as digests.
+    /// The files a real user's setup lives in, as digests.
     ///
     /// Never their contents: this runs on a developer's machine, and a failure
     /// message that dumps `~/.claude.json` would publish every project path and
@@ -1590,7 +1659,8 @@ mod tests {
                 entries: vec![
                     Digest::take(real_settings_file(), Strictness::Exact),
                     Digest::take(real_claude_json(), Strictness::WhenUntouched),
-                    Digest::take(real_entity_root_file(), Strictness::Exact),
+                    Digest::take(real_pointer_file("pulse-root"), Strictness::Exact),
+                    Digest::take(real_pointer_file("entity-root"), Strictness::Exact),
                 ],
                 hook_commands: recall_hook_commands(&real_settings_file()),
                 mcp_servers: mcp_server_names(&real_claude_json()),
@@ -1623,12 +1693,13 @@ mod tests {
         real_home().join(".claude.json")
     }
 
-    fn real_entity_root_file() -> PathBuf {
+    /// The persisted pointer — `pulse-root`, or the pre-4.6.0 `entity-root`.
+    fn real_pointer_file(name: &str) -> PathBuf {
         let base = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
             _ => real_home().join(".config"),
         };
-        base.join("recall-echo").join("entity-root")
+        base.join("recall-echo").join(name)
     }
 
     fn real_home() -> PathBuf {
@@ -1754,7 +1825,7 @@ mod tests {
     fn archive_template_has_header() {
         let sandbox = Sandbox::new();
         sandbox.init("skip\n").unwrap();
-        let content = fs::read_to_string(sandbox.entity_root().join("memory/ARCHIVE.md")).unwrap();
+        let content = fs::read_to_string(sandbox.pulse_root().join("memory/ARCHIVE.md")).unwrap();
         assert!(content.contains("# Conversation Archive"));
         assert!(content.contains("| # | Date"));
     }
@@ -1765,7 +1836,7 @@ mod tests {
 ///
 /// [`run_with_reader`] and [`run`] build [`paths::ConfigRoots::from_env`], and
 /// that is the whole of #59 — a test calling either rewrites the developer's
-/// hooks and global entity-root pointer. Tests take `run_with` and a sandbox.
+/// hooks and global pulse-root pointer. Tests take `run_with` and a sandbox.
 /// Reading `from_env` to assert production resolution is allowed on a line
 /// marked `sanctioned:`.
 #[cfg(test)]

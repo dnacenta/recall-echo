@@ -34,7 +34,7 @@ fn use_test_binary() {
 
 struct Fixture {
     _dir: TempDir,
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
     memory_dir: PathBuf,
     socket: PathBuf,
 }
@@ -49,8 +49,8 @@ impl Fixture {
         use_test_binary();
 
         let dir = TempDir::new().expect("temp dir");
-        let entity_root = dir.path().join("e");
-        let memory_dir = entity_root.join("memory");
+        let pulse_root = dir.path().join("e");
+        let memory_dir = pulse_root.join("memory");
         std::fs::create_dir_all(memory_dir.join("graph")).expect("memory dir");
 
         let socket = dir.path().join("g.sock");
@@ -65,7 +65,7 @@ impl Fixture {
 
         Self {
             _dir: dir,
-            entity_root,
+            pulse_root,
             memory_dir,
             socket,
         }
@@ -86,12 +86,12 @@ impl Fixture {
             .expect("daemon stops when asked");
     }
 
-    /// Run `recall-echo graph <args>` against this fixture's entity root.
+    /// Run `recall-echo graph <args>` against this fixture's pulse root.
     fn graph_cli(&self, args: &[&str]) -> std::process::Child {
         std::process::Command::new(env!("CARGO_BIN_EXE_recall-echo"))
             .arg("graph")
-            .arg("--entity-root")
-            .arg(&self.entity_root)
+            .arg("--pulse-root")
+            .arg(&self.pulse_root)
             .args(args)
             .env(
                 serve_client::DAEMON_BIN_ENV,

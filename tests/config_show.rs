@@ -15,10 +15,14 @@ use std::process::Command;
 use tempfile::TempDir;
 
 /// `config show` writes to stderr; stdout stays free for piping.
-fn config_show(entity_root: &std::path::Path) -> String {
+fn config_show(pulse_root: &std::path::Path) -> String {
+    config_show_with("--pulse-root", pulse_root)
+}
+
+fn config_show_with(flag: &str, pulse_root: &std::path::Path) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_recall-echo"))
-        .args(["config", "--entity-root"])
-        .arg(entity_root)
+        .args(["config", flag])
+        .arg(pulse_root)
         .arg("show")
         .output()
         .expect("run config show");
@@ -26,7 +30,7 @@ fn config_show(entity_root: &std::path::Path) -> String {
     String::from_utf8(output.stderr).expect("utf-8 output")
 }
 
-fn entity_root(config: &str) -> TempDir {
+fn pulse_root(config: &str) -> TempDir {
     let dir = TempDir::new().expect("temp dir");
     let memory_dir = dir.path().join("memory");
     std::fs::create_dir_all(&memory_dir).expect("memory dir");
@@ -38,7 +42,7 @@ fn entity_root(config: &str) -> TempDir {
 
 #[test]
 fn every_section_is_shown_even_at_its_defaults() {
-    let dir = entity_root("");
+    let dir = pulse_root("");
     let shown = config_show(dir.path());
 
     for section in [
@@ -57,7 +61,7 @@ fn every_section_is_shown_even_at_its_defaults() {
 
 #[test]
 fn capture_says_what_it_sweeps_and_how_long_it_waits() {
-    let dir = entity_root("");
+    let dir = pulse_root("");
     let shown = config_show(dir.path());
 
     assert!(shown.contains("enabled     = true"), "{shown}");
@@ -70,14 +74,14 @@ fn capture_says_what_it_sweeps_and_how_long_it_waits() {
 
 #[test]
 fn configured_capture_sources_are_listed_by_name() {
-    let dir = entity_root("[capture]\nsources = [\"codex\", \"grok\"]\n");
+    let dir = pulse_root("[capture]\nsources = [\"codex\", \"grok\"]\n");
     let shown = config_show(dir.path());
     assert!(shown.contains("sources     = codex, grok"), "{shown}");
 }
 
 #[test]
 fn extraction_shows_what_the_daemon_will_do_on_its_own() {
-    let dir = entity_root("");
+    let dir = pulse_root("");
     let shown = config_show(dir.path());
 
     assert!(shown.contains("background_enabled = true"), "{shown}");
@@ -87,7 +91,7 @@ fn extraction_shows_what_the_daemon_will_do_on_its_own() {
 
 #[test]
 fn serve_shows_where_the_daemon_listens_and_how_long_it_lives() {
-    let dir = entity_root("");
+    let dir = pulse_root("");
     let shown = config_show(dir.path());
 
     assert!(
@@ -99,7 +103,7 @@ fn serve_shows_where_the_daemon_listens_and_how_long_it_lives() {
 
 #[test]
 fn a_daemon_that_never_shuts_down_says_so_rather_than_printing_zero() {
-    let dir = entity_root("[serve]\nsocket_path = \"/tmp/re.sock\"\nidle_timeout_secs = 0\n");
+    let dir = pulse_root("[serve]\nsocket_path = \"/tmp/re.sock\"\nidle_timeout_secs = 0\n");
     let shown = config_show(dir.path());
 
     assert!(
@@ -107,4 +111,14 @@ fn a_daemon_that_never_shuts_down_says_so_rather_than_printing_zero() {
         "{shown}"
     );
     assert!(shown.contains("never idle-shuts-down"), "{shown}");
+}
+
+/// The pre-4.6.0 flag reads the same store as the new one.
+#[test]
+fn the_legacy_entity_root_flag_reads_the_same_store() {
+    let dir = pulse_root("[capture]\nsources = [\"codex\"]\n");
+    assert_eq!(
+        config_show_with("--entity-root", dir.path()),
+        config_show(dir.path())
+    );
 }

@@ -199,14 +199,14 @@ fn normalize_date_time_parses_locomo_strings() {
 #[tokio::test(flavor = "current_thread")]
 async fn ingest_writes_archives_with_session_dates() {
     let tmp = tempfile::tempdir().unwrap();
-    let entity_root = tmp.path();
+    let pulse_root = tmp.path();
     let conv = sample_conversation();
 
-    let stats = ingest_conversation(entity_root, &conv, None).await.unwrap();
+    let stats = ingest_conversation(pulse_root, &conv, None).await.unwrap();
     assert_eq!(stats.sessions_written, 2);
     assert_eq!(stats.log_numbers, vec![1, 2]);
 
-    let conversations = entity_root.join("memory/conversations");
+    let conversations = pulse_root.join("memory/conversations");
     assert!(conversations.join("conversation-001.md").exists());
     assert!(conversations.join("conversation-002.md").exists());
 
@@ -228,14 +228,14 @@ async fn ingest_writes_archives_with_session_dates() {
 #[tokio::test(flavor = "current_thread")]
 async fn answer_calls_llm_with_question_in_prompt() {
     let tmp = tempfile::tempdir().unwrap();
-    let entity_root = tmp.path();
-    setup_empty_entity(entity_root).unwrap();
+    let pulse_root = tmp.path();
+    setup_empty_pulse(pulse_root).unwrap();
 
     let provider = TestLlmProvider::new("Biscuit");
     let opts = AnswerOpts::default();
 
     let answer = answer_with_provider(
-        entity_root,
+        pulse_root,
         "What is Caroline's dog's name?",
         &opts,
         &provider,
@@ -259,8 +259,8 @@ async fn answer_calls_llm_with_question_in_prompt() {
     assert!(user.contains("## Recent episodes"));
 }
 
-fn setup_empty_entity(entity_root: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(entity_root.join("memory/conversations"))?;
-    fs::write(entity_root.join("memory/MEMORY.md"), "")?;
+fn setup_empty_pulse(pulse_root: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(pulse_root.join("memory/conversations"))?;
+    fs::write(pulse_root.join("memory/MEMORY.md"), "")?;
     Ok(())
 }

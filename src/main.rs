@@ -25,15 +25,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize the memory system for an entity
+    /// Initialize the memory system for a pulse
     Init {
-        /// Entity root directory (defaults to ~/.claude when Claude Code is installed, else the current directory)
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to ~/.claude when Claude Code is installed, else the current directory)
+        pulse_root: Option<PathBuf>,
     },
     /// Memory system health check
     Status {
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        pulse_root: Option<PathBuf>,
     },
     /// Search conversation archives
     Search {
@@ -51,24 +51,24 @@ enum Commands {
     },
     /// Analyze MEMORY.md and suggest distillation
     Distill {
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        pulse_root: Option<PathBuf>,
     },
     /// Output EPHEMERAL.md content
     Consume {
-        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
+        pulse_root: Option<PathBuf>,
     },
     /// Memory dashboard with health, stats, and recent sessions
     Dashboard {
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        pulse_root: Option<PathBuf>,
     },
     /// Archive a Claude Code session from JSONL transcript (SessionEnd hook)
     ArchiveSession {
-        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
-        #[arg(long)]
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// Archive JSONL transcripts
     Archive {
@@ -93,21 +93,21 @@ enum Commands {
         /// Trigger source (e.g., "precompact")
         #[arg(long)]
         trigger: String,
-        /// Entity root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
-        #[arg(long)]
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, the root `init` persisted, then ~/.claude)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// View or modify configuration
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        #[arg(long)]
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// Run the graph daemon (started automatically by graph commands and hooks)
     Serve {
-        /// Memory directory to serve (defaults to {entity_root}/memory)
+        /// Memory directory to serve (defaults to {pulse_root}/memory)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Stay in the foreground: log to stderr and never idle-shut-down
@@ -117,9 +117,9 @@ enum Commands {
     },
     /// Run the MCP server (stdio) so an agent can query its own memory
     Mcp {
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        #[arg(long)]
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// Show what memory holds — everything, or one subject
     WhatDoYouKnow {
@@ -129,17 +129,17 @@ enum Commands {
         /// Entities listed per type (or results, with --about)
         #[arg(long, default_value = "3")]
         limit: usize,
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        #[arg(long)]
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// Knowledge graph operations
     Graph {
         #[command(subcommand)]
         command: GraphCommands,
-        /// Entity root directory (defaults to the initialised cwd, else the root `init` persisted)
-        #[arg(long)]
-        entity_root: Option<PathBuf>,
+        /// Pulse root directory (defaults to the initialised cwd, else the root `init` persisted)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// LoCoMo benchmark harness (ingest a conversation, answer a question)
     #[cfg(feature = "bench")]
@@ -167,9 +167,9 @@ enum Commands {
 enum BenchCommands {
     /// Ingest a single LoCoMo conversation JSON
     Ingest {
-        /// Entity root directory
-        #[arg(long)]
-        entity_root: PathBuf,
+        /// Pulse root directory
+        #[arg(long, alias = "entity-root")]
+        pulse_root: PathBuf,
         /// Path to a JSON file containing a BenchConversation; omit to read stdin
         #[arg(long)]
         conv_json: Option<PathBuf>,
@@ -183,11 +183,11 @@ enum BenchCommands {
         #[arg(long)]
         no_llm: bool,
     },
-    /// Answer a question against an already-ingested entity
+    /// Answer a question against an already-ingested pulse root
     Answer {
-        /// Entity root directory
-        #[arg(long)]
-        entity_root: PathBuf,
+        /// Pulse root directory
+        #[arg(long, alias = "entity-root")]
+        pulse_root: PathBuf,
         /// The question to answer (use `--question-stdin` to read from stdin instead)
         #[arg(long)]
         question: Option<String>,
@@ -414,10 +414,10 @@ enum GraphCommands {
     },
     /// Sync vigil-pulse signals and outcomes into the graph
     VigilSync {
-        /// Path to signals.json (defaults to {entity_root}/vigil/signals.json)
+        /// Path to signals.json (defaults to {pulse_root}/vigil/signals.json)
         #[arg(long)]
         signals_path: Option<PathBuf>,
-        /// Path to outcomes.json (defaults to {entity_root}/caliber/outcomes.json)
+        /// Path to outcomes.json (defaults to {pulse_root}/caliber/outcomes.json)
         #[arg(long)]
         outcomes_path: Option<PathBuf>,
     },
@@ -502,14 +502,14 @@ fn main() {
 
     let result = match cli.command {
         None => status::run(),
-        Some(Commands::Init { entity_root }) => {
-            let root = resolve_init_root(entity_root);
+        Some(Commands::Init { pulse_root }) => {
+            let root = resolve_init_root(pulse_root);
             init::run(&root)
         }
         Some(Commands::Status {
-            entity_root: Some(root),
+            pulse_root: Some(root),
         }) => status::run_with_base(&root),
-        Some(Commands::Status { entity_root: None }) => status::run(),
+        Some(Commands::Status { pulse_root: None }) => status::run(),
         Some(Commands::Search {
             query,
             ranked,
@@ -522,27 +522,27 @@ fn main() {
                 search::run(&query, context)
             }
         }
-        Some(Commands::Distill { entity_root }) => {
-            let root = resolve_entity_root(entity_root);
+        Some(Commands::Distill { pulse_root }) => {
+            let root = resolve_pulse_root(pulse_root);
             distill::run_with_base(&root)
         }
-        Some(Commands::Consume { entity_root }) => {
+        Some(Commands::Consume { pulse_root }) => {
             // Same layout resolution as archive-session and checkpoint: the
             // file consume reads must be the file the SessionEnd hook wrote,
-            // on both the entity layout and a claude-style root.
-            paths::resolved_hook_base_dir(entity_root.as_deref())
+            // on both the pulse layout and a claude-style root.
+            paths::resolved_hook_base_dir(pulse_root.as_deref())
                 .and_then(|base| recall_echo::consume::run(&base.join("EPHEMERAL.md")))
         }
-        Some(Commands::Dashboard { entity_root }) => {
-            let root = resolve_entity_root(entity_root);
+        Some(Commands::Dashboard { pulse_root }) => {
+            let root = resolve_pulse_root(pulse_root);
             let recall = RecallEcho::new(root);
             let version = env!("CARGO_PKG_VERSION");
             dashboard::render(&recall, "echo", version, 200);
             Ok(())
         }
         // JSONL commands (ported from recall-claude)
-        Some(Commands::ArchiveSession { entity_root }) => {
-            archive::run_from_hook(entity_root.as_deref())
+        Some(Commands::ArchiveSession { pulse_root }) => {
+            archive::run_from_hook(pulse_root.as_deref())
         }
         Some(Commands::Archive { all_unarchived }) => {
             if all_unarchived {
@@ -554,13 +554,13 @@ fn main() {
         Some(Commands::Ingest { from, all, dir }) => run_ingest(&from, all, dir),
         Some(Commands::Checkpoint {
             trigger,
-            entity_root,
-        }) => checkpoint::run_from_hook(&trigger, entity_root.as_deref()),
+            pulse_root,
+        }) => checkpoint::run_from_hook(&trigger, pulse_root.as_deref()),
         Some(Commands::Config {
             command,
-            entity_root,
+            pulse_root,
         }) => {
-            let root = resolve_entity_root(entity_root);
+            let root = resolve_pulse_root(pulse_root);
             let memory_dir = root.join("memory");
             match command {
                 ConfigCommands::Show => config_cli::show(&memory_dir),
@@ -589,11 +589,11 @@ fn main() {
                 }
             }),
         Some(Commands::Serve { dir, foreground }) => {
-            let memory_dir = dir.unwrap_or_else(|| resolve_entity_root(None).join("memory"));
+            let memory_dir = dir.unwrap_or_else(|| resolve_pulse_root(None).join("memory"));
             run_serve(&memory_dir, foreground)
         }
-        Some(Commands::Mcp { entity_root }) => {
-            let memory_dir = resolve_entity_root(entity_root).join("memory");
+        Some(Commands::Mcp { pulse_root }) => {
+            let memory_dir = resolve_pulse_root(pulse_root).join("memory");
             client_runtime()
                 .map_err(recall_echo::error::RecallError::from)
                 .and_then(|rt| rt.block_on(recall_echo::mcp::run(&memory_dir)))
@@ -601,9 +601,9 @@ fn main() {
         Some(Commands::WhatDoYouKnow {
             about,
             limit,
-            entity_root,
+            pulse_root,
         }) => {
-            let memory_dir = resolve_entity_root(entity_root).join("memory");
+            let memory_dir = resolve_pulse_root(pulse_root).join("memory");
             client_runtime()
                 .map_err(recall_echo::error::RecallError::from)
                 .and_then(|rt| {
@@ -616,9 +616,9 @@ fn main() {
         }
         Some(Commands::Graph {
             command,
-            entity_root,
+            pulse_root,
         }) => {
-            let root = resolve_entity_root(entity_root);
+            let root = resolve_pulse_root(pulse_root);
             let memory_dir = root.join("memory");
             client_runtime()
                 .map_err(recall_echo::error::RecallError::from)
@@ -903,8 +903,8 @@ fn capture_memory_dir() -> Result<PathBuf, recall_echo::error::RecallError> {
     paths::resolved_hook_base_dir(None)
 }
 
-fn resolve_entity_root(explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(|| paths::entity_root().unwrap_or_else(|_| PathBuf::from(".")))
+fn resolve_pulse_root(explicit: Option<PathBuf>) -> PathBuf {
+    explicit.unwrap_or_else(|| paths::pulse_root().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// The provenance override a `--external` flag asks for. Without the flag the
@@ -922,7 +922,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
 
     match command {
         BenchCommands::Ingest {
-            entity_root,
+            pulse_root,
             conv_json,
             provider,
             model,
@@ -932,7 +932,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             let conv: BenchConversation = serde_json::from_str(&raw)?;
 
             rt.block_on(async {
-                let memory_dir = entity_root.join("memory");
+                let memory_dir = pulse_root.join("memory");
                 let llm_pair = if no_llm {
                     None
                 } else {
@@ -946,13 +946,13 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                     .as_ref()
                     .map(|(p, _)| p.as_ref() as &dyn recall_echo::graph::llm::LlmProvider);
 
-                let stats = ingest_conversation(&entity_root, &conv, llm_ref).await?;
+                let stats = ingest_conversation(&pulse_root, &conv, llm_ref).await?;
                 println!("{}", serde_json::to_string(&stats)?);
                 Ok::<_, recall_echo::error::RecallError>(())
             })
         }
         BenchCommands::Answer {
-            entity_root,
+            pulse_root,
             question,
             question_stdin,
             provider,
@@ -992,7 +992,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             };
 
             rt.block_on(async {
-                let answer = answer_question(&entity_root, &question_text, opts).await?;
+                let answer = answer_question(&pulse_root, &question_text, opts).await?;
                 println!("{}", serde_json::to_string(&answer)?);
                 Ok::<_, recall_echo::error::RecallError>(())
             })
@@ -1025,7 +1025,7 @@ fn read_stdin_to_string() -> Result<String, recall_echo::error::RecallError> {
     Ok(buf.trim().to_string())
 }
 
-/// Resolve entity root for init, preferring Claude Code directory.
+/// Resolve pulse root for init, preferring Claude Code directory.
 fn resolve_init_root(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(p) = explicit {
         return p;
@@ -1040,4 +1040,83 @@ fn resolve_init_root(explicit: Option<PathBuf>) -> PathBuf {
     }
     // Fall back to cwd
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every subcommand that takes the root as a flag, split around where the
+    /// flag goes: `(before, after)`.
+    const FLAGGED: [(&[&str], &[&str]); 6] = [
+        (&["archive-session"], &[]),
+        (&["checkpoint", "--trigger", "precompact"], &[]),
+        (&["config"], &["show"]),
+        (&["mcp"], &[]),
+        (&["what-do-you-know"], &[]),
+        (&["graph"], &["status"]),
+    ];
+
+    fn parse_root(flag: &str, before: &[&str], after: &[&str]) -> Option<PathBuf> {
+        let argv = std::iter::once("recall-echo")
+            .chain(before.iter().copied())
+            .chain([flag, "/srv/pulse"])
+            .chain(after.iter().copied());
+        let cli =
+            Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{flag} with {before:?}: {err}"));
+        match cli.command.expect("a subcommand") {
+            Commands::ArchiveSession { pulse_root }
+            | Commands::Checkpoint { pulse_root, .. }
+            | Commands::Config { pulse_root, .. }
+            | Commands::Mcp { pulse_root }
+            | Commands::WhatDoYouKnow { pulse_root, .. }
+            | Commands::Graph { pulse_root, .. } => pulse_root,
+            _ => panic!("{before:?} is not a command with a root flag"),
+        }
+    }
+
+    #[test]
+    fn every_root_flag_is_spelled_pulse_root() {
+        for (before, after) in FLAGGED {
+            assert_eq!(
+                parse_root("--pulse-root", before, after),
+                Some(PathBuf::from("/srv/pulse")),
+                "{before:?}"
+            );
+        }
+    }
+
+    /// Hooks and MCP registrations written before 4.6.0 carry `--entity-root`
+    /// and must keep parsing to the same root.
+    #[test]
+    fn the_pre_4_6_entity_root_flag_still_parses() {
+        for (before, after) in FLAGGED {
+            assert_eq!(
+                parse_root("--entity-root", before, after),
+                Some(PathBuf::from("/srv/pulse")),
+                "{before:?}"
+            );
+        }
+    }
+
+    /// The old spelling is accepted, not advertised.
+    #[test]
+    fn help_shows_pulse_root_and_hides_entity_root() {
+        let mut cli = Cli::command();
+        for name in ["archive-session", "checkpoint", "config", "mcp", "graph"] {
+            let help = cli
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("{name} subcommand"))
+                .render_long_help()
+                .to_string();
+            assert!(help.contains("--pulse-root"), "{name}: {help}");
+            assert!(!help.contains("entity-root"), "{name}: {help}");
+        }
+    }
+
+    #[test]
+    fn the_command_line_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
 }

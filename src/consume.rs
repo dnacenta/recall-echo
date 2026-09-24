@@ -5,7 +5,7 @@
 //! EPHEMERAL.md consumption — reads recent session context.
 //!
 //! Returns EPHEMERAL.md content as a String for injection into
-//! the entity's context. Does not clear the file (archival handles that).
+//! the agent's context. Does not clear the file (archival handles that).
 
 use std::fs;
 use std::path::Path;

@@ -12,7 +12,7 @@ use crate::theme::{BOLD, DIM, RESET, WARN};
 
 /// Analyze MEMORY.md and suggest distillation actions.
 pub fn run() -> Result<(), RecallError> {
-    let base = paths::entity_root()?;
+    let base = paths::pulse_root()?;
     run_with_base(&base)
 }
 

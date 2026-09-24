@@ -17,13 +17,13 @@ use crate::paths;
 use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
 
 pub fn run() -> Result<(), RecallError> {
-    let (root, source) = paths::entity_root_described()?;
+    let (root, source) = paths::pulse_root_described()?;
     eprintln!("{DIM}root {} — {source}{RESET}", root.display());
     run_with_base(&root)
 }
 
-pub fn run_with_base(entity_root: &Path) -> Result<(), RecallError> {
-    let memory = entity_root.join("memory");
+pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
+    let memory = pulse_root.join("memory");
     if !memory.exists() {
         return Err(RecallError::NotInitialized(
             "memory/ directory not found. Run `recall-echo init` first.".into(),

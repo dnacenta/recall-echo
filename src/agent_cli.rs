@@ -39,10 +39,10 @@
 //! `HOME` and reading back the config it wrote:
 //!
 //! ```text
-//! claude mcp add recall-echo -s user -- <exe> mcp --entity-root <root>
-//! gemini mcp add -s user recall-echo  <exe> mcp --entity-root <root>
-//! grok   mcp add recall-echo -s user -- <exe> mcp --entity-root <root>
-//! codex  mcp add recall-echo          -- <exe> mcp --entity-root <root>
+//! claude mcp add recall-echo -s user -- <exe> mcp --pulse-root <root>
+//! gemini mcp add -s user recall-echo  <exe> mcp --pulse-root <root>
+//! grok   mcp add recall-echo -s user -- <exe> mcp --pulse-root <root>
+//! codex  mcp add recall-echo          -- <exe> mcp --pulse-root <root>
 //! ```
 //!
 //! Gemini takes the server name *after* its flags and rejects a `--` separator;
@@ -185,12 +185,12 @@ impl AgentCli {
     /// The full `mcp add` argv registering recall-echo's MCP server with this
     /// client. See the module docs for why all four differ.
     #[must_use]
-    pub fn mcp_add_argv(self, exe: &str, entity_root: &Path) -> Vec<String> {
+    pub fn mcp_add_argv(self, exe: &str, pulse_root: &Path) -> Vec<String> {
         let server = vec![
             exe.to_string(),
             "mcp".to_string(),
-            "--entity-root".to_string(),
-            entity_root.display().to_string(),
+            "--pulse-root".to_string(),
+            pulse_root.display().to_string(),
         ];
         let mut argv = vec![self.command(), "mcp".into(), "add".into()];
         match self {
@@ -316,10 +316,10 @@ pub struct McpReport {
 pub async fn register_mcp(
     cli: AgentCli,
     exe: &str,
-    entity_root: &Path,
+    pulse_root: &Path,
     roots: &ConfigRoots,
 ) -> McpReport {
-    let argv = cli.mcp_add_argv(exe, entity_root);
+    let argv = cli.mcp_add_argv(exe, pulse_root);
     let command = shell_line(&argv);
     let Some((binary, args)) = argv.split_first() else {
         return McpReport {
@@ -520,7 +520,7 @@ mod tests {
                 "--",
                 "/usr/local/bin/recall-echo",
                 "mcp",
-                "--entity-root",
+                "--pulse-root",
                 "/home/d/entity",
             ]
         );
@@ -542,7 +542,7 @@ mod tests {
                 "recall-echo",
                 "/usr/local/bin/recall-echo",
                 "mcp",
-                "--entity-root",
+                "--pulse-root",
                 "/home/d/entity",
             ]
         );
@@ -570,7 +570,7 @@ mod tests {
                 "--",
                 "/usr/local/bin/recall-echo",
                 "mcp",
-                "--entity-root",
+                "--pulse-root",
                 "/home/d/entity",
             ]
         );
@@ -588,7 +588,7 @@ mod tests {
                 [
                     "/usr/local/bin/recall-echo",
                     "mcp",
-                    "--entity-root",
+                    "--pulse-root",
                     "/home/d/entity"
                 ],
                 "{cli}"
