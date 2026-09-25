@@ -1,0 +1,34 @@
+```json
+{
+  "entities": [
+    {
+      "name": "Synth",
+      "type": "person",
+      "abstract": "The pulse running this session, reflecting on its own stuck threads.",
+      "overview": null,
+      "content": null,
+      "attributes": {}
+    },
+    {
+      "name": "Disk meter",
+      "type": "thread",
+      "abstract": "A watch thread on disk usage that stopped teaching anything new.",
+      "overview": null,
+      "content": null,
+      "attributes": {}
+    }
+  ],
+  "relationships": [
+    {
+      "source": "Synth",
+      "target": "Disk meter",
+      "rel_type": "RELATES_TO",
+      "description": "Synth kept the thread open across sessions.",
+      "confidence": "explicit"
+    }
+  ],
+  "cases": [],
+  "patterns": [],
+  "preferences": []
+}
+```

@@ -69,6 +69,22 @@ pub async fn get_entity_by_name(
     deserialize_take_opt(&mut response, 0)
 }
 
+/// Get an entity whose name matches `name` ignoring case.
+///
+/// Not indexed — it scans the entity table — so it is only for names an
+/// exact lookup already missed.
+pub async fn get_entity_by_name_ignoring_case(
+    db: &Surreal<Db>,
+    name: &str,
+) -> Result<Option<Entity>, GraphError> {
+    let mut response = db
+        .query("SELECT * FROM entity WHERE string::lowercase(name) = $name LIMIT 1")
+        .bind(("name", name.trim().to_lowercase()))
+        .await?;
+
+    deserialize_take_opt(&mut response, 0)
+}
+
 /// Get an entity by its record ID string (e.g. "entity:abc123").
 pub async fn get_entity_by_id(db: &Surreal<Db>, id: &str) -> Result<Option<Entity>, GraphError> {
     let mut response = db

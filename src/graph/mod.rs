@@ -7,6 +7,7 @@
 //! Provides a structured graph layer (Layer 0) underneath flat-file memory systems.
 //! Used by recall-echo (pulse-null pulses) and recall-claude (Claude Code users).
 
+pub mod aliases;
 pub mod confidence;
 pub mod correct;
 pub mod crud;
@@ -19,6 +20,7 @@ pub mod gc;
 pub mod ingest;
 pub mod inspect;
 pub mod llm;
+pub mod llm_json;
 pub mod pipeline;
 pub mod pipeline_sync;
 pub mod query;
@@ -255,6 +257,12 @@ impl GraphMemory {
     /// Get an entity by name.
     pub async fn get_entity(&self, name: &str) -> Result<Option<Entity>, GraphError> {
         crud::get_entity_by_name(&self.db, name).await
+    }
+
+    /// Get an entity by name, ignoring case. A table scan: for names an exact
+    /// [`GraphMemory::get_entity`] already missed.
+    pub async fn get_entity_ignoring_case(&self, name: &str) -> Result<Option<Entity>, GraphError> {
+        crud::get_entity_by_name_ignoring_case(&self.db, name).await
     }
 
     /// Get an entity by its record ID.
