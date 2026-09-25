@@ -3663,9 +3663,9 @@ dependencies = [
 
 [[package]]
 name = "pulse-system-types"
-version = "0.6.3"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "497484670f2bb673be80340ac2ead8f0107e19f029d1f68dcdf33643788389d0"
+checksum = "6d19dae6f34122ab0f7b7b03dc343346ff1a48811d60bf49e0e0cded609c2eae"
 dependencies = [
  "serde",
  "serde_json",

@@ -220,7 +220,7 @@ mod plugin_impl {
         config: &serde_json::Value,
         ctx: &PluginContext,
     ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
-        let pulse_root = configured_pulse_root(config).unwrap_or_else(|| ctx.entity_root.clone());
+        let pulse_root = configured_pulse_root(config).unwrap_or_else(|| ctx.pulse_root.clone());
 
         Ok(Box::new(RecallEcho::new(pulse_root)))
     }
