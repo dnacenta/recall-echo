@@ -3,6 +3,42 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [4.6.2] — Unreleased
+
+### Fixed
+
+- Extraction no longer drops a whole chunk over one bad answer. Measured on a
+  real 54-chunk archive (claude-code, sonnet): 3 of 54 first answers were
+  rejected by 4.6.1 and contributed nothing — two with `"relationships": [[]]`
+  (once followed by `.length ? null : null`), one with an entity typed
+  `artifact`. Now 54 of 54 extract.
+  - The answer is read with a real JSON parser from its first `{`: fences and
+    prose around the object are ignored, and a `}` inside a string no longer
+    ends it early.
+  - Arrays are read element by element. A malformed element costs itself;
+    `null`/`[]`/`{}` placeholders are skipped; an entity type outside the
+    schema is kept as `concept`.
+  - An unusable answer gets exactly one retry: a truncated answer is asked
+    again as two halves of the chunk, anything else is asked again whole. If
+    the retry fails too, the complete leading elements of a truncated answer
+    are salvaged (the cut is closed and re-parsed — never guessed).
+  - Warnings name the failure class (no JSON / truncated / invalid JSON /
+    unexpected shape), the parser's position and the answer's size, instead
+    of quoting its first 200 characters. A chunk recovered with loss is
+    reported as `extraction chunk N (recovered): …`.
+  - Calls that yielded nothing are billed: an archive whose every chunk
+    failed reports what those calls cost.
+- Dedup decisions wrapped in prose were rejected even when the JSON object in
+  them was valid.
+
+### Added
+
+- `graph::extract::extract_chunk`, returning `ChunkExtraction` (result,
+  usage, calls, recovery notes) or `ChunkFailure` (error, usage, calls).
+  `extract_from_chunk` keeps its signature.
+- `graph::llm_json`: `first_json_object`, `salvage_truncated`, `JsonFailure`.
+- `ExtractionResult::element_count` and `ExtractionResult::append`.
+
 ## [4.6.1] — Unreleased
 
 ### Fixed

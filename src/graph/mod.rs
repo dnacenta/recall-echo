@@ -19,6 +19,7 @@ pub mod gc;
 pub mod ingest;
 pub mod inspect;
 pub mod llm;
+pub mod llm_json;
 pub mod pipeline;
 pub mod pipeline_sync;
 pub mod query;

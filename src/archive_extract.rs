@@ -247,6 +247,33 @@ mod tests {
         }
     }
 
+    /// Answers every call with prose: nothing to extract, but every call ran.
+    struct ProseModel;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ProseModel {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            Ok("I'd be happy to help with that transcript.".into())
+        }
+    }
+
+    /// Answers the first call with invalid JSON and every later one cleanly.
+    struct GlitchOnceModel {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for GlitchOnceModel {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if call == 0 {
+                r#"{"entities": [], "relationships": [[]].length ? null : null}"#.into()
+            } else {
+                r#"{"entities": [], "relationships": []}"#.into()
+            })
+        }
+    }
+
     /// Panics if called: the assertion that nothing was spent.
     struct NoModel;
 
@@ -334,6 +361,51 @@ mod tests {
             "{err}"
         );
         assert!(graph.log_awaits_extraction(7).await.unwrap());
+    }
+
+    /// Calls that ran and yielded nothing were still paid for, and the error
+    /// says what the answers were rather than quoting them.
+    #[tokio::test]
+    async fn unusable_answers_are_billed_and_classified() {
+        let (_tmp, graph) = store_with_pending(7).await;
+
+        let err = extract_into(&graph, &ProseModel, &archive(7), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ExtractArchiveError::AllChunksFailed { first, .. } if first.contains("no JSON")),
+            "{err}"
+        );
+        assert_eq!(err.tokens_spent(), 5_000, "the call and its one retry");
+        assert!(graph.log_awaits_extraction(7).await.unwrap());
+    }
+
+    /// A chunk recovered by its retry is an extraction, with the recovery
+    /// named among the warnings.
+    #[tokio::test]
+    async fn a_recovered_chunk_is_extracted_with_a_warning() {
+        let (_tmp, graph) = store_with_pending(7).await;
+        let model = GlitchOnceModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let outcome = extract_into(&graph, &model, &archive(7), None)
+            .await
+            .unwrap();
+
+        let ExtractOutcome::Extracted(extraction) = outcome else {
+            panic!("expected an extraction, got {outcome:?}");
+        };
+        assert!(
+            extraction
+                .warnings
+                .iter()
+                .any(|w| w.contains("recovered") && w.contains("invalid JSON")),
+            "{:?}",
+            extraction.warnings
+        );
+        assert!(!graph.log_awaits_extraction(7).await.unwrap());
     }
 
     #[tokio::test]

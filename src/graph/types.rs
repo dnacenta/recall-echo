@@ -597,6 +597,27 @@ pub struct ExtractionResult {
     pub preferences: Vec<ExtractedPreference>,
 }
 
+impl ExtractionResult {
+    /// How many entries of every kind this result holds.
+    #[must_use]
+    pub fn element_count(&self) -> usize {
+        self.entities.len()
+            + self.relationships.len()
+            + self.cases.len()
+            + self.patterns.len()
+            + self.preferences.len()
+    }
+
+    /// Move every entry of `other` onto the end of this result.
+    pub fn append(&mut self, mut other: Self) {
+        self.entities.append(&mut other.entities);
+        self.relationships.append(&mut other.relationships);
+        self.cases.append(&mut other.cases);
+        self.patterns.append(&mut other.patterns);
+        self.preferences.append(&mut other.preferences);
+    }
+}
+
 /// LLM deduplication decision for a candidate entity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

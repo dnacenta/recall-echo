@@ -328,22 +328,19 @@ fn build_dedup_message(candidate: &ExtractedEntity, similar: &[&SearchResult]) -
 }
 
 /// Parse the LLM's dedup decision from JSON.
+///
+/// The decision object may sit inside a fence or between sentences; the
+/// first object in the answer is the decision.
+///
+/// # Errors
+///
+/// A parse error naming the failure class and the response length, or the
+/// decision's own problem (missing field, unknown decision).
 pub fn parse_dedup_response(text: &str) -> Result<DedupDecision, GraphError> {
-    let cleaned = strip_markdown_fencing(text);
-
-    let v: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
-        // Try extracting JSON from surrounding text
-        if let Some(json_str) = extract_json_object(&cleaned) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                return parse_decision_value(&v)
-                    .err()
-                    .unwrap_or_else(|| GraphError::Parse(e.to_string()));
-            }
-        }
-        GraphError::Parse(format!("dedup response not valid JSON: {e}"))
+    let object = first_json_object(text).map_err(|failure| {
+        GraphError::Parse(format!("dedup answer {failure} [{} bytes]", text.len()))
     })?;
-
-    parse_decision_value(&v)
+    parse_decision_value(&serde_json::Value::Object(object))
 }
 
 fn parse_decision_value(v: &serde_json::Value) -> Result<DedupDecision, GraphError> {
@@ -368,7 +365,8 @@ fn parse_decision_value(v: &serde_json::Value) -> Result<DedupDecision, GraphErr
     }
 }
 
-use super::util::{extract_json_object, merge_json_objects, strip_markdown_fencing};
+use super::llm_json::first_json_object;
+use super::util::merge_json_objects;
 
 #[cfg(test)]
 mod tests {
@@ -405,6 +403,27 @@ mod tests {
         let json = "```json\n{\"decision\": \"skip\", \"reason\": \"dup\"}\n```";
         let decision = parse_dedup_response(json).unwrap();
         assert_eq!(decision, DedupDecision::Skip);
+    }
+
+    /// A decision between sentences used to be rejected even though the
+    /// object in it was perfectly valid.
+    #[test]
+    fn a_decision_wrapped_in_prose_is_read() {
+        let text = "Comparing them: {\"decision\": \"merge\", \"target\": \"Rust\", \"reason\": \"same {thing}\"}\nHope that helps.";
+        assert_eq!(
+            parse_dedup_response(text).unwrap(),
+            DedupDecision::Merge {
+                target: "Rust".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unusable_dedup_answer_names_its_class_and_size() {
+        let err = parse_dedup_response("I think these are the same.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no JSON") && err.contains("27 bytes"), "{err}");
     }
 
     fn stored(abstract_text: &str, overview: &str, content: Option<&str>) -> Entity {

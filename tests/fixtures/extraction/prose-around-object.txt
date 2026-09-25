@@ -1,0 +1,5 @@
+Here is the extraction for this transcript chunk:
+
+{"entities":[{"name":"NeoVim","type":"tool","abstract":"The editor D uses; config keys look like {\"lazy\": true}.","overview":null,"content":null,"attributes":{}}],"relationships":[],"cases":[],"patterns":[],"preferences":[]}
+
+Let me know if you want me to extract anything else (e.g. {more detail}).

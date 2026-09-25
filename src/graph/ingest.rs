@@ -12,7 +12,7 @@ use super::confidence::{ExtractionContext, Observation, Provenance};
 use super::crud;
 use super::dedup::{self, Resolution, ResolvedEntity};
 use super::error::GraphError;
-use super::extract;
+use super::extract::{self, ChunkExtraction, ChunkFailure};
 use super::llm::{LlmProvider, TokenUsage};
 use super::types::*;
 use super::utility;
@@ -211,14 +211,10 @@ async fn extract_indexed(
     session_id: &str,
     log_number: Option<u32>,
     index: usize,
-) -> (usize, Result<ChunkExtraction, GraphError>) {
-    let result = extract::extract_from_chunk(llm, chunk, session_id, log_number).await;
+) -> (usize, Result<ChunkExtraction, ChunkFailure>) {
+    let result = extract::extract_chunk(llm, chunk, session_id, log_number).await;
     (index, result)
 }
-
-/// What one extraction produced, what it reported spending, and how many
-/// model calls that took (the truncation retry makes it two).
-type ChunkExtraction = (ExtractionResult, Option<TokenUsage>, u32);
 
 /// Tokens assumed for one extraction call when the provider reports none:
 /// system prompt + chunk input + output.
@@ -256,7 +252,7 @@ async fn process_extraction(
         .enumerate()
         .map(|(i, chunk)| extract_indexed(llm, chunk, session_id, log_number, i))
         .collect();
-    let extraction_results: Vec<(usize, Result<ChunkExtraction, GraphError>)> =
+    let extraction_results: Vec<(usize, Result<ChunkExtraction, ChunkFailure>)> =
         stream::iter(pending)
             .buffer_unordered(LLM_CONCURRENCY)
             .collect()
@@ -270,24 +266,39 @@ async fn process_extraction(
 
     for (i, result) in extraction_results {
         match result {
-            Ok((extraction, usage, attempts)) => {
+            Ok(extraction) => {
                 let provenance = context.provenance.classify(&chunks[i]);
-                all_entities.extend(extract::flatten_extraction(&extraction));
+                all_entities.extend(extract::flatten_extraction(&extraction.result));
                 all_relationships.extend(
                     extraction
+                        .result
                         .relationships
                         .into_iter()
                         .map(|rel| (provenance, rel)),
                 );
+                report.errors.extend(
+                    extraction
+                        .notes
+                        .iter()
+                        .map(|note| format!("extraction chunk {i} (recovered): {note}")),
+                );
                 bill(
                     report,
-                    usage,
-                    ESTIMATED_EXTRACTION_TOKENS * u64::from(attempts),
+                    extraction.usage,
+                    ESTIMATED_EXTRACTION_TOKENS * u64::from(extraction.calls),
                 );
             }
-            Err(e) => {
+            Err(failure) => {
                 report.chunks_failed += 1;
-                report.errors.push(format!("extraction chunk {i}: {e}"));
+                report
+                    .errors
+                    .push(format!("extraction chunk {i}: {}", failure.error));
+                // A failed call was still paid for.
+                bill(
+                    report,
+                    failure.usage,
+                    ESTIMATED_EXTRACTION_TOKENS * u64::from(failure.calls),
+                );
             }
         }
     }
