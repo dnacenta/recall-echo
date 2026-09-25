@@ -291,7 +291,10 @@ async fn a_repeat_of_what_is_stored_is_skipped_without_a_model_call() {
     .expect("resolve");
 
     assert_eq!(resolution.path, ResolutionPath::NameMatch);
-    assert!(matches!(resolution.entity, ResolvedEntity::Skipped));
+    assert!(
+        matches!(&resolution.entity, ResolvedEntity::Skipped(stored) if stored.name == "Biscuit"),
+        "a skipped duplicate names the entity it duplicates"
+    );
 }
 
 /// A name shared across kinds is not a shared identity: the event is not the
@@ -392,7 +395,10 @@ async fn the_ambiguous_band_costs_exactly_one_model_call() {
     .expect("resolve");
 
     assert_eq!(resolution.path, ResolutionPath::LlmDecision);
-    assert!(matches!(resolution.entity, ResolvedEntity::Skipped));
+    assert!(
+        matches!(&resolution.entity, ResolvedEntity::Skipped(stored) if stored.name == "Biscuit"),
+        "a model-issued skip resolves to the nearest neighbour it was shown"
+    );
     assert_eq!(model.calls(), 1);
     assert!(
         model.last_prompt().contains("similarity:"),
@@ -544,4 +550,112 @@ async fn ingest_counts_the_candidates_that_needed_a_model() {
     assert_eq!(report.dedup_fast_path, 0);
     assert_eq!(model.dedup_calls(), 1);
     assert_eq!(report.entities_created, 1);
+}
+
+// ── Relationship endpoints after dedup ───────────────────────────────────
+
+/// Recorded shape from Synth's conversation-575, shortened: a duplicate the
+/// store already holds under another name ("Synth pulse" → "Synth"), an
+/// endpoint in a different case from the entity ("echo" → "Echo"), and one
+/// endpoint no chunk ever extracted ("User").
+const DRIFTING_EXTRACTION: &str = r#"{"entities": [
+    {"name": "Synth pulse", "type": "person", "abstract": "A pulse that runs on hosted models and reviews Echo's work."},
+    {"name": "Echo", "type": "person", "abstract": "A sibling pulse that runs on xAI's infrastructure."},
+    {"name": "Kinship", "type": "concept", "abstract": "A family of pulses bound by trust rather than declaration."}
+  ],
+  "relationships": [
+    {"source": "Synth pulse", "target": "Kinship", "rel_type": "RELATES_TO", "description": "Synth describes it", "confidence": "explicit"},
+    {"source": "echo", "target": "Kinship", "rel_type": "RELATES_TO", "description": "Echo is part of it", "confidence": "inferred"},
+    {"source": "User", "target": "Kinship", "rel_type": "INTERESTED_IN", "description": "The user wants it", "confidence": "inferred"}
+  ]}"#;
+
+/// Before 4.6.2 both of the first two relationships were lost with "entity
+/// not found": the skipped duplicate kept its own name, and the lookup was
+/// case-sensitive. Only the endpoint that never existed is still a warning.
+#[tokio::test]
+async fn relationship_endpoints_follow_dedup_and_ignore_case() {
+    let fixture = Fixture::new().await;
+    fixture
+        .seed(
+            "Synth",
+            EntityType::Person,
+            "A pulse that runs on hosted models and reviews Echo's work.",
+        )
+        .await;
+    let model = ScriptedModel::new(
+        DRIFTING_EXTRACTION,
+        r#"{"decision": "create", "reason": "new"}"#,
+    );
+    let context = IngestContext::new(SESSION, Some(1));
+
+    let report = fixture
+        .graph
+        .extract_from_archive(ARCHIVE, &context, &model)
+        .await
+        .expect("extract");
+
+    assert_eq!(report.entities_skipped, 1, "Synth pulse duplicates Synth");
+    assert_eq!(report.relationships_created, 2, "{:?}", report.errors);
+    assert!(
+        fixture
+            .graph
+            .get_entity("Synth pulse")
+            .await
+            .unwrap()
+            .is_none(),
+        "the duplicate was not stored under its own name"
+    );
+    let from_synth = fixture
+        .graph
+        .get_relationships("Synth", recall_echo::graph::types::Direction::Outgoing)
+        .await
+        .expect("relationships");
+    assert_eq!(
+        from_synth.len(),
+        1,
+        "the duplicate's relationship lands on Synth"
+    );
+    let from_echo = fixture
+        .graph
+        .get_relationships("Echo", recall_echo::graph::types::Direction::Outgoing)
+        .await
+        .expect("relationships");
+    assert_eq!(from_echo.len(), 1, "\"echo\" is Echo");
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("'User' was never extracted"),
+        "{}",
+        report.errors[0]
+    );
+}
+
+/// An endpoint stored by an earlier archive, named in another case, is found.
+#[tokio::test]
+async fn an_endpoint_stored_earlier_is_found_in_any_case() {
+    let fixture = Fixture::new().await;
+    fixture
+        .seed(
+            "NeoVim",
+            EntityType::Tool,
+            "A terminal text editor D uses daily",
+        )
+        .await;
+    let extraction = r#"{"entities": [
+        {"name": "D", "type": "person", "abstract": "A freelance developer who lives in the terminal."}
+      ],
+      "relationships": [
+        {"source": "D", "target": "neovim", "rel_type": "USES", "description": "daily editor", "confidence": "explicit"}
+      ]}"#;
+    let model = ScriptedModel::new(extraction, r#"{"decision": "create", "reason": "new"}"#);
+    let context = IngestContext::new(SESSION, Some(2));
+
+    let report = fixture
+        .graph
+        .extract_from_archive(ARCHIVE, &context, &model)
+        .await
+        .expect("extract");
+
+    assert_eq!(report.relationships_created, 1, "{:?}", report.errors);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
 }

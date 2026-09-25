@@ -43,7 +43,10 @@ Rules:
 pub enum ResolvedEntity {
     Created(Entity),
     Merged(Entity),
-    Skipped,
+    /// The candidate added nothing to this stored entity, which it duplicates.
+    /// Carried so the candidate's name still leads somewhere: relationships
+    /// extracted alongside it name the candidate, not the stored entity.
+    Skipped(Entity),
 }
 
 /// Which gate decided a candidate — the cost record of one resolution.
@@ -170,7 +173,14 @@ async fn resolve_with_llm(
         .await?;
 
     let resolved = match parse_dedup_response(&completion.text)? {
-        DedupDecision::Skip => ResolvedEntity::Skipped,
+        // The model names no target for a skip; the duplicate is the
+        // nearest of the neighbours it was shown. There always is one — the
+        // model is only asked about a candidate that has a comparable
+        // neighbour — but a skip with nothing to point at must not lose it.
+        DedupDecision::Skip => match comparable.first() {
+            Some(duplicate) => ResolvedEntity::Skipped(duplicate.entity.clone()),
+            None => create(gm, candidate, session_id).await?,
+        },
 
         DedupDecision::Create => create(gm, candidate, session_id).await?,
 
@@ -219,7 +229,7 @@ async fn absorb(
         return create(gm, candidate, session_id).await;
     }
     if !adds_information(target, candidate) {
-        return Ok(ResolvedEntity::Skipped);
+        return Ok(ResolvedEntity::Skipped(target.clone()));
     }
     Ok(ResolvedEntity::Merged(
         merge_entity(gm, target, candidate).await?,

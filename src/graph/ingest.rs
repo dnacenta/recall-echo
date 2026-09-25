@@ -4,10 +4,11 @@
 
 //! Ingestion orchestrator — chunk → episode → extract → dedup → relationships.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
 
+use super::aliases::{self, EntityAliases};
 use super::confidence::{ExtractionContext, Observation, Provenance};
 use super::crud;
 use super::dedup::{self, Resolution, ResolvedEntity};
@@ -252,11 +253,16 @@ async fn process_extraction(
         .enumerate()
         .map(|(i, chunk)| extract_indexed(llm, chunk, session_id, log_number, i))
         .collect();
-    let extraction_results: Vec<(usize, Result<ChunkExtraction, ChunkFailure>)> =
+    let mut extraction_results: Vec<(usize, Result<ChunkExtraction, ChunkFailure>)> =
         stream::iter(pending)
             .buffer_unordered(LLM_CONCURRENCY)
             .collect()
             .await;
+    // Answers arrive in whatever order the model finished them. Dedup is
+    // order-sensitive — each decision sees the ones before it — so put them
+    // back in transcript order: the same archive then resolves the same way
+    // however fast the provider happened to be.
+    extraction_results.sort_by_key(|(index, _)| *index);
 
     // Collect entities and relationships from successful extractions. A
     // relationship keeps the class of the chunk it came out of: the evidence
@@ -307,11 +313,11 @@ async fn process_extraction(
     let deduplicated = local_merge_entities(all_entities);
 
     // Phase 3: Dedup sequentially — each resolve_entity sees the full DB state
-    let mut name_map: HashMap<String, String> = HashMap::new();
+    let mut aliases = EntityAliases::default();
 
     for candidate in &deduplicated {
         match dedup::resolve_entity(gm, llm, candidate, session_id).await {
-            Ok(resolution) => record_resolution(report, &mut name_map, candidate, resolution),
+            Ok(resolution) => record_resolution(report, &mut aliases, candidate, resolution),
             Err(e) => {
                 report
                     .errors
@@ -321,13 +327,41 @@ async fn process_extraction(
     }
 
     // Phase 4: Create relationships or Bayesian-update existing ones
+    let extracted: HashSet<String> = deduplicated
+        .iter()
+        .map(|candidate| aliases::fold(&candidate.name))
+        .collect();
     for (provenance, rel) in &all_relationships {
-        let from_name = name_map.get(&rel.source).unwrap_or(&rel.source);
-        let to_name = name_map.get(&rel.target).unwrap_or(&rel.target);
+        let endpoints = (
+            resolve_endpoint(gm, &aliases, &rel.source).await,
+            resolve_endpoint(gm, &aliases, &rel.target).await,
+        );
+        let (from_name, to_name) = match endpoints {
+            (Ok(Some(from)), Ok(Some(to))) => (from, to),
+            (from, to) => {
+                let problems = [(&rel.source, from), (&rel.target, to)]
+                    .into_iter()
+                    .filter_map(|(name, found)| missing_endpoint(name, found, &extracted))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                report.errors.push(format!(
+                    "relationship {} -> {}: {problems}",
+                    rel.source, rel.target
+                ));
+                continue;
+            }
+        };
+
+        // Both names resolved to one entity: a duplicate related to what it
+        // duplicates says nothing.
+        if from_name == to_name {
+            report.relationships_skipped += 1;
+            continue;
+        }
 
         // Check if a relationship of the same type already exists
         if let Some(existing) =
-            find_existing_relationship(gm, from_name, to_name, &rel.rel_type).await
+            find_existing_relationship(gm, &from_name, &to_name, &rel.rel_type).await
         {
             if let Err(e) = record_reextraction(gm, &existing, *provenance).await {
                 report
@@ -399,11 +433,12 @@ async fn record_reextraction(
     crud::record_observation(gm.db(), &existing.id_string(), evidence, observation).await
 }
 
-/// Fold one dedup resolution into the run's report: what it decided, and what
-/// deciding it cost.
+/// Fold one dedup resolution into the run's report — what it decided, and
+/// what deciding it cost — and record which stored entity the candidate's
+/// name now leads to.
 fn record_resolution(
     report: &mut IngestionReport,
-    name_map: &mut HashMap<String, String>,
+    aliases: &mut EntityAliases,
     candidate: &ExtractedEntity,
     resolution: Resolution,
 ) {
@@ -417,19 +452,57 @@ fn record_resolution(
 
     match resolution.entity {
         ResolvedEntity::Created(entity) => {
-            name_map.insert(candidate.name.clone(), entity.name.clone());
+            aliases.record(&candidate.name, &entity.name);
             report.entity_ids.push(entity.id_string());
             report.entities_created += 1;
         }
         ResolvedEntity::Merged(entity) => {
-            name_map.insert(candidate.name.clone(), entity.name.clone());
+            aliases.record(&candidate.name, &entity.name);
             report.entity_ids.push(entity.id_string());
             report.entities_merged += 1;
         }
-        ResolvedEntity::Skipped => {
-            name_map.insert(candidate.name.clone(), candidate.name.clone());
+        ResolvedEntity::Skipped(duplicate) => {
+            aliases.record(&candidate.name, &duplicate.name);
             report.entities_skipped += 1;
         }
+    }
+}
+
+/// The stored name a relationship endpoint refers to: what this run resolved
+/// that name to, else an entity already stored under it — exactly, then
+/// ignoring case.
+async fn resolve_endpoint(
+    gm: &GraphMemory,
+    aliases: &EntityAliases,
+    name: &str,
+) -> Result<Option<String>, GraphError> {
+    if let Some(stored) = aliases.resolve(name) {
+        return Ok(Some(stored.to_string()));
+    }
+    if let Some(entity) = gm.get_entity(name.trim()).await? {
+        return Ok(Some(entity.name));
+    }
+    Ok(gm
+        .get_entity_ignoring_case(name)
+        .await?
+        .map(|entity| entity.name))
+}
+
+/// Why an endpoint that did not resolve is missing, or `None` if it did.
+fn missing_endpoint(
+    name: &str,
+    found: Result<Option<String>, GraphError>,
+    extracted: &HashSet<String>,
+) -> Option<String> {
+    match found {
+        Ok(Some(_)) => None,
+        Err(e) => Some(format!("looking up '{name}' failed: {e}")),
+        Ok(None) if extracted.contains(&aliases::fold(name)) => Some(format!(
+            "'{name}' was extracted but not stored (its dedup failed)"
+        )),
+        Ok(None) => Some(format!(
+            "'{name}' was never extracted as an entity and is not in the graph"
+        )),
     }
 }
 

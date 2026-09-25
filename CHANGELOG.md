@@ -30,6 +30,21 @@ changes a user has to know about before upgrading.
     failed reports what those calls cost.
 - Dedup decisions wrapped in prose were rejected even when the JSON object in
   them was valid.
+- Relationships are no longer lost to dedup. Replaying the same archive, 55
+  of 395 extracted relationships failed with `entity not found` although 51
+  of them named an entity the run had extracted; now 4 warnings remain, each
+  for an endpoint no chunk ever extracted (`User`, `Rust`).
+  - Every candidate name is recorded, case-folded, against the stored entity
+    it resolved to — created, merged, or skipped as a duplicate — and
+    relationship endpoints resolve through that before the store is asked.
+    `synth` finds `Synth`; a skipped `Synth pulse` finds the `Synth` it
+    duplicates.
+  - An endpoint from an earlier archive is found in any case.
+  - A relationship whose endpoints resolve to one entity is dropped.
+  - The warning says whether the endpoint was never extracted or was
+    extracted and failed dedup.
+- Chunk answers are deduplicated in transcript order, not in the order the
+  model finished them, so an archive resolves the same way on every run.
 
 ### Added
 
@@ -38,6 +53,13 @@ changes a user has to know about before upgrading.
   `extract_from_chunk` keeps its signature.
 - `graph::llm_json`: `first_json_object`, `salvage_truncated`, `JsonFailure`.
 - `ExtractionResult::element_count` and `ExtractionResult::append`.
+- `graph::aliases::EntityAliases`, `GraphMemory::get_entity_ignoring_case`.
+
+### Changed
+
+- `dedup::ResolvedEntity::Skipped` carries the stored entity the candidate
+  duplicates (`Skipped(Entity)`). A model-issued skip names no target; the
+  nearest neighbour it was shown is taken.
 
 ## [4.6.1] — Unreleased
 
