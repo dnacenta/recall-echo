@@ -432,6 +432,11 @@ impl GraphMemory {
         crud::mark_episodes_extracted(&self.db, log_number).await
     }
 
+    /// True when some episode of archive `log_number` has not been extracted.
+    pub async fn log_awaits_extraction(&self, log_number: u32) -> Result<bool, GraphError> {
+        crud::log_awaits_extraction(&self.db, log_number).await
+    }
+
     /// Get log numbers of episodes that have NOT been extracted.
     pub async fn unextracted_log_numbers(&self) -> Result<Vec<i64>, GraphError> {
         crud::get_unextracted_log_numbers(&self.db).await

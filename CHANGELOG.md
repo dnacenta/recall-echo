@@ -3,7 +3,40 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
-## [4.6.0] — Unreleased
+## [4.6.1] — Unreleased
+
+### Fixed
+
+- Extraction finds `grok` in `~/.grok/bin`, where its official installer puts
+  it. The installer only adds that directory to the shell's rc file, so a
+  service or background process never had it on `PATH` and every extraction
+  failed with "grok not found". The directory is searched for `grok` alone.
+- A CLI provider that exits non-zero with nothing on stderr reports the first
+  line of its stdout instead: `claude -p` says "Not logged in" there and
+  nowhere else, and "exited 1:" alone could not be diagnosed.
+
+### Added
+
+- `archive_extract::extract_archive(memory_dir, log, &CliOverrides)` (feature
+  `llm`): extract one archive with the provider `.recall-echo.toml`
+  configures, in either graph mode, without handing recall-echo a model.
+  For hosts that archive their own conversations (pulse-null) and so know
+  when an archive needs extracting — `[graph] mode = "server"` has no daemon
+  to do it in the background. One call is one attempt; it reports the tokens
+  spent, skips an archive with nothing pending, and leaves an archive pending
+  when every chunk failed.
+- `CliOverrides` — how a host wants the CLI spawned: `command` (wins over
+  `[llm.cli] command`, `*_BIN` and the search), `env` (the child's entire
+  environment, for a host that allowlists what its agent CLI sees, login
+  included) and `current_dir` (agent CLIs read project instructions and hooks
+  from it). All `None` is exactly what `graph extract` does.
+- `llm_provider::create_provider_with_overrides` and
+  `GraphMemory::log_awaits_extraction`, which the above is built on.
+
+The binary a CLI provider spawns can already be pinned in config, and still
+wins over the search: `[llm.cli] command = "/home/you/.grok/bin/grok"`.
+
+## [4.6.0] — 2026-09-25
 
 The agent home recall-echo serves is now called a **pulse** (a pulse-null
 pulse such as Echo or Synth). The knowledge-graph *entity* — what extraction

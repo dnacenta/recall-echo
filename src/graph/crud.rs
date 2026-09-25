@@ -553,6 +553,27 @@ pub async fn mark_episodes_extracted(db: &Surreal<Db>, log_number: u32) -> Resul
     Ok(())
 }
 
+/// Whether any episode of one archive still awaits extraction. Served by the
+/// `episode_log` index; the `extracted` test filters its output.
+const LOG_AWAITS_EXTRACTION: &str = "SELECT count() AS count FROM episode \
+     WHERE log_number = $ln AND extracted = false GROUP ALL";
+
+/// True when at least one episode of archive `log_number` is not yet
+/// extracted. An archive with no episodes at all has nothing awaiting.
+pub async fn log_awaits_extraction(db: &Surreal<Db>, log_number: u32) -> Result<bool, GraphError> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        count: u64,
+    }
+
+    let mut response = db
+        .query(LOG_AWAITS_EXTRACTION)
+        .bind(("ln", i64::from(log_number)))
+        .await?;
+    let rows: Vec<CountRow> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows.first().is_some_and(|row| row.count > 0))
+}
+
 /// The rows the extraction scan is looking for, as a literal fragment shared
 /// by the scan and its count so the two can never disagree.
 macro_rules! unextracted_source {

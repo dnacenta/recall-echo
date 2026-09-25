@@ -19,6 +19,7 @@
 //! What the vendors do *not* agree on is stdout: one JSON object, one JSON
 //! object per line, or prose. That is an [`OutputMode`], not a code path.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -486,8 +487,31 @@ const WELL_KNOWN_BIN_DIRS_UNDER_HOME: &[&str] = &[
     ".cargo/bin",
     "bin",
 ];
+/// Directories a vendor's own installer puts its one binary in, relative to
+/// `$HOME`, keyed by that binary's name. Tried after the shared directories
+/// above and only for the binary they belong to.
+///
+/// Grok's official installer drops `grok` into `~/.grok/bin` and adds that to
+/// the shell's rc file — which a service unit or a background daemon never
+/// reads, so `PATH` alone never finds it there.
+const VENDOR_BIN_DIRS_UNDER_HOME: &[(&str, &str)] = &[("grok", ".grok/bin")];
 /// System directories tried last.
 const WELL_KNOWN_SYSTEM_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// Every directory under `home` worth searching for `command`: the shared
+/// install directories, then the vendor's own, if `command` has one.
+fn home_bin_dirs(home: &Path, command: &str) -> Vec<PathBuf> {
+    let vendor = VENDOR_BIN_DIRS_UNDER_HOME
+        .iter()
+        .filter(|(binary, _)| *binary == command)
+        .map(|(_, dir)| *dir);
+    WELL_KNOWN_BIN_DIRS_UNDER_HOME
+        .iter()
+        .copied()
+        .chain(vendor)
+        .map(|dir| home.join(dir))
+        .collect()
+}
 
 const REMEDY: &str =
     "set [llm.cli] command or the provider's *_BIN variable to the binary's real path";
@@ -583,11 +607,7 @@ pub(crate) fn locate_in(
 
     let fallbacks: Vec<PathBuf> = home
         .into_iter()
-        .flat_map(|home| {
-            WELL_KNOWN_BIN_DIRS_UNDER_HOME
-                .iter()
-                .map(move |d| home.join(d))
-        })
+        .flat_map(|home| home_bin_dirs(home, command))
         .chain(WELL_KNOWN_SYSTEM_BIN_DIRS.iter().map(PathBuf::from))
         .collect();
     if let Some(found) = fallbacks
@@ -612,6 +632,26 @@ fn default_timeout() -> Option<Duration> {
 
 // ── Provider ─────────────────────────────────────────────────────────────
 
+/// How a host that embeds recall-echo wants the extraction CLI spawned.
+///
+/// Every field left `None` means "as configured, as inherited": the default
+/// is exactly what `graph extract` does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CliOverrides {
+    /// The binary to spawn, instead of `[llm.cli] command`, the `*_BIN`
+    /// variable or the search. Must be an absolute path to an executable.
+    pub command: Option<PathBuf>,
+    /// The child's entire environment. When set, the CLI starts from an empty
+    /// environment plus exactly these variables — a host that allowlists what
+    /// its own agent CLI sees (credentials included) hands the same list here,
+    /// so extraction neither lacks the login nor inherits everything else.
+    pub env: Option<Vec<(OsString, OsString)>>,
+    /// The child's working directory. Agent CLIs read project instructions,
+    /// hooks and rules from it, so a host whose own working directory is an
+    /// agent's home should point extraction somewhere neutral.
+    pub current_dir: Option<PathBuf>,
+}
+
 /// Completes by spawning an agent CLI described by a [`CliSpec`].
 ///
 /// Costs nothing per token: the CLI authenticates with the subscription the
@@ -619,12 +659,35 @@ fn default_timeout() -> Option<Duration> {
 pub struct CliProvider {
     spec: CliSpec,
     model: String,
+    env: Option<Vec<(OsString, OsString)>>,
+    current_dir: Option<PathBuf>,
 }
 
 impl CliProvider {
     #[must_use]
     pub fn new(spec: CliSpec, model: String) -> Self {
-        Self { spec, model }
+        Self {
+            spec,
+            model,
+            env: None,
+            current_dir: None,
+        }
+    }
+
+    /// Spawn with exactly this environment instead of inheriting this
+    /// process's. See [`CliOverrides::env`].
+    #[must_use]
+    pub fn with_env(mut self, env: Option<Vec<(OsString, OsString)>>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Spawn in this directory instead of this process's. See
+    /// [`CliOverrides::current_dir`].
+    #[must_use]
+    pub fn with_current_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.current_dir = dir;
+        self
     }
 
     /// The spec this provider calls.
@@ -689,6 +752,12 @@ impl CliProvider {
             // A dropped future (a timeout, a cancelled task) must not leave an
             // agent running against the user's subscription.
             .kill_on_drop(true);
+        if let Some(env) = &self.env {
+            command.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
+        if let Some(dir) = &self.current_dir {
+            command.current_dir(dir);
+        }
         for key in &self.spec.env_remove {
             command.env_remove(key);
         }
@@ -719,11 +788,10 @@ impl CliProvider {
         .map_err(|e| GraphError::Llm(format!("{binary} process failed: {e}")))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(GraphError::Llm(format!(
                 "{binary} exited {}: {}",
                 output.status,
-                truncate_str(stderr.trim(), STDERR_EXCERPT)
+                failure_detail(&output.stderr, &output.stdout)
             )));
         }
 
@@ -732,6 +800,23 @@ impl CliProvider {
             return Err(GraphError::Llm(format!("{binary} returned empty output")));
         }
         Ok(stdout)
+    }
+}
+
+/// What a failed CLI said about it: its stderr, or — when that is empty —
+/// the first line of its stdout. `claude -p` reports "Not logged in" on
+/// stdout and nothing on stderr, and an error that reads only "exited 1:"
+/// cannot be diagnosed.
+fn failure_detail(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return truncate_str(stderr, STDERR_EXCERPT).to_string();
+    }
+    let stdout = String::from_utf8_lossy(stdout);
+    match stdout.lines().map(str::trim).find(|line| !line.is_empty()) {
+        Some(line) => format!("(stdout) {}", truncate_str(line, STDERR_EXCERPT)),
+        None => "no output".to_string(),
     }
 }
 
@@ -1015,6 +1100,42 @@ mod tests {
         let home = tmp.path().join("home");
         let bin = executable_at(&home.join(".claude/local"), "claude");
         assert_eq!(locate_in("claude", None, Some(&home)).unwrap(), bin);
+    }
+
+    /// Grok's installer puts the binary in `~/.grok/bin` and only teaches the
+    /// shell's rc file about it, so a daemon or service never has it on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn locate_tries_groks_own_install_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bin = executable_at(&home.join(".grok/bin"), "grok");
+        let bare_path = std::ffi::OsString::from("/nonexistent-a:/nonexistent-b");
+        assert_eq!(
+            locate_in("grok", Some(&bare_path), Some(&home)).unwrap(),
+            bin
+        );
+    }
+
+    /// A vendor's directory is searched for that vendor's binary only: a
+    /// planted `~/.grok/bin/claude` must not become Claude Code.
+    #[cfg(unix)]
+    #[test]
+    fn a_vendor_dir_is_not_searched_for_another_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        executable_at(&home.join(".grok/bin"), "no-such-agent-cli");
+        let err = locate_in("no-such-agent-cli", None, Some(&home)).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        assert!(!err.contains(".grok/bin"), "{err}");
+    }
+
+    #[test]
+    fn the_grok_search_names_its_install_dir() {
+        let home = Path::new("/home/someone");
+        let dirs = home_bin_dirs(home, "grok");
+        assert_eq!(dirs.last(), Some(&home.join(".grok/bin")));
+        assert!(!home_bin_dirs(home, "claude").contains(&home.join(".grok/bin")));
     }
 
     #[cfg(unix)]
@@ -1819,6 +1940,53 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("not authenticated"), "{message}");
         assert!(message.contains("exited"), "{message}");
+    }
+
+    /// `claude -p` says "Not logged in" on stdout, with nothing on stderr.
+    #[tokio::test]
+    async fn a_silent_stderr_falls_back_to_the_first_stdout_line() {
+        let mock = MockCli::new("printf '\\nNot logged in · Please run /login\\nmore\\n'\nexit 1");
+        let provider = mock.provider(CliSection::default(), "");
+
+        let message = provider
+            .complete(SYSTEM, USER, 1024)
+            .await
+            .expect_err("non-zero exit")
+            .to_string();
+        assert!(
+            message.contains("(stdout) Not logged in · Please run /login"),
+            "{message}"
+        );
+        assert!(!message.contains("more"), "{message}");
+    }
+
+    #[test]
+    fn a_failure_with_no_output_at_all_says_so() {
+        assert_eq!(failure_detail(b"  \n", b""), "no output");
+        assert_eq!(failure_detail(b"boom\n", b"ignored"), "boom");
+    }
+
+    /// A host's environment replaces the inherited one outright, and its
+    /// working directory is where the CLI runs.
+    #[tokio::test]
+    async fn an_overridden_env_and_cwd_reach_the_process() {
+        // HOME is in every test process's environment and not in the list.
+        assert!(std::env::var_os("HOME").is_some());
+        let mock =
+            MockCli::new("printf '%s|%s|%s' \"$PULSE_TEST_TOKEN\" \"${HOME:-absent}\" \"$(pwd)\"");
+        let cwd = tempfile::tempdir().unwrap();
+        let provider = mock
+            .provider(CliSection::default(), "")
+            .with_env(Some(vec![
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("PULSE_TEST_TOKEN".into(), "t0ken".into()),
+            ]))
+            .with_current_dir(Some(cwd.path().to_path_buf()));
+
+        let answer = provider.complete(SYSTEM, USER, 1024).await.unwrap();
+
+        let expected_cwd = cwd.path().canonicalize().unwrap();
+        assert_eq!(answer, format!("t0ken|absent|{}", expected_cwd.display()),);
     }
 
     #[tokio::test]

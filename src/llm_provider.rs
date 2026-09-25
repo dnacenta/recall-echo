@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use crate::graph::error::GraphError;
 use crate::graph::llm::{Completion, LlmProvider, TokenUsage};
 
-use crate::cli_provider::{CliProvider, CliSpec};
+use crate::cli_provider::{CliOverrides, CliProvider, CliSpec};
 use crate::config::{self, Provider};
 
 // ── Factory ──────────────────────────────────────────────────────────────
@@ -64,6 +64,38 @@ pub fn create_provider_with_binary(
         cfg.model = m.to_string();
     }
 
+    provider_from_section(cfg, &CliOverrides::default())
+}
+
+/// The provider `.recall-echo.toml` configures, spawned the way a host asks.
+///
+/// For a host that already knows where the CLI lives and what it may see —
+/// pulse-null carries its own `cli_bin` and an allowlisted child environment
+/// — and should not depend on the search, or on its own environment, lining
+/// up. [`CliOverrides::command`] takes the place of `[llm.cli] command`, so it
+/// wins over the `*_BIN` variable and the search alike. An HTTP provider
+/// ignores every override.
+pub fn create_provider_with_overrides(
+    memory_dir: &Path,
+    overrides: &CliOverrides,
+) -> Result<ProviderHandle, crate::error::RecallError> {
+    let mut cfg = config::load(memory_dir).llm;
+    if let Some(command) = &overrides.command {
+        let command = command.to_str().ok_or_else(|| {
+            crate::error::RecallError::Config(format!(
+                "CLI binary path {} is not valid UTF-8",
+                command.display()
+            ))
+        })?;
+        cfg.cli.command = Some(command.to_string());
+    }
+    provider_from_section(cfg, overrides)
+}
+
+fn provider_from_section(
+    cfg: config::LlmSection,
+    overrides: &CliOverrides,
+) -> Result<ProviderHandle, crate::error::RecallError> {
     if cfg.provider.is_cli() {
         let mut spec = CliSpec::resolve(&cfg.provider, &cfg.cli)?;
         // Spawn by absolute path. The bare name only works where PATH says so,
@@ -71,7 +103,9 @@ pub fn create_provider_with_binary(
         let binary = spec.locate_command()?;
         spec.use_located_command(&binary)?;
         let model = spec.resolve_model(&cfg.model);
-        let provider = CliProvider::new(spec, model.clone());
+        let provider = CliProvider::new(spec, model.clone())
+            .with_env(overrides.env.clone())
+            .with_current_dir(overrides.current_dir.clone());
         return Ok(ProviderHandle {
             llm: Box::new(provider),
             model,
