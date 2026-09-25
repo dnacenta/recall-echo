@@ -1,6 +1,6 @@
 [package]
 name = "recall-echo"
-version = "4.5.0"
+version = "4.6.0"
 edition = "2021"
 description = "Persistent memory system with knowledge graph — for any LLM tool"
 license = "MPL-2.0"
@@ -39,7 +39,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"], optional = true }
 
 # Pulse-null integration (optional) — plugin system for pulse-null entities
-pulse-system-types = { version = "0.6", optional = true }
+pulse-system-types = { version = "0.7", optional = true }
 
 # Self-update (optional) — unpack the release tar.gz the `update` command downloads.
 # tar without default features: we copy the one entry ourselves, so xattr and

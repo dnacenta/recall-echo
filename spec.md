@@ -2,7 +2,7 @@
 
 ## What It Is
 
-recall-echo is a persistent four-layer memory system for pulse-null entities. It gives AI agents long-term recall across sessions — a knowledge graph with Bayesian confidence, curated facts, recent session context, and searchable conversation archives. Designed as a native pulse-null plugin (Memory role) with standalone CLI support for administration.
+recall-echo is a persistent four-layer memory system for pulse-null pulses. It gives AI agents long-term recall across sessions — a knowledge graph with Bayesian confidence, curated facts, recent session context, and searchable conversation archives. Designed as a native pulse-null plugin (Memory role) with standalone CLI support for administration.
 
 Inspired by MemGPT (arxiv:2310.08560) — event-driven memory management for LLMs.
 
@@ -48,10 +48,10 @@ recall-echo makes the entire memory lifecycle mechanical. When integrated with p
 └──────────────────────────────────────────────────────────┘
 ```
 
-All paths are relative to an entity root directory:
+All paths are relative to a pulse root directory:
 
 ```
-{entity_root}/memory/
+{pulse_root}/memory/
 ├── MEMORY.md                    # Layer 1 — curated facts
 ├── EPHEMERAL.md                 # Layer 2 — rolling session window
 ├── ARCHIVE.md                   # Layer 3 — conversation index
@@ -73,10 +73,10 @@ recall-echo operates in two modes:
 
 As a native pulse-null plugin implementing the `Plugin` trait from pulse-system-types:
 
-- **Role**: `PluginRole::Memory` (required — exactly one per entity)
+- **Role**: `PluginRole::Memory` (required — exactly one per pulse)
 - **Factory**: `create(config, ctx) -> Box<dyn Plugin>`
 - **Health**: Reports memory directory state (Healthy / Degraded / Down)
-- **Setup**: Prompts for entity_root during pulse-null init wizard
+- **Setup**: Prompts for pulse_root during pulse-null init wizard
 - **Lifecycle**: pulse-null calls `archive::archive_session()` and `checkpoint::create_checkpoint()` automatically
 
 The plugin does not contribute tools, scheduled tasks, or HTTP routes. It is a data layer — pulse-null orchestrates when archival and checkpointing happen.
@@ -86,13 +86,13 @@ The plugin does not contribute tools, scheduled tasks, or HTTP routes. It is a d
 For administration and use outside pulse-null:
 
 ```
-recall-echo init [entity_root]       # Create memory directory structure
-recall-echo status [entity_root]     # Health check with dashboard
-recall-echo dashboard [entity_root]  # Full dashboard with stats and health
+recall-echo init [pulse_root]        # Create memory directory structure
+recall-echo status [pulse_root]      # Health check with dashboard
+recall-echo dashboard [pulse_root]   # Full dashboard with stats and health
 recall-echo search <query>           # Line-level archive search
 recall-echo search <query> --ranked  # File-ranked search with relevance scoring
-recall-echo distill [entity_root]    # Analyze MEMORY.md, suggest cleanup
-recall-echo consume [entity_root]    # Output EPHEMERAL.md content
+recall-echo distill [pulse_root]     # Analyze MEMORY.md, suggest cleanup
+recall-echo consume [pulse_root]     # Output EPHEMERAL.md content
 recall-echo archive-session          # Archive Claude Code session from JSONL
 recall-echo archive --all-unarchived # Batch archive all missed sessions
 recall-echo checkpoint               # Save checkpoint before context compression
@@ -106,7 +106,7 @@ recall-echo graph <subcommand>       # Knowledge graph operations
 
 The source of truth. Distilled facts, user preferences, patterns, key decisions. Always loaded into agent context at session start.
 
-- Lives at: `{entity_root}/memory/MEMORY.md`
+- Lives at: `{pulse_root}/memory/MEMORY.md`
 - Size discipline: Keep under 200 lines
 - Updated: During conversations when stable facts are confirmed
 - Distillation: `recall-echo distill` analyzes heavy sections and suggests extracting them to topic files (e.g., `memory/debugging.md`)
@@ -115,7 +115,7 @@ The source of truth. Distilled facts, user preferences, patterns, key decisions.
 
 A FIFO rolling window of recent session summaries. Gives the agent immediate context about recent work.
 
-- Lives at: `{entity_root}/memory/EPHEMERAL.md`
+- Lives at: `{pulse_root}/memory/EPHEMERAL.md`
 - Max entries: Configurable (default 5, range 1–50)
 - Format: Separator-delimited entries with session ID, date, duration, message count, summary, and archive pointer
 - Updated: Automatically when a session is archived
@@ -124,8 +124,8 @@ A FIFO rolling window of recent session summaries. Gives the agent immediate con
 
 Full conversation archives with structured metadata. Not loaded into context — searched on demand via Grep.
 
-- Index: `{entity_root}/memory/ARCHIVE.md` (markdown table)
-- Archives: `{entity_root}/memory/conversations/conversation-NNN.md`
+- Index: `{pulse_root}/memory/ARCHIVE.md` (markdown table)
+- Archives: `{pulse_root}/memory/conversations/conversation-NNN.md`
 - Format: YAML frontmatter + markdown sections
 
 ## Archive Format
@@ -206,7 +206,7 @@ pub async fn create(
 ) -> Result<Box<dyn Plugin>, Box<dyn Error + Send + Sync>>
 ```
 
-Config accepts `entity_root` (string). Falls back to `ctx.entity_root` if not specified. Returns a fully initialized `RecallEcho` instance — no two-phase init.
+Config accepts `pulse_root` (string; the pre-4.6.0 key `entity_root` is still read). Falls back to `ctx.entity_root` if not specified. Returns a fully initialized `RecallEcho` instance — no two-phase init.
 
 ### Health Checks
 
@@ -251,7 +251,7 @@ All tests run in isolated temporary directories — no production memory touched
 
 ## Resolved Decisions
 
-1. **Entity-root model**: All paths relative to entity_root, not hardcoded home dir. Supports multi-entity scenarios.
+1. **Pulse-root model**: All paths relative to pulse_root, not hardcoded home dir. Supports multi-pulse scenarios.
 2. **Markdown archives**: Replaced JSONL with markdown + YAML frontmatter. Human-readable, Grep-searchable.
 3. **FIFO ephemeral**: Rolling window of N entries (default 5) instead of single session summary.
 4. **LLM summaries with fallback**: Graceful degradation when no provider available.

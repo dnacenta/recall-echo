@@ -21,7 +21,7 @@
 //!
 //! # Features
 //!
-//! - `pulse-null` — Plugin integration for pulse-null entities
+//! - `pulse-null` — Plugin integration for pulse-null pulses
 //! - `llm` — HTTP-based LLM provider for entity extraction
 
 pub mod agent_cli;
@@ -79,9 +79,9 @@ pub use summarize::ConversationSummary;
 
 /// The recall-echo memory system.
 ///
-/// All paths are derived from entity_root:
+/// All paths are derived from pulse_root:
 /// ```text
-/// {entity_root}/memory/
+/// {pulse_root}/memory/
 /// ├── MEMORY.md
 /// ├── EPHEMERAL.md
 /// ├── ARCHIVE.md
@@ -89,32 +89,39 @@ pub use summarize::ConversationSummary;
 /// └── graph/ (knowledge graph store)
 /// ```
 pub struct RecallEcho {
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl RecallEcho {
-    /// Create a new RecallEcho instance with a specific entity root directory.
+    /// Create a new RecallEcho instance with a specific pulse root directory.
     #[must_use]
-    pub fn new(entity_root: PathBuf) -> Self {
-        Self { entity_root }
+    pub fn new(pulse_root: PathBuf) -> Self {
+        Self { pulse_root }
     }
 
     /// Create a RecallEcho using the default path resolution
     /// (RECALL_ECHO_HOME, an initialised cwd, or the root `init` persisted).
     pub fn from_default() -> Result<Self, error::RecallError> {
-        Ok(Self::new(paths::entity_root()?))
+        Ok(Self::new(paths::pulse_root()?))
     }
 
-    /// Entity root directory.
+    /// Pulse root directory.
+    #[must_use]
+    pub fn pulse_root(&self) -> &Path {
+        &self.pulse_root
+    }
+
+    /// Pulse root directory, under its pre-4.6.0 name.
+    #[deprecated(since = "4.6.0", note = "renamed to `pulse_root`")]
     #[must_use]
     pub fn entity_root(&self) -> &Path {
-        &self.entity_root
+        self.pulse_root()
     }
 
-    /// Memory directory: {entity_root}/memory/
+    /// Memory directory: {pulse_root}/memory/
     #[must_use]
     pub fn memory_dir(&self) -> PathBuf {
-        self.entity_root.join("memory")
+        self.pulse_root.join("memory")
     }
 
     /// Path to MEMORY.md.
@@ -199,8 +206,8 @@ mod plugin_impl {
 
         fn get_setup_prompts() -> Vec<SetupPrompt> {
             vec![SetupPrompt {
-                key: "entity_root".into(),
-                question: "Entity root directory:".into(),
+                key: "pulse_root".into(),
+                question: "Pulse root directory:".into(),
                 required: true,
                 secret: false,
                 default: None,
@@ -213,13 +220,18 @@ mod plugin_impl {
         config: &serde_json::Value,
         ctx: &PluginContext,
     ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
-        let entity_root = config
-            .get("entity_root")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| ctx.entity_root.clone());
+        let pulse_root = configured_pulse_root(config).unwrap_or_else(|| ctx.pulse_root.clone());
 
-        Ok(Box::new(RecallEcho::new(entity_root)))
+        Ok(Box::new(RecallEcho::new(pulse_root)))
+    }
+
+    /// The plugin config's pulse root: `pulse_root`, or the pre-4.6.0
+    /// `entity_root` key a config written by an older setup wizard carries.
+    fn configured_pulse_root(config: &serde_json::Value) -> Option<PathBuf> {
+        ["pulse_root", "entity_root"]
+            .iter()
+            .find_map(|key| config.get(key).and_then(|v| v.as_str()))
+            .map(PathBuf::from)
     }
 
     impl Plugin for RecallEcho {
@@ -253,6 +265,36 @@ mod plugin_impl {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn plugin_config_reads_the_pulse_root_key() {
+            let config = serde_json::json!({ "pulse_root": "/srv/echo" });
+            assert_eq!(
+                configured_pulse_root(&config),
+                Some(PathBuf::from("/srv/echo"))
+            );
+        }
+
+        #[test]
+        fn plugin_config_still_reads_the_legacy_entity_root_key() {
+            let config = serde_json::json!({ "entity_root": "/srv/echo" });
+            assert_eq!(
+                configured_pulse_root(&config),
+                Some(PathBuf::from("/srv/echo"))
+            );
+        }
+
+        #[test]
+        fn plugin_config_prefers_pulse_root_over_the_legacy_key() {
+            let config = serde_json::json!({ "pulse_root": "/new", "entity_root": "/old" });
+            assert_eq!(configured_pulse_root(&config), Some(PathBuf::from("/new")));
+            assert_eq!(configured_pulse_root(&serde_json::json!({})), None);
         }
     }
 }

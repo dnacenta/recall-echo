@@ -29,7 +29,9 @@ pub struct SessionMetadata {
     pub session_id: String,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
-    pub entity_name: String,
+    /// The pulse whose session this is, written as the archive's `pulse:`
+    /// frontmatter key. Empty when unknown.
+    pub pulse_name: String,
 }
 
 /// Result of archiving a conversation — used by callers for graph ingestion.
@@ -134,6 +136,29 @@ pub fn archive_conversation(
     summary: &summarize::ConversationSummary,
     source: &str,
 ) -> Result<ArchiveResult, RecallError> {
+    write_archive(memory_dir, conv, summary, source, None)
+}
+
+/// [`archive_conversation`] for a named pulse: the archive's frontmatter
+/// records it as `pulse: "<name>"`.
+pub fn archive_pulse_conversation(
+    memory_dir: &Path,
+    conv: &Conversation,
+    summary: &summarize::ConversationSummary,
+    source: &str,
+    pulse_name: &str,
+) -> Result<ArchiveResult, RecallError> {
+    let pulse = Some(pulse_name).filter(|name| !name.trim().is_empty());
+    write_archive(memory_dir, conv, summary, source, pulse)
+}
+
+fn write_archive(
+    memory_dir: &Path,
+    conv: &Conversation,
+    summary: &summarize::ConversationSummary,
+    source: &str,
+    pulse: Option<&str>,
+) -> Result<ArchiveResult, RecallError> {
     let conversations_dir = memory_dir.join("conversations");
     let archive_index = memory_dir.join("ARCHIVE.md");
     let ephemeral_path = memory_dir.join("EPHEMERAL.md");
@@ -171,6 +196,7 @@ pub fn archive_conversation(
         message_count: total_messages,
         duration: duration.clone(),
         source: source.to_string(),
+        pulse: pulse.map(String::from),
         topics: summary.topics.clone(),
     };
 
@@ -460,9 +486,9 @@ fn classify(transcript_path: &str, session_id: &str) -> HookTarget {
 
 /// Main archive-session flow, called from the SessionEnd hook.
 /// Reads hook input from stdin.
-pub fn run_from_hook(entity_root: Option<&Path>) -> Result<(), RecallError> {
+pub fn run_from_hook(pulse_root: Option<&Path>) -> Result<(), RecallError> {
     let hook_input = crate::jsonl::read_hook_input()?;
-    let base_dir = crate::paths::resolved_hook_base_dir(entity_root)?;
+    let base_dir = crate::paths::resolved_hook_base_dir(pulse_root)?;
     run_with_hook_input(&hook_input, &base_dir)
 }
 
@@ -648,7 +674,8 @@ pub async fn archive_session(
     conv.last_timestamp = metadata.ended_at.clone();
 
     let summary = summarize::extract_with_fallback(provider, &conv).await;
-    let result = archive_conversation(memory_dir, &conv, &summary, "session")?;
+    let result =
+        archive_pulse_conversation(memory_dir, &conv, &summary, "session", &metadata.pulse_name)?;
     let log_number = result.log_number;
 
     // Graph ingestion (async path — no need for Runtime)
@@ -787,6 +814,33 @@ mod tests {
         assert!(content.contains("session_id: \"test-abc\""));
         assert!(content.contains("source: \"test\""));
         assert!(content.contains("Built something cool"));
+    }
+
+    #[test]
+    fn a_pulse_archive_records_the_pulse_in_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        let mut conv = Conversation::new("pulse-session");
+        conv.user_message_count = 1;
+        conv.entries
+            .push(conversation::ConversationEntry::UserMessage(
+                "hi".to_string(),
+            ));
+        let summary = summarize::ConversationSummary::default();
+
+        archive_pulse_conversation(memory, &conv, &summary, "session", "Echo").unwrap();
+        archive_conversation(memory, &conv, &summary, "jsonl").unwrap();
+
+        let named = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        assert!(named.contains("\npulse: \"Echo\"\n"), "{named}");
+        assert!(!named.contains("entity:"), "{named}");
+        let parsed = crate::frontmatter::parse(&named).unwrap();
+        assert_eq!(parsed.pulse.as_deref(), Some("Echo"));
+
+        let anonymous =
+            fs::read_to_string(memory.join("conversations/conversation-002.md")).unwrap();
+        assert!(!anonymous.contains("pulse:"), "{anonymous}");
     }
 
     #[test]

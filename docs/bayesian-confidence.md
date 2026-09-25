@@ -18,7 +18,7 @@ An autonomous agent that runs for weeks or months hits the same recurring proble
 
 **Deterministic timestamps with bi-temporal invalidation** (Graphiti's approach) capture *when* something was true but not *how much* the system should trust it. A relationship that the agent observed once last Tuesday is treated identically to one it has heard nine times across nine independent conversations. Contradiction is binary — either you invalidate the old edge and write a new one, or you don't.
 
-**ADD-only accumulation with a conflict detector** (mem0's approach) sidesteps merge entirely. New observations get appended; conflicts get flagged. This works for short-horizon agents, but for an entity running for months the accumulated noise grows unbounded, and "is this still true?" becomes a query the system cannot answer.
+**ADD-only accumulation with a conflict detector** (mem0's approach) sidesteps merge entirely. New observations get appended; conflicts get flagged. This works for short-horizon agents, but for an agent running for months the accumulated noise grows unbounded, and "is this still true?" becomes a query the system cannot answer.
 
 **Full graph rewrites** (Cognee's approach) regenerate the structure when contradictions accumulate. This loses history.
 
@@ -142,7 +142,7 @@ Note the honest asymmetry: the multiplicative rule assumes edge independence, an
 
 Persisting evidence makes a second problem sharp rather than solving it. If every corroboration adds to α, then an agent that re-asserts its own beliefs across sessions manufactures confidence out of nothing. The graph grows more certain of what it already believed, for no reason other than that it keeps hearing its own voice.
 
-The provenance analysis below originates in research by **Echo, a `pulse-null` entity**, conducted 2026-08-04 on exactly this question — whether a memory system can tell independent corroboration from itself re-asserting. What follows is that analysis and the mechanism it implies, now shipped.
+The provenance analysis below originates in research by **Echo, a `pulse-null` pulse**, conducted 2026-08-04 on exactly this question — whether a memory system can tell independent corroboration from itself re-asserting. What follows is that analysis and the mechanism it implies, now shipped.
 
 ### The epistemology: independence is a precondition, not a nicety
 
@@ -304,4 +304,4 @@ The test suite in `confidence.rs:443-849` covers the update math, accumulation, 
 
 ---
 
-`recall-echo` exists because the entity it serves — `pulse-null`, a long-running autonomous Rust runtime — needed a memory layer that wouldn't degrade into noise after a few months of operation. The Bayesian model is the part that earns its keep. Making it remember its own evidence, and making it refuse to count its own voice as a second witness, is what Phase 1 was for. The rest is plumbing.
+`recall-echo` exists because the runtime it serves — `pulse-null`, a long-running autonomous Rust runtime — needed a memory layer that wouldn't degrade into noise after a few months of operation. The Bayesian model is the part that earns its keep. Making it remember its own evidence, and making it refuse to count its own voice as a second witness, is what Phase 1 was for. The rest is plumbing.

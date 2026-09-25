@@ -6,14 +6,14 @@
 //!
 //! Exposes two operations to the benchmark runner:
 //!
-//! 1. [`ingest_conversation`] — write a LoCoMo conversation as N entity sessions
+//! 1. [`ingest_conversation`] — write a LoCoMo conversation as N pulse sessions
 //!    (one archive per session, dated correctly), then trigger graph extraction.
 //! 2. [`answer_question`] — answer a question using hybrid retrieval
 //!    (graph query + archive ranked search + MEMORY.md), call an LLM, return
 //!    the predicted answer plus the retrieval trace as JSON.
 //!
 //! This module is intentionally a *thin* facade: every call ultimately drives
-//! the same code paths an entity exercises at runtime. Score validity depends
+//! the same code paths a pulse exercises at runtime. Score validity depends
 //! on that, so do not reimplement archive format, retrieval, or extraction here.
 
 use serde::{Deserialize, Serialize};

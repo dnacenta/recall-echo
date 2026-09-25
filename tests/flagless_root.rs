@@ -4,7 +4,7 @@
 
 //! Flagless commands find the store `init` persisted (#63).
 //!
-//! Run against the real binary from a directory that is *not* the entity
+//! Run against the real binary from a directory that is *not* the pulse
 //! root, with `XDG_CONFIG_HOME` and `HOME` pointed at a temp dir so the
 //! developer's real persisted root and `~/.claude` are never read or written.
 
@@ -46,8 +46,13 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     fn persist(&self, root: &Path) {
+        self.persist_as("pulse-root", root);
+    }
+
+    /// Write the pointer under `name` — `entity-root` is the pre-4.6.0 file.
+    fn persist_as(&self, name: &str, root: &Path) {
         std::fs::write(
-            self.config.join("recall-echo").join("entity-root"),
+            self.config.join("recall-echo").join(name),
             format!("{}\n", root.display()),
         )
         .expect("persist");
@@ -109,7 +114,7 @@ fn a_missing_persisted_root_is_named_and_ignored() {
     let out = fx.run(&["status"], None);
     let err = stderr(&out);
     assert!(!out.status.success());
-    assert!(err.contains("ignoring persisted entity root"), "{err}");
+    assert!(err.contains("ignoring persisted pulse root"), "{err}");
     assert!(err.contains("gone"), "{err}");
     assert!(err.contains("memory/ directory not found"), "{err}");
 }
@@ -135,4 +140,32 @@ fn recall_echo_home_wins_over_a_stale_persisted_root() {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("healthy"), "{err}");
     assert!(!err.contains("ignoring persisted"), "{err}");
+}
+
+/// An install `init`-ed before 4.6.0 has only `entity-root`: it keeps
+/// resolving, and both the stderr note and the provenance line say so.
+#[test]
+fn a_legacy_entity_root_file_still_resolves_and_is_named() {
+    let fx = fixture();
+    fx.persist_as("entity-root", &fx.root);
+    let out = fx.run(&["status"], None);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("healthy"), "{err}");
+    assert!(err.contains("legacy pointer"), "{err}");
+    assert!(err.contains("legacy entity-root file"), "{err}");
+}
+
+/// Once `init` has written `pulse-root`, a leftover `entity-root` is ignored.
+#[test]
+fn the_pulse_root_file_wins_over_a_leftover_entity_root_file() {
+    let fx = fixture();
+    fx.persist(&fx.root);
+    fx.persist_as("entity-root", &fx.root.join("gone"));
+    let out = fx.run(&["status"], None);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("persisted by `recall-echo init`"), "{err}");
+    assert!(!err.contains("legacy"), "{err}");
+    assert!(!err.contains("gone"), "{err}");
 }
