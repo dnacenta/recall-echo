@@ -26,6 +26,8 @@
 
 pub mod agent_cli;
 pub mod archive;
+#[cfg(feature = "llm")]
+pub mod archive_extract;
 pub mod capture;
 pub mod checkpoint;
 pub mod cli_provider;
