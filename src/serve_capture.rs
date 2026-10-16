@@ -54,6 +54,7 @@ const MAX_ATTEMPTS: u32 = 2;
 ///
 /// Behind a trait so the scheduling — when it sweeps, when it yields, when it
 /// gives up on a file — is exercised without a store, a daemon or a CLI.
+#[allow(clippy::double_must_use, reason = "async-trait adds #[must_use]")]
 #[async_trait]
 pub trait CaptureUnit: Send + Sync {
     /// Finished, unarchived transcripts across the configured CLIs, oldest

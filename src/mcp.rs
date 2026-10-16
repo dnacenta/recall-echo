@@ -101,6 +101,7 @@ calling one speculatively costs nothing but tokens.";
 /// One method, one meaning: hand a daemon [`Request`] over, get its JSON back.
 /// The indirection exists so the protocol layer can be exercised without a
 /// store, an embedding model or a daemon.
+#[allow(clippy::double_must_use, reason = "async-trait adds #[must_use]")]
 #[async_trait::async_trait]
 pub trait GraphBackend: Send + Sync {
     /// Run a graph operation and return the daemon's `data` payload.

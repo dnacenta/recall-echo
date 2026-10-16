@@ -89,6 +89,7 @@ pub struct UnitReport {
 ///
 /// Kept behind a trait so the worker's scheduling — when it waits, when it
 /// yields, when it stops — can be exercised without a store or a model.
+#[allow(clippy::double_must_use, reason = "async-trait adds #[must_use]")]
 #[async_trait]
 pub trait ExtractionUnit: Send + Sync {
     /// Log numbers still awaiting extraction, at most `limit` of them.
