@@ -81,6 +81,7 @@ impl Completion {
 /// Implementors bridge this to their actual LLM backend:
 /// - recall-echo bridges to `echo_system_types::LmProvider`
 /// - Standalone users can implement with any HTTP client
+#[allow(clippy::double_must_use, reason = "async-trait adds #[must_use]")]
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Send a system prompt and user message, get back a text response.
