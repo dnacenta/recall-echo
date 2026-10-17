@@ -111,13 +111,18 @@ pub fn is_jsonl_transcript(path: &str) -> bool {
         })
 }
 
-/// How many non-empty lines [`is_subagent_transcript`] reads before giving up.
+/// How many lines [`is_subagent_transcript`] reads before giving up — blank
+/// lines included, so a file of newlines cannot stretch the window.
 ///
 /// On a survey of 192 real transcripts the first entry carrying `isSidechain`
 /// sat at line 2 at the latest in a subagent's file and line 8 in a session's —
 /// metadata entries (`ai-title`, `last-prompt`, `mode`, `queue-operation`, a
 /// fork's `fork-context-ref`) come first and carry no flag.
 const SIDECHAIN_SNIFF_LINES: usize = 64;
+
+/// How many bytes [`is_subagent_transcript`] reads at most. A line cap alone
+/// does not bound the read: one line can be the whole file.
+const SIDECHAIN_SNIFF_BYTES: u64 = 256 * 1024;
 
 /// Whether a Claude Code transcript belongs to a subagent rather than a session.
 ///
@@ -133,8 +138,9 @@ const SIDECHAIN_SNIFF_LINES: usize = 64;
 ///
 /// A subagent's "user" turns are the parent model's prompts, so archiving one
 /// as a session would enter model-written text as something the human said.
-/// At most [`SIDECHAIN_SNIFF_LINES`] lines are read; a file that cannot be
-/// opened is decided by its path alone.
+/// At most [`SIDECHAIN_SNIFF_LINES`] lines and [`SIDECHAIN_SNIFF_BYTES`] bytes
+/// are read, and only lines that mention `"isSidechain"` are parsed; a file
+/// that cannot be opened is decided by its path alone.
 #[must_use]
 pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
     if path
@@ -147,11 +153,11 @@ pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
     };
-    BufReader::new(file)
+    BufReader::new(file.take(SIDECHAIN_SNIFF_BYTES))
         .lines()
-        .map_while(Result::ok)
-        .filter(|line| !line.trim().is_empty())
         .take(SIDECHAIN_SNIFF_LINES)
+        .map_while(Result::ok)
+        .filter(|line| line.contains("\"isSidechain\""))
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
         .find_map(|entry| {
             entry
@@ -567,6 +573,34 @@ mod tests {
         // One line earlier and it is inside the window.
         lines.remove(0);
         let path = write_lines(dir.path(), "x/in-window.jsonl", &lines);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    /// Blank lines count toward the line cap: a run of newlines cannot push
+    /// the window past [`SIDECHAIN_SNIFF_LINES`].
+    #[test]
+    fn blank_lines_count_toward_the_sniff_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![""; SIDECHAIN_SNIFF_LINES];
+        lines.push(SUBAGENT_TURN);
+        let path = write_lines(dir.path(), "x/blank-padded.jsonl", &lines);
+        assert!(!is_subagent_transcript(&path));
+    }
+
+    /// The read is bounded in bytes too: one enormous first line ends the
+    /// sniff, however few lines it is.
+    #[test]
+    fn the_sniff_stops_at_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let padded =
+            |bytes: usize| format!(r#"{{"type":"progress","pad":"{}"}}"#, "x".repeat(bytes));
+
+        let over = padded(SIDECHAIN_SNIFF_BYTES as usize);
+        let path = write_lines(dir.path(), "x/over.jsonl", &[&over, SUBAGENT_TURN]);
+        assert!(!is_subagent_transcript(&path));
+
+        let under = padded(SIDECHAIN_SNIFF_BYTES as usize / 2);
+        let path = write_lines(dir.path(), "x/under.jsonl", &[&under, SUBAGENT_TURN]);
         assert!(is_subagent_transcript(&path));
     }
 

@@ -56,6 +56,9 @@ impl Transcript for ClaudeCodeTranscripts {
     fn discover(&self, since: Option<SystemTime>) -> Result<Vec<TranscriptRef>, RecallError> {
         let found = walk_files(&self.projects_dir, "jsonl", 0)
             .into_iter()
+            // Regular files only (a symlink to one is followed): a FIFO or a
+            // link to `/dev/zero` named `*.jsonl` would hang or feed the sniff.
+            .filter(|path| path.metadata().is_ok_and(|meta| meta.is_file()))
             .filter_map(|path| {
                 let session_id = path.file_stem()?.to_str()?.to_string();
                 Some(TranscriptRef {
@@ -172,6 +175,33 @@ mod tests {
         let found = adapter.discover(None).unwrap();
         let ids: Vec<_> = found.iter().map(|t| t.session_id.as_str()).collect();
         assert_eq!(ids, ["sess-abc"]);
+    }
+
+    /// A FIFO or a link to a device is never handed to the sniff or the
+    /// parser; a link to a real transcript still counts.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_keeps_only_regular_files() {
+        let tmp = fixture_tree();
+        let project = tmp.path().join("projects").join("-home-dev-app");
+        let status = std::process::Command::new("mkfifo")
+            .arg(project.join("fifo.jsonl"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::os::unix::fs::symlink("/dev/zero", project.join("zero.jsonl")).unwrap();
+        std::os::unix::fs::symlink(project.join("sess-abc.jsonl"), project.join("linked.jsonl"))
+            .unwrap();
+
+        let adapter = ClaudeCodeTranscripts::new(tmp.path().join("projects"));
+        let mut ids: Vec<_> = adapter
+            .discover(None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["linked", "sess-abc"]);
     }
 
     #[test]
