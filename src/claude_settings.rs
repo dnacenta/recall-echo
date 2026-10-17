@@ -64,8 +64,10 @@ pub(crate) enum Skip {
     /// rules and puts its MEMORY.md into the pulse's prompt itself.
     PulseRoot,
     /// The user these settings belong to runs pulses (the listed pulse
-    /// directories): a user-level rules file would load into every one of
-    /// their sessions, on top of the MEMORY.md pulse-null already gives them.
+    /// directories). User-level rules would load into every one of their
+    /// sessions, on top of the MEMORY.md pulse-null already gives them, and
+    /// user-level hooks would fire for every pulse and resolve to the wrong
+    /// store — pulse-null gives each pulse its own.
     PulseHome(Vec<PathBuf>),
 }
 
@@ -82,8 +84,8 @@ impl std::fmt::Display for Skip {
                 let names: Vec<String> = pulses.iter().map(|p| p.display().to_string()).collect();
                 write!(
                     f,
-                    "this user runs pulse-null pulses ({}), and a user-level rules file would \
-                     load into every pulse session",
+                    "this user runs pulse-null pulses ({}); user-level hooks and rules would \
+                     fire in every pulse session, and pulse-null gives each pulse its own",
                     names.join(", ")
                 )
             }
@@ -120,26 +122,49 @@ fn is_pulse_root(root: &Path) -> bool {
     root.join("pulse-null.toml").is_file()
 }
 
-/// The pulses under `home`, in the shape pulse-null discovers them:
-/// `<home>/pulse-null/<name>/pulse-null.toml`. Sorted, so messages are stable.
+/// The pulses under `home`, everywhere pulse-null looks for them: the flat
+/// `~/pulse-null/<name>`, the containers `~/pulse-null/pulses/<name>` and
+/// (before PN-115) `~/pulse-null/entities/<name>`, and the legacy
+/// `~/entity`. A pulse is a real directory — not a symlink — holding
+/// `pulse-null.toml`, as pulse-null's own discovery judges it. Sorted, so
+/// messages are stable.
 fn pulses_in(home: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(home.join("pulse-null")) else {
-        return Vec::new();
-    };
-    let mut pulses: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|dir| is_pulse_root(dir))
-        .collect();
+    let install = home.join("pulse-null");
+    let mut pulses: Vec<PathBuf> = [
+        install.clone(),
+        install.join("pulses"),
+        install.join("entities"),
+    ]
+    .iter()
+    .filter_map(|dir| fs::read_dir(dir).ok())
+    .flat_map(|entries| entries.filter_map(Result::ok))
+    .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+    .map(|entry| entry.path())
+    .filter(|dir| is_pulse_root(dir))
+    .collect();
+    let legacy = home.join("entity");
+    if fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.is_dir()) && is_pulse_root(&legacy) {
+        pulses.push(legacy);
+    }
     pulses.sort();
+    pulses.dedup();
     pulses
+}
+
+/// Whether `a` and `b` name the same directory.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// The one guard every Claude Code step goes through: hooks, the rules file
 /// and the auto-memory question.
 ///
-/// `Err` skips all three. A target whose [`ClaudeTarget::memory_steps`] is
-/// `Err` still gets hooks.
+/// `Err` skips all three — including when the user runs pulses and the
+/// target is their own `~/.claude`, where hooks would fire for every pulse.
+/// A target whose [`ClaudeTarget::memory_steps`] is `Err` still gets hooks.
 pub(crate) fn claude_code_target(
     roots: &paths::ConfigRoots,
     pulse_root: &Path,
@@ -148,13 +173,17 @@ pub(crate) fn claude_code_target(
     if paths::is_build_dir(roots.recall_bin()) {
         return Err(Skip::BuildDir);
     }
+    let home = roots.home();
+    let pulses = home.as_deref().map(pulses_in).unwrap_or_default();
+    let user_level = home
+        .as_deref()
+        .is_some_and(|home| same_dir(&home.join(".claude"), claude_dir));
+    if !pulses.is_empty() && user_level {
+        return Err(Skip::PulseHome(pulses));
+    }
     let memory_skip = if is_pulse_root(pulse_root) {
         Some(Skip::PulseRoot)
     } else {
-        let pulses = roots
-            .home()
-            .map(|home| pulses_in(&home))
-            .unwrap_or_default();
         (!pulses.is_empty()).then_some(Skip::PulseHome(pulses))
     };
     Ok(ClaudeTarget {
@@ -1024,30 +1053,72 @@ mod tests {
         assert_eq!(plain.memory_steps(), Ok(()));
     }
 
+    fn plant_pulse(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("pulse-null.toml"), "[pulse]\n").unwrap();
+    }
+
     #[test]
-    fn a_home_with_pulses_skips_the_memory_steps_for_any_root() {
+    fn pulses_are_found_in_every_shape_pulse_null_discovers() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        plant_pulse(&h.join("pulse-null/echo"));
+        plant_pulse(&h.join("pulse-null/pulses/synth"));
+        plant_pulse(&h.join("pulse-null/entities/old"));
+        plant_pulse(&h.join("entity"));
+        // Not pulses: no toml, and a symlink to a pulse.
+        fs::create_dir_all(h.join("pulse-null/notes")).unwrap();
+        std::os::unix::fs::symlink(h.join("pulse-null/echo"), h.join("pulse-null/alias")).unwrap();
+
+        assert_eq!(
+            pulses_in(h),
+            vec![
+                h.join("entity"),
+                h.join("pulse-null/echo"),
+                h.join("pulse-null/entities/old"),
+                h.join("pulse-null/pulses/synth"),
+            ]
+        );
+    }
+
+    /// The user runs pulses and the target is their own `~/.claude`: every
+    /// Claude Code step is skipped, hooks included.
+    #[test]
+    fn a_pulse_users_own_claude_dir_gets_no_hooks_either() {
         let tmp = tempfile::tempdir().unwrap();
         let roots = paths::ConfigRoots::sandboxed(tmp.path()).unwrap();
-        for name in ["echo", "synth"] {
-            let pulse = tmp.path().join("pulse-null").join(name);
-            fs::create_dir_all(&pulse).unwrap();
-            fs::write(pulse.join("pulse-null.toml"), "[pulse]\n").unwrap();
-        }
-        // A directory without the toml is not a pulse.
-        fs::create_dir_all(tmp.path().join("pulse-null/notes")).unwrap();
+        plant_pulse(&tmp.path().join("pulse-null/pulses/echo"));
+        let plain_root = tmp.path().join("store");
+        fs::create_dir_all(&plain_root).unwrap();
+
+        let skip = claude_code_target(&roots, &plain_root)
+            .err()
+            .expect("skipped");
+        assert_eq!(
+            skip,
+            Skip::PulseHome(vec![tmp.path().join("pulse-null/pulses/echo")])
+        );
+        assert!(skip.to_string().contains("user-level hooks"), "{skip}");
+    }
+
+    /// Pulses in the home, but a Claude Code directory elsewhere: its hooks
+    /// do not fire for the pulses, so only the memory steps are skipped.
+    #[test]
+    fn a_home_with_pulses_skips_only_the_memory_steps_for_another_claude_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        plant_pulse(&home.path().join("entity"));
+        let roots = paths::ConfigRoots::sandboxed(tmp.path())
+            .unwrap()
+            .with_home(home.path());
         let plain_root = tmp.path().join("store");
         fs::create_dir_all(&plain_root).unwrap();
 
         let target = claude_code_target(&roots, &plain_root).expect("hooks still run");
-        let skip = target.memory_steps().unwrap_err();
         assert_eq!(
-            skip,
-            &Skip::PulseHome(vec![
-                tmp.path().join("pulse-null/echo"),
-                tmp.path().join("pulse-null/synth"),
-            ])
+            target.memory_steps(),
+            Err(&Skip::PulseHome(vec![home.path().join("entity")]))
         );
-        assert!(skip.to_string().contains("pulse-null/echo"), "{skip}");
     }
 
     #[test]

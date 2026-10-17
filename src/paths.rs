@@ -422,6 +422,14 @@ impl ConfigRoots {
         self
     }
 
+    /// The same roots, as though they belonged to the user whose home is
+    /// `home` — tests place pulses there.
+    #[cfg(test)]
+    pub(crate) fn with_home(mut self, home: &Path) -> Self {
+        self.agent_home = Some(home.to_path_buf());
+        self
+    }
+
     /// The same roots, as though Claude Code's auto-memory switch read `value`.
     #[must_use]
     pub fn with_auto_memory_env(mut self, value: Option<&str>) -> Self {

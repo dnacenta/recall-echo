@@ -1304,10 +1304,11 @@ mod tests {
         assert!(!sandbox_rules(&sandbox).exists());
     }
 
-    /// The user runs pulses: no user-level rules file and no auto-memory
-    /// change, whatever root `init` is given (#75 audit B6).
+    /// The user runs pulses: no user-level hooks, rules file or auto-memory
+    /// change in their own `~/.claude`, whatever root `init` is given (#75
+    /// audit B6, M1).
     #[test]
-    fn init_skips_the_memory_steps_when_the_home_holds_pulses() {
+    fn init_skips_every_claude_code_step_when_the_home_holds_pulses() {
         let sandbox = Sandbox::new();
         let pulse = sandbox.dir.path().join("pulse-null").join("echo");
         fs::create_dir_all(&pulse).unwrap();
@@ -1326,6 +1327,9 @@ mod tests {
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
         assert!(settings.get("autoMemoryEnabled").is_none(), "{settings}");
+        // The sandbox's .claude is this user's own: no user-level hooks
+        // either, they would fire for every pulse (#75 audit M1).
+        assert!(settings.get("hooks").is_none(), "{settings}");
         assert_eq!(reader.position(), 0, "nothing asked");
     }
 
@@ -1704,19 +1708,19 @@ mod tests {
         assert_eq!(reader.position(), 0, "nothing asked");
     }
 
+    /// A pulse root outside every place pulse-null discovers pulses in the
+    /// user's home (here `<home>/elsewhere/echo`; `<home>/entity` would be
+    /// the legacy layout and skip hooks too): hooks land, the memory steps
+    /// do not run.
     #[test]
     fn auto_memory_skipped_for_pulse_root() {
         let sandbox = Sandbox::new();
-        fs::write(sandbox.pulse_root().join("pulse-null.toml"), "[pulse]\n").unwrap();
+        let pulse = sandbox.dir.path().join("elsewhere").join("echo");
+        fs::create_dir_all(&pulse).unwrap();
+        fs::write(pulse.join("pulse-null.toml"), "[pulse]\n").unwrap();
         let path = seeded_settings(&sandbox);
         let mut reader = Cursor::new(b"y\n".to_vec());
-        configure_claude_code(
-            &sandbox.roots,
-            &sandbox.pulse_root(),
-            &mut reader,
-            true,
-            None,
-        );
+        configure_claude_code(&sandbox.roots, &pulse, &mut reader, true, None);
         // Hooks still land; the memory steps do not run at all.
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
