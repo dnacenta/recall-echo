@@ -201,7 +201,34 @@ fn classify(path: &Path) -> io::Result<Existing> {
 pub fn install(claude_dir: &Path, root: &Path) -> Report {
     let mut warnings = Vec::new();
     let outcome = install_into(claude_dir, root, &mut warnings);
+    if matches!(outcome, Outcome::Refused(_)) {
+        warnings.extend(stale_import(claude_dir, root));
+    }
     Report { outcome, warnings }
+}
+
+/// A warning when a managed rules file imports some other store's MEMORY.md
+/// — for when this run did not, or could not, write it for `root`.
+///
+/// Only a warning: the file is still serving the store it names, and
+/// rewriting or deleting it here could cut that store off.
+pub(crate) fn stale_import(claude_dir: &Path, root: &Path) -> Option<String> {
+    let rules_dir = claude_dir.join("rules");
+    let path = rules_dir.join(FILE_NAME);
+    let Ok(Existing::Managed(content)) = classify(&path) else {
+        return None;
+    };
+    let ours = root.join("memory").join("MEMORY.md");
+    if imports_file(&content, &rules_dir, &ours) {
+        return None;
+    }
+    let theirs = import_tokens(&content).into_iter().next()?;
+    Some(format!(
+        "{} still imports {theirs} — Claude Code sessions load that MEMORY.md, not this \
+         store's ({}). Re-run init for the store you mean, or delete the file",
+        path.display(),
+        ours.display()
+    ))
 }
 
 fn install_into(claude_dir: &Path, root: &Path, warnings: &mut Vec<String>) -> Outcome {
@@ -763,6 +790,37 @@ mod tests {
         fs::write(dirs.claude().join("rules"), "not a directory").unwrap();
         let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_refused_install_names_the_store_the_managed_file_still_imports() {
+        let dirs = Dirs::new();
+        install(&dirs.claude(), &dirs.root("root-a"));
+        let spaced = dirs.tmp.path().join("my root");
+        fs::create_dir_all(spaced.join("memory")).unwrap();
+
+        let report = install(&dirs.claude(), &spaced);
+        assert!(matches!(report.outcome, Outcome::Refused(_)), "{report:?}");
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.contains("still imports"))
+            .expect("a stale-import warning");
+        assert!(warning.contains("root-a"), "{warning}");
+        // Left as it was: still serving root-a.
+        assert_eq!(
+            fs::read_to_string(dirs.rules()).unwrap(),
+            render(&dirs.root("root-a")).unwrap()
+        );
+    }
+
+    #[test]
+    fn stale_import_is_silent_for_the_same_store_or_no_managed_file() {
+        let dirs = Dirs::new();
+        assert_eq!(stale_import(&dirs.claude(), &dirs.root("root-a")), None);
+        install(&dirs.claude(), &dirs.root("root-a"));
+        assert_eq!(stale_import(&dirs.claude(), &dirs.root("root-a")), None);
+        assert!(stale_import(&dirs.claude(), &dirs.root("root-b")).is_some());
     }
 
     #[test]

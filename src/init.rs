@@ -443,6 +443,7 @@ fn configure_claude_code(
                 Status::Exists,
                 &format!("Skipped Claude Code hooks, rules file and auto-memory — {skip}"),
             );
+            warn_stale_import(roots.claude_dir(), pulse_root);
             return;
         }
     };
@@ -452,10 +453,19 @@ fn configure_claude_code(
             Status::Exists,
             &format!("Skipped rules file and auto-memory — {skip}"),
         );
+        warn_stale_import(Some(target.claude_dir()), pulse_root);
         return;
     }
     configure_rules(&target, pulse_root);
     configure_auto_memory(&target, reader, interactive, env_disable);
+}
+
+/// After a skipped rules step: say so if a managed rules file is loading some
+/// other store's MEMORY.md into every session.
+fn warn_stale_import(claude_dir: Option<&Path>, pulse_root: &Path) {
+    if let Some(warning) = claude_dir.and_then(|dir| rules_file::stale_import(dir, pulse_root)) {
+        print_status(Status::Exists, &warning);
+    }
 }
 
 /// Install or repair the three hooks in the target's settings.json.
