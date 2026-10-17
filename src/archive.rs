@@ -561,13 +561,24 @@ pub fn run_with_hook_input(
     Ok(())
 }
 
+/// [`archive_all_unarchived_at`] with no `--pulse-root`.
+pub fn archive_all_unarchived() -> Result<(), RecallError> {
+    archive_all_unarchived_at(None)
+}
+
 /// Archive every unarchived Claude Code session under `~/.claude/projects/`.
 ///
-/// Archives land in the store the hooks write to — `<root>/memory` once
-/// `init` has pinned a root — not in `~/.claude` itself, which is the pre-4.x
-/// layout nothing reads any more.
-pub fn archive_all_unarchived() -> Result<(), RecallError> {
-    let memory_dir = crate::paths::resolved_hook_base_dir(None)?;
+/// The store is `pulse_root` when given, else `RECALL_ECHO_HOME`, else the
+/// root `init` persisted, else the legacy `~/.claude` — never the current
+/// directory, which the hooks consult but a batch import must not
+/// ([`crate::paths::batch_archive_base_dir`]). The chosen store and why are
+/// printed before anything is written.
+pub fn archive_all_unarchived_at(pulse_root: Option<&Path>) -> Result<(), RecallError> {
+    let (memory_dir, why) = crate::paths::batch_archive_base_dir(pulse_root)?;
+    eprintln!(
+        "recall-echo: archiving into {} ({why})",
+        memory_dir.display()
+    );
     let transcripts = ClaudeCodeTranscripts::detect()
         .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
     archive_all_with(&memory_dir, &transcripts)
