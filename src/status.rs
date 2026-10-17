@@ -66,6 +66,17 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
             issues.push(format!("MEMORY.md approaching limit ({pct}%)"));
         }
         let content = fs::read_to_string(&memory_path).unwrap_or_default();
+        eprintln!(
+            "                  {DIM}{} — loaded into every Claude Code session{RESET}",
+            crate::distill::size_summary(&content)
+        );
+        if content.len() > crate::distill::DISTILL_AFTER_BYTES {
+            issues.push(format!(
+                "MEMORY.md is {} KB, over the {} KB budget — run distill",
+                content.len() / 1024,
+                crate::distill::DISTILL_AFTER_BYTES / 1024
+            ));
+        }
         issues.extend(crate::rules_file::hidden_import_warning(&content));
     } else {
         eprintln!("  MEMORY.md       {DIM}not found{RESET}");

@@ -914,6 +914,14 @@ pub fn run_with(
     // Write MEMORY.md (never overwrite)
     write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
     if let Ok(content) = fs::read_to_string(memory_dir.join("MEMORY.md")) {
+        print_status(
+            Status::Exists,
+            &format!(
+                "MEMORY.md is {} lines, {} — loaded into every Claude Code session",
+                content.lines().count(),
+                crate::distill::size_summary(&content)
+            ),
+        );
         if let Some(warning) = rules_file::hidden_import_warning(&content) {
             print_status(Status::Exists, &warning);
         }
