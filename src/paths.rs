@@ -287,16 +287,6 @@ pub enum PersistOutcome {
     Skipped(&'static str),
 }
 
-/// The global destinations `init` writes to, resolved once and passed down.
-///
-/// `init` touches three things nobody named on the command line: the Claude
-/// Code hook file (`~/.claude/settings.json`), the persisted pulse root
-/// (`$XDG_CONFIG_HOME/recall-echo/pulse-root`), and — through the agent CLIs
-/// it shells out to — their own user config. Resolving those paths inside each
-/// writer left a caller no way to redirect them, and the test suite rewrote the
-/// developer's real configuration on every run (#59). They are an input now,
-/// together with the binary path those files are written to point at.
-///
 /// Whether stdin and stderr are both terminals.
 ///
 /// stderr alone is not enough — with stdin piped, a blank line in the pipe
@@ -307,6 +297,16 @@ fn stdio_is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// The global destinations `init` writes to, resolved once and passed down.
+///
+/// `init` touches three things nobody named on the command line: the Claude
+/// Code hook file (`~/.claude/settings.json`), the persisted pulse root
+/// (`$XDG_CONFIG_HOME/recall-echo/pulse-root`), and — through the agent CLIs
+/// it shells out to — their own user config. Resolving those paths inside each
+/// writer left a caller no way to redirect them, and the test suite rewrote the
+/// developer's real configuration on every run (#59). They are an input now,
+/// together with the binary path those files are written to point at.
+///
 /// Construct with [`ConfigRoots::from_env`] in production and
 /// [`ConfigRoots::sandboxed`] anywhere the writes must not escape a directory.
 #[derive(Debug, Clone)]
