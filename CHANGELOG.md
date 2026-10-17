@@ -14,21 +14,45 @@ changes a user has to know about before upgrading.
   EPHEMERAL.md window and entered the parent model's prompts into the graph
   as `user` evidence.
   - A transcript is a subagent's when its directory is `subagents`, or when
-    the first entry carrying `isSidechain` within its first 64 lines has it
-    `true` (a fork's transcript opens with an unflagged `fork-context-ref`).
-  - Capture, `ingest` and `archive --all-unarchived` skip them; the
-    SessionEnd and PreCompact hooks decline them with one stderr line and
-    exit 0.
+    the first entry carrying `isSidechain` has it `true` (a fork's
+    transcript opens with an unflagged `fork-context-ref`). The read is
+    bounded: 64 lines, blank ones included, and 256 KiB; only lines
+    mentioning `"isSidechain"` are parsed, and an undecodable line is
+    skipped rather than ending the read.
+  - Discovery sets aside `subagents/` files by layout, unread. The flag is
+    read only for transcripts not already archived, so finished sessions
+    are not re-read on every sweep. Capture, `ingest` and
+    `archive --all-unarchived` skip both kinds; the SessionEnd and
+    PreCompact hooks decline them with one stderr line and exit 0.
   - Already-written subagent archives are left in place; pruning them is
     #76. EPHEMERAL.md clears itself within five real sessions.
-- `archive --all-unarchived` writes into the store the hooks write to
-  (`<root>/memory`), not `~/.claude/conversations`. On a 4.x install it used
-  to fail with "conversations/ directory not found".
+- `archive --all-unarchived` writes into `--pulse-root`, `RECALL_ECHO_HOME`
+  or the root `init` persisted — never a store taken from the current
+  directory, so a cloned repo or a legacy `~/.claude` that looks initialised
+  cannot receive every unarchived session — and names the store and why
+  before writing. It used to write `~/.claude/conversations`, which on a 4.x
+  install failed with "conversations/ directory not found".
+- Claude Code discovery reads regular files only: a FIFO or a link to a
+  device named `*.jsonl` is skipped instead of hanging the sweep.
 
 ### Added
 
-- `jsonl::is_subagent_transcript`, `archive::archive_all_with`,
-  `checkpoint::run_with_hook_input`.
+- `archive --all-unarchived --pulse-root <dir>` (alias `--entity-root`).
+- Skipped subagent runs are counted: `Pending::subagents_skipped`,
+  `CaptureReport::subagents_skipped`, shown by `ingest` and
+  `archive --all-unarchived`. With `RECALL_ECHO_DEBUG` set, each skip is
+  named on stderr with the signal that caught it.
+- `jsonl::is_subagent_transcript`, `jsonl::in_subagents_dir`,
+  `jsonl::flags_sidechain`, `jsonl::report_declined_subagent`,
+  `Transcript::is_sub_run`, `Transcript::discover_with_skipped` (both
+  provided), `archive::archive_all_with`, `archive::archive_all_unarchived_at`,
+  `paths::batch_archive_base_dir`, `checkpoint::run_with_hook_input`.
+
+### Changed
+
+- `capture::pending` checks the archive before the settle time: a live
+  transcript whose session is already archived counts as a duplicate, not
+  as active.
 
 ### Deprecated
 
