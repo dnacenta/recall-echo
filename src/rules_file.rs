@@ -206,6 +206,9 @@ fn install_into(claude_dir: &Path, root: &Path, warnings: &mut Vec<String>) -> O
         Ok(dir) => dir,
         Err(why) => return Outcome::Refused(why),
     };
+    if let Err(why) = vet_store(&root) {
+        return Outcome::Refused(why);
+    }
     let import_line = import_for(&memory_dir);
     let content = render_with(&memory_dir, &import_line);
     let rules_dir = claude_dir.join("rules");
@@ -226,6 +229,54 @@ fn install_into(claude_dir: &Path, root: &Path, warnings: &mut Vec<String>) -> O
         Ok(()) => Outcome::Written(path),
         Err(e) => Outcome::Failed(format!("could not write {}: {e}", path.display())),
     }
+}
+
+/// Whether what the import would load is this user's alone.
+///
+/// The rules file puts MEMORY.md into every Claude Code session, so anyone
+/// who can write the root, `memory/` or MEMORY.md itself — or swap MEMORY.md
+/// for a symlink — could put words into every session. The root and
+/// `memory/` must be directories this user owns that no other user can write
+/// into ([`crate::paths::trusted_root`]); MEMORY.md, when it exists, a
+/// regular file held to the same standard.
+fn vet_store(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let memory = root.join("memory");
+    for dir in [root, memory.as_path()] {
+        crate::paths::trusted_root(dir)
+            .map_err(|reason| format!("{} {reason} — refusing to import from it", dir.display()))?;
+    }
+    let memory_md = memory.join("MEMORY.md");
+    let meta = match fs::symlink_metadata(&memory_md) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot inspect {}: {e}", memory_md.display())),
+    };
+    let refuse = |reason: String| {
+        Err(format!(
+            "{} {reason} — refusing to import it",
+            memory_md.display()
+        ))
+    };
+    if meta.file_type().is_symlink() {
+        return refuse("is a symlink".to_string());
+    }
+    if !meta.is_file() {
+        return refuse("is not a regular file".to_string());
+    }
+    let uid = crate::serve_security::current_uid().map_err(|e| e.to_string())?;
+    if meta.uid() != uid {
+        return refuse(format!("is owned by uid {}, not {uid}", meta.uid()));
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        return refuse(format!(
+            "is writable by other users (mode {:04o})",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
 }
 
 /// Create `rules_dir` owner-only, or vet the one that is there.
@@ -363,8 +414,14 @@ mod tests {
     impl Dirs {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
-            for sub in [".claude", "root-a", "root-b"] {
+            for sub in [".claude", "root-a/memory", "root-b/memory"] {
                 fs::create_dir_all(tmp.path().join(sub)).unwrap();
+            }
+            // Independent of the umask: the trust checks refuse group-writable.
+            for sub in ["root-a", "root-a/memory", "root-b", "root-b/memory"] {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(tmp.path().join(sub), fs::Permissions::from_mode(0o755))
+                    .unwrap();
             }
             Self { tmp }
         }
@@ -518,6 +575,70 @@ mod tests {
 
         let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert!(matches!(outcome, Outcome::Unmanaged { .. }), "{outcome:?}");
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn assert_refused_without_writing(dirs: &Dirs, root: &Path, needle: &str) {
+        let outcome = install(&dirs.claude(), root).outcome;
+        match outcome {
+            Outcome::Refused(why) => assert!(why.contains(needle), "{why}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(!dirs.rules().exists());
+    }
+
+    #[test]
+    fn install_refuses_a_root_others_can_write() {
+        let dirs = Dirs::new();
+        chmod(&dirs.root("root-a"), 0o777);
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by other users");
+    }
+
+    #[test]
+    fn install_refuses_a_memory_dir_others_can_write() {
+        let dirs = Dirs::new();
+        chmod(&dirs.root("root-a").join("memory"), 0o775);
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by other users");
+    }
+
+    #[test]
+    fn install_refuses_a_missing_memory_dir() {
+        let dirs = Dirs::new();
+        fs::remove_dir(dirs.root("root-a").join("memory")).unwrap();
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "cannot be resolved");
+    }
+
+    #[test]
+    fn install_refuses_a_symlinked_memory_md() {
+        let dirs = Dirs::new();
+        let elsewhere = dirs.tmp.path().join("elsewhere.md");
+        fs::write(&elsewhere, "planted\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dirs.root("root-a").join("memory/MEMORY.md"))
+            .unwrap();
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "is a symlink");
+    }
+
+    #[test]
+    fn install_refuses_a_memory_md_others_can_write() {
+        let dirs = Dirs::new();
+        let memory_md = dirs.root("root-a").join("memory/MEMORY.md");
+        fs::write(&memory_md, "# Memory\n").unwrap();
+        chmod(&memory_md, 0o666);
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by other users");
+    }
+
+    #[test]
+    fn install_accepts_an_ordinary_memory_md() {
+        let dirs = Dirs::new();
+        let memory_md = dirs.root("root-a").join("memory/MEMORY.md");
+        fs::write(&memory_md, "# Memory\n").unwrap();
+        chmod(&memory_md, 0o644);
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
+        assert_eq!(outcome, Outcome::Written(dirs.rules()));
     }
 
     #[test]
