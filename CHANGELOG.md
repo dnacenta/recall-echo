@@ -53,6 +53,12 @@ changes a user has to know about before upgrading.
 - `capture::pending` checks the archive before the settle time: a live
   transcript whose session is already archived counts as a duplicate, not
   as active.
+- **Source-breaking for struct literals:** `capture::Pending` and
+  `capture::CaptureReport` gain a public `subagents_skipped` field. Both have
+  only public fields and no `#[non_exhaustive]`, so code that builds either
+  with a struct literal not ending in `..Default::default()` stops
+  compiling. Field access and `Default` are unaffected. Both become
+  `#[non_exhaustive]` in v5.
 
 ### Deprecated
 
