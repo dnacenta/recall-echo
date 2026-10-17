@@ -46,7 +46,8 @@ changes a user has to know about before upgrading.
 - `jsonl::is_subagent_transcript`, `jsonl::in_subagents_dir`,
   `jsonl::flags_sidechain`, `jsonl::report_declined_subagent`,
   `Transcript::is_sub_run`, `Transcript::discover_with_skipped` (both
-  provided), `archive::archive_all_with`, `archive::archive_all_unarchived_at`,
+  provided), `archive::archive_all_with` (returns `archive::BatchArchiveReport`,
+  `#[non_exhaustive]`), `archive::archive_all_unarchived_at`,
   `paths::batch_archive_base_dir`, `checkpoint::run_with_hook_input`.
 
 ### Changed
