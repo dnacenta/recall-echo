@@ -271,52 +271,106 @@ fn install_into(claude_dir: &Path, root: &Path, warnings: &mut Vec<String>) -> O
     }
 }
 
+/// Why users other than the owner could write a path with this `mode` and
+/// group `gid`, or `None` when they cannot.
+///
+/// Write for everyone is always foreign. Group write is not when the group
+/// is the owner's private group (`private_group`): on Ubuntu and Fedora a
+/// 0002 umask makes everything a user creates group-writable, and that group
+/// holds nobody else.
+fn foreign_write(mode: u32, gid: u32, private_group: Option<u32>) -> Option<String> {
+    let mode = mode & 0o7777;
+    if mode & 0o002 != 0 {
+        return Some(format!("is writable by every user (mode {mode:04o})"));
+    }
+    if mode & 0o020 != 0 && private_group != Some(gid) {
+        let group = crate::serve_security::group_name(gid).map_or_else(
+            || format!("gid {gid}"),
+            |name| format!("group {name} (gid {gid})"),
+        );
+        return Some(format!(
+            "is writable by {group}, which is not your private group (mode {mode:04o})"
+        ));
+    }
+    None
+}
+
+/// The checks one path of the store must pass: owned by `uid`, and no write
+/// access for anyone else. The refusal names the `chmod` that fixes it.
+fn check_private(
+    path: &Path,
+    meta: &fs::Metadata,
+    uid: u32,
+    private_group: Option<u32>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if meta.uid() != uid {
+        return Err(format!(
+            "{} is owned by uid {}, not you (uid {uid}) — refusing to import from it",
+            path.display(),
+            meta.uid()
+        ));
+    }
+    if let Some(reason) = foreign_write(meta.mode(), meta.gid(), private_group) {
+        return Err(format!(
+            "{} {reason} — refusing to import from it. Fix: chmod g-w,o-w {}",
+            path.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Whether what the import would load is this user's alone.
 ///
 /// The rules file puts MEMORY.md into every Claude Code session, so anyone
 /// who can write the root, `memory/` or MEMORY.md itself — or swap MEMORY.md
 /// for a symlink — could put words into every session. The root and
-/// `memory/` must be directories this user owns that no other user can write
-/// into ([`crate::paths::trusted_root`]); MEMORY.md, when it exists, a
-/// regular file held to the same standard.
+/// `memory/` must be directories, and MEMORY.md (when it exists) a regular
+/// file, each owned by this user and writable by nobody else ([`foreign_write`]).
 fn vet_store(root: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let uid = crate::serve_security::current_uid().map_err(|e| e.to_string())?;
+    let private_group = crate::serve_security::private_group(uid);
 
     let memory = root.join("memory");
     for dir in [root, memory.as_path()] {
-        crate::paths::trusted_root(dir)
-            .map_err(|reason| format!("{} {reason} — refusing to import from it", dir.display()))?;
+        let canonical = fs::canonicalize(dir).map_err(|e| {
+            format!(
+                "{} cannot be resolved ({e}) — refusing to import from it",
+                dir.display()
+            )
+        })?;
+        let meta = fs::symlink_metadata(&canonical)
+            .map_err(|e| format!("cannot inspect {}: {e}", canonical.display()))?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "{} is not a directory — refusing to import from it",
+                canonical.display()
+            ));
+        }
+        check_private(&canonical, &meta, uid, private_group)?;
     }
+
     let memory_md = memory.join("MEMORY.md");
     let meta = match fs::symlink_metadata(&memory_md) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("cannot inspect {}: {e}", memory_md.display())),
     };
-    let refuse = |reason: String| {
-        Err(format!(
-            "{} {reason} — refusing to import it",
-            memory_md.display()
-        ))
-    };
     if meta.file_type().is_symlink() {
-        return refuse("is a symlink".to_string());
-    }
-    if !meta.is_file() {
-        return refuse("is not a regular file".to_string());
-    }
-    let uid = crate::serve_security::current_uid().map_err(|e| e.to_string())?;
-    if meta.uid() != uid {
-        return refuse(format!("is owned by uid {}, not {uid}", meta.uid()));
-    }
-    let mode = meta.permissions().mode();
-    if mode & 0o022 != 0 {
-        return refuse(format!(
-            "is writable by other users (mode {:04o})",
-            mode & 0o7777
+        return Err(format!(
+            "{} is a symlink — refusing to import it",
+            memory_md.display()
         ));
     }
-    Ok(())
+    if !meta.is_file() {
+        return Err(format!(
+            "{} is not a regular file — refusing to import it",
+            memory_md.display()
+        ));
+    }
+    check_private(&memory_md, &meta, uid, private_group)
 }
 
 /// The `@` import tokens in a memory file, as Claude Code would see them:
@@ -404,20 +458,21 @@ fn imports_file(content: &str, dir: &Path, target: &Path) -> bool {
 /// other users can write into, or that someone else owns, lets them plant
 /// rules Claude Code will load into every session — that is worth saying.
 fn ensure_rules_dir(rules_dir: &Path, warnings: &mut Vec<String>) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     match fs::metadata(rules_dir) {
         Ok(meta) => {
-            let mode = meta.permissions().mode();
-            if mode & 0o022 != 0 {
+            let uid = crate::serve_security::current_uid().ok();
+            let private_group = uid.and_then(crate::serve_security::private_group);
+            if let Some(reason) = foreign_write(meta.mode(), meta.gid(), private_group) {
                 warnings.push(format!(
-                    "{} is writable by other users (mode {:04o}) — anyone who can write \
-                     there can add rules to every Claude Code session",
+                    "{} {reason} — anyone who can write there can add rules to every \
+                     Claude Code session. Fix: chmod g-w,o-w {}",
                     rules_dir.display(),
-                    mode & 0o7777
+                    rules_dir.display()
                 ));
             }
-            if let Ok(uid) = crate::serve_security::current_uid() {
+            if let Some(uid) = uid {
                 if meta.uid() != uid {
                     warnings.push(format!(
                         "{} is owned by uid {}, not you (uid {uid})",
@@ -553,6 +608,14 @@ mod tests {
         fn rules(&self) -> PathBuf {
             self.claude().join("rules").join(FILE_NAME)
         }
+        /// Write `root`'s MEMORY.md 0644, whatever the umask.
+        fn write_memory_md(&self, root: &str, content: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.root(root).join("memory/MEMORY.md");
+            fs::write(&path, content).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            path
+        }
     }
 
     #[test]
@@ -657,7 +720,7 @@ mod tests {
             format!("# mine\n\n@{}/memory/MEMORY.md\n", alias.display()),
         )
         .unwrap();
-        fs::write(dirs.root("root-a").join("memory/MEMORY.md"), "# Memory\n").unwrap();
+        dirs.write_memory_md("root-a", "# Memory\n");
 
         let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert_eq!(outcome, Outcome::UnmanagedImports(dirs.rules()));
@@ -667,8 +730,7 @@ mod tests {
     fn an_import_of_another_store_or_inside_code_still_gets_the_advice() {
         let dirs = Dirs::new();
         fs::create_dir_all(dirs.claude().join("rules")).unwrap();
-        let ours = dirs.root("root-a").join("memory/MEMORY.md");
-        fs::write(&ours, "# Memory\n").unwrap();
+        let ours = dirs.write_memory_md("root-a", "# Memory\n");
         fs::write(
             dirs.rules(),
             format!(
@@ -763,7 +825,7 @@ mod tests {
             report
                 .warnings
                 .iter()
-                .any(|w| w.contains("writable by other users")),
+                .any(|w| w.contains("writable by every user")),
             "{:?}",
             report.warnings
         );
@@ -802,14 +864,72 @@ mod tests {
     fn install_refuses_a_root_others_can_write() {
         let dirs = Dirs::new();
         chmod(&dirs.root("root-a"), 0o777);
-        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by other users");
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by every user");
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "Fix: chmod g-w,o-w");
     }
 
     #[test]
-    fn install_refuses_a_memory_dir_others_can_write() {
+    fn install_refuses_a_memory_dir_every_user_can_write() {
         let dirs = Dirs::new();
-        chmod(&dirs.root("root-a").join("memory"), 0o775);
-        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by other users");
+        chmod(&dirs.root("root-a").join("memory"), 0o777);
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by every user");
+    }
+
+    #[test]
+    fn group_write_is_foreign_unless_the_group_is_the_users_private_one() {
+        assert_eq!(foreign_write(0o755, 1000, Some(1000)), None);
+        assert_eq!(foreign_write(0o775, 1000, Some(1000)), None);
+        assert_eq!(
+            foreign_write(0o40775, 1000, Some(1000)),
+            None,
+            "file-type bits ignored"
+        );
+        let shared = foreign_write(0o775, 1000, Some(1001)).expect("a shared group");
+        assert!(shared.contains("not your private group"), "{shared}");
+        assert!(
+            foreign_write(0o775, 1000, None).is_some(),
+            "no private group known"
+        );
+        let everyone = foreign_write(0o757, 1000, Some(1000)).expect("others-write");
+        assert!(everyone.contains("every user"), "{everyone}");
+    }
+
+    /// Ubuntu and Fedora: umask 0002 under a user-private group makes the
+    /// whole store group-writable, and that is fine.
+    #[test]
+    fn install_accepts_a_store_group_writable_by_the_users_private_group() {
+        use std::os::unix::fs::MetadataExt;
+        let dirs = Dirs::new();
+        let uid = crate::serve_security::current_uid().unwrap();
+        let root = dirs.root("root-a");
+        let Some(private) = crate::serve_security::private_group(uid) else {
+            eprintln!("skipped: this account has no private group");
+            return;
+        };
+        if fs::metadata(&root).unwrap().gid() != private {
+            eprintln!("skipped: test files are not created in the private group");
+            return;
+        }
+        let memory_md = dirs.write_memory_md("root-a", "# Memory\n");
+        chmod(&root, 0o775);
+        chmod(&root.join("memory"), 0o775);
+        chmod(&memory_md, 0o664);
+        let outcome = install(&dirs.claude(), &root).outcome;
+        assert_eq!(outcome, Outcome::Written(dirs.rules()));
+    }
+
+    #[test]
+    fn install_refuses_a_store_group_writable_by_a_shared_group() {
+        let dirs = Dirs::new();
+        let memory = dirs.root("root-a").join("memory");
+        // Needs the right to hand the directory to another group: root can.
+        if std::os::unix::fs::chown(&memory, None, Some(65534)).is_err() {
+            eprintln!("skipped: cannot chgrp to a shared group here");
+            return;
+        }
+        chmod(&memory, 0o775);
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "not your private group");
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "Fix: chmod g-w,o-w");
     }
 
     #[test]
@@ -832,17 +952,15 @@ mod tests {
     #[test]
     fn install_refuses_a_memory_md_others_can_write() {
         let dirs = Dirs::new();
-        let memory_md = dirs.root("root-a").join("memory/MEMORY.md");
-        fs::write(&memory_md, "# Memory\n").unwrap();
+        let memory_md = dirs.write_memory_md("root-a", "# Memory\n");
         chmod(&memory_md, 0o666);
-        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by other users");
+        assert_refused_without_writing(&dirs, &dirs.root("root-a"), "writable by every user");
     }
 
     #[test]
     fn install_accepts_an_ordinary_memory_md() {
         let dirs = Dirs::new();
-        let memory_md = dirs.root("root-a").join("memory/MEMORY.md");
-        fs::write(&memory_md, "# Memory\n").unwrap();
+        let memory_md = dirs.write_memory_md("root-a", "# Memory\n");
         chmod(&memory_md, 0o644);
         let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert_eq!(outcome, Outcome::Written(dirs.rules()));

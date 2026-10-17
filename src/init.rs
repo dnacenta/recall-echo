@@ -119,9 +119,19 @@ fn notice_legacy_conversations(pulse_root: &Path, new_dir: &Path) {
     }
 }
 
+/// Create `path` (and any missing parents) owner-only.
+///
+/// Explicit, not the umask's: under the 0002 umask Ubuntu and Fedora give
+/// login shells, a default directory is group-writable — and the rules file
+/// refuses to import from a store anyone but its owner could write.
 fn ensure_dir(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
     if !path.exists() {
-        if let Err(e) = fs::create_dir_all(path) {
+        if let Err(e) = fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+        {
             print_status(
                 Status::Error,
                 &format!("Failed to create {}: {e}", path.display()),
@@ -137,7 +147,15 @@ fn write_if_not_exists(path: &Path, content: &str, label: &str) {
             &format!("{label} already exists — preserved"),
         );
     } else {
-        match fs::write(path, content) {
+        // Owner-only from birth, whatever the umask (see `ensure_dir`).
+        use std::os::unix::fs::OpenOptionsExt;
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut file| file.write_all(content.as_bytes()));
+        match written {
             Ok(()) => print_status(Status::Created, &format!("Created {label}")),
             Err(e) => print_status(Status::Error, &format!("Failed to create {label}: {e}")),
         }
@@ -1028,6 +1046,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let entity = dir.path().join("entity");
             fs::create_dir_all(&entity).unwrap();
+            // Independent of the umask: the rules file refuses a root anyone
+            // else can write (#75 audit H1).
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&entity, fs::Permissions::from_mode(0o755)).unwrap();
+            }
             let roots = paths::ConfigRoots::sandboxed(dir.path()).unwrap();
             Self { dir, roots }
         }
@@ -1052,6 +1076,27 @@ mod tests {
         assert!(root.join("memory/EPHEMERAL.md").exists());
         assert!(root.join("memory/ARCHIVE.md").exists());
         assert!(root.join("memory/conversations").exists());
+    }
+
+    /// `init` makes its store owner-only whatever the umask: memory/ and
+    /// conversations/ 0700, MEMORY.md, EPHEMERAL.md and ARCHIVE.md 0600 —
+    /// so the rules step never refuses the store `init` just created (H1).
+    #[test]
+    fn init_creates_the_store_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+        let memory = sandbox.pulse_root().join("memory");
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(memory.clone()), 0o700);
+        assert_eq!(mode(memory.join("conversations")), 0o700);
+        for file in ["MEMORY.md", "EPHEMERAL.md", "ARCHIVE.md"] {
+            assert_eq!(mode(memory.join(file)), 0o600, "{file}");
+        }
+        assert!(
+            sandbox_rules(&sandbox).exists(),
+            "the rules step accepted it"
+        );
     }
 
     /// Everything `init` writes outside the pulse root lands in the sandbox:
@@ -1596,6 +1641,10 @@ mod tests {
         let sandbox = Sandbox::new();
         let memory = sandbox.pulse_root().join("memory");
         fs::create_dir_all(&memory).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&memory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(
             memory.join(".recall-echo.toml"),
             "[llm]\nprovider = \"ollama\"\n",

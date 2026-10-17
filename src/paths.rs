@@ -650,7 +650,7 @@ fn resolve_root_source(
 /// write into. Returns the canonical path. The persisted file is plain text
 /// the test suite has been known to overwrite with a `/tmp` path (#59) — a
 /// directory anyone can recreate there must never win.
-pub(crate) fn trusted_root(root: &Path) -> Result<PathBuf, String> {
+fn trusted_root(root: &Path) -> Result<PathBuf, String> {
     if !root.is_absolute() {
         return Err("is not an absolute path".into());
     }
