@@ -125,60 +125,80 @@ fn is_format_char(c: char) -> bool {
     )
 }
 
+/// The import line for a memory directory `memory_dir` already vetted.
+fn import_for(memory_dir: &str) -> String {
+    format!("@{memory_dir}/MEMORY.md")
+}
+
+/// The template with this store's paths filled in.
+fn render_with(memory_dir: &str, import_line: &str) -> String {
+    TEMPLATE
+        .replace("{{MARKER}}", MARKER)
+        .replace("{{MEMORY_IMPORT}}", import_line)
+        .replace("{{MEMORY_DIR}}", memory_dir)
+}
+
 /// The one line that puts MEMORY.md into every session.
+#[cfg(test)]
 pub fn import_line(root: &Path) -> Result<String, String> {
-    memory_dir(root).map(|dir| format!("@{dir}/MEMORY.md"))
+    memory_dir(root).map(|dir| import_for(&dir))
 }
 
 /// Render the rules file for the store at `root` (a pulse root, canonical).
+#[cfg(test)]
 pub fn render(root: &Path) -> Result<String, String> {
     let memory_dir = memory_dir(root)?;
-    Ok(TEMPLATE
-        .replace("{{MARKER}}", MARKER)
-        .replace("{{MEMORY_IMPORT}}", &format!("@{memory_dir}/MEMORY.md"))
-        .replace("{{MEMORY_DIR}}", &memory_dir))
+    Ok(render_with(&memory_dir, &import_for(&memory_dir)))
+}
+
+/// What is at the rules path now.
+enum Existing {
+    Absent,
+    /// A file this module wrote, with its content.
+    Managed(String),
+    /// The user's: a file without the marker, or a symlink.
+    Unmanaged,
+}
+
+fn classify(path: &Path) -> io::Result<Existing> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Existing::Absent),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(Existing::Unmanaged);
+    }
+    let content = fs::read_to_string(path)?;
+    Ok(if is_managed(&content) {
+        Existing::Managed(content)
+    } else {
+        Existing::Unmanaged
+    })
 }
 
 /// Write or refresh `<claude_dir>/rules/recall-echo.md` for the store at `root`.
 ///
-/// Absent: written. Ours (first line opens with the marker token): rewritten only when it
-/// differs from what renders now. Anything else at that path, a symlink
-/// included, belongs to the user and is never replaced.
+/// Absent: written. Ours (first line opens with the marker token): rewritten
+/// only when it differs from what renders now. Anything else at that path, a
+/// symlink included, belongs to the user and is never replaced.
 pub fn install(claude_dir: &Path, root: &Path) -> Outcome {
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let content = match render(&root) {
-        Ok(content) => content,
+    let memory_dir = match memory_dir(&root) {
+        Ok(dir) => dir,
         Err(why) => return Outcome::Refused(why),
     };
+    let import_line = import_for(&memory_dir);
+    let content = render_with(&memory_dir, &import_line);
     let rules_dir = claude_dir.join("rules");
     let path = rules_dir.join(FILE_NAME);
 
-    match fs::symlink_metadata(&path) {
-        Ok(meta) => {
-            let existing = if meta.file_type().is_symlink() {
-                None
-            } else {
-                match fs::read_to_string(&path) {
-                    Ok(existing) => Some(existing),
-                    Err(e) => {
-                        return Outcome::Failed(format!("could not read {}: {e}", path.display()))
-                    }
-                }
-            };
-            match existing {
-                Some(existing) if is_managed(&existing) => {
-                    if existing == content {
-                        return Outcome::Unchanged(path);
-                    }
-                }
-                _ => {
-                    let import_line = import_line(&root).unwrap_or_default();
-                    return Outcome::Unmanaged { path, import_line };
-                }
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Outcome::Failed(format!("could not inspect {}: {e}", path.display())),
+    match classify(&path) {
+        Ok(Existing::Absent) => {}
+        Ok(Existing::Managed(existing)) if existing == content => return Outcome::Unchanged(path),
+        Ok(Existing::Managed(_)) => {}
+        Ok(Existing::Unmanaged) => return Outcome::Unmanaged { path, import_line },
+        Err(e) => return Outcome::Failed(format!("could not read {}: {e}", path.display())),
     }
 
     if let Err(e) = fs::create_dir_all(&rules_dir) {

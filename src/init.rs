@@ -31,7 +31,7 @@
 //!
 //! - hooks are matched by command name, so re-running never duplicates one;
 //! - the rules file carries a marker line, so only a file `init` wrote is ever
-//!   rewritten (see [`crate::rules_file`]);
+//!   rewritten (see `rules_file`);
 //! - MCP servers live in a map keyed by name in every client, so re-registering
 //!   the same name is a no-op (see [`crate::agent_cli`]);
 //! - the model is a content-addressed cache, so a second warm is a no-op.

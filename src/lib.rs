@@ -45,7 +45,7 @@ pub mod inspect_cli;
 pub mod jsonl;
 pub mod mcp;
 pub mod paths;
-pub mod rules_file;
+pub(crate) mod rules_file;
 pub mod search;
 pub mod serve;
 pub mod serve_capture;
