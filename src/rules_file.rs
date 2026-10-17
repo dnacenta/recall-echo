@@ -25,6 +25,19 @@ use std::path::{Path, PathBuf};
 /// the user's own and is never touched.
 pub const MARKER: &str = "<!-- recall-echo:managed — rewritten by `recall-echo init`; delete this line to keep your own edits -->";
 
+/// What identifies [`MARKER`]: the line's fixed opening, so the prose after
+/// it can be reworded in a later release without orphaning every file an
+/// earlier one wrote.
+const MARKER_TOKEN: &str = "<!-- recall-echo:managed";
+
+/// Whether `content` is a file this module wrote.
+fn is_managed(content: &str) -> bool {
+    content
+        .lines()
+        .next()
+        .is_some_and(|first| first.starts_with(MARKER_TOKEN))
+}
+
 /// The file's name under `<claude_dir>/rules/`.
 pub const FILE_NAME: &str = "recall-echo.md";
 
@@ -86,7 +99,7 @@ pub fn render(root: &Path) -> Result<String, String> {
 
 /// Write or refresh `<claude_dir>/rules/recall-echo.md` for the store at `root`.
 ///
-/// Absent: written. Ours (first line is [`MARKER`]): rewritten only when it
+/// Absent: written. Ours (first line opens with the marker token): rewritten only when it
 /// differs from what renders now. Anything else at that path, a symlink
 /// included, belongs to the user and is never replaced.
 pub fn install(claude_dir: &Path, root: &Path) -> Outcome {
@@ -111,7 +124,7 @@ pub fn install(claude_dir: &Path, root: &Path) -> Outcome {
                 }
             };
             match existing {
-                Some(existing) if existing.lines().next() == Some(MARKER) => {
+                Some(existing) if is_managed(&existing) => {
                     if existing == content {
                         return Outcome::Unchanged(path);
                     }
@@ -254,6 +267,26 @@ mod tests {
         install(&dirs.claude(), &dirs.root("root-a"));
         let outcome = install(&dirs.claude(), &dirs.root("root-a"));
         assert_eq!(outcome, Outcome::Unchanged(dirs.rules()));
+    }
+
+    /// A file an earlier release wrote, whose marker prose has since been
+    /// reworded, is still ours.
+    #[test]
+    fn install_rewrites_a_managed_file_with_reworded_marker_prose() {
+        let dirs = Dirs::new();
+        fs::create_dir_all(dirs.claude().join("rules")).unwrap();
+        fs::write(
+            dirs.rules(),
+            "<!-- recall-echo:managed — written by an older release -->\nold body\n",
+        )
+        .unwrap();
+
+        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        assert_eq!(outcome, Outcome::Written(dirs.rules()));
+        assert_eq!(
+            fs::read_to_string(dirs.rules()).unwrap(),
+            render(&dirs.root("root-a")).unwrap()
+        );
     }
 
     #[test]
