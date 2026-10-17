@@ -3,6 +3,46 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [4.8.0] — Unreleased
+
+### Fixed
+
+- MEMORY.md now reaches Claude Code sessions (#75). Before, nothing loaded
+  it: the SessionStart hook printed EPHEMERAL.md only, and the rules template
+  that claimed MEMORY.md was "auto-loaded" was never installed. `init` now
+  writes `~/.claude/rules/recall-echo.md`, a memory file whose single `@`
+  import is the store's `memory/MEMORY.md`. Claude Code inlines it whole on
+  every startup, resume and `/clear`. The hook could not carry it: Claude Code
+  inlines hook output only up to about 10,000 characters and replaces the
+  rest with a preview and a file path.
+- The SessionStart hook also fires on `/clear`, so a cleared session still
+  gets the recent-session summaries.
+- The rules template matches the 4.x layout. It used to point at
+  `~/.claude/EPHEMERAL.md` and `~/.claude/conversations/` and describe
+  checkpoint steps that `checkpoint` now does itself.
+
+### Changed
+
+- When Claude Code's built-in auto-memory is on, `init` asks once whether to
+  turn it off, so there is one curated store. Enter or `y` writes
+  `"autoMemoryEnabled": false` to `~/.claude/settings.json`; `n` or end of
+  input leaves it on. A scripted (non-terminal) install never changes the
+  setting; it prints a notice. Notes already under
+  `~/.claude/projects/*/memory/` are not moved.
+
+### Upgrading
+
+- Re-run `recall-echo init` to get the rules file and the new hook matcher.
+- A hand-written `~/.claude/rules/recall-echo.md` (no
+  `recall-echo:managed` first line) is left alone, and `init` prints the
+  import line to add. To switch to the managed file, move yours aside and
+  re-run `init`.
+- Pulse-null pulses are unaffected. A root holding `pulse-null.toml` gets no
+  rules file and no auto-memory question, and `consume` prints exactly what it
+  printed before. Running `init` as the user that pulses run as, with a root
+  that is not a pulse, still writes the user-level rules file, which every
+  pulse session then loads.
+
 ## [4.7.0] — 2026-10-17
 
 ### Fixed

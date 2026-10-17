@@ -5,9 +5,20 @@
 | Layer | What | Read |
 |---|---|---|
 | 0 Knowledge graph | entities, relationships, episodes in embedded SurrealDB, local embeddings | by meaning, on demand |
-| 1 `MEMORY.md` | curated facts, kept short | always in context |
-| 2 `EPHEMERAL.md` | the last few session summaries (5 by default) | at session start |
+| 1 `MEMORY.md` | curated facts, kept short | in every Claude Code session, imported by `~/.claude/rules/recall-echo.md` |
+| 2 `EPHEMERAL.md` | the last few session summaries (5 by default) | printed by the SessionStart hook on startup, resume and `/clear` |
 | 3 Archives | every conversation in full, markdown with frontmatter | searched on demand |
+
+The two layers take different paths into a Claude Code session because Claude Code inlines
+a hook's stdout only up to about 10,000 characters; anything longer arrives as a short
+preview and a file path. EPHEMERAL.md fits (five entries are about 2 KB), so `consume`
+prints it. A curated MEMORY.md routinely does not, so `init` writes
+`~/.claude/rules/recall-echo.md` instead: a memory file whose single `@` import is the
+store's MEMORY.md, inlined whole on every startup, resume and `/clear`. Its first line marks
+it as managed. `init` rewrites only a file carrying that line; a hand-written file at that
+path is left alone, and `init` prints the import line it needs. A pulse root (a
+`pulse-null.toml` beside `memory/`) gets no rules file, because pulse-null puts MEMORY.md
+into the pulse's prompt itself.
 
 Every relationship carries a Beta posterior, not a yes or no. Corroboration raises it,
 contradiction lowers it, and the evidence stays on the edge, so one offhand remark cannot

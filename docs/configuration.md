@@ -62,6 +62,10 @@ docs_dir = ""                 # LEARNING.md, THOUGHTS.md, CURIOSITY.md, REFLECTI
 auto_sync = false             # sync them into the graph on every archive
 ```
 
+`ephemeral.max_entries` also sets how much the SessionStart hook prints. Claude Code
+inlines hook output up to about 10,000 characters, so keep the window well under that.
+At about 400 characters per entry, the default 5 entries come to roughly 2 KB.
+
 `recall-echo config show` prints the effective settings and the exact command a CLI
 provider will run. `recall-echo config set KEY VALUE` changes one (`provider`, `model`,
 `api_base`, `llm.cli.*`, `ephemeral.max_entries`, `graph.provenance.*`, …).

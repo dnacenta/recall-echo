@@ -18,7 +18,7 @@ binaries cover Linux and macOS on x86_64 and arm64. After the first install,
 ## Setup
 
 ```
-recall-echo init [ROOT]              create memory/, install hooks, register MCP, fetch the model
+recall-echo init [ROOT]              create memory/, install hooks + rules file, register MCP, fetch the model
 recall-echo status [ROOT]            health: MEMORY.md use, ephemeral entries, archives
 recall-echo dashboard [ROOT]         status plus stats and recent sessions
 recall-echo config show              effective settings and the exact provider command
@@ -27,7 +27,11 @@ recall-echo update                   install the latest release
 ```
 
 `init` defaults its root to `~/.claude` when Claude Code is installed, else the current
-directory, and never overwrites existing files. `update` swaps the binary only after the
+directory, and never overwrites existing files. With Claude Code installed it also writes
+`~/.claude/rules/recall-echo.md`, which imports MEMORY.md into every session; a
+hand-written file at that path is left alone. When Claude Code's built-in auto-memory is
+on, `init` asks once whether to turn it off (`autoMemoryEnabled: false`), so there is a
+single curated store. A scripted install only prints a notice. `update` swaps the binary only after the
 new one answers `--version`: a liveness check over HTTPS, not a cryptographic one
 (checksummed releases are planned). `--check` only reports and exits 10 when an update
 exists, `--version vX.Y.Z` pins a release, `--force` reinstalls.
@@ -41,7 +45,7 @@ not a terminal, `NO_COLOR` is set or `TERM` is `dumb`; `CLICOLOR_FORCE=1` forces
 ```
 recall-echo archive-session          SessionEnd hook: archive the session that just ended
 recall-echo checkpoint               PreCompact hook: save a checkpoint before compaction
-recall-echo consume                  SessionStart hook: print EPHEMERAL.md
+recall-echo consume                  SessionStart hook (startup, resume, /clear): print EPHEMERAL.md
 recall-echo archive --all-unarchived archive every missed transcript under ~/.claude/projects/
 recall-echo ingest --from CLI        import codex, grok or claude-code transcripts (repeatable)
 recall-echo ingest --all             import from every CLI in [capture] sources, or every one installed
