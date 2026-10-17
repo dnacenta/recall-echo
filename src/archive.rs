@@ -540,10 +540,7 @@ pub fn run_with_hook_input(
             );
         }
         HookTarget::Subagent => {
-            eprintln!(
-                "recall-echo: {transcript_path} is a subagent transcript (part of a session, \
-                 not one), nothing archived"
-            );
+            crate::jsonl::report_declined_subagent(transcript_path, "nothing archived");
         }
         HookTarget::ClaudeJsonl => {
             archive_from_jsonl(base_dir, &hook_input.session_id, transcript_path)?;

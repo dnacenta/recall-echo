@@ -46,10 +46,7 @@ pub fn run_with_hook_input(
     if let Some(input) = hook_input {
         let transcript_path = input.transcript_path.trim();
         if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
-            eprintln!(
-                "recall-echo: {transcript_path} is a subagent transcript (part of a session, \
-                 not one), no checkpoint written"
-            );
+            crate::jsonl::report_declined_subagent(transcript_path, "no checkpoint written");
             return Ok(());
         }
     }

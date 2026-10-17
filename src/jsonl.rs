@@ -169,6 +169,16 @@ pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// What a hook says when it was pointed at a subagent's transcript, `not_done`
+/// naming the work it skipped. One line on stderr — stdout may be reserved
+/// for JSON by the harness — shared by `archive-session` and `checkpoint`.
+pub fn report_declined_subagent(transcript_path: &str, not_done: &str) {
+    eprintln!(
+        "recall-echo: {transcript_path} is a subagent transcript (part of a session, not one), \
+         {not_done}"
+    );
+}
+
 /// Parse a Claude Code JSONL transcript into a Conversation.
 pub fn parse_transcript(
     path: &str,
