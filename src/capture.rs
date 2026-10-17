@@ -155,10 +155,15 @@ pub fn pending(
 
     let mut pending = Pending::default();
     for transcript in adapter.discover(watermark)? {
-        if transcript.age_at(options.now) < options.settle {
-            pending.active += 1;
-        } else if archived.contains(&transcript.session_id) {
+        // The archived check comes first and costs nothing; only what survives
+        // it is read to see whether it is a sub-run. Duplicates never advance
+        // the watermark, so reading them would repeat on every poll.
+        if archived.contains(&transcript.session_id) {
             pending.duplicates += 1;
+        } else if adapter.is_sub_run(&transcript) {
+            continue;
+        } else if transcript.age_at(options.now) < options.settle {
+            pending.active += 1;
         } else {
             pending.ready.push(transcript);
         }
@@ -577,6 +582,72 @@ mod tests {
             ..CaptureSection::default()
         };
         assert_eq!(configured_sources(&config), vec![Source::Grok]);
+    }
+
+    /// Records discovery reports, and how often a sweep asks whether one is a
+    /// sub-run — the question that costs a read.
+    struct CountingAdapter {
+        root: PathBuf,
+        found: Vec<TranscriptRef>,
+        sub_run_ids: Vec<&'static str>,
+        asked: std::sync::atomic::AtomicU32,
+    }
+
+    impl Transcript for CountingAdapter {
+        fn source(&self) -> Source {
+            Source::ClaudeCode
+        }
+        fn sessions_root(&self) -> &Path {
+            &self.root
+        }
+        fn discover(&self, _since: Option<SystemTime>) -> Result<Vec<TranscriptRef>, RecallError> {
+            Ok(self.found.clone())
+        }
+        fn parse(
+            &self,
+            _transcript: &TranscriptRef,
+        ) -> Result<crate::conversation::Conversation, RecallError> {
+            unreachable!("selection never parses")
+        }
+        fn is_sub_run(&self, transcript: &TranscriptRef) -> bool {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.sub_run_ids.contains(&transcript.session_id.as_str())
+        }
+    }
+
+    /// RE-74 audit: an archived session is never read to ask whether it is a
+    /// sub-run, and a sub-run is neither active nor ready, however fresh.
+    #[test]
+    fn only_unarchived_records_are_read_for_sub_runs() {
+        let fixture = Fixture::new();
+        let record = |id: &str| TranscriptRef {
+            source: Source::ClaudeCode,
+            session_id: id.to_string(),
+            path: fixture.sessions.join(format!("{id}.jsonl")),
+            modified: SystemTime::now(),
+            cwd: None,
+        };
+        let adapter = CountingAdapter {
+            root: fixture.sessions.clone(),
+            found: vec![record("archived"), record("fork"), record("live")],
+            sub_run_ids: vec!["fork"],
+            asked: std::sync::atomic::AtomicU32::new(0),
+        };
+        let archived: HashSet<String> = ["archived".to_string()].into();
+        let fresh = CaptureOptions {
+            settle: Duration::from_secs(3600),
+            now: SystemTime::now(),
+        };
+
+        let found = pending(&fixture.memory, &adapter, &archived, fresh).unwrap();
+        assert_eq!(found.duplicates, 1);
+        assert_eq!(found.active, 1, "only `live` is active; the fork is not");
+        assert!(found.ready.is_empty());
+        assert_eq!(
+            adapter.asked.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "`archived` must not be read"
+        );
     }
 
     #[test]

@@ -70,15 +70,20 @@ impl Transcript for ClaudeCodeTranscripts {
                 })
             })
             .collect();
-        // A subagent's run is part of a session, not one. Filtered after the
-        // watermark so only new files are sniffed.
+        // A subagent's run is part of a session, not one. The layout check is
+        // free, so it happens here; the content check reads the file and is
+        // left to `is_sub_run`, asked only about transcripts not yet archived.
         let mut fresh = newer_than(found, since);
-        fresh.retain(|transcript| !crate::jsonl::is_subagent_transcript(&transcript.path));
+        fresh.retain(|transcript| !crate::jsonl::in_subagents_dir(&transcript.path));
         Ok(fresh)
     }
 
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError> {
         crate::jsonl::parse_transcript(&transcript.path.to_string_lossy(), &transcript.session_id)
+    }
+
+    fn is_sub_run(&self, transcript: &TranscriptRef) -> bool {
+        crate::jsonl::flags_sidechain(&transcript.path)
     }
 }
 

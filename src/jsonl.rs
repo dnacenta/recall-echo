@@ -143,13 +143,25 @@ const SIDECHAIN_SNIFF_BYTES: u64 = 256 * 1024;
 /// that cannot be opened is decided by its path alone.
 #[must_use]
 pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
-    if path
-        .parent()
+    in_subagents_dir(path) || flags_sidechain(path)
+}
+
+/// The free half of [`is_subagent_transcript`]: the file sits in a directory
+/// named `subagents`. Discovery applies it to every file it walks.
+#[must_use]
+pub fn in_subagents_dir(path: &std::path::Path) -> bool {
+    path.parent()
         .and_then(std::path::Path::file_name)
         .is_some_and(|dir| dir == "subagents")
-    {
-        return true;
-    }
+}
+
+/// The reading half of [`is_subagent_transcript`]: the first entry carrying
+/// `isSidechain` has it `true`. Bounded by [`SIDECHAIN_SNIFF_LINES`] and
+/// [`SIDECHAIN_SNIFF_BYTES`]; false for a file that cannot be opened. Capture
+/// calls it only for transcripts not already archived, so a finished session
+/// is not re-read on every sweep.
+#[must_use]
+pub fn flags_sidechain(path: &std::path::Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
     };

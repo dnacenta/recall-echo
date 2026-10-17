@@ -152,6 +152,14 @@ pub trait Transcript: Send + Sync {
     /// Read one discovered session into the universal conversation format.
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError>;
 
+    /// Whether a discovered record turns out, on reading, to be part of
+    /// another session rather than a session of its own — a Claude Code
+    /// subagent outside `subagents/`. Reads the file, so callers ask only
+    /// about records not already archived. Most CLIs have no such thing.
+    fn is_sub_run(&self, _transcript: &TranscriptRef) -> bool {
+        false
+    }
+
     /// True when this CLI has recorded at least one session on this machine.
     fn is_installed(&self) -> bool {
         self.sessions_root().exists()

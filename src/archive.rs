@@ -615,6 +615,10 @@ pub fn archive_all_with(
             skipped_count += 1;
             continue;
         }
+        // Read only after the archived check, as the capture sweep does.
+        if transcripts.is_sub_run(&transcript) {
+            continue;
+        }
 
         let path_str = transcript.path.to_string_lossy().to_string();
         match archive_from_jsonl(memory_dir, session_id, &path_str) {
