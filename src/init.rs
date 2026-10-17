@@ -1508,6 +1508,28 @@ mod tests {
         );
     }
 
+    /// AC10, build-directory arm: from a `target/debug` binary, even an
+    /// interactive run answered yes writes neither the rules file nor any
+    /// settings.json change (#75 audit B9).
+    #[test]
+    fn a_build_directory_binary_writes_no_rules_and_no_settings() {
+        let sandbox = configured_sandbox();
+        let roots = paths::ConfigRoots::sandboxed_in_build_dir(sandbox.dir.path())
+            .unwrap()
+            .with_interactive(true);
+        assert_eq!(
+            claude_settings::claude_code_target(&roots, &sandbox.pulse_root()).err(),
+            Some(claude_settings::Skip::BuildDir)
+        );
+        let path = settings_file(&sandbox);
+        fs::write(&path, r#"{"model": "opus"}"#).unwrap();
+
+        init_with(&sandbox, &roots, "y\n");
+        assert!(!sandbox_rules(&sandbox).exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"model": "opus"}"#);
+        assert!(!path.with_extension("json.bak").exists());
+    }
+
     /// A sandbox whose provider is already configured, so the provider menu
     /// never consumes a line: every answer in the reader is the auto-memory
     /// question's.

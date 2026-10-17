@@ -372,6 +372,21 @@ impl ConfigRoots {
         })
     }
 
+    /// [`ConfigRoots::sandboxed`], but with the hooks' binary under
+    /// `<dir>/target/debug/` — what `cargo test` and `cargo run` look like —
+    /// so the build-directory guard is what decides.
+    #[cfg(test)]
+    pub(crate) fn sandboxed_in_build_dir(dir: &Path) -> Result<Self, RecallError> {
+        let mut roots = Self::sandboxed(dir)?;
+        roots.recall_bin = dir
+            .join("target")
+            .join("debug")
+            .join("recall-echo")
+            .display()
+            .to_string();
+        Ok(roots)
+    }
+
     /// The same roots with no Claude Code installed — the branch where hooks
     /// have nowhere to go.
     #[must_use]
