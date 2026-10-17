@@ -592,6 +592,27 @@ mod tests {
         );
     }
 
+    /// Same root, but someone edited below the marker: the file is ours, so
+    /// it is brought back to what renders — edits belong above a deleted
+    /// marker line, not inside a managed file.
+    #[test]
+    fn install_rewrites_a_managed_file_edited_below_the_marker() {
+        let dirs = Dirs::new();
+        install(&dirs.claude(), &dirs.root("root-a"));
+        let edited = format!(
+            "{}\n- an extra rule\n",
+            fs::read_to_string(dirs.rules()).unwrap()
+        );
+        fs::write(dirs.rules(), &edited).unwrap();
+
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
+        assert_eq!(outcome, Outcome::Written(dirs.rules()));
+        assert_eq!(
+            fs::read_to_string(dirs.rules()).unwrap(),
+            render(&dirs.root("root-a")).unwrap()
+        );
+    }
+
     #[test]
     fn install_rewrites_when_managed_and_root_changed() {
         let dirs = Dirs::new();

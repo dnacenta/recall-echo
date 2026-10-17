@@ -497,7 +497,7 @@ fn configure_claude_code(
                     reader,
                     interactive,
                     env_disable,
-                );
+                ) == AutoMemoryStep::TurnedOff;
             }
         }
     }
@@ -650,8 +650,21 @@ fn configure_rules(target: &claude_settings::ClaudeTarget, pulse_root: &Path) {
     }
 }
 
+/// What the auto-memory step did.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoMemoryStep {
+    /// Already off — nothing said, nothing asked.
+    AlreadyOff,
+    /// Not interactive: the notice line was printed instead of a question.
+    Noticed,
+    /// Asked; the user kept it on.
+    Declined,
+    /// Asked; turned off in the settings value.
+    TurnedOff,
+}
+
 /// Offer to turn off Claude Code's built-in auto-memory (#75), in the
-/// settings value. Returns whether the user said yes.
+/// settings value.
 ///
 /// With it on, the user has a second curated store that recall-echo neither
 /// reads nor feeds — and it is the one the model is told to use. The choice
@@ -663,9 +676,9 @@ fn stage_auto_memory(
     reader: &mut dyn BufRead,
     interactive: bool,
     env_disable: Option<&str>,
-) -> bool {
+) -> AutoMemoryStep {
     if !claude_settings::auto_memory_on(settings, env_disable) {
-        return false;
+        return AutoMemoryStep::AlreadyOff;
     }
     let what = "Claude Code's built-in auto-memory is on: a second curated store that \
                 recall-echo does not read";
@@ -678,17 +691,17 @@ fn stage_auto_memory(
                 settings_path.display()
             ),
         );
-        return false;
+        return AutoMemoryStep::Noticed;
     }
 
     eprintln!("\n{BOLD}{what}.{RESET}");
     eprintln!("  {DIM}{not_moved}{RESET}");
     if !ask_yes_default(reader, "Turn it off?") {
         print_status(Status::Exists, "Left Claude Code's auto-memory on");
-        return false;
+        return AutoMemoryStep::Declined;
     }
     claude_settings::disable_auto_memory(settings);
-    true
+    AutoMemoryStep::TurnedOff
 }
 
 /// Ask a question that defaults to yes. Enter, `y` or `yes` accept; anything
@@ -1382,6 +1395,33 @@ mod tests {
         let reader = ask_auto_memory(&sandbox, "y\n", false);
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    /// The non-interactive branch is the notice, not a silent no-op.
+    #[test]
+    fn a_non_interactive_run_takes_the_notice_branch() {
+        let path = Path::new("/sandbox/.claude/settings.json");
+        let step = |settings: serde_json::Value, interactive: bool, answer: &str| {
+            let mut settings = settings;
+            let mut reader = Cursor::new(answer.as_bytes().to_vec());
+            stage_auto_memory(&mut settings, path, &mut reader, interactive, None)
+        };
+        assert_eq!(
+            step(serde_json::json!({}), false, "y\n"),
+            AutoMemoryStep::Noticed
+        );
+        assert_eq!(
+            step(serde_json::json!({}), true, "n\n"),
+            AutoMemoryStep::Declined
+        );
+        assert_eq!(
+            step(serde_json::json!({}), true, "y\n"),
+            AutoMemoryStep::TurnedOff
+        );
+        assert_eq!(
+            step(serde_json::json!({"autoMemoryEnabled": false}), false, ""),
+            AutoMemoryStep::AlreadyOff
+        );
     }
 
     #[test]

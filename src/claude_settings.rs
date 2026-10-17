@@ -1051,6 +1051,28 @@ mod tests {
     }
 
     #[test]
+    fn open_settings_refuses_a_top_level_that_is_not_an_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        for body in ["[]", "\"text\"", "42", "null", "{broken"] {
+            let path = tmp.path().join("settings.json");
+            fs::write(&path, body).unwrap();
+            assert!(
+                matches!(open_settings(&path), OpenSettings::Refused(_)),
+                "{body} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn open_settings_treats_a_missing_file_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        match open_settings(&tmp.path().join("settings.json")) {
+            OpenSettings::Edit(edit) => assert_eq!(edit.value, serde_json::json!({})),
+            _ => panic!("a missing settings.json is a fresh one"),
+        }
+    }
+
+    #[test]
     fn disable_auto_memory_sets_the_key_and_keeps_the_rest() {
         let mut settings = serde_json::json!({"model": "opus"});
         disable_auto_memory(&mut settings);
