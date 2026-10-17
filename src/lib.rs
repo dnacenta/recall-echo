@@ -30,6 +30,7 @@ pub mod archive;
 pub mod archive_extract;
 pub mod capture;
 pub mod checkpoint;
+pub(crate) mod claude_settings;
 pub mod cli_provider;
 pub mod config;
 pub mod config_cli;
