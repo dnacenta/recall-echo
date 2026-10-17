@@ -12,9 +12,23 @@
 ## Goal
 
 After `recall-echo init` in a Claude Code install, every session (startup, resume and `/clear`)
-has the whole of `<root>/memory/MEMORY.md` and the current `<root>/memory/EPHEMERAL.md` in
-context, once each. No layer depends on a hand-written rules file. Pulse-null pulses get
-exactly what they get today.
+has the whole of `<root>/memory/MEMORY.md` in context exactly once, and the current
+`<root>/memory/EPHEMERAL.md` too. EPHEMERAL arrives once on startup and on `/clear`. On
+resume, Claude Code also replays the earlier session's copy from the transcript, so it
+appears twice: the stale replayed copy, and the fresh one from `consume`, which is the copy
+that knows about the sessions since. No layer depends on a hand-written rules file.
+Pulse-null pulses get exactly what they get today.
+
+Verified 2026-10-17 in isolated sandboxes. On startup, MEMORY.md's tail (20 KB file) was
+present once. After `/clear` and on `--resume`, MEMORY.md values changed on disk were
+present, and only the new ones. On `--resume`, EPHEMERAL showed both the replayed copy and
+the fresh one.
+
+### Decision: keep `resume` in the matcher
+
+The duplicate on resume is accepted. It predates 4.8.0, since `resume` was already in the
+4.6.2 matcher. It costs about 2 KB. Dropping `resume` would leave a resumed session with only
+the stale replayed copy.
 
 ## Why this matters
 
