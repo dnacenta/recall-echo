@@ -20,9 +20,15 @@
 //!   under, because that is the subscription the user just proved they have;
 //! - none — the full provider menu, since now the choice really is open.
 //!
+//! And one yes/no, only when Claude Code's built-in auto-memory is on: turn it
+//! off, so MEMORY.md here is the one curated store? Enter means yes, end of
+//! input means no. It is skipped for a pulse root, a user who runs pulses and
+//! a build-directory binary, and never asked when auto-memory is already off.
+//!
 //! Nothing prompts unless stdin and stderr are both terminals
-//! ([`paths::ConfigRoots::interactive`]); a scripted or piped install takes the
-//! same defaults without blocking.
+//! ([`paths::ConfigRoots::interactive`]); a scripted or piped install takes
+//! the same defaults without blocking, and leaves auto-memory as it is with a
+//! notice.
 //!
 //! # What it does without asking
 //!
@@ -41,10 +47,10 @@
 //!
 //! A binary under `target/debug` or `target/release` is a test harness or a
 //! working copy, not something a user's hooks and MCP configs should be pinned
-//! to for the life of the install. Everything that writes *outside* the entity
-//! root — hooks, the rules file, MCP registration — is skipped there, which is also what keeps
-//! `cargo test` from repointing the developer's live tooling at a test binary
-//! or downloading 127 MB per test.
+//! to for the life of the install. Everything that writes *outside* the pulse
+//! root — hooks, the rules file, the auto-memory switch, MCP registration — is
+//! skipped there, which is also what keeps `cargo test` from repointing the
+//! developer's live tooling at a test binary or downloading 127 MB per test.
 
 use std::fs;
 use std::io::{self, BufRead, Write as _};
