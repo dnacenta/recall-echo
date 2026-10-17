@@ -18,9 +18,15 @@ changes a user has to know about before upgrading.
   - The file is 0600, in a `rules/` directory created 0700. `init` warns
     when an existing `rules/` is writable by others or owned by another uid.
   - It is written only when the root, `memory/` and MEMORY.md are this
-    user's alone: owned by them, not group- or world-writable, and MEMORY.md
-    a regular file rather than a symlink. A root with whitespace, control
-    characters, a backslash or invisible format characters is refused too.
+    user's alone: owned by them, writable by nobody else, and MEMORY.md a
+    regular file rather than a symlink. Group-write is fine when the group is
+    the user's private group (Ubuntu and Fedora, umask 0002). Each refusal
+    prints the `chmod g-w,o-w` that fixes it. `init` creates `memory/` 0700
+    and its files 0600 whatever the umask, and `status` reports a store that
+    would be refused. A root with whitespace, control characters, a backslash
+    or invisible format characters is refused too.
+  - When the rules step is refused, or skipped for a pulse, a managed rules
+    file that imports this store is removed, and `init` says so.
   - A file counts as managed when its first line starts with
     `<!-- recall-echo:managed`. A hand-written file is never touched; `init`
     says whether it already imports this MEMORY.md or prints the line to add.
@@ -55,8 +61,9 @@ changes a user has to know about before upgrading.
   step. The bytes it replaces are kept as `settings.json.bak`. If the file
   changes while `init` is running, the new content is kept and the changes
   are applied to it again; if it is no longer valid JSON, nothing is written.
-  A settings.json that is a symlink is never replaced; `init` prints what to
-  add instead.
+  The backup is owner-only and never written through a symlink. A
+  settings.json that is a symlink, or becomes one during the prompt, is never
+  replaced; `init` prints what to add instead.
 
 ### Upgrading
 
@@ -66,8 +73,10 @@ changes a user has to know about before upgrading.
   file, move yours aside and re-run `init`.
 - Pulse-null pulses are unaffected. `init` writes no rules file and asks no
   auto-memory question for a root holding `pulse-null.toml`, or for a user
-  whose home holds pulses (`~/pulse-null/*/pulse-null.toml`), and says why.
-  `consume` prints exactly what it printed before.
+  whose home holds pulses (`~/pulse-null/<n>`, `~/pulse-null/pulses/<n>`,
+  `~/pulse-null/entities/<n>` or `~/entity`), and says why. For such a user's
+  own `~/.claude` it writes no user-level hooks either: they would fire for
+  every pulse. `consume` prints exactly what it printed before.
 
 ## [4.7.0] — 2026-10-17
 

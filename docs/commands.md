@@ -33,9 +33,11 @@ hand-written file at that path is left alone. When Claude Code's built-in auto-m
 on, `init` asks once whether to turn it off (`autoMemoryEnabled: false`), so there is a
 single curated store. It asks only when stdin and stderr are both terminals, and end of
 input means no; a scripted install only prints a notice. The rules file and the question
-are skipped for a pulse-null pulse root and for a user who runs pulses
-(`~/pulse-null/*/pulse-null.toml`). settings.json is read once and written once, keeping the
-replaced bytes as `settings.json.bak`; a symlinked settings.json is never replaced. `init`
+are skipped for a pulse-null pulse root and for a user who runs pulses (in
+`~/pulse-null/`, its `pulses/` or `entities/`, or the legacy `~/entity`); for that user's own
+`~/.claude` the hooks are skipped too. settings.json is read once and written once, keeping
+the replaced bytes as an owner-only `settings.json.bak`; a symlinked settings.json is never
+replaced. `init`
 and `status` warn when MEMORY.md carries `@` import lines, which Claude Code would follow
 into every session.
 

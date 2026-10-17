@@ -19,12 +19,15 @@ it as managed. `init` rewrites only a file carrying that line. A hand-written fi
 path is left alone: if it already imports this MEMORY.md `init` says so, otherwise it prints
 the import line the file needs. A pulse root (a `pulse-null.toml` beside `memory/`) gets no
 rules file, and neither does a user who runs pulses, because pulse-null puts MEMORY.md into
-each pulse's prompt itself.
+each pulse's prompt itself. That user's own `~/.claude` gets no user-level hooks either:
+they would fire for every pulse, and pulse-null gives each pulse its own.
 
 Because that import puts MEMORY.md into every session, `init` refuses to write it unless the
-root, `memory/` and MEMORY.md are this user's alone: owned by them, not writable by group or
-others, and MEMORY.md not a symlink. Claude Code also follows imports inside an imported
-file, so `status`, `distill` and `init` warn about any `@` line inside MEMORY.md.
+root, `memory/` and MEMORY.md are this user's alone: owned by them, writable by nobody else
+(group-write by the user's private group is fine), and MEMORY.md not a symlink. When that
+check fails, or the rules step is skipped for a pulse, a managed rules file importing this
+store is removed. Claude Code also follows imports inside an imported file, so `status`,
+`distill` and `init` warn about any `@` line inside MEMORY.md.
 
 Every relationship carries a Beta posterior, not a yes or no. Corroboration raises it,
 contradiction lowers it, and the evidence stays on the edge, so one offhand remark cannot
