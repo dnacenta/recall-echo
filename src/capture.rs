@@ -84,6 +84,8 @@ pub struct Pending {
     pub active: u32,
     /// Transcripts whose session is already archived.
     pub duplicates: u32,
+    /// Subagent runs set aside — part of a session, not one (RE-74).
+    pub subagents_skipped: u32,
 }
 
 /// What one CLI's sweep did.
@@ -96,6 +98,8 @@ pub struct CaptureReport {
     pub duplicates: u32,
     pub active: u32,
     pub failed: u32,
+    /// Subagent runs set aside — part of a session, not one (RE-74).
+    pub subagents_skipped: u32,
 }
 
 impl CaptureReport {
@@ -135,7 +139,22 @@ impl CaptureReport {
         if self.active > 0 {
             line.push_str(&format!(", {} still active", self.active));
         }
+        if let Some(skipped) = self.subagents_note() {
+            line.push_str(&format!(", {skipped}"));
+        }
         Some(line)
+    }
+
+    /// `N subagent run(s) skipped`, or `None` when there were none.
+    #[must_use]
+    pub fn subagents_note(&self) -> Option<String> {
+        (self.subagents_skipped > 0).then(|| {
+            format!(
+                "{} subagent run{} skipped",
+                self.subagents_skipped,
+                if self.subagents_skipped == 1 { "" } else { "s" }
+            )
+        })
     }
 }
 
@@ -153,12 +172,22 @@ pub fn pending(
 ) -> Result<Pending, RecallError> {
     let watermark = read_watermark(memory_dir, adapter.source());
 
-    let mut pending = Pending::default();
-    for transcript in adapter.discover(watermark)? {
-        if transcript.age_at(options.now) < options.settle {
-            pending.active += 1;
-        } else if archived.contains(&transcript.session_id) {
+    let (found, by_layout) = adapter.discover_with_skipped(watermark)?;
+    let mut pending = Pending {
+        subagents_skipped: by_layout,
+        ..Pending::default()
+    };
+    for transcript in found {
+        // The archived check comes first and costs nothing; only what survives
+        // it is read to see whether it is a sub-run. Duplicates never advance
+        // the watermark, so reading them would repeat on every poll.
+        if archived.contains(&transcript.session_id) {
             pending.duplicates += 1;
+        } else if adapter.is_sub_run(&transcript) {
+            crate::jsonl::debug_skipped_subagent(&transcript.path, "isSidechain flag");
+            pending.subagents_skipped += 1;
+        } else if transcript.age_at(options.now) < options.settle {
+            pending.active += 1;
         } else {
             pending.ready.push(transcript);
         }
@@ -288,6 +317,7 @@ pub fn sweep(
     let mut report = CaptureReport {
         active: found.active,
         duplicates: found.duplicates,
+        subagents_skipped: found.subagents_skipped,
         ..CaptureReport::default()
     };
     let mut watermark = Watermark::new();
@@ -357,7 +387,10 @@ pub fn ingest(memory_dir: &Path, sources: &[Source]) -> Result<(), RecallError> 
         total += report.archived.len();
         match report.summary(*source) {
             Some(line) => eprintln!("recall-echo: {line}"),
-            None => eprintln!("recall-echo: no new {source} sessions"),
+            None => match report.subagents_note() {
+                Some(skipped) => eprintln!("recall-echo: no new {source} sessions ({skipped})"),
+                None => eprintln!("recall-echo: no new {source} sessions"),
+            },
         }
     }
 
@@ -577,6 +610,97 @@ mod tests {
             ..CaptureSection::default()
         };
         assert_eq!(configured_sources(&config), vec![Source::Grok]);
+    }
+
+    /// RE-74 audit: skipped subagent runs are visible wherever a report is
+    /// printed, and do not on their own make a sweep speak.
+    #[test]
+    fn the_summary_counts_skipped_subagent_runs() {
+        let worked = CaptureReport {
+            archived: vec![7],
+            subagents_skipped: 3,
+            ..CaptureReport::default()
+        };
+        let line = worked.summary(Source::ClaudeCode).unwrap();
+        assert!(line.ends_with(", 3 subagent runs skipped"), "{line}");
+
+        let idle = CaptureReport {
+            subagents_skipped: 1,
+            ..CaptureReport::default()
+        };
+        assert_eq!(idle.summary(Source::ClaudeCode), None);
+        assert_eq!(
+            idle.subagents_note().as_deref(),
+            Some("1 subagent run skipped")
+        );
+        assert_eq!(CaptureReport::default().subagents_note(), None);
+    }
+
+    /// Records discovery reports, and how often a sweep asks whether one is a
+    /// sub-run — the question that costs a read.
+    struct CountingAdapter {
+        root: PathBuf,
+        found: Vec<TranscriptRef>,
+        sub_run_ids: Vec<&'static str>,
+        asked: std::sync::atomic::AtomicU32,
+    }
+
+    impl Transcript for CountingAdapter {
+        fn source(&self) -> Source {
+            Source::ClaudeCode
+        }
+        fn sessions_root(&self) -> &Path {
+            &self.root
+        }
+        fn discover(&self, _since: Option<SystemTime>) -> Result<Vec<TranscriptRef>, RecallError> {
+            Ok(self.found.clone())
+        }
+        fn parse(
+            &self,
+            _transcript: &TranscriptRef,
+        ) -> Result<crate::conversation::Conversation, RecallError> {
+            unreachable!("selection never parses")
+        }
+        fn is_sub_run(&self, transcript: &TranscriptRef) -> bool {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.sub_run_ids.contains(&transcript.session_id.as_str())
+        }
+    }
+
+    /// RE-74 audit: an archived session is never read to ask whether it is a
+    /// sub-run, and a sub-run is neither active nor ready, however fresh.
+    #[test]
+    fn only_unarchived_records_are_read_for_sub_runs() {
+        let fixture = Fixture::new();
+        let record = |id: &str| TranscriptRef {
+            source: Source::ClaudeCode,
+            session_id: id.to_string(),
+            path: fixture.sessions.join(format!("{id}.jsonl")),
+            modified: SystemTime::now(),
+            cwd: None,
+        };
+        let adapter = CountingAdapter {
+            root: fixture.sessions.clone(),
+            found: vec![record("archived"), record("fork"), record("live")],
+            sub_run_ids: vec!["fork"],
+            asked: std::sync::atomic::AtomicU32::new(0),
+        };
+        let archived: HashSet<String> = ["archived".to_string()].into();
+        let fresh = CaptureOptions {
+            settle: Duration::from_secs(3600),
+            now: SystemTime::now(),
+        };
+
+        let found = pending(&fixture.memory, &adapter, &archived, fresh).unwrap();
+        assert_eq!(found.duplicates, 1);
+        assert_eq!(found.active, 1, "only `live` is active; the fork is not");
+        assert_eq!(found.subagents_skipped, 1);
+        assert!(found.ready.is_empty());
+        assert_eq!(
+            adapter.asked.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "`archived` must not be read"
+        );
     }
 
     #[test]

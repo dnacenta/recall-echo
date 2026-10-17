@@ -3,6 +3,69 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [4.7.0] — Unreleased
+
+### Fixed
+
+- Claude Code subagent runs are no longer archived as sessions (#74). On one
+  install 156 of 251 archives were subagents: the capture sweep and `ingest`
+  took every `*.jsonl` under `projects/`, including
+  `<session>/subagents/agent-<id>.jsonl`. They crowded the five-slot
+  EPHEMERAL.md window and entered the parent model's prompts into the graph
+  as `user` evidence.
+  - A transcript is a subagent's when its directory is `subagents`, or when
+    the first entry carrying `isSidechain` has it `true` (a fork's
+    transcript opens with an unflagged `fork-context-ref`). The read is
+    bounded: 64 lines, blank ones included, and 256 KiB; only lines
+    mentioning `"isSidechain"` are parsed, and an undecodable line is
+    skipped rather than ending the read.
+  - Discovery sets aside `subagents/` files by layout, unread. The flag is
+    read only for transcripts not already archived, so finished sessions
+    are not re-read on every sweep. Capture, `ingest` and
+    `archive --all-unarchived` skip both kinds; the SessionEnd and
+    PreCompact hooks decline them with one stderr line and exit 0.
+  - Already-written subagent archives are left in place; pruning them is
+    #76. EPHEMERAL.md clears itself within five real sessions.
+- `archive --all-unarchived` writes into `--pulse-root`, `RECALL_ECHO_HOME`
+  or the root `init` persisted, and never takes its store from the current
+  directory, so a cloned repo that looks initialised cannot steer it. With
+  none of those pinned it falls back to the legacy `~/.claude`, and says so
+  on stderr. It names the store and why before writing. It used to write
+  `~/.claude/conversations` unconditionally, which on a 4.x install failed
+  with "conversations/ directory not found".
+- Claude Code discovery reads regular files only: a FIFO or a link to a
+  device named `*.jsonl` is skipped instead of hanging the sweep.
+
+### Added
+
+- `archive --all-unarchived --pulse-root <dir>` (alias `--entity-root`).
+- Skipped subagent runs are counted: `Pending::subagents_skipped`,
+  `CaptureReport::subagents_skipped`, shown by `ingest` and
+  `archive --all-unarchived`. With `RECALL_ECHO_DEBUG` set, each skip is
+  named on stderr with the signal that caught it.
+- `jsonl::is_subagent_transcript`, `Transcript::is_sub_run`,
+  `Transcript::discover_with_skipped` (both provided),
+  `archive::archive_all_with` (returns `archive::BatchArchiveReport`,
+  `#[non_exhaustive]`), `archive::archive_all_unarchived_at`,
+  `checkpoint::run_with_hook_input`.
+
+### Changed
+
+- `capture::pending` checks the archive before the settle time: a live
+  transcript whose session is already archived counts as a duplicate, not
+  as active.
+- **Source-breaking for struct literals:** `capture::Pending` and
+  `capture::CaptureReport` gain a public `subagents_skipped` field. Both have
+  only public fields and no `#[non_exhaustive]`, so code that builds either
+  with a struct literal not ending in `..Default::default()` stops
+  compiling. Field access and `Default` are unaffected. Both become
+  `#[non_exhaustive]` in v5.
+
+### Deprecated
+
+- `archive::archive_all_with_base`: use `archive_all_with`, which takes the
+  store and the transcripts separately.
+
 ## [4.6.2] — Unreleased
 
 ### Fixed

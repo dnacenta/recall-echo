@@ -111,6 +111,96 @@ pub fn is_jsonl_transcript(path: &str) -> bool {
         })
 }
 
+/// How many lines [`is_subagent_transcript`] reads before giving up — blank
+/// lines included, so a file of newlines cannot stretch the window.
+///
+/// On a survey of 192 real transcripts the first entry carrying `isSidechain`
+/// sat at line 2 at the latest in a subagent's file and line 8 in a session's —
+/// metadata entries (`ai-title`, `last-prompt`, `mode`, `queue-operation`, a
+/// fork's `fork-context-ref`) come first and carry no flag.
+const SIDECHAIN_SNIFF_LINES: usize = 64;
+
+/// How many bytes [`is_subagent_transcript`] reads at most. A line cap alone
+/// does not bound the read: one line can be the whole file.
+const SIDECHAIN_SNIFF_BYTES: u64 = 256 * 1024;
+
+/// Whether a Claude Code transcript belongs to a subagent rather than a session.
+///
+/// Claude Code writes each subagent's run to
+/// `projects/<project>/<session>/subagents/agent-<id>.jsonl`, and marks every
+/// turn in it `isSidechain: true`. Either signal is enough:
+///
+/// - the file's directory is named `subagents` — free, and today's layout;
+/// - the first entry that carries an `isSidechain` field has it `true` — Claude
+///   Code's own marker, which survives a layout change. It is the first entry
+///   *carrying* the field, not the first line: a fork's transcript opens with a
+///   `fork-context-ref` entry that has none.
+///
+/// A subagent's "user" turns are the parent model's prompts, so archiving one
+/// as a session would enter model-written text as something the human said.
+/// At most [`SIDECHAIN_SNIFF_LINES`] lines and [`SIDECHAIN_SNIFF_BYTES`] bytes
+/// are read, and only lines that mention `"isSidechain"` are parsed; a file
+/// that cannot be opened is decided by its path alone.
+#[must_use]
+pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
+    in_subagents_dir(path) || flags_sidechain(path)
+}
+
+/// The free half of [`is_subagent_transcript`]: the file sits in a directory
+/// named `subagents`. Discovery applies it to every file it walks.
+#[must_use]
+pub(crate) fn in_subagents_dir(path: &std::path::Path) -> bool {
+    path.parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|dir| dir == "subagents")
+}
+
+/// The reading half of [`is_subagent_transcript`]: the first entry carrying
+/// `isSidechain` has it `true`. Bounded by [`SIDECHAIN_SNIFF_LINES`] and
+/// [`SIDECHAIN_SNIFF_BYTES`]; false for a file that cannot be opened. Capture
+/// calls it only for transcripts not already archived, so a finished session
+/// is not re-read on every sweep.
+#[must_use]
+pub(crate) fn flags_sidechain(path: &std::path::Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file.take(SIDECHAIN_SNIFF_BYTES))
+        .lines()
+        .take(SIDECHAIN_SNIFF_LINES)
+        // An undecodable line is skipped, not the end of the sniff: stopping
+        // there would wave a subagent through on one bad byte.
+        .filter_map(Result::ok)
+        .filter(|line| line.contains("\"isSidechain\""))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find_map(|entry| {
+            entry
+                .get("isSidechain")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// One `recall-echo: debug:` line naming a skipped subagent transcript and
+/// the signal that caught it (`signal`). Only when `RECALL_ECHO_DEBUG` is set
+/// and non-empty: the crate has no logger, and the daemon sweeps on a timer.
+pub(crate) fn debug_skipped_subagent(path: &std::path::Path, signal: &str) {
+    if std::env::var_os("RECALL_ECHO_DEBUG").is_some_and(|value| !value.is_empty()) {
+        // `{:?}` escapes control characters: the name is whatever is on disk.
+        eprintln!("recall-echo: debug: skipped subagent transcript {path:?} ({signal})");
+    }
+}
+
+/// What a hook says when it was pointed at a subagent's transcript, `not_done`
+/// naming the work it skipped. One line on stderr — stdout may be reserved
+/// for JSON by the harness — shared by `archive-session` and `checkpoint`.
+pub(crate) fn report_declined_subagent(transcript_path: &str, not_done: &str) {
+    eprintln!(
+        "recall-echo: {transcript_path} is a subagent transcript (part of a session, not one), \
+         {not_done}"
+    );
+}
+
 /// Parse a Claude Code JSONL transcript into a Conversation.
 pub fn parse_transcript(
     path: &str,
@@ -426,6 +516,148 @@ mod tests {
         assert!(!is_jsonl_transcript(&write("empty.jsonl", "")));
         assert!(!is_jsonl_transcript(&write("prose.txt", "hello\nthere")));
         assert!(!is_jsonl_transcript("/nonexistent/transcript.jsonl"));
+    }
+
+    // ── Subagent detection ───────────────────────────────────────────────
+
+    const SUBAGENT_TURN: &str = r#"{"type":"user","isSidechain":true,"agentId":"a1","sessionId":"parent","message":{"role":"user","content":"Draft slide 4"}}"#;
+    const SESSION_TURN: &str = r#"{"type":"user","isSidechain":false,"sessionId":"s1","message":{"role":"user","content":"hello"}}"#;
+    const FORK_CONTEXT_REF: &str = r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"parent","contextLength":10}"#;
+
+    fn write_lines(dir: &std::path::Path, name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn subagent_detected_by_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "s1/subagents/agent-a1.jsonl", &[SUBAGENT_TURN]);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn fork_detected_by_first_flagged_entry_outside_subagents_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(
+            dir.path(),
+            "elsewhere/agent-a2.jsonl",
+            &[FORK_CONTEXT_REF, SUBAGENT_TURN],
+        );
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn subagents_dir_without_flag_still_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let unflagged = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
+        let path = write_lines(dir.path(), "s1/subagents/agent-a3.jsonl", &[unflagged]);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn main_transcript_with_metadata_preamble_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let preamble = [
+            r#"{"type":"ai-title","title":"t"}"#,
+            r#"{"type":"last-prompt","prompt":"p"}"#,
+            r#"{"type":"mode","mode":"default"}"#,
+            r#"{"type":"queue-operation","operation":"enqueue"}"#,
+            r#"{"type":"ai-title","title":"t2"}"#,
+            r#"{"type":"last-prompt","prompt":"p2"}"#,
+            r#"{"type":"mode","mode":"plan"}"#,
+            SESSION_TURN,
+            SUBAGENT_TURN,
+        ];
+        let path = write_lines(dir.path(), "-home-dev-app/s1.jsonl", &preamble);
+        assert!(!is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn main_transcript_without_flag_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::PathBuf::from(write_test_jsonl(dir.path()));
+        assert!(!is_subagent_transcript(&path));
+        let empty = write_lines(dir.path(), "empty.jsonl", &[]);
+        assert!(!is_subagent_transcript(&empty));
+    }
+
+    #[test]
+    fn malformed_lines_in_window_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(
+            dir.path(),
+            "x/agent-a4.jsonl",
+            &["{not json", "", "   ", SUBAGENT_TURN],
+        );
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn flag_beyond_sniff_window_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let filler = r#"{"type":"progress"}"#;
+        let mut lines = vec![filler; SIDECHAIN_SNIFF_LINES];
+        lines.push(SUBAGENT_TURN);
+        let path = write_lines(dir.path(), "x/late.jsonl", &lines);
+        assert!(!is_subagent_transcript(&path));
+
+        // One line earlier and it is inside the window.
+        lines.remove(0);
+        let path = write_lines(dir.path(), "x/in-window.jsonl", &lines);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    /// A line that is not UTF-8 is skipped like a malformed one; the flag
+    /// after it is still read.
+    #[test]
+    fn invalid_utf8_line_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-a6.jsonl");
+        let mut body = vec![0xff, 0xfe, b'{', b'\n'];
+        body.extend_from_slice(SUBAGENT_TURN.as_bytes());
+        std::fs::write(&path, body).unwrap();
+        assert!(is_subagent_transcript(&path));
+    }
+
+    /// Blank lines count toward the line cap: a run of newlines cannot push
+    /// the window past [`SIDECHAIN_SNIFF_LINES`].
+    #[test]
+    fn blank_lines_count_toward_the_sniff_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![""; SIDECHAIN_SNIFF_LINES];
+        lines.push(SUBAGENT_TURN);
+        let path = write_lines(dir.path(), "x/blank-padded.jsonl", &lines);
+        assert!(!is_subagent_transcript(&path));
+    }
+
+    /// The read is bounded in bytes too: one enormous first line ends the
+    /// sniff, however few lines it is.
+    #[test]
+    fn the_sniff_stops_at_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let padded =
+            |bytes: usize| format!(r#"{{"type":"progress","pad":"{}"}}"#, "x".repeat(bytes));
+
+        let over = padded(SIDECHAIN_SNIFF_BYTES as usize);
+        let path = write_lines(dir.path(), "x/over.jsonl", &[&over, SUBAGENT_TURN]);
+        assert!(!is_subagent_transcript(&path));
+
+        let under = padded(SIDECHAIN_SNIFF_BYTES as usize / 2);
+        let path = write_lines(dir.path(), "x/under.jsonl", &[&under, SUBAGENT_TURN]);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn unopenable_path_decided_by_path_alone() {
+        assert!(is_subagent_transcript(std::path::Path::new(
+            "/nonexistent/s1/subagents/agent-a5.jsonl"
+        )));
+        assert!(!is_subagent_transcript(std::path::Path::new(
+            "/nonexistent/s1.jsonl"
+        )));
     }
 
     #[test]

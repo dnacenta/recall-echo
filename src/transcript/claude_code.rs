@@ -54,8 +54,18 @@ impl Transcript for ClaudeCodeTranscripts {
     }
 
     fn discover(&self, since: Option<SystemTime>) -> Result<Vec<TranscriptRef>, RecallError> {
+        self.discover_with_skipped(since).map(|(found, _)| found)
+    }
+
+    fn discover_with_skipped(
+        &self,
+        since: Option<SystemTime>,
+    ) -> Result<(Vec<TranscriptRef>, u32), RecallError> {
         let found = walk_files(&self.projects_dir, "jsonl", 0)
             .into_iter()
+            // Regular files only (a symlink to one is followed): a FIFO or a
+            // link to `/dev/zero` named `*.jsonl` would hang or feed the sniff.
+            .filter(|path| path.metadata().is_ok_and(|meta| meta.is_file()))
             .filter_map(|path| {
                 let session_id = path.file_stem()?.to_str()?.to_string();
                 Some(TranscriptRef {
@@ -67,11 +77,28 @@ impl Transcript for ClaudeCodeTranscripts {
                 })
             })
             .collect();
-        Ok(newer_than(found, since))
+        // A subagent's run is part of a session, not one. The layout check is
+        // free, so it happens here; the content check reads the file and is
+        // left to `is_sub_run`, asked only about transcripts not yet archived.
+        let mut fresh = newer_than(found, since);
+        let before = fresh.len();
+        fresh.retain(|transcript| {
+            let subagent = crate::jsonl::in_subagents_dir(&transcript.path);
+            if subagent {
+                crate::jsonl::debug_skipped_subagent(&transcript.path, "subagents/ directory");
+            }
+            !subagent
+        });
+        let skipped = u32::try_from(before - fresh.len()).unwrap_or(u32::MAX);
+        Ok((fresh, skipped))
     }
 
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError> {
         crate::jsonl::parse_transcript(&transcript.path.to_string_lossy(), &transcript.session_id)
+    }
+
+    fn is_sub_run(&self, transcript: &TranscriptRef) -> bool {
+        crate::jsonl::flags_sidechain(&transcript.path)
     }
 }
 
@@ -141,6 +168,66 @@ mod tests {
         );
         assert_eq!(through_adapter.first_timestamp, directly.first_timestamp);
         assert_eq!(through_adapter.last_timestamp, directly.last_timestamp);
+    }
+
+    /// A subagent in `subagents/` is set aside by layout alone, unread. A fork
+    /// moved beside its parent is still discovered — the layout says nothing
+    /// — and reads as a sub-run, so capture drops it after its archived check.
+    #[test]
+    fn subagents_are_set_aside_by_layout_and_forks_flagged_by_content() {
+        let tmp = fixture_tree();
+        let project = tmp.path().join("projects").join("-home-dev-app");
+        let subagents = project.join("sess-abc").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), TRANSCRIPT).unwrap();
+        let fork = concat!(
+            r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"sess-abc"}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"timestamp":"2026-03-05T14:31:00.000Z","message":{"role":"user","content":"Draft the slide"}}"#,
+            "\n",
+        );
+        std::fs::write(project.join("agent-a2.jsonl"), fork).unwrap();
+
+        let adapter = ClaudeCodeTranscripts::new(tmp.path().join("projects"));
+        let (found, by_layout) = adapter.discover_with_skipped(None).unwrap();
+        assert_eq!(by_layout, 1, "agent-a1 is set aside unread");
+        let mut ids: Vec<_> = found.iter().map(|t| t.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["agent-a2", "sess-abc"]);
+
+        let sub_runs: Vec<_> = found
+            .iter()
+            .filter(|t| adapter.is_sub_run(t))
+            .map(|t| t.session_id.as_str())
+            .collect();
+        assert_eq!(sub_runs, ["agent-a2"]);
+    }
+
+    /// A FIFO or a link to a device is never handed to the sniff or the
+    /// parser; a link to a real transcript still counts.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_keeps_only_regular_files() {
+        let tmp = fixture_tree();
+        let project = tmp.path().join("projects").join("-home-dev-app");
+        let status = std::process::Command::new("mkfifo")
+            .arg(project.join("fifo.jsonl"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::os::unix::fs::symlink("/dev/zero", project.join("zero.jsonl")).unwrap();
+        std::os::unix::fs::symlink(project.join("sess-abc.jsonl"), project.join("linked.jsonl"))
+            .unwrap();
+
+        let adapter = ClaudeCodeTranscripts::new(tmp.path().join("projects"));
+        let mut ids: Vec<_> = adapter
+            .discover(None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["linked", "sess-abc"]);
     }
 
     #[test]

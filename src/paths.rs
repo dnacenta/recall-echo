@@ -671,6 +671,57 @@ pub fn resolved_hook_base_dir(explicit: Option<&std::path::Path>) -> Result<Path
     }
 }
 
+/// [`resolve_root_source`] with the cwd arm removed: `RECALL_ECHO_HOME`, then
+/// the persisted root, then nothing pinned. The cwd is not an input, so no
+/// directory can steer the result by looking initialised.
+fn resolve_batch_root_source(
+    env_home: Option<&str>,
+    persisted: impl FnOnce() -> Option<PersistedPointer>,
+    trusted: impl Fn(&Path) -> Result<PathBuf, String>,
+) -> RootSource {
+    resolve_root_source(env_home, None, persisted, |_| false, trusted)
+}
+
+/// The store `archive --all-unarchived` writes into, and which arm chose it.
+///
+/// A batch import writes every unarchived session at once, so — unlike the
+/// hooks, which run inside one session — it never takes the store from the
+/// cwd: a directory that merely looks initialised (a cloned repo, say) cannot
+/// steer it (RE-74 audit). Order: `explicit` (`--pulse-root`),
+/// `RECALL_ECHO_HOME`, the root `init` persisted; with none of those, the
+/// legacy `~/.claude` itself, and the fallback is named on stderr.
+pub(crate) fn batch_archive_base_dir(
+    explicit: Option<&Path>,
+) -> Result<(PathBuf, String), RecallError> {
+    if let Some(root) = explicit {
+        return Ok((hook_base_dir(Some(root))?, "from --pulse-root".into()));
+    }
+    let env_home = std::env::var("RECALL_ECHO_HOME").ok();
+    let source = resolve_batch_root_source(
+        env_home.as_deref(),
+        || read_pointer(&state_dir()?),
+        trusted_root,
+    );
+    if matches!(source, RootSource::PersistedLegacy(_)) {
+        note_legacy_pointer();
+    }
+    let label = source.label();
+    match source.into_hook_root() {
+        (Some(root), _) => Ok((hook_base_dir(Some(&root))?, label.into())),
+        (None, stale) => {
+            if let Some(stale) = stale {
+                warn_stale_persisted_root(&stale);
+            }
+            Ok((
+                hook_base_dir(None)?,
+                "nothing pinned \u{2014} legacy ~/.claude fallback; run `recall-echo init` or pass \
+                 --pulse-root"
+                    .into(),
+            ))
+        }
+    }
+}
+
 /// Expand a leading `~/` to the home directory. Other paths pass through.
 #[must_use]
 pub fn expand_tilde(path: &str) -> String {
@@ -790,6 +841,42 @@ mod tests {
     fn pointer_is_absent_when_neither_file_exists() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(read_pointer(tmp.path()), None);
+    }
+
+    /// RE-74 audit: the batch-archive resolver has no cwd arm. The persisted
+    /// root wins where the hooks' chain would have taken an initialised cwd,
+    /// `RECALL_ECHO_HOME` still beats it, and nothing pinned is nothing pinned.
+    #[test]
+    fn the_batch_archive_root_never_comes_from_the_cwd() {
+        let persisted = || {
+            Some(PersistedPointer {
+                root: PathBuf::from("/pinned"),
+                file: PointerFile::Current,
+            })
+        };
+        assert_eq!(
+            resolve_batch_root_source(None, persisted, trust_all),
+            RootSource::Persisted(PathBuf::from("/pinned"))
+        );
+        // The hooks' chain, given an initialised cwd, would have said Cwd.
+        assert_eq!(
+            resolve_root_source(
+                None,
+                Some(Path::new("/clone")),
+                persisted,
+                |_| true,
+                trust_all
+            ),
+            RootSource::Cwd(PathBuf::from("/clone"))
+        );
+        assert_eq!(
+            resolve_batch_root_source(Some("/env"), persisted, trust_all),
+            RootSource::Env(PathBuf::from("/env"))
+        );
+        assert_eq!(
+            resolve_batch_root_source(None, || None, trust_all),
+            RootSource::Unpinned { stale: None }
+        );
     }
 
     #[test]

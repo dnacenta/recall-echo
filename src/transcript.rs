@@ -147,10 +147,39 @@ pub trait Transcript: Send + Sync {
     ///
     /// A missing root is not an error: a CLI that has never run has no
     /// sessions, which is exactly an empty list.
+    ///
+    /// Not every record returned is a session of its own: a caller that
+    /// archives what it finds must also drop the ones
+    /// [`Transcript::is_sub_run`] reports — after its cheaper checks, since
+    /// that call reads the file. `capture::pending` and
+    /// `archive::archive_all_with` both do.
     fn discover(&self, since: Option<SystemTime>) -> Result<Vec<TranscriptRef>, RecallError>;
 
     /// Read one discovered session into the universal conversation format.
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError>;
+
+    /// [`Transcript::discover`], plus how many records it set aside by layout
+    /// alone as part of another session, for the capture report. Zero for
+    /// CLIs that have no such records.
+    ///
+    /// The default calls `discover`. An adapter that overrides this one may
+    /// implement `discover` by delegating here (Claude Code does), but an
+    /// adapter that delegates `discover` here must override this method too —
+    /// otherwise the two defaults call each other forever.
+    fn discover_with_skipped(
+        &self,
+        since: Option<SystemTime>,
+    ) -> Result<(Vec<TranscriptRef>, u32), RecallError> {
+        Ok((self.discover(since)?, 0))
+    }
+
+    /// Whether a discovered record turns out, on reading, to be part of
+    /// another session rather than a session of its own — a Claude Code
+    /// subagent outside `subagents/`. Reads the file, so callers ask only
+    /// about records not already archived. Most CLIs have no such thing.
+    fn is_sub_run(&self, _transcript: &TranscriptRef) -> bool {
+        false
+    }
 
     /// True when this CLI has recorded at least one session on this machine.
     fn is_installed(&self) -> bool {

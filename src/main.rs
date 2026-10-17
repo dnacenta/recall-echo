@@ -75,6 +75,9 @@ enum Commands {
         /// Archive all unarchived JSONL transcripts under ~/.claude/projects/
         #[arg(long)]
         all_unarchived: bool,
+        /// Pulse root to archive into (defaults to RECALL_ECHO_HOME, then the root `init` persisted, then ~/.claude — never the current directory)
+        #[arg(long, alias = "entity-root")]
+        pulse_root: Option<PathBuf>,
     },
     /// Import sessions from an agent CLI's own transcripts (codex, grok, claude-code)
     Ingest {
@@ -544,9 +547,12 @@ fn main() {
         Some(Commands::ArchiveSession { pulse_root }) => {
             archive::run_from_hook(pulse_root.as_deref())
         }
-        Some(Commands::Archive { all_unarchived }) => {
+        Some(Commands::Archive {
+            all_unarchived,
+            pulse_root,
+        }) => {
             if all_unarchived {
-                archive::archive_all_unarchived()
+                archive::archive_all_unarchived_at(pulse_root.as_deref())
             } else {
                 Err("Use --all-unarchived to archive all unarchived JSONL transcripts.".into())
             }
@@ -1049,8 +1055,9 @@ mod tests {
 
     /// Every subcommand that takes the root as a flag, split around where the
     /// flag goes: `(before, after)`.
-    const FLAGGED: [(&[&str], &[&str]); 6] = [
+    const FLAGGED: [(&[&str], &[&str]); 7] = [
         (&["archive-session"], &[]),
+        (&["archive", "--all-unarchived"], &[]),
         (&["checkpoint", "--trigger", "precompact"], &[]),
         (&["config"], &["show"]),
         (&["mcp"], &[]),
@@ -1067,6 +1074,7 @@ mod tests {
             Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{flag} with {before:?}: {err}"));
         match cli.command.expect("a subcommand") {
             Commands::ArchiveSession { pulse_root }
+            | Commands::Archive { pulse_root, .. }
             | Commands::Checkpoint { pulse_root, .. }
             | Commands::Config { pulse_root, .. }
             | Commands::Mcp { pulse_root }

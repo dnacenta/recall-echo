@@ -22,6 +22,7 @@ use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
 use crate::summarize;
 use crate::tags;
+use crate::transcript::{ClaudeCodeTranscripts, Transcript};
 
 /// Session metadata provided by the caller.
 #[derive(Debug, Clone)]
@@ -453,6 +454,8 @@ enum HookTarget {
     Unnamed,
     /// A path with nothing at it — a session that was never persisted.
     Absent,
+    /// A Claude Code subagent's transcript — part of a session, not one.
+    Subagent,
     /// Claude Code's JSON Lines, to be streamed from the path.
     ClaudeJsonl,
     /// A Gemini chat session document, already read.
@@ -468,6 +471,9 @@ fn classify(transcript_path: &str, session_id: &str) -> HookTarget {
     }
     if !Path::new(transcript_path).exists() {
         return HookTarget::Absent;
+    }
+    if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
+        return HookTarget::Subagent;
     }
     // Sniffed rather than assumed: a migrated Gemini hook hands this command a
     // JSON document, and every line of one fails the JSON Lines parser.
@@ -533,6 +539,9 @@ pub fn run_with_hook_input(
                  nothing to archive"
             );
         }
+        HookTarget::Subagent => {
+            crate::jsonl::report_declined_subagent(transcript_path, "nothing archived");
+        }
         HookTarget::ClaudeJsonl => {
             archive_from_jsonl(base_dir, &hook_input.session_id, transcript_path)?;
         }
@@ -552,14 +561,75 @@ pub fn run_with_hook_input(
     Ok(())
 }
 
-/// Archive all unarchived JSONL transcripts found under ~/.claude/projects/.
+/// [`archive_all_unarchived_at`] with no `--pulse-root`.
 pub fn archive_all_unarchived() -> Result<(), RecallError> {
-    let base = crate::paths::claude_dir()?;
-    archive_all_with_base(&base)
+    archive_all_unarchived_at(None)
 }
 
+/// Archive every unarchived Claude Code session under `~/.claude/projects/`.
+///
+/// The store is `pulse_root` when given, else `RECALL_ECHO_HOME`, else the
+/// root `init` persisted, else the legacy `~/.claude` — never the current
+/// directory, which the hooks consult but a batch import must not
+/// (`paths::batch_archive_base_dir`). The chosen store and why are
+/// printed before anything is written.
+pub fn archive_all_unarchived_at(pulse_root: Option<&Path>) -> Result<(), RecallError> {
+    let (memory_dir, why) = crate::paths::batch_archive_base_dir(pulse_root)?;
+    // `{:?}` escapes control characters: the path can come from a file.
+    eprintln!("recall-echo: archiving into {memory_dir:?} ({why})");
+    let transcripts = ClaudeCodeTranscripts::detect()
+        .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
+    archive_all_with(&memory_dir, &transcripts).map(|_| ())
+}
+
+/// [`archive_all_with`] for a claude-style root that is both the store and
+/// the parent of `projects/`.
+#[deprecated(
+    since = "4.7.0",
+    note = "use `archive_all_with`, which takes the store and the transcripts separately"
+)]
 pub fn archive_all_with_base(base: &Path) -> Result<(), RecallError> {
-    let conversations_dir = base.join("conversations");
+    archive_all_with(base, &ClaudeCodeTranscripts::new(base.join("projects"))).map(|_| ())
+}
+
+/// What [`archive_all_with`] did — the numbers its summary line prints.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BatchArchiveReport {
+    /// Sessions archived by this run.
+    pub archived: u32,
+    /// Sessions skipped because `conversations/` already holds them.
+    pub already_archived: u32,
+    /// Subagent runs set aside, by layout or by their `isSidechain` flag.
+    pub subagents_skipped: u32,
+}
+
+impl BatchArchiveReport {
+    /// The line `archive --all-unarchived` ends on.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "archived {} conversation{}, skipped {} already archived and {} subagent run{}",
+            self.archived,
+            if self.archived == 1 { "" } else { "s" },
+            self.already_archived,
+            self.subagents_skipped,
+            if self.subagents_skipped == 1 { "" } else { "s" }
+        )
+    }
+}
+
+/// Archive every session `transcripts` discovers that `memory_dir` does not
+/// hold yet — oldest first, no settle time, no watermark.
+///
+/// Discovery is the capture sweep's, so subagent transcripts are never
+/// mistaken for sessions here either. The summary is printed to stderr and
+/// returned.
+pub fn archive_all_with(
+    memory_dir: &Path,
+    transcripts: &ClaudeCodeTranscripts,
+) -> Result<BatchArchiveReport, RecallError> {
+    let conversations_dir = memory_dir.join("conversations");
     if !conversations_dir.exists() {
         return Err(RecallError::NotInitialized(
             "conversations/ directory not found. Run `recall-echo init` first.".into(),
@@ -568,48 +638,40 @@ pub fn archive_all_with_base(base: &Path) -> Result<(), RecallError> {
 
     let archived_sessions = collect_archived_sessions(&conversations_dir);
 
-    let projects_dir = base.join("projects");
-    if !projects_dir.exists() {
+    if !transcripts.is_installed() {
         eprintln!("No projects directory found \u{2014} nothing to archive.");
-        return Ok(());
+        return Ok(BatchArchiveReport::default());
     }
 
-    let mut jsonl_files = find_jsonl_files(&projects_dir);
-    jsonl_files.sort_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-
-    let mut archived_count = 0;
-    let mut skipped_count = 0;
-
-    for jsonl_path in &jsonl_files {
-        let session_id = match jsonl_path.file_stem().and_then(|s| s.to_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-
-        if archived_sessions.contains(&session_id) {
-            skipped_count += 1;
+    let (found, by_layout) = transcripts.discover_with_skipped(None)?;
+    let mut report = BatchArchiveReport {
+        subagents_skipped: by_layout,
+        ..BatchArchiveReport::default()
+    };
+    for transcript in found {
+        let session_id = &transcript.session_id;
+        if archived_sessions.contains(session_id) {
+            report.already_archived += 1;
+            continue;
+        }
+        // Read only after the archived check, as the capture sweep does.
+        if transcripts.is_sub_run(&transcript) {
+            crate::jsonl::debug_skipped_subagent(&transcript.path, "isSidechain flag");
+            report.subagents_skipped += 1;
             continue;
         }
 
-        let path_str = jsonl_path.to_string_lossy().to_string();
-        match archive_from_jsonl(base, &session_id, &path_str) {
-            Ok(_) => archived_count += 1,
+        let path_str = transcript.path.to_string_lossy().to_string();
+        match archive_from_jsonl(memory_dir, session_id, &path_str) {
+            Ok(_) => report.archived += 1,
             Err(e) => {
                 eprintln!("recall-echo: skipping {session_id} \u{2014} {e}");
             }
         }
     }
 
-    eprintln!(
-        "recall-echo: archived {archived_count} conversation{}, skipped {skipped_count} already archived",
-        if archived_count == 1 { "" } else { "s" }
-    );
-
-    Ok(())
+    eprintln!("recall-echo: {}", report.summary());
+    Ok(report)
 }
 
 /// Session ids that already have an archive in `conversations/`.
@@ -637,21 +699,6 @@ pub fn collect_archived_sessions(conversations_dir: &Path) -> std::collections::
         }
     }
     sessions
-}
-
-fn find_jsonl_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_jsonl_files(&path));
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                files.push(path);
-            }
-        }
-    }
-    files
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +991,139 @@ mod tests {
         assert!(
             run_with_hook_input(&hook_input, Path::new("/nonexistent-base")).is_ok(),
             "an unreadable transcript must not fail the session"
+        );
+    }
+
+    /// Where Claude Code writes a subagent's run, and a fork's run moved
+    /// anywhere else: both are declined by the hook (RE-74).
+    #[test]
+    fn classify_subagent_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let subagents = dir.path().join("sess/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let by_path = subagents.join("agent-a1.jsonl");
+        fs::write(&by_path, CLAUDE_JSONL).unwrap();
+        assert!(matches!(
+            classify(&by_path.to_string_lossy(), "agent-a1"),
+            HookTarget::Subagent
+        ));
+
+        let fork = concat!(
+            r#"{"type":"fork-context-ref","agentId":"a2"}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"hi"}}"#,
+            "\n",
+        );
+        let (_dir, by_flag) = written("agent-a2.jsonl", fork);
+        assert!(matches!(
+            classify(&by_flag, "agent-a2"),
+            HookTarget::Subagent
+        ));
+    }
+
+    #[test]
+    fn hook_on_subagent_transcript_archives_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        let subagents = tmp.path().join("projects/-p/sess/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-a1.jsonl");
+        fs::write(&path, CLAUDE_JSONL).unwrap();
+
+        let hook_input = crate::jsonl::HookInput {
+            session_id: "agent-a1".into(),
+            transcript_path: path.to_string_lossy().to_string(),
+            _cwd: None,
+            _hook_event_name: Some("SessionEnd".into()),
+        };
+        assert!(run_with_hook_input(&hook_input, &memory).is_ok());
+        assert_eq!(
+            fs::read_dir(memory.join("conversations")).unwrap().count(),
+            0
+        );
+        assert!(!memory.join("ARCHIVE.md").exists());
+        assert!(!memory.join("EPHEMERAL.md").exists());
+    }
+
+    /// RE-74 audit C3: a fork moved beside its parent is caught by the
+    /// `is_sub_run` read, not the layout, and both runs are counted.
+    #[test]
+    fn archive_all_skips_a_fork_beside_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join(".claude/projects/-home-dev-app");
+        fs::create_dir_all(project.join("sess-1/subagents")).unwrap();
+        fs::write(project.join("sess-1.jsonl"), CLAUDE_JSONL).unwrap();
+        fs::write(
+            project.join("sess-1/subagents/agent-a1.jsonl"),
+            CLAUDE_JSONL,
+        )
+        .unwrap();
+        let fork = concat!(
+            r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"sess-1"}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"worker prompt"}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            "\n",
+        );
+        fs::write(project.join("agent-a2.jsonl"), fork).unwrap();
+        let memory = tmp.path().join("root/memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+
+        let transcripts = ClaudeCodeTranscripts::new(tmp.path().join(".claude/projects"));
+        let report = archive_all_with(&memory, &transcripts).unwrap();
+
+        let archived = collect_archived_sessions(&memory.join("conversations"));
+        assert_eq!(archived.len(), 1, "{archived:?}");
+        assert!(archived.contains("sess-1"));
+        assert!(!archived.contains("agent-a2"));
+        assert_eq!(report.archived, 1);
+        assert_eq!(report.subagents_skipped, 2, "one by layout, one by flag");
+        assert!(
+            report.summary().ends_with("and 2 subagent runs"),
+            "{}",
+            report.summary()
+        );
+    }
+
+    /// `archive --all-unarchived` writes into the store it is given — never a
+    /// `conversations/` beside `projects/` — and skips subagents like the
+    /// capture sweep does (RE-74).
+    #[test]
+    fn archive_all_writes_into_memory_store_and_skips_subagents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join(".claude");
+        let project = claude.join("projects/-home-dev-app");
+        fs::create_dir_all(project.join("sess-1/subagents")).unwrap();
+        fs::write(project.join("sess-1.jsonl"), CLAUDE_JSONL).unwrap();
+        fs::write(
+            project.join("sess-1/subagents/agent-a1.jsonl"),
+            CLAUDE_JSONL,
+        )
+        .unwrap();
+        let memory = tmp.path().join("root/memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        // A legacy store beside `projects/` — where 4.6.2 wrote.
+        fs::create_dir_all(claude.join("conversations")).unwrap();
+
+        let transcripts = ClaudeCodeTranscripts::new(claude.join("projects"));
+        archive_all_with(&memory, &transcripts).unwrap();
+
+        let archived = collect_archived_sessions(&memory.join("conversations"));
+        assert_eq!(archived.len(), 1, "{archived:?}");
+        assert!(archived.contains("sess-1"));
+        assert_eq!(
+            fs::read_dir(claude.join("conversations")).unwrap().count(),
+            0,
+            "nothing may land in the legacy store beside projects/"
+        );
+
+        // Re-running finds nothing new.
+        archive_all_with(&memory, &transcripts).unwrap();
+        assert_eq!(
+            fs::read_dir(memory.join("conversations")).unwrap().count(),
+            1
         );
     }
 }
