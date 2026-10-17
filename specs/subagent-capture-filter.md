@@ -1,7 +1,7 @@
 # Spec — Subagent transcripts are not sessions: capture, hooks and batch archive skip them
 
-**Status:** draft (RE-74)
-**Target version:** 4.6.2 → 4.6.3 (bug fix, no surface change)
+**Status:** approved (RE-74), in build
+**Target version:** 4.7.0, one release shared with RE-75 (bug fix, no surface change)
 **Drafted:** 2026-10-17
 **Baseline:** `main` @ `86c7590` (v4.6.2 + docs)
 **Issue:** #74
@@ -106,7 +106,7 @@ and Grok adapters are untouched.
 
 - **Removing what is already written** (156 archives, their ARCHIVE.md rows and graph
   episodes). Archives are immutable by contract, and episode removal is a graph operation;
-  this wants its own `prune` design. Follow-up issue. EPHEMERAL heals by itself: the next five
+  this wants its own `prune` design. Follow-up #76. EPHEMERAL heals by itself: the next five
   real sessions push the subagent entries out of the window.
 - **Folding a subagent into its parent's archive.** The parent transcript already records the
   Agent tool call (`ToolUse`) and, for foreground agents, its result (`ToolResult`).
