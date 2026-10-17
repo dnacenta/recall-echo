@@ -957,7 +957,13 @@ pub fn run_with(
 
     // Write MEMORY.md (never overwrite)
     write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
-    if let Ok(content) = fs::read_to_string(memory_dir.join("MEMORY.md")) {
+    let memory_md = memory_dir.join("MEMORY.md");
+    // Only a regular file: a FIFO there would block the read forever.
+    if let Some(content) = fs::metadata(&memory_md)
+        .is_ok_and(|meta| meta.is_file())
+        .then(|| fs::read_to_string(&memory_md).ok())
+        .flatten()
+    {
         print_status(
             Status::Exists,
             &format!(

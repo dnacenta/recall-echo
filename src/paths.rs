@@ -416,6 +416,7 @@ impl ConfigRoots {
 
     /// The same roots, answering as though the session were (or were not)
     /// at a terminal — tests drive the prompts with this.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_interactive(mut self, interactive: bool) -> Self {
         self.interactive = interactive;
@@ -431,6 +432,7 @@ impl ConfigRoots {
     }
 
     /// The same roots, as though Claude Code's auto-memory switch read `value`.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_auto_memory_env(mut self, value: Option<&str>) -> Self {
         self.auto_memory_env = value.map(str::to_string);

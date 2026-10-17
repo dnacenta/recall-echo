@@ -53,11 +53,12 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
 
     // MEMORY.md
     let memory_path = memory.join("MEMORY.md");
-    if memory_path.exists() {
-        let lines = fs::read_to_string(&memory_path)
-            .unwrap_or_default()
-            .lines()
-            .count();
+    // Read once, and only a regular file: a FIFO would block the read forever.
+    let memory_md = fs::metadata(&memory_path)
+        .is_ok_and(|meta| meta.is_file())
+        .then(|| fs::read_to_string(&memory_path).unwrap_or_default());
+    if let Some(content) = memory_md {
+        let lines = content.lines().count();
         let pct = (lines as f32 / 200.0 * 100.0) as u32;
         let bar = progress_bar(pct, 4);
         let color = if pct > 90 {
@@ -71,7 +72,6 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
         if pct > 70 {
             issues.push(format!("MEMORY.md approaching limit ({pct}%)"));
         }
-        let content = fs::read_to_string(&memory_path).unwrap_or_default();
         eprintln!(
             "                  {DIM}{} — loaded into every Claude Code session{RESET}",
             crate::distill::size_summary(&content)
@@ -84,6 +84,9 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
             ));
         }
         issues.extend(crate::rules_file::hidden_import_warning(&content));
+    } else if fs::symlink_metadata(&memory_path).is_ok() {
+        eprintln!("  MEMORY.md       {BAD}not a regular file{RESET}");
+        issues.push("MEMORY.md is not a regular file".to_string());
     } else {
         eprintln!("  MEMORY.md       {DIM}not found{RESET}");
         issues.push("MEMORY.md not found".to_string());
@@ -205,6 +208,20 @@ fn progress_bar(pct: u32, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A FIFO in MEMORY.md's place is reported, never read — reading it
+    /// would block `status` forever.
+    #[test]
+    fn status_does_not_read_a_fifo_memory_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        std::fs::create_dir_all(memory.join("conversations")).unwrap();
+        let fifo = std::ffi::CString::new(memory.join("MEMORY.md").to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // Returns at all: before, this blocked on the FIFO.
+        run_with_base(tmp.path()).unwrap();
+    }
+
     #[test]
     fn status_reports_a_store_others_can_write() {
         use std::os::unix::fs::PermissionsExt;
