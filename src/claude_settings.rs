@@ -301,12 +301,16 @@ impl SettingsEdit {
         let content = serde_json::to_string_pretty(&value)
             .map_err(|e| format!("Failed to serialize settings: {e}"))?;
         if let Some(replaced) = &current {
-            fs::write(self.path.with_extension("json.bak"), replaced).map_err(|e| {
-                format!(
-                    "Could not keep a backup of {} ({e}) — not written",
-                    self.path.display()
-                )
-            })?;
+            // Through the same writer: owner-only, created exclusively, and a
+            // symlink at the `.bak` path is replaced, never written through.
+            atomic_replace(&self.path.with_extension("json.bak"), replaced, false).map_err(
+                |e| {
+                    format!(
+                        "Could not keep a backup of {} ({e}) — not written",
+                        self.path.display()
+                    )
+                },
+            )?;
         }
         atomic_replace(&self.path, &content, true)
             .map_err(|e| format!("Failed to write {}: {e}", self.path.display()))?;
@@ -374,7 +378,11 @@ pub(crate) fn apply_hooks(
 /// later leaves a world-readable window — and is synced before the rename.
 /// `keep_mode` copies the existing file's permissions onto the replacement,
 /// for a file whose mode is the user's choice rather than ours.
-pub(crate) fn atomic_replace(path: &Path, content: &str, keep_mode: bool) -> std::io::Result<()> {
+pub(crate) fn atomic_replace(
+    path: &Path,
+    content: impl AsRef<[u8]>,
+    keep_mode: bool,
+) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -387,7 +395,7 @@ pub(crate) fn atomic_replace(path: &Path, content: &str, keep_mode: bool) -> std
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
+        f.write_all(content.as_ref())?;
         f.sync_all()?;
         if keep_mode {
             if let Ok(meta) = fs::metadata(path) {
@@ -1118,6 +1126,34 @@ mod tests {
         assert_eq!(
             target.memory_steps(),
             Err(&Skip::PulseHome(vec![home.path().join("entity")]))
+        );
+    }
+
+    /// `.bak` is the replaced bytes, owner-only, and a symlink planted at the
+    /// `.bak` path is replaced rather than followed (#75 audit L3).
+    #[test]
+    fn commit_keeps_an_owner_only_backup_and_never_writes_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, r#"{"model": "opus"}"#).unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("json.bak")).unwrap();
+
+        let OpenSettings::Edit(mut edit) = open_settings(&path) else {
+            panic!("a readable settings.json");
+        };
+        disable_auto_memory(&mut edit.value);
+        assert_eq!(edit.commit(|_| Ok(())), Ok(Committed::Written));
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        let bak = path.with_extension("json.bak");
+        assert!(!fs::symlink_metadata(&bak).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&bak).unwrap(), r#"{"model": "opus"}"#);
+        assert_eq!(
+            fs::metadata(&bak).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
