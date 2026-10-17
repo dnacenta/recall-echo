@@ -359,7 +359,7 @@ fn check_private(
 /// for a symlink — could put words into every session. The root and
 /// `memory/` must be directories, and MEMORY.md (when it exists) a regular
 /// file, each owned by this user and writable by nobody else ([`foreign_write`]).
-fn vet_store(root: &Path) -> Result<(), String> {
+pub(crate) fn vet_store(root: &Path) -> Result<(), String> {
     let uid = crate::serve_security::current_uid().map_err(|e| e.to_string())?;
     let private_group = crate::serve_security::private_group(uid);
 

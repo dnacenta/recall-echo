@@ -22,6 +22,12 @@ pub fn run() -> Result<(), RecallError> {
     run_with_base(&root)
 }
 
+/// The checks `init` applies before importing this store's MEMORY.md into
+/// every Claude Code session, as a status issue when they fail.
+fn trust_issue(pulse_root: &Path) -> Option<String> {
+    crate::rules_file::vet_store(pulse_root).err()
+}
+
 pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
     let memory = pulse_root.join("memory");
     if !memory.exists() {
@@ -82,6 +88,7 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
         eprintln!("  MEMORY.md       {DIM}not found{RESET}");
         issues.push("MEMORY.md not found".to_string());
     }
+    issues.extend(trust_issue(pulse_root));
 
     // EPHEMERAL.md
     let cfg = config::load(&memory);
@@ -198,6 +205,23 @@ fn progress_bar(pct: u32, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_reports_a_store_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        for dir in [tmp.path(), memory.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(trust_issue(tmp.path()), None);
+
+        std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let issue = trust_issue(tmp.path()).expect("an issue");
+        assert!(issue.contains("writable by every user"), "{issue}");
+        assert!(issue.contains("chmod g-w,o-w"), "{issue}");
+    }
+
     use super::*;
 
     /// Init writes hooks and a persisted root pointer outside the store, so
