@@ -10,6 +10,26 @@ use crate::error::RecallError;
 use crate::paths;
 use crate::theme::{BOLD, DIM, RESET, WARN};
 
+/// Above this many bytes MEMORY.md is due a distill whatever its line count:
+/// it is imported whole into every Claude Code session, and 200 long lines
+/// cost a session far more than 200 short ones.
+pub(crate) const DISTILL_AFTER_BYTES: usize = 25 * 1024;
+
+/// Line count at which a distill is suggested.
+const DISTILL_AFTER_LINES: usize = 140;
+
+/// MEMORY.md's size as a session pays for it: bytes and a coarse char/4
+/// token estimate.
+pub(crate) fn size_summary(content: &str) -> String {
+    let bytes = content.len();
+    format!("{bytes} bytes, ~{} tokens", bytes.div_ceil(4))
+}
+
+/// Whether MEMORY.md is due a distill, by lines or by bytes.
+fn needs_distill(line_count: usize, bytes: usize) -> bool {
+    line_count >= DISTILL_AFTER_LINES || bytes > DISTILL_AFTER_BYTES
+}
+
 /// Analyze MEMORY.md and suggest distillation actions.
 pub fn run() -> Result<(), RecallError> {
     let base = paths::pulse_root()?;
@@ -30,13 +50,28 @@ pub fn run_with_base(base: &Path) -> Result<(), RecallError> {
 
     eprintln!("\n{BOLD}recall-echo distill{RESET} — MEMORY.md analysis\n");
     eprintln!("  Lines: {line_count}/200");
+    eprintln!("  Size:  {}", size_summary(&content));
+    if let Some(warning) = crate::rules_file::hidden_import_warning(&content) {
+        eprintln!("  {WARN}!{RESET} {warning}");
+    }
 
-    if line_count < 140 {
+    if !needs_distill(line_count, content.len()) {
         eprintln!("  {DIM}MEMORY.md is healthy — no distillation needed.{RESET}\n");
         return Ok(());
     }
 
-    let suggestions = analyze_memory(&lines);
+    let mut suggestions = analyze_memory(&lines);
+    if content.len() > DISTILL_AFTER_BYTES {
+        suggestions.insert(
+            0,
+            format!(
+                "MEMORY.md is {} KB, over the {} KB budget — every session loads it whole; \
+                 move detail into topic files",
+                content.len() / 1024,
+                DISTILL_AFTER_BYTES / 1024
+            ),
+        );
+    }
 
     if suggestions.is_empty() {
         eprintln!("  {DIM}No specific suggestions — consider manual review.{RESET}\n");
@@ -231,6 +266,22 @@ fn find_empty_sections(lines: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn distill_triggers_on_bytes_as_well_as_lines() {
+        assert!(!needs_distill(100, 10 * 1024));
+        assert!(needs_distill(140, 1024));
+        assert!(needs_distill(100, DISTILL_AFTER_BYTES + 1));
+        assert!(!needs_distill(139, DISTILL_AFTER_BYTES));
+    }
+
+    #[test]
+    fn size_summary_reports_bytes_and_tokens() {
+        assert_eq!(
+            size_summary(&"x".repeat(18_642)),
+            "18642 bytes, ~4661 tokens"
+        );
+    }
+
     use super::*;
 
     #[test]
