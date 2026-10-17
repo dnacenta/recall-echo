@@ -123,14 +123,26 @@ rest of `init` unchanged:
 - a root that is relative or not UTF-8;
 - a root containing whitespace, control characters, a backslash, or Unicode format
   characters (bidi controls, zero-width characters, tags);
-- a root or `<root>/memory/` that is missing, owned by another uid, or writable by group or
-  others;
-- a MEMORY.md that is a symlink, is not a regular file, is owned by another uid, or is
-  writable by group or others.
+- a root or `<root>/memory/` that is missing, is owned by another uid, or that other users
+  can write;
+- a MEMORY.md that is a symlink, is not a regular file, is owned by another uid, or that
+  other users can write.
 
-When the rules step is refused or skipped but a managed rules file imports a different
-store's MEMORY.md, `init` names that store in a warning. It neither rewrites nor deletes the
-file: the file is still serving the store it names.
+"Other users can write" means write for everyone, or write for a group other than the user's
+**private group**: their primary group, named after them, with no other members. That is the
+user-private-group scheme Ubuntu and Fedora use, where login shells run with umask 0002 and
+every file is group-writable, harmlessly. Every refusal names the fix
+(`chmod g-w,o-w <path>`). `init` itself creates `memory/` and `conversations/` 0700, and
+MEMORY.md, EPHEMERAL.md and ARCHIVE.md 0600, whatever the umask, so it never refuses the
+store it just made.
+
+When the rules step is refused, or skipped for a pulse (not for a build-directory binary),
+`init` looks at the managed rules file that is there. If it imports *this* store's
+MEMORY.md, it would keep loading exactly what the run declined to import, so it is removed
+and `init` says so ("Removed managed rules file … because …"). If it imports a different
+store's MEMORY.md, it is still serving that store, so it stays and a warning names the store.
+A file without the marker is never touched. `status` runs the same trust checks on the
+current store and reports a failure as an issue.
 
 ### Layer 2: EPHEMERAL stays on the hook, now including `/clear`
 
@@ -146,10 +158,14 @@ holds only recall-echo's hook. A group shared with other hooks keeps its matcher
 
 - `consume` output is unchanged (EPHEMERAL only).
 - `init` writes no rules file and skips the auto-memory step when the root holds
-  `pulse-null.toml`, or when the target user's home holds pulses
-  (`$HOME/pulse-null/*/pulse-null.toml`, the shape pulse-null discovers). It prints why.
+  `pulse-null.toml`, or when the target user's home holds pulses in any shape pulse-null
+  discovers: `~/pulse-null/<n>`, `~/pulse-null/pulses/<n>`, `~/pulse-null/entities/<n>` and
+  the legacy `~/entity`, each a real directory holding `pulse-null.toml`. It prints why.
   Pulse-null renders each pulse's own `.claude/rules/recall-echo.md` and loads MEMORY.md
   itself, and a user-level rules file would load into every pulse session.
+- When those pulses belong to the user whose own `~/.claude` is the target, `init` skips the
+  user-level **hooks** too. They would fire for every pulse and resolve to the wrong store,
+  which pulse-null's `repair` warns about. Pulse-null gives each pulse its own hooks.
 - Pulse hooks are written by pulse-null, not by `recall-echo init`, so the matcher change
   never reaches them.
 
@@ -179,8 +195,11 @@ one value, and it is written once at the end, only when something changed. Right
 write the file is read again. If it changed while `init` ran (an editor saving during the
 prompt, say), the new content wins and this run's changes are applied to it again. If the
 new content is no longer a JSON object, nothing is written. `settings.json.bak` holds the
-bytes the write replaced. A settings.json that is a symlink is never replaced; `init`
-prints the hooks it needs and the `autoMemoryEnabled` key instead.
+bytes the write replaced, written owner-only through the same exclusive writer (a symlink at
+the `.bak` path is replaced, never followed). A settings.json that is a symlink is never
+replaced, whether it was one at the first read or became one during the prompt; `init`
+prints the hooks it needs and the `autoMemoryEnabled` key instead. `init` and `status` read
+MEMORY.md only when it is a regular file, so a FIFO there cannot hang them.
 
 ### MEMORY.md hygiene
 
@@ -233,7 +252,8 @@ Paths in the body are rendered from the root, not hard-coded to `~/.claude`.
 - AC1: Given a Claude Code install with no rules file, when `recall-echo init <root>` runs,
   then `<claude_dir>/rules/recall-echo.md` exists (0600, in a 0700 `rules/` it created), its
   first line is the managed marker, and it contains exactly one import,
-  `@<canonical root>/memory/MEMORY.md`.
+  `@<canonical root>/memory/MEMORY.md`. The store `init` created is owner-only (`memory/`
+  and `conversations/` 0700, the three files 0600) under any umask.
 - AC2: Given that file and a MEMORY.md over 10,000 chars, when a headless Claude Code session
   starts, then the last line of MEMORY.md is in context. This is checked with a headless
   probe that plants a marker at the tail.
@@ -257,9 +277,10 @@ Paths in the body are rendered from the root, not hard-coded to `~/.claude`.
   It reports "already imports MEMORY.md" when the file already has an `@` line resolving to
   this store's MEMORY.md, and prints the import line to add otherwise. A symlink, a FIFO or
   a directory at that path is never read or replaced.
-- AC8: Given a root holding `pulse-null.toml`, or a target home holding
-  `pulse-null/*/pulse-null.toml`, `init` writes no rules file, does not touch auto-memory,
-  and says why. For any root, `consume` output is byte-identical to 4.6.2.
+- AC8: Given a root holding `pulse-null.toml`, or a target home holding pulses in any of
+  pulse-null's four shapes, `init` writes no rules file, does not touch auto-memory, and says
+  why. When the target is that pulse user's own `~/.claude`, it writes no hooks either. For
+  any root, `consume` output is byte-identical to 4.6.2.
 - AC9: A non-interactive `init` (stdin or stderr not a terminal) never changes
   `autoMemoryEnabled` and prints one notice when auto-memory is on. End of input at the
   question means no. With `autoMemoryEnabled: false` or `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
@@ -271,20 +292,24 @@ Paths in the body are rendered from the root, not hard-coded to `~/.claude`.
 
 - AC11: A root that fails the render or trust checks (relative, non-UTF-8, whitespace,
   control, backslash or format characters; root or `memory/` missing, foreign-owned or
-  group/world-writable; MEMORY.md a symlink, not a regular file, foreign-owned or
-  group/world-writable) leaves no rules file and prints one error line naming why. Hooks
-  and MCP are handled exactly as before. If a managed rules file imports another store, a
-  warning names it.
+  writable by others; MEMORY.md a symlink, not a regular file, foreign-owned or writable by
+  others — where group-write by the user's private group does not count) leaves
+  no rules file and prints one error line naming why and the `chmod g-w,o-w` fix. Hooks and
+  MCP are handled exactly as before. A managed rules file importing this store is removed
+  and the removal reported. One importing another store stays, and a warning names it.
+  Unmarked files are never touched.
 - AC12: An unreadable or invalid `settings.json`, or one whose top level is not an object,
   means the hooks and auto-memory steps are refused and the file is never overwritten. A
   symlinked settings.json is never replaced, and `init` prints what to add.
-- AC15: One run writes settings.json at most once, and `.bak` holds the bytes it replaced. A
-  change made to the file during the prompt is kept, with this run's changes applied to it.
-  A file broken during the prompt is not overwritten.
+- AC15: One run writes settings.json at most once, and `.bak` holds the bytes it replaced
+  (0600, never written through a symlink). A change made to the file during the prompt is
+  kept, with this run's changes applied to it. A file broken during the prompt, or turned
+  into a symlink, is not overwritten.
 - AC16: `status`, `distill` and `init` warn about `@` import tokens in MEMORY.md (outside
   code), and the rendered rules file tells the model never to put secrets or `@` lines in
-  MEMORY.md. `init` and `status` report MEMORY.md bytes and approximate tokens. `distill`
-  suggests distilling above 25 KB whatever the line count.
+  MEMORY.md. `init` and `status` report MEMORY.md bytes and approximate tokens, and read it
+  only when it is a regular file. `distill` suggests distilling above 25 KB whatever the line
+  count. `status` reports a store the rules step would refuse.
 - AC13: If the rules directory cannot be created or written, `init` prints an error line and
   carries on. `init` never fails because of an integration.
 
