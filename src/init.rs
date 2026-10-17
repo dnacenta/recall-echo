@@ -20,8 +20,8 @@
 //!   under, because that is the subscription the user just proved they have;
 //! - none — the full provider menu, since now the choice really is open.
 //!
-//! Nothing prompts unless stderr is a terminal ([`atty_check`]); a scripted or
-//! piped install takes the same defaults without blocking.
+//! Nothing prompts unless stdin and stderr are both terminals ([`atty_check`]);
+//! a scripted or piped install takes the same defaults without blocking.
 //!
 //! # What it does without asking
 //!
@@ -768,10 +768,14 @@ fn print_summary(summary: &Summary) {
     eprintln!();
 }
 
-/// Check if stderr is a terminal (for interactive prompts).
+/// Whether `init` may ask anything: stdin and stderr are both terminals.
+///
+/// stderr alone is not enough — with stdin piped, a blank line in the pipe
+/// would read as the default answer, and a default of yes would change a
+/// setting nobody was asked about.
 fn atty_check() -> bool {
     use std::io::IsTerminal;
-    std::io::stderr().is_terminal()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────
