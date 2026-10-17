@@ -505,46 +505,156 @@ fn configure_rules(roots: &paths::ConfigRoots, pulse_root: &Path) {
     }
 }
 
+/// Claude Code's own switch for its built-in auto-memory.
+const AUTO_MEMORY_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+
+/// Whether Claude Code's built-in auto-memory is on for this user: it is
+/// unless `settings.json` says `"autoMemoryEnabled": false`, or
+/// [`AUTO_MEMORY_ENV`] is truthy — in the environment (`env_disable`) or in
+/// the settings' own `env` block, which Claude Code applies at startup.
+fn auto_memory_on(settings: &serde_json::Value, env_disable: Option<&str>) -> bool {
+    fn truthy(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+    let setting_off = settings
+        .get("autoMemoryEnabled")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    let settings_env_off = settings
+        .get("env")
+        .and_then(|env| env.get(AUTO_MEMORY_ENV))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(truthy);
+    !(setting_off || settings_env_off || env_disable.is_some_and(truthy))
+}
+
+/// Offer to turn off Claude Code's built-in auto-memory (#75).
+///
+/// With it on, the user has a second curated store that recall-echo neither
+/// reads nor feeds — and it is the one the model is told to use. The choice
+/// is the user's: asked once, only when auto-memory is on and stderr is a
+/// terminal (`interactive`), defaulting to yes on Enter. End of input counts
+/// as no, so a piped install never changes a Claude Code setting by default;
+/// a non-interactive one gets a notice line instead. Skipped for a pulse root
+/// and wherever hooks are skipped.
+fn configure_auto_memory(
+    roots: &paths::ConfigRoots,
+    pulse_root: &Path,
+    reader: &mut dyn BufRead,
+    interactive: bool,
+    env_disable: Option<&str>,
+) {
+    let Some(claude_dir) = roots.claude_dir() else {
+        return;
+    };
+    if paths::is_build_dir(roots.recall_bin()) || is_pulse_root(pulse_root) {
+        return;
+    }
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings = match read_settings(&settings_path) {
+        Ok(settings) => settings,
+        Err(why) => {
+            print_status(
+                Status::Error,
+                &format!("{why} — Claude Code auto-memory left as is"),
+            );
+            return;
+        }
+    };
+    if !auto_memory_on(&settings, env_disable) {
+        return;
+    }
+
+    let what = "Claude Code's built-in auto-memory is on: a second curated store that \
+                recall-echo does not read";
+    let not_moved = "Notes already under ~/.claude/projects/*/memory/ are not moved.";
+    if !interactive {
+        print_status(
+            Status::Exists,
+            &format!(
+                "{what}. Set \"autoMemoryEnabled\": false in {} to keep one store. {not_moved}",
+                settings_path.display()
+            ),
+        );
+        return;
+    }
+
+    eprintln!("\n{BOLD}{what}.{RESET}");
+    eprintln!("  {DIM}{not_moved}{RESET}");
+    eprint!("  Turn it off? [Y/n] ");
+    let mut answer = String::new();
+    let accepted = match reader.read_line(&mut answer) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        ),
+    };
+    if !accepted {
+        print_status(Status::Exists, "Left Claude Code's auto-memory on");
+        return;
+    }
+
+    settings["autoMemoryEnabled"] = serde_json::Value::Bool(false);
+    let written = serde_json::to_string_pretty(&settings)
+        .map_err(|e| e.to_string())
+        .and_then(|content| {
+            write_settings_atomically(&settings_path, &content).map_err(|e| e.to_string())
+        });
+    match written {
+        Ok(()) => print_status(
+            Status::Created,
+            "Turned off Claude Code's auto-memory — MEMORY.md here is the one curated store",
+        ),
+        Err(e) => print_status(
+            Status::Error,
+            &format!("Failed to write {}: {e}", settings_path.display()),
+        ),
+    }
+}
+
+/// Read `settings.json` for an edit.
+///
+/// Absent means a fresh install: `{}`. Unreadable or unparseable means the
+/// user's existing configuration — falling back to `{}` there would
+/// overwrite everything they have (permissions, MCP servers, env) with a
+/// file containing nothing but our change. The `Err` names why.
+fn read_settings(settings_path: &Path) -> Result<serde_json::Value, String> {
+    if !settings_path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let content = fs::read_to_string(settings_path)
+        .map_err(|e| format!("Could not read {} ({e})", settings_path.display()))?;
+    let settings: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "{} is not valid JSON ({e}) — refusing to overwrite it; fix the file and re-run init",
+            settings_path.display()
+        )
+    })?;
+    if !settings.is_object() {
+        return Err(format!(
+            "{} is not a JSON object — refusing to overwrite it",
+            settings_path.display()
+        ));
+    }
+    Ok(settings)
+}
+
 /// Install or repair the three hooks in the settings file at `settings_path`.
 ///
 /// Split from [`configure_hooks`] so the writer can be exercised against a
 /// named file with a named binary: where it writes is an argument, never a
 /// path this process resolves for itself (#59).
 fn install_hooks(settings_path: &Path, pulse_root: &Path, recall_bin: &str) -> bool {
-    // Absent means a fresh install. Unreadable or unparseable means the
-    // user's existing configuration — falling back to `{}` there would
-    // overwrite everything they have (permissions, MCP servers, env) with a
-    // file containing nothing but these hooks.
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = match fs::read_to_string(settings_path) {
-            Ok(c) => c,
-            Err(e) => {
-                print_status(
-                    Status::Error,
-                    &format!(
-                        "Could not read {} ({e}) — hooks not configured",
-                        settings_path.display()
-                    ),
-                );
-                return false;
-            }
-        };
-        match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                print_status(
-                    Status::Error,
-                    &format!(
-                        "{} is not valid JSON ({e}) — refusing to overwrite it; \
-                         fix the file and re-run init",
-                        settings_path.display()
-                    ),
-                );
-                return false;
-            }
+    let mut settings = match read_settings(settings_path) {
+        Ok(settings) => settings,
+        Err(why) => {
+            print_status(Status::Error, &format!("{why} — hooks not configured"));
+            return false;
         }
-    } else {
-        serde_json::json!({})
     };
 
     let root = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
@@ -1178,6 +1288,14 @@ pub fn run_with(
     // is not installed.
     configure_hooks(roots, pulse_root);
     configure_rules(roots, pulse_root);
+    let env_disable = std::env::var(AUTO_MEMORY_ENV).ok();
+    configure_auto_memory(
+        roots,
+        pulse_root,
+        reader,
+        atty_check(),
+        env_disable.as_deref(),
+    );
 
     let mcp = match &runtime {
         Some(runtime) => register_mcp_clients(runtime, &detected, pulse_root, roots),
@@ -1781,6 +1899,142 @@ mod tests {
         let roots = sandbox.roots.clone().without_claude_code();
         configure_rules(&roots, &sandbox.pulse_root());
         assert!(!sandbox.dir.path().join(".claude/rules").exists());
+    }
+
+    #[test]
+    fn auto_memory_on_table() {
+        use serde_json::json;
+        let cases = [
+            (json!({}), None, true),
+            (json!({"autoMemoryEnabled": true}), None, true),
+            (json!({"autoMemoryEnabled": false}), None, false),
+            (json!({}), Some("1"), false),
+            (json!({}), Some("TRUE"), false),
+            (json!({}), Some("0"), true),
+            (json!({}), Some(""), true),
+            (json!({"env": {AUTO_MEMORY_ENV: "1"}}), None, false),
+            (json!({"env": {AUTO_MEMORY_ENV: "false"}}), None, true),
+        ];
+        for (settings, env, on) in cases {
+            assert_eq!(auto_memory_on(&settings, env), on, "{settings} env={env:?}");
+        }
+    }
+
+    /// The user's settings file in the sandbox, seeded with keys that must
+    /// survive an edit.
+    fn seeded_settings(sandbox: &Sandbox) -> PathBuf {
+        let path = sandbox.roots.claude_dir().unwrap().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"model": "opus", "permissions": {"allow": ["Bash(ls)"]}}"#,
+        )
+        .unwrap();
+        path
+    }
+
+    fn ask_auto_memory(sandbox: &Sandbox, answer: &str, interactive: bool) -> Cursor<Vec<u8>> {
+        let mut reader = Cursor::new(answer.as_bytes().to_vec());
+        configure_auto_memory(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut reader,
+            interactive,
+            None,
+        );
+        reader
+    }
+
+    #[test]
+    fn auto_memory_yes_writes_false_preserving_keys() {
+        let sandbox = Sandbox::new();
+        let path = seeded_settings(&sandbox);
+        ask_auto_memory(&sandbox, "y\n", true);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(settings["autoMemoryEnabled"], serde_json::json!(false));
+        assert_eq!(settings["model"], "opus");
+        assert_eq!(settings["permissions"]["allow"][0], "Bash(ls)");
+    }
+
+    #[test]
+    fn auto_memory_enter_defaults_to_yes() {
+        let sandbox = Sandbox::new();
+        let path = seeded_settings(&sandbox);
+        ask_auto_memory(&sandbox, "\n", true);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"autoMemoryEnabled\": false"));
+    }
+
+    #[test]
+    fn auto_memory_no_or_end_of_input_leaves_settings_byte_identical() {
+        for answer in ["n\n", "no\n", ""] {
+            let sandbox = Sandbox::new();
+            let path = seeded_settings(&sandbox);
+            let before = fs::read(&path).unwrap();
+            ask_auto_memory(&sandbox, answer, true);
+            assert_eq!(fs::read(&path).unwrap(), before, "answer {answer:?}");
+        }
+    }
+
+    #[test]
+    fn auto_memory_non_interactive_never_writes_or_reads() {
+        let sandbox = Sandbox::new();
+        let path = seeded_settings(&sandbox);
+        let before = fs::read(&path).unwrap();
+        let reader = ask_auto_memory(&sandbox, "y\n", false);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    #[test]
+    fn auto_memory_already_off_is_not_asked() {
+        let sandbox = Sandbox::new();
+        let path = sandbox.roots.claude_dir().unwrap().join("settings.json");
+        fs::write(&path, r#"{"autoMemoryEnabled": false}"#).unwrap();
+        let before = fs::read(&path).unwrap();
+        let reader = ask_auto_memory(&sandbox, "y\n", true);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    #[test]
+    fn auto_memory_off_by_environment_is_not_asked() {
+        let sandbox = Sandbox::new();
+        let path = seeded_settings(&sandbox);
+        let before = fs::read(&path).unwrap();
+        let mut reader = Cursor::new(b"y\n".to_vec());
+        configure_auto_memory(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut reader,
+            true,
+            Some("1"),
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    #[test]
+    fn auto_memory_invalid_settings_refused() {
+        let sandbox = Sandbox::new();
+        let path = sandbox.roots.claude_dir().unwrap().join("settings.json");
+        fs::write(&path, "{not json").unwrap();
+        let reader = ask_auto_memory(&sandbox, "y\n", true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
+        assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    #[test]
+    fn auto_memory_skipped_for_pulse_root() {
+        let sandbox = Sandbox::new();
+        fs::write(sandbox.pulse_root().join("pulse-null.toml"), "[pulse]\n").unwrap();
+        let path = seeded_settings(&sandbox);
+        let before = fs::read(&path).unwrap();
+        let reader = ask_auto_memory(&sandbox, "y\n", true);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(reader.position(), 0, "nothing asked");
     }
 
     /// The whole init flow, run against a sandbox, writes the hooks into the
