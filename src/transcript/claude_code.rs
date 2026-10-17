@@ -170,31 +170,37 @@ mod tests {
         assert_eq!(through_adapter.last_timestamp, directly.last_timestamp);
     }
 
-    /// Subagents and forks live beside their parent's transcript; only the
-    /// parent is a session.
+    /// A subagent in `subagents/` is set aside by layout alone, unread. A fork
+    /// moved beside its parent is still discovered — the layout says nothing
+    /// — and reads as a sub-run, so capture drops it after its archived check.
     #[test]
-    fn discovery_skips_subagent_and_fork_transcripts() {
+    fn subagents_are_set_aside_by_layout_and_forks_flagged_by_content() {
         let tmp = fixture_tree();
-        let session_dir = tmp
-            .path()
-            .join("projects")
-            .join("-home-dev-app")
-            .join("sess-abc")
-            .join("subagents");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let sidechain =
-            TRANSCRIPT.replace(r#""type":"user","#, r#""type":"user","isSidechain":true,"#);
-        std::fs::write(session_dir.join("agent-a1.jsonl"), &sidechain).unwrap();
-        let fork = format!(
-            "{}\n{sidechain}",
-            r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"sess-abc"}"#
+        let project = tmp.path().join("projects").join("-home-dev-app");
+        let subagents = project.join("sess-abc").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), TRANSCRIPT).unwrap();
+        let fork = concat!(
+            r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"sess-abc"}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"timestamp":"2026-03-05T14:31:00.000Z","message":{"role":"user","content":"Draft the slide"}}"#,
+            "\n",
         );
-        std::fs::write(session_dir.join("agent-a2.jsonl"), fork).unwrap();
+        std::fs::write(project.join("agent-a2.jsonl"), fork).unwrap();
 
         let adapter = ClaudeCodeTranscripts::new(tmp.path().join("projects"));
-        let found = adapter.discover(None).unwrap();
-        let ids: Vec<_> = found.iter().map(|t| t.session_id.as_str()).collect();
-        assert_eq!(ids, ["sess-abc"]);
+        let (found, by_layout) = adapter.discover_with_skipped(None).unwrap();
+        assert_eq!(by_layout, 1, "agent-a1 is set aside unread");
+        let mut ids: Vec<_> = found.iter().map(|t| t.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["agent-a2", "sess-abc"]);
+
+        let sub_runs: Vec<_> = found
+            .iter()
+            .filter(|t| adapter.is_sub_run(t))
+            .map(|t| t.session_id.as_str())
+            .collect();
+        assert_eq!(sub_runs, ["agent-a2"]);
     }
 
     /// A FIFO or a link to a device is never handed to the sniff or the

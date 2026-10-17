@@ -310,17 +310,18 @@ const CLAUDE_SUBAGENT: &str = concat!(
     "\n",
 );
 
-/// Write a subagent and a fork beside `session`'s transcript, where Claude
-/// Code puts them.
-fn add_subagents(projects_dir: &Path, session: &str) {
-    let dir = projects_dir.join(session).join("subagents");
+/// Write a subagent where Claude Code puts it (`<session>/subagents/`), and a
+/// fork beside `session`'s own transcript, where only its `isSidechain` flag
+/// gives it away.
+fn add_subagents(project_dir: &Path, session: &str) {
+    let dir = project_dir.join(session).join("subagents");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("agent-a1.jsonl"), CLAUDE_SUBAGENT).unwrap();
     let fork = format!(
         "{}\n{CLAUDE_SUBAGENT}",
         r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"parent"}"#
     );
-    std::fs::write(dir.join("agent-a2.jsonl"), fork).unwrap();
+    std::fs::write(project_dir.join("agent-a2.jsonl"), fork).unwrap();
 }
 
 #[test]
