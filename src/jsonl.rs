@@ -156,7 +156,9 @@ pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
     BufReader::new(file.take(SIDECHAIN_SNIFF_BYTES))
         .lines()
         .take(SIDECHAIN_SNIFF_LINES)
-        .map_while(Result::ok)
+        // An undecodable line is skipped, not the end of the sniff: stopping
+        // there would wave a subagent through on one bad byte.
+        .filter_map(Result::ok)
         .filter(|line| line.contains("\"isSidechain\""))
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
         .find_map(|entry| {
@@ -573,6 +575,18 @@ mod tests {
         // One line earlier and it is inside the window.
         lines.remove(0);
         let path = write_lines(dir.path(), "x/in-window.jsonl", &lines);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    /// A line that is not UTF-8 is skipped like a malformed one; the flag
+    /// after it is still read.
+    #[test]
+    fn invalid_utf8_line_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-a6.jsonl");
+        let mut body = vec![0xff, 0xfe, b'{', b'\n'];
+        body.extend_from_slice(SUBAGENT_TURN.as_bytes());
+        std::fs::write(&path, body).unwrap();
         assert!(is_subagent_transcript(&path));
     }
 
