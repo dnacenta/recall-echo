@@ -6,8 +6,9 @@
 //!
 //! Creates the directory structure and template files needed for four-layer
 //! memory (graph, curated, short-term, long-term), picks an extraction
-//! provider, installs Claude Code's hooks, registers the MCP server with every
-//! agent CLI on the machine, and downloads the embedding model.
+//! provider, installs Claude Code's hooks and the rules file that imports
+//! MEMORY.md, registers the MCP server with every agent CLI on the machine,
+//! and downloads the embedding model.
 //!
 //! # What `init` asks
 //!
@@ -29,6 +30,8 @@
 //! itself, and none of them can fail the command:
 //!
 //! - hooks are matched by command name, so re-running never duplicates one;
+//! - the rules file carries a marker line, so only a file `init` wrote is ever
+//!   rewritten (see [`crate::rules_file`]);
 //! - MCP servers live in a map keyed by name in every client, so re-registering
 //!   the same name is a no-op (see [`crate::agent_cli`]);
 //! - the model is a content-addressed cache, so a second warm is a no-op.
@@ -38,7 +41,7 @@
 //! A binary under `target/debug` or `target/release` is a test harness or a
 //! working copy, not something a user's hooks and MCP configs should be pinned
 //! to for the life of the install. Everything that writes *outside* the entity
-//! root — hooks, MCP registration — is skipped there, which is also what keeps
+//! root — hooks, the rules file, MCP registration — is skipped there, which is also what keeps
 //! `cargo test` from repointing the developer's live tooling at a test binary
 //! or downloading 127 MB per test.
 
@@ -50,6 +53,7 @@ use crate::agent_cli::{self, AgentCli, McpReport, McpStatus};
 use crate::config::{self, Config, LlmSection, Provider};
 use crate::error::RecallError;
 use crate::paths;
+use crate::rules_file;
 use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
 use crate::transcript::Source;
 
@@ -439,6 +443,66 @@ fn configure_hooks(roots: &paths::ConfigRoots, pulse_root: &Path) -> bool {
         pulse_root,
         roots.recall_bin(),
     )
+}
+
+/// Whether `root` is a pulse-null pulse. Pulse-null writes each pulse's own
+/// `.claude/` rules and puts MEMORY.md into the pulse's system prompt itself,
+/// so a user-level rules file would load it a second time in every pulse.
+fn is_pulse_root(root: &Path) -> bool {
+    root.join("pulse-null.toml").is_file()
+}
+
+/// Install the rules file that imports MEMORY.md into every Claude Code
+/// session (#75) — the only channel that carries Layer 1 whole.
+///
+/// Skipped wherever hooks are (no Claude Code, a build-directory binary),
+/// and for a pulse root.
+fn configure_rules(roots: &paths::ConfigRoots, pulse_root: &Path) {
+    let Some(claude_dir) = roots.claude_dir() else {
+        return;
+    };
+    if paths::is_build_dir(roots.recall_bin()) {
+        print_status(
+            Status::Exists,
+            "Skipped rules file — running from a build directory",
+        );
+        return;
+    }
+    if is_pulse_root(pulse_root) {
+        print_status(
+            Status::Exists,
+            "Skipped rules file — pulse-null writes this pulse's own rules",
+        );
+        return;
+    }
+
+    match rules_file::install(claude_dir, pulse_root) {
+        rules_file::Outcome::Written(path) => print_status(
+            Status::Created,
+            &format!(
+                "Wrote {} — MEMORY.md now loads in every Claude Code session",
+                path.display()
+            ),
+        ),
+        rules_file::Outcome::Unchanged(path) => print_status(
+            Status::Exists,
+            &format!("{} already up to date", path.display()),
+        ),
+        rules_file::Outcome::Unmanaged { path, import_line } => {
+            print_status(
+                Status::Exists,
+                &format!(
+                    "{} is not managed by recall-echo — left as is. For MEMORY.md to \
+                     load in every session it needs this line:",
+                    path.display()
+                ),
+            );
+            eprintln!("      {import_line}");
+        }
+        rules_file::Outcome::Refused(why) | rules_file::Outcome::Failed(why) => {
+            print_status(Status::Error, &format!("Rules file not written: {why}"));
+        }
+    }
 }
 
 /// Install or repair the three hooks in the settings file at `settings_path`.
@@ -1110,6 +1174,7 @@ pub fn run_with(
     // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
     // is not installed.
     configure_hooks(roots, pulse_root);
+    configure_rules(roots, pulse_root);
 
     let mcp = match &runtime {
         Some(runtime) => register_mcp_clients(runtime, &detected, pulse_root, roots),
@@ -1606,6 +1671,69 @@ mod tests {
         assert!(!sandbox.dir.path().join(".claude/settings.json").exists());
     }
 
+    fn sandbox_rules(sandbox: &Sandbox) -> PathBuf {
+        sandbox
+            .roots
+            .claude_dir()
+            .unwrap()
+            .join("rules")
+            .join(rules_file::FILE_NAME)
+    }
+
+    /// `init` writes the managed rules file into the sandbox, importing this
+    /// root's MEMORY.md and nothing else (#75).
+    #[test]
+    fn init_writes_rules_file_in_sandbox() {
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+
+        let rules = fs::read_to_string(sandbox_rules(&sandbox)).expect("rules file in the sandbox");
+        assert_eq!(rules.lines().next(), Some(rules_file::MARKER));
+        let root = fs::canonicalize(sandbox.pulse_root()).unwrap();
+        let line = rules_file::import_line(&root).unwrap();
+        let imports: Vec<&str> = rules.lines().filter(|l| l.starts_with('@')).collect();
+        assert_eq!(imports, [line.as_str()]);
+    }
+
+    #[test]
+    fn a_second_init_leaves_the_rules_file_as_it_was() {
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+        let first = fs::read(sandbox_rules(&sandbox)).unwrap();
+
+        sandbox.init("skip\n").unwrap();
+        assert_eq!(fs::read(sandbox_rules(&sandbox)).unwrap(), first);
+    }
+
+    /// A pulse gets MEMORY.md from pulse-null's own prompt; a user-level
+    /// import would load it twice in every pulse session.
+    #[test]
+    fn init_skips_rules_for_pulse_root() {
+        let sandbox = Sandbox::new();
+        fs::write(sandbox.pulse_root().join("pulse-null.toml"), "[pulse]\n").unwrap();
+        sandbox.init("skip\n").unwrap();
+        assert!(!sandbox_rules(&sandbox).exists());
+    }
+
+    #[test]
+    fn init_leaves_an_unmanaged_rules_file_untouched() {
+        let sandbox = Sandbox::new();
+        let rules = sandbox_rules(&sandbox);
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        fs::write(&rules, "# hand-written\n").unwrap();
+
+        sandbox.init("skip\n").unwrap();
+        assert_eq!(fs::read_to_string(&rules).unwrap(), "# hand-written\n");
+    }
+
+    #[test]
+    fn rules_are_skipped_when_claude_code_is_absent() {
+        let sandbox = Sandbox::new();
+        let roots = sandbox.roots.clone().without_claude_code();
+        configure_rules(&roots, &sandbox.pulse_root());
+        assert!(!sandbox.dir.path().join(".claude/rules").exists());
+    }
+
     /// The whole init flow, run against a sandbox, writes the hooks into the
     /// sandbox's `settings.json` — through the real `configure_hooks`
     /// dispatcher, with no guard short-circuiting it — and leaves the real
@@ -1635,6 +1763,10 @@ mod tests {
                 "{command} missing from the sandboxed settings.json: {hooks}"
             );
         }
+        assert!(
+            sandbox_rules(&sandbox).exists(),
+            "the rules file landed in the sandbox"
+        );
 
         before.assert_unchanged();
     }
@@ -1658,6 +1790,7 @@ mod tests {
             Self {
                 entries: vec![
                     Digest::take(real_settings_file(), Strictness::Exact),
+                    Digest::take(real_rules_file(), Strictness::Exact),
                     Digest::take(real_claude_json(), Strictness::WhenUntouched),
                     Digest::take(real_pointer_file("pulse-root"), Strictness::Exact),
                     Digest::take(real_pointer_file("entity-root"), Strictness::Exact),
@@ -1691,6 +1824,15 @@ mod tests {
 
     fn real_claude_json() -> PathBuf {
         real_home().join(".claude.json")
+    }
+
+    /// `~/.claude/rules/recall-echo.md` — spelled out, not taken from
+    /// `rules_file`, for the same reason as the settings path.
+    fn real_rules_file() -> PathBuf {
+        real_home()
+            .join(".claude")
+            .join("rules")
+            .join("recall-echo.md")
     }
 
     /// The persisted pointer — `pulse-root`, or the pre-4.6.0 `entity-root`.
