@@ -152,6 +152,16 @@ pub trait Transcript: Send + Sync {
     /// Read one discovered session into the universal conversation format.
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError>;
 
+    /// [`Transcript::discover`], plus how many records it set aside by layout
+    /// alone as part of another session, for the capture report. Zero for
+    /// CLIs that have no such records.
+    fn discover_with_skipped(
+        &self,
+        since: Option<SystemTime>,
+    ) -> Result<(Vec<TranscriptRef>, u32), RecallError> {
+        Ok((self.discover(since)?, 0))
+    }
+
     /// Whether a discovered record turns out, on reading, to be part of
     /// another session rather than a session of its own — a Claude Code
     /// subagent outside `subagents/`. Reads the file, so callers ask only

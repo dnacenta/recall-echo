@@ -609,7 +609,8 @@ pub fn archive_all_with(
     let mut archived_count = 0;
     let mut skipped_count = 0;
 
-    for transcript in transcripts.discover(None)? {
+    let (found, mut subagents_skipped) = transcripts.discover_with_skipped(None)?;
+    for transcript in found {
         let session_id = &transcript.session_id;
         if archived_sessions.contains(session_id) {
             skipped_count += 1;
@@ -617,6 +618,8 @@ pub fn archive_all_with(
         }
         // Read only after the archived check, as the capture sweep does.
         if transcripts.is_sub_run(&transcript) {
+            crate::jsonl::debug_skipped_subagent(&transcript.path, "isSidechain flag");
+            subagents_skipped += 1;
             continue;
         }
 
@@ -630,8 +633,10 @@ pub fn archive_all_with(
     }
 
     eprintln!(
-        "recall-echo: archived {archived_count} conversation{}, skipped {skipped_count} already archived",
-        if archived_count == 1 { "" } else { "s" }
+        "recall-echo: archived {archived_count} conversation{}, skipped {skipped_count} already \
+         archived and {subagents_skipped} subagent run{}",
+        if archived_count == 1 { "" } else { "s" },
+        if subagents_skipped == 1 { "" } else { "s" }
     );
 
     Ok(())

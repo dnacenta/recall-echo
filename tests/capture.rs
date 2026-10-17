@@ -368,6 +368,7 @@ fn a_subagent_only_sweep_reports_nothing_and_the_next_session_still_lands() {
             ),
             (0, 0, 0, 0)
         );
+        assert_eq!(report.subagents_skipped, 2, "both runs are counted");
     }
     assert!(capture::read_watermark(&memory, Source::ClaudeCode).is_none());
 

@@ -181,6 +181,18 @@ pub fn flags_sidechain(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// One `recall-echo: debug:` line naming a skipped subagent transcript and
+/// the signal that caught it (`signal`). Only when `RECALL_ECHO_DEBUG` is set
+/// and non-empty: the crate has no logger, and the daemon sweeps on a timer.
+pub(crate) fn debug_skipped_subagent(path: &std::path::Path, signal: &str) {
+    if std::env::var_os("RECALL_ECHO_DEBUG").is_some_and(|value| !value.is_empty()) {
+        eprintln!(
+            "recall-echo: debug: skipped subagent transcript {} ({signal})",
+            path.display()
+        );
+    }
+}
+
 /// What a hook says when it was pointed at a subagent's transcript, `not_done`
 /// naming the work it skipped. One line on stderr — stdout may be reserved
 /// for JSON by the harness — shared by `archive-session` and `checkpoint`.

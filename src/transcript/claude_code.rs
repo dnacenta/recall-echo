@@ -54,6 +54,13 @@ impl Transcript for ClaudeCodeTranscripts {
     }
 
     fn discover(&self, since: Option<SystemTime>) -> Result<Vec<TranscriptRef>, RecallError> {
+        self.discover_with_skipped(since).map(|(found, _)| found)
+    }
+
+    fn discover_with_skipped(
+        &self,
+        since: Option<SystemTime>,
+    ) -> Result<(Vec<TranscriptRef>, u32), RecallError> {
         let found = walk_files(&self.projects_dir, "jsonl", 0)
             .into_iter()
             // Regular files only (a symlink to one is followed): a FIFO or a
@@ -74,8 +81,16 @@ impl Transcript for ClaudeCodeTranscripts {
         // free, so it happens here; the content check reads the file and is
         // left to `is_sub_run`, asked only about transcripts not yet archived.
         let mut fresh = newer_than(found, since);
-        fresh.retain(|transcript| !crate::jsonl::in_subagents_dir(&transcript.path));
-        Ok(fresh)
+        let before = fresh.len();
+        fresh.retain(|transcript| {
+            let subagent = crate::jsonl::in_subagents_dir(&transcript.path);
+            if subagent {
+                crate::jsonl::debug_skipped_subagent(&transcript.path, "subagents/ directory");
+            }
+            !subagent
+        });
+        let skipped = u32::try_from(before - fresh.len()).unwrap_or(u32::MAX);
+        Ok((fresh, skipped))
     }
 
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError> {

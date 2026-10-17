@@ -84,6 +84,8 @@ pub struct Pending {
     pub active: u32,
     /// Transcripts whose session is already archived.
     pub duplicates: u32,
+    /// Subagent runs set aside — part of a session, not one (RE-74).
+    pub subagents_skipped: u32,
 }
 
 /// What one CLI's sweep did.
@@ -96,6 +98,8 @@ pub struct CaptureReport {
     pub duplicates: u32,
     pub active: u32,
     pub failed: u32,
+    /// Subagent runs set aside — part of a session, not one (RE-74).
+    pub subagents_skipped: u32,
 }
 
 impl CaptureReport {
@@ -135,7 +139,22 @@ impl CaptureReport {
         if self.active > 0 {
             line.push_str(&format!(", {} still active", self.active));
         }
+        if let Some(skipped) = self.subagents_note() {
+            line.push_str(&format!(", {skipped}"));
+        }
         Some(line)
+    }
+
+    /// `N subagent run(s) skipped`, or `None` when there were none.
+    #[must_use]
+    pub fn subagents_note(&self) -> Option<String> {
+        (self.subagents_skipped > 0).then(|| {
+            format!(
+                "{} subagent run{} skipped",
+                self.subagents_skipped,
+                if self.subagents_skipped == 1 { "" } else { "s" }
+            )
+        })
     }
 }
 
@@ -153,15 +172,20 @@ pub fn pending(
 ) -> Result<Pending, RecallError> {
     let watermark = read_watermark(memory_dir, adapter.source());
 
-    let mut pending = Pending::default();
-    for transcript in adapter.discover(watermark)? {
+    let (found, by_layout) = adapter.discover_with_skipped(watermark)?;
+    let mut pending = Pending {
+        subagents_skipped: by_layout,
+        ..Pending::default()
+    };
+    for transcript in found {
         // The archived check comes first and costs nothing; only what survives
         // it is read to see whether it is a sub-run. Duplicates never advance
         // the watermark, so reading them would repeat on every poll.
         if archived.contains(&transcript.session_id) {
             pending.duplicates += 1;
         } else if adapter.is_sub_run(&transcript) {
-            continue;
+            crate::jsonl::debug_skipped_subagent(&transcript.path, "isSidechain flag");
+            pending.subagents_skipped += 1;
         } else if transcript.age_at(options.now) < options.settle {
             pending.active += 1;
         } else {
@@ -293,6 +317,7 @@ pub fn sweep(
     let mut report = CaptureReport {
         active: found.active,
         duplicates: found.duplicates,
+        subagents_skipped: found.subagents_skipped,
         ..CaptureReport::default()
     };
     let mut watermark = Watermark::new();
@@ -362,7 +387,10 @@ pub fn ingest(memory_dir: &Path, sources: &[Source]) -> Result<(), RecallError> 
         total += report.archived.len();
         match report.summary(*source) {
             Some(line) => eprintln!("recall-echo: {line}"),
-            None => eprintln!("recall-echo: no new {source} sessions"),
+            None => match report.subagents_note() {
+                Some(skipped) => eprintln!("recall-echo: no new {source} sessions ({skipped})"),
+                None => eprintln!("recall-echo: no new {source} sessions"),
+            },
         }
     }
 
@@ -584,6 +612,30 @@ mod tests {
         assert_eq!(configured_sources(&config), vec![Source::Grok]);
     }
 
+    /// RE-74 audit: skipped subagent runs are visible wherever a report is
+    /// printed, and do not on their own make a sweep speak.
+    #[test]
+    fn the_summary_counts_skipped_subagent_runs() {
+        let worked = CaptureReport {
+            archived: vec![7],
+            subagents_skipped: 3,
+            ..CaptureReport::default()
+        };
+        let line = worked.summary(Source::ClaudeCode).unwrap();
+        assert!(line.ends_with(", 3 subagent runs skipped"), "{line}");
+
+        let idle = CaptureReport {
+            subagents_skipped: 1,
+            ..CaptureReport::default()
+        };
+        assert_eq!(idle.summary(Source::ClaudeCode), None);
+        assert_eq!(
+            idle.subagents_note().as_deref(),
+            Some("1 subagent run skipped")
+        );
+        assert_eq!(CaptureReport::default().subagents_note(), None);
+    }
+
     /// Records discovery reports, and how often a sweep asks whether one is a
     /// sub-run — the question that costs a read.
     struct CountingAdapter {
@@ -642,6 +694,7 @@ mod tests {
         let found = pending(&fixture.memory, &adapter, &archived, fresh).unwrap();
         assert_eq!(found.duplicates, 1);
         assert_eq!(found.active, 1, "only `live` is active; the fork is not");
+        assert_eq!(found.subagents_skipped, 1);
         assert!(found.ready.is_empty());
         assert_eq!(
             adapter.asked.load(std::sync::atomic::Ordering::SeqCst),
