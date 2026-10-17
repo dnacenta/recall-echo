@@ -575,10 +575,8 @@ pub fn archive_all_unarchived() -> Result<(), RecallError> {
 /// printed before anything is written.
 pub fn archive_all_unarchived_at(pulse_root: Option<&Path>) -> Result<(), RecallError> {
     let (memory_dir, why) = crate::paths::batch_archive_base_dir(pulse_root)?;
-    eprintln!(
-        "recall-echo: archiving into {} ({why})",
-        memory_dir.display()
-    );
+    // `{:?}` escapes control characters: the path can come from a file.
+    eprintln!("recall-echo: archiving into {memory_dir:?} ({why})");
     let transcripts = ClaudeCodeTranscripts::detect()
         .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
     archive_all_with(&memory_dir, &transcripts).map(|_| ())
