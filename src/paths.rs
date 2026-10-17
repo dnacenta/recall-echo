@@ -297,6 +297,16 @@ pub enum PersistOutcome {
 /// developer's real configuration on every run (#59). They are an input now,
 /// together with the binary path those files are written to point at.
 ///
+/// Whether stdin and stderr are both terminals.
+///
+/// stderr alone is not enough — with stdin piped, a blank line in the pipe
+/// would read as a prompt's default answer, and a default of yes would
+/// change a setting nobody was asked about.
+fn stdio_is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 /// Construct with [`ConfigRoots::from_env`] in production and
 /// [`ConfigRoots::sandboxed`] anywhere the writes must not escape a directory.
 #[derive(Debug, Clone)]
@@ -307,6 +317,10 @@ pub struct ConfigRoots {
     agent_home: Option<PathBuf>,
     recall_bin: String,
     spawns_agents: bool,
+    /// Whether `init` may ask the user anything.
+    interactive: bool,
+    /// Claude Code's own auto-memory switch as the session sees it.
+    auto_memory_env: Option<String>,
 }
 
 impl ConfigRoots {
@@ -331,6 +345,8 @@ impl ConfigRoots {
             agent_home: None,
             recall_bin,
             spawns_agents: true,
+            interactive: stdio_is_interactive(),
+            auto_memory_env: std::env::var(crate::claude_settings::AUTO_MEMORY_ENV).ok(),
         }
     }
 
@@ -351,6 +367,8 @@ impl ConfigRoots {
             agent_home: Some(dir.to_path_buf()),
             recall_bin: dir.join("bin").join("recall-echo").display().to_string(),
             spawns_agents: false,
+            interactive: false,
+            auto_memory_env: None,
         })
     }
 
@@ -379,6 +397,34 @@ impl ConfigRoots {
     #[must_use]
     pub fn entity_root_file(&self) -> Option<&Path> {
         self.pulse_root_file()
+    }
+
+    /// The same roots, answering as though the session were (or were not)
+    /// at a terminal — tests drive the prompts with this.
+    #[must_use]
+    pub fn with_interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+
+    /// The same roots, as though Claude Code's auto-memory switch read `value`.
+    #[must_use]
+    pub fn with_auto_memory_env(mut self, value: Option<&str>) -> Self {
+        self.auto_memory_env = value.map(str::to_string);
+        self
+    }
+
+    /// Whether `init` may ask anything: stdin and stderr were both terminals
+    /// in [`ConfigRoots::from_env`]; never in a sandbox unless set.
+    #[must_use]
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
+
+    /// `CLAUDE_CODE_DISABLE_AUTO_MEMORY` as this run sees it.
+    #[must_use]
+    pub fn auto_memory_env(&self) -> Option<&str> {
+        self.auto_memory_env.as_deref()
     }
 
     /// The home directory of the user these roots configure: the sandbox

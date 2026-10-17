@@ -20,8 +20,9 @@
 //!   under, because that is the subscription the user just proved they have;
 //! - none — the full provider menu, since now the choice really is open.
 //!
-//! Nothing prompts unless stdin and stderr are both terminals ([`atty_check`]);
-//! a scripted or piped install takes the same defaults without blocking.
+//! Nothing prompts unless stdin and stderr are both terminals
+//! ([`paths::ConfigRoots::interactive`]); a scripted or piped install takes the
+//! same defaults without blocking.
 //!
 //! # What it does without asking
 //!
@@ -143,7 +144,11 @@ fn write_if_not_exists(path: &Path, content: &str, label: &str) {
 ///
 /// `detected` is every agent CLI whose binary is on this machine, in
 /// preference order. `None` means the user chose to configure it later.
-fn select_provider(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Option<Provider> {
+fn select_provider(
+    reader: &mut dyn BufRead,
+    detected: &[AgentCli],
+    interactive: bool,
+) -> Option<Provider> {
     match detected {
         // Nothing to choose between: the answer is obvious, so do not ask it.
         [only] => {
@@ -158,9 +163,9 @@ fn select_provider(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Option<Pr
                 "\n  {WARN}~{RESET} No agent CLI found. Extraction needs a model provider — \
                  {BOLD}ollama{RESET} is the free, local option."
             );
-            prompt_any_provider(reader)
+            prompt_any_provider(reader, interactive)
         }
-        several => prompt_installed_cli(reader, several),
+        several => prompt_installed_cli(reader, several, interactive),
     }
 }
 
@@ -179,9 +184,13 @@ fn default_cli(detected: &[AgentCli]) -> AgentCli {
 }
 
 /// Short menu over the CLIs that are actually installed.
-fn prompt_installed_cli(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Option<Provider> {
+fn prompt_installed_cli(
+    reader: &mut dyn BufRead,
+    detected: &[AgentCli],
+    interactive: bool,
+) -> Option<Provider> {
     let default = default_cli(detected);
-    if !atty_check() {
+    if !interactive {
         print_status(
             Status::Created,
             &format!(
@@ -225,7 +234,7 @@ fn prompt_installed_cli(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Opti
         return Some(default.provider());
     }
     if answer == "o" || answer == "other" {
-        return prompt_any_provider(reader);
+        return prompt_any_provider(reader, interactive);
     }
     if let Some(cli) = answer
         .parse::<usize>()
@@ -245,8 +254,8 @@ fn prompt_installed_cli(reader: &mut dyn BufRead, detected: &[AgentCli]) -> Opti
 /// not. Reached when nothing was detected, or when the user asks for it.
 ///
 /// Returns `None` if the user chose to configure it later.
-fn prompt_any_provider(reader: &mut dyn BufRead) -> Option<Provider> {
-    if !atty_check() {
+fn prompt_any_provider(reader: &mut dyn BufRead, interactive: bool) -> Option<Provider> {
+    if !interactive {
         return Some(Provider::Anthropic);
     }
 
@@ -293,6 +302,7 @@ fn configure_llm(
     reader: &mut dyn BufRead,
     memory_dir: &Path,
     detected: &[AgentCli],
+    interactive: bool,
 ) -> Option<Provider> {
     if config::exists(memory_dir) {
         print_status(
@@ -302,7 +312,7 @@ fn configure_llm(
         return Some(config::load(memory_dir).llm.provider);
     }
 
-    let Some(provider) = select_provider(reader, detected) else {
+    let Some(provider) = select_provider(reader, detected, interactive) else {
         print_status(
             Status::Exists,
             "Skipped LLM config — run `recall-echo config set provider <name>` later",
@@ -768,16 +778,6 @@ fn print_summary(summary: &Summary) {
     eprintln!();
 }
 
-/// Whether `init` may ask anything: stdin and stderr are both terminals.
-///
-/// stderr alone is not enough — with stdin piped, a blank line in the pipe
-/// would read as the default answer, and a default of yes would change a
-/// setting nobody was asked about.
-fn atty_check() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
-}
-
 // ── Entry point ──────────────────────────────────────────────────────────
 
 /// Initialize memory structure at the given pulse root.
@@ -871,19 +871,18 @@ pub fn run_with(
     }
 
     let detected = agent_cli::installed();
-    let provider = configure_llm(reader, &memory_dir, &detected);
+    let provider = configure_llm(reader, &memory_dir, &detected, roots.interactive());
 
     // Hooks are Claude Code's capture mechanism, not a consequence of the
     // extraction provider: a user who extracts with grok still wants their
     // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
     // is not installed.
-    let env_disable = std::env::var(claude_settings::AUTO_MEMORY_ENV).ok();
     configure_claude_code(
         roots,
         pulse_root,
         reader,
-        atty_check(),
-        env_disable.as_deref(),
+        roots.interactive(),
+        roots.auto_memory_env(),
     );
 
     let mcp = match &runtime {
@@ -996,6 +995,7 @@ mod tests {
             &mut Cursor::new(b"" as &[u8]),
             &memory_dir,
             &[AgentCli::Grok],
+            false,
         );
         assert_eq!(chosen, Some(Provider::Grok));
 
@@ -1004,6 +1004,7 @@ mod tests {
             &mut Cursor::new(b"" as &[u8]),
             &memory_dir,
             &[AgentCli::ClaudeCode, AgentCli::Codex],
+            false,
         );
         assert_eq!(again, Some(Provider::Grok));
     }
@@ -1022,7 +1023,7 @@ mod tests {
     fn a_single_installed_cli_is_chosen_without_asking() {
         let mut reader = Cursor::new(b"" as &[u8]);
         assert_eq!(
-            select_provider(&mut reader, &[AgentCli::Codex]),
+            select_provider(&mut reader, &[AgentCli::Codex], false),
             Some(Provider::Codex)
         );
         assert_eq!(reader.position(), 0, "nothing should have been read");
@@ -1033,7 +1034,7 @@ mod tests {
     #[test]
     fn several_installed_clis_default_without_blocking() {
         let mut reader = Cursor::new(b"" as &[u8]);
-        let chosen = select_provider(&mut reader, &[AgentCli::Grok, AgentCli::Codex]);
+        let chosen = select_provider(&mut reader, &[AgentCli::Grok, AgentCli::Codex], false);
         assert_eq!(chosen, Some(Provider::Grok));
     }
 
@@ -1053,7 +1054,10 @@ mod tests {
     #[test]
     fn no_installed_cli_falls_back_to_the_full_menu() {
         let mut reader = Cursor::new(b"" as &[u8]);
-        assert_eq!(select_provider(&mut reader, &[]), Some(Provider::Anthropic));
+        assert_eq!(
+            select_provider(&mut reader, &[], false),
+            Some(Provider::Anthropic)
+        );
     }
 
     #[test]
@@ -1291,6 +1295,62 @@ mod tests {
         configure_auto_memory(&target(&sandbox), &mut reader, true, Some("1"));
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    /// A sandbox whose provider is already configured, so the provider menu
+    /// never consumes a line: every answer in the reader is the auto-memory
+    /// question's.
+    fn configured_sandbox() -> Sandbox {
+        let sandbox = Sandbox::new();
+        let memory = sandbox.pulse_root().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(
+            memory.join(".recall-echo.toml"),
+            "[llm]\nprovider = \"ollama\"\n",
+        )
+        .unwrap();
+        sandbox
+    }
+
+    fn init_with(sandbox: &Sandbox, roots: &paths::ConfigRoots, input: &str) {
+        let mut reader = Cursor::new(input.as_bytes().to_vec());
+        run_with(&sandbox.pulse_root(), &mut reader, roots).unwrap();
+    }
+
+    fn auto_memory_key(sandbox: &Sandbox) -> Option<serde_json::Value> {
+        let path = sandbox.roots.claude_dir().unwrap().join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        settings.get("autoMemoryEnabled").cloned()
+    }
+
+    /// `run_with` asks only when its roots say the session is interactive —
+    /// never because of whatever terminal the test runner happens to have.
+    #[test]
+    fn init_takes_interactivity_from_its_roots() {
+        let quiet = configured_sandbox();
+        init_with(&quiet, &quiet.roots, "y\n");
+        assert_eq!(
+            auto_memory_key(&quiet),
+            None,
+            "a sandbox never asks by default"
+        );
+
+        let asked = configured_sandbox();
+        init_with(&asked, &asked.roots.clone().with_interactive(true), "y\n");
+        assert_eq!(auto_memory_key(&asked), Some(serde_json::json!(false)));
+    }
+
+    #[test]
+    fn init_takes_the_auto_memory_switch_from_its_roots() {
+        let sandbox = configured_sandbox();
+        let roots = sandbox
+            .roots
+            .clone()
+            .with_interactive(true)
+            .with_auto_memory_env(Some("1"));
+        init_with(&sandbox, &roots, "y\n");
+        assert_eq!(auto_memory_key(&sandbox), None, "already off: not asked");
     }
 
     #[test]
