@@ -298,3 +298,81 @@ fn discovery_respects_a_watermark() {
     let after = adapter.discover(Some(all[0].modified)).unwrap();
     assert!(after.is_empty());
 }
+
+// ── Subagents (RE-74) ────────────────────────────────────────────────────
+
+/// A subagent's run as Claude Code records it: every turn `isSidechain`, the
+/// "user" turn being the parent model's prompt, not anything the human said.
+const CLAUDE_SUBAGENT: &str = concat!(
+    r#"{"type":"user","isSidechain":true,"agentId":"a1","timestamp":"2026-08-01T09:00:03.000Z","message":{"role":"user","content":"SUBAGENT WORKER PROMPT"}}"#,
+    "\n",
+    r#"{"type":"assistant","isSidechain":true,"agentId":"a1","timestamp":"2026-08-01T09:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Worker done."}]}}"#,
+    "\n",
+);
+
+/// Write a subagent and a fork beside `session`'s transcript, where Claude
+/// Code puts them.
+fn add_subagents(projects_dir: &Path, session: &str) {
+    let dir = projects_dir.join(session).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent-a1.jsonl"), CLAUDE_SUBAGENT).unwrap();
+    let fork = format!(
+        "{}\n{CLAUDE_SUBAGENT}",
+        r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"parent"}"#
+    );
+    std::fs::write(dir.join("agent-a2.jsonl"), fork).unwrap();
+}
+
+#[test]
+fn a_session_is_archived_and_its_subagents_are_not() {
+    let machine = Machine::new();
+    add_subagents(&machine.claude.join("-home-dev-app"), "cc-session-1");
+
+    assert_eq!(machine.sweep_all(), vec![1, 2, 3]);
+    let all = machine.archives().join("\n");
+    assert!(!all.contains("agent-a"), "{all}");
+    assert!(!all.contains("SUBAGENT WORKER PROMPT"), "{all}");
+
+    let index = read(&machine.memory.join("ARCHIVE.md"));
+    assert!(!index.contains("agent-a"), "{index}");
+    let ephemeral = read(&machine.memory.join("EPHEMERAL.md"));
+    assert!(!ephemeral.contains("agent-a"), "{ephemeral}");
+}
+
+/// Subagent files are not sessions in any state: not active while fresh, not
+/// archived, duplicated or failed once settled, and they do not stand in the
+/// way of the watermark when a real session arrives.
+#[test]
+fn a_subagent_only_sweep_reports_nothing_and_the_next_session_still_lands() {
+    let tmp = TempDir::new().unwrap();
+    let memory = tmp.path().join("memory");
+    std::fs::create_dir_all(memory.join("conversations")).unwrap();
+    let projects = tmp.path().join(".claude/projects");
+    let project = projects.join("-home-dev-app");
+    add_subagents(&project, "cc-session-1");
+    let adapter = ClaudeCodeTranscripts::new(projects.clone());
+
+    let fresh = CaptureOptions {
+        settle: Duration::from_secs(3600),
+        now: SystemTime::now(),
+    };
+    for options in [fresh, settled()] {
+        let report = capture::sweep(&memory, &adapter, options).unwrap();
+        assert!(report.archived.is_empty());
+        assert_eq!(
+            (
+                report.active,
+                report.duplicates,
+                report.failed,
+                report.empty
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+    assert!(capture::read_watermark(&memory, Source::ClaudeCode).is_none());
+
+    std::fs::write(project.join("cc-session-1.jsonl"), CLAUDE_CODE).unwrap();
+    let report = capture::sweep(&memory, &adapter, settled()).unwrap();
+    assert_eq!(report.archived, vec![1]);
+    assert!(capture::read_watermark(&memory, Source::ClaudeCode).is_some());
+}

@@ -67,7 +67,11 @@ impl Transcript for ClaudeCodeTranscripts {
                 })
             })
             .collect();
-        Ok(newer_than(found, since))
+        // A subagent's run is part of a session, not one. Filtered after the
+        // watermark so only new files are sniffed.
+        let mut fresh = newer_than(found, since);
+        fresh.retain(|transcript| !crate::jsonl::is_subagent_transcript(&transcript.path));
+        Ok(fresh)
     }
 
     fn parse(&self, transcript: &TranscriptRef) -> Result<Conversation, RecallError> {
@@ -141,6 +145,33 @@ mod tests {
         );
         assert_eq!(through_adapter.first_timestamp, directly.first_timestamp);
         assert_eq!(through_adapter.last_timestamp, directly.last_timestamp);
+    }
+
+    /// Subagents and forks live beside their parent's transcript; only the
+    /// parent is a session.
+    #[test]
+    fn discovery_skips_subagent_and_fork_transcripts() {
+        let tmp = fixture_tree();
+        let session_dir = tmp
+            .path()
+            .join("projects")
+            .join("-home-dev-app")
+            .join("sess-abc")
+            .join("subagents");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let sidechain =
+            TRANSCRIPT.replace(r#""type":"user","#, r#""type":"user","isSidechain":true,"#);
+        std::fs::write(session_dir.join("agent-a1.jsonl"), &sidechain).unwrap();
+        let fork = format!(
+            "{}\n{sidechain}",
+            r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"sess-abc"}"#
+        );
+        std::fs::write(session_dir.join("agent-a2.jsonl"), fork).unwrap();
+
+        let adapter = ClaudeCodeTranscripts::new(tmp.path().join("projects"));
+        let found = adapter.discover(None).unwrap();
+        let ids: Vec<_> = found.iter().map(|t| t.session_id.as_str()).collect();
+        assert_eq!(ids, ["sess-abc"]);
     }
 
     #[test]

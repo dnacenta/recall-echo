@@ -111,6 +111,56 @@ pub fn is_jsonl_transcript(path: &str) -> bool {
         })
 }
 
+/// How many non-empty lines [`is_subagent_transcript`] reads before giving up.
+///
+/// On a survey of 192 real transcripts the first entry carrying `isSidechain`
+/// sat at line 2 at the latest in a subagent's file and line 8 in a session's —
+/// metadata entries (`ai-title`, `last-prompt`, `mode`, `queue-operation`, a
+/// fork's `fork-context-ref`) come first and carry no flag.
+const SIDECHAIN_SNIFF_LINES: usize = 64;
+
+/// Whether a Claude Code transcript belongs to a subagent rather than a session.
+///
+/// Claude Code writes each subagent's run to
+/// `projects/<project>/<session>/subagents/agent-<id>.jsonl`, and marks every
+/// turn in it `isSidechain: true`. Either signal is enough:
+///
+/// - the file's directory is named `subagents` — free, and today's layout;
+/// - the first entry that carries an `isSidechain` field has it `true` — Claude
+///   Code's own marker, which survives a layout change. It is the first entry
+///   *carrying* the field, not the first line: a fork's transcript opens with a
+///   `fork-context-ref` entry that has none.
+///
+/// A subagent's "user" turns are the parent model's prompts, so archiving one
+/// as a session would enter model-written text as something the human said.
+/// At most [`SIDECHAIN_SNIFF_LINES`] lines are read; a file that cannot be
+/// opened is decided by its path alone.
+#[must_use]
+pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
+    if path
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|dir| dir == "subagents")
+    {
+        return true;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .take(SIDECHAIN_SNIFF_LINES)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find_map(|entry| {
+            entry
+                .get("isSidechain")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 /// Parse a Claude Code JSONL transcript into a Conversation.
 pub fn parse_transcript(
     path: &str,
@@ -426,6 +476,108 @@ mod tests {
         assert!(!is_jsonl_transcript(&write("empty.jsonl", "")));
         assert!(!is_jsonl_transcript(&write("prose.txt", "hello\nthere")));
         assert!(!is_jsonl_transcript("/nonexistent/transcript.jsonl"));
+    }
+
+    // ── Subagent detection ───────────────────────────────────────────────
+
+    const SUBAGENT_TURN: &str = r#"{"type":"user","isSidechain":true,"agentId":"a1","sessionId":"parent","message":{"role":"user","content":"Draft slide 4"}}"#;
+    const SESSION_TURN: &str = r#"{"type":"user","isSidechain":false,"sessionId":"s1","message":{"role":"user","content":"hello"}}"#;
+    const FORK_CONTEXT_REF: &str = r#"{"type":"fork-context-ref","agentId":"a2","parentSessionId":"parent","contextLength":10}"#;
+
+    fn write_lines(dir: &std::path::Path, name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn subagent_detected_by_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "s1/subagents/agent-a1.jsonl", &[SUBAGENT_TURN]);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn fork_detected_by_first_flagged_entry_outside_subagents_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(
+            dir.path(),
+            "elsewhere/agent-a2.jsonl",
+            &[FORK_CONTEXT_REF, SUBAGENT_TURN],
+        );
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn subagents_dir_without_flag_still_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let unflagged = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
+        let path = write_lines(dir.path(), "s1/subagents/agent-a3.jsonl", &[unflagged]);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn main_transcript_with_metadata_preamble_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let preamble = [
+            r#"{"type":"ai-title","title":"t"}"#,
+            r#"{"type":"last-prompt","prompt":"p"}"#,
+            r#"{"type":"mode","mode":"default"}"#,
+            r#"{"type":"queue-operation","operation":"enqueue"}"#,
+            r#"{"type":"ai-title","title":"t2"}"#,
+            r#"{"type":"last-prompt","prompt":"p2"}"#,
+            r#"{"type":"mode","mode":"plan"}"#,
+            SESSION_TURN,
+            SUBAGENT_TURN,
+        ];
+        let path = write_lines(dir.path(), "-home-dev-app/s1.jsonl", &preamble);
+        assert!(!is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn main_transcript_without_flag_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::PathBuf::from(write_test_jsonl(dir.path()));
+        assert!(!is_subagent_transcript(&path));
+        let empty = write_lines(dir.path(), "empty.jsonl", &[]);
+        assert!(!is_subagent_transcript(&empty));
+    }
+
+    #[test]
+    fn malformed_lines_in_window_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(
+            dir.path(),
+            "x/agent-a4.jsonl",
+            &["{not json", "", "   ", SUBAGENT_TURN],
+        );
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn flag_beyond_sniff_window_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let filler = r#"{"type":"progress"}"#;
+        let mut lines = vec![filler; SIDECHAIN_SNIFF_LINES];
+        lines.push(SUBAGENT_TURN);
+        let path = write_lines(dir.path(), "x/late.jsonl", &lines);
+        assert!(!is_subagent_transcript(&path));
+
+        // One line earlier and it is inside the window.
+        lines.remove(0);
+        let path = write_lines(dir.path(), "x/in-window.jsonl", &lines);
+        assert!(is_subagent_transcript(&path));
+    }
+
+    #[test]
+    fn unopenable_path_decided_by_path_alone() {
+        assert!(is_subagent_transcript(std::path::Path::new(
+            "/nonexistent/s1/subagents/agent-a5.jsonl"
+        )));
+        assert!(!is_subagent_transcript(std::path::Path::new(
+            "/nonexistent/s1.jsonl"
+        )));
     }
 
     #[test]
