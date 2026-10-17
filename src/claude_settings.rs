@@ -288,6 +288,15 @@ impl SettingsEdit {
         self,
         reapply: impl FnOnce(&mut serde_json::Value) -> Result<(), String>,
     ) -> Result<Committed, String> {
+        // Again here, not only in `open_settings`: it may have become a
+        // symlink while a prompt was waiting, and a symlink is never replaced.
+        if fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(format!(
+                "{} became a symlink while init was running — not replaced; this run's \
+                 changes were not written",
+                self.path.display()
+            ));
+        }
         let current = read_bytes(&self.path)?;
         let (value, committed) = if current == self.original {
             (self.value, Committed::Written)
@@ -1154,6 +1163,34 @@ mod tests {
         assert_eq!(
             fs::metadata(&bak).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn commit_refuses_a_settings_file_that_became_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, r#"{"model": "opus"}"#).unwrap();
+        let OpenSettings::Edit(mut edit) = open_settings(&path) else {
+            panic!("a readable settings.json");
+        };
+        disable_auto_memory(&mut edit.value);
+
+        // During the prompt, a dotfiles manager swaps in a symlink.
+        let dotfiles = tmp.path().join("dotfiles.json");
+        fs::write(&dotfiles, r#"{"model": "opus"}"#).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, &path).unwrap();
+
+        let err = edit.commit(|_| Ok(())).unwrap_err();
+        assert!(err.contains("became a symlink"), "{err}");
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&dotfiles).unwrap(),
+            r#"{"model": "opus"}"#
         );
     }
 
