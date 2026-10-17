@@ -28,6 +28,32 @@ pub fn run_from_hook(trigger: &str, pulse_root: Option<&Path>) -> Result<(), Rec
 }
 
 pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), RecallError> {
+    // Try to read hook input from stdin (Claude Code passes transcript_path)
+    let hook_input = crate::jsonl::read_hook_input().ok();
+    run_with_hook_input(trigger, hook_input.as_ref(), base_dir)
+}
+
+/// Checkpoint the session a hook input names — or an empty checkpoint when
+/// there is no input.
+///
+/// A subagent compacting its own context is not the session compacting: its
+/// transcript is noted on stderr and nothing is numbered or written.
+pub fn run_with_hook_input(
+    trigger: &str,
+    hook_input: Option<&crate::jsonl::HookInput>,
+    base_dir: &Path,
+) -> Result<(), RecallError> {
+    if let Some(input) = hook_input {
+        let transcript_path = input.transcript_path.trim();
+        if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
+            eprintln!(
+                "recall-echo: {transcript_path} is a subagent transcript (part of a session, \
+                 not one), no checkpoint written"
+            );
+            return Ok(());
+        }
+    }
+
     let conversations_dir = base_dir.join("conversations");
     let archive_index = base_dir.join("ARCHIVE.md");
 
@@ -37,15 +63,12 @@ pub fn run_from_hook_with_paths(trigger: &str, base_dir: &Path) -> Result<(), Re
         ));
     }
 
-    // Try to read hook input from stdin (Claude Code passes transcript_path)
-    let hook_input = crate::jsonl::read_hook_input().ok();
-
     let next_num = archive::highest_conversation_number(&conversations_dir) + 1;
     let now = conversation::utc_now();
     let date = conversation::date_from_timestamp(&now);
 
     // If we have hook input with a transcript, parse it for metadata
-    let data = match &hook_input {
+    let data = match hook_input {
         Some(input) => extract_from_transcript(input).unwrap_or_else(empty_checkpoint),
         None => empty_checkpoint(),
     };
@@ -225,6 +248,34 @@ mod tests {
         assert_eq!(data.session_id, "test-ckpt");
         assert!(data.message_count > 0);
         assert!(!data.topics.is_empty());
+    }
+
+    /// RE-74: a subagent's compaction writes nothing — no conversation file, no
+    /// index row — and does not fail the hook.
+    #[test]
+    fn checkpoint_on_subagent_transcript_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        let subagents = tmp.path().join("projects/-p/test-ckpt/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-a1.jsonl");
+        fs::rename(write_test_jsonl(tmp.path()), &path).unwrap();
+
+        let input = crate::jsonl::HookInput {
+            session_id: "agent-a1".to_string(),
+            transcript_path: path.to_string_lossy().to_string(),
+            _cwd: None,
+            _hook_event_name: Some("PreCompact".to_string()),
+        };
+        run_with_hook_input("precompact", Some(&input), tmp.path()).unwrap();
+
+        assert_eq!(
+            fs::read_dir(tmp.path().join("conversations"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!tmp.path().join("ARCHIVE.md").exists());
     }
 
     #[test]

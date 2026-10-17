@@ -453,6 +453,8 @@ enum HookTarget {
     Unnamed,
     /// A path with nothing at it — a session that was never persisted.
     Absent,
+    /// A Claude Code subagent's transcript — part of a session, not one.
+    Subagent,
     /// Claude Code's JSON Lines, to be streamed from the path.
     ClaudeJsonl,
     /// A Gemini chat session document, already read.
@@ -468,6 +470,9 @@ fn classify(transcript_path: &str, session_id: &str) -> HookTarget {
     }
     if !Path::new(transcript_path).exists() {
         return HookTarget::Absent;
+    }
+    if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
+        return HookTarget::Subagent;
     }
     // Sniffed rather than assumed: a migrated Gemini hook hands this command a
     // JSON document, and every line of one fails the JSON Lines parser.
@@ -531,6 +536,12 @@ pub fn run_with_hook_input(
             eprintln!(
                 "recall-echo: no transcript at {transcript_path} (session not persisted), \
                  nothing to archive"
+            );
+        }
+        HookTarget::Subagent => {
+            eprintln!(
+                "recall-echo: {transcript_path} is a subagent transcript (part of a session, \
+                 not one), nothing archived"
             );
         }
         HookTarget::ClaudeJsonl => {
@@ -945,5 +956,57 @@ mod tests {
             run_with_hook_input(&hook_input, Path::new("/nonexistent-base")).is_ok(),
             "an unreadable transcript must not fail the session"
         );
+    }
+
+    /// Where Claude Code writes a subagent's run, and a fork's run moved
+    /// anywhere else: both are declined by the hook (RE-74).
+    #[test]
+    fn classify_subagent_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let subagents = dir.path().join("sess/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let by_path = subagents.join("agent-a1.jsonl");
+        fs::write(&by_path, CLAUDE_JSONL).unwrap();
+        assert!(matches!(
+            classify(&by_path.to_string_lossy(), "agent-a1"),
+            HookTarget::Subagent
+        ));
+
+        let fork = concat!(
+            r#"{"type":"fork-context-ref","agentId":"a2"}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"hi"}}"#,
+            "\n",
+        );
+        let (_dir, by_flag) = written("agent-a2.jsonl", fork);
+        assert!(matches!(
+            classify(&by_flag, "agent-a2"),
+            HookTarget::Subagent
+        ));
+    }
+
+    #[test]
+    fn hook_on_subagent_transcript_archives_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        let subagents = tmp.path().join("projects/-p/sess/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-a1.jsonl");
+        fs::write(&path, CLAUDE_JSONL).unwrap();
+
+        let hook_input = crate::jsonl::HookInput {
+            session_id: "agent-a1".into(),
+            transcript_path: path.to_string_lossy().to_string(),
+            _cwd: None,
+            _hook_event_name: Some("SessionEnd".into()),
+        };
+        assert!(run_with_hook_input(&hook_input, &memory).is_ok());
+        assert_eq!(
+            fs::read_dir(memory.join("conversations")).unwrap().count(),
+            0
+        );
+        assert!(!memory.join("ARCHIVE.md").exists());
+        assert!(!memory.join("EPHEMERAL.md").exists());
     }
 }
