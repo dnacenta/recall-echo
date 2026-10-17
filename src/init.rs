@@ -729,6 +729,9 @@ fn is_bare_recall_invocation(cmd: &str, subcommand: &str) -> bool {
         && parts.next() == Some(subcommand)
 }
 
+/// The sources the SessionStart `consume` hook fires on.
+const SESSION_START_MATCHER: &str = "startup|resume|clear";
+
 /// Install or repair the three recall-echo hooks in a settings.json value.
 ///
 /// The pulse root is baked into every command: hooks run with the harness's
@@ -756,14 +759,14 @@ fn upsert_recall_hooks(
     notes: &mut Vec<String>,
 ) -> Result<bool, String> {
     let root = shell_path(pulse_root);
-    // SessionStart fires once per session (startup or resume) — injects
-    // EPHEMERAL.md into context via stdout. Skips `clear` (user reset) and
-    // `compact` (we just recovered from a compaction, no prior session to
-    // surface). `consume` takes the root positionally.
+    // SessionStart injects EPHEMERAL.md into context via stdout on startup,
+    // resume and `/clear` — a cleared session still wants to know what came
+    // before it (#75). Skips `compact`: the conversation continues, nothing
+    // prior to surface. `consume` takes the root positionally.
     let plan: [(&str, Option<&str>, &str, String); 3] = [
         (
             "SessionStart",
-            Some("startup|resume"),
+            Some(SESSION_START_MATCHER),
             "consume",
             format!("{recall_bin} consume {root}"),
         ),
@@ -1511,6 +1514,52 @@ mod tests {
         let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
         assert!(!changed);
         assert_eq!(settings, before);
+    }
+
+    fn session_start_matchers(settings: &serde_json::Value) -> Vec<String> {
+        settings["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["matcher"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// A cleared session still gets EPHEMERAL.md (#75).
+    #[test]
+    fn init_session_start_matcher_includes_clear() {
+        let mut settings = serde_json::json!({});
+        upsert(&mut settings, "/home/d/.wiseferry");
+        assert_eq!(session_start_matchers(&settings), ["startup|resume|clear"]);
+    }
+
+    /// A 4.6 install's recall-echo-only group is upgraded on re-init.
+    #[test]
+    fn init_upgrades_recall_only_startup_resume_group() {
+        let mut settings = serde_json::json!({});
+        upsert(&mut settings, "/home/d/.wiseferry");
+        settings["hooks"]["SessionStart"][0]["matcher"] = "startup|resume".into();
+
+        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(changed);
+        assert_eq!(session_start_matchers(&settings), ["startup|resume|clear"]);
+    }
+
+    /// A group shared with someone else's hook keeps its matcher: it governs
+    /// their hook too.
+    #[test]
+    fn init_keeps_shared_group_matcher() {
+        let mut settings = serde_json::json!({});
+        upsert(&mut settings, "/home/d/.wiseferry");
+        let ours = settings["hooks"]["SessionStart"][0]["hooks"][0].clone();
+        settings["hooks"]["SessionStart"] = serde_json::json!([{
+            "matcher": "startup",
+            "hooks": [ours, {"type": "command", "command": "notify-send hello"}]
+        }]);
+
+        let (changed, _) = upsert(&mut settings, "/home/d/.wiseferry");
+        assert!(!changed);
+        assert_eq!(session_start_matchers(&settings), ["startup"]);
     }
 
     #[test]
