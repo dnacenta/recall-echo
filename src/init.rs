@@ -431,7 +431,9 @@ fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOu
 /// that imports MEMORY.md, and the auto-memory question.
 ///
 /// All three go through [`claude_settings::claude_code_target`], so they skip
-/// for the same reasons with the same words. The settings file is
+/// for the same reasons with the same words. settings.json is read once, both
+/// the hooks and the auto-memory answer are applied to that one value, and it
+/// is written once at the end ([`claude_settings::SettingsEdit`]). The file is
 /// `<roots.claude_dir()>/settings.json` — `~/.claude/settings.json` in
 /// production, a sandbox under test — regardless of where `pulse_root` is,
 /// and the binary the hooks invoke comes from `roots` too: nothing here is
@@ -457,17 +459,144 @@ fn configure_claude_code(
             return;
         }
     };
-    configure_hooks(&target, roots, pulse_root);
-    if let Err(skip) = target.memory_steps() {
-        print_status(
-            Status::Exists,
-            &format!("Skipped rules file and auto-memory — {skip}"),
-        );
-        warn_stale_import(Some(target.claude_dir()), pulse_root);
+
+    let settings_path = target.settings_path();
+    let mut edit = match claude_settings::open_settings(&settings_path) {
+        claude_settings::OpenSettings::Edit(edit) => Some(edit),
+        claude_settings::OpenSettings::Symlink => {
+            advise_symlinked_settings(&settings_path, roots, pulse_root);
+            None
+        }
+        claude_settings::OpenSettings::Refused(why) => {
+            print_status(
+                Status::Error,
+                &format!("{why} — hooks and auto-memory left as is"),
+            );
+            None
+        }
+    };
+
+    let hooks_changed = edit
+        .as_mut()
+        .is_some_and(|edit| stage_hooks(&mut edit.value, roots, pulse_root));
+    let mut auto_memory_off = false;
+    match target.memory_steps() {
+        Err(skip) => {
+            print_status(
+                Status::Exists,
+                &format!("Skipped rules file and auto-memory — {skip}"),
+            );
+            warn_stale_import(Some(target.claude_dir()), pulse_root);
+        }
+        Ok(()) => {
+            configure_rules(&target, pulse_root);
+            if let Some(edit) = edit.as_mut() {
+                auto_memory_off = stage_auto_memory(
+                    &mut edit.value,
+                    &settings_path,
+                    reader,
+                    interactive,
+                    env_disable,
+                );
+            }
+        }
+    }
+
+    if let Some(edit) = edit {
+        commit_settings(edit, hooks_changed, auto_memory_off, roots, pulse_root);
+    }
+}
+
+/// Apply the three hooks to the settings value. Returns whether it changed.
+fn stage_hooks(
+    settings: &mut serde_json::Value,
+    roots: &paths::ConfigRoots,
+    pulse_root: &Path,
+) -> bool {
+    match claude_settings::apply_hooks(settings, pulse_root, roots.recall_bin()) {
+        Ok(change) => {
+            for note in &change.notes {
+                print_status(Status::Exists, note);
+            }
+            if !change.changed {
+                print_status(Status::Exists, "Hooks already configured in settings.json");
+            }
+            change.changed
+        }
+        Err(why) => {
+            print_status(Status::Error, &why);
+            false
+        }
+    }
+}
+
+/// Write the one edit — when there is anything to write — and report it.
+fn commit_settings(
+    edit: claude_settings::SettingsEdit,
+    hooks_changed: bool,
+    auto_memory_off: bool,
+    roots: &paths::ConfigRoots,
+    pulse_root: &Path,
+) {
+    if !hooks_changed && !auto_memory_off {
         return;
     }
-    configure_rules(&target, pulse_root);
-    configure_auto_memory(&target, reader, interactive, env_disable);
+    let reapply = |settings: &mut serde_json::Value| {
+        if hooks_changed {
+            claude_settings::apply_hooks(settings, pulse_root, roots.recall_bin())?;
+        }
+        if auto_memory_off {
+            claude_settings::disable_auto_memory(settings);
+        }
+        Ok(())
+    };
+    match edit.commit(reapply) {
+        Ok(committed) => {
+            if committed == claude_settings::Committed::WrittenOverChange {
+                print_status(
+                    Status::Exists,
+                    "settings.json changed while init was running — kept its new content \
+                     and applied this run's changes to it",
+                );
+            }
+            if hooks_changed {
+                print_status(
+                    Status::Created,
+                    "Configured SessionStart + SessionEnd + PreCompact hooks in settings.json",
+                );
+            }
+            if auto_memory_off {
+                print_status(
+                    Status::Created,
+                    "Turned off Claude Code's auto-memory — MEMORY.md here is the one curated \
+                     store",
+                );
+            }
+        }
+        Err(why) => print_status(Status::Error, &why),
+    }
+}
+
+/// settings.json is a symlink — a dotfiles setup — so it is never replaced.
+/// Say what it needs instead.
+fn advise_symlinked_settings(settings_path: &Path, roots: &paths::ConfigRoots, pulse_root: &Path) {
+    let mut wanted = serde_json::json!({});
+    let hooks = claude_settings::apply_hooks(&mut wanted, pulse_root, roots.recall_bin())
+        .ok()
+        .and_then(|_| serde_json::to_string_pretty(&wanted["hooks"]).ok());
+    print_status(
+        Status::Exists,
+        &format!(
+            "{} is a symlink — not replaced. Add the recall-echo hooks to the file it points \
+             at yourself, and \"autoMemoryEnabled\": false to keep one curated store:",
+            settings_path.display()
+        ),
+    );
+    if let Some(hooks) = hooks {
+        for line in format!("\"hooks\": {hooks}").lines() {
+            eprintln!("      {line}");
+        }
+    }
 }
 
 /// After a skipped rules step: say so if a managed rules file is loading some
@@ -475,50 +604,6 @@ fn configure_claude_code(
 fn warn_stale_import(claude_dir: Option<&Path>, pulse_root: &Path) {
     if let Some(warning) = claude_dir.and_then(|dir| rules_file::stale_import(dir, pulse_root)) {
         print_status(Status::Exists, &warning);
-    }
-}
-
-/// Install or repair the three hooks in the target's settings.json.
-/// Returns true when they are in place afterwards.
-fn configure_hooks(
-    target: &claude_settings::ClaudeTarget,
-    roots: &paths::ConfigRoots,
-    pulse_root: &Path,
-) -> bool {
-    let settings_path = target.settings_path();
-    let mut settings = match claude_settings::read_settings(&settings_path) {
-        Ok(settings) => settings,
-        Err(why) => {
-            print_status(Status::Error, &format!("{why} — hooks not configured"));
-            return false;
-        }
-    };
-    let change = match claude_settings::apply_hooks(&mut settings, pulse_root, roots.recall_bin()) {
-        Ok(change) => change,
-        Err(why) => {
-            print_status(Status::Error, &why);
-            return false;
-        }
-    };
-    for note in &change.notes {
-        print_status(Status::Exists, note);
-    }
-    if !change.changed {
-        print_status(Status::Exists, "Hooks already configured in settings.json");
-        return true;
-    }
-    match claude_settings::write_settings(&settings_path, &settings) {
-        Ok(()) => {
-            print_status(
-                Status::Created,
-                "Configured SessionStart + SessionEnd + PreCompact hooks in settings.json",
-            );
-            true
-        }
-        Err(why) => {
-            print_status(Status::Error, &why);
-            false
-        }
     }
 }
 
@@ -565,33 +650,23 @@ fn configure_rules(target: &claude_settings::ClaudeTarget, pulse_root: &Path) {
     }
 }
 
-/// Offer to turn off Claude Code's built-in auto-memory (#75).
+/// Offer to turn off Claude Code's built-in auto-memory (#75), in the
+/// settings value. Returns whether the user said yes.
 ///
 /// With it on, the user has a second curated store that recall-echo neither
 /// reads nor feeds — and it is the one the model is told to use. The choice
 /// is the user's: asked once, only when auto-memory is on and the session is
 /// `interactive`; a non-interactive one gets a notice line instead.
-fn configure_auto_memory(
-    target: &claude_settings::ClaudeTarget,
+fn stage_auto_memory(
+    settings: &mut serde_json::Value,
+    settings_path: &Path,
     reader: &mut dyn BufRead,
     interactive: bool,
     env_disable: Option<&str>,
-) {
-    let settings_path = target.settings_path();
-    let mut settings = match claude_settings::read_settings(&settings_path) {
-        Ok(settings) => settings,
-        Err(why) => {
-            print_status(
-                Status::Error,
-                &format!("{why} — Claude Code auto-memory left as is"),
-            );
-            return;
-        }
-    };
-    if !claude_settings::auto_memory_on(&settings, env_disable) {
-        return;
+) -> bool {
+    if !claude_settings::auto_memory_on(settings, env_disable) {
+        return false;
     }
-
     let what = "Claude Code's built-in auto-memory is on: a second curated store that \
                 recall-echo does not read";
     let not_moved = "Notes already under ~/.claude/projects/*/memory/ are not moved.";
@@ -603,23 +678,17 @@ fn configure_auto_memory(
                 settings_path.display()
             ),
         );
-        return;
+        return false;
     }
 
     eprintln!("\n{BOLD}{what}.{RESET}");
     eprintln!("  {DIM}{not_moved}{RESET}");
     if !ask_yes_default(reader, "Turn it off?") {
         print_status(Status::Exists, "Left Claude Code's auto-memory on");
-        return;
+        return false;
     }
-    claude_settings::disable_auto_memory(&mut settings);
-    match claude_settings::write_settings(&settings_path, &settings) {
-        Ok(()) => print_status(
-            Status::Created,
-            "Turned off Claude Code's auto-memory — MEMORY.md here is the one curated store",
-        ),
-        Err(why) => print_status(Status::Error, &why),
-    }
+    claude_settings::disable_auto_memory(settings);
+    true
 }
 
 /// Ask a question that defaults to yes. Enter, `y` or `yes` accept; anything
@@ -875,8 +944,8 @@ pub fn run_with(
 
     // Hooks are Claude Code's capture mechanism, not a consequence of the
     // extraction provider: a user who extracts with grok still wants their
-    // Claude Code sessions archived. `configure_hooks` no-ops when Claude Code
-    // is not installed.
+    // Claude Code sessions archived. `configure_claude_code` no-ops when Claude
+    // Code is not installed.
     configure_claude_code(
         roots,
         pulse_root,
@@ -1208,27 +1277,54 @@ mod tests {
         assert!(!sandbox.dir.path().join(".claude/rules").exists());
     }
 
-    /// The user's settings file in the sandbox, seeded with keys that must
-    /// survive an edit.
-    fn seeded_settings(sandbox: &Sandbox) -> PathBuf {
-        let path = sandbox.roots.claude_dir().unwrap().join("settings.json");
-        fs::write(
-            &path,
-            r#"{"model": "opus", "permissions": {"allow": ["Bash(ls)"]}}"#,
-        )
-        .unwrap();
+    fn settings_file(sandbox: &Sandbox) -> PathBuf {
+        sandbox.roots.claude_dir().unwrap().join("settings.json")
+    }
+
+    /// Write `json` as the sandbox user's settings.json, then let one
+    /// non-interactive run put the hooks in place — so a later run changes
+    /// only what the auto-memory answer changes.
+    fn settled_settings(sandbox: &Sandbox, json: &str) -> PathBuf {
+        let path = settings_file(sandbox);
+        fs::write(&path, json).unwrap();
+        configure_claude_code(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut Cursor::new(Vec::new()),
+            false,
+            None,
+        );
         path
     }
 
-    fn target(sandbox: &Sandbox) -> claude_settings::ClaudeTarget {
-        claude_settings::claude_code_target(&sandbox.roots, &sandbox.pulse_root())
-            .expect("the sandbox has Claude Code")
+    /// The user's settings file in the sandbox, seeded with keys that must
+    /// survive an edit, hooks already in place.
+    fn seeded_settings(sandbox: &Sandbox) -> PathBuf {
+        settled_settings(
+            sandbox,
+            r#"{"model": "opus", "permissions": {"allow": ["Bash(ls)"]}}"#,
+        )
+    }
+
+    fn ask_auto_memory_with(
+        sandbox: &Sandbox,
+        answer: &str,
+        interactive: bool,
+        env_disable: Option<&str>,
+    ) -> Cursor<Vec<u8>> {
+        let mut reader = Cursor::new(answer.as_bytes().to_vec());
+        configure_claude_code(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut reader,
+            interactive,
+            env_disable,
+        );
+        reader
     }
 
     fn ask_auto_memory(sandbox: &Sandbox, answer: &str, interactive: bool) -> Cursor<Vec<u8>> {
-        let mut reader = Cursor::new(answer.as_bytes().to_vec());
-        configure_auto_memory(&target(sandbox), &mut reader, interactive, None);
-        reader
+        ask_auto_memory_with(sandbox, answer, interactive, None)
     }
 
     #[test]
@@ -1278,8 +1374,7 @@ mod tests {
     #[test]
     fn auto_memory_already_off_is_not_asked() {
         let sandbox = Sandbox::new();
-        let path = sandbox.roots.claude_dir().unwrap().join("settings.json");
-        fs::write(&path, r#"{"autoMemoryEnabled": false}"#).unwrap();
+        let path = settled_settings(&sandbox, r#"{"autoMemoryEnabled": false}"#);
         let before = fs::read(&path).unwrap();
         let reader = ask_auto_memory(&sandbox, "y\n", true);
         assert_eq!(fs::read(&path).unwrap(), before);
@@ -1291,10 +1386,126 @@ mod tests {
         let sandbox = Sandbox::new();
         let path = seeded_settings(&sandbox);
         let before = fs::read(&path).unwrap();
-        let mut reader = Cursor::new(b"y\n".to_vec());
-        configure_auto_memory(&target(&sandbox), &mut reader, true, Some("1"));
+        let reader = ask_auto_memory_with(&sandbox, "y\n", true, Some("1"));
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
+    /// One read, one write: a run that changes both the hooks and the
+    /// auto-memory switch writes settings.json once — `.bak` is the file as
+    /// the user had it before the run, not an intermediate state.
+    #[test]
+    fn one_run_writes_settings_once_and_backs_up_the_original() {
+        let sandbox = Sandbox::new();
+        let path = settings_file(&sandbox);
+        let original = r#"{"model": "opus"}"#;
+        fs::write(&path, original).unwrap();
+
+        ask_auto_memory(&sandbox, "y\n", true);
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(settings["hooks"]["SessionStart"].is_array(), "{settings}");
+        assert_eq!(settings["autoMemoryEnabled"], serde_json::json!(false));
+        assert_eq!(settings["model"], "opus");
+        assert_eq!(
+            fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            original
+        );
+    }
+
+    /// Rewrites settings.json the moment the answer is read, as an editor
+    /// saving during the prompt would.
+    struct EditsDuringPrompt {
+        answer: Cursor<Vec<u8>>,
+        path: PathBuf,
+        edit: Option<&'static str>,
+    }
+
+    impl std::io::Read for EditsDuringPrompt {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.answer.read(buf)
+        }
+    }
+
+    impl BufRead for EditsDuringPrompt {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if let Some(edit) = self.edit.take() {
+                fs::write(&self.path, edit).unwrap();
+            }
+            self.answer.fill_buf()
+        }
+        fn consume(&mut self, amount: usize) {
+            self.answer.consume(amount);
+        }
+    }
+
+    fn answer_while_editing(sandbox: &Sandbox, edit: &'static str) -> PathBuf {
+        let path = settings_file(sandbox);
+        fs::write(&path, r#"{"model": "opus"}"#).unwrap();
+        let mut reader = EditsDuringPrompt {
+            answer: Cursor::new(b"y\n".to_vec()),
+            path: path.clone(),
+            edit: Some(edit),
+        };
+        configure_claude_code(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut reader,
+            true,
+            None,
+        );
+        path
+    }
+
+    #[test]
+    fn a_change_made_during_the_prompt_is_kept_and_this_runs_changes_reapplied() {
+        let sandbox = Sandbox::new();
+        let path = answer_while_editing(&sandbox, r#"{"theme": "dark"}"#);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark", "{settings}");
+        assert!(
+            settings.get("model").is_none(),
+            "the stale read must not win: {settings}"
+        );
+        assert!(settings["hooks"]["SessionStart"].is_array(), "{settings}");
+        assert_eq!(settings["autoMemoryEnabled"], serde_json::json!(false));
+        assert_eq!(
+            fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            r#"{"theme": "dark"}"#
+        );
+    }
+
+    #[test]
+    fn a_file_broken_during_the_prompt_is_never_overwritten() {
+        let sandbox = Sandbox::new();
+        let path = answer_while_editing(&sandbox, "{broken");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn a_symlinked_settings_file_is_never_replaced() {
+        let sandbox = Sandbox::new();
+        let dotfiles = sandbox.dir.path().join("dotfiles-settings.json");
+        fs::write(&dotfiles, r#"{"model": "opus"}"#).unwrap();
+        let path = settings_file(&sandbox);
+        std::os::unix::fs::symlink(&dotfiles, &path).unwrap();
+
+        let reader = ask_auto_memory(&sandbox, "y\n", true);
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&dotfiles).unwrap(),
+            r#"{"model": "opus"}"#
+        );
+        assert_eq!(
+            reader.position(),
+            0,
+            "nothing asked: nothing could be written"
+        );
     }
 
     /// A sandbox whose provider is already configured, so the provider menu
@@ -1386,7 +1597,7 @@ mod tests {
     }
 
     /// The whole init flow, run against a sandbox, writes the hooks into the
-    /// sandbox's `settings.json` — through the real `configure_hooks`
+    /// sandbox's `settings.json` — through the real `configure_claude_code`
     /// dispatcher, with no guard short-circuiting it — and leaves the real
     /// configuration exactly as it found it (#59).
     ///

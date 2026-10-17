@@ -45,7 +45,7 @@ pub(crate) fn auto_memory_on(settings: &serde_json::Value, env_disable: Option<&
 
 /// Turn Claude Code's built-in auto-memory off in `settings`, in memory.
 ///
-/// `settings` is an object — [`read_settings`] refuses anything else.
+/// `settings` is an object — [`open_settings`] refuses anything else.
 pub(crate) fn disable_auto_memory(settings: &mut serde_json::Value) {
     settings["autoMemoryEnabled"] = serde_json::Value::Bool(false);
 }
@@ -165,31 +165,124 @@ pub(crate) fn claude_code_target(
 
 // ── settings.json ────────────────────────────────────────────────────────
 
-/// Read `settings.json` for an edit.
+/// Parse settings.json as it was read: `None` (no file) is a fresh `{}`.
 ///
-/// Absent means a fresh install: `{}`. Unreadable or unparseable means the
-/// user's existing configuration — falling back to `{}` there would
-/// overwrite everything they have (permissions, MCP servers, env) with a
-/// file containing nothing but our change. The `Err` names why.
-pub(crate) fn read_settings(settings_path: &Path) -> Result<serde_json::Value, String> {
-    if !settings_path.exists() {
+/// Unparseable, or not an object, means the user's existing configuration —
+/// falling back to `{}` there would overwrite everything they have
+/// (permissions, MCP servers, env) with a file holding nothing but our
+/// change. The `Err` names why.
+fn parse_settings(path: &Path, bytes: Option<&[u8]>) -> Result<serde_json::Value, String> {
+    let Some(bytes) = bytes else {
         return Ok(serde_json::json!({}));
-    }
-    let content = fs::read_to_string(settings_path)
-        .map_err(|e| format!("Could not read {} ({e})", settings_path.display()))?;
-    let settings: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+    };
+    let settings: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
         format!(
             "{} is not valid JSON ({e}) — refusing to overwrite it; fix the file and re-run init",
-            settings_path.display()
+            path.display()
         )
     })?;
     if !settings.is_object() {
         return Err(format!(
             "{} is not a JSON object — refusing to overwrite it",
-            settings_path.display()
+            path.display()
         ));
     }
     Ok(settings)
+}
+
+/// The file's bytes, or `None` when there is no file.
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Could not read {} ({e})", path.display())),
+    }
+}
+
+/// One `init`'s edit of settings.json: read once, changed in memory by every
+/// step, written once (#75 audit B2).
+pub(crate) struct SettingsEdit {
+    path: PathBuf,
+    /// The bytes as they were read; `None` when there was no file.
+    original: Option<Vec<u8>>,
+    /// The settings, with this run's changes applied so far.
+    pub(crate) value: serde_json::Value,
+}
+
+/// What [`open_settings`] found.
+pub(crate) enum OpenSettings {
+    Edit(SettingsEdit),
+    /// settings.json is a symlink — a dotfiles setup's, never replaced.
+    Symlink,
+    /// Unreadable, or not a JSON object: never overwritten. The reason.
+    Refused(String),
+}
+
+/// How [`SettingsEdit::commit`] wrote.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Committed {
+    /// Over the file exactly as it was read.
+    Written,
+    /// The file changed while `init` ran (an editor, during a prompt): its
+    /// new content was kept and this run's changes applied to it again.
+    WrittenOverChange,
+}
+
+pub(crate) fn open_settings(path: &Path) -> OpenSettings {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return OpenSettings::Symlink;
+    }
+    let original = match read_bytes(path) {
+        Ok(original) => original,
+        Err(why) => return OpenSettings::Refused(why),
+    };
+    match parse_settings(path, original.as_deref()) {
+        Ok(value) => OpenSettings::Edit(SettingsEdit {
+            path: path.to_path_buf(),
+            original,
+            value,
+        }),
+        Err(why) => OpenSettings::Refused(why),
+    }
+}
+
+impl SettingsEdit {
+    /// Write the edited settings — once.
+    ///
+    /// The file is read again first. When it changed since [`open_settings`],
+    /// the new content wins and `reapply` makes this run's changes to it
+    /// again; when the new content is no longer a JSON object, nothing is
+    /// written. The bytes being replaced are kept as `settings.json.bak`, and
+    /// the replacement keeps the file's permissions — it can hold permission
+    /// allowlists and credentials, so its mode is not ours to loosen.
+    pub(crate) fn commit(
+        self,
+        reapply: impl FnOnce(&mut serde_json::Value) -> Result<(), String>,
+    ) -> Result<Committed, String> {
+        let current = read_bytes(&self.path)?;
+        let (value, committed) = if current == self.original {
+            (self.value, Committed::Written)
+        } else {
+            let mut fresh = parse_settings(&self.path, current.as_deref()).map_err(|why| {
+                format!("{why} (it changed while init was running) — this run's changes were not written")
+            })?;
+            reapply(&mut fresh)?;
+            (fresh, Committed::WrittenOverChange)
+        };
+        let content = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("Failed to serialize settings: {e}"))?;
+        if let Some(replaced) = &current {
+            fs::write(self.path.with_extension("json.bak"), replaced).map_err(|e| {
+                format!(
+                    "Could not keep a backup of {} ({e}) — not written",
+                    self.path.display()
+                )
+            })?;
+        }
+        atomic_replace(&self.path, &content, true)
+            .map_err(|e| format!("Failed to write {}: {e}", self.path.display()))?;
+        Ok(committed)
+    }
 }
 
 /// What [`apply_hooks`] did to a settings value.
@@ -241,29 +334,6 @@ pub(crate) fn apply_hooks(
     let changed = upsert_recall_hooks(settings, recall_bin, &root, &mut notes)
         .map_err(|why| format!("settings.json: {why} — hooks not configured"))?;
     Ok(HookChange { changed, notes })
-}
-
-/// Serialize `settings` and replace the file at `settings_path` with it.
-pub(crate) fn write_settings(
-    settings_path: &Path,
-    settings: &serde_json::Value,
-) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(settings)
-        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    write_settings_atomically(settings_path, &content)
-        .map_err(|e| format!("Failed to write {}: {e}", settings_path.display()))
-}
-
-/// Replace settings.json without a window where it is truncated or absent.
-///
-/// The previous content is kept as `settings.json.bak`; the new content keeps
-/// the original file's permissions — the file can hold permission allowlists
-/// and credentials, so its mode is not ours to loosen.
-fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
-    if path.exists() {
-        let _ = fs::copy(path, path.with_extension("json.bak"));
-    }
-    atomic_replace(path, content, true)
 }
 
 /// Replace `path` with `content` without a window where Claude Code could
