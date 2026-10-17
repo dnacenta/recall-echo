@@ -15,10 +15,16 @@ preview and a file path. EPHEMERAL.md fits (five entries are about 2 KB), so `co
 prints it. A curated MEMORY.md routinely does not, so `init` writes
 `~/.claude/rules/recall-echo.md` instead: a memory file whose single `@` import is the
 store's MEMORY.md, inlined whole on every startup, resume and `/clear`. Its first line marks
-it as managed. `init` rewrites only a file carrying that line; a hand-written file at that
-path is left alone, and `init` prints the import line it needs. A pulse root (a
-`pulse-null.toml` beside `memory/`) gets no rules file, because pulse-null puts MEMORY.md
-into the pulse's prompt itself.
+it as managed. `init` rewrites only a file carrying that line. A hand-written file at that
+path is left alone: if it already imports this MEMORY.md `init` says so, otherwise it prints
+the import line the file needs. A pulse root (a `pulse-null.toml` beside `memory/`) gets no
+rules file, and neither does a user who runs pulses, because pulse-null puts MEMORY.md into
+each pulse's prompt itself.
+
+Because that import puts MEMORY.md into every session, `init` refuses to write it unless the
+root, `memory/` and MEMORY.md are this user's alone: owned by them, not writable by group or
+others, and MEMORY.md not a symlink. Claude Code also follows imports inside an imported
+file, so `status`, `distill` and `init` warn about any `@` line inside MEMORY.md.
 
 Every relationship carries a Beta posterior, not a yes or no. Corroboration raises it,
 contradiction lowers it, and the evidence stays on the edge, so one offhand remark cannot

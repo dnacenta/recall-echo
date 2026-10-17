@@ -19,7 +19,7 @@ binaries cover Linux and macOS on x86_64 and arm64. After the first install,
 
 ```
 recall-echo init [ROOT]              create memory/, install hooks + rules file, register MCP, fetch the model
-recall-echo status [ROOT]            health: MEMORY.md use, ephemeral entries, archives
+recall-echo status [ROOT]            health: MEMORY.md lines, bytes and tokens, ephemeral entries, archives
 recall-echo dashboard [ROOT]         status plus stats and recent sessions
 recall-echo config show              effective settings and the exact provider command
 recall-echo config set KEY VALUE     change one setting
@@ -31,7 +31,15 @@ directory, and never overwrites existing files. With Claude Code installed it al
 `~/.claude/rules/recall-echo.md`, which imports MEMORY.md into every session; a
 hand-written file at that path is left alone. When Claude Code's built-in auto-memory is
 on, `init` asks once whether to turn it off (`autoMemoryEnabled: false`), so there is a
-single curated store. A scripted install only prints a notice. `update` swaps the binary only after the
+single curated store. It asks only when stdin and stderr are both terminals, and end of
+input means no; a scripted install only prints a notice. The rules file and the question
+are skipped for a pulse-null pulse root and for a user who runs pulses
+(`~/pulse-null/*/pulse-null.toml`). settings.json is read once and written once, keeping the
+replaced bytes as `settings.json.bak`; a symlinked settings.json is never replaced. `init`
+and `status` warn when MEMORY.md carries `@` import lines, which Claude Code would follow
+into every session.
+
+`update` swaps the binary only after the
 new one answers `--version`: a liveness check over HTTPS, not a cryptographic one
 (checksummed releases are planned). `--check` only reports and exits 10 when an update
 exists, `--version vX.Y.Z` pins a release, `--force` reinstalls.
@@ -49,7 +57,7 @@ recall-echo consume                  SessionStart hook (startup, resume, /clear)
 recall-echo archive --all-unarchived archive every missed transcript under ~/.claude/projects/
 recall-echo ingest --from CLI        import codex, grok or claude-code transcripts (repeatable)
 recall-echo ingest --all             import from every CLI in [capture] sources, or every one installed
-recall-echo distill                  suggest moving MEMORY.md sections over 30 lines into topic files
+recall-echo distill                  past 140 lines or 25 KB: suggest moving MEMORY.md sections into topic files
 ```
 
 `archive-session` reads Claude Code's JSONL and Gemini CLI's JSON chat sessions, sniffing
