@@ -43,12 +43,11 @@ changes a user has to know about before upgrading.
   `CaptureReport::subagents_skipped`, shown by `ingest` and
   `archive --all-unarchived`. With `RECALL_ECHO_DEBUG` set, each skip is
   named on stderr with the signal that caught it.
-- `jsonl::is_subagent_transcript`, `jsonl::in_subagents_dir`,
-  `jsonl::flags_sidechain`, `jsonl::report_declined_subagent`,
-  `Transcript::is_sub_run`, `Transcript::discover_with_skipped` (both
-  provided), `archive::archive_all_with` (returns `archive::BatchArchiveReport`,
+- `jsonl::is_subagent_transcript`, `Transcript::is_sub_run`,
+  `Transcript::discover_with_skipped` (both provided),
+  `archive::archive_all_with` (returns `archive::BatchArchiveReport`,
   `#[non_exhaustive]`), `archive::archive_all_unarchived_at`,
-  `paths::batch_archive_base_dir`, `checkpoint::run_with_hook_input`.
+  `checkpoint::run_with_hook_input`.
 
 ### Changed
 

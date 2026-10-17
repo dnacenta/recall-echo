@@ -571,7 +571,7 @@ pub fn archive_all_unarchived() -> Result<(), RecallError> {
 /// The store is `pulse_root` when given, else `RECALL_ECHO_HOME`, else the
 /// root `init` persisted, else the legacy `~/.claude` — never the current
 /// directory, which the hooks consult but a batch import must not
-/// ([`crate::paths::batch_archive_base_dir`]). The chosen store and why are
+/// (`paths::batch_archive_base_dir`). The chosen store and why are
 /// printed before anything is written.
 pub fn archive_all_unarchived_at(pulse_root: Option<&Path>) -> Result<(), RecallError> {
     let (memory_dir, why) = crate::paths::batch_archive_base_dir(pulse_root)?;

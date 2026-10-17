@@ -690,7 +690,9 @@ fn resolve_batch_root_source(
 /// steer it (RE-74 audit). Order: `explicit` (`--pulse-root`),
 /// `RECALL_ECHO_HOME`, the root `init` persisted; with none of those, the
 /// legacy `~/.claude` itself, and the fallback is named on stderr.
-pub fn batch_archive_base_dir(explicit: Option<&Path>) -> Result<(PathBuf, String), RecallError> {
+pub(crate) fn batch_archive_base_dir(
+    explicit: Option<&Path>,
+) -> Result<(PathBuf, String), RecallError> {
     if let Some(root) = explicit {
         return Ok((hook_base_dir(Some(root))?, "from --pulse-root".into()));
     }

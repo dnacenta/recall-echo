@@ -149,7 +149,7 @@ pub fn is_subagent_transcript(path: &std::path::Path) -> bool {
 /// The free half of [`is_subagent_transcript`]: the file sits in a directory
 /// named `subagents`. Discovery applies it to every file it walks.
 #[must_use]
-pub fn in_subagents_dir(path: &std::path::Path) -> bool {
+pub(crate) fn in_subagents_dir(path: &std::path::Path) -> bool {
     path.parent()
         .and_then(std::path::Path::file_name)
         .is_some_and(|dir| dir == "subagents")
@@ -161,7 +161,7 @@ pub fn in_subagents_dir(path: &std::path::Path) -> bool {
 /// calls it only for transcripts not already archived, so a finished session
 /// is not re-read on every sweep.
 #[must_use]
-pub fn flags_sidechain(path: &std::path::Path) -> bool {
+pub(crate) fn flags_sidechain(path: &std::path::Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
     };
@@ -196,7 +196,7 @@ pub(crate) fn debug_skipped_subagent(path: &std::path::Path, signal: &str) {
 /// What a hook says when it was pointed at a subagent's transcript, `not_done`
 /// naming the work it skipped. One line on stderr — stdout may be reserved
 /// for JSON by the harness — shared by `archive-session` and `checkpoint`.
-pub fn report_declined_subagent(transcript_path: &str, not_done: &str) {
+pub(crate) fn report_declined_subagent(transcript_path: &str, not_done: &str) {
     eprintln!(
         "recall-echo: {transcript_path} is a subagent transcript (part of a session, not one), \
          {not_done}"
