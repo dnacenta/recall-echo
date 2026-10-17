@@ -220,23 +220,33 @@ pub(crate) fn write_settings(
 
 /// Replace settings.json without a window where it is truncated or absent.
 ///
-/// The previous content is kept as `settings.json.bak`; the new content lands
-/// via a temp file and rename, keeping the original file's permissions — the
-/// file can hold permission allowlists and credentials, so its mode is not
-/// ours to loosen.
+/// The previous content is kept as `settings.json.bak`; the new content keeps
+/// the original file's permissions — the file can hold permission allowlists
+/// and credentials, so its mode is not ours to loosen.
 fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     if path.exists() {
         let _ = fs::copy(path, path.with_extension("json.bak"));
     }
-    // Pid-suffixed so concurrent inits cannot rename each other's half-written
-    // temp into place.
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    atomic_replace(path, content, true)
+}
+
+/// Replace `path` with `content` without a window where Claude Code could
+/// read it half-written, find it absent, or anyone else could read it.
+///
+/// The temp file sits beside `path`, pid-suffixed so concurrent inits cannot
+/// rename each other's temp into place, is created exclusively (`O_EXCL`)
+/// and owner-only from birth — creating at the umask default and tightening
+/// later leaves a world-readable window — and is synced before the rename.
+/// `keep_mode` copies the existing file's permissions onto the replacement,
+/// for a file whose mode is the user's choice rather than ours.
+pub(crate) fn atomic_replace(path: &Path, content: &str, keep_mode: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(name);
     let _ = fs::remove_file(&tmp);
-    // Owner-only from birth: the file can hold credentials, and creating at
-    // the umask default before tightening leaves a world-readable window.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
+    let written = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -244,13 +254,17 @@ fn write_settings_atomically(path: &Path, content: &str) -> std::io::Result<()> 
             .open(&tmp)?;
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
+        if keep_mode {
+            if let Ok(meta) = fs::metadata(path) {
+                fs::set_permissions(&tmp, meta.permissions())?;
+            }
+        }
+        fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    #[cfg(not(unix))]
-    fs::write(&tmp, content)?;
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
-    }
-    fs::rename(&tmp, path)
+    written
 }
 
 /// Quote a path for use inside a shell hook command line.

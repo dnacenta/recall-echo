@@ -505,7 +505,11 @@ fn configure_hooks(
 /// Install the rules file that imports MEMORY.md into every Claude Code
 /// session (#75) — the only channel that carries Layer 1 whole.
 fn configure_rules(target: &claude_settings::ClaudeTarget, pulse_root: &Path) {
-    match rules_file::install(target.claude_dir(), pulse_root) {
+    let report = rules_file::install(target.claude_dir(), pulse_root);
+    for warning in &report.warnings {
+        print_status(Status::Exists, warning);
+    }
+    match report.outcome {
         rules_file::Outcome::Written(path) => print_status(
             Status::Created,
             &format!(

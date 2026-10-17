@@ -43,15 +43,24 @@ pub const FILE_NAME: &str = "recall-echo.md";
 
 const TEMPLATE: &str = include_str!("../templates/recall-echo.md");
 
-/// What [`install`] did.
+/// What [`install`] did, and anything worth a warning on the way.
+#[derive(Debug)]
+pub struct Report {
+    pub outcome: Outcome,
+    /// Things the user should hear about that did not stop the install.
+    pub warnings: Vec<String>,
+}
+
+/// What [`install`] did to the rules file.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Written fresh, or rewritten because it was ours and out of date.
     Written(PathBuf),
     /// Ours, and already what this root and template render to.
     Unchanged(PathBuf),
-    /// Something without the marker is there — the user's file, or a
-    /// symlink to one. Left alone; `import_line` is what it would need.
+    /// Something without the marker is there — the user's file, a symlink,
+    /// or not a regular file at all. Left alone; `import_line` is what it
+    /// would need.
     Unmanaged { path: PathBuf, import_line: String },
     /// The root cannot be written into an import line.
     Refused(String),
@@ -166,7 +175,9 @@ fn classify(path: &Path) -> io::Result<Existing> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Existing::Absent),
         Err(e) => return Err(e),
     };
-    if meta.file_type().is_symlink() {
+    // A symlink is the user's choice; anything but a regular file (a FIFO
+    // would block the read forever) is not ours either.
+    if meta.file_type().is_symlink() || !meta.is_file() {
         return Ok(Existing::Unmanaged);
     }
     let content = fs::read_to_string(path)?;
@@ -181,8 +192,15 @@ fn classify(path: &Path) -> io::Result<Existing> {
 ///
 /// Absent: written. Ours (first line opens with the marker token): rewritten
 /// only when it differs from what renders now. Anything else at that path, a
-/// symlink included, belongs to the user and is never replaced.
-pub fn install(claude_dir: &Path, root: &Path) -> Outcome {
+/// symlink included, belongs to the user and is never replaced. The file is
+/// owner-only and its directory is created 0700.
+pub fn install(claude_dir: &Path, root: &Path) -> Report {
+    let mut warnings = Vec::new();
+    let outcome = install_into(claude_dir, root, &mut warnings);
+    Report { outcome, warnings }
+}
+
+fn install_into(claude_dir: &Path, root: &Path, warnings: &mut Vec<String>) -> Outcome {
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let memory_dir = match memory_dir(&root) {
         Ok(dir) => dir,
@@ -201,24 +219,51 @@ pub fn install(claude_dir: &Path, root: &Path) -> Outcome {
         Err(e) => return Outcome::Failed(format!("could not read {}: {e}", path.display())),
     }
 
-    if let Err(e) = fs::create_dir_all(&rules_dir) {
+    if let Err(e) = ensure_rules_dir(&rules_dir, warnings) {
         return Outcome::Failed(format!("could not create {}: {e}", rules_dir.display()));
     }
-    match write_atomically(&path, &content) {
+    match crate::claude_settings::atomic_replace(&path, &content, false) {
         Ok(()) => Outcome::Written(path),
         Err(e) => Outcome::Failed(format!("could not write {}: {e}", path.display())),
     }
 }
 
-/// Replace `path` without a window where Claude Code could read it half-written.
-fn write_atomically(path: &Path, content: &str) -> io::Result<()> {
-    // Pid-suffixed so concurrent inits cannot rename each other's temp.
-    let tmp = path.with_extension(format!("md.tmp.{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+/// Create `rules_dir` owner-only, or vet the one that is there.
+///
+/// An existing directory is the user's and is not chmod-ed, but one that
+/// other users can write into, or that someone else owns, lets them plant
+/// rules Claude Code will load into every session — that is worth saying.
+fn ensure_rules_dir(rules_dir: &Path, warnings: &mut Vec<String>) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match fs::metadata(rules_dir) {
+        Ok(meta) => {
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 {
+                warnings.push(format!(
+                    "{} is writable by other users (mode {:04o}) — anyone who can write \
+                     there can add rules to every Claude Code session",
+                    rules_dir.display(),
+                    mode & 0o7777
+                ));
+            }
+            if let Ok(uid) = crate::serve_security::current_uid() {
+                if meta.uid() != uid {
+                    warnings.push(format!(
+                        "{} is owned by uid {}, not you (uid {uid})",
+                        rules_dir.display(),
+                        meta.uid()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(rules_dir),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +382,7 @@ mod tests {
     #[test]
     fn install_writes_when_absent() {
         let dirs = Dirs::new();
-        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert_eq!(outcome, Outcome::Written(dirs.rules()));
         let written = fs::read_to_string(dirs.rules()).unwrap();
         assert_eq!(written, render(&dirs.root("root-a")).unwrap());
@@ -347,7 +392,7 @@ mod tests {
     fn install_unchanged_when_managed_and_equal() {
         let dirs = Dirs::new();
         install(&dirs.claude(), &dirs.root("root-a"));
-        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert_eq!(outcome, Outcome::Unchanged(dirs.rules()));
     }
 
@@ -363,7 +408,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert_eq!(outcome, Outcome::Written(dirs.rules()));
         assert_eq!(
             fs::read_to_string(dirs.rules()).unwrap(),
@@ -375,7 +420,7 @@ mod tests {
     fn install_rewrites_when_managed_and_root_changed() {
         let dirs = Dirs::new();
         install(&dirs.claude(), &dirs.root("root-a"));
-        let outcome = install(&dirs.claude(), &dirs.root("root-b"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-b")).outcome;
         assert_eq!(outcome, Outcome::Written(dirs.rules()));
         let written = fs::read_to_string(dirs.rules()).unwrap();
         let line = import_line(&dirs.root("root-b")).unwrap();
@@ -389,7 +434,7 @@ mod tests {
         fs::create_dir_all(dirs.claude().join("rules")).unwrap();
         fs::write(dirs.rules(), "# my own rules\n").unwrap();
 
-        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert_eq!(
             outcome,
             Outcome::Unmanaged {
@@ -413,7 +458,7 @@ mod tests {
         fs::create_dir_all(dirs.claude().join("rules")).unwrap();
         std::os::unix::fs::symlink(&target, dirs.rules()).unwrap();
 
-        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert!(matches!(outcome, Outcome::Unmanaged { .. }), "{outcome:?}");
         assert!(fs::symlink_metadata(dirs.rules())
             .unwrap()
@@ -426,12 +471,62 @@ mod tests {
     }
 
     #[test]
+    fn install_writes_owner_only_into_a_0700_rules_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dirs = Dirs::new();
+        install(&dirs.claude(), &dirs.root("root-a"));
+        let file_mode = fs::metadata(dirs.rules()).unwrap().permissions().mode() & 0o777;
+        let dir_mode = fs::metadata(dirs.claude().join("rules"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn install_warns_about_a_rules_dir_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dirs = Dirs::new();
+        let rules_dir = dirs.claude().join("rules");
+        fs::create_dir_all(&rules_dir).unwrap();
+        fs::set_permissions(&rules_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let report = install(&dirs.claude(), &dirs.root("root-a"));
+        assert_eq!(report.outcome, Outcome::Written(dirs.rules()));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("writable by other users")),
+            "{:?}",
+            report.warnings
+        );
+        // The user's directory is reported, not chmod-ed.
+        let mode = fs::metadata(&rules_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o777);
+    }
+
+    #[test]
+    fn install_never_reads_a_fifo_at_the_rules_path() {
+        let dirs = Dirs::new();
+        fs::create_dir_all(dirs.claude().join("rules")).unwrap();
+        let fifo = std::ffi::CString::new(dirs.rules().to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
+        assert!(matches!(outcome, Outcome::Unmanaged { .. }), "{outcome:?}");
+    }
+
+    #[test]
     fn install_reports_failure_when_rules_dir_unwritable() {
         let dirs = Dirs::new();
         // A file where the directory should be: fails even when run as root,
         // which permission bits would not.
         fs::write(dirs.claude().join("rules"), "not a directory").unwrap();
-        let outcome = install(&dirs.claude(), &dirs.root("root-a"));
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
     }
 
@@ -440,7 +535,7 @@ mod tests {
         let dirs = Dirs::new();
         let spaced = dirs.tmp.path().join("my root");
         fs::create_dir_all(&spaced).unwrap();
-        let outcome = install(&dirs.claude(), &spaced);
+        let outcome = install(&dirs.claude(), &spaced).outcome;
         assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
         assert!(!dirs.claude().join("rules").exists());
     }
