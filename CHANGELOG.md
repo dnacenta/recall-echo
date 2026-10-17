@@ -27,11 +27,12 @@ changes a user has to know about before upgrading.
   - Already-written subagent archives are left in place; pruning them is
     #76. EPHEMERAL.md clears itself within five real sessions.
 - `archive --all-unarchived` writes into `--pulse-root`, `RECALL_ECHO_HOME`
-  or the root `init` persisted — never a store taken from the current
-  directory, so a cloned repo or a legacy `~/.claude` that looks initialised
-  cannot receive every unarchived session — and names the store and why
-  before writing. It used to write `~/.claude/conversations`, which on a 4.x
-  install failed with "conversations/ directory not found".
+  or the root `init` persisted, and never takes its store from the current
+  directory, so a cloned repo that looks initialised cannot steer it. With
+  none of those pinned it falls back to the legacy `~/.claude`, and says so
+  on stderr. It names the store and why before writing. It used to write
+  `~/.claude/conversations` unconditionally, which on a 4.x install failed
+  with "conversations/ directory not found".
 - Claude Code discovery reads regular files only: a FIFO or a link to a
   device named `*.jsonl` is skipped instead of hanging the sweep.
 

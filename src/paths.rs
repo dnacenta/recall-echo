@@ -686,10 +686,10 @@ fn resolve_batch_root_source(
 ///
 /// A batch import writes every unarchived session at once, so — unlike the
 /// hooks, which run inside one session — it never takes the store from the
-/// cwd: a cloned repo or a legacy `~/.claude` that merely looks initialised
-/// must not receive them (RE-74 audit). Order: `explicit` (`--pulse-root`),
-/// `RECALL_ECHO_HOME`, the root `init` persisted, then the legacy `~/.claude`
-/// fallback, named on stderr.
+/// cwd: a directory that merely looks initialised (a cloned repo, say) cannot
+/// steer it (RE-74 audit). Order: `explicit` (`--pulse-root`),
+/// `RECALL_ECHO_HOME`, the root `init` persisted; with none of those, the
+/// legacy `~/.claude` itself, and the fallback is named on stderr.
 pub fn batch_archive_base_dir(explicit: Option<&Path>) -> Result<(PathBuf, String), RecallError> {
     if let Some(root) = explicit {
         return Ok((hook_base_dir(Some(root))?, "from --pulse-root".into()));
