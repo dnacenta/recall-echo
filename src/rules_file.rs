@@ -62,6 +62,9 @@ pub enum Outcome {
     /// or not a regular file at all. Left alone; `import_line` is what it
     /// would need.
     Unmanaged { path: PathBuf, import_line: String },
+    /// The user's own file, left alone, which already imports this store's
+    /// MEMORY.md — nothing to advise.
+    UnmanagedImports(PathBuf),
     /// The root cannot be written into an import line.
     Refused(String),
     /// Reading or writing failed.
@@ -165,8 +168,9 @@ enum Existing {
     Absent,
     /// A file this module wrote, with its content.
     Managed(String),
-    /// The user's: a file without the marker, or a symlink.
-    Unmanaged,
+    /// The user's: a file without the marker (with its content), a symlink,
+    /// or something that is not a regular file (no content).
+    Unmanaged(Option<String>),
 }
 
 fn classify(path: &Path) -> io::Result<Existing> {
@@ -178,13 +182,13 @@ fn classify(path: &Path) -> io::Result<Existing> {
     // A symlink is the user's choice; anything but a regular file (a FIFO
     // would block the read forever) is not ours either.
     if meta.file_type().is_symlink() || !meta.is_file() {
-        return Ok(Existing::Unmanaged);
+        return Ok(Existing::Unmanaged(None));
     }
     let content = fs::read_to_string(path)?;
     Ok(if is_managed(&content) {
         Existing::Managed(content)
     } else {
-        Existing::Unmanaged
+        Existing::Unmanaged(Some(content))
     })
 }
 
@@ -218,7 +222,16 @@ fn install_into(claude_dir: &Path, root: &Path, warnings: &mut Vec<String>) -> O
         Ok(Existing::Absent) => {}
         Ok(Existing::Managed(existing)) if existing == content => return Outcome::Unchanged(path),
         Ok(Existing::Managed(_)) => {}
-        Ok(Existing::Unmanaged) => return Outcome::Unmanaged { path, import_line },
+        Ok(Existing::Unmanaged(Some(existing)))
+            if imports_file(
+                &existing,
+                &rules_dir,
+                &root.join("memory").join("MEMORY.md"),
+            ) =>
+        {
+            return Outcome::UnmanagedImports(path)
+        }
+        Ok(Existing::Unmanaged(_)) => return Outcome::Unmanaged { path, import_line },
         Err(e) => return Outcome::Failed(format!("could not read {}: {e}", path.display())),
     }
 
@@ -277,6 +290,62 @@ fn vet_store(root: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The `@` import tokens in a memory file, as Claude Code would see them:
+/// words opening with `@` followed by a path-ish character (`~`, `/`, `.`
+/// or a word character), outside fenced code blocks and inline code spans.
+/// Each is returned without its `@`.
+pub(crate) fn import_tokens(content: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // Drop inline code spans: everything between paired backticks.
+        let outside_code: String = line
+            .split('`')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, part)| part)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in outside_code.split_whitespace() {
+            let Some(rest) = word.strip_prefix('@') else {
+                continue;
+            };
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '~' | '/' | '.') || c.is_alphanumeric() || c == '_')
+            {
+                tokens.push(rest.to_string());
+            }
+        }
+    }
+    tokens
+}
+
+/// Whether a memory file in `dir` imports `target`: an `@` token that, with
+/// `~/` expanded and a relative path resolved against `dir` (as Claude Code
+/// resolves it), names the same file once both sides are canonical.
+fn imports_file(content: &str, dir: &Path, target: &Path) -> bool {
+    let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canonical(target);
+    import_tokens(content).iter().any(|token| {
+        let expanded = PathBuf::from(crate::paths::expand_tilde(token));
+        let resolved = if expanded.is_absolute() {
+            expanded
+        } else {
+            dir.join(expanded)
+        };
+        canonical(&resolved) == target
+    })
 }
 
 /// Create `rules_dir` owner-only, or vet the one that is there.
@@ -503,6 +572,51 @@ mod tests {
             fs::read_to_string(dirs.rules()).unwrap(),
             "# my own rules\n"
         );
+    }
+
+    #[test]
+    fn install_reports_a_hand_written_file_that_already_imports_memory_md() {
+        let dirs = Dirs::new();
+        fs::create_dir_all(dirs.claude().join("rules")).unwrap();
+        // Through a symlinked route to the same root: canonicalized, it matches.
+        let alias = dirs.tmp.path().join("alias");
+        std::os::unix::fs::symlink(dirs.root("root-a"), &alias).unwrap();
+        fs::write(
+            dirs.rules(),
+            format!("# mine\n\n@{}/memory/MEMORY.md\n", alias.display()),
+        )
+        .unwrap();
+        fs::write(dirs.root("root-a").join("memory/MEMORY.md"), "# Memory\n").unwrap();
+
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
+        assert_eq!(outcome, Outcome::UnmanagedImports(dirs.rules()));
+    }
+
+    #[test]
+    fn an_import_of_another_store_or_inside_code_still_gets_the_advice() {
+        let dirs = Dirs::new();
+        fs::create_dir_all(dirs.claude().join("rules")).unwrap();
+        let ours = dirs.root("root-a").join("memory/MEMORY.md");
+        fs::write(&ours, "# Memory\n").unwrap();
+        fs::write(
+            dirs.rules(),
+            format!(
+                "@{}/memory/MEMORY.md\n```\n@{}\n```\nsee `@{}`\n",
+                dirs.root("root-b").display(),
+                ours.display(),
+                ours.display()
+            ),
+        )
+        .unwrap();
+
+        let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
+        assert!(matches!(outcome, Outcome::Unmanaged { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn import_tokens_skip_fences_spans_and_email_like_words() {
+        let content = "@/a/b.md and @~/c.md\n```\n@/in/fence.md\n```\n`@/in/span.md` x@y.z @ alone\n@./rel.md\n";
+        assert_eq!(import_tokens(content), ["/a/b.md", "~/c.md", "./rel.md"]);
     }
 
     #[cfg(unix)]

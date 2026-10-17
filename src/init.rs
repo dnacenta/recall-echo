@@ -521,6 +521,13 @@ fn configure_rules(target: &claude_settings::ClaudeTarget, pulse_root: &Path) {
             Status::Exists,
             &format!("{} already up to date", path.display()),
         ),
+        rules_file::Outcome::UnmanagedImports(path) => print_status(
+            Status::Exists,
+            &format!(
+                "{} is not managed by recall-echo but already imports MEMORY.md — left as is",
+                path.display()
+            ),
+        ),
         rules_file::Outcome::Unmanaged { path, import_line } => {
             print_status(
                 Status::Exists,
