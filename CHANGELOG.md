@@ -3,7 +3,7 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
-## [4.7.0] — Unreleased
+## [4.7.0] — 2026-10-17
 
 ### Fixed
 
@@ -66,7 +66,7 @@ changes a user has to know about before upgrading.
 - `archive::archive_all_with_base`: use `archive_all_with`, which takes the
   store and the transcripts separately.
 
-## [4.6.2] — Unreleased
+## [4.6.2] — 2026-09-25
 
 ### Fixed
 
@@ -124,7 +124,7 @@ changes a user has to know about before upgrading.
   duplicates (`Skipped(Entity)`). A model-issued skip names no target; the
   nearest neighbour it was shown is taken.
 
-## [4.6.1] — Unreleased
+## [4.6.1] — 2026-09-25
 
 ### Fixed
 
