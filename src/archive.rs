@@ -1042,6 +1042,8 @@ mod tests {
         .unwrap();
         let memory = tmp.path().join("root/memory");
         fs::create_dir_all(memory.join("conversations")).unwrap();
+        // A legacy store beside `projects/` — where 4.6.2 wrote.
+        fs::create_dir_all(claude.join("conversations")).unwrap();
 
         let transcripts = ClaudeCodeTranscripts::new(claude.join("projects"));
         archive_all_with(&memory, &transcripts).unwrap();
@@ -1049,7 +1051,11 @@ mod tests {
         let archived = collect_archived_sessions(&memory.join("conversations"));
         assert_eq!(archived.len(), 1, "{archived:?}");
         assert!(archived.contains("sess-1"));
-        assert!(!claude.join("conversations").exists());
+        assert_eq!(
+            fs::read_dir(claude.join("conversations")).unwrap().count(),
+            0,
+            "nothing may land in the legacy store beside projects/"
+        );
 
         // Re-running finds nothing new.
         archive_all_with(&memory, &transcripts).unwrap();

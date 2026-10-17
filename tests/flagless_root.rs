@@ -169,3 +169,82 @@ fn the_pulse_root_file_wins_over_a_leftover_entity_root_file() {
     assert!(!err.contains("legacy"), "{err}");
     assert!(!err.contains("gone"), "{err}");
 }
+
+// ── archive --all-unarchived (RE-74 audit) ───────────────────────────────
+
+const SESSION: &str = concat!(
+    r#"{"type":"user","isSidechain":false,"timestamp":"2026-10-17T10:00:00.000Z","message":{"role":"user","content":"a real question"}}"#,
+    "\n",
+    r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-10-17T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"a real answer"}]}}"#,
+    "\n",
+);
+
+fn conversation_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |entries| entries.count())
+}
+
+impl Fixture {
+    /// `archive --all-unarchived` from an initialised-looking cwd, against
+    /// the sandboxed `~/.claude`; nothing from the developer's environment
+    /// can name a store or a transcript directory.
+    fn batch_archive(&self, extra: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_recall-echo"))
+            .args(["archive", "--all-unarchived"])
+            .args(extra)
+            .current_dir(&self.elsewhere)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("HOME", &self.home)
+            .env_remove("RECALL_ECHO_HOME")
+            .env_remove("RECALL_ECHO_CLAUDE_DIR")
+            .output()
+            .expect("run recall-echo")
+    }
+}
+
+/// The batch import writes into the pinned root even from a directory that
+/// looks initialised both ways — the hooks' cwd arm does not apply to it —
+/// and `--pulse-root` beats the persisted root.
+#[test]
+fn batch_archive_ignores_an_initialised_cwd_and_honours_pulse_root() {
+    let fx = fixture();
+    for layout in ["conversations", "memory/conversations"] {
+        std::fs::create_dir_all(fx.elsewhere.join(layout)).expect("decoy layout");
+    }
+    let project = fx.home.join(".claude/projects/-home-dev-app");
+    std::fs::create_dir_all(&project).expect("projects");
+    std::fs::write(project.join("sess-1.jsonl"), SESSION).expect("session");
+    fx.persist(&fx.root);
+
+    let out = fx.batch_archive(&[]);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("archiving into"), "{err}");
+    assert!(err.contains("persisted by `recall-echo init`"), "{err}");
+    assert_eq!(
+        conversation_count(&fx.root.join("memory/conversations")),
+        1,
+        "{err}"
+    );
+    assert_eq!(conversation_count(&fx.elsewhere.join("conversations")), 0);
+    assert_eq!(
+        conversation_count(&fx.elsewhere.join("memory/conversations")),
+        0
+    );
+
+    let other = fx.root.parent().expect("tmp").join("other");
+    std::fs::create_dir_all(other.join("memory/conversations")).expect("other store");
+    let out = fx.batch_archive(&["--pulse-root", other.to_str().expect("utf-8 path")]);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("from --pulse-root"), "{err}");
+    assert_eq!(
+        conversation_count(&other.join("memory/conversations")),
+        1,
+        "{err}"
+    );
+    assert_eq!(conversation_count(&fx.root.join("memory/conversations")), 1);
+    assert_eq!(
+        conversation_count(&fx.elsewhere.join("memory/conversations")),
+        0
+    );
+}
