@@ -1150,6 +1150,31 @@ mod tests {
         assert!(!sandbox_rules(&sandbox).exists());
     }
 
+    /// The user runs pulses: no user-level rules file and no auto-memory
+    /// change, whatever root `init` is given (#75 audit B6).
+    #[test]
+    fn init_skips_the_memory_steps_when_the_home_holds_pulses() {
+        let sandbox = Sandbox::new();
+        let pulse = sandbox.dir.path().join("pulse-null").join("echo");
+        fs::create_dir_all(&pulse).unwrap();
+        fs::write(pulse.join("pulse-null.toml"), "[pulse]\n").unwrap();
+        let settings_path = seeded_settings(&sandbox);
+
+        let mut reader = Cursor::new(b"y\n".to_vec());
+        configure_claude_code(
+            &sandbox.roots,
+            &sandbox.pulse_root(),
+            &mut reader,
+            true,
+            None,
+        );
+        assert!(!sandbox_rules(&sandbox).exists());
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
+        assert!(settings.get("autoMemoryEnabled").is_none(), "{settings}");
+        assert_eq!(reader.position(), 0, "nothing asked");
+    }
+
     #[test]
     fn init_leaves_an_unmanaged_rules_file_untouched() {
         let sandbox = Sandbox::new();

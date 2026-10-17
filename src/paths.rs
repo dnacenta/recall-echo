@@ -381,6 +381,13 @@ impl ConfigRoots {
         self.pulse_root_file()
     }
 
+    /// The home directory of the user these roots configure: the sandbox
+    /// under test, the real home otherwise.
+    #[must_use]
+    pub fn home(&self) -> Option<PathBuf> {
+        self.agent_home.clone().or_else(dirs::home_dir)
+    }
+
     /// The binary path written into hooks and MCP registrations.
     #[must_use]
     pub fn recall_bin(&self) -> &str {

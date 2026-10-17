@@ -63,18 +63,31 @@ pub(crate) enum Skip {
     /// A pulse-null pulse: pulse-null writes this pulse's own Claude Code
     /// rules and puts its MEMORY.md into the pulse's prompt itself.
     PulseRoot,
+    /// The user these settings belong to runs pulses (the listed pulse
+    /// directories): a user-level rules file would load into every one of
+    /// their sessions, on top of the MEMORY.md pulse-null already gives them.
+    PulseHome(Vec<PathBuf>),
 }
 
 impl std::fmt::Display for Skip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Skip::NoClaudeCode => "Claude Code is not installed",
-            Skip::BuildDir => "running from a build directory",
-            Skip::PulseRoot => {
+        match self {
+            Skip::NoClaudeCode => f.write_str("Claude Code is not installed"),
+            Skip::BuildDir => f.write_str("running from a build directory"),
+            Skip::PulseRoot => f.write_str(
                 "this is a pulse-null pulse, and pulse-null writes its rules and loads its \
-                 MEMORY.md itself"
+                 MEMORY.md itself",
+            ),
+            Skip::PulseHome(pulses) => {
+                let names: Vec<String> = pulses.iter().map(|p| p.display().to_string()).collect();
+                write!(
+                    f,
+                    "this user runs pulse-null pulses ({}), and a user-level rules file would \
+                     load into every pulse session",
+                    names.join(", ")
+                )
             }
-        })
+        }
     }
 }
 
@@ -107,6 +120,21 @@ fn is_pulse_root(root: &Path) -> bool {
     root.join("pulse-null.toml").is_file()
 }
 
+/// The pulses under `home`, in the shape pulse-null discovers them:
+/// `<home>/pulse-null/<name>/pulse-null.toml`. Sorted, so messages are stable.
+fn pulses_in(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(home.join("pulse-null")) else {
+        return Vec::new();
+    };
+    let mut pulses: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|dir| is_pulse_root(dir))
+        .collect();
+    pulses.sort();
+    pulses
+}
+
 /// The one guard every Claude Code step goes through: hooks, the rules file
 /// and the auto-memory question.
 ///
@@ -120,7 +148,15 @@ pub(crate) fn claude_code_target(
     if paths::is_build_dir(roots.recall_bin()) {
         return Err(Skip::BuildDir);
     }
-    let memory_skip = is_pulse_root(pulse_root).then_some(Skip::PulseRoot);
+    let memory_skip = if is_pulse_root(pulse_root) {
+        Some(Skip::PulseRoot)
+    } else {
+        let pulses = roots
+            .home()
+            .map(|home| pulses_in(&home))
+            .unwrap_or_default();
+        (!pulses.is_empty()).then_some(Skip::PulseHome(pulses))
+    };
     Ok(ClaudeTarget {
         claude_dir: claude_dir.to_path_buf(),
         memory_skip,
@@ -916,6 +952,32 @@ mod tests {
 
         let plain = claude_code_target(&roots, tmp.path()).unwrap();
         assert_eq!(plain.memory_steps(), Ok(()));
+    }
+
+    #[test]
+    fn a_home_with_pulses_skips_the_memory_steps_for_any_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = paths::ConfigRoots::sandboxed(tmp.path()).unwrap();
+        for name in ["echo", "synth"] {
+            let pulse = tmp.path().join("pulse-null").join(name);
+            fs::create_dir_all(&pulse).unwrap();
+            fs::write(pulse.join("pulse-null.toml"), "[pulse]\n").unwrap();
+        }
+        // A directory without the toml is not a pulse.
+        fs::create_dir_all(tmp.path().join("pulse-null/notes")).unwrap();
+        let plain_root = tmp.path().join("store");
+        fs::create_dir_all(&plain_root).unwrap();
+
+        let target = claude_code_target(&roots, &plain_root).expect("hooks still run");
+        let skip = target.memory_steps().unwrap_err();
+        assert_eq!(
+            skip,
+            &Skip::PulseHome(vec![
+                tmp.path().join("pulse-null/echo"),
+                tmp.path().join("pulse-null/synth"),
+            ])
+        );
+        assert!(skip.to_string().contains("pulse-null/echo"), "{skip}");
     }
 
     #[test]
