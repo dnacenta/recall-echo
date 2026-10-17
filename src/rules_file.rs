@@ -201,10 +201,40 @@ fn classify(path: &Path) -> io::Result<Existing> {
 pub fn install(claude_dir: &Path, root: &Path) -> Report {
     let mut warnings = Vec::new();
     let outcome = install_into(claude_dir, root, &mut warnings);
-    if matches!(outcome, Outcome::Refused(_)) {
-        warnings.extend(stale_import(claude_dir, root));
+    if let Outcome::Refused(why) = &outcome {
+        warnings.extend(retire_managed(claude_dir, root, why));
     }
     Report { outcome, warnings }
+}
+
+/// When this run will not write the rules file for `root`, deal with the
+/// managed one that is there, and say what happened.
+///
+/// A managed file importing *this* store would keep loading the very
+/// MEMORY.md the run just declined to import — so it is removed, and the
+/// message says why (`because`). A managed file importing another store is
+/// still serving that store: it stays, with a warning ([`stale_import`]).
+/// A file without the marker is the user's and is never touched.
+pub(crate) fn retire_managed(claude_dir: &Path, root: &Path, because: &str) -> Option<String> {
+    let rules_dir = claude_dir.join("rules");
+    let path = rules_dir.join(FILE_NAME);
+    let Ok(Existing::Managed(content)) = classify(&path) else {
+        return None;
+    };
+    if !imports_file(&content, &rules_dir, &root.join("memory").join("MEMORY.md")) {
+        return stale_import(claude_dir, root);
+    }
+    Some(match fs::remove_file(&path) {
+        Ok(()) => format!(
+            "Removed managed rules file {} — it imported this store's MEMORY.md, and {because}",
+            path.display()
+        ),
+        Err(e) => format!(
+            "Could not remove managed rules file {} ({e}) — it still imports this store's \
+             MEMORY.md, although {because}",
+            path.display()
+        ),
+    })
 }
 
 /// A warning when a managed rules file imports some other store's MEMORY.md
@@ -996,6 +1026,38 @@ mod tests {
             fs::read_to_string(dirs.rules()).unwrap(),
             render(&dirs.root("root-a")).unwrap()
         );
+    }
+
+    /// The store stopped passing the trust checks: the managed file that
+    /// imports it is removed, and the warning says so.
+    #[test]
+    fn a_refused_install_removes_the_managed_file_importing_this_store() {
+        let dirs = Dirs::new();
+        install(&dirs.claude(), &dirs.root("root-a"));
+        chmod(&dirs.root("root-a"), 0o777);
+
+        let report = install(&dirs.claude(), &dirs.root("root-a"));
+        assert!(matches!(report.outcome, Outcome::Refused(_)), "{report:?}");
+        assert!(!dirs.rules().exists(), "the managed file is gone");
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("Removed managed rules file"))
+            .expect("the removal is reported");
+        assert!(warning.contains("writable by every user"), "{warning}");
+    }
+
+    #[test]
+    fn retire_never_touches_a_file_without_the_marker() {
+        let dirs = Dirs::new();
+        fs::create_dir_all(dirs.claude().join("rules")).unwrap();
+        let mine = format!("@{}/memory/MEMORY.md\n", dirs.root("root-a").display());
+        fs::write(dirs.rules(), &mine).unwrap();
+        assert_eq!(
+            retire_managed(&dirs.claude(), &dirs.root("root-a"), "test"),
+            None
+        );
+        assert_eq!(fs::read_to_string(dirs.rules()).unwrap(), mine);
     }
 
     #[test]

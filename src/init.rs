@@ -479,7 +479,10 @@ fn configure_claude_code(
                 Status::Exists,
                 &format!("Skipped Claude Code hooks, rules file and auto-memory — {skip}"),
             );
-            warn_stale_import(roots.claude_dir(), pulse_root);
+            // A dev build skipping is no reason to undo a real install.
+            if skip != claude_settings::Skip::BuildDir {
+                retire_rules(roots.claude_dir(), pulse_root, &skip);
+            }
             return;
         }
     };
@@ -510,7 +513,7 @@ fn configure_claude_code(
                 Status::Exists,
                 &format!("Skipped rules file and auto-memory — {skip}"),
             );
-            warn_stale_import(Some(target.claude_dir()), pulse_root);
+            retire_rules(Some(target.claude_dir()), pulse_root, skip);
         }
         Ok(()) => {
             configure_rules(&target, pulse_root);
@@ -623,11 +626,15 @@ fn advise_symlinked_settings(settings_path: &Path, roots: &paths::ConfigRoots, p
     }
 }
 
-/// After a skipped rules step: say so if a managed rules file is loading some
-/// other store's MEMORY.md into every session.
-fn warn_stale_import(claude_dir: Option<&Path>, pulse_root: &Path) {
-    if let Some(warning) = claude_dir.and_then(|dir| rules_file::stale_import(dir, pulse_root)) {
-        print_status(Status::Exists, &warning);
+/// After a skipped rules step: remove a managed rules file that imports this
+/// store (the skip's reason applies to it too), or warn about one importing
+/// another store. Files without the marker are never touched.
+fn retire_rules(claude_dir: Option<&Path>, pulse_root: &Path, skip: &claude_settings::Skip) {
+    let because = format!("this run skips the rules file: {skip}");
+    if let Some(message) =
+        claude_dir.and_then(|dir| rules_file::retire_managed(dir, pulse_root, &because))
+    {
+        print_status(Status::Exists, &message);
     }
 }
 
@@ -1300,6 +1307,27 @@ mod tests {
     fn init_skips_rules_for_pulse_root() {
         let sandbox = Sandbox::new();
         fs::write(sandbox.pulse_root().join("pulse-null.toml"), "[pulse]\n").unwrap();
+        sandbox.init("skip\n").unwrap();
+        assert!(!sandbox_rules(&sandbox).exists());
+    }
+
+    /// The user starts running pulses after an earlier `init`: the managed
+    /// rules file importing this store is removed, and nothing else is
+    /// touched (#75 audit M2).
+    #[test]
+    fn a_later_pulse_home_removes_the_managed_rules_file_for_this_store() {
+        let sandbox = Sandbox::new();
+        sandbox.init("skip\n").unwrap();
+        assert!(sandbox_rules(&sandbox).exists());
+
+        let pulse = sandbox
+            .dir
+            .path()
+            .join("pulse-null")
+            .join("pulses")
+            .join("echo");
+        fs::create_dir_all(&pulse).unwrap();
+        fs::write(pulse.join("pulse-null.toml"), "[pulse]\n").unwrap();
         sandbox.init("skip\n").unwrap();
         assert!(!sandbox_rules(&sandbox).exists());
     }
