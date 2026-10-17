@@ -3,6 +3,38 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [4.7.0] — Unreleased
+
+### Fixed
+
+- Claude Code subagent runs are no longer archived as sessions (#74). On one
+  install 156 of 251 archives were subagents: the capture sweep and `ingest`
+  took every `*.jsonl` under `projects/`, including
+  `<session>/subagents/agent-<id>.jsonl`. They crowded the five-slot
+  EPHEMERAL.md window and entered the parent model's prompts into the graph
+  as `user` evidence.
+  - A transcript is a subagent's when its directory is `subagents`, or when
+    the first entry carrying `isSidechain` within its first 64 lines has it
+    `true` (a fork's transcript opens with an unflagged `fork-context-ref`).
+  - Capture, `ingest` and `archive --all-unarchived` skip them; the
+    SessionEnd and PreCompact hooks decline them with one stderr line and
+    exit 0.
+  - Already-written subagent archives are left in place; pruning them is
+    #76. EPHEMERAL.md clears itself within five real sessions.
+- `archive --all-unarchived` writes into the store the hooks write to
+  (`<root>/memory`), not `~/.claude/conversations`. On a 4.x install it used
+  to fail with "conversations/ directory not found".
+
+### Added
+
+- `jsonl::is_subagent_transcript`, `archive::archive_all_with`,
+  `checkpoint::run_with_hook_input`.
+
+### Deprecated
+
+- `archive::archive_all_with_base`: use `archive_all_with`, which takes the
+  store and the transcripts separately.
+
 ## [4.6.2] — Unreleased
 
 ### Fixed

@@ -22,6 +22,7 @@ use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
 use crate::summarize;
 use crate::tags;
+use crate::transcript::{ClaudeCodeTranscripts, Transcript};
 
 /// Session metadata provided by the caller.
 #[derive(Debug, Clone)]
@@ -563,14 +564,38 @@ pub fn run_with_hook_input(
     Ok(())
 }
 
-/// Archive all unarchived JSONL transcripts found under ~/.claude/projects/.
+/// Archive every unarchived Claude Code session under `~/.claude/projects/`.
+///
+/// Archives land in the store the hooks write to — `<root>/memory` once
+/// `init` has pinned a root — not in `~/.claude` itself, which is the pre-4.x
+/// layout nothing reads any more.
 pub fn archive_all_unarchived() -> Result<(), RecallError> {
-    let base = crate::paths::claude_dir()?;
-    archive_all_with_base(&base)
+    let memory_dir = crate::paths::resolved_hook_base_dir(None)?;
+    let transcripts = ClaudeCodeTranscripts::detect()
+        .ok_or_else(|| RecallError::Other("Could not determine home directory".into()))?;
+    archive_all_with(&memory_dir, &transcripts)
 }
 
+/// [`archive_all_with`] for a claude-style root that is both the store and
+/// the parent of `projects/`.
+#[deprecated(
+    since = "4.7.0",
+    note = "use `archive_all_with`, which takes the store and the transcripts separately"
+)]
 pub fn archive_all_with_base(base: &Path) -> Result<(), RecallError> {
-    let conversations_dir = base.join("conversations");
+    archive_all_with(base, &ClaudeCodeTranscripts::new(base.join("projects")))
+}
+
+/// Archive every session `transcripts` discovers that `memory_dir` does not
+/// hold yet — oldest first, no settle time, no watermark.
+///
+/// Discovery is the capture sweep's, so subagent transcripts are never
+/// mistaken for sessions here either.
+pub fn archive_all_with(
+    memory_dir: &Path,
+    transcripts: &ClaudeCodeTranscripts,
+) -> Result<(), RecallError> {
+    let conversations_dir = memory_dir.join("conversations");
     if !conversations_dir.exists() {
         return Err(RecallError::NotInitialized(
             "conversations/ directory not found. Run `recall-echo init` first.".into(),
@@ -579,35 +604,23 @@ pub fn archive_all_with_base(base: &Path) -> Result<(), RecallError> {
 
     let archived_sessions = collect_archived_sessions(&conversations_dir);
 
-    let projects_dir = base.join("projects");
-    if !projects_dir.exists() {
+    if !transcripts.is_installed() {
         eprintln!("No projects directory found \u{2014} nothing to archive.");
         return Ok(());
     }
 
-    let mut jsonl_files = find_jsonl_files(&projects_dir);
-    jsonl_files.sort_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-
     let mut archived_count = 0;
     let mut skipped_count = 0;
 
-    for jsonl_path in &jsonl_files {
-        let session_id = match jsonl_path.file_stem().and_then(|s| s.to_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-
-        if archived_sessions.contains(&session_id) {
+    for transcript in transcripts.discover(None)? {
+        let session_id = &transcript.session_id;
+        if archived_sessions.contains(session_id) {
             skipped_count += 1;
             continue;
         }
 
-        let path_str = jsonl_path.to_string_lossy().to_string();
-        match archive_from_jsonl(base, &session_id, &path_str) {
+        let path_str = transcript.path.to_string_lossy().to_string();
+        match archive_from_jsonl(memory_dir, session_id, &path_str) {
             Ok(_) => archived_count += 1,
             Err(e) => {
                 eprintln!("recall-echo: skipping {session_id} \u{2014} {e}");
@@ -648,21 +661,6 @@ pub fn collect_archived_sessions(conversations_dir: &Path) -> std::collections::
         }
     }
     sessions
-}
-
-fn find_jsonl_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_jsonl_files(&path));
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                files.push(path);
-            }
-        }
-    }
-    files
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,5 +1006,39 @@ mod tests {
         );
         assert!(!memory.join("ARCHIVE.md").exists());
         assert!(!memory.join("EPHEMERAL.md").exists());
+    }
+
+    /// `archive --all-unarchived` writes into the store it is given — never a
+    /// `conversations/` beside `projects/` — and skips subagents like the
+    /// capture sweep does (RE-74).
+    #[test]
+    fn archive_all_writes_into_memory_store_and_skips_subagents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join(".claude");
+        let project = claude.join("projects/-home-dev-app");
+        fs::create_dir_all(project.join("sess-1/subagents")).unwrap();
+        fs::write(project.join("sess-1.jsonl"), CLAUDE_JSONL).unwrap();
+        fs::write(
+            project.join("sess-1/subagents/agent-a1.jsonl"),
+            CLAUDE_JSONL,
+        )
+        .unwrap();
+        let memory = tmp.path().join("root/memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+
+        let transcripts = ClaudeCodeTranscripts::new(claude.join("projects"));
+        archive_all_with(&memory, &transcripts).unwrap();
+
+        let archived = collect_archived_sessions(&memory.join("conversations"));
+        assert_eq!(archived.len(), 1, "{archived:?}");
+        assert!(archived.contains("sess-1"));
+        assert!(!claude.join("conversations").exists());
+
+        // Re-running finds nothing new.
+        archive_all_with(&memory, &transcripts).unwrap();
+        assert_eq!(
+            fs::read_dir(memory.join("conversations")).unwrap().count(),
+            1
+        );
     }
 }
