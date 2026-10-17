@@ -80,7 +80,49 @@ fn memory_dir(root: &Path) -> Result<String, String> {
             "pulse root {root} contains whitespace, which an @ import cannot carry"
         ));
     }
+    if root.contains('\\') {
+        return Err(format!(
+            "pulse root {root} contains a backslash, which an @ import may read as an escape"
+        ));
+    }
+    if root.chars().any(is_format_char) {
+        return Err(
+            "pulse root contains invisible formatting characters (bidi controls, zero-width \
+             or tag characters), which would make the import line read differently from \
+             what it loads"
+                .to_string(),
+        );
+    }
     Ok(format!("{}/memory", root.trim_end_matches('/')))
+}
+
+/// Unicode general category Cf: characters that change how text is shown
+/// without being seen themselves.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 /// The one line that puts MEMORY.md into every session.
@@ -220,6 +262,26 @@ mod tests {
     fn render_refuses_control_chars_in_root() {
         let err = render(Path::new("/home/user\n/.claude")).unwrap_err();
         assert!(err.contains("control"), "{err}");
+    }
+
+    #[test]
+    fn render_refuses_backslash_in_root() {
+        let err = render(Path::new("/home/user\\x/.claude")).unwrap_err();
+        assert!(err.contains("backslash"), "{err}");
+    }
+
+    #[test]
+    fn render_refuses_format_chars_in_root() {
+        for sneaky in ["\u{202E}", "\u{200B}", "\u{2066}", "\u{FEFF}", "\u{E0041}"] {
+            let root = format!("/home/user{sneaky}/.claude");
+            let err = render(Path::new(&root)).unwrap_err();
+            assert!(err.contains("invisible"), "{sneaky:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn render_accepts_ordinary_non_ascii() {
+        assert!(render(Path::new("/home/josé/.claude")).is_ok());
     }
 
     #[test]
