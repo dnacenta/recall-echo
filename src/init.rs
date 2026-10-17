@@ -913,6 +913,11 @@ pub fn run_with(
 
     // Write MEMORY.md (never overwrite)
     write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
+    if let Ok(content) = fs::read_to_string(memory_dir.join("MEMORY.md")) {
+        if let Some(warning) = rules_file::hidden_import_warning(&content) {
+            print_status(Status::Exists, &warning);
+        }
+    }
 
     // Write EPHEMERAL.md (never overwrite)
     write_if_not_exists(&memory_dir.join("EPHEMERAL.md"), "", "EPHEMERAL.md");

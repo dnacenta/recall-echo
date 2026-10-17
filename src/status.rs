@@ -65,6 +65,8 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
         if pct > 70 {
             issues.push(format!("MEMORY.md approaching limit ({pct}%)"));
         }
+        let content = fs::read_to_string(&memory_path).unwrap_or_default();
+        issues.extend(crate::rules_file::hidden_import_warning(&content));
     } else {
         eprintln!("  MEMORY.md       {DIM}not found{RESET}");
         issues.push("MEMORY.md not found".to_string());

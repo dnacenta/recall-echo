@@ -35,3 +35,4 @@ You have a persistent four-layer memory, kept by recall-echo in `{{MEMORY_DIR}}/
 - No duplicates in MEMORY.md — update the existing entry.
 - Archive conversation files are immutable.
 - When MEMORY.md nears 200 lines, distill it into topic files.
+- Never put secrets (keys, tokens, passwords) in MEMORY.md, and never add `@` lines to it. It is imported into every session, and Claude Code follows the imports inside it.

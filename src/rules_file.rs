@@ -358,6 +358,29 @@ pub(crate) fn import_tokens(content: &str) -> Vec<String> {
     tokens
 }
 
+/// A warning when MEMORY.md carries `@` import lines of its own.
+///
+/// MEMORY.md is imported into every session, and Claude Code follows the
+/// imports inside an imported file, so one `@` line in it — written by the
+/// model, or planted — quietly loads another file into every session from
+/// then on.
+pub(crate) fn hidden_import_warning(memory_md: &str) -> Option<String> {
+    let tokens = import_tokens(memory_md);
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut shown: Vec<String> = tokens.iter().take(3).map(|t| format!("@{t}")).collect();
+    if tokens.len() > 3 {
+        shown.push("…".to_string());
+    }
+    Some(format!(
+        "MEMORY.md has {} @ import line(s) ({}) — Claude Code follows them and loads those \
+         files into every session. Remove them; MEMORY.md should be plain text",
+        tokens.len(),
+        shown.join(", ")
+    ))
+}
+
 /// Whether a memory file in `dir` imports `target`: an `@` token that, with
 /// `~/` expanded and a relative path resolved against `dir` (as Claude Code
 /// resolves it), names the same file once both sides are canonical.
@@ -426,8 +449,8 @@ mod tests {
         let out = rendered();
         let imports: Vec<&str> = out.lines().filter(|l| l.starts_with('@')).collect();
         assert_eq!(imports, ["@/home/user/.claude/memory/MEMORY.md"]);
-        // No other line carries an import either.
-        assert_eq!(out.matches('@').count(), 1, "{out}");
+        // No other import anywhere, as Claude Code would read the file.
+        assert_eq!(import_tokens(&out), ["/home/user/.claude/memory/MEMORY.md"]);
     }
 
     #[test]
@@ -638,6 +661,28 @@ mod tests {
 
         let outcome = install(&dirs.claude(), &dirs.root("root-a")).outcome;
         assert!(matches!(outcome, Outcome::Unmanaged { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn hidden_import_warning_names_imports_outside_code_only() {
+        assert_eq!(
+            hidden_import_warning("# Memory\n- a fact, mail me at d@x.io\n"),
+            None
+        );
+        assert_eq!(
+            hidden_import_warning("see `@~/notes.md`\n```\n@/x.md\n```\n"),
+            None
+        );
+        let warning = hidden_import_warning("- fact\n@~/.ssh/notes.md\n").expect("a warning");
+        assert!(warning.contains("@~/.ssh/notes.md"), "{warning}");
+        assert!(warning.contains("every session"), "{warning}");
+    }
+
+    #[test]
+    fn the_template_tells_the_model_to_keep_memory_md_plain() {
+        let out = rendered();
+        assert!(out.contains("Never put secrets"), "{out}");
+        assert!(out.contains("never add `@` lines"), "{out}");
     }
 
     #[test]

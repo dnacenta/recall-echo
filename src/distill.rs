@@ -30,6 +30,9 @@ pub fn run_with_base(base: &Path) -> Result<(), RecallError> {
 
     eprintln!("\n{BOLD}recall-echo distill{RESET} — MEMORY.md analysis\n");
     eprintln!("  Lines: {line_count}/200");
+    if let Some(warning) = crate::rules_file::hidden_import_warning(&content) {
+        eprintln!("  {WARN}!{RESET} {warning}");
+    }
 
     if line_count < 140 {
         eprintln!("  {DIM}MEMORY.md is healthy — no distillation needed.{RESET}\n");
