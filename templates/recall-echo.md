@@ -7,7 +7,7 @@ You have a persistent four-layer memory, kept by recall-echo in `{{MEMORY_DIR}}/
 
 ### Layer 0 — Knowledge graph
 - Entities, relationships (each with a Bayesian confidence) and conversation episodes, built automatically from archived sessions.
-- Read it with the recall-echo MCP tools: `recall_query` first, then `recall_search`, `recall_episodes`, `recall_traverse` and `recall_overview`. The CLI equivalent is `recall-echo graph query|search|traverse`.
+- Read it with the recall-echo MCP tools. There are six, all read-only: `recall_query` first, then `recall_search`, `recall_episodes`, `recall_traverse`, `recall_overview` and `recall_status`. The CLI equivalent is `recall-echo graph query|search|traverse`.
 - Query it before answering anything that depends on earlier sessions and is not in MEMORY.md.
 
 ### Layer 1 — Curated memory (MEMORY.md)
