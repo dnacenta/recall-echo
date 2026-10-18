@@ -27,11 +27,9 @@ Open an [issue](https://github.com/dnacenta/recall-echo/issues). Use a clear tit
 ## Making changes
 
 1. Fork the repo
-2. Create a branch from `development` (see naming below)
+2. Create a branch from `main` (see naming below)
 3. Make your changes
-4. Open a PR targeting `development`
-
-`main` is protected. All changes go through `development` first.
+4. Open a PR targeting `main`
 
 ## Branch naming
 
@@ -49,7 +47,7 @@ Branches follow this pattern:
 | `docs`     | Documentation only                   | `docs/2-usage-examples`              |
 | `chore`    | Maintenance, deps, CI                | `chore/10-update-dependencies`       |
 
-If there's no issue yet, create one first so there's a number to reference.
+Issues are expected for features and bugs. Small docs or chore fixes can go straight to a PR.
 
 ## Commit messages
 
