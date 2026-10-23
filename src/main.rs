@@ -240,6 +240,10 @@ enum BenchCommands {
         /// More than one prints each run plus the median and the range.
         #[arg(long, default_value_t = 1)]
         repeat: usize,
+        /// Extraction pipeline. Overrides `[graph] pipeline`. Absent means v1
+        /// unless the memory directory's config says otherwise.
+        #[arg(long, value_parser = parse_pipeline)]
+        pipeline: Option<recall_echo::graph::PipelineVersion>,
     },
 }
 
@@ -350,6 +354,10 @@ enum GraphCommands {
         /// instead of inferring authorship from conversation turn roles
         #[arg(long)]
         external: bool,
+        /// Extraction pipeline. Overrides `[graph] pipeline`. Absent follows
+        /// the config key, which defaults to v1 (episodes only).
+        #[arg(long, value_parser = parse_pipeline)]
+        pipeline: Option<recall_echo::graph::PipelineVersion>,
     },
     /// Re-run schema migrations against the graph store
     ///
@@ -393,6 +401,10 @@ enum GraphCommands {
         /// Maximum tokens to spend, measured and estimated alike (0 = unlimited, default: 5000000)
         #[arg(long, default_value = "5000000")]
         max_tokens: u64,
+        /// Extraction pipeline. Overrides `[graph] pipeline`. Absent follows
+        /// the config key, which defaults to v1.
+        #[arg(long, value_parser = parse_pipeline)]
+        pipeline: Option<recall_echo::graph::PipelineVersion>,
     },
     /// Pipeline operations — sync, status, flow, stale detection
     Pipeline {
@@ -733,11 +745,16 @@ fn main() {
                                 )
                                 .await
                             }
-                            GraphCommands::Ingest { archive, external } => {
+                            GraphCommands::Ingest {
+                                archive,
+                                external,
+                                pipeline,
+                            } => {
                                 graph_cli::ingest(
                                     &memory_dir,
                                     &archive,
                                     external_provenance(external),
+                                    pipeline,
                                 )
                                 .await
                             }
@@ -757,16 +774,20 @@ fn main() {
                                 provider,
                                 delay_ms,
                                 max_tokens,
+                                pipeline,
                             } => {
                                 graph_cli::extract(
                                     &memory_dir,
-                                    log,
-                                    all,
-                                    dry_run,
-                                    model,
-                                    provider,
-                                    delay_ms,
-                                    max_tokens,
+                                    graph_cli::ExtractOptions {
+                                        log,
+                                        all,
+                                        dry_run,
+                                        model,
+                                        provider,
+                                        delay_ms,
+                                        max_tokens,
+                                        pipeline,
+                                    },
                                 )
                                 .await
                             }
@@ -934,6 +955,11 @@ fn resolve_pulse_root(explicit: Option<PathBuf>) -> PathBuf {
 
 /// The provenance override a `--external` flag asks for. Without the flag the
 /// class is inferred per chunk from conversation turn roles.
+fn parse_pipeline(raw: &str) -> Result<recall_echo::graph::PipelineVersion, String> {
+    recall_echo::graph::PipelineVersion::parse(raw)
+        .ok_or_else(|| format!("pipeline must be v1 or v2, not {raw}"))
+}
+
 fn external_provenance(external: bool) -> Option<recall_echo::graph::Provenance> {
     external.then_some(recall_echo::graph::Provenance::External)
 }
@@ -1028,7 +1054,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             provider,
             model,
             repeat,
-        } => run_writes(script, work_dir, provider, model, repeat),
+            pipeline,
+        } => run_writes(script, work_dir, provider, model, repeat, pipeline),
     }
 }
 
@@ -1039,6 +1066,7 @@ fn run_writes(
     provider: Option<String>,
     model: Option<String>,
     repeat: usize,
+    pipeline: Option<recall_echo::graph::PipelineVersion>,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1056,9 +1084,20 @@ fn run_writes(
         None => Scratch::Temporary(temporary_work_dir()?),
     };
     let root = scratch.path().to_path_buf();
+    let configured = recall_echo::config::load_from_dir(&root.join("memory"))
+        .graph
+        .and_then(|section| section.pipeline);
+    let pipeline = recall_echo::graph::PipelineVersion::resolve(pipeline, configured.as_deref())
+        .map_err(recall_echo::error::RecallError::Config)?;
     let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
     let json = if repeat == 1 {
-        let report = rt.block_on(grade_once(&script, &root, provider, model.as_deref()))?;
+        let report = rt.block_on(grade_once(
+            &script,
+            &root,
+            provider,
+            model.as_deref(),
+            pipeline,
+        ))?;
         serde_json::to_string_pretty(&report)?
     } else {
         let report = rt.block_on(grade_repeat(
@@ -1067,6 +1106,7 @@ fn run_writes(
             repeat,
             provider,
             model.as_deref(),
+            pipeline,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1080,6 +1120,7 @@ async fn grade_once(
     root: &std::path::Path,
     provider: Option<String>,
     model: Option<&str>,
+    pipeline: recall_echo::graph::PipelineVersion,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1088,9 +1129,9 @@ async fn grade_once(
             let memory_dir = root.join("memory");
             let (llm, _) =
                 recall_echo::llm_provider::create_provider(&memory_dir, Some(&name), model)?;
-            writes::run(script, root, Extractor::Live(llm.as_ref())).await
+            writes::run(script, root, Extractor::Live(llm.as_ref()), pipeline).await
         }
-        None => writes::run(script, root, Extractor::Scripted).await,
+        None => writes::run(script, root, Extractor::Scripted, pipeline).await,
     }
 }
 
@@ -1101,6 +1142,7 @@ async fn grade_repeat(
     repeat: usize,
     provider: Option<String>,
     model: Option<&str>,
+    pipeline: recall_echo::graph::PipelineVersion,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1109,9 +1151,16 @@ async fn grade_repeat(
             let memory_dir = root.join("memory");
             let (llm, _) =
                 recall_echo::llm_provider::create_provider(&memory_dir, Some(&name), model)?;
-            writes::run_repeat(script, root, repeat, Extractor::Live(llm.as_ref())).await
+            writes::run_repeat(
+                script,
+                root,
+                repeat,
+                Extractor::Live(llm.as_ref()),
+                pipeline,
+            )
+            .await
         }
-        None => writes::run_repeat(script, root, repeat, Extractor::Scripted).await,
+        None => writes::run_repeat(script, root, repeat, Extractor::Scripted, pipeline).await,
     }
 }
 

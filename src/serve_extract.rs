@@ -389,6 +389,7 @@ impl ExtractionWorker {
 pub struct GraphExtractionUnit {
     graph: Arc<GraphMemory>,
     llm: Box<dyn LlmProvider>,
+    memory_dir: PathBuf,
     conversations_dir: PathBuf,
     quarantine_path: PathBuf,
 }
@@ -398,12 +399,14 @@ impl GraphExtractionUnit {
     pub fn new(
         graph: Arc<GraphMemory>,
         llm: Box<dyn LlmProvider>,
+        memory_dir: PathBuf,
         conversations_dir: PathBuf,
         quarantine_path: PathBuf,
     ) -> Self {
         Self {
             graph,
             llm,
+            memory_dir,
             conversations_dir,
             quarantine_path,
         }
@@ -431,11 +434,18 @@ impl ExtractionUnit for GraphExtractionUnit {
         let content = std::fs::read_to_string(&path)?;
         let (session_id, _) = crate::graph_cli::extract_archive_metadata(&content, &path);
         let context = IngestContext::new(session_id, Some(log_number));
+        let pipeline = crate::graph::v2::pipeline_for_hook(&self.memory_dir);
 
-        let report = self
-            .graph
-            .extract_from_archive(&content, &context, self.llm.as_ref())
-            .await?;
+        let report = crate::graph::v2::extract_log(
+            &self.graph,
+            &self.memory_dir,
+            log_number,
+            &content,
+            &context,
+            self.llm.as_ref(),
+            pipeline,
+        )
+        .await?;
         // Decide before marking: a total failure is an Err and stays pending.
         let outcome = unit_outcome(report)?;
         self.graph.mark_extracted(log_number).await?;
@@ -578,6 +588,7 @@ pub fn spawn(setup: Setup) -> Option<tokio::task::JoinHandle<()>> {
     let unit: Arc<dyn ExtractionUnit> = Arc::new(GraphExtractionUnit::new(
         Arc::clone(&setup.graph),
         llm,
+        setup.memory_dir.clone(),
         conversations_dir,
         setup
             .memory_dir

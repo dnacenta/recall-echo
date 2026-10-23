@@ -11,7 +11,7 @@ use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport, EdgeCor
 use crate::graph::edge_view::EdgeView;
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::*;
-use crate::graph::{IngestContext, Provenance};
+use crate::graph::{IngestContext, PipelineVersion, Provenance};
 use crate::serve::{
     AddEntityArgs, CorrectArgs, IngestArchiveArgs, QueryArgs, RelateArgs, Request, SearchArgs,
     TraverseArgs,
@@ -413,16 +413,20 @@ pub async fn search(
     Ok(())
 }
 
-/// Ingest a single archive file into the graph (episodes only, no LLM extraction).
+/// Ingest a single archive file into the graph.
 ///
-/// `provenance` forces an authorship class on every episode of the run — how
-/// `--external` marks genuinely external material. `None` infers per chunk
-/// from conversation turn roles.
+/// Episodes are always written, with no model call. `pipeline` v2 then
+/// extracts the session; v1 leaves extraction to `graph extract` and the
+/// daemon, as before. `provenance` forces an authorship class on every
+/// episode of the run — how `--external` marks genuinely external material.
+/// `None` infers per chunk from conversation turn roles.
 pub async fn ingest(
     memory_dir: &Path,
     archive_path: &Path,
     provenance: Option<Provenance>,
+    pipeline: Option<PipelineVersion>,
 ) -> Result<(), RecallError> {
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -434,10 +438,11 @@ pub async fn ingest(
 
     // Extract session_id and log_number from frontmatter if available
     let (session_id, log_number) = extract_archive_metadata(&content, archive_path);
+    let v2_text = (pipeline == PipelineVersion::V2).then(|| content.clone());
 
     let request = Request::IngestArchive(IngestArchiveArgs {
         content,
-        session_id,
+        session_id: session_id.clone(),
         log_number,
         provenance,
     });
@@ -455,7 +460,77 @@ pub async fn ingest(
             println!("  {WARN}warning:{RESET} {err}");
         }
     }
+    if let Some(text) = v2_text {
+        extract_ingested_v2(memory_dir, &text, &session_id, log_number).await?;
+    }
     Ok(())
+}
+
+/// Run pipeline v2 on an archive whose episodes were just ingested.
+#[cfg(feature = "llm")]
+async fn extract_ingested_v2(
+    memory_dir: &Path,
+    text: &str,
+    session_id: &str,
+    log_number: Option<u32>,
+) -> Result<(), RecallError> {
+    let Some(log) = log_number else {
+        return Err(RecallError::Config(
+            "pipeline v2 needs a conversation-NNN archive so the session can be loaded".into(),
+        ));
+    };
+    let (llm, _) = crate::llm_provider::create_provider(memory_dir, None, None)?;
+    let memory = memory_dir.to_path_buf();
+    let text = text.to_string();
+    let session_id = session_id.to_string();
+    let report = serve_client::exclusive(memory_dir, |gm| async move {
+        let context = IngestContext::new(session_id, Some(log));
+        let report = crate::graph::v2::extract_log(
+            &gm,
+            &memory,
+            log,
+            &text,
+            &context,
+            llm.as_ref(),
+            PipelineVersion::V2,
+        )
+        .await?;
+        if !report.is_total_failure() {
+            gm.mark_extracted(log).await?;
+        }
+        Ok(report)
+    })
+    .await?;
+    if report.is_total_failure() {
+        let first = report
+            .errors
+            .first()
+            .map(String::as_str)
+            .unwrap_or("parse failure");
+        return Err(RecallError::Other(format!(
+            "pipeline v2 left log {log:03} pending: {first}"
+        )));
+    }
+    println!(
+        "  {GOOD}✓{RESET} pipeline v2: +{} entities, {} rels, {} slots",
+        report.entities_created, report.relationships_created, report.slots_written
+    );
+    for err in &report.errors {
+        println!("  {WARN}warning:{RESET} {err}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "llm"))]
+async fn extract_ingested_v2(
+    _memory_dir: &Path,
+    _text: &str,
+    _session_id: &str,
+    _log_number: Option<u32>,
+) -> Result<(), RecallError> {
+    Err(RecallError::Config(
+        "pipeline v2 extracts with an LLM provider, which this build does not include".into(),
+    ))
 }
 
 /// How an ingest run's provenance choice reads in its summary line.
@@ -795,19 +870,43 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// Arguments for [`extract`]. One value, so the pipeline flag does not become
+/// a ninth parameter.
+#[cfg(feature = "llm")]
+pub struct ExtractOptions {
+    /// One archive, by log number.
+    pub log: Option<u32>,
+    /// Every archive that has not been extracted.
+    pub all: bool,
+    /// List the archives and call nothing.
+    pub dry_run: bool,
+    /// Provider model override.
+    pub model: Option<String>,
+    /// Provider override.
+    pub provider: Option<String>,
+    /// Milliseconds to wait between archives.
+    pub delay_ms: u64,
+    /// Spend cap across the run. Zero means no cap.
+    pub max_tokens: u64,
+    /// Flag value. `None` reads `[graph] pipeline`, which defaults to v1.
+    pub pipeline: Option<PipelineVersion>,
+}
+
 /// Extract entities from already-ingested archives using an LLM.
 #[cfg(feature = "llm")]
-#[allow(clippy::too_many_arguments)]
-pub async fn extract(
-    memory_dir: &Path,
-    log: Option<u32>,
-    all: bool,
-    dry_run: bool,
-    model_override: Option<String>,
-    provider_override: Option<String>,
-    delay_ms: u64,
-    max_tokens: u64,
-) -> Result<(), RecallError> {
+pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), RecallError> {
+    let ExtractOptions {
+        log,
+        all,
+        dry_run,
+        model: model_override,
+        provider: provider_override,
+        delay_ms,
+        max_tokens,
+        pipeline,
+    } = options;
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
+    let memory = memory_dir.to_path_buf();
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -901,7 +1000,17 @@ pub async fn extract(
             let context = IngestContext::new(session_id, Some(*ln));
 
             // Try extraction, retry once on failure, quarantine on second failure
-            let report = match gm.extract_from_archive(&content, &context, &*llm).await {
+            let report = match crate::graph::v2::extract_log(
+                &gm,
+                &memory,
+                *ln,
+                &content,
+                &context,
+                &*llm,
+                pipeline,
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     println!(
@@ -909,7 +1018,17 @@ pub async fn extract(
                         idx + 1,
                         total_count
                     );
-                    match gm.extract_from_archive(&content, &context, &*llm).await {
+                    match crate::graph::v2::extract_log(
+                        &gm,
+                        &memory,
+                        *ln,
+                        &content,
+                        &context,
+                        &*llm,
+                        pipeline,
+                    )
+                    .await
+                    {
                         Ok(r) => r,
                         Err(e2) => {
                             println!(
@@ -971,8 +1090,13 @@ pub async fn extract(
                     if report.errors.len() == 1 { "" } else { "s" }
                 )
             };
+            let slots_label = if report.slots_written > 0 {
+                format!(", {} slots", report.slots_written)
+            } else {
+                String::new()
+            };
             println!(
-                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({}){warn_label}",
+                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels{slots_label} ({}){warn_label}",
                 idx + 1,
                 total_count,
                 report.entities_created,

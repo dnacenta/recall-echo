@@ -31,6 +31,8 @@ pub mod types;
 pub mod util;
 pub mod utility;
 pub(crate) mod v2;
+
+pub use v2::PipelineVersion;
 pub mod vigil_sync;
 
 use std::collections::HashMap;

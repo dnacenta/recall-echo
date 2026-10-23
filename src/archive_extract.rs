@@ -137,8 +137,9 @@ pub async fn extract_archive(
     let llm = handle.llm;
     let binary = handle.binary;
 
+    let memory = memory_dir.to_path_buf();
     crate::serve_client::exclusive(memory_dir, |graph| async move {
-        Ok(extract_into(&graph, llm.as_ref(), &archive, binary).await)
+        Ok(extract_into(&graph, &memory, llm.as_ref(), &archive, binary).await)
     })
     .await?
 }
@@ -169,6 +170,7 @@ impl ArchiveFile {
 /// only when the provider actually answered.
 pub(crate) async fn extract_into(
     graph: &GraphMemory,
+    memory_dir: &Path,
     llm: &dyn LlmProvider,
     archive: &ArchiveFile,
     binary: Option<PathBuf>,
@@ -183,10 +185,18 @@ pub(crate) async fn extract_into(
     }
 
     let context = IngestContext::new(archive.session_id.clone(), Some(log_number));
-    let report = graph
-        .extract_from_archive(&archive.content, &context, llm)
-        .await
-        .map_err(RecallError::from)?;
+    let pipeline = crate::graph::v2::pipeline_for_hook(memory_dir);
+    let report = crate::graph::v2::extract_log(
+        graph,
+        memory_dir,
+        log_number,
+        &archive.content,
+        &context,
+        llm,
+        pipeline,
+    )
+    .await
+    .map_err(RecallError::from)?;
     let extraction = classify(log_number, report, binary)?;
 
     graph
@@ -313,10 +323,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_extracted_archive_is_marked_and_reports_what_it_spent() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
         let binary = Some(PathBuf::from("/opt/grok"));
 
-        let outcome = extract_into(&graph, &EmptyModel, &archive(7), binary.clone())
+        let outcome = extract_into(&graph, tmp.path(), &EmptyModel, &archive(7), binary.clone())
             .await
             .unwrap();
 
@@ -334,15 +344,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_archive_with_nothing_pending_costs_nothing() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
         graph.mark_extracted(7).await.unwrap();
 
-        let outcome = extract_into(&graph, &NoModel, &archive(7), None)
+        let outcome = extract_into(&graph, tmp.path(), &NoModel, &archive(7), None)
             .await
             .unwrap();
         assert_eq!(outcome, ExtractOutcome::NothingPending);
 
-        let never_ingested = extract_into(&graph, &NoModel, &archive(8), None)
+        let never_ingested = extract_into(&graph, tmp.path(), &NoModel, &archive(8), None)
             .await
             .unwrap();
         assert_eq!(never_ingested, ExtractOutcome::NothingPending);
@@ -350,9 +360,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_provider_that_fails_every_chunk_leaves_the_archive_pending() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
 
-        let err = extract_into(&graph, &BrokenModel, &archive(7), None)
+        let err = extract_into(&graph, tmp.path(), &BrokenModel, &archive(7), None)
             .await
             .unwrap_err();
 
@@ -367,9 +377,9 @@ mod tests {
     /// says what the answers were rather than quoting them.
     #[tokio::test]
     async fn unusable_answers_are_billed_and_classified() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
 
-        let err = extract_into(&graph, &ProseModel, &archive(7), None)
+        let err = extract_into(&graph, tmp.path(), &ProseModel, &archive(7), None)
             .await
             .unwrap_err();
 
@@ -385,12 +395,12 @@ mod tests {
     /// named among the warnings.
     #[tokio::test]
     async fn a_recovered_chunk_is_extracted_with_a_warning() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
         let model = GlitchOnceModel {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let outcome = extract_into(&graph, &model, &archive(7), None)
+        let outcome = extract_into(&graph, tmp.path(), &model, &archive(7), None)
             .await
             .unwrap();
 

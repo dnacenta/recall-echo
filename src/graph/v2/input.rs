@@ -10,9 +10,8 @@
 //! back out of merged headings and tool output. An older archive has no
 //! sidecar; it is read from the markdown role blocks instead.
 //!
-//! `load_session` and `window` are that reader. This increment does not
-//! extract, so nothing else in the crate calls them yet.
-#![allow(dead_code)]
+//! `load_session` and `window` are that reader. The second pipeline reads
+//! them when it extracts. This module still only loads and renders.
 
 use std::fs;
 use std::path::{Component, Path};

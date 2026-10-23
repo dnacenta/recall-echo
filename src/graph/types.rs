@@ -758,6 +758,28 @@ pub struct IngestionReport {
     /// without a model call.
     #[serde(default)]
     pub dedup_fast_path: u32,
+    /// Windows the second pipeline sent to the provider.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub windows: u32,
+    /// Provider calls the second pipeline made, including a parse retry.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub llm_calls: u32,
+    /// Facts, bugs and releases the model returned, before the schema table.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub candidates: u32,
+    /// Candidates that survived the table and were handed to the writer.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub kept: u32,
+    /// Literal facts appended as slots. A reinforced slot is not counted again.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub slots_written: u32,
+    /// Candidates dropped, keyed by the reason.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub drops: HashMap<String, u32>,
+}
+
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl IngestionReport {
