@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use super::grade::{self, ExtractorLabel, ObservedEdge, SessionObservation, WriteReport};
 use super::script::{Claim, ClaimOp, FactScript, ScriptFact, ScriptSession, Side, Speaker};
@@ -31,6 +32,7 @@ const DURATION: &str = "session";
 const SOURCE: &str = "writes";
 
 /// Where the claims to ingest come from.
+#[derive(Clone, Copy)]
 pub enum Extractor<'a> {
     /// Replay the claims in the script. Makes no provider call.
     Scripted,
@@ -121,6 +123,175 @@ pub async fn run(
     Ok(report)
 }
 
+/// Grade `script` `repeat` times, each in a fresh `parent/run-<k>` directory.
+///
+/// `parent` must be missing or empty. Nothing is created when it is not.
+/// `k` starts at 1. One run still uses `run-1`; the command prints a single
+/// report itself when repeat is 1.
+pub async fn run_repeat(
+    script: &FactScript,
+    parent: &Path,
+    repeat: usize,
+    extractor: Extractor<'_>,
+) -> Result<RepeatReport, RecallError> {
+    if repeat == 0 {
+        return Err(RecallError::Config("repeat must be at least 1".to_string()));
+    }
+    require_scratch(parent)?;
+    if !parent.exists() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut runs = Vec::with_capacity(repeat);
+    for k in 1..=repeat {
+        let dir = parent.join(format!("run-{k}"));
+        fs::create_dir(&dir)?;
+        runs.push(run(script, &dir, extractor).await?);
+    }
+    Ok(RepeatReport::from_runs(runs))
+}
+
+/// N fresh runs, plus the median and the min/max of each graded count.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepeatReport {
+    pub runs: Vec<WriteReport>,
+    pub median: MetricSet,
+    pub range: MetricRange,
+}
+
+impl RepeatReport {
+    fn from_runs(runs: Vec<WriteReport>) -> Self {
+        let metrics: Vec<MetricSet> = runs.iter().map(MetricSet::from_report).collect();
+        let (median, range) = summarize(&metrics);
+        Self {
+            runs,
+            median,
+            range,
+        }
+    }
+}
+
+/// One run's pattern counts and its per-session call and time rates.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricSet {
+    pub found: f64,
+    pub complete: f64,
+    pub wrong: f64,
+    pub missing: f64,
+    pub retired: f64,
+    pub premature: f64,
+    pub noise_hits: f64,
+    pub unmatched: f64,
+    pub calls_per_session: f64,
+    pub ms_per_session: f64,
+}
+
+/// Min and max of one metric across the repeated runs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricSpan {
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Min and max of every [`MetricSet`] field.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricRange {
+    pub found: MetricSpan,
+    pub complete: MetricSpan,
+    pub wrong: MetricSpan,
+    pub missing: MetricSpan,
+    pub retired: MetricSpan,
+    pub premature: MetricSpan,
+    pub noise_hits: MetricSpan,
+    pub unmatched: MetricSpan,
+    pub calls_per_session: MetricSpan,
+    pub ms_per_session: MetricSpan,
+}
+
+impl MetricSet {
+    fn from_report(report: &WriteReport) -> Self {
+        let patterns = report.patterns.as_ref();
+        let count = |pick: fn(&super::grade::PatternScore) -> u32| {
+            patterns.map(|score| f64::from(pick(score))).unwrap_or(0.0)
+        };
+        let sessions = report.sessions.len();
+        let per_session = |total: u64| {
+            if sessions == 0 {
+                0.0
+            } else {
+                total as f64 / sessions as f64
+            }
+        };
+        Self {
+            found: count(|score| score.found.count),
+            complete: count(|score| score.complete.count),
+            wrong: count(|score| score.wrong.count),
+            missing: count(|score| score.missing.count),
+            retired: count(|score| score.retired.count),
+            premature: count(|score| score.premature.count),
+            noise_hits: count(|score| score.noise_hits.count),
+            unmatched: count(|score| score.unmatched.count),
+            calls_per_session: per_session(
+                report.sessions.iter().map(|session| session.calls).sum(),
+            ),
+            ms_per_session: per_session(report.sessions.iter().map(|session| session.millis).sum()),
+        }
+    }
+}
+
+fn summarize(metrics: &[MetricSet]) -> (MetricSet, MetricRange) {
+    (
+        MetricSet {
+            found: median(&column(metrics, |item| item.found)),
+            complete: median(&column(metrics, |item| item.complete)),
+            wrong: median(&column(metrics, |item| item.wrong)),
+            missing: median(&column(metrics, |item| item.missing)),
+            retired: median(&column(metrics, |item| item.retired)),
+            premature: median(&column(metrics, |item| item.premature)),
+            noise_hits: median(&column(metrics, |item| item.noise_hits)),
+            unmatched: median(&column(metrics, |item| item.unmatched)),
+            calls_per_session: median(&column(metrics, |item| item.calls_per_session)),
+            ms_per_session: median(&column(metrics, |item| item.ms_per_session)),
+        },
+        MetricRange {
+            found: span(&column(metrics, |item| item.found)),
+            complete: span(&column(metrics, |item| item.complete)),
+            wrong: span(&column(metrics, |item| item.wrong)),
+            missing: span(&column(metrics, |item| item.missing)),
+            retired: span(&column(metrics, |item| item.retired)),
+            premature: span(&column(metrics, |item| item.premature)),
+            noise_hits: span(&column(metrics, |item| item.noise_hits)),
+            unmatched: span(&column(metrics, |item| item.unmatched)),
+            calls_per_session: span(&column(metrics, |item| item.calls_per_session)),
+            ms_per_session: span(&column(metrics, |item| item.ms_per_session)),
+        },
+    )
+}
+
+fn column(metrics: &[MetricSet], pick: impl Fn(&MetricSet) -> f64) -> Vec<f64> {
+    metrics.iter().map(pick).collect()
+}
+
+/// Median. An even count averages the two central values.
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+}
+
+fn span(values: &[f64]) -> MetricSpan {
+    let min = values.iter().copied().reduce(f64::min).unwrap_or(0.0);
+    let max = values.iter().copied().reduce(f64::max).unwrap_or(0.0);
+    MetricSpan { min, max }
+}
+
 /// Whether keyword search returns an archive that contains `answer`.
 pub(crate) fn keyword_hit(
     memory_dir: &Path,
@@ -171,7 +342,7 @@ fn write_session(
 ) -> Result<WrittenArchive, RecallError> {
     let conversations = memory_dir.join("conversations");
     let log_number = highest_conversation_number(&conversations) + 1;
-    let conversation = to_conversation(session);
+    let conversation = load_conversation(session)?;
     let message_count = conversation.total_messages();
     let topics = vec![script.name.clone(), session.id.clone()];
     let frontmatter = Frontmatter {
@@ -219,6 +390,25 @@ fn write_session(
         log_number,
         path,
     })
+}
+
+fn load_conversation(session: &ScriptSession) -> Result<Conversation, RecallError> {
+    let Some(path) = &session.transcript_path else {
+        if session.transcript.is_some() {
+            return Err(RecallError::Config(format!(
+                "session '{}' transcript was not resolved; load the script from its file",
+                session.id
+            )));
+        }
+        return Ok(to_conversation(session));
+    };
+    let path = path.to_str().ok_or_else(|| {
+        RecallError::Config(format!(
+            "session '{}' transcript path is not utf-8",
+            session.id
+        ))
+    })?;
+    crate::jsonl::parse_transcript(path, &session.id)
 }
 
 fn to_conversation(session: &ScriptSession) -> Conversation {
@@ -382,6 +572,21 @@ impl ScriptedExtractor {
     fn new(script: &FactScript) -> Result<Self, RecallError> {
         let mut prepared = Vec::new();
         for session in &script.sessions {
+            if session.transcript.is_some() {
+                for claim in &session.claims {
+                    let needle = claim.quote.clone().ok_or_else(|| {
+                        RecallError::Config(format!(
+                            "claim '{}' in session '{}' has no quote",
+                            claim.fact, session.id
+                        ))
+                    })?;
+                    prepared.push(Prepared {
+                        needle,
+                        body: extraction_for(script, claim)?,
+                    });
+                }
+                continue;
+            }
             for turn in &session.turns {
                 if turn.claims.is_empty() {
                     continue;
@@ -694,6 +899,146 @@ mod tests {
         assert!(report.questions[0].keyword_hit);
         assert!(report.questions[1].graph_hit);
         assert!(report.questions[1].keyword_hit);
+        assert!(report.patterns.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeat_refuses_a_non_empty_work_dir_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("keep"), "real").unwrap();
+        let err = run_repeat(&history(), tmp.path(), 3, Extractor::Scripted)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&tmp.path().display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("not empty"), "{message}");
+        assert!(!tmp.path().join("run-1").exists());
+        assert!(!tmp.path().join("memory").exists());
+        assert_eq!(fs::read_to_string(tmp.path().join("keep")).unwrap(), "real");
+
+        let err = run_repeat(&history(), tmp.path(), 0, Extractor::Scripted)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+        assert!(!tmp.path().join("run-1").exists());
+    }
+
+    #[test]
+    fn repeat_median_and_range_on_fixed_numbers() {
+        let odd = [
+            fixed_metric(1.0, 10.0, 100.0, 4.0),
+            fixed_metric(3.0, 30.0, 300.0, 8.0),
+            fixed_metric(2.0, 20.0, 50.0, 6.0),
+        ];
+        let (mid, range) = summarize(&odd);
+        assert_eq!(mid.found, 2.0);
+        assert_eq!(mid.complete, 20.0);
+        assert_eq!(mid.calls_per_session, 100.0);
+        assert_eq!(mid.ms_per_session, 6.0);
+        assert_eq!(range.found.min, 1.0);
+        assert_eq!(range.found.max, 3.0);
+        assert_eq!(range.calls_per_session.min, 50.0);
+        assert_eq!(range.calls_per_session.max, 300.0);
+
+        let even = [
+            fixed_metric(0.0, 0.0, 10.0, 5.0),
+            fixed_metric(0.0, 0.0, 20.0, 9.0),
+        ];
+        let (mid, range) = summarize(&even);
+        assert_eq!(mid.calls_per_session, 15.0);
+        assert_eq!(mid.ms_per_session, 7.0);
+        assert_eq!(range.ms_per_session.min, 5.0);
+        assert_eq!(range.ms_per_session.max, 9.0);
+        assert_eq!(median(&[]), 0.0);
+    }
+
+    fn fixed_metric(found: f64, complete: f64, calls: f64, millis: f64) -> MetricSet {
+        MetricSet {
+            found,
+            complete,
+            wrong: 0.0,
+            missing: 0.0,
+            retired: 0.0,
+            premature: 0.0,
+            noise_hits: 0.0,
+            unmatched: 0.0,
+            calls_per_session: calls,
+            ms_per_session: millis,
+        }
+    }
+
+    // Pre-redesign baseline for the linkshelf fixture under the scripted
+    // extractor. Supersede does not retire the old edge, and reject still
+    // stores the fact, so the six superseded facts and F42 stay live.
+    // Pattern grading still finds all 46 facts; F01 is the incomplete one
+    // because its object does not carry the uv detail. Later pipeline work
+    // updates these counts on purpose.
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn linkshelf_scripted_v1_baseline() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/linkshelf/script.toml");
+        let script = crate::bench::writes::load_script(&path).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let report = run(&script, tmp.path(), Extractor::Scripted).await.unwrap();
+
+        assert_eq!(report.extractor, ExtractorLabel::Scripted);
+        assert_eq!(
+            report.steps.len(),
+            script
+                .sessions
+                .iter()
+                .map(|session| session.claims.len())
+                .sum::<usize>()
+        );
+        assert_eq!(report.sessions.len(), 14);
+        assert_eq!(report.operations.create, counted(39, 1, 0));
+        assert_eq!(report.operations.corroborate, counted(0, 0, 0));
+        assert_eq!(report.operations.supersede, counted(0, 0, 6));
+        assert_eq!(report.operations.contradict, counted(0, 0, 0));
+        assert_eq!(report.operations.no_op, counted(0, 0, 1));
+        assert_eq!(report.operations.removed, counted(0, 0, 0));
+        assert_eq!(report.operations.revived, counted(0, 0, 0));
+        assert!(report.junk_edges.is_empty());
+        assert_eq!(
+            report
+                .wrong_facts
+                .iter()
+                .map(|wrong| (wrong.fact.as_str(), wrong.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                ("F04", grade::WrongReason::StillLive),
+                ("F05", grade::WrongReason::StillLive),
+                ("F09", grade::WrongReason::StillLive),
+                ("F10", grade::WrongReason::StillLive),
+                ("F26", grade::WrongReason::StillLive),
+                ("F27", grade::WrongReason::StillLive),
+                ("F42", grade::WrongReason::StillLive),
+            ]
+        );
+        let patterns = report.patterns.expect("pattern section");
+        assert_eq!(patterns.facts, 46);
+        assert_eq!(patterns.pairs, 6);
+        assert_eq!(patterns.noise, 7);
+        assert_eq!(patterns.found.count, 46);
+        assert_eq!(patterns.complete.count, 45);
+        assert!(!patterns.complete.ids.iter().any(|id| id == "F01"));
+        assert_eq!(
+            patterns.wrong.ids,
+            ["F04", "F05", "F09", "F10", "F26", "F27"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(patterns.missing.count, 0);
+        assert_eq!(patterns.retired.count, 0);
+        assert_eq!(patterns.premature.count, 0);
+        assert_eq!(patterns.noise_hits.count, 0);
+        assert_eq!(patterns.unmatched.count, 0);
+        assert!(patterns.wrong.ids.iter().all(|id| id != "F42"));
     }
 
     #[cfg(feature = "embedded")]

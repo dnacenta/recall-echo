@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use super::script::{
-    Claim, ClaimOp, EndProvenance, FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker,
+    compile_pattern, Claim, ClaimOp, EndProvenance, EndState, FactScript, ScriptFact,
+    ScriptSession, ScriptTurn, Speaker,
 };
 use crate::error::RecallError;
 use crate::graph::ProvenanceWeights;
@@ -160,6 +161,39 @@ pub struct WriteReport {
     pub millis: u64,
     /// Time to open the embedder before the first session is timed.
     pub setup_millis: u64,
+    /// Pattern score. Absent when no fact carries a match block, so a turn
+    /// script's report keeps its previous shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patterns: Option<PatternScore>,
+}
+
+/// How many facts, pairs and noise items landed in each pattern bucket.
+///
+/// Counts are the bucket sizes. `ids` names the facts, pairs (`old->new`),
+/// noise items, or unmatched record lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PatternScore {
+    pub facts: u32,
+    pub pairs: u32,
+    pub noise: u32,
+    pub found: PatternBucket,
+    pub complete: PatternBucket,
+    pub wrong: PatternBucket,
+    pub missing: PatternBucket,
+    /// Superseded pairs whose old fact was retired in `retire_in` or later.
+    pub retired: PatternBucket,
+    /// Superseded pairs whose old fact was retired before `retire_in`.
+    pub premature: PatternBucket,
+    pub noise_hits: PatternBucket,
+    /// Live records that match no fact's core patterns. A proxy for junk.
+    pub unmatched: PatternBucket,
+}
+
+/// One pattern bucket: a count and the ids in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PatternBucket {
+    pub count: u32,
+    pub ids: Vec<String>,
 }
 
 type EdgeKey = (String, String, String);
@@ -366,6 +400,7 @@ pub fn grade(
         calls: sessions.iter().map(|s| s.calls).sum(),
         millis: sessions.iter().map(|s| s.millis).sum(),
         setup_millis: 0,
+        patterns: score_patterns(script, sessions)?,
     })
 }
 
@@ -420,8 +455,15 @@ fn grade_session(
         };
         for turn in &session.turns {
             for claim in &turn.claims {
-                score_claim(&mut ctx, turn, claim)?;
+                let speaker = claim.by.unwrap_or(turn.role);
+                score_claim(&mut ctx, speaker, claim)?;
             }
+        }
+        for claim in &session.claims {
+            // A transcript claim has no turn. `by` overrides; otherwise the
+            // claim is graded as user evidence.
+            let speaker = claim.by.unwrap_or(Speaker::User);
+            score_claim(&mut ctx, speaker, claim)?;
         }
         score_noise(&mut ctx);
     }
@@ -433,12 +475,12 @@ fn grade_session(
     Ok(())
 }
 
-fn score_claim(ctx: &mut Score<'_>, turn: &ScriptTurn, claim: &Claim) -> Result<(), RecallError> {
+fn score_claim(ctx: &mut Score<'_>, speaker: Speaker, claim: &Claim) -> Result<(), RecallError> {
     match claim.op {
         ClaimOp::Create => score_create(ctx, claim),
-        ClaimOp::Corroborate => score_corroborate(ctx, turn, claim),
+        ClaimOp::Corroborate => score_corroborate(ctx, speaker, claim),
         ClaimOp::Supersede => score_supersede(ctx, claim),
-        ClaimOp::Contradict => score_contradict(ctx, turn, claim),
+        ClaimOp::Contradict => score_contradict(ctx, speaker, claim),
         ClaimOp::Reject => score_reject(ctx, claim),
     }
 }
@@ -461,11 +503,10 @@ fn score_create(ctx: &mut Score<'_>, claim: &Claim) -> Result<(), RecallError> {
 
 fn score_corroborate(
     ctx: &mut Score<'_>,
-    turn: &ScriptTurn,
+    speaker: Speaker,
     claim: &Claim,
 ) -> Result<(), RecallError> {
     let key = fact_key(ctx.script.fact(&claim.fact)?);
-    let speaker = claim.by.unwrap_or(turn.role);
     let weights = ctx.weights;
     let matched = take(ctx.unused, |effect| match effect {
         Effect::Corroborated {
@@ -526,11 +567,10 @@ fn score_supersede(ctx: &mut Score<'_>, claim: &Claim) -> Result<(), RecallError
 
 fn score_contradict(
     ctx: &mut Score<'_>,
-    turn: &ScriptTurn,
+    speaker: Speaker,
     claim: &Claim,
 ) -> Result<(), RecallError> {
     let key = fact_key(ctx.script.fact(&claim.fact)?);
-    let speaker = claim.by.unwrap_or(turn.role);
     let weight = speaker_weight(speaker, ctx.weights);
     let matched = take(ctx.unused, |effect| match effect {
         Effect::Contradicted {
@@ -831,11 +871,231 @@ fn ratio(numerator: u32, denominator: u32) -> Option<f64> {
     (denominator > 0).then(|| f64::from(numerator) / f64::from(denominator))
 }
 
+/// Pattern score for `script`, or `None` when no fact has a match block.
+///
+/// Records are `subject | relation | object`. Live and retired records are
+/// both visible to `found`; stale and noise checks use live records only.
+/// A rejected fact is found or missing: there is no rejection rule yet.
+fn score_patterns(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+) -> Result<Option<PatternScore>, RecallError> {
+    if script.facts.iter().all(|fact| fact.pattern.is_none()) {
+        return Ok(None);
+    }
+    let final_edges = sessions
+        .last()
+        .map(|session| session.after.as_slice())
+        .unwrap_or(&[]);
+    let mut found = Vec::new();
+    let mut complete = Vec::new();
+    let mut wrong = Vec::new();
+    let mut missing = Vec::new();
+    let mut compiled = Vec::new();
+    for fact in &script.facts {
+        let Some(pattern) = &fact.pattern else {
+            continue;
+        };
+        let core = compile_all(&pattern.core_all)?;
+        let detail = compile_all(&pattern.detail_all)?;
+        let wrong_any = compile_all(&pattern.wrong_any)?;
+        let hits: Vec<&ObservedEdge> = final_edges
+            .iter()
+            .filter(|edge| matches_all(&core, &record_line(edge)))
+            .collect();
+        if hits.is_empty() {
+            missing.push(fact.id.clone());
+        } else {
+            found.push(fact.id.clone());
+            if hits
+                .iter()
+                .any(|edge| matches_all(&detail, &record_line(edge)))
+            {
+                complete.push(fact.id.clone());
+            }
+        }
+        if fact_is_wrong(fact, &hits, final_edges, &core, &wrong_any) {
+            wrong.push(fact.id.clone());
+        }
+        compiled.push(core);
+    }
+
+    let mut retired = Vec::new();
+    let mut premature = Vec::new();
+    for pair in &script.superseded_pairs {
+        let old = script.fact(&pair.old)?;
+        let Some(pattern) = &old.pattern else {
+            continue;
+        };
+        let core = compile_all(&pattern.core_all)?;
+        let Some(when) = retirement_index(script, sessions, &core)? else {
+            continue;
+        };
+        let at = session_index(script, &pair.retire_in)?;
+        let label = format!("{}->{}", pair.old, pair.new);
+        if when < at {
+            premature.push(label);
+        } else {
+            retired.push(label);
+        }
+    }
+
+    let live_lines: Vec<String> = final_edges
+        .iter()
+        .filter(|edge| edge.live)
+        .map(record_line)
+        .collect();
+    let mut noise_hits = Vec::new();
+    for item in &script.noise {
+        let patterns = compile_all(&item.match_any)?;
+        if live_lines.iter().any(|line| matches_any(&patterns, line)) {
+            noise_hits.push(item.id.clone());
+        }
+    }
+    let unmatched = live_lines
+        .into_iter()
+        .filter(|line| !compiled.iter().any(|core| matches_all(core, line)))
+        .collect();
+
+    Ok(Some(PatternScore {
+        facts: count_of(
+            script
+                .facts
+                .iter()
+                .filter(|fact| fact.pattern.is_some())
+                .count(),
+        ),
+        pairs: count_of(script.superseded_pairs.len()),
+        noise: count_of(script.noise.len()),
+        found: bucket(found),
+        complete: bucket(complete),
+        wrong: bucket(wrong),
+        missing: bucket(missing),
+        retired: bucket(retired),
+        premature: bucket(premature),
+        noise_hits: bucket(noise_hits),
+        unmatched: bucket(unmatched),
+    }))
+}
+
+fn fact_is_wrong(
+    fact: &ScriptFact,
+    hits: &[&ObservedEdge],
+    edges: &[ObservedEdge],
+    core: &[regex::Regex],
+    wrong_any: &[regex::Regex],
+) -> bool {
+    match fact.end_state {
+        // A live fact is wrong when one of its own live records matches a
+        // wrong pattern. Another fact's record does not count.
+        EndState::Live => hits
+            .iter()
+            .any(|edge| edge.live && matches_any(wrong_any, &record_line(edge))),
+        // Strict stale rule: a superseded fact is still wrong while a live
+        // record matches its core.
+        EndState::Superseded => edges
+            .iter()
+            .any(|edge| edge.live && matches_all(core, &record_line(edge))),
+        EndState::Rejected => false,
+    }
+}
+
+/// Session index at which the old fact's live records disappear for good.
+///
+/// `None` when a live record still asserts it at the end, or it was never live.
+fn retirement_index(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+    core: &[regex::Regex],
+) -> Result<Option<usize>, RecallError> {
+    let mut seen_live = false;
+    let mut cleared: Option<usize> = None;
+    for (index, session) in script.sessions.iter().enumerate() {
+        let observed = sessions
+            .iter()
+            .find(|item| item.id == session.id)
+            .ok_or_else(|| {
+                RecallError::Config(format!("missing observation for session '{}'", session.id))
+            })?;
+        let before_live = any_live(&observed.before, core);
+        let after_live = any_live(&observed.after, core);
+        if after_live {
+            seen_live = true;
+            cleared = None;
+            continue;
+        }
+        if before_live || (!seen_live && newly_retired(observed, core)) {
+            seen_live = true;
+            cleared = Some(index);
+        }
+    }
+    Ok(cleared)
+}
+
+fn newly_retired(observed: &SessionObservation, core: &[regex::Regex]) -> bool {
+    let before: HashSet<&str> = observed
+        .before
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect();
+    observed.after.iter().any(|edge| {
+        !edge.live && !before.contains(edge.id.as_str()) && matches_all(core, &record_line(edge))
+    })
+}
+
+fn any_live(edges: &[ObservedEdge], core: &[regex::Regex]) -> bool {
+    edges
+        .iter()
+        .any(|edge| edge.live && matches_all(core, &record_line(edge)))
+}
+
+fn session_index(script: &FactScript, id: &str) -> Result<usize, RecallError> {
+    script
+        .sessions
+        .iter()
+        .position(|session| session.id == id)
+        .ok_or_else(|| RecallError::Config(format!("unknown session '{id}'")))
+}
+
+fn record_line(edge: &ObservedEdge) -> String {
+    format!("{} | {} | {}", edge.subject, edge.relation, edge.object)
+}
+
+fn matches_all(patterns: &[regex::Regex], line: &str) -> bool {
+    patterns.iter().all(|pattern| pattern.is_match(line))
+}
+
+fn matches_any(patterns: &[regex::Regex], line: &str) -> bool {
+    patterns.iter().any(|pattern| pattern.is_match(line))
+}
+
+fn compile_all(sources: &[String]) -> Result<Vec<regex::Regex>, RecallError> {
+    sources
+        .iter()
+        .map(|source| {
+            compile_pattern(source)
+                .map_err(|err| RecallError::Config(format!("regex '{source}': {err}")))
+        })
+        .collect()
+}
+
+fn bucket(mut ids: Vec<String>) -> PatternBucket {
+    ids.sort();
+    PatternBucket {
+        count: count_of(ids.len()),
+        ids,
+    }
+}
+
+fn count_of(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::script::{
-        Claim, ClaimOp, DerivedQuestion, EndProvenance, ExpectedFact, FactScript, ScriptFact,
-        ScriptSession, ScriptTurn, Speaker,
+        Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState, ExpectedFact, FactPattern,
+        FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker,
     };
     use super::*;
 
@@ -853,6 +1113,9 @@ mod tests {
             object_type: "concept".to_string(),
             subject_abstract: None,
             object_abstract: None,
+            end_state: EndState::Live,
+            superseded_in: None,
+            pattern: None,
         }
     }
 
@@ -871,6 +1134,7 @@ mod tests {
             fact: fact_id.to_string(),
             replacement: replacement.map(str::to_string),
             by: None,
+            quote: None,
         }
     }
 
@@ -879,6 +1143,9 @@ mod tests {
             id: id.to_string(),
             date: "2026-01-01T00:00:00Z".to_string(),
             turns: vec![turn],
+            transcript: None,
+            transcript_path: None,
+            claims: Vec::new(),
         }
     }
 
@@ -916,6 +1183,8 @@ mod tests {
     fn history() -> FactScript {
         FactScript {
             name: "host".to_string(),
+            project: None,
+            cwd: None,
             sessions: vec![
                 session(
                     "s1",
@@ -995,6 +1264,8 @@ mod tests {
                 needs: vec!["oak".into()],
                 absent: vec!["host".into()],
             }],
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
         }
     }
 
@@ -1057,6 +1328,9 @@ mod tests {
         assert!(report.steps.iter().all(|step| step.matched));
         assert!(report.questions[0].graph_hit);
         assert!(report.questions[0].keyword_hit);
+        assert!(report.patterns.is_none());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("patterns"), "{json}");
     }
 
     #[test]
@@ -1151,6 +1425,10 @@ mod tests {
                 self_reinforcements: Some(0),
             }],
             questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
         };
         let created = edge("pine", "pine", true, 9.0, 1.0, 0);
         let restated = edge("pine", "pine", true, 9.0 + weights().weight_self, 1.0, 1);
@@ -1205,6 +1483,10 @@ mod tests {
                 self_reinforcements: Some(1),
             }],
             questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
         };
         let created = edge("pine", "pine", true, 9.0, 1.0, 0);
         let restated = edge("pine", "pine", true, 9.0 + weights().weight_self, 1.0, 1);
@@ -1245,6 +1527,10 @@ mod tests {
                 self_reinforcements: None,
             }],
             questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
         };
         let before = edge("pine", "pine", true, 9.0, 1.0, 0);
         let after = edge(
@@ -1284,6 +1570,10 @@ mod tests {
                 self_reinforcements: None,
             }],
             questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
         };
         let dead = edge("pine", "pine", false, 9.0, 1.0, 0);
         let live = edge("pine", "pine", true, 9.0, 1.0, 0);
@@ -1325,6 +1615,10 @@ mod tests {
                 self_reinforcements: Some(1),
             }],
             questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
         };
         let only_self = edge("pine", "pine", true, 9.0 + weights().weight_self, 1.0, 1);
         let report = grade(
@@ -1363,6 +1657,204 @@ mod tests {
     fn a_session_count_mismatch_is_rejected() {
         let err = grade(&history(), &[], &weights(), &[], ExtractorLabel::Scripted).unwrap_err();
         assert!(err.to_string().contains("session observations"), "{err}");
+    }
+
+    #[test]
+    fn pattern_scorer_counts_found_complete_wrong_stale_premature_noise() {
+        let script = pattern_script();
+        let report = grade(
+            &script,
+            &pattern_observations(),
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        let patterns = report.patterns.expect("pattern section");
+        assert_eq!(patterns.facts, 8);
+        assert_eq!(patterns.pairs, 3);
+        assert_eq!(patterns.noise, 2);
+        assert_eq!(
+            patterns.found.ids,
+            ids(&["alpha", "beta", "delta", "epsilon", "gamma", "rho", "zeta"])
+        );
+        assert_eq!(patterns.found.count, 7);
+        assert_eq!(
+            patterns.complete.ids,
+            ids(&["alpha", "delta", "epsilon", "gamma", "rho", "zeta"])
+        );
+        // gamma matches wrong_any; epsilon is superseded and still live.
+        assert_eq!(patterns.wrong.ids, ids(&["epsilon", "gamma"]));
+        assert_eq!(patterns.missing.ids, ids(&["absent"]));
+        assert_eq!(patterns.retired.ids, ids(&["delta->delta2"]));
+        assert_eq!(patterns.premature.ids, ids(&["zeta->zeta2"]));
+        assert_eq!(patterns.noise_hits.ids, ids(&["N1"]));
+        assert_eq!(
+            patterns.unmatched.ids,
+            ids(&["deploy | setting | leftover"])
+        );
+        // Rejected rho is found, not wrong.
+        assert!(!patterns.wrong.ids.iter().any(|id| id == "rho"));
+    }
+
+    fn pattern_script() -> FactScript {
+        FactScript {
+            name: "patterns".into(),
+            project: None,
+            cwd: None,
+            sessions: vec![
+                session("s1", turn(Speaker::User, "s1", vec![], false)),
+                session("s2", turn(Speaker::User, "s2", vec![], false)),
+            ],
+            facts: vec![
+                patterned(
+                    "alpha",
+                    "alpha detail",
+                    EndState::Live,
+                    None,
+                    &["alpha"],
+                    &["detail"],
+                    &[],
+                ),
+                patterned(
+                    "beta",
+                    "beta",
+                    EndState::Live,
+                    None,
+                    &["beta"],
+                    &["extra"],
+                    &[],
+                ),
+                patterned(
+                    "gamma",
+                    "gamma evil",
+                    EndState::Live,
+                    None,
+                    &["gamma"],
+                    &[],
+                    &["evil"],
+                ),
+                patterned(
+                    "delta",
+                    "delta",
+                    EndState::Superseded,
+                    Some("s2"),
+                    &["delta"],
+                    &[],
+                    &[],
+                ),
+                patterned(
+                    "epsilon",
+                    "epsilon",
+                    EndState::Superseded,
+                    Some("s2"),
+                    &["epsilon"],
+                    &[],
+                    &[],
+                ),
+                patterned(
+                    "zeta",
+                    "zeta",
+                    EndState::Superseded,
+                    Some("s2"),
+                    &["zeta"],
+                    &[],
+                    &[],
+                ),
+                patterned("rho", "rho", EndState::Rejected, None, &["rho"], &[], &[]),
+                patterned(
+                    "absent",
+                    "absent",
+                    EndState::Live,
+                    None,
+                    &["absent"],
+                    &[],
+                    &[],
+                ),
+                fact("delta2", "next"),
+                fact("epsilon2", "next"),
+                fact("zeta2", "next"),
+            ],
+            expect: vec![],
+            questions: vec![],
+            superseded_pairs: vec![
+                super::super::script::SupersededPair {
+                    old: "delta".into(),
+                    new: "delta2".into(),
+                    retire_in: "s2".into(),
+                },
+                super::super::script::SupersededPair {
+                    old: "epsilon".into(),
+                    new: "epsilon2".into(),
+                    retire_in: "s2".into(),
+                },
+                super::super::script::SupersededPair {
+                    old: "zeta".into(),
+                    new: "zeta2".into(),
+                    retire_in: "s2".into(),
+                },
+            ],
+            noise: vec![
+                super::super::script::NoiseItem {
+                    id: "N1".into(),
+                    session: "s1".into(),
+                    match_any: vec!["alpha".into()],
+                },
+                super::super::script::NoiseItem {
+                    id: "N2".into(),
+                    session: "s2".into(),
+                    match_any: vec!["zzz".into()],
+                },
+            ],
+        }
+    }
+
+    fn patterned(
+        id: &str,
+        object: &str,
+        end_state: EndState,
+        superseded_in: Option<&str>,
+        core: &[&str],
+        detail: &[&str],
+        wrong: &[&str],
+    ) -> ScriptFact {
+        let mut fact = fact(id, object);
+        fact.end_state = end_state;
+        fact.superseded_in = superseded_in.map(str::to_string);
+        fact.pattern = Some(FactPattern {
+            core_all: core.iter().map(|item| (*item).to_string()).collect(),
+            detail_all: detail.iter().map(|item| (*item).to_string()).collect(),
+            wrong_any: wrong.iter().map(|item| (*item).to_string()).collect(),
+        });
+        fact
+    }
+
+    fn pattern_observations() -> Vec<SessionObservation> {
+        let zeta_live = edge("zeta", "zeta", true, 9.0, 1.0, 0);
+        let after_s1 = vec![
+            edge("alpha", "alpha detail", true, 9.0, 1.0, 0),
+            edge("beta", "beta", true, 9.0, 1.0, 0),
+            edge("gamma", "gamma evil", true, 9.0, 1.0, 0),
+            edge("delta", "delta", true, 9.0, 1.0, 0),
+            edge("epsilon", "epsilon", true, 9.0, 1.0, 0),
+            edge("zeta", "zeta", false, 9.0, 1.0, 0),
+            edge("rho", "rho", true, 9.0, 1.0, 0),
+            edge("left", "leftover", true, 9.0, 1.0, 0),
+        ];
+        let mut after_s2 = after_s1.clone();
+        after_s2
+            .iter_mut()
+            .find(|item| item.id == "delta")
+            .expect("delta")
+            .live = false;
+        vec![
+            obs("s1", vec![zeta_live], after_s1.clone()),
+            obs("s2", after_s1, after_s2),
+        ]
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
 
     fn full(n: u32) -> OpScore {

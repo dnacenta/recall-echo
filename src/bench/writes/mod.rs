@@ -20,11 +20,15 @@ mod run;
 mod script;
 
 pub use grade::{
-    grade, ExtractorLabel, JunkEdge, ObservedEdge, OpScore, OpTable, QuestionScore,
-    SessionObservation, SessionReport, StepLog, WriteOp, WriteReport, WrongFact, WrongReason,
+    grade, ExtractorLabel, JunkEdge, ObservedEdge, OpScore, OpTable, PatternBucket, PatternScore,
+    QuestionScore, SessionObservation, SessionReport, StepLog, WriteOp, WriteReport, WrongFact,
+    WrongReason,
 };
-pub use run::{require_scratch, run, Extractor};
+pub use run::{
+    require_scratch, run, run_repeat, Extractor, MetricRange, MetricSet, MetricSpan, RepeatReport,
+};
 pub use script::{
-    load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, ExpectedFact,
-    FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker,
+    load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState,
+    ExpectedFact, FactPattern, FactScript, NoiseItem, ScriptFact, ScriptSession, ScriptTurn,
+    Speaker, SupersededPair,
 };
