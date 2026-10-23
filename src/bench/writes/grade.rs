@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use super::script::{
     compile_pattern, Claim, ClaimOp, EndProvenance, EndState, FactScript, ScriptFact,
-    ScriptSession, ScriptTurn, Speaker,
+    ScriptSession, ScriptTurn, Speaker, SupersededPair,
 };
 use crate::error::RecallError;
 use crate::graph::ProvenanceWeights;
@@ -194,7 +194,8 @@ pub struct PatternScore {
     /// Rejected facts. `absent` matched no live record and is neither found
     /// nor missing. `live` matched a live record and is also in `wrong`.
     pub rejected: RejectedScore,
-    /// Core matches the one-to-one pass left unassigned. Debugging only.
+    /// Core matches of live and superseded facts that neither pass assigned.
+    /// A rejected fact's match is not listed here. Debugging only.
     pub shared: PatternBucket,
 }
 
@@ -219,7 +220,9 @@ pub struct PatternWrongBucket {
 pub enum PatternWrongReason {
     /// A live fact's core match also matches one of its `wrong_any` patterns.
     WrongAny,
-    /// A superseded fact still has a live core match.
+    /// A superseded fact has a live core match. A record assigned to its
+    /// successor is excused only when it matches strictly more of the
+    /// successor's patterns (core and detail) than of the old fact's.
     StillLive,
     /// A rejected fact's core matches a live record.
     RejectedLive,
@@ -909,8 +912,14 @@ fn ratio(numerator: u32, denominator: u32) -> Option<f64> {
 ///
 /// Records are `subject | relation | object`. Live and retired records are
 /// both visible to `found`; stale and noise checks use live records only.
-/// A record is credited to one fact. A rejected fact is never found: a live
-/// core match is `rejected_live`, and anything else is correct-absent.
+/// Live facts are assigned first, one record each. A rejected fact never
+/// takes a record: a live core match is `rejected_live`, and anything else
+/// is correct-absent. A superseded fact may take only a record no live fact
+/// claimed. A live record counts as `still_live` for that old fact unless
+/// it was assigned to the successor and matches strictly more of the
+/// successor's patterns (each matching core pattern and each matching
+/// detail pattern) than of the old fact's. A tie stays `still_live`, and
+/// the successor can still be `found` on that same row.
 fn score_patterns(
     script: &FactScript,
     sessions: &[SessionObservation],
@@ -925,7 +934,7 @@ fn score_patterns(
         .unwrap_or(&[]);
     let records = record_refs(final_edges);
     let assignment = assign_records(&facts, &records);
-    let placed = place_facts(&facts, &records, &assignment);
+    let placed = place_facts(&facts, &records, &assignment, &script.superseded_pairs);
     let (retired, premature) = score_retirements(script, sessions)?;
     let noise_hits = pattern_noise_hits(script, &records)?;
     Ok(Some(PatternScore {
@@ -1014,20 +1023,86 @@ fn matching_indexes(records: &[RecordRef], core: &[regex::Regex]) -> Vec<usize> 
 
 /// Give each record to at most one fact.
 ///
-/// Detail wins so a dropped fact cannot stay found on another fact's richer
-/// record. On a tie, the fact with fewer candidates takes the record, so a
-/// fact that has another home does not crowd out a fact that has only this
-/// one. Script order, then the record text, settles whatever is left. Record
-/// text keeps the result independent of snapshot order.
+/// Live facts are assigned first. A rejected fact never takes a record, so
+/// it cannot mark a live fact missing and count the same row as
+/// `rejected_live`. A superseded fact may take a record only after every
+/// live fact has been served, and only a record no live fact took, so an
+/// old value can stay found on its own leftover row without crowding out
+/// its successor.
+///
+/// Within a pass, detail wins so a dropped fact cannot stay found on
+/// another fact's richer record. On a tie, the fact with fewer candidates
+/// takes the record, so a fact that has another home does not crowd out a
+/// fact that has only this one. The second pass counts only records the
+/// first pass left free. Script order, then the record text, then the
+/// record id, settles whatever is left. Record text keeps the result
+/// independent of snapshot order.
 fn assign_records(facts: &[PatternFact<'_>], records: &[RecordRef]) -> Assignment {
     let candidates: Vec<Vec<usize>> = facts
         .iter()
         .map(|fact| matching_indexes(records, &fact.core))
         .collect();
+    let mut by_fact = vec![None; facts.len()];
+    let mut used = HashSet::new();
+    assign_pass(
+        &mut by_fact,
+        &mut used,
+        facts,
+        records,
+        &candidates,
+        EndState::Live,
+    );
+    assign_pass(
+        &mut by_fact,
+        &mut used,
+        facts,
+        records,
+        &candidates,
+        EndState::Superseded,
+    );
+
+    let mut shared = Vec::new();
+    for (fact_index, fact_candidates) in candidates.iter().enumerate() {
+        // A rejected fact does not consume a record and does not leave one
+        // behind as shared. Its live match is `rejected_live` instead.
+        if facts[fact_index].fact.end_state == EndState::Rejected {
+            continue;
+        }
+        for &record_index in fact_candidates {
+            if !used.contains(&record_index) {
+                shared.push(record_index);
+            }
+        }
+    }
+    shared.sort_unstable();
+    shared.dedup();
+    Assignment {
+        by_fact,
+        shared,
+        candidates,
+    }
+}
+
+fn assign_pass(
+    by_fact: &mut [Option<usize>],
+    used: &mut HashSet<usize>,
+    facts: &[PatternFact<'_>],
+    records: &[RecordRef],
+    candidates: &[Vec<usize>],
+    end_state: EndState,
+) {
     let mut pairs = Vec::new();
     for (fact_index, fact_candidates) in candidates.iter().enumerate() {
-        let candidate_count = fact_candidates.len();
-        for &record_index in fact_candidates {
+        if facts[fact_index].fact.end_state != end_state {
+            continue;
+        }
+        let available: Vec<usize> = fact_candidates
+            .iter()
+            .copied()
+            .filter(|index| !used.contains(index))
+            .collect();
+        let candidate_count = available.len();
+        for record_index in available {
             pairs.push(CandidatePair {
                 fact_index,
                 record_index,
@@ -1050,30 +1125,12 @@ fn assign_records(facts: &[PatternFact<'_>], records: &[RecordRef]) -> Assignmen
             .then(left_record.id.cmp(&right_record.id))
     });
 
-    let mut by_fact = vec![None; facts.len()];
-    let mut used = HashSet::new();
     for pair in pairs {
         if by_fact[pair.fact_index].is_some() || used.contains(&pair.record_index) {
             continue;
         }
         used.insert(pair.record_index);
         by_fact[pair.fact_index] = Some(pair.record_index);
-    }
-
-    let mut shared = Vec::new();
-    for fact_candidates in &candidates {
-        for &record_index in fact_candidates {
-            if !used.contains(&record_index) {
-                shared.push(record_index);
-            }
-        }
-    }
-    shared.sort_unstable();
-    shared.dedup();
-    Assignment {
-        by_fact,
-        shared,
-        candidates,
     }
 }
 
@@ -1095,6 +1152,7 @@ fn place_facts(
     facts: &[PatternFact<'_>],
     records: &[RecordRef],
     assignment: &Assignment,
+    pairs: &[SupersededPair],
 ) -> Placed {
     let mut placed = Placed {
         found: Vec::new(),
@@ -1104,9 +1162,9 @@ fn place_facts(
         absent: Vec::new(),
         rejected_live: Vec::new(),
     };
-    for (index, prepared) in facts.iter().enumerate() {
-        let hits = &assignment.candidates[index];
-        let reason = fact_is_wrong(prepared.fact, hits, records, &prepared.wrong_any);
+    for index in 0..facts.len() {
+        let prepared = &facts[index];
+        let reason = fact_is_wrong(index, facts, records, assignment, pairs);
         let id = prepared.fact.id.clone();
         if let Some(reason) = reason {
             placed.wrong.push((id.clone(), reason));
@@ -1131,26 +1189,109 @@ fn place_facts(
     placed
 }
 
-/// Why `fact` is wrong, if it is.
+/// Why the fact at `fact_index` is wrong, if it is.
 ///
-/// `hits` are the records whose core patterns all match this fact. A live
-/// fact is wrong when one of those live records also matches a wrong pattern.
-/// A superseded or rejected fact is wrong while any hit is still live.
+/// A live fact is wrong when one of its live core matches also matches a
+/// wrong pattern. A rejected fact is wrong while any core match is still
+/// live, whether or not another fact was given that record. A superseded
+/// fact is wrong while a live core match is not excused as its successor's
+/// record.
 fn fact_is_wrong(
-    fact: &ScriptFact,
-    hits: &[usize],
+    fact_index: usize,
+    facts: &[PatternFact<'_>],
     records: &[RecordRef],
-    wrong_any: &[regex::Regex],
+    assignment: &Assignment,
+    pairs: &[SupersededPair],
 ) -> Option<PatternWrongReason> {
-    let live_hit = hits.iter().any(|&index| records[index].live);
-    match fact.end_state {
+    let hits = &assignment.candidates[fact_index];
+    let live_hit = |index: usize| records[index].live;
+    match facts[fact_index].fact.end_state {
         EndState::Live => hits
             .iter()
-            .any(|&index| records[index].live && matches_any(wrong_any, &records[index].line))
+            .any(|&index| {
+                live_hit(index) && matches_any(&facts[fact_index].wrong_any, &records[index].line)
+            })
             .then_some(PatternWrongReason::WrongAny),
-        EndState::Superseded => live_hit.then_some(PatternWrongReason::StillLive),
-        EndState::Rejected => live_hit.then_some(PatternWrongReason::RejectedLive),
+        EndState::Superseded => {
+            superseded_still_live(fact_index, facts, records, assignment, pairs)
+                .then_some(PatternWrongReason::StillLive)
+        }
+        EndState::Rejected => hits
+            .iter()
+            .any(|&index| live_hit(index))
+            .then_some(PatternWrongReason::RejectedLive),
     }
+}
+
+/// A live core match counts against a superseded fact unless that record was
+/// assigned to a successor and matches strictly more of the successor's
+/// patterns than of this fact's.
+///
+/// The successor's own row often quotes the old value. That quote is excused
+/// only when the row fits the successor better: more of its core and detail
+/// patterns match than match the old fact. A tie is the old value, including
+/// a stale row that merely names the new value. The successor can still be
+/// `found` on that row, because live facts are assigned first.
+fn superseded_still_live(
+    fact_index: usize,
+    facts: &[PatternFact<'_>],
+    records: &[RecordRef],
+    assignment: &Assignment,
+    pairs: &[SupersededPair],
+) -> bool {
+    let successors = successor_indexes(facts, pairs, &facts[fact_index].fact.id);
+    assignment.candidates[fact_index]
+        .iter()
+        .any(|&record_index| {
+            records[record_index].live
+                && !excused_successor_record(
+                    record_index,
+                    fact_index,
+                    &successors,
+                    facts,
+                    records,
+                    assignment,
+                )
+        })
+}
+
+fn successor_indexes(
+    facts: &[PatternFact<'_>],
+    pairs: &[SupersededPair],
+    old_id: &str,
+) -> Vec<usize> {
+    pairs
+        .iter()
+        .filter(|pair| pair.old == old_id)
+        .filter_map(|pair| facts.iter().position(|fact| fact.fact.id == pair.new))
+        .collect()
+}
+
+fn excused_successor_record(
+    record_index: usize,
+    old_index: usize,
+    successors: &[usize],
+    facts: &[PatternFact<'_>],
+    records: &[RecordRef],
+    assignment: &Assignment,
+) -> bool {
+    let line = &records[record_index].line;
+    let old_hits = pattern_hits(&facts[old_index], line);
+    successors.iter().any(|&successor| {
+        assignment.by_fact[successor] == Some(record_index)
+            && pattern_hits(&facts[successor], line) > old_hits
+    })
+}
+
+/// How many of this fact's core and detail patterns match `line`.
+///
+/// `wrong_any` is a penalty, not evidence that the row is this fact.
+fn pattern_hits(fact: &PatternFact<'_>, line: &str) -> usize {
+    fact.core
+        .iter()
+        .filter(|pattern| pattern.is_match(line))
+        .count()
+        + detail_hits(&fact.detail, line)
 }
 
 fn score_retirements(
@@ -1326,7 +1467,7 @@ fn count_of(len: usize) -> u32 {
 mod tests {
     use super::super::script::{
         Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState, ExpectedFact, FactPattern,
-        FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker,
+        FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker, SupersededPair,
     };
     use super::*;
 
@@ -2157,6 +2298,247 @@ mod tests {
         assert!(patterns.shared.ids.is_empty());
     }
 
+    #[test]
+    fn rejected_fact_does_not_consume_a_live_facts_record() {
+        let patterns = grade_patterns(
+            vec![
+                patterned(
+                    "live",
+                    "backoff",
+                    EndState::Live,
+                    None,
+                    &["backoff"],
+                    &[],
+                    &[],
+                ),
+                patterned(
+                    "rejected",
+                    "tenacity",
+                    EndState::Rejected,
+                    None,
+                    &["tenacity|backoff"],
+                    &["depend"],
+                    &[],
+                ),
+            ],
+            vec![edge(
+                "row",
+                "retry with backoff dependency",
+                true,
+                9.0,
+                1.0,
+                0,
+            )],
+        );
+        assert_eq!(patterns.found.ids, ids(&["live"]));
+        assert_eq!(patterns.complete.ids, ids(&["live"]));
+        assert!(patterns.missing.ids.is_empty());
+        assert_eq!(patterns.wrong.ids, ids(&["rejected"]));
+        assert_eq!(
+            patterns.wrong.reasons,
+            vec![PatternWrongReason::RejectedLive]
+        );
+        assert_eq!(patterns.rejected.live.ids, ids(&["rejected"]));
+        assert!(patterns.rejected.absent.ids.is_empty());
+        assert!(patterns.shared.ids.is_empty());
+    }
+
+    #[test]
+    fn superseded_overlap_does_not_hide_the_successor() {
+        let record = edge("row", "retry with backoff", true, 9.0, 1.0, 0);
+        let patterns = grade_patterns_with_pairs(
+            vec![
+                patterned(
+                    "old",
+                    "old",
+                    EndState::Superseded,
+                    Some("s1"),
+                    &["backoff"],
+                    &[],
+                    &[],
+                ),
+                patterned("new", "new", EndState::Live, None, &["backoff"], &[], &[]),
+            ],
+            vec![record.clone()],
+            vec![pair("old", "new")],
+        );
+        assert_eq!(patterns.found.ids, ids(&["new"]));
+        assert_eq!(patterns.missing.ids, ids(&["old"]));
+        // Both facts match this one row in a single core pattern, so the
+        // successor does not match strictly more and the old fact stays live.
+        assert_eq!(patterns.wrong.ids, ids(&["old"]));
+        assert_eq!(patterns.wrong.reasons, vec![PatternWrongReason::StillLive]);
+        assert!(patterns.shared.ids.is_empty());
+
+        // A separate row that matches the old core and not the new one still
+        // counts, and it does not take the successor's record.
+        let leftover = grade_patterns_with_pairs(
+            vec![
+                patterned(
+                    "old",
+                    "old",
+                    EndState::Superseded,
+                    Some("s1"),
+                    &["tenacity|backoff"],
+                    &[],
+                    &[],
+                ),
+                patterned("new", "new", EndState::Live, None, &["backoff"], &[], &[]),
+            ],
+            vec![
+                record,
+                edge("old-row", "tenacity leftover", true, 9.0, 1.0, 0),
+            ],
+            vec![pair("old", "new")],
+        );
+        assert_eq!(leftover.found.ids, ids(&["new", "old"]));
+        assert!(leftover.missing.ids.is_empty());
+        assert_eq!(leftover.wrong.ids, ids(&["old"]));
+        assert_eq!(leftover.wrong.reasons, vec![PatternWrongReason::StillLive]);
+        assert!(leftover.shared.ids.is_empty());
+    }
+
+    #[test]
+    fn stale_row_that_names_the_successor_stays_live() {
+        let patterns = grade_patterns_with_pairs(
+            vec![
+                patterned(
+                    "old",
+                    "json",
+                    EndState::Superseded,
+                    Some("s1"),
+                    &["json"],
+                    &[],
+                    &[],
+                ),
+                patterned("new", "sqlite", EndState::Live, None, &["sqlite"], &[], &[]),
+            ],
+            vec![edge(
+                "row",
+                "json file (sqlite considered)",
+                true,
+                9.0,
+                1.0,
+                0,
+            )],
+            vec![pair("old", "new")],
+        );
+        // The row matches each core once. Live assignment still gives it to
+        // the successor, and the tie keeps the old fact still_live.
+        assert_eq!(patterns.found.ids, ids(&["new"]));
+        assert_eq!(patterns.complete.ids, ids(&["new"]));
+        assert_eq!(patterns.missing.ids, ids(&["old"]));
+        assert_eq!(patterns.wrong.ids, ids(&["old"]));
+        assert_eq!(patterns.wrong.reasons, vec![PatternWrongReason::StillLive]);
+        assert!(patterns.shared.ids.is_empty());
+
+        // The successor's detail matches and the old fact's does not, so the
+        // row fits the successor better and the quote of the old value is excused.
+        let excused = grade_patterns_with_pairs(
+            vec![
+                patterned(
+                    "old",
+                    "json",
+                    EndState::Superseded,
+                    Some("s1"),
+                    &["json"],
+                    &["file"],
+                    &[],
+                ),
+                patterned(
+                    "new",
+                    "sqlite",
+                    EndState::Live,
+                    None,
+                    &["sqlite"],
+                    &["wal"],
+                    &[],
+                ),
+            ],
+            vec![edge("row", "sqlite wal, json retired", true, 9.0, 1.0, 0)],
+            vec![pair("old", "new")],
+        );
+        assert_eq!(excused.found.ids, ids(&["new"]));
+        assert_eq!(excused.complete.ids, ids(&["new"]));
+        assert_eq!(excused.missing.ids, ids(&["old"]));
+        assert!(excused.wrong.ids.is_empty());
+        assert!(excused.shared.ids.is_empty());
+    }
+
+    #[test]
+    fn record_order_does_not_change_a_text_or_id_tie() {
+        let facts = vec![patterned(
+            "only",
+            "only",
+            EndState::Live,
+            None,
+            &["same"],
+            &[],
+            &[],
+        )];
+        // id-b sorts before id-a, and the line "same alpha" sorts before
+        // "same beta". Text wins, so the later line is the leftover either way.
+        let early = edge("id-b", "same alpha", true, 9.0, 1.0, 0);
+        let late = edge("id-a", "same beta", true, 9.0, 1.0, 0);
+        let forward = grade_patterns(facts.clone(), vec![early.clone(), late.clone()]);
+        let backward = grade_patterns(facts, vec![late, early]);
+        assert_eq!(forward, backward);
+        assert_eq!(forward.found.ids, ids(&["only"]));
+        assert_eq!(forward.shared.ids, ids(&["deploy | setting | same beta"]));
+
+        let tied = vec![patterned(
+            "only",
+            "only",
+            EndState::Live,
+            None,
+            &["same"],
+            &[],
+            &[],
+        )];
+        let low = edge("a", "same", true, 9.0, 1.0, 0);
+        let high = edge("m", "same", true, 9.0, 1.0, 0);
+        let low_first = grade_patterns(tied.clone(), vec![low.clone(), high.clone()]);
+        let high_first = grade_patterns(tied.clone(), vec![high.clone(), low.clone()]);
+        assert_eq!(low_first, high_first);
+        let script = script_of(tied);
+        let compiled = compile_pattern_facts(&script).unwrap();
+        let forward_records = record_refs(&[low.clone(), high.clone()]);
+        let backward_records = record_refs(&[high, low]);
+        assert_eq!(
+            assigned_id(&compiled, &forward_records),
+            assigned_id(&compiled, &backward_records)
+        );
+        assert_eq!(assigned_id(&compiled, &forward_records), "a");
+    }
+
+    fn pair(old: &str, new: &str) -> SupersededPair {
+        SupersededPair {
+            old: old.to_string(),
+            new: new.to_string(),
+            retire_in: "s1".to_string(),
+        }
+    }
+
+    fn script_of(facts: Vec<ScriptFact>) -> FactScript {
+        FactScript {
+            name: "patterns".into(),
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
+            sessions: vec![session("s1", turn(Speaker::User, "s1", vec![], false))],
+            facts,
+            expect: vec![],
+            questions: vec![],
+        }
+    }
+
+    fn assigned_id(facts: &[PatternFact<'_>], records: &[RecordRef]) -> String {
+        let assignment = assign_records(facts, records);
+        let index = assignment.by_fact[0].expect("assigned");
+        records[index].id.clone()
+    }
+
     fn pattern_script() -> FactScript {
         FactScript {
             name: "patterns".into(),
@@ -2318,17 +2700,16 @@ mod tests {
     }
 
     fn grade_patterns(facts: Vec<ScriptFact>, edges: Vec<ObservedEdge>) -> PatternScore {
-        let script = FactScript {
-            name: "patterns".into(),
-            project: None,
-            cwd: None,
-            superseded_pairs: Vec::new(),
-            noise: Vec::new(),
-            sessions: vec![session("s1", turn(Speaker::User, "s1", vec![], false))],
-            facts,
-            expect: vec![],
-            questions: vec![],
-        };
+        grade_patterns_with_pairs(facts, edges, Vec::new())
+    }
+
+    fn grade_patterns_with_pairs(
+        facts: Vec<ScriptFact>,
+        edges: Vec<ObservedEdge>,
+        superseded_pairs: Vec<SupersededPair>,
+    ) -> PatternScore {
+        let mut script = script_of(facts);
+        script.superseded_pairs = superseded_pairs;
         grade(
             &script,
             &[obs("s1", vec![], edges)],
