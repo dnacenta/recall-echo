@@ -7,6 +7,7 @@
 //! Archives go through the same renderer ingestion already reads, so turn
 //! headings survive and provenance is classified the way a real session is.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,7 @@ use crate::conversation::{self, conversation_to_markdown, Conversation, Conversa
 use crate::ephemeral::{self, EphemeralEntry};
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
+use crate::graph::confidence::PRIOR_CONCENTRATION;
 use crate::graph::llm::{Completion, LlmProvider};
 use crate::graph::types::{ExtractedEntity, ExtractedRelationship, ExtractionResult};
 use crate::graph::{GraphMemory, IngestContext};
@@ -84,9 +86,32 @@ pub async fn run(
     gm.embedder()?;
     let setup_millis = u64::try_from(setup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let mut before = snapshot(&gm).await?;
+    let sessions = collect_sessions(&gm, &written, &provider).await?;
+
+    let keyword_hits = script
+        .questions
+        .iter()
+        .map(|question| keyword_hit(&memory_dir, &question.text, &question.answer))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut report = grade::grade(script, &sessions, &weights, &keyword_hits, label)?;
+    report.setup_millis = setup_millis;
+    Ok(report)
+}
+
+/// Ingest each archive and snapshot the graph around it.
+///
+/// One map of β at first sight covers the whole run. Creation writes
+/// α + β = `PRIOR_CONCENTRATION` and only a contradiction moves β, so that
+/// first β is the starting prior on every later snapshot of the edge.
+async fn collect_sessions(
+    gm: &GraphMemory,
+    written: &[WrittenArchive],
+    provider: &Counting<'_>,
+) -> Result<Vec<SessionObservation>, RecallError> {
+    let mut first_beta = HashMap::new();
+    let mut before = snapshot(gm, &mut first_beta).await?;
     let mut sessions = Vec::with_capacity(written.len());
-    for archive in &written {
+    for archive in written {
         let text = fs::read_to_string(&archive.path)?;
         let calls_before = provider.calls();
         let started = Instant::now();
@@ -99,7 +124,7 @@ pub async fn run(
             .await?;
         let calls = provider.calls().saturating_sub(calls_before);
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let after = snapshot(&gm).await?;
+        let after = snapshot(gm, &mut first_beta).await?;
         sessions.push(SessionObservation {
             id: archive.id.clone(),
             before,
@@ -110,15 +135,7 @@ pub async fn run(
         });
         before = after;
     }
-
-    let keyword_hits = script
-        .questions
-        .iter()
-        .map(|question| keyword_hit(&memory_dir, &question.text, &question.answer))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut report = grade::grade(script, &sessions, &weights, &keyword_hits, label)?;
-    report.setup_millis = setup_millis;
-    Ok(report)
+    Ok(sessions)
 }
 
 /// Whether keyword search returns an archive that contains `answer`.
@@ -247,7 +264,10 @@ fn to_conversation(session: &ScriptSession) -> Conversation {
     }
 }
 
-async fn snapshot(gm: &GraphMemory) -> Result<Vec<ObservedEdge>, RecallError> {
+async fn snapshot(
+    gm: &GraphMemory,
+    first_beta: &mut HashMap<String, f64>,
+) -> Result<Vec<ObservedEdge>, RecallError> {
     // Names live on the entity records, not on the edge. The same lookup the
     // inspect path uses keeps a dangling id visible instead of dropping it.
     let relationships = crate::graph::crud::list_all_relationships(gm.db()).await?;
@@ -257,18 +277,34 @@ async fn snapshot(gm: &GraphMemory) -> Result<Vec<ObservedEdge>, RecallError> {
         let from_id = crate::graph::edge_view::record_id(&relationship.from_id);
         let to_id = crate::graph::edge_view::record_id(&relationship.to_id);
         let evidence = relationship.evidence();
+        let id = relationship.id_string();
+        let beta = evidence.beta();
+        let prior_alpha = starting_alpha(&id, beta, first_beta);
         edges.push(ObservedEdge {
-            id: relationship.id_string(),
+            id,
             subject: names.name_of(gm.db(), &from_id).await?,
             relation: relationship.rel_type.clone(),
             object: names.name_of(gm.db(), &to_id).await?,
             live: relationship.valid_until.is_none(),
             alpha: evidence.alpha(),
-            beta: evidence.beta(),
+            beta,
             self_reinforcements: relationship.self_reinforcements.unwrap_or(0).max(0),
+            prior_alpha,
         });
     }
     Ok(edges)
+}
+
+/// α the edge was created at. β at first sight is the prior's β.
+fn starting_alpha(id: &str, beta: f64, first_beta: &mut HashMap<String, f64>) -> f64 {
+    let beta_first = match first_beta.get(id) {
+        Some(seen) => *seen,
+        None => {
+            first_beta.insert(id.to_string(), beta);
+            beta
+        }
+    };
+    PRIOR_CONCENTRATION - beta_first
 }
 
 fn provider_for<'a>(
@@ -469,6 +505,7 @@ fn extracted_entity(fact: &ScriptFact, side: Side) -> Result<ExtractedEntity, Re
 
 #[cfg(test)]
 mod tests {
+    use super::super::script::ScriptTurn;
     use super::*;
     use crate::graph::extract::chunk_conversation;
     use crate::graph::{Provenance, ProvenancePolicy};
@@ -694,6 +731,94 @@ mod tests {
         assert!(report.questions[0].keyword_hit);
         assert!(report.questions[1].graph_hit);
         assert!(report.questions[1].keyword_hit);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn prior_alpha_comes_from_first_sight() {
+        let script = corroboration();
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let written = write_archives(&memory_dir, &script).unwrap();
+        let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
+        gm.embedder().unwrap();
+        let (_label, provider) = provider_for(&script, Extractor::Scripted).unwrap();
+        let sessions = collect_sessions(&gm, &written, &provider).await.unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].before.is_empty());
+        let created = setting(&sessions[0].after);
+        let later = setting(&sessions[1].after);
+        assert_eq!(later.id, created.id);
+        assert_eq!(
+            created.prior_alpha,
+            crate::graph::confidence::PRIOR_CONCENTRATION - created.beta
+        );
+        assert_eq!(later.prior_alpha, created.prior_alpha);
+        assert!(later.alpha > created.alpha);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn corroboration() -> FactScript {
+        FactScript {
+            name: "prior".into(),
+            sessions: vec![
+                ScriptSession {
+                    id: "s1".into(),
+                    date: "2026-01-01T00:00:00Z".into(),
+                    turns: vec![ScriptTurn {
+                        role: Speaker::User,
+                        text: "The deploy host is pine.".into(),
+                        claims: vec![Claim {
+                            op: ClaimOp::Create,
+                            fact: "host".into(),
+                            replacement: None,
+                            by: None,
+                        }],
+                        noise: false,
+                    }],
+                },
+                ScriptSession {
+                    id: "s2".into(),
+                    date: "2026-01-02T00:00:00Z".into(),
+                    turns: vec![ScriptTurn {
+                        role: Speaker::User,
+                        text: "Pine remains the deploy host.".into(),
+                        claims: vec![Claim {
+                            op: ClaimOp::Corroborate,
+                            fact: "host".into(),
+                            replacement: None,
+                            by: None,
+                        }],
+                        noise: false,
+                    }],
+                },
+            ],
+            facts: vec![ScriptFact {
+                id: "host".into(),
+                subject: "deploy".into(),
+                relation: "setting".into(),
+                object: "pine".into(),
+                subject_type: "project".into(),
+                object_type: "concept".into(),
+                subject_abstract: None,
+                object_abstract: None,
+            }],
+            expect: vec![],
+            questions: vec![],
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn setting(edges: &[ObservedEdge]) -> &ObservedEdge {
+        let found: Vec<_> = edges
+            .iter()
+            .filter(|edge| {
+                edge.subject == "deploy" && edge.relation == "setting" && edge.object == "pine"
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "edges: {edges:?}");
+        found[0]
     }
 
     #[cfg(feature = "embedded")]
