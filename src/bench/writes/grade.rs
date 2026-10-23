@@ -220,9 +220,9 @@ pub struct PatternWrongBucket {
 pub enum PatternWrongReason {
     /// A live fact's core match also matches one of its `wrong_any` patterns.
     WrongAny,
-    /// A superseded fact has a live core match that is not a record assigned
-    /// to its successor. A successor record that matches the new core is
-    /// excused; one that matches the old core and not the new one still counts.
+    /// A superseded fact has a live core match. A record assigned to its
+    /// successor is excused only when it matches strictly more of the
+    /// successor's patterns (core and detail) than of the old fact's.
     StillLive,
     /// A rejected fact's core matches a live record.
     RejectedLive,
@@ -916,9 +916,10 @@ fn ratio(numerator: u32, denominator: u32) -> Option<f64> {
 /// takes a record: a live core match is `rejected_live`, and anything else
 /// is correct-absent. A superseded fact may take only a record no live fact
 /// claimed. A live record counts as `still_live` for that old fact unless
-/// the record was assigned to its successor and also matches the successor's
-/// core. A successor record that matches the old core and not the new one
-/// still counts.
+/// it was assigned to the successor and matches strictly more of the
+/// successor's patterns (each matching core pattern and each matching
+/// detail pattern) than of the old fact's. A tie stays `still_live`, and
+/// the successor can still be `found` on that same row.
 fn score_patterns(
     script: &FactScript,
     sessions: &[SessionObservation],
@@ -1223,12 +1224,14 @@ fn fact_is_wrong(
 }
 
 /// A live core match counts against a superseded fact unless that record was
-/// assigned to a successor whose core also matches it.
+/// assigned to a successor and matches strictly more of the successor's
+/// patterns than of this fact's.
 ///
-/// The successor's own row often quotes the old value. Counting that row
-/// would mark the old fact stale even though the stored value is the new
-/// one. A record assigned to the successor that matches the old core and
-/// not the new one still counts: the stored row is the old value.
+/// The successor's own row often quotes the old value. That quote is excused
+/// only when the row fits the successor better: more of its core and detail
+/// patterns match than match the old fact. A tie is the old value, including
+/// a stale row that merely names the new value. The successor can still be
+/// `found` on that row, because live facts are assigned first.
 fn superseded_still_live(
     fact_index: usize,
     facts: &[PatternFact<'_>],
@@ -1241,7 +1244,14 @@ fn superseded_still_live(
         .iter()
         .any(|&record_index| {
             records[record_index].live
-                && !excused_successor_record(record_index, &successors, facts, records, assignment)
+                && !excused_successor_record(
+                    record_index,
+                    fact_index,
+                    &successors,
+                    facts,
+                    records,
+                    assignment,
+                )
         })
 }
 
@@ -1259,15 +1269,29 @@ fn successor_indexes(
 
 fn excused_successor_record(
     record_index: usize,
+    old_index: usize,
     successors: &[usize],
     facts: &[PatternFact<'_>],
     records: &[RecordRef],
     assignment: &Assignment,
 ) -> bool {
+    let line = &records[record_index].line;
+    let old_hits = pattern_hits(&facts[old_index], line);
     successors.iter().any(|&successor| {
         assignment.by_fact[successor] == Some(record_index)
-            && matches_all(&facts[successor].core, &records[record_index].line)
+            && pattern_hits(&facts[successor], line) > old_hits
     })
+}
+
+/// How many of this fact's core and detail patterns match `line`.
+///
+/// `wrong_any` is a penalty, not evidence that the row is this fact.
+fn pattern_hits(fact: &PatternFact<'_>, line: &str) -> usize {
+    fact.core
+        .iter()
+        .filter(|pattern| pattern.is_match(line))
+        .count()
+        + detail_hits(&fact.detail, line)
 }
 
 fn score_retirements(
@@ -2340,7 +2364,10 @@ mod tests {
         );
         assert_eq!(patterns.found.ids, ids(&["new"]));
         assert_eq!(patterns.missing.ids, ids(&["old"]));
-        assert!(patterns.wrong.ids.is_empty());
+        // Both facts match this one row in a single core pattern, so the
+        // successor does not match strictly more and the old fact stays live.
+        assert_eq!(patterns.wrong.ids, ids(&["old"]));
+        assert_eq!(patterns.wrong.reasons, vec![PatternWrongReason::StillLive]);
         assert!(patterns.shared.ids.is_empty());
 
         // A separate row that matches the old core and not the new one still
@@ -2372,42 +2399,70 @@ mod tests {
     }
 
     #[test]
-    fn successor_row_that_misses_the_new_core_still_counts() {
-        let script = script_of(vec![
-            patterned(
-                "old",
-                "old",
-                EndState::Superseded,
-                Some("s1"),
-                &["tenacity"],
-                &[],
-                &[],
-            ),
-            patterned("new", "new", EndState::Live, None, &["backoff"], &[], &[]),
-        ]);
-        let facts = compile_pattern_facts(&script).unwrap();
-        let records = record_refs(&[edge("row", "tenacity leftover", true, 9.0, 1.0, 0)]);
-        let pairs = vec![pair("old", "new")];
-        // The successor holds this row even though its core does not match.
-        // The stored row is the old value, so it still counts.
-        let assigned = Assignment {
-            by_fact: vec![None, Some(0)],
-            shared: Vec::new(),
-            candidates: vec![vec![0], Vec::new()],
-        };
-        assert!(superseded_still_live(
-            0, &facts, &records, &assigned, &pairs
-        ));
+    fn stale_row_that_names_the_successor_stays_live() {
+        let patterns = grade_patterns_with_pairs(
+            vec![
+                patterned(
+                    "old",
+                    "json",
+                    EndState::Superseded,
+                    Some("s1"),
+                    &["json"],
+                    &[],
+                    &[],
+                ),
+                patterned("new", "sqlite", EndState::Live, None, &["sqlite"], &[], &[]),
+            ],
+            vec![edge(
+                "row",
+                "json file (sqlite considered)",
+                true,
+                9.0,
+                1.0,
+                0,
+            )],
+            vec![pair("old", "new")],
+        );
+        // The row matches each core once. Live assignment still gives it to
+        // the successor, and the tie keeps the old fact still_live.
+        assert_eq!(patterns.found.ids, ids(&["new"]));
+        assert_eq!(patterns.complete.ids, ids(&["new"]));
+        assert_eq!(patterns.missing.ids, ids(&["old"]));
+        assert_eq!(patterns.wrong.ids, ids(&["old"]));
+        assert_eq!(patterns.wrong.reasons, vec![PatternWrongReason::StillLive]);
+        assert!(patterns.shared.ids.is_empty());
 
-        let records = record_refs(&[edge("row", "retry with backoff", true, 9.0, 1.0, 0)]);
-        let excused = Assignment {
-            by_fact: vec![None, Some(0)],
-            shared: Vec::new(),
-            candidates: vec![vec![0], vec![0]],
-        };
-        assert!(!superseded_still_live(
-            0, &facts, &records, &excused, &pairs
-        ));
+        // The successor's detail matches and the old fact's does not, so the
+        // row fits the successor better and the quote of the old value is excused.
+        let excused = grade_patterns_with_pairs(
+            vec![
+                patterned(
+                    "old",
+                    "json",
+                    EndState::Superseded,
+                    Some("s1"),
+                    &["json"],
+                    &["file"],
+                    &[],
+                ),
+                patterned(
+                    "new",
+                    "sqlite",
+                    EndState::Live,
+                    None,
+                    &["sqlite"],
+                    &["wal"],
+                    &[],
+                ),
+            ],
+            vec![edge("row", "sqlite wal, json retired", true, 9.0, 1.0, 0)],
+            vec![pair("old", "new")],
+        );
+        assert_eq!(excused.found.ids, ids(&["new"]));
+        assert_eq!(excused.complete.ids, ids(&["new"]));
+        assert_eq!(excused.missing.ids, ids(&["old"]));
+        assert!(excused.wrong.ids.is_empty());
+        assert!(excused.shared.ids.is_empty());
     }
 
     #[test]
