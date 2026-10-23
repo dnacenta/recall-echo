@@ -199,8 +199,20 @@ fn empty_project() -> ProjectIdentity {
     }
 }
 
+/// A transcript cwd is untrusted. Read `.git/config` only when it cannot stall
+/// the archive: an absolute path, a regular file, and a small one.
+const GIT_CONFIG_MAX_BYTES: u64 = 64 * 1024;
+
 fn origin_repo_name(cwd: &Path) -> Option<String> {
-    let text = fs::read_to_string(cwd.join(".git").join("config")).ok()?;
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let path = cwd.join(".git").join("config");
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > GIT_CONFIG_MAX_BYTES {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
     repo_name(&origin_url(&text)?)
 }
 
@@ -382,6 +394,17 @@ fn read_markdown(path: &Path) -> Result<SessionInput, GraphError> {
     })
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum DetailsSkip {
+    #[default]
+    Off,
+    /// Writer form is `<details>…` then a blank line, then an opening fence.
+    AwaitFence,
+    InFence,
+    /// `</details>` inside the fenced output must not end the skip.
+    AwaitClose,
+}
+
 #[derive(Default)]
 struct MarkdownTurns {
     turns: Vec<Turn>,
@@ -389,27 +412,25 @@ struct MarkdownTurns {
     role: Option<TurnRole>,
     text: String,
     pending: Vec<String>,
-    skipping_details: bool,
+    details: DetailsSkip,
 }
 
 impl MarkdownTurns {
     fn push_line(&mut self, raw: &str) {
         let line = raw.trim_end_matches('\r');
-        if self.skipping_details {
-            if line.contains("</details>") {
-                self.skipping_details = false;
-            }
+        if self.details != DetailsSkip::Off {
+            self.step_details(line);
             return;
         }
-        if line.contains("<details") {
-            self.skipping_details = !line.contains("</details>");
+        if is_writer_details(line) {
+            self.details = DetailsSkip::AwaitFence;
             return;
         }
         if let Some(role) = heading_role(line) {
             self.start_turn(role);
             return;
         }
-        if line.trim().starts_with('#') {
+        if ends_writer_section(line) {
             self.finish_text();
             return;
         }
@@ -424,6 +445,18 @@ impl MarkdownTurns {
             self.text.push_str(line);
             self.text.push('\n');
         }
+    }
+
+    /// The writer wraps tool output in one fence, then a line that is
+    /// exactly `</details>`. A close tag inside that fence stays output.
+    fn step_details(&mut self, line: &str) {
+        let trimmed = line.trim();
+        self.details = match self.details {
+            DetailsSkip::AwaitFence if trimmed == "```" => DetailsSkip::InFence,
+            DetailsSkip::InFence if trimmed == "```" => DetailsSkip::AwaitClose,
+            DetailsSkip::AwaitClose if trimmed == "</details>" => DetailsSkip::Off,
+            other => other,
+        };
     }
 
     fn start_turn(&mut self, role: TurnRole) {
@@ -467,10 +500,35 @@ fn heading_role(line: &str) -> Option<TurnRole> {
     }
 }
 
+/// The writer emits `> **Name**: \`input\``. A blockquote without that
+/// backtick span (`> **Note**: …`) is text, not a tool name.
 fn quoted_tool(line: &str) -> Option<String> {
     let rest = line.trim().strip_prefix("> **")?;
-    let (name, _) = rest.split_once("**:")?;
-    (!name.is_empty()).then(|| name.to_string())
+    let (name, value) = rest.split_once("**:")?;
+    let value = value.trim();
+    let span = value.len() >= 2 && value.starts_with('`') && value.ends_with('`');
+    (span && !name.is_empty()).then(|| name.to_string())
+}
+
+/// The archive writer closes the turns with these two headings. Any other
+/// `#` line (`#[derive]`, a shebang, a heading in the prompt) is text.
+fn ends_writer_section(line: &str) -> bool {
+    let line = line.trim();
+    line == "## Tags" || is_conversation_heading(line)
+}
+
+fn is_conversation_heading(line: &str) -> bool {
+    let Some(number) = line.strip_prefix("# Conversation ") else {
+        return false;
+    };
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_writer_details(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "<details><summary>Result</summary>" | "<details><summary>Error</summary>"
+    )
 }
 
 fn render_window(session: &SessionInput, start: usize, end: usize) -> String {
@@ -570,6 +628,40 @@ mod tests {
     }
 
     #[test]
+    fn project_identity_skips_non_regular_or_oversize_git_config() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let fifo_repo = tmp.path().join("fifo-repo");
+        fs::create_dir_all(fifo_repo.join(".git")).unwrap();
+        let fifo = fifo_repo.join(".git/config");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path inside this temp dir, and
+        // mkfifo only creates a fifo there. The read guard must not open it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0);
+        let fifo_id = project_identity(Some(&fifo_repo));
+        assert_eq!(fifo_id.name, "fifo-repo");
+        assert_eq!(fifo_id.aliases, vec!["fifo-repo".to_string()]);
+
+        let dir_repo = tmp.path().join("dir-repo");
+        fs::create_dir_all(dir_repo.join(".git/config")).unwrap();
+        let dir_id = project_identity(Some(&dir_repo));
+        assert_eq!(dir_id.name, "dir-repo");
+        assert_eq!(dir_id.aliases, vec!["dir-repo".to_string()]);
+
+        let huge_repo = tmp.path().join("huge-repo");
+        fs::create_dir_all(huge_repo.join(".git")).unwrap();
+        let mut body = String::from(
+            "[remote \"origin\"]\n\turl = https://example.com/acme/should-not-read.git\n",
+        );
+        body.push_str(&"x".repeat(64 * 1024));
+        fs::write(huge_repo.join(".git/config"), body).unwrap();
+        let huge_id = project_identity(Some(&huge_repo));
+        assert_eq!(huge_id.name, "huge-repo");
+        assert_eq!(huge_id.aliases, vec!["huge-repo".to_string()]);
+    }
+
+    #[test]
     fn markdown_fallback_skips_tool_blocks() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -661,6 +753,121 @@ Looks good.
         assert!(!rendered.contains("SECRET_TOOL_OUTPUT"));
         assert!(!rendered.contains("src/store.py"));
         assert!(!rendered.contains("must not become a turn"));
+    }
+
+    fn load_markdown(body: &str) -> SessionInput {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        let archive = format!(
+            "---\nlog: 1\ndate: \"2026-09-28T09:10:37Z\"\nsession_id: \"sess\"\n\
+             message_count: 1\nduration: \"1m\"\nsource: \"jsonl\"\ntopics: []\n---\n\n{body}"
+        );
+        fs::write(memory.join("conversations/conversation-001.md"), archive).unwrap();
+        load_session(memory, 1).unwrap()
+    }
+
+    #[test]
+    fn markdown_fallback_keeps_tool_output_that_contains_details_close() {
+        let session = load_markdown(
+            "\
+### Assistant
+
+ok
+
+<details><summary>Result</summary>
+
+```
+<div></details>
+</details>
+LEAKED_TOOL_OUTPUT
+```
+
+</details>
+
+still the assistant
+
+### User
+
+see <details> in the prompt
+and </details> too
+",
+        );
+        assert_eq!(
+            session.turns,
+            vec![
+                Turn {
+                    index: 0,
+                    role: TurnRole::Assistant,
+                    text: "ok\n\n\nstill the assistant".into(),
+                },
+                Turn {
+                    index: 1,
+                    role: TurnRole::User,
+                    text: "see <details> in the prompt\nand </details> too".into(),
+                },
+            ]
+        );
+        assert!(session.tool_lines.is_empty());
+        assert!(!format!("{session:?}").contains("LEAKED_TOOL_OUTPUT"));
+    }
+
+    #[test]
+    fn markdown_fallback_keeps_hash_lines_in_the_turn() {
+        let session = load_markdown(
+            "\
+# Conversation 001
+
+### User
+
+Fix this:
+```rust
+#[derive(Debug)]
+struct KeepMe;
+```
+AFTER_HASH_LINE
+
+#!/bin/bash
+echo kept
+
+## Heading inside the prompt
+
+## Tags
+
+**Project**: should-not-be-turn
+",
+        );
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].text,
+            "Fix this:\n```rust\n#[derive(Debug)]\nstruct KeepMe;\n```\n\
+             AFTER_HASH_LINE\n\n#!/bin/bash\necho kept\n\n## Heading inside the prompt"
+        );
+        assert!(!session.turns[0].text.contains("should-not-be-turn"));
+    }
+
+    #[test]
+    fn markdown_fallback_keeps_note_blockquote_as_text() {
+        let session = load_markdown(
+            "\
+### Assistant
+
+> **Note**: this stays text
+
+> **Write**: `src/store.py`
+
+kept
+",
+        );
+        assert_eq!(
+            session.turns,
+            vec![Turn {
+                index: 0,
+                role: TurnRole::Assistant,
+                text: "> **Note**: this stays text\n\n\nkept".into(),
+            }]
+        );
+        assert_eq!(session.tool_lines, vec![(1, vec!["Write".into()])]);
     }
 
     fn user_turn(index: usize) -> Turn {

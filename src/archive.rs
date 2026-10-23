@@ -197,8 +197,7 @@ fn write_archive(
 
     let next_num = highest_conversation_number(&conversations_dir) + 1;
 
-    let timestamp = session_timestamp(conv.first_timestamp.as_deref());
-    let date = conversation::date_from_timestamp(&timestamp);
+    let (timestamp, date) = session_clock(conv.first_timestamp.as_deref());
     let duration = match (&conv.first_timestamp, &conv.last_timestamp) {
         (Some(start), Some(end)) => conversation::calculate_duration(start, end),
         _ => "unknown".to_string(),
@@ -302,12 +301,21 @@ fn write_archive(
 }
 
 /// The archive's clock: the session's first timestamp when it is RFC 3339,
-/// otherwise the moment of import.
-fn session_timestamp(first: Option<&str>) -> String {
-    match first {
-        Some(ts) if chrono::DateTime::parse_from_rfc3339(ts).is_ok() => ts.to_string(),
-        _ => conversation::utc_now(),
+/// otherwise the moment of import. The second value is the calendar day for
+/// the ARCHIVE.md column and the sidecar.
+///
+/// Chrono accepts a space or a lowercase `t` as the date/time separator. The
+/// day comes from the parsed value, so those forms still yield `YYYY-MM-DD`.
+/// An offset keeps that offset's calendar day rather than converting to UTC.
+fn session_clock(first: Option<&str>) -> (String, String) {
+    if let Some(ts) = first {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+            return (ts.to_string(), parsed.date_naive().to_string());
+        }
     }
+    let now = conversation::utc_now();
+    let day = conversation::date_from_timestamp(&now);
+    (now, day)
 }
 
 /// Hook cwd, else the first transcript line that carries one, else the cwd
@@ -1329,6 +1337,41 @@ mod tests {
             day == &before[..10] || day == &after[..10],
             "fell back to {day}, import was {before}..{after}"
         );
+    }
+
+    #[test]
+    fn archive_date_normalises_space_and_lowercase_separator() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let summary = summarize::ConversationSummary::default();
+
+        archive_conversation(
+            memory,
+            &one_turn("space", Some("2026-09-28 09:10:37Z")),
+            &summary,
+            "jsonl",
+        )
+        .unwrap();
+        archive_conversation(
+            memory,
+            &one_turn("lower", Some("2026-09-29t09:10:37Z")),
+            &summary,
+            "jsonl",
+        )
+        .unwrap();
+
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("| 001 | 2026-09-28 | space |"), "{index}");
+        assert!(index.contains("| 002 | 2026-09-29 | lower |"), "{index}");
+        assert!(!index.contains("09:10:37"), "{index}");
+
+        for (number, day) in [(1, "2026-09-28"), (2, "2026-09-29")] {
+            let raw =
+                fs::read_to_string(memory.join(format!("turns/conversation-{number:03}.json")))
+                    .unwrap();
+            let sidecar: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(sidecar["date"], day, "{raw}");
+        }
     }
 
     #[test]
