@@ -616,31 +616,69 @@ mod tests {
                 .map(|session| session.millis)
                 .sum::<u64>()
         );
-        assert_consistent(&report.operations.create, 1);
-        assert_consistent(&report.operations.corroborate, 2);
-        assert_consistent(&report.operations.supersede, 1);
-        assert_consistent(&report.operations.contradict, 1);
-        assert_consistent(&report.operations.no_op, 2);
-        assert!(
-            report.operations.create.tp >= 1,
-            "scripted create did not land: {}",
-            serde_json::to_string_pretty(&report).unwrap()
+        // Pre-redesign baseline for history.toml. Supersede, contradict and
+        // reject do not land on today's write path. These counts are expected
+        // to change when that path changes; update them in the same commit.
+        assert_eq!(report.operations.create, counted(1, 1, 0));
+        assert_eq!(report.operations.corroborate, counted(2, 1, 0));
+        assert_eq!(report.operations.supersede, counted(0, 0, 1));
+        assert_eq!(report.operations.contradict, counted(0, 0, 1));
+        assert_eq!(report.operations.no_op, counted(1, 0, 1));
+        assert_eq!(
+            report.wrong_facts,
+            vec![
+                grade::WrongFact {
+                    fact: "deploy-host".into(),
+                    reason: grade::WrongReason::StillLive,
+                },
+                grade::WrongFact {
+                    fact: "deploy-host-birch".into(),
+                    reason: grade::WrongReason::StillLive,
+                },
+            ]
         );
+        assert!(report.junk_edges.is_empty());
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .map(|step| (step.expected, step.actual, step.matched))
+                .collect::<Vec<_>>(),
+            vec![
+                (grade::WriteOp::Create, grade::WriteOp::Create, true),
+                (
+                    grade::WriteOp::Corroborate,
+                    grade::WriteOp::Corroborate,
+                    true,
+                ),
+                (
+                    grade::WriteOp::Corroborate,
+                    grade::WriteOp::Corroborate,
+                    true,
+                ),
+                (grade::WriteOp::Supersede, grade::WriteOp::Create, false),
+                (
+                    grade::WriteOp::Contradict,
+                    grade::WriteOp::Corroborate,
+                    false
+                ),
+                (grade::WriteOp::NoOp, grade::WriteOp::Create, false),
+                (grade::WriteOp::NoOp, grade::WriteOp::NoOp, true),
+            ]
+        );
+        assert!(!report.questions[0].graph_hit);
+        assert!(report.questions[0].keyword_hit);
+        assert!(report.questions[1].graph_hit);
+        assert!(report.questions[1].keyword_hit);
     }
 
-    fn assert_consistent(score: &grade::OpScore, gold: u32) {
-        assert_eq!(score.tp + score.missed, gold);
-        let precision =
-            (score.tp + score.fp > 0).then(|| f64::from(score.tp) / f64::from(score.tp + score.fp));
-        let recall = (score.tp + score.missed > 0)
-            .then(|| f64::from(score.tp) / f64::from(score.tp + score.missed));
-        assert_eq!(score.precision, precision);
-        assert_eq!(score.recall, recall);
-        if let Some(value) = score.precision {
-            assert!((0.0..=1.0).contains(&value));
-        }
-        if let Some(value) = score.recall {
-            assert!((0.0..=1.0).contains(&value));
+    fn counted(tp: u32, fp: u32, missed: u32) -> grade::OpScore {
+        grade::OpScore {
+            tp,
+            fp,
+            missed,
+            precision: (tp + fp > 0).then(|| f64::from(tp) / f64::from(tp + fp)),
+            recall: (tp + missed > 0).then(|| f64::from(tp) / f64::from(tp + missed)),
         }
     }
 }
