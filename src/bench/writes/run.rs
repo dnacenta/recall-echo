@@ -1011,9 +1011,10 @@ mod tests {
     // extractor. Supersede does not retire the old edge, and reject still
     // stores the fact, so the six superseded facts and F42 stay live.
     // F42 is wrong (rejected_live) and not found. F01 is found but incomplete
-    // because its object does not carry the uv detail. Every core match is
-    // assigned, so shared is empty. Later pipeline work updates these counts
-    // on purpose.
+    // because its object does not carry the uv detail. Live and superseded
+    // core matches are assigned, so shared is empty. F42's row is not
+    // assigned and is not shared: a rejected match is left out of shared.
+    // Later pipeline work updates these counts on purpose.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     async fn linkshelf_scripted_v1_baseline() {
