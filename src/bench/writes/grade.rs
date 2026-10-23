@@ -182,7 +182,7 @@ pub struct PatternScore {
     pub noise: u32,
     pub found: PatternBucket,
     pub complete: PatternBucket,
-    pub wrong: PatternBucket,
+    pub wrong: PatternWrongBucket,
     pub missing: PatternBucket,
     /// Superseded pairs whose old fact was retired in `retire_in` or later.
     pub retired: PatternBucket,
@@ -191,6 +191,38 @@ pub struct PatternScore {
     pub noise_hits: PatternBucket,
     /// Live records that match no fact's core patterns. A proxy for junk.
     pub unmatched: PatternBucket,
+    /// Rejected facts. `absent` matched no live record and is neither found
+    /// nor missing. `live` matched a live record and is also in `wrong`.
+    pub rejected: RejectedScore,
+    /// Core matches the one-to-one pass left unassigned. Debugging only.
+    pub shared: PatternBucket,
+}
+
+/// Rejected facts, split by whether a live record still matches the core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RejectedScore {
+    pub absent: PatternBucket,
+    pub live: PatternBucket,
+}
+
+/// The pattern `wrong` bucket. `reasons[i]` explains `ids[i]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PatternWrongBucket {
+    pub count: u32,
+    pub ids: Vec<String>,
+    pub reasons: Vec<PatternWrongReason>,
+}
+
+/// Why a fact landed in the pattern `wrong` bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternWrongReason {
+    /// A live fact's core match also matches one of its `wrong_any` patterns.
+    WrongAny,
+    /// A superseded fact still has a live core match.
+    StillLive,
+    /// A rejected fact's core matches a live record.
+    RejectedLive,
 }
 
 /// One pattern bucket: a count and the ids in it.
@@ -877,51 +909,254 @@ fn ratio(numerator: u32, denominator: u32) -> Option<f64> {
 ///
 /// Records are `subject | relation | object`. Live and retired records are
 /// both visible to `found`; stale and noise checks use live records only.
-/// A rejected fact is found or missing: there is no rejection rule yet.
+/// A record is credited to one fact. A rejected fact is never found: a live
+/// core match is `rejected_live`, and anything else is correct-absent.
 fn score_patterns(
     script: &FactScript,
     sessions: &[SessionObservation],
 ) -> Result<Option<PatternScore>, RecallError> {
-    if script.facts.iter().all(|fact| fact.pattern.is_none()) {
+    let facts = compile_pattern_facts(script)?;
+    if facts.is_empty() {
         return Ok(None);
     }
     let final_edges = sessions
         .last()
         .map(|session| session.after.as_slice())
         .unwrap_or(&[]);
-    let mut found = Vec::new();
-    let mut complete = Vec::new();
-    let mut wrong = Vec::new();
-    let mut missing = Vec::new();
-    let mut compiled = Vec::new();
+    let records = record_refs(final_edges);
+    let assignment = assign_records(&facts, &records);
+    let placed = place_facts(&facts, &records, &assignment);
+    let (retired, premature) = score_retirements(script, sessions)?;
+    let noise_hits = pattern_noise_hits(script, &records)?;
+    Ok(Some(PatternScore {
+        facts: count_of(facts.len()),
+        pairs: count_of(script.superseded_pairs.len()),
+        noise: count_of(script.noise.len()),
+        found: bucket(placed.found),
+        complete: bucket(placed.complete),
+        wrong: wrong_bucket(placed.wrong),
+        missing: bucket(placed.missing),
+        retired: bucket(retired),
+        premature: bucket(premature),
+        noise_hits: bucket(noise_hits),
+        unmatched: bucket(unmatched_lines(&facts, &records)),
+        rejected: RejectedScore {
+            absent: bucket(placed.absent),
+            live: bucket(placed.rejected_live),
+        },
+        shared: bucket(shared_lines(&records, &assignment.shared)),
+    }))
+}
+
+struct PatternFact<'a> {
+    fact: &'a ScriptFact,
+    core: Vec<regex::Regex>,
+    detail: Vec<regex::Regex>,
+    wrong_any: Vec<regex::Regex>,
+}
+
+struct RecordRef {
+    id: String,
+    line: String,
+    live: bool,
+}
+
+struct Assignment {
+    by_fact: Vec<Option<usize>>,
+    shared: Vec<usize>,
+    candidates: Vec<Vec<usize>>,
+}
+
+struct Placed {
+    found: Vec<String>,
+    complete: Vec<String>,
+    wrong: Vec<(String, PatternWrongReason)>,
+    missing: Vec<String>,
+    absent: Vec<String>,
+    rejected_live: Vec<String>,
+}
+
+fn compile_pattern_facts(script: &FactScript) -> Result<Vec<PatternFact<'_>>, RecallError> {
+    let mut facts = Vec::new();
     for fact in &script.facts {
         let Some(pattern) = &fact.pattern else {
             continue;
         };
-        let core = compile_all(&pattern.core_all)?;
-        let detail = compile_all(&pattern.detail_all)?;
-        let wrong_any = compile_all(&pattern.wrong_any)?;
-        let hits: Vec<&ObservedEdge> = final_edges
-            .iter()
-            .filter(|edge| matches_all(&core, &record_line(edge)))
-            .collect();
-        if hits.is_empty() {
-            missing.push(fact.id.clone());
-        } else {
-            found.push(fact.id.clone());
-            if hits
-                .iter()
-                .any(|edge| matches_all(&detail, &record_line(edge)))
-            {
-                complete.push(fact.id.clone());
-            }
+        facts.push(PatternFact {
+            fact,
+            core: compile_all(&pattern.core_all)?,
+            detail: compile_all(&pattern.detail_all)?,
+            wrong_any: compile_all(&pattern.wrong_any)?,
+        });
+    }
+    Ok(facts)
+}
+
+fn record_refs(edges: &[ObservedEdge]) -> Vec<RecordRef> {
+    edges
+        .iter()
+        .map(|edge| RecordRef {
+            id: edge.id.clone(),
+            line: record_line(edge),
+            live: edge.live,
+        })
+        .collect()
+}
+
+fn matching_indexes(records: &[RecordRef], core: &[regex::Regex]) -> Vec<usize> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| matches_all(core, &record.line))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Give each record to at most one fact.
+///
+/// Detail wins so a dropped fact cannot stay found on another fact's richer
+/// record. On a tie, the fact with fewer candidates takes the record, so a
+/// fact that has another home does not crowd out a fact that has only this
+/// one. Script order, then the record text, settles whatever is left. Record
+/// text keeps the result independent of snapshot order.
+fn assign_records(facts: &[PatternFact<'_>], records: &[RecordRef]) -> Assignment {
+    let candidates: Vec<Vec<usize>> = facts
+        .iter()
+        .map(|fact| matching_indexes(records, &fact.core))
+        .collect();
+    let mut pairs = Vec::new();
+    for (fact_index, fact_candidates) in candidates.iter().enumerate() {
+        let candidate_count = fact_candidates.len();
+        for &record_index in fact_candidates {
+            pairs.push(CandidatePair {
+                fact_index,
+                record_index,
+                detail_hits: detail_hits(&facts[fact_index].detail, &records[record_index].line),
+                candidate_count,
+            });
         }
-        if fact_is_wrong(fact, &hits, final_edges, &core, &wrong_any) {
-            wrong.push(fact.id.clone());
+    }
+    // Snapshot order is not stable, so a remaining tie uses the record text
+    // and id rather than its position.
+    pairs.sort_by(|left, right| {
+        let left_record = &records[left.record_index];
+        let right_record = &records[right.record_index];
+        right
+            .detail_hits
+            .cmp(&left.detail_hits)
+            .then(left.candidate_count.cmp(&right.candidate_count))
+            .then(left.fact_index.cmp(&right.fact_index))
+            .then(left_record.line.cmp(&right_record.line))
+            .then(left_record.id.cmp(&right_record.id))
+    });
+
+    let mut by_fact = vec![None; facts.len()];
+    let mut used = HashSet::new();
+    for pair in pairs {
+        if by_fact[pair.fact_index].is_some() || used.contains(&pair.record_index) {
+            continue;
         }
-        compiled.push(core);
+        used.insert(pair.record_index);
+        by_fact[pair.fact_index] = Some(pair.record_index);
     }
 
+    let mut shared = Vec::new();
+    for fact_candidates in &candidates {
+        for &record_index in fact_candidates {
+            if !used.contains(&record_index) {
+                shared.push(record_index);
+            }
+        }
+    }
+    shared.sort_unstable();
+    shared.dedup();
+    Assignment {
+        by_fact,
+        shared,
+        candidates,
+    }
+}
+
+struct CandidatePair {
+    fact_index: usize,
+    record_index: usize,
+    detail_hits: usize,
+    candidate_count: usize,
+}
+
+fn detail_hits(detail: &[regex::Regex], line: &str) -> usize {
+    detail
+        .iter()
+        .filter(|pattern| pattern.is_match(line))
+        .count()
+}
+
+fn place_facts(
+    facts: &[PatternFact<'_>],
+    records: &[RecordRef],
+    assignment: &Assignment,
+) -> Placed {
+    let mut placed = Placed {
+        found: Vec::new(),
+        complete: Vec::new(),
+        wrong: Vec::new(),
+        missing: Vec::new(),
+        absent: Vec::new(),
+        rejected_live: Vec::new(),
+    };
+    for (index, prepared) in facts.iter().enumerate() {
+        let hits = &assignment.candidates[index];
+        let reason = fact_is_wrong(prepared.fact, hits, records, &prepared.wrong_any);
+        let id = prepared.fact.id.clone();
+        if let Some(reason) = reason {
+            placed.wrong.push((id.clone(), reason));
+        }
+        if prepared.fact.end_state == EndState::Rejected {
+            match reason {
+                Some(PatternWrongReason::RejectedLive) => placed.rejected_live.push(id),
+                _ => placed.absent.push(id),
+            }
+            continue;
+        }
+        match assignment.by_fact[index] {
+            Some(record) => {
+                placed.found.push(id.clone());
+                if matches_all(&prepared.detail, &records[record].line) {
+                    placed.complete.push(id);
+                }
+            }
+            None => placed.missing.push(id),
+        }
+    }
+    placed
+}
+
+/// Why `fact` is wrong, if it is.
+///
+/// `hits` are the records whose core patterns all match this fact. A live
+/// fact is wrong when one of those live records also matches a wrong pattern.
+/// A superseded or rejected fact is wrong while any hit is still live.
+fn fact_is_wrong(
+    fact: &ScriptFact,
+    hits: &[usize],
+    records: &[RecordRef],
+    wrong_any: &[regex::Regex],
+) -> Option<PatternWrongReason> {
+    let live_hit = hits.iter().any(|&index| records[index].live);
+    match fact.end_state {
+        EndState::Live => hits
+            .iter()
+            .any(|&index| records[index].live && matches_any(wrong_any, &records[index].line))
+            .then_some(PatternWrongReason::WrongAny),
+        EndState::Superseded => live_hit.then_some(PatternWrongReason::StillLive),
+        EndState::Rejected => live_hit.then_some(PatternWrongReason::RejectedLive),
+    }
+}
+
+fn score_retirements(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+) -> Result<(Vec<String>, Vec<String>), RecallError> {
     let mut retired = Vec::new();
     let mut premature = Vec::new();
     for pair in &script.superseded_pairs {
@@ -941,65 +1176,44 @@ fn score_patterns(
             retired.push(label);
         }
     }
+    Ok((retired, premature))
+}
 
-    let live_lines: Vec<String> = final_edges
-        .iter()
-        .filter(|edge| edge.live)
-        .map(record_line)
-        .collect();
+fn pattern_noise_hits(
+    script: &FactScript,
+    records: &[RecordRef],
+) -> Result<Vec<String>, RecallError> {
     let mut noise_hits = Vec::new();
     for item in &script.noise {
         let patterns = compile_all(&item.match_any)?;
-        if live_lines.iter().any(|line| matches_any(&patterns, line)) {
+        let hit = records
+            .iter()
+            .any(|record| record.live && matches_any(&patterns, &record.line));
+        if hit {
             noise_hits.push(item.id.clone());
         }
     }
-    let unmatched = live_lines
-        .into_iter()
-        .filter(|line| !compiled.iter().any(|core| matches_all(core, line)))
-        .collect();
-
-    Ok(Some(PatternScore {
-        facts: count_of(
-            script
-                .facts
-                .iter()
-                .filter(|fact| fact.pattern.is_some())
-                .count(),
-        ),
-        pairs: count_of(script.superseded_pairs.len()),
-        noise: count_of(script.noise.len()),
-        found: bucket(found),
-        complete: bucket(complete),
-        wrong: bucket(wrong),
-        missing: bucket(missing),
-        retired: bucket(retired),
-        premature: bucket(premature),
-        noise_hits: bucket(noise_hits),
-        unmatched: bucket(unmatched),
-    }))
+    Ok(noise_hits)
 }
 
-fn fact_is_wrong(
-    fact: &ScriptFact,
-    hits: &[&ObservedEdge],
-    edges: &[ObservedEdge],
-    core: &[regex::Regex],
-    wrong_any: &[regex::Regex],
-) -> bool {
-    match fact.end_state {
-        // A live fact is wrong when one of its own live records matches a
-        // wrong pattern. Another fact's record does not count.
-        EndState::Live => hits
-            .iter()
-            .any(|edge| edge.live && matches_any(wrong_any, &record_line(edge))),
-        // Strict stale rule: a superseded fact is still wrong while a live
-        // record matches its core.
-        EndState::Superseded => edges
-            .iter()
-            .any(|edge| edge.live && matches_all(core, &record_line(edge))),
-        EndState::Rejected => false,
-    }
+fn unmatched_lines(facts: &[PatternFact<'_>], records: &[RecordRef]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| {
+            record.live
+                && !facts
+                    .iter()
+                    .any(|fact| matches_all(&fact.core, &record.line))
+        })
+        .map(|record| record.line.clone())
+        .collect()
+}
+
+fn shared_lines(records: &[RecordRef], shared: &[usize]) -> Vec<String> {
+    shared
+        .iter()
+        .map(|&index| records[index].line.clone())
+        .collect()
 }
 
 /// Session index at which the old fact's live records disappear for good.
@@ -1086,6 +1300,21 @@ fn bucket(mut ids: Vec<String>) -> PatternBucket {
     PatternBucket {
         count: count_of(ids.len()),
         ids,
+    }
+}
+
+fn wrong_bucket(mut rows: Vec<(String, PatternWrongReason)>) -> PatternWrongBucket {
+    rows.sort();
+    let mut ids = Vec::with_capacity(rows.len());
+    let mut reasons = Vec::with_capacity(rows.len());
+    for (id, reason) in rows {
+        ids.push(id);
+        reasons.push(reason);
+    }
+    PatternWrongBucket {
+        count: count_of(ids.len()),
+        ids,
+        reasons,
     }
 }
 
@@ -1743,15 +1972,24 @@ mod tests {
         assert_eq!(patterns.noise, 2);
         assert_eq!(
             patterns.found.ids,
-            ids(&["alpha", "beta", "delta", "epsilon", "gamma", "rho", "zeta"])
+            ids(&["alpha", "beta", "delta", "epsilon", "gamma", "zeta"])
         );
-        assert_eq!(patterns.found.count, 7);
+        assert_eq!(patterns.found.count, 6);
         assert_eq!(
             patterns.complete.ids,
-            ids(&["alpha", "delta", "epsilon", "gamma", "rho", "zeta"])
+            ids(&["alpha", "delta", "epsilon", "gamma", "zeta"])
         );
         // gamma matches wrong_any; epsilon is superseded and still live.
-        assert_eq!(patterns.wrong.ids, ids(&["epsilon", "gamma"]));
+        // rho is rejected and still live, so it is wrong and not found.
+        assert_eq!(patterns.wrong.ids, ids(&["epsilon", "gamma", "rho"]));
+        assert_eq!(
+            patterns.wrong.reasons,
+            vec![
+                PatternWrongReason::StillLive,
+                PatternWrongReason::WrongAny,
+                PatternWrongReason::RejectedLive,
+            ]
+        );
         assert_eq!(patterns.missing.ids, ids(&["absent"]));
         assert_eq!(patterns.retired.ids, ids(&["delta->delta2"]));
         assert_eq!(patterns.premature.ids, ids(&["zeta->zeta2"]));
@@ -1760,8 +1998,163 @@ mod tests {
             patterns.unmatched.ids,
             ids(&["deploy | setting | leftover"])
         );
-        // Rejected rho is found, not wrong.
-        assert!(!patterns.wrong.ids.iter().any(|id| id == "rho"));
+        assert_eq!(patterns.rejected.live.ids, ids(&["rho"]));
+        assert!(patterns.rejected.absent.ids.is_empty());
+        assert!(patterns.shared.ids.is_empty());
+        assert!(!patterns.found.ids.iter().any(|id| id == "rho"));
+    }
+
+    #[test]
+    fn ac1_rejected_fact_with_a_live_record_is_wrong_not_found() {
+        let patterns = grade_patterns(
+            vec![patterned(
+                "rho",
+                "rho",
+                EndState::Rejected,
+                None,
+                &["rho"],
+                &["detail"],
+                &[],
+            )],
+            vec![edge("rho", "rho detail", true, 9.0, 1.0, 0)],
+        );
+        assert_eq!(patterns.wrong.ids, ids(&["rho"]));
+        assert_eq!(
+            patterns.wrong.reasons,
+            vec![PatternWrongReason::RejectedLive]
+        );
+        assert!(patterns.found.ids.is_empty());
+        assert!(patterns.complete.ids.is_empty());
+        assert!(patterns.missing.ids.is_empty());
+        assert_eq!(patterns.rejected.live.ids, ids(&["rho"]));
+        assert!(patterns.rejected.absent.ids.is_empty());
+    }
+
+    #[test]
+    fn ac2_rejected_fact_with_no_record_is_absent_not_missing() {
+        let patterns = grade_patterns(
+            vec![
+                patterned("rho", "rho", EndState::Rejected, None, &["rho"], &[], &[]),
+                patterned("kept", "kept", EndState::Live, None, &["kept"], &[], &[]),
+            ],
+            vec![edge("kept", "kept", true, 9.0, 1.0, 0)],
+        );
+        assert_eq!(patterns.rejected.absent.ids, ids(&["rho"]));
+        assert!(patterns.rejected.live.ids.is_empty());
+        assert!(patterns.missing.ids.is_empty());
+        assert!(patterns.wrong.ids.is_empty());
+        assert_eq!(patterns.found.ids, ids(&["kept"]));
+    }
+
+    #[test]
+    fn rejected_fact_with_only_a_retired_record_is_absent() {
+        let patterns = grade_patterns(
+            vec![patterned(
+                "rho",
+                "rho",
+                EndState::Rejected,
+                None,
+                &["rho"],
+                &[],
+                &[],
+            )],
+            vec![edge("rho", "rho", false, 9.0, 1.0, 0)],
+        );
+        assert_eq!(patterns.rejected.absent.ids, ids(&["rho"]));
+        assert!(patterns.rejected.live.ids.is_empty());
+        assert!(patterns.found.ids.is_empty());
+        assert!(patterns.missing.ids.is_empty());
+        assert!(patterns.wrong.ids.is_empty());
+        assert!(patterns.shared.ids.is_empty());
+    }
+
+    #[test]
+    fn ac3_two_facts_sharing_one_record_find_only_one() {
+        let patterns = grade_patterns(
+            vec![
+                patterned(
+                    "alpha",
+                    "alpha",
+                    EndState::Live,
+                    None,
+                    &["shared"],
+                    &[],
+                    &[],
+                ),
+                patterned("beta", "beta", EndState::Live, None, &["shared"], &[], &[]),
+            ],
+            vec![edge("only", "shared", true, 9.0, 1.0, 0)],
+        );
+        assert_eq!(patterns.found.ids, ids(&["alpha"]));
+        assert_eq!(patterns.missing.ids, ids(&["beta"]));
+        assert!(patterns.shared.ids.is_empty());
+    }
+
+    #[test]
+    fn assignment_prefers_the_record_with_more_detail_matches() {
+        let patterns = grade_patterns(
+            vec![
+                patterned(
+                    "wide",
+                    "wide",
+                    EndState::Live,
+                    None,
+                    &["contested|spare"],
+                    &["marker"],
+                    &[],
+                ),
+                patterned(
+                    "narrow",
+                    "narrow",
+                    EndState::Live,
+                    None,
+                    &["contested"],
+                    &[],
+                    &[],
+                ),
+            ],
+            vec![
+                edge("a", "contested marker", true, 9.0, 1.0, 0),
+                edge("b", "spare", true, 9.0, 1.0, 0),
+            ],
+        );
+        assert_eq!(patterns.found.ids, ids(&["wide"]));
+        assert_eq!(patterns.complete.ids, ids(&["wide"]));
+        assert_eq!(patterns.missing.ids, ids(&["narrow"]));
+        assert_eq!(patterns.shared.ids, ids(&["deploy | setting | spare"]));
+    }
+
+    #[test]
+    fn assignment_gives_a_tied_record_to_the_fact_with_fewer_candidates() {
+        let patterns = grade_patterns(
+            vec![
+                patterned(
+                    "wide",
+                    "wide",
+                    EndState::Live,
+                    None,
+                    &["contested|spare"],
+                    &[],
+                    &[],
+                ),
+                patterned(
+                    "narrow",
+                    "narrow",
+                    EndState::Live,
+                    None,
+                    &["contested"],
+                    &[],
+                    &[],
+                ),
+            ],
+            vec![
+                edge("a", "contested", true, 9.0, 1.0, 0),
+                edge("b", "spare", true, 9.0, 1.0, 0),
+            ],
+        );
+        assert_eq!(patterns.found.ids, ids(&["narrow", "wide"]));
+        assert!(patterns.missing.ids.is_empty());
+        assert!(patterns.shared.ids.is_empty());
     }
 
     fn pattern_script() -> FactScript {
@@ -1922,6 +2315,30 @@ mod tests {
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn grade_patterns(facts: Vec<ScriptFact>, edges: Vec<ObservedEdge>) -> PatternScore {
+        let script = FactScript {
+            name: "patterns".into(),
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
+            sessions: vec![session("s1", turn(Speaker::User, "s1", vec![], false))],
+            facts,
+            expect: vec![],
+            questions: vec![],
+        };
+        grade(
+            &script,
+            &[obs("s1", vec![], edges)],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap()
+        .patterns
+        .expect("pattern section")
     }
 
     fn full(n: u32) -> OpScore {

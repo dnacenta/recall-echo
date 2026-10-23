@@ -1041,9 +1041,10 @@ mod tests {
     // Pre-redesign baseline for the linkshelf fixture under the scripted
     // extractor. Supersede does not retire the old edge, and reject still
     // stores the fact, so the six superseded facts and F42 stay live.
-    // Pattern grading still finds all 46 facts; F01 is the incomplete one
-    // because its object does not carry the uv detail. Later pipeline work
-    // updates these counts on purpose.
+    // F42 is wrong (rejected_live) and not found. F01 is found but incomplete
+    // because its object does not carry the uv detail. Every core match is
+    // assigned, so shared is empty. Later pipeline work updates these counts
+    // on purpose.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     async fn linkshelf_scripted_v1_baseline() {
@@ -1091,22 +1092,43 @@ mod tests {
         assert_eq!(patterns.facts, 46);
         assert_eq!(patterns.pairs, 6);
         assert_eq!(patterns.noise, 7);
-        assert_eq!(patterns.found.count, 46);
-        assert_eq!(patterns.complete.count, 45);
+        assert_eq!(
+            patterns.found.count, 45,
+            "missing {:?} shared {:?}",
+            patterns.missing.ids, patterns.shared.ids
+        );
+        assert!(patterns.found.ids.iter().any(|id| id == "F01"));
+        assert!(patterns.found.ids.iter().all(|id| id != "F42"));
+        assert_eq!(patterns.complete.count, 44);
         assert!(!patterns.complete.ids.iter().any(|id| id == "F01"));
+        assert!(!patterns.complete.ids.iter().any(|id| id == "F42"));
         assert_eq!(
             patterns.wrong.ids,
-            ["F04", "F05", "F09", "F10", "F26", "F27"]
+            ["F04", "F05", "F09", "F10", "F26", "F27", "F42"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(
+            patterns.wrong.reasons,
+            vec![
+                grade::PatternWrongReason::StillLive,
+                grade::PatternWrongReason::StillLive,
+                grade::PatternWrongReason::StillLive,
+                grade::PatternWrongReason::StillLive,
+                grade::PatternWrongReason::StillLive,
+                grade::PatternWrongReason::StillLive,
+                grade::PatternWrongReason::RejectedLive,
+            ]
+        );
         assert_eq!(patterns.missing.count, 0);
+        assert_eq!(patterns.rejected.absent.count, 0);
+        assert_eq!(patterns.rejected.live.ids, vec!["F42".to_string()]);
+        assert_eq!(patterns.shared.count, 0);
         assert_eq!(patterns.retired.count, 0);
         assert_eq!(patterns.premature.count, 0);
         assert_eq!(patterns.noise_hits.count, 0);
         assert_eq!(patterns.unmatched.count, 0);
-        assert!(patterns.wrong.ids.iter().all(|id| id != "F42"));
     }
 
     #[cfg(feature = "embedded")]

@@ -64,5 +64,5 @@ The transcripts use the JSON Lines format read by `src/jsonl.rs`: one entry per 
 
 ## Grading caveats
 
-- Rejected facts (F42) are graded found or missing only, so a stored rejected fact still reads as found. The op table and `wrong_facts` show the failure.
-- Some facts' core patterns also match another fact's record (for example F01 and F03 via F32, F13 and F14 via F43 and F46, F39 and F40 via F41), so pattern recall can be overstated until matching is one-to-one.
+- A rejected fact whose core matches a live record is `wrong` with reason `rejected_live`, and it is not `found`. F42 is that case on the current writer: the dependency is stored even though the user rejected it. A rejected fact with no live match is `rejected.absent` and counts as neither found nor missing.
+- Records are assigned one-to-one. The record that matches the most detail patterns is preferred, then the fact with the fewest candidates. A record used for one fact is not another fact's find. Core matches left over are reported as `shared` (F01 and F03 can still see F32's record, F13 and F14 can still see F43 and F46, F39 and F40 can still see F41).
