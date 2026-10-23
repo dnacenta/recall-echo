@@ -411,7 +411,7 @@ impl LlmProvider for ScriptedExtractor {
         user_message: &str,
         _max_tokens: u32,
     ) -> Result<String, crate::graph::error::GraphError> {
-        if system_prompt.contains("deduplication system") {
+        if system_prompt.contains(crate::graph::dedup::DEDUP_SYSTEM_PROMPT) {
             return Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string());
         }
         self.extraction_json(user_message)
@@ -558,13 +558,21 @@ mod tests {
         let extractor = ScriptedExtractor::new(&script).unwrap();
         let dedup = extractor
             .complete(
-                "You are a deduplication system for a knowledge graph.",
+                crate::graph::dedup::DEDUP_SYSTEM_PROMPT,
                 "The deploy host is pine.",
                 300,
             )
             .await
             .unwrap();
         assert!(dedup.contains("\"create\""), "{dedup}");
+
+        // A reworded prompt that still says the old phrase is extraction, not dedup.
+        let loose = extractor
+            .complete("deduplication system", "The deploy host is pine.", 300)
+            .await
+            .unwrap();
+        assert!(loose.contains("\"source\""), "{loose}");
+        assert!(!loose.contains("\"decision\""), "{loose}");
 
         let extracted = extractor
             .complete(
