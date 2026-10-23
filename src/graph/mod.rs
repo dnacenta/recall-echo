@@ -30,6 +30,7 @@ pub mod traverse;
 pub mod types;
 pub mod util;
 pub mod utility;
+pub(crate) mod v2;
 pub mod vigil_sync;
 
 use std::collections::HashMap;

@@ -379,6 +379,15 @@ fn write_session(
     fs::write(&path, &content)?;
 
     let date = conversation::date_from_timestamp(&session.date);
+    let cwd = crate::archive::resolve_cwd(None, session.transcript_path.as_deref(), None);
+    crate::archive::write_sidecar_best_effort(
+        memory_dir,
+        log_number,
+        &session.id,
+        &date,
+        cwd.as_deref(),
+        &conversation.entries,
+    );
     append_index(
         &memory_dir.join("ARCHIVE.md"),
         log_number,
@@ -774,6 +783,28 @@ mod tests {
             Provenance::SelfGenerated
         );
         assert!(assistant.contains("### Assistant"));
+    }
+
+    #[test]
+    fn write_session_writes_a_turns_sidecar() {
+        let script = history();
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        write_archives(&memory, &script).unwrap();
+
+        let raw = fs::read_to_string(memory.join("turns/conversation-001.json")).unwrap();
+        let sidecar: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(sidecar["date"], "2026-01-01");
+        assert_eq!(sidecar["session_id"], "s1");
+        assert_eq!(sidecar["turns"][0]["role"], "user");
+        assert_eq!(sidecar["turns"][0]["text"], "The deploy host is pine.");
+        assert!(sidecar["cwd"].is_null());
+        assert_eq!(sidecar["tools"], serde_json::json!([]));
+        let conversations = fs::read_dir(memory.join("conversations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(conversations.iter().all(|name| name.ends_with(".md")));
     }
 
     #[test]
