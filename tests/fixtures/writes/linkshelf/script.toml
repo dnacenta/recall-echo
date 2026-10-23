@@ -1,0 +1,1264 @@
+# linkshelf: synthetic regression fixture. Not a benchmark; never tune prompts or thresholds on it.
+# Expected end state after ingesting s01..s14 in order. See README.md.
+name = "linkshelf"
+project = "linkshelf"
+cwd = "/work/linkshelf"
+
+[[sessions]]
+id = "s01"
+date = "2026-09-28T09:10:37Z"
+transcript = "sessions/s01.jsonl"
+
+# F01 (user): linkshelf is a Python 3.12 bookmark-manager CLI, managed with uv
+[[sessions.claims]]
+op = "create"
+fact = "F01"
+quote = "Python 3.12, managed with uv"
+
+# F02 (user): CLI framework is Typer (chosen over Click; derives options from type hints)
+[[sessions.claims]]
+op = "create"
+fact = "F02"
+quote = "Typer. I want type hints everywhere anyway"
+
+# F03 (user): Type hints everywhere; mypy in strict mode (hard rule)
+[[sessions.claims]]
+op = "create"
+fact = "F03"
+quote = "mypy in strict mode from day one. That's a hard rule"
+
+# F04 (user): Storage: single JSON file at ~/.local/share/linkshelf/shelf.json
+[[sessions.claims]]
+op = "create"
+fact = "F04"
+quote = "Put it at ~/.local/share/linkshelf/shelf.json"
+
+[[sessions]]
+id = "s02"
+date = "2026-09-29T17:40:37Z"
+transcript = "sessions/s02.jsonl"
+
+# F05 (assistant): Tests run with `uv run pytest -q`
+[[sessions.claims]]
+op = "create"
+fact = "F05"
+quote = "Run them with `uv run pytest -q`"
+
+# F06 (user): URL normalisation lowercases scheme/host only; the trailing slash is kept
+[[sessions.claims]]
+op = "create"
+fact = "F06"
+quote = "Don't strip the trailing slash"
+
+# F07 (user): Commit messages use conventional commits (feat:, fix:, chore:)
+[[sessions.claims]]
+op = "create"
+fact = "F07"
+quote = "conventional commits for every message (feat:, fix:, chore: ...)"
+
+# F08 (user): Never put emojis in commit messages
+[[sessions.claims]]
+op = "create"
+fact = "F08"
+quote = "never put emojis in commit messages"
+
+[[sessions]]
+id = "s03"
+date = "2026-09-30T18:05:37Z"
+transcript = "sessions/s03.jsonl"
+
+# F09 (assistant): Tags stored as one comma-separated string per bookmark
+[[sessions.claims]]
+op = "create"
+fact = "F09"
+quote = "keep tags on each bookmark as one comma-separated string"
+
+# F10 (user): Formatter is black
+[[sessions.claims]]
+op = "create"
+fact = "F10"
+quote = "Yes, use black."
+
+# F11 (user): `list --tag` filters by tag; `tag <id> <tag>...` adds tags
+[[sessions.claims]]
+op = "create"
+fact = "F11"
+quote = "`linkshelf tag <id> <tag>...` and `list --tag`"
+
+[[sessions]]
+id = "s04"
+date = "2026-10-02T08:30:37Z"
+transcript = "sessions/s04.jsonl"
+
+# F12 (assistant): Bug: concurrent `linkshelf add` corrupted shelf.json (read-modify-write, no locking)
+[[sessions.claims]]
+op = "create"
+fact = "F12"
+quote = "the JSON store is read-modify-write with no locking"
+
+# F13 (user): Fix for F12: move storage to SQLite (handles concurrent writers)
+[[sessions.claims]]
+op = "create"
+fact = "F13"
+quote = "Agreed, move to SQLite."
+
+# F14 (user): Storage: SQLite at ~/.local/share/linkshelf/shelf.db with WAL mode
+[[sessions.claims]]
+op = "supersede"
+fact = "F04"
+replacement = "F14"
+quote = "Same directory, file shelf.db. Turn on WAL mode."
+
+# F15 (user): Tags: `tags` table + `bookmark_tags` join table
+[[sessions.claims]]
+op = "supersede"
+fact = "F09"
+replacement = "F15"
+quote = "Yes, do the tags table and join table. Drop the comma string."
+
+# F16 (assistant): One-off migration script scripts/migrate_json.py (212 bookmarks, 37 tags)
+[[sessions.claims]]
+op = "create"
+fact = "F16"
+quote = "`scripts/migrate_json.py` (212 bookmarks, 37 tags migrated)"
+
+[[sessions]]
+id = "s05"
+date = "2026-10-03T19:00:37Z"
+transcript = "sessions/s05.jsonl"
+
+# F17 (user): `export --format csv|html`: CSV and Netscape bookmark HTML
+[[sessions.claims]]
+op = "create"
+fact = "F17"
+quote = "CSV and also the Netscape bookmark HTML format"
+
+# F18 (assistant): CSV columns in order: url, title, tags, added_at; tags joined with `;`
+[[sessions.claims]]
+op = "create"
+fact = "F18"
+quote = "CSV columns, in order: url, title, tags, added_at. Tags in CSV are joined with `;`."
+
+# F19 (user): All output dates ISO 8601 in UTC with Z suffix, never local time (project-wide)
+[[sessions.claims]]
+op = "create"
+fact = "F19"
+quote = "always ISO 8601 in UTC, like 2026-10-03T19:00:00Z. Not local time."
+
+[[sessions]]
+id = "s06"
+date = "2026-10-05T10:15:37Z"
+transcript = "sessions/s06.jsonl"
+
+# F20 (assistant): Bug: exported added_at 2 h off; cause: naive datetime.now() (UTC+2) labelled as UTC
+[[sessions.claims]]
+op = "create"
+fact = "F20"
+quote = "records `datetime.now()`, a naive local time"
+
+# F21 (assistant): Fix: store datetime.now(timezone.utc); regression test test_export_utc; scripts/fix_tz.py corrects old rows
+[[sessions.claims]]
+op = "create"
+fact = "F21"
+quote = "bookmarks now store `datetime.now(timezone.utc)`"
+
+[[sessions]]
+id = "s07"
+date = "2026-10-06T16:20:37Z"
+transcript = "sessions/s07.jsonl"
+
+# F22 (user): Formatter + linter: ruff (ruff format, ruff check); black removed
+[[sessions.claims]]
+op = "supersede"
+fact = "F10"
+replacement = "F22"
+quote = "I want ruff instead of black, both for formatting and linting."
+
+# F23 (assistant): ruff runs via pre-commit hooks (.pre-commit-config.yaml)
+[[sessions.claims]]
+op = "create"
+fact = "F23"
+quote = "now run via pre-commit hooks (.pre-commit-config.yaml)"
+
+# F24 (user): Line length 100
+[[sessions.claims]]
+op = "create"
+fact = "F24"
+quote = "Line length 100."
+
+[[sessions]]
+id = "s08"
+date = "2026-10-08T18:45:37Z"
+transcript = "sessions/s08.jsonl"
+
+# F25 (assistant): `linkshelf serve`: local web UI with Starlette + uvicorn
+[[sessions.claims]]
+op = "create"
+fact = "F25"
+quote = "I'd use Starlette + uvicorn"
+
+# F26 (user): serve default port 8080
+[[sessions.claims]]
+op = "create"
+fact = "F26"
+quote = "OK, 8080 and requests are fine."
+
+# F27 (user): Titles fetched on `add` with requests
+[[sessions.claims]]
+op = "create"
+fact = "F27"
+quote = "OK, 8080 and requests are fine."
+
+# F28 (user): Title fetch timeout 5 s
+[[sessions.claims]]
+op = "create"
+fact = "F28"
+quote = "5 seconds timeout is good."
+
+[[sessions]]
+id = "s09"
+date = "2026-10-09T09:00:37Z"
+transcript = "sessions/s09.jsonl"
+
+# F29 (assistant): Bug: `add` crashed with UnicodeDecodeError on a Shift_JIS page; body decoded as UTF-8 unconditionally
+[[sessions.claims]]
+op = "create"
+fact = "F29"
+quote = "fetch.py decodes the body as UTF-8 unconditionally"
+
+# F30 (assistant): Fix: decode with the response charset and errors="replace"
+[[sessions.claims]]
+op = "create"
+fact = "F30"
+quote = "use the charset from the response"
+
+# F31 (user): Minimal dependencies: no BeautifulSoup, use stdlib html.parser
+[[sessions.claims]]
+op = "create"
+fact = "F31"
+quote = "I want as few dependencies as possible in this project. Use the stdlib html.parser."
+
+[[sessions]]
+id = "s10"
+date = "2026-10-11T11:30:37Z"
+transcript = "sessions/s10.jsonl"
+
+# F32 (user): CI on GitHub Actions, Python 3.12 + 3.13 matrix (ruff, mypy --strict, tests)
+[[sessions.claims]]
+op = "create"
+fact = "F32"
+quote = "Set up CI on GitHub Actions. Test on Python 3.12 and 3.13."
+
+# F33 (user): Test command is `just test` = uv run pytest -q --cov=linkshelf --cov-fail-under=85
+[[sessions.claims]]
+op = "supersede"
+fact = "F05"
+replacement = "F33"
+quote = "The test command should be `just test`"
+
+# F34 (user): Coverage must be >= 85% (currently 88%)
+[[sessions.claims]]
+op = "create"
+fact = "F34"
+quote = "Fail under 85%."
+
+[[sessions]]
+id = "s11"
+date = "2026-10-12T20:10:37Z"
+transcript = "sessions/s11.jsonl"
+
+# F35 (user): serve default port 8765
+[[sessions.claims]]
+op = "supersede"
+fact = "F26"
+replacement = "F35"
+quote = "8765 is good."
+
+# F36 (user): Reason for F35: 8080 clashes with the user's other project's dev server
+[[sessions.claims]]
+op = "create"
+fact = "F36"
+quote = "keeps clashing with my other project's dev server, which is always on 8080"
+
+# F37 (assistant): Port configurable via `port` in ~/.config/linkshelf/config.toml or `--port`
+[[sessions.claims]]
+op = "create"
+fact = "F37"
+quote = "overridden with `port = ...` in ~/.config/linkshelf/config.toml, or `--port`"
+
+[[sessions]]
+id = "s12"
+date = "2026-10-13T18:00:37Z"
+transcript = "sessions/s12.jsonl"
+
+# F38 (user): HTTP client is httpx (AsyncClient); requests removed
+[[sessions.claims]]
+op = "supersede"
+fact = "F27"
+replacement = "F38"
+quote = "Yes, switch to httpx and drop requests entirely."
+
+# F39 (user): `linkshelf refresh` re-fetches all titles concurrently, global limit 8 (asyncio.Semaphore)
+[[sessions.claims]]
+op = "create"
+fact = "F39"
+quote = "Cap concurrency at 8."
+
+[[sessions]]
+id = "s13"
+date = "2026-10-15T07:50:37Z"
+transcript = "sessions/s13.jsonl"
+
+# F40 (user): Bug: refresh rate-limited (429) by github.com: too many concurrent requests to one host
+[[sessions.claims]]
+op = "create"
+fact = "F40"
+quote = "refresh got me rate-limited by github.com"
+
+# F41 (assistant): Fix: per-host semaphore of 2 on top of the global 8
+[[sessions.claims]]
+op = "create"
+fact = "F41"
+quote = "per-host semaphore of 2 on top of the global limit of 8"
+
+# F42 (user): tenacity/backoff was tried and removed: the user does not want that dependency
+[[sessions.claims]]
+op = "reject"
+fact = "F42"
+quote = "I don't want tenacity as a dependency for this. Remove it."
+
+[[sessions]]
+id = "s14"
+date = "2026-10-16T17:30:37Z"
+transcript = "sessions/s14.jsonl"
+
+# F43 (assistant): v0.2.0 released: SQLite + tags table, export, serve, refresh, UTC + charset fixes
+[[sessions.claims]]
+op = "create"
+fact = "F43"
+quote = "v0.2.0 tagged"
+
+# F44 (assistant): Publishing via PyPI trusted publishing from GitHub Actions on `v*` tags (no API token); release.yml
+[[sessions.claims]]
+op = "create"
+fact = "F44"
+quote = "PyPI trusted publishing from GitHub Actions"
+
+# F45 (assistant): Version lives only in pyproject.toml, read with importlib.metadata
+[[sessions.claims]]
+op = "create"
+fact = "F45"
+quote = "The version lives only in pyproject.toml; the code reads it with importlib.metadata."
+
+# F46 (user): v0.3 plan: import bookmarks from Firefox places.sqlite
+[[sessions.claims]]
+op = "create"
+fact = "F46"
+quote = "For v0.3 the plan is importing bookmarks from Firefox's places.sqlite."
+
+# decision: linkshelf is a Python 3.12 bookmark-manager CLI, managed with uv
+[[facts]]
+id = "F01"
+subject = "linkshelf"
+relation = "setting:python_version"
+object = "3.12"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["python ?3\\.12|python\\S*\\W+3\\.12"]
+detail_all = ["\\buv\\b"]
+wrong_any = []
+
+# decision: CLI framework is Typer (chosen over Click; derives options from type hints)
+[[facts]]
+id = "F02"
+subject = "linkshelf"
+relation = "setting:cli_framework"
+object = "Typer (chosen over Click)"
+subject_type = "project"
+object_type = "tool"
+end_state = "live"
+[facts.match]
+core_all = ["\\btyper\\b"]
+detail_all = ["click\\W.*\\b(rejected|considered)\\b|(over|instead of|rather than|not) click"]
+wrong_any = []
+
+# rule: Type hints everywhere; mypy in strict mode (hard rule)
+[[facts]]
+id = "F03"
+subject = "linkshelf"
+relation = "rule:typing"
+object = "type hints everywhere, mypy --strict"
+subject_type = "project"
+object_type = "policy"
+end_state = "live"
+[facts.match]
+core_all = ["mypy"]
+detail_all = ["strict"]
+wrong_any = []
+
+# config: Storage: single JSON file at ~/.local/share/linkshelf/shelf.json
+[[facts]]
+id = "F04"
+subject = "linkshelf"
+relation = "setting:storage"
+object = "single JSON file at ~/.local/share/linkshelf/shelf.json"
+subject_type = "project"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s04"
+[facts.match]
+core_all = ["shelf\\.json|uses\\S* \\| json\\b|\\bjson\\b.{0,30}(file|storage|stor)|(storage|stores?|database)\\W.{0,30}\\bjson\\b"]
+detail_all = ["~/\\.local/share/linkshelf/shelf\\.json"]
+wrong_any = ["~/local/share"]
+
+# config: Tests run with `uv run pytest -q`
+[[facts]]
+id = "F05"
+subject = "linkshelf"
+relation = "setting:test_command"
+object = "uv run pytest -q"
+subject_type = "project"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s10"
+[facts.match]
+core_all = ["uv run pytest -q(?:[^|-]|-(?:-+co?-)*(?:[^|-]|-+(?:[^c|-]|c[^o|-]|co[^v|-])))*(?:-(?:-+co?-)*(?:-+(?:co?)?)?)?(?:\\||$)"]
+detail_all = []
+wrong_any = []
+
+# decision: URL normalisation lowercases scheme/host only; the trailing slash is kept
+[[facts]]
+id = "F06"
+subject = "linkshelf"
+relation = "decision:url_normalisation"
+object = "lowercase scheme and host only, keep the trailing slash"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["trailing slash"]
+detail_all = ["lowercas|scheme|host"]
+wrong_any = []
+
+# rule: Commit messages use conventional commits (feat:, fix:, chore:)
+[[facts]]
+id = "F07"
+subject = "linkshelf"
+relation = "rule:commit_style"
+object = "conventional commits (feat:, fix:, chore:)"
+subject_type = "project"
+object_type = "policy"
+end_state = "live"
+[facts.match]
+core_all = ["conventional commit|feat:?,? ?fix:?,? ?chore"]
+detail_all = ["feat"]
+wrong_any = []
+
+# rule: Never put emojis in commit messages
+[[facts]]
+id = "F08"
+subject = "linkshelf"
+relation = "rule:commit_emoji"
+object = "never put emojis in commit messages"
+subject_type = "project"
+object_type = "policy"
+end_state = "live"
+[facts.match]
+core_all = ["emoji"]
+detail_all = []
+wrong_any = []
+
+# config: Tags stored as one comma-separated string per bookmark
+[[facts]]
+id = "F09"
+subject = "linkshelf"
+relation = "setting:tag_storage"
+object = "one comma-separated string per bookmark"
+subject_type = "project"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s04"
+[facts.match]
+core_all = ["comma[- ]separated (tag|string)|tags?\\b.{0,40}comma[- ]separated|comma[- ]separated.{0,20}tags?"]
+detail_all = []
+wrong_any = []
+
+# config: Formatter is black
+[[facts]]
+id = "F10"
+subject = "linkshelf"
+relation = "setting:formatter"
+object = "black"
+subject_type = "project"
+object_type = "tool"
+end_state = "superseded"
+superseded_in = "s07"
+[facts.match]
+core_all = ["\\bblack\\b"]
+detail_all = []
+wrong_any = []
+
+# feature: `list --tag` filters by tag; `tag <id> <tag>...` adds tags
+[[facts]]
+id = "F11"
+subject = "linkshelf"
+relation = "feature:tag_commands"
+object = "`tag <id> <tag>...` adds tags, `list --tag` filters by tag"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["--tag\\b|\\btag <id>|list\\b.*\\bfilter.*\\btag|\\btag\\b command"]
+detail_all = ["--tag\\b", "tag <id>|adds? tags"]
+wrong_any = []
+
+# bug: Bug: concurrent `linkshelf add` corrupted shelf.json (read-modify-write, no locking)
+[[facts]]
+id = "F12"
+subject = "linkshelf"
+relation = "bug:concurrent_add"
+object = "concurrent add corrupted the store (read-modify-write, no locking)"
+subject_type = "project"
+object_type = "observation"
+end_state = "live"
+[facts.match]
+core_all = ["(concurren|parallel|simultaneous).*(corrupt|add)|corrupt.*(concurren|parallel|simultaneous)"]
+detail_all = ["read.?modify.?write|lock"]
+wrong_any = []
+
+# bug_fix: Fix for F12: move storage to SQLite (handles concurrent writers)
+[[facts]]
+id = "F13"
+subject = "linkshelf"
+relation = "fix:concurrent_add"
+object = "move storage to SQLite, which handles concurrent writers"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["sqlite"]
+detail_all = ["(concurren|corrupt).*sqlite|sqlite.*(concurren|corrupt|writer)"]
+wrong_any = []
+
+# config: Storage: SQLite at ~/.local/share/linkshelf/shelf.db with WAL mode
+[[facts]]
+id = "F14"
+subject = "linkshelf"
+relation = "setting:storage"
+object = "SQLite at ~/.local/share/linkshelf/shelf.db with WAL mode"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["sqlite|shelf\\.db"]
+detail_all = ["shelf\\.db", "\\bwal\\b"]
+wrong_any = []
+
+# config: Tags: `tags` table + `bookmark_tags` join table
+[[facts]]
+id = "F15"
+subject = "linkshelf"
+relation = "setting:tag_storage"
+object = "tags table plus bookmark_tags join table"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["bookmark_tags|join table|tags table"]
+detail_all = []
+wrong_any = []
+
+# config: One-off migration script scripts/migrate_json.py (212 bookmarks, 37 tags)
+[[facts]]
+id = "F16"
+subject = "linkshelf"
+relation = "setting:migration_script"
+object = "scripts/migrate_json.py migrated 212 bookmarks and 37 tags"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["migrate_json"]
+detail_all = ["\\b212\\b", "\\b37\\b"]
+wrong_any = []
+
+# decision: `export --format csv|html`: CSV and Netscape bookmark HTML
+[[facts]]
+id = "F17"
+subject = "linkshelf"
+relation = "decision:export_formats"
+object = "export --format csv or html: CSV and Netscape bookmark HTML"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["\\bcsv\\b", "\\bhtml(?:$|[^\\w.]|\\.(?:$|[^p]|p(?:$|[^a]|a(?:$|[^r]|r(?:$|[^s]|s(?:$|[^e]|e(?:$|[^r])))))))|netscape"]
+detail_all = ["netscape|export"]
+wrong_any = []
+
+# decision: CSV columns in order: url, title, tags, added_at; tags joined with `;`
+[[facts]]
+id = "F18"
+subject = "linkshelf"
+relation = "decision:csv_columns"
+object = "url, title, tags, added_at; tags joined with ;"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["url, ?title, ?tags, ?added_at"]
+detail_all = [";"]
+wrong_any = []
+
+# rule: All output dates ISO 8601 in UTC with Z suffix, never local time (project-wide)
+[[facts]]
+id = "F19"
+subject = "linkshelf"
+relation = "rule:output_dates"
+object = "ISO 8601 in UTC with Z suffix, never local time"
+subject_type = "project"
+object_type = "policy"
+end_state = "live"
+[facts.match]
+core_all = ["iso ?8601"]
+detail_all = ["utc|\\bz\\b"]
+wrong_any = []
+
+# bug: Bug: exported added_at 2 h off; cause: naive datetime.now() (UTC+2) labelled as UTC
+[[facts]]
+id = "F20"
+subject = "linkshelf"
+relation = "bug:export_timestamps"
+object = "exported added_at 2 hours off: naive datetime.now() labelled as UTC"
+subject_type = "project"
+object_type = "observation"
+end_state = "live"
+[facts.match]
+core_all = ["two hours|\\b2 ?h(ours?)?\\b|hours off|timestamps? (were|was|are) off"]
+detail_all = ["datetime\\.now\\(\\)|naive|local time|timezone ambigu"]
+wrong_any = []
+
+# bug_fix: Fix: store datetime.now(timezone.utc); regression test test_export_utc; scripts/fix_tz.py corrects old rows
+[[facts]]
+id = "F21"
+subject = "linkshelf"
+relation = "fix:export_timestamps"
+object = "store datetime.now(timezone.utc), regression test test_export_utc, scripts/fix_tz.py corrects old rows"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["timezone\\.utc"]
+detail_all = ["test_export_utc", "fix_tz"]
+wrong_any = []
+
+# config: Formatter + linter: ruff (ruff format, ruff check); black removed
+[[facts]]
+id = "F22"
+subject = "linkshelf"
+relation = "setting:formatter"
+object = "ruff for formatting and linting (ruff format, ruff check)"
+subject_type = "project"
+object_type = "tool"
+end_state = "live"
+[facts.match]
+core_all = ["\\bruff\\b"]
+detail_all = ["format|lint|check"]
+wrong_any = []
+
+# config: ruff runs via pre-commit hooks (.pre-commit-config.yaml)
+[[facts]]
+id = "F23"
+subject = "linkshelf"
+relation = "setting:pre_commit"
+object = "ruff runs via pre-commit hooks (.pre-commit-config.yaml)"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["pre-?commit"]
+detail_all = ["ruff"]
+wrong_any = []
+
+# rule: Line length 100
+[[facts]]
+id = "F24"
+subject = "linkshelf"
+relation = "setting:line_length"
+object = "line length 100"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["line[ _-]?length\\W.*\\b100\\b|\\b100\\b.*line[ _-]?length"]
+detail_all = []
+wrong_any = []
+
+# decision: `linkshelf serve`: local web UI with Starlette + uvicorn
+[[facts]]
+id = "F25"
+subject = "linkshelf"
+relation = "decision:serve_stack"
+object = "linkshelf serve: local web UI with Starlette + uvicorn"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["starlette"]
+detail_all = ["uvicorn"]
+wrong_any = []
+
+# config: serve default port 8080
+[[facts]]
+id = "F26"
+subject = "linkshelf"
+relation = "setting:serve_port"
+object = "8080"
+subject_type = "project"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s11"
+[facts.match]
+core_all = ["\\b8080\\b"]
+detail_all = []
+wrong_any = []
+
+# config: Titles fetched on `add` with requests
+[[facts]]
+id = "F27"
+subject = "linkshelf"
+relation = "setting:http_client"
+object = "requests, used to fetch titles on add"
+subject_type = "project"
+object_type = "tool"
+end_state = "superseded"
+superseded_in = "s12"
+[facts.match]
+core_all = ["\\brequests\\b"]
+detail_all = []
+wrong_any = []
+
+# config: Title fetch timeout 5 s
+[[facts]]
+id = "F28"
+subject = "linkshelf"
+relation = "setting:title_fetch_timeout"
+object = "5 seconds"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["timeout\\D{0,30}\\b5\\b|\\b5 ?(s|sec|secs|seconds?)\\b.{0,20}timeout|timeout_seconds\\W+5\\b"]
+detail_all = []
+wrong_any = []
+
+# bug: Bug: `add` crashed with UnicodeDecodeError on a Shift_JIS page; body decoded as UTF-8 unconditionally
+[[facts]]
+id = "F29"
+subject = "linkshelf"
+relation = "bug:fetch_encoding"
+object = "add crashed with UnicodeDecodeError on a Shift_JIS page; body decoded as UTF-8 unconditionally"
+subject_type = "project"
+object_type = "observation"
+end_state = "live"
+[facts.match]
+core_all = ["shift_jis|unicodedecodeerror|japanese"]
+detail_all = ["utf-?8|unicodedecodeerror"]
+wrong_any = []
+
+# bug_fix: Fix: decode with the response charset and errors="replace"
+[[facts]]
+id = "F30"
+subject = "linkshelf"
+relation = "fix:fetch_encoding"
+object = "decode with the response charset and errors=\"replace\""
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["(response|header).{0,30}(charset|encoding)|charset.{0,40}(response|header)|response\\.encoding|apparent_encoding|errors=.?replace"]
+detail_all = ["replace"]
+wrong_any = []
+
+# rule: Minimal dependencies: no BeautifulSoup, use stdlib html.parser
+[[facts]]
+id = "F31"
+subject = "linkshelf"
+relation = "rule:dependencies"
+object = "minimal dependencies: no BeautifulSoup, use stdlib html.parser"
+subject_type = "project"
+object_type = "policy"
+end_state = "live"
+[facts.match]
+core_all = ["html\\.parser|minimal dep|few(est)? dependencies|minimi[sz]e dependencies"]
+detail_all = ["beautifulsoup|bs4", "html\\.parser"]
+wrong_any = []
+
+# config: CI on GitHub Actions, Python 3.12 + 3.13 matrix (ruff, mypy --strict, tests)
+[[facts]]
+id = "F32"
+subject = "linkshelf"
+relation = "setting:ci"
+object = "GitHub Actions, Python 3.12 + 3.13 matrix (ruff, mypy --strict, tests)"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["github actions"]
+detail_all = ["3\\.13|matrix"]
+wrong_any = []
+
+# config: Test command is `just test` = uv run pytest -q --cov=linkshelf --cov-fail-under=85
+[[facts]]
+id = "F33"
+subject = "linkshelf"
+relation = "setting:test_command"
+object = "just test = uv run pytest -q --cov=linkshelf --cov-fail-under=85"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["just test|justfile.{0,40}\\btest|\\btest.{0,40}justfile|pytest -q --cov"]
+detail_all = ["--cov|cov-fail-under"]
+wrong_any = []
+
+# rule: Coverage must be >= 85% (currently 88%)
+[[facts]]
+id = "F34"
+subject = "linkshelf"
+relation = "rule:coverage"
+object = "coverage must be at least 85% (currently 88%)"
+subject_type = "project"
+object_type = "policy"
+end_state = "live"
+[facts.match]
+core_all = ["(cov|coverage|fail.?under)\\D{0,40}\\b85\\b|\\b85 ?%"]
+detail_all = ["\\b88\\b"]
+wrong_any = []
+
+# config: serve default port 8765
+[[facts]]
+id = "F35"
+subject = "linkshelf"
+relation = "setting:serve_port"
+object = "8765"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["\\b8765\\b"]
+detail_all = []
+wrong_any = []
+
+# reason: Reason for F35: 8080 clashes with the user's other project's dev server
+[[facts]]
+id = "F36"
+subject = "linkshelf"
+relation = "reason:serve_port"
+object = "the old port clashes with the dev server of another project"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["(clash|conflict|collid).{0,80}(8080|dev server|other project)|(8080|dev server).{0,80}(clash|conflict|collid)"]
+detail_all = []
+wrong_any = []
+
+# config: Port configurable via `port` in ~/.config/linkshelf/config.toml or `--port`
+[[facts]]
+id = "F37"
+subject = "linkshelf"
+relation = "setting:port_override"
+object = "`port` in ~/.config/linkshelf/config.toml or --port"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["config\\.toml|--port"]
+detail_all = ["config\\.toml", "--port|command.?line|cli (flag|arg|option)"]
+wrong_any = []
+
+# config: HTTP client is httpx (AsyncClient); requests removed
+[[facts]]
+id = "F38"
+subject = "linkshelf"
+relation = "setting:http_client"
+object = "httpx AsyncClient"
+subject_type = "project"
+object_type = "tool"
+end_state = "live"
+[facts.match]
+core_all = ["\\bhttpx\\b"]
+detail_all = ["asyncclient"]
+wrong_any = []
+
+# decision: `linkshelf refresh` re-fetches all titles concurrently, global limit 8 (asyncio.Semaphore)
+[[facts]]
+id = "F39"
+subject = "linkshelf"
+relation = "decision:refresh"
+object = "refresh re-fetches all titles concurrently with a global limit of 8 (asyncio.Semaphore)"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["(global|concurren|limit|cap|max)\\D{0,40}\\b8\\b|semaphore\\(8\\)|\\b8\\b\\D{0,20}(global|concurren)"]
+detail_all = ["refresh"]
+wrong_any = []
+
+# bug: Bug: refresh rate-limited (429) by github.com: too many concurrent requests to one host
+[[facts]]
+id = "F40"
+subject = "linkshelf"
+relation = "bug:refresh_rate_limit"
+object = "refresh rate-limited (429) by github.com: too many concurrent connections to one host"
+subject_type = "project"
+object_type = "observation"
+end_state = "live"
+[facts.match]
+core_all = ["\\b429\\b|rate.?limit"]
+detail_all = ["github"]
+wrong_any = []
+
+# bug_fix: Fix: per-host semaphore of 2 on top of the global 8
+[[facts]]
+id = "F41"
+subject = "linkshelf"
+relation = "fix:refresh_rate_limit"
+object = "per-host semaphore of 2 on top of the global 8"
+subject_type = "project"
+object_type = "decision"
+end_state = "live"
+[facts.match]
+core_all = ["per[ _-]?host"]
+detail_all = ["\\b2\\b"]
+wrong_any = []
+
+# rule: tenacity/backoff was tried and removed: the user does not want that dependency
+[[facts]]
+id = "F42"
+subject = "linkshelf"
+relation = "rule:retry_dependency"
+object = "tenacity as a dependency (tried and removed)"
+subject_type = "project"
+object_type = "policy"
+end_state = "rejected"
+[facts.match]
+core_all = ["tenacity|backoff"]
+detail_all = ["depend"]
+wrong_any = []
+
+# release: v0.2.0 released: SQLite + tags table, export, serve, refresh, UTC + charset fixes
+[[facts]]
+id = "F43"
+subject = "linkshelf"
+relation = "release:v0.2.0"
+object = "v0.2.0 released: SQLite + tags table, export, serve, refresh, UTC and charset fixes"
+subject_type = "project"
+object_type = "event"
+end_state = "live"
+[facts.match]
+core_all = ["0\\.2\\.0"]
+detail_all = ["0\\.2\\.0.*(sqlite|export|serve|refresh|utc|charset)|(sqlite|export|serve|refresh|utc|charset).*0\\.2\\.0"]
+wrong_any = []
+
+# release: Publishing via PyPI trusted publishing from GitHub Actions on `v*` tags (no API token); release.yml
+[[facts]]
+id = "F44"
+subject = "linkshelf"
+relation = "release:publishing"
+object = "PyPI trusted publishing from GitHub Actions on v* tags, no API token (release.yml)"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["trusted publish|pypi"]
+detail_all = ["trusted", "v\\*|tags?|token|release\\.yml"]
+wrong_any = []
+
+# release: Version lives only in pyproject.toml, read with importlib.metadata
+[[facts]]
+id = "F45"
+subject = "linkshelf"
+relation = "release:versioning"
+object = "version lives only in pyproject.toml, read with importlib.metadata"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["importlib"]
+detail_all = ["pyproject"]
+wrong_any = []
+
+# plan: v0.3 plan: import bookmarks from Firefox places.sqlite
+[[facts]]
+id = "F46"
+subject = "linkshelf"
+relation = "plan:next_release"
+object = "v0.3: import bookmarks from Firefox places.sqlite"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["places\\.sqlite|v?0\\.3(?:$|[^\\w.])|firefox.{0,30}import|import.{0,30}firefox"]
+detail_all = ["firefox"]
+wrong_any = []
+
+[[superseded_pairs]]
+old = "F04"
+new = "F14"
+retire_in = "s04"
+
+[[superseded_pairs]]
+old = "F09"
+new = "F15"
+retire_in = "s04"
+
+[[superseded_pairs]]
+old = "F10"
+new = "F22"
+retire_in = "s07"
+
+[[superseded_pairs]]
+old = "F05"
+new = "F33"
+retire_in = "s10"
+
+[[superseded_pairs]]
+old = "F26"
+new = "F35"
+retire_in = "s11"
+
+[[superseded_pairs]]
+old = "F27"
+new = "F38"
+retire_in = "s12"
+
+# chit-chat: coffee is terrible; it's raining
+[[noise]]
+id = "N01"
+session = "s01"
+match_any = ["coffee|raining|\\brain\\b"]
+
+# `rich` for tables: explicitly not decided (maybe later)
+[[noise]]
+id = "N02"
+session = "s03"
+match_any = ["\\brich\\b"]
+
+# tabs vs spaces joke (spaces is just ruff's default)
+[[noise]]
+id = "N03"
+session = "s07"
+match_any = ["\\btabs?\\b|spaces vs|indentation"]
+
+# user on holiday the week after next
+[[noise]]
+id = "N04"
+session = "s11"
+match_any = ["holiday|vacation"]
+
+# Firefox *sync*: someday, just a thought, not a plan (not the same as F46)
+[[noise]]
+id = "N05"
+session = "s11"
+match_any = ["firefox.{0,20}sync|sync.{0,20}firefox"]
+
+# typo `refrsh` -> 'No such command' tool error
+[[noise]]
+id = "N06"
+session = "s12"
+match_any = ["refrsh|no such command"]
+
+# tenacity run: '41.3s (37 retries)' (transient tool output)
+[[noise]]
+id = "N07"
+session = "s13"
+match_any = ["41\\.3|37 retries"]
+
+# Existing validation requires every fact in expect; live mirrors end_state.
+[[expect]]
+fact = "F01"
+live = true
+
+[[expect]]
+fact = "F02"
+live = true
+
+[[expect]]
+fact = "F03"
+live = true
+
+[[expect]]
+fact = "F04"
+live = false
+
+[[expect]]
+fact = "F05"
+live = false
+
+[[expect]]
+fact = "F06"
+live = true
+
+[[expect]]
+fact = "F07"
+live = true
+
+[[expect]]
+fact = "F08"
+live = true
+
+[[expect]]
+fact = "F09"
+live = false
+
+[[expect]]
+fact = "F10"
+live = false
+
+[[expect]]
+fact = "F11"
+live = true
+
+[[expect]]
+fact = "F12"
+live = true
+
+[[expect]]
+fact = "F13"
+live = true
+
+[[expect]]
+fact = "F14"
+live = true
+
+[[expect]]
+fact = "F15"
+live = true
+
+[[expect]]
+fact = "F16"
+live = true
+
+[[expect]]
+fact = "F17"
+live = true
+
+[[expect]]
+fact = "F18"
+live = true
+
+[[expect]]
+fact = "F19"
+live = true
+
+[[expect]]
+fact = "F20"
+live = true
+
+[[expect]]
+fact = "F21"
+live = true
+
+[[expect]]
+fact = "F22"
+live = true
+
+[[expect]]
+fact = "F23"
+live = true
+
+[[expect]]
+fact = "F24"
+live = true
+
+[[expect]]
+fact = "F25"
+live = true
+
+[[expect]]
+fact = "F26"
+live = false
+
+[[expect]]
+fact = "F27"
+live = false
+
+[[expect]]
+fact = "F28"
+live = true
+
+[[expect]]
+fact = "F29"
+live = true
+
+[[expect]]
+fact = "F30"
+live = true
+
+[[expect]]
+fact = "F31"
+live = true
+
+[[expect]]
+fact = "F32"
+live = true
+
+[[expect]]
+fact = "F33"
+live = true
+
+[[expect]]
+fact = "F34"
+live = true
+
+[[expect]]
+fact = "F35"
+live = true
+
+[[expect]]
+fact = "F36"
+live = true
+
+[[expect]]
+fact = "F37"
+live = true
+
+[[expect]]
+fact = "F38"
+live = true
+
+[[expect]]
+fact = "F39"
+live = true
+
+[[expect]]
+fact = "F40"
+live = true
+
+[[expect]]
+fact = "F41"
+live = true
+
+[[expect]]
+fact = "F42"
+live = false
+
+[[expect]]
+fact = "F43"
+live = true
+
+[[expect]]
+fact = "F44"
+live = true
+
+[[expect]]
+fact = "F45"
+live = true
+
+[[expect]]
+fact = "F46"
+live = true

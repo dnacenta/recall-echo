@@ -236,6 +236,10 @@ enum BenchCommands {
         /// Provider model override
         #[arg(long)]
         model: Option<String>,
+        /// Fresh scratch stores to grade. One prints the single report.
+        /// More than one prints each run plus the median and the range.
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
     },
 }
 
@@ -1023,7 +1027,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             work_dir,
             provider,
             model,
-        } => run_writes(script, work_dir, provider, model),
+            repeat,
+        } => run_writes(script, work_dir, provider, model, repeat),
     }
 }
 
@@ -1033,9 +1038,15 @@ fn run_writes(
     work_dir: Option<PathBuf>,
     provider: Option<String>,
     model: Option<String>,
+    repeat: usize,
 ) -> Result<(), recall_echo::error::RecallError> {
-    use recall_echo::bench::writes::{self, Extractor};
+    use recall_echo::bench::writes;
 
+    if repeat == 0 {
+        return Err(recall_echo::error::RecallError::Config(
+            "repeat must be at least 1".into(),
+        ));
+    }
     let script = writes::load_script(&script)?;
     let scratch = match work_dir {
         Some(dir) => {
@@ -1046,22 +1057,62 @@ fn run_writes(
     };
     let root = scratch.path().to_path_buf();
     let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
-    let report = rt.block_on(async {
-        match provider {
-            Some(name) => {
-                let memory_dir = root.join("memory");
-                let (llm, _) = recall_echo::llm_provider::create_provider(
-                    &memory_dir,
-                    Some(&name),
-                    model.as_deref(),
-                )?;
-                writes::run(&script, &root, Extractor::Live(llm.as_ref())).await
-            }
-            None => writes::run(&script, &root, Extractor::Scripted).await,
-        }
-    })?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let json = if repeat == 1 {
+        let report = rt.block_on(grade_once(&script, &root, provider, model.as_deref()))?;
+        serde_json::to_string_pretty(&report)?
+    } else {
+        let report = rt.block_on(grade_repeat(
+            &script,
+            &root,
+            repeat,
+            provider,
+            model.as_deref(),
+        ))?;
+        serde_json::to_string_pretty(&report)?
+    };
+    println!("{json}");
     Ok(())
+}
+
+#[cfg(feature = "bench")]
+async fn grade_once(
+    script: &recall_echo::bench::writes::FactScript,
+    root: &std::path::Path,
+    provider: Option<String>,
+    model: Option<&str>,
+) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
+    use recall_echo::bench::writes::{self, Extractor};
+
+    match provider {
+        Some(name) => {
+            let memory_dir = root.join("memory");
+            let (llm, _) =
+                recall_echo::llm_provider::create_provider(&memory_dir, Some(&name), model)?;
+            writes::run(script, root, Extractor::Live(llm.as_ref())).await
+        }
+        None => writes::run(script, root, Extractor::Scripted).await,
+    }
+}
+
+#[cfg(feature = "bench")]
+async fn grade_repeat(
+    script: &recall_echo::bench::writes::FactScript,
+    root: &std::path::Path,
+    repeat: usize,
+    provider: Option<String>,
+    model: Option<&str>,
+) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
+    use recall_echo::bench::writes::{self, Extractor};
+
+    match provider {
+        Some(name) => {
+            let memory_dir = root.join("memory");
+            let (llm, _) =
+                recall_echo::llm_provider::create_provider(&memory_dir, Some(&name), model)?;
+            writes::run_repeat(script, root, repeat, Extractor::Live(llm.as_ref())).await
+        }
+        None => writes::run_repeat(script, root, repeat, Extractor::Scripted).await,
+    }
 }
 
 #[cfg(feature = "bench")]
