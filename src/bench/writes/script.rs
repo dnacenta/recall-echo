@@ -165,9 +165,12 @@ pub enum EndState {
     /// Still asserted.
     #[default]
     Live,
-    /// Replaced. A live record that still matches is stale.
+    /// Replaced. A live record that still matches the old value is stale,
+    /// except one assigned to the successor that also matches the new value.
     Superseded,
-    /// Refused. Graded only as found or missing; rejection is later work.
+    /// Refused. A live core match is `rejected_live` (wrong, not found);
+    /// no live match is correct-absent. The fact does not take a record
+    /// from a live fact.
     Rejected,
 }
 
