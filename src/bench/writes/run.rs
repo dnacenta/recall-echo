@@ -64,6 +64,9 @@ pub fn require_scratch(path: &Path) -> Result<(), RecallError> {
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
 /// `work_dir` must be missing or empty. The function creates `memory/` under it.
+///
+/// Session `millis` is ingest time. Model load is measured first and reported
+/// as `setup_millis`, so the first session is not charged for it.
 pub async fn run(
     script: &FactScript,
     work_dir: &Path,
@@ -75,6 +78,11 @@ pub async fn run(
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
     let (label, provider) = provider_for(script, extractor)?;
+
+    // The first embed loads the model. Do that outside the session clock.
+    let setup_started = Instant::now();
+    gm.embedder()?;
+    let setup_millis = u64::try_from(setup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut before = snapshot(&gm).await?;
     let mut sessions = Vec::with_capacity(written.len());
@@ -108,7 +116,9 @@ pub async fn run(
         .iter()
         .map(|question| keyword_hit(&memory_dir, &question.text, &question.answer))
         .collect::<Result<Vec<_>, _>>()?;
-    grade::grade(script, &sessions, &weights, &keyword_hits, label)
+    let mut report = grade::grade(script, &sessions, &weights, &keyword_hits, label)?;
+    report.setup_millis = setup_millis;
+    Ok(report)
 }
 
 /// Whether keyword search returns an archive that contains `answer`.

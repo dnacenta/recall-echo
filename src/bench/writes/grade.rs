@@ -156,7 +156,10 @@ pub struct WriteReport {
     pub steps: Vec<StepLog>,
     pub questions: Vec<QuestionScore>,
     pub calls: u64,
+    /// Sum of per-session ingest time. Model load is [`WriteReport::setup_millis`].
     pub millis: u64,
+    /// Time to open the embedder before the first session is timed.
+    pub setup_millis: u64,
 }
 
 type EdgeKey = (String, String, String);
@@ -362,6 +365,7 @@ pub fn grade(
         questions,
         calls: sessions.iter().map(|s| s.calls).sum(),
         millis: sessions.iter().map(|s| s.millis).sum(),
+        setup_millis: 0,
     })
 }
 
