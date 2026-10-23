@@ -4,11 +4,11 @@
 
 //! Claude Code transcripts — `~/.claude/projects/<project>/<session>.jsonl`.
 //!
-//! The parser itself is [`crate::jsonl`], unchanged: Claude Code's SessionEnd
-//! hook has always used it, thousands of archives were written by it, and its
-//! output is what every other adapter is measured against. This adapter adds
-//! only the two things the hook never needed — where the files are, and which
-//! of them are new.
+//! The parser is [`crate::jsonl`]. Claude Code's SessionEnd hook has always
+//! used it, thousands of archives were written by it, and its output is what
+//! every other adapter is measured against. This adapter adds only the two
+//! things the hook never needed — where the files are, and which of them are
+//! new.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
