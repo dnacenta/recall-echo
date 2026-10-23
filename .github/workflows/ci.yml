@@ -33,3 +33,6 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: E9 check
+        run: cargo run --example e9_provenance_ablation -- check
