@@ -39,6 +39,10 @@ pub enum WriteOp {
     Contradict,
     #[serde(rename = "no-op")]
     NoOp,
+    /// An edge that was present and then gone. Never expected by a claim.
+    Removed,
+    /// An edge that was not live and then was. Never expected by a claim.
+    Revived,
 }
 
 /// One edge as read back from the store.
@@ -85,6 +89,8 @@ pub struct OpTable {
     pub contradict: OpScore,
     #[serde(rename = "no-op")]
     pub no_op: OpScore,
+    pub removed: OpScore,
+    pub revived: OpScore,
 }
 
 /// A fact whose end state does not match the script.
@@ -173,6 +179,8 @@ enum Effect {
         key: EdgeKey,
         delta_beta: f64,
     },
+    Removed,
+    Revived,
 }
 
 impl Effect {
@@ -182,6 +190,8 @@ impl Effect {
             Self::Corroborated { .. } => WriteOp::Corroborate,
             Self::Retired { .. } => WriteOp::Supersede,
             Self::Contradicted { .. } => WriteOp::Contradict,
+            Self::Removed => WriteOp::Removed,
+            Self::Revived => WriteOp::Revived,
         }
     }
 }
@@ -210,6 +220,8 @@ struct Tally {
     supersede: Counts,
     contradict: Counts,
     no_op: Counts,
+    removed: Counts,
+    revived: Counts,
 }
 
 impl Tally {
@@ -240,6 +252,16 @@ impl Tally {
                 fp: 0,
                 missed: 0,
             },
+            removed: Counts {
+                tp: 0,
+                fp: 0,
+                missed: 0,
+            },
+            revived: Counts {
+                tp: 0,
+                fp: 0,
+                missed: 0,
+            },
         }
     }
 
@@ -250,6 +272,8 @@ impl Tally {
             WriteOp::Supersede => &mut self.supersede,
             WriteOp::Contradict => &mut self.contradict,
             WriteOp::NoOp => &mut self.no_op,
+            WriteOp::Removed => &mut self.removed,
+            WriteOp::Revived => &mut self.revived,
         }
     }
 
@@ -320,6 +344,8 @@ pub fn grade(
             supersede: tally.supersede.score(),
             contradict: tally.contradict.score(),
             no_op: tally.no_op.score(),
+            removed: tally.removed.score(),
+            revived: tally.revived.score(),
         },
         wrong_facts,
         junk_edges,
@@ -604,10 +630,8 @@ fn corroboration_fits(
     }
     let weight = speaker_weight(speaker, weights);
     match speaker {
-        Speaker::Assistant => {
-            let steps = u32::try_from(delta_self).unwrap_or(0);
-            delta_self >= 1 && approx(delta_alpha, weight * f64::from(steps))
-        }
+        // One claim is one reinforcement. A larger jump is a different event.
+        Speaker::Assistant => delta_self == 1 && approx(delta_alpha, weight),
         Speaker::User => delta_self == 0 && approx(delta_alpha, weight),
     }
 }
@@ -622,7 +646,13 @@ fn speaker_weight(speaker: Speaker, weights: &ProvenanceWeights) -> f64 {
 fn diff(before: &[ObservedEdge], after: &[ObservedEdge]) -> Vec<Effect> {
     let prev: HashMap<&str, &ObservedEdge> =
         before.iter().map(|edge| (edge.id.as_str(), edge)).collect();
+    let still_there: HashSet<&str> = after.iter().map(|edge| edge.id.as_str()).collect();
     let mut effects = Vec::new();
+    for edge in before {
+        if !still_there.contains(edge.id.as_str()) {
+            effects.push(Effect::Removed);
+        }
+    }
     for edge in after {
         let key = edge.key();
         match prev.get(edge.id.as_str()) {
@@ -634,6 +664,9 @@ fn diff(before: &[ObservedEdge], after: &[ObservedEdge]) -> Vec<Effect> {
 }
 
 fn push_update(effects: &mut Vec<Effect>, old: &ObservedEdge, edge: &ObservedEdge, key: EdgeKey) {
+    if !old.live && edge.live {
+        effects.push(Effect::Revived);
+    }
     if old.live && !edge.live {
         effects.push(Effect::Retired { key });
         return;
@@ -1185,6 +1218,86 @@ mod tests {
         .unwrap();
         assert_eq!(report.operations.corroborate, full(1));
         assert!(report.wrong_facts.is_empty());
+    }
+
+    #[test]
+    fn two_self_reinforcements_are_not_one_assistant_claim() {
+        let script = FactScript {
+            name: "self".into(),
+            sessions: vec![session(
+                "s1",
+                turn(
+                    Speaker::Assistant,
+                    "note",
+                    vec![claim(ClaimOp::Corroborate, "host", None)],
+                    false,
+                ),
+            )],
+            facts: vec![fact("host", "pine")],
+            expect: vec![ExpectedFact {
+                fact: "host".into(),
+                live: true,
+                provenance: None,
+                self_reinforcements: None,
+            }],
+            questions: vec![],
+        };
+        let before = edge("pine", "pine", true, 9.0, 1.0, 0);
+        let after = edge(
+            "pine",
+            "pine",
+            true,
+            9.0 + 2.0 * weights().weight_self,
+            1.0,
+            2,
+        );
+        let report = grade(
+            &script,
+            &[obs("s1", vec![before], vec![after])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert_eq!(report.operations.corroborate.tp, 0);
+        assert_eq!(report.operations.corroborate.fp, 1);
+        assert_eq!(report.operations.corroborate.missed, 1);
+    }
+
+    #[test]
+    fn a_deleted_edge_and_a_revived_edge_are_false_positives() {
+        let script = FactScript {
+            name: "gone".into(),
+            sessions: vec![
+                session("s1", turn(Speaker::User, "quiet", vec![], true)),
+                session("s2", turn(Speaker::User, "again", vec![], true)),
+            ],
+            facts: vec![fact("host", "pine")],
+            expect: vec![ExpectedFact {
+                fact: "host".into(),
+                live: true,
+                provenance: None,
+                self_reinforcements: None,
+            }],
+            questions: vec![],
+        };
+        let dead = edge("pine", "pine", false, 9.0, 1.0, 0);
+        let live = edge("pine", "pine", true, 9.0, 1.0, 0);
+        let report = grade(
+            &script,
+            &[
+                obs("s1", vec![live.clone()], vec![]),
+                obs("s2", vec![dead.clone()], vec![live]),
+            ],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert_eq!(report.operations.removed.fp, 1);
+        assert_eq!(report.operations.removed.tp, 0);
+        assert_eq!(report.operations.revived.fp, 1);
+        assert_eq!(report.operations.revived.tp, 0);
     }
 
     #[test]

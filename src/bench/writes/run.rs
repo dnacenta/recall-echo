@@ -624,6 +624,8 @@ mod tests {
         assert_eq!(report.operations.supersede, counted(0, 0, 1));
         assert_eq!(report.operations.contradict, counted(0, 0, 1));
         assert_eq!(report.operations.no_op, counted(1, 0, 1));
+        assert_eq!(report.operations.removed, counted(0, 0, 0));
+        assert_eq!(report.operations.revived, counted(0, 0, 0));
         assert_eq!(
             report.wrong_facts,
             vec![
