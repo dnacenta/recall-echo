@@ -224,6 +224,7 @@ async fn define_meta(db: &Surreal<Db>) -> Result<(), GraphError> {
         r#"
         DEFINE TABLE IF NOT EXISTS meta SCHEMAFULL;
         DEFINE FIELD IF NOT EXISTS schema_version ON meta TYPE int DEFAULT 0;
+        DEFINE FIELD IF NOT EXISTS pipeline ON meta TYPE option<string>;
         "#,
     )
     .await?
@@ -290,6 +291,10 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS self_reinforcements ON relates_to TYPE option<int>;
         DEFINE FIELD IF NOT EXISTS last_reinforced ON relates_to TYPE option<datetime>;
         DEFINE FIELD IF NOT EXISTS source      ON relates_to TYPE option<string>;
+        DEFINE FIELD IF NOT EXISTS status      ON relates_to TYPE option<string>;
+        DEFINE FIELD IF NOT EXISTS provenance  ON relates_to TYPE option<string>;
+        DEFINE FIELD IF NOT EXISTS ended_by    ON relates_to TYPE option<string>;
+        DEFINE FIELD IF NOT EXISTS evidence    ON relates_to TYPE option<array<object>> FLEXIBLE;
 
         DEFINE INDEX IF NOT EXISTS rel_type_idx ON relates_to FIELDS rel_type;
 

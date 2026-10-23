@@ -389,6 +389,7 @@ impl ExtractionWorker {
 pub struct GraphExtractionUnit {
     graph: Arc<GraphMemory>,
     llm: Box<dyn LlmProvider>,
+    memory_dir: PathBuf,
     conversations_dir: PathBuf,
     quarantine_path: PathBuf,
 }
@@ -398,12 +399,14 @@ impl GraphExtractionUnit {
     pub fn new(
         graph: Arc<GraphMemory>,
         llm: Box<dyn LlmProvider>,
+        memory_dir: PathBuf,
         conversations_dir: PathBuf,
         quarantine_path: PathBuf,
     ) -> Self {
         Self {
             graph,
             llm,
+            memory_dir,
             conversations_dir,
             quarantine_path,
         }
@@ -431,11 +434,18 @@ impl ExtractionUnit for GraphExtractionUnit {
         let content = std::fs::read_to_string(&path)?;
         let (session_id, _) = crate::graph_cli::extract_archive_metadata(&content, &path);
         let context = IngestContext::new(session_id, Some(log_number));
+        let pipeline = crate::graph::v2::pipeline_for_hook(&self.memory_dir);
 
-        let report = self
-            .graph
-            .extract_from_archive(&content, &context, self.llm.as_ref())
-            .await?;
+        let report = crate::graph::v2::extract_log(
+            &self.graph,
+            &self.memory_dir,
+            log_number,
+            &content,
+            &context,
+            self.llm.as_ref(),
+            pipeline,
+        )
+        .await?;
         // Decide before marking: a total failure is an Err and stays pending.
         let outcome = unit_outcome(report)?;
         self.graph.mark_extracted(log_number).await?;
@@ -465,6 +475,17 @@ impl ExtractionUnit for GraphExtractionUnit {
 fn unit_outcome(report: crate::graph::types::IngestionReport) -> Result<UnitReport, GraphError> {
     if report.is_total_failure() {
         return Err(GraphError::Llm(all_failed_message(&report)));
+    }
+    // A v2 window that failed twice is not a finished session. v1 partial
+    // yield (`windows == 0`) is still a report, and is marked.
+    if report.leaves_pending() {
+        let first = report.errors.first().map_or("", String::as_str);
+        return Err(GraphError::Llm(format!(
+            "{} of {} windows failed, session left pending; first: {}",
+            report.chunks_failed,
+            report.windows,
+            one_line(first),
+        )));
     }
     Ok(UnitReport {
         entities: report.entities_created + report.entities_merged,
@@ -578,6 +599,7 @@ pub fn spawn(setup: Setup) -> Option<tokio::task::JoinHandle<()>> {
     let unit: Arc<dyn ExtractionUnit> = Arc::new(GraphExtractionUnit::new(
         Arc::clone(&setup.graph),
         llm,
+        setup.memory_dir.clone(),
         conversations_dir,
         setup
             .memory_dir
@@ -702,6 +724,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "llm error: all 3 extraction chunks failed, nothing extracted; first: extraction chunk 0: failed to spawn claude: No such file"
+        );
+    }
+
+    #[test]
+    fn a_failed_v2_window_is_not_a_finished_session() {
+        let mut report = report_with(2, 1, &["parse failure: no JSON object"]);
+        report.windows = 2;
+        let err = unit_outcome(report).expect_err("left pending");
+        assert!(
+            err.to_string()
+                .contains("1 of 2 windows failed, session left pending"),
+            "{err}"
         );
     }
 
