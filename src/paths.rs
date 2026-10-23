@@ -287,6 +287,16 @@ pub enum PersistOutcome {
     Skipped(&'static str),
 }
 
+/// Whether stdin and stderr are both terminals.
+///
+/// stderr alone is not enough — with stdin piped, a blank line in the pipe
+/// would read as a prompt's default answer, and a default of yes would
+/// change a setting nobody was asked about.
+fn stdio_is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 /// The global destinations `init` writes to, resolved once and passed down.
 ///
 /// `init` touches three things nobody named on the command line: the Claude
@@ -307,6 +317,10 @@ pub struct ConfigRoots {
     agent_home: Option<PathBuf>,
     recall_bin: String,
     spawns_agents: bool,
+    /// Whether `init` may ask the user anything.
+    interactive: bool,
+    /// Claude Code's own auto-memory switch as the session sees it.
+    auto_memory_env: Option<String>,
 }
 
 impl ConfigRoots {
@@ -331,6 +345,8 @@ impl ConfigRoots {
             agent_home: None,
             recall_bin,
             spawns_agents: true,
+            interactive: stdio_is_interactive(),
+            auto_memory_env: std::env::var(crate::claude_settings::AUTO_MEMORY_ENV).ok(),
         }
     }
 
@@ -351,7 +367,24 @@ impl ConfigRoots {
             agent_home: Some(dir.to_path_buf()),
             recall_bin: dir.join("bin").join("recall-echo").display().to_string(),
             spawns_agents: false,
+            interactive: false,
+            auto_memory_env: None,
         })
+    }
+
+    /// [`ConfigRoots::sandboxed`], but with the hooks' binary under
+    /// `<dir>/target/debug/` — what `cargo test` and `cargo run` look like —
+    /// so the build-directory guard is what decides.
+    #[cfg(test)]
+    pub(crate) fn sandboxed_in_build_dir(dir: &Path) -> Result<Self, RecallError> {
+        let mut roots = Self::sandboxed(dir)?;
+        roots.recall_bin = dir
+            .join("target")
+            .join("debug")
+            .join("recall-echo")
+            .display()
+            .to_string();
+        Ok(roots)
     }
 
     /// The same roots with no Claude Code installed — the branch where hooks
@@ -379,6 +412,51 @@ impl ConfigRoots {
     #[must_use]
     pub fn entity_root_file(&self) -> Option<&Path> {
         self.pulse_root_file()
+    }
+
+    /// The same roots, answering as though the session were (or were not)
+    /// at a terminal — tests drive the prompts with this.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+
+    /// The same roots, as though they belonged to the user whose home is
+    /// `home` — tests place pulses there.
+    #[cfg(test)]
+    pub(crate) fn with_home(mut self, home: &Path) -> Self {
+        self.agent_home = Some(home.to_path_buf());
+        self
+    }
+
+    /// The same roots, as though Claude Code's auto-memory switch read `value`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_auto_memory_env(mut self, value: Option<&str>) -> Self {
+        self.auto_memory_env = value.map(str::to_string);
+        self
+    }
+
+    /// Whether `init` may ask anything: stdin and stderr were both terminals
+    /// in [`ConfigRoots::from_env`]; never in a sandbox unless set.
+    #[must_use]
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
+
+    /// `CLAUDE_CODE_DISABLE_AUTO_MEMORY` as this run sees it.
+    #[must_use]
+    pub fn auto_memory_env(&self) -> Option<&str> {
+        self.auto_memory_env.as_deref()
+    }
+
+    /// The home directory of the user these roots configure: the sandbox
+    /// under test, the real home otherwise.
+    #[must_use]
+    pub fn home(&self) -> Option<PathBuf> {
+        self.agent_home.clone().or_else(dirs::home_dir)
     }
 
     /// The binary path written into hooks and MCP registrations.

@@ -112,6 +112,103 @@ pub(crate) fn require_private_dir(dir: &Path) -> Result<(), RecallError> {
     Ok(())
 }
 
+/// The user's private group, when the account has one: its primary group,
+/// named after the user, with no other members.
+///
+/// That is the user-private-group scheme Ubuntu and Fedora use, under which
+/// login shells run with a umask of 0002 and every file a user makes is
+/// group-writable — harmlessly, because the group holds nobody else. `None`
+/// when the account or group cannot be read, or the group is shared.
+pub(crate) fn private_group(uid: u32) -> Option<u32> {
+    let (user, gid) = user_name_and_gid(uid)?;
+    let (group, members) = group_name_and_members(gid)?;
+    (group == user && members.iter().all(|member| *member == user)).then_some(gid)
+}
+
+/// A group's name, for messages; `None` when it cannot be read.
+pub(crate) fn group_name(gid: u32) -> Option<String> {
+    group_name_and_members(gid).map(|(name, _)| name)
+}
+
+/// Call a `get*_r` lookup with a buffer that grows on `ERANGE`.
+fn with_lookup_buffer<T>(mut lookup: impl FnMut(&mut [u8]) -> Result<Option<T>, i32>) -> Option<T> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match lookup(&mut buf) {
+            Err(libc::ERANGE) if buf.len() < 1 << 20 => buf.resize(buf.len() * 2, 0),
+            Ok(found) => return found,
+            Err(_) => return None,
+        }
+    }
+}
+
+fn user_name_and_gid(uid: u32) -> Option<(String, u32)> {
+    with_lookup_buffer(|buf| {
+        // SAFETY: `pwd` and `result` outlive the call, `buf` is a valid
+        // writable buffer of the length passed, and the strings read below
+        // point into `buf`, which is still alive.
+        unsafe {
+            let mut pwd: libc::passwd = std::mem::zeroed();
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            );
+            if rc != 0 {
+                return Err(rc);
+            }
+            if result.is_null() {
+                return Ok(None);
+            }
+            let name = std::ffi::CStr::from_ptr(pwd.pw_name)
+                .to_string_lossy()
+                .into_owned();
+            Ok(Some((name, pwd.pw_gid)))
+        }
+    })
+}
+
+fn group_name_and_members(gid: u32) -> Option<(String, Vec<String>)> {
+    with_lookup_buffer(|buf| {
+        // SAFETY: as in `user_name_and_gid`; `gr_mem` is a NULL-terminated
+        // array of pointers into `buf`.
+        unsafe {
+            let mut grp: libc::group = std::mem::zeroed();
+            let mut result: *mut libc::group = std::ptr::null_mut();
+            let rc = libc::getgrgid_r(
+                gid,
+                &mut grp,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            );
+            if rc != 0 {
+                return Err(rc);
+            }
+            if result.is_null() {
+                return Ok(None);
+            }
+            let name = std::ffi::CStr::from_ptr(grp.gr_name)
+                .to_string_lossy()
+                .into_owned();
+            let mut members = Vec::new();
+            let mut member = grp.gr_mem;
+            while !member.is_null() && !(*member).is_null() {
+                members.push(
+                    std::ffi::CStr::from_ptr(*member)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                member = member.add(1);
+            }
+            Ok(Some((name, members)))
+        }
+    })
+}
+
 /// Verify that `dir` is a directory only this user can write into.
 ///
 /// The policy for a directory recall-echo does *not* own — one named by

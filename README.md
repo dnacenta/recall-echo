@@ -27,8 +27,9 @@ curl -fsSL https://raw.githubusercontent.com/dnacenta/recall-echo/main/install.s
 recall-echo init
 ```
 
-`init` finds your agent CLIs (Claude Code, Codex, Grok, Gemini), installs the hooks,
-registers the MCP server with each and downloads the embedding model. With cargo:
+`init` finds your agent CLIs (Claude Code, Codex, Grok, Gemini), installs the hooks and
+the rules file that loads MEMORY.md into every Claude Code session, registers the MCP
+server with each and downloads the embedding model. With cargo:
 `cargo install recall-echo --locked`. Prebuilt binaries are on the
 [releases page](https://github.com/dnacenta/recall-echo/releases/latest).
 

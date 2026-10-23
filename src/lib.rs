@@ -30,6 +30,7 @@ pub mod archive;
 pub mod archive_extract;
 pub mod capture;
 pub mod checkpoint;
+pub(crate) mod claude_settings;
 pub mod cli_provider;
 pub mod config;
 pub mod config_cli;
@@ -45,6 +46,7 @@ pub mod inspect_cli;
 pub mod jsonl;
 pub mod mcp;
 pub mod paths;
+pub(crate) mod rules_file;
 pub mod search;
 pub mod serve;
 pub mod serve_capture;
@@ -67,7 +69,10 @@ pub mod llm_provider;
 #[cfg(feature = "pulse-null")]
 pub mod pulse_null;
 
-#[cfg(feature = "bench")]
+// `cargo test` does not enable optional features, and the writes harness has
+// to compile in that run. `answer` calls the provider, so it stays behind
+// `llm` (which the `bench` feature enables) rather than every test build.
+#[cfg(any(test, feature = "bench"))]
 pub mod bench;
 
 #[cfg(feature = "self-update")]

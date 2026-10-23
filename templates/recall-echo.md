@@ -1,76 +1,38 @@
+{{MARKER}}
 # recall-echo — Memory Protocol
 
-You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
+You have a persistent four-layer memory, kept by recall-echo in `{{MEMORY_DIR}}/`. Use it to keep continuity across sessions.
 
 ## Memory Layers
 
-### Layer 0 — Knowledge Graph (structured, semantic)
-- Embedded SurrealDB graph database with FastEmbed local embeddings.
-- Stores entities, relationships, and conversation episodes.
-- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
-- Semantic search finds memories by meaning, not just keywords.
-- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
+### Layer 0 — Knowledge graph
+- Entities, relationships (each with a Bayesian confidence) and conversation episodes, built automatically from archived sessions.
+- Read it with the recall-echo MCP tools. There are six, all read-only: `recall_query` first, then `recall_search`, `recall_episodes`, `recall_traverse`, `recall_overview` and `recall_status`. The CLI equivalent is `recall-echo graph query|search|traverse`.
+- Query it before answering anything that depends on earlier sessions and is not in MEMORY.md.
 
-### Layer 1 — Curated Memory (MEMORY.md)
-- Location: `~/.claude/memory/MEMORY.md`
-- Your source of truth. Distilled facts, preferences, patterns, key decisions.
-- Auto-loaded at session start (first 200 lines).
-- Keep under 200 lines. Only write confirmed, stable information.
-- Before adding, check if an existing entry should be updated. No duplicates.
+### Layer 1 — Curated memory (MEMORY.md)
+{{MEMORY_IMPORT}}
 
-### Layer 2 — Recent Sessions (EPHEMERAL.md)
-@~/.claude/EPHEMERAL.md
-- Rolling window of your last 5 session summaries.
-- Read at session start to orient on recent work.
-- Each entry has a pointer to the full archive.
-- Managed automatically by recall-echo hooks. Do not edit manually.
+- `{{MEMORY_DIR}}/MEMORY.md`, imported above into every session. Your source of truth: distilled facts, preferences, patterns and decisions.
+- Keep it under 200 lines. Move detail into topic files beside it and link them from MEMORY.md; `recall-echo distill` suggests what to move.
+- Only confirmed, stable information. Before adding an entry, check whether an existing one should be updated instead.
 
-### Layer 3 — Full Archive (conversations/)
-- Index: `~/.claude/ARCHIVE.md`
-- Full conversations: `~/.claude/conversations/conversation-NNN.md`
-- NOT loaded into context. Search on demand using Grep.
-- To search: `Grep pattern="search term" path="~/.claude/conversations/"`
+### Layer 2 — Recent sessions (EPHEMERAL.md)
+- `{{MEMORY_DIR}}/EPHEMERAL.md`: a rolling window of recent session summaries, each pointing at its archive file.
+- The SessionStart hook prints it into context on startup, resume and `/clear`. The SessionEnd hook writes it — never edit it by hand.
+
+### Layer 3 — Full archive
+- `{{MEMORY_DIR}}/conversations/conversation-NNN.md`, indexed in `{{MEMORY_DIR}}/ARCHIVE.md`. Immutable.
+- Not loaded into context. Search it on demand: `recall-echo search "<query>" --ranked`, or grep `{{MEMORY_DIR}}/conversations/`.
 
 ## Session Lifecycle
 
-### On session start:
-1. MEMORY.md is in your context (auto-loaded).
-2. EPHEMERAL.md is in your context (via @ import above).
-3. Orient from recent sessions. Use archive pointers if you need full context.
-
-### During the session:
-- Update MEMORY.md when you learn stable facts.
-- When the user references past work, search the archive first.
-- Do NOT update MEMORY.md with speculative or session-specific info.
-
-### On PreCompact (context about to be compressed):
-The PreCompact hook automatically runs `recall-echo checkpoint --trigger precompact`.
-The output tells you the file path and log number. Open that file and fill in the
-Summary, Key Details, Action Items, and Unresolved sections with context from the
-current conversation.
-
-### On session end:
-- The SessionEnd hook archives this conversation automatically.
-- No manual action required.
-
-## Commands
-
-- `recall-echo init` — Initialize or upgrade the memory system
-- `recall-echo consume` — Output EPHEMERAL.md at session start (PreToolUse hook)
-- `recall-echo checkpoint --trigger precompact` — Save checkpoint before context compression
-- `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
-- `recall-echo archive --all-unarchived` — Batch archive all missed sessions
-- `recall-echo search <query>` — Search conversation archives
-- `recall-echo search <query> --ranked` — Ranked search with relevance scoring
-- `recall-echo distill` — Analyze MEMORY.md and suggest cleanup
-- `recall-echo status` — Memory system health check
-- `recall-echo graph search <query>` — Semantic search across graph entities
-- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
-- `recall-echo graph traverse <entity>` — Graph traversal with confidence display
+- Claude Code hooks do the plumbing. SessionStart runs `recall-echo consume`. PreCompact runs `recall-echo checkpoint`, which writes the conversation so far into the archive. SessionEnd runs `recall-echo archive-session`, which archives the session, rolls EPHEMERAL.md and feeds the graph. Nothing needs archiving by hand.
+- When the user refers to earlier work, check MEMORY.md, then the graph, then the archive before saying you don't remember.
 
 ## Rules
 
-- Never write duplicates to MEMORY.md. Check first, update if exists.
-- When MEMORY.md approaches 200 lines, distill it.
-- Archive conversations are immutable. Never modify them.
-- When the user says "we discussed this before" — search archives before saying you don't remember.
+- No duplicates in MEMORY.md — update the existing entry.
+- Archive conversation files are immutable.
+- When MEMORY.md nears 200 lines, distill it into topic files.
+- Never put secrets (keys, tokens, passwords) in MEMORY.md, and never add `@` lines to it. It is imported into every session, and Claude Code follows the imports inside it.

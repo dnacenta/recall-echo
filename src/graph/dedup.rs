@@ -18,7 +18,9 @@ use super::types::*;
 use super::GraphMemory;
 use crate::config::DedupBand;
 
-const DEDUP_SYSTEM_PROMPT: &str = r#"You are a deduplication system for a knowledge graph. Given a candidate entity and existing similar entities, decide:
+/// The prompt dedup sends. The scripted extractor matches this whole value,
+/// so a rewording stays in lockstep with detection instead of a loose phrase.
+pub(crate) const DEDUP_SYSTEM_PROMPT: &str = r#"You are a deduplication system for a knowledge graph. Given a candidate entity and existing similar entities, decide:
 
 1. "skip" — The candidate is a duplicate. It adds no new information.
 2. "create" — The candidate is genuinely new despite surface similarity.

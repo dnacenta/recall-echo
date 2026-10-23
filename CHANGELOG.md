@@ -3,6 +3,81 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [4.8.0] — 2026-10-17
+
+### Fixed
+
+- MEMORY.md now reaches Claude Code sessions (#75). Before, nothing loaded
+  it: the SessionStart hook printed EPHEMERAL.md only, and the rules template
+  that claimed MEMORY.md was "auto-loaded" was never installed. `init` now
+  writes `~/.claude/rules/recall-echo.md`, a memory file whose single `@`
+  import is the store's `memory/MEMORY.md`. Claude Code inlines it whole on
+  every startup, resume and `/clear`. The hook could not carry it: Claude Code
+  inlines hook output only up to about 10,000 characters and replaces the
+  rest with a preview and a file path.
+  - The file is 0600, in a `rules/` directory created 0700. `init` warns
+    when an existing `rules/` is writable by others or owned by another uid.
+  - It is written only when the root, `memory/` and MEMORY.md are this
+    user's alone: owned by them, writable by nobody else, and MEMORY.md a
+    regular file rather than a symlink. Group-write is fine when the group is
+    the user's private group (Ubuntu and Fedora, umask 0002). Each refusal
+    prints the `chmod g-w,o-w` that fixes it. `init` creates `memory/` 0700
+    and its files 0600 whatever the umask, and `status` reports a store that
+    would be refused. A root with whitespace, control characters, a backslash
+    or invisible format characters is refused too.
+  - When the rules step is refused, or skipped for a pulse, a managed rules
+    file that imports this store is removed, and `init` says so.
+  - A file counts as managed when its first line starts with
+    `<!-- recall-echo:managed`. A hand-written file is never touched; `init`
+    says whether it already imports this MEMORY.md or prints the line to add.
+    A symlink or FIFO at that path is never read or replaced.
+- The SessionStart hook also fires on `/clear`, so a cleared session still
+  gets the recent-session summaries.
+- The rules template matches the 4.x layout. It used to point at
+  `~/.claude/EPHEMERAL.md` and `~/.claude/conversations/` and describe
+  checkpoint steps that `checkpoint` now does itself. It now also tells the
+  model never to put secrets or `@` lines in MEMORY.md.
+
+### Added
+
+- `status`, `distill` and `init` warn when MEMORY.md carries `@` import
+  lines. MEMORY.md is imported into every session, and Claude Code follows
+  imports inside it.
+- `init` and `status` report MEMORY.md's size in bytes and approximate
+  tokens. `distill` suggests distilling above 25 KB as well as at 140 lines.
+- `init` warns when a skipped or refused run leaves a managed rules file
+  importing a different store's MEMORY.md, and leaves that file in place.
+
+### Changed
+
+- When Claude Code's built-in auto-memory is on, `init` asks once whether to
+  turn it off, so there is one curated store. Enter or `y` writes
+  `"autoMemoryEnabled": false` to `~/.claude/settings.json`; `n` or end of
+  input leaves it on. `init` asks only when stdin and stderr are both
+  terminals; otherwise it never changes the setting and prints a notice
+  (this also applies to the provider menu). Notes already under
+  `~/.claude/projects/*/memory/` are not moved.
+- `init` reads settings.json once and writes it at most once, after every
+  step. The bytes it replaces are kept as `settings.json.bak`. If the file
+  changes while `init` is running, the new content is kept and the changes
+  are applied to it again; if it is no longer valid JSON, nothing is written.
+  The backup is owner-only and never written through a symlink. A
+  settings.json that is a symlink, or becomes one during the prompt, is never
+  replaced; `init` prints what to add instead.
+
+### Upgrading
+
+- Re-run `recall-echo init` to get the rules file and the new hook matcher.
+- A hand-written `~/.claude/rules/recall-echo.md` (no
+  `recall-echo:managed` first line) is left alone. To switch to the managed
+  file, move yours aside and re-run `init`.
+- Pulse-null pulses are unaffected. `init` writes no rules file and asks no
+  auto-memory question for a root holding `pulse-null.toml`, or for a user
+  whose home holds pulses (`~/pulse-null/<n>`, `~/pulse-null/pulses/<n>`,
+  `~/pulse-null/entities/<n>` or `~/entity`), and says why. For such a user's
+  own `~/.claude` it writes no user-level hooks either: they would fire for
+  every pulse. `consume` prints exactly what it printed before.
+
 ## [4.7.0] — 2026-10-17
 
 ### Fixed

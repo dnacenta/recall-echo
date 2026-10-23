@@ -18,8 +18,8 @@ binaries cover Linux and macOS on x86_64 and arm64. After the first install,
 ## Setup
 
 ```
-recall-echo init [ROOT]              create memory/, install hooks, register MCP, fetch the model
-recall-echo status [ROOT]            health: MEMORY.md use, ephemeral entries, archives
+recall-echo init [ROOT]              create memory/, install hooks + rules file, register MCP, fetch the model
+recall-echo status [ROOT]            health: MEMORY.md lines, bytes and tokens, ephemeral entries, archives
 recall-echo dashboard [ROOT]         status plus stats and recent sessions
 recall-echo config show              effective settings and the exact provider command
 recall-echo config set KEY VALUE     change one setting
@@ -27,7 +27,21 @@ recall-echo update                   install the latest release
 ```
 
 `init` defaults its root to `~/.claude` when Claude Code is installed, else the current
-directory, and never overwrites existing files. `update` swaps the binary only after the
+directory, and never overwrites existing files. With Claude Code installed it also writes
+`~/.claude/rules/recall-echo.md`, which imports MEMORY.md into every session; a
+hand-written file at that path is left alone. When Claude Code's built-in auto-memory is
+on, `init` asks once whether to turn it off (`autoMemoryEnabled: false`), so there is a
+single curated store. It asks only when stdin and stderr are both terminals, and end of
+input means no; a scripted install only prints a notice. The rules file and the question
+are skipped for a pulse-null pulse root and for a user who runs pulses (in
+`~/pulse-null/`, its `pulses/` or `entities/`, or the legacy `~/entity`); for that user's own
+`~/.claude` the hooks are skipped too. settings.json is read once and written once, keeping
+the replaced bytes as an owner-only `settings.json.bak`; a symlinked settings.json is never
+replaced. `init`
+and `status` warn when MEMORY.md carries `@` import lines, which Claude Code would follow
+into every session.
+
+`update` swaps the binary only after the
 new one answers `--version`: a liveness check over HTTPS, not a cryptographic one
 (checksummed releases are planned). `--check` only reports and exits 10 when an update
 exists, `--version vX.Y.Z` pins a release, `--force` reinstalls.
@@ -41,11 +55,11 @@ not a terminal, `NO_COLOR` is set or `TERM` is `dumb`; `CLICOLOR_FORCE=1` forces
 ```
 recall-echo archive-session          SessionEnd hook: archive the session that just ended
 recall-echo checkpoint               PreCompact hook: save a checkpoint before compaction
-recall-echo consume                  SessionStart hook: print EPHEMERAL.md
+recall-echo consume                  SessionStart hook (startup, resume, /clear): print EPHEMERAL.md
 recall-echo archive --all-unarchived archive every missed transcript under ~/.claude/projects/
 recall-echo ingest --from CLI        import codex, grok or claude-code transcripts (repeatable)
 recall-echo ingest --all             import from every CLI in [capture] sources, or every one installed
-recall-echo distill                  suggest moving MEMORY.md sections over 30 lines into topic files
+recall-echo distill                  past 140 lines or 25 KB: suggest moving MEMORY.md sections into topic files
 ```
 
 `archive-session` reads Claude Code's JSONL and Gemini CLI's JSON chat sessions, sniffing
