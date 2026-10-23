@@ -305,7 +305,7 @@ pub fn grade(
     }
 
     let final_edges = sessions.last().map(|s| s.after.as_slice()).unwrap_or(&[]);
-    let mut wrong_facts = end_state(script, final_edges)?;
+    let mut wrong_facts = end_state(script, final_edges, weights)?;
     let mut junk_edges = junk(script, final_edges)?;
     wrong_facts.sort();
     junk_edges.sort();
@@ -655,7 +655,11 @@ fn push_update(effects: &mut Vec<Effect>, old: &ObservedEdge, edge: &ObservedEdg
     }
 }
 
-fn end_state(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<WrongFact>, RecallError> {
+fn end_state(
+    script: &FactScript,
+    edges: &[ObservedEdge],
+    weights: &ProvenanceWeights,
+) -> Result<Vec<WrongFact>, RecallError> {
     let mut wrong = Vec::new();
     for expected in &script.expect {
         let key = fact_key(script.fact(&expected.fact)?);
@@ -673,7 +677,7 @@ fn end_state(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<WrongFac
                 reason: WrongReason::StillLive,
             });
         }
-        if provenance_miss(expected, matching.as_slice()) {
+        if provenance_miss(expected, matching.as_slice(), weights) {
             wrong.push(WrongFact {
                 fact: expected.fact.clone(),
                 reason: WrongReason::Provenance,
@@ -683,7 +687,11 @@ fn end_state(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<WrongFac
     Ok(wrong)
 }
 
-fn provenance_miss(expected: &super::script::ExpectedFact, matching: &[&ObservedEdge]) -> bool {
+fn provenance_miss(
+    expected: &super::script::ExpectedFact,
+    matching: &[&ObservedEdge],
+    weights: &ProvenanceWeights,
+) -> bool {
     if expected.provenance.is_none() && expected.self_reinforcements.is_none() {
         return false;
     }
@@ -698,9 +706,22 @@ fn provenance_miss(expected: &super::script::ExpectedFact, matching: &[&Observed
         .is_none_or(|n| edge.self_reinforcements == n);
     let role_ok = expected.provenance.is_none_or(|role| match role {
         EndProvenance::User => edge.self_reinforcements == 0,
-        EndProvenance::Assistant | EndProvenance::Mixed => edge.self_reinforcements >= 1,
+        EndProvenance::Assistant => edge.self_reinforcements >= 1,
+        // Mixed is both sides. Self-reinforcement alone is Assistant.
+        EndProvenance::Mixed => edge.self_reinforcements >= 1 && has_user_evidence(edge, weights),
     });
     !tally_ok || !role_ok
+}
+
+/// Create stores the extraction prior and does not apply provenance. User
+/// evidence is whatever alpha remains after that prior and the self-weight
+/// tally are removed.
+fn has_user_evidence(edge: &ObservedEdge, weights: &ProvenanceWeights) -> bool {
+    let prior = crate::graph::confidence::ExtractionContext::Explicit.prior()
+        * crate::graph::confidence::PRIOR_CONCENTRATION;
+    let steps = u32::try_from(edge.self_reinforcements.max(0)).unwrap_or(0);
+    let self_alpha = weights.weight_self * f64::from(steps);
+    edge.alpha - prior - self_alpha >= weights.weight_user - EPS
 }
 
 fn junk(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<JunkEdge>, RecallError> {
@@ -1163,6 +1184,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.operations.corroborate, full(1));
+        assert!(report.wrong_facts.is_empty());
+    }
+
+    #[test]
+    fn an_assistant_only_edge_fails_mixed() {
+        let script = FactScript {
+            name: "mixed".into(),
+            sessions: vec![session(
+                "s1",
+                turn(
+                    Speaker::User,
+                    "create",
+                    vec![claim(ClaimOp::Create, "host", None)],
+                    false,
+                ),
+            )],
+            facts: vec![fact("host", "pine")],
+            expect: vec![ExpectedFact {
+                fact: "host".into(),
+                live: true,
+                provenance: Some(EndProvenance::Mixed),
+                self_reinforcements: Some(1),
+            }],
+            questions: vec![],
+        };
+        let only_self = edge("pine", "pine", true, 9.0 + weights().weight_self, 1.0, 1);
+        let report = grade(
+            &script,
+            &[obs("s1", vec![], vec![only_self])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert!(report
+            .wrong_facts
+            .iter()
+            .any(|wrong| wrong.reason == WrongReason::Provenance));
+
+        let both = edge(
+            "pine",
+            "pine",
+            true,
+            9.0 + weights().weight_user + weights().weight_self,
+            1.0,
+            1,
+        );
+        let report = grade(
+            &script,
+            &[obs("s1", vec![], vec![both])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
         assert!(report.wrong_facts.is_empty());
     }
 
