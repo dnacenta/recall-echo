@@ -32,7 +32,7 @@ const SOURCE: &str = "writes";
 
 /// Where the claims to ingest come from.
 pub enum Extractor<'a> {
-    /// Replay the claims in the script. Makes no network call.
+    /// Replay the claims in the script. Makes no provider call.
     Scripted,
     /// A caller-supplied provider. The test run does not use this.
     Live(&'a dyn LlmProvider),

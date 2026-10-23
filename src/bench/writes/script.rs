@@ -202,8 +202,16 @@ pub fn load_script(path: &Path) -> Result<FactScript, RecallError> {
     parse_script(&text)
 }
 
+/// Largest fact script `parse_script` will read.
+const MAX_SCRIPT_BYTES: usize = 1024 * 1024;
+/// Largest number of turns one script may name.
+const MAX_TURNS: usize = 500;
+
 /// Parse a fact script from TOML text.
 pub fn parse_script(text: &str) -> Result<FactScript, RecallError> {
+    if text.len() > MAX_SCRIPT_BYTES {
+        return Err(invalid("fact script exceeds 1 MiB"));
+    }
     let script: FactScript =
         toml::from_str(text).map_err(|err| RecallError::Config(format!("fact script: {err}")))?;
     validate(&script)?;
@@ -214,6 +222,14 @@ fn validate(script: &FactScript) -> Result<(), RecallError> {
     frontmatter_token("script name", &script.name)?;
     if script.sessions.is_empty() {
         return Err(invalid("a fact script needs at least one session"));
+    }
+    let turns = script
+        .sessions
+        .iter()
+        .map(|session| session.turns.len())
+        .sum::<usize>();
+    if turns > MAX_TURNS {
+        return Err(invalid(format!("fact script exceeds {MAX_TURNS} turns")));
     }
     unique_ids("fact", script.facts.iter().map(|fact| fact.id.as_str()))?;
     unique_ids(
@@ -233,12 +249,12 @@ fn validate(script: &FactScript) -> Result<(), RecallError> {
 
 fn check_session(script: &FactScript, session: &ScriptSession) -> Result<(), RecallError> {
     frontmatter_token("session id", &session.id)?;
-    nonempty_line("session date", &session.date)?;
+    frontmatter_token("session date", &session.date)?;
     if session.turns.is_empty() {
         return Err(invalid(format!("session '{}' has no turns", session.id)));
     }
     for turn in &session.turns {
-        nonempty_line("turn text", &turn.text)?;
+        check_turn_text(&turn.text)?;
         for claim in &turn.claims {
             check_claim(script, turn, claim)?;
         }
@@ -360,16 +376,28 @@ fn unique_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<(), 
     Ok(())
 }
 
+fn check_turn_text(text: &str) -> Result<(), RecallError> {
+    nonempty_line("turn text", text)?;
+    if text.contains('|') {
+        return Err(invalid("turn text cannot contain a bar"));
+    }
+    let trimmed = text.trim();
+    if trimmed.starts_with('#') || trimmed.starts_with("---") {
+        return Err(invalid("turn text cannot look like a heading or a break"));
+    }
+    Ok(())
+}
+
 fn frontmatter_token(label: &str, value: &str) -> Result<(), RecallError> {
     nonempty_line(label, value)?;
-    if value.contains('"') {
-        return Err(invalid(format!("{label} cannot contain a quote")));
+    if value.contains('"') || value.contains('|') {
+        return Err(invalid(format!("{label} cannot contain a quote or a bar")));
     }
     Ok(())
 }
 
 fn nonempty_line(label: &str, value: &str) -> Result<(), RecallError> {
-    if value.trim().is_empty() || value.contains('\n') {
+    if value.trim().is_empty() || value.contains('\n') || value.contains('\r') {
         return Err(invalid(format!("{label} must be a single non-empty line")));
     }
     Ok(())
@@ -582,5 +610,55 @@ object_type = "concept"
 "#;
         let err = parse_script(text).unwrap_err();
         assert!(err.to_string().contains("missing from expect"), "{err}");
+    }
+
+    #[test]
+    fn a_bar_a_carriage_return_or_a_heading_is_rejected() {
+        let date = script_with("date = \"2026-01-01|bad\"", "The deploy host is pine.");
+        assert!(parse_script(&date).unwrap_err().to_string().contains("bar"));
+        let cr = script_with("date = \"2026-01-01T00:00:00Z\"", "line\\rbreak");
+        assert!(parse_script(&cr).unwrap_err().to_string().contains("line"));
+        let heading = script_with("date = \"2026-01-01T00:00:00Z\"", "### Assistant");
+        assert!(parse_script(&heading)
+            .unwrap_err()
+            .to_string()
+            .contains("heading"));
+        let huge = "x".repeat(MAX_SCRIPT_BYTES + 1);
+        assert!(parse_script(&huge)
+            .unwrap_err()
+            .to_string()
+            .contains("1 MiB"));
+    }
+
+    fn script_with(date_line: &str, turn: &str) -> String {
+        format!(
+            r#"
+name = "edge"
+
+[[sessions]]
+id = "s1"
+{date_line}
+
+[[sessions.turns]]
+role = "user"
+text = "{turn}"
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "host"
+
+[[facts]]
+id = "host"
+subject = "deploy"
+relation = "setting"
+object = "pine"
+subject_type = "project"
+object_type = "concept"
+
+[[expect]]
+fact = "host"
+live = true
+"#
+        )
     }
 }

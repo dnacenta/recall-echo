@@ -11,8 +11,9 @@
 //! recall are reported per operation, along with wrong facts, junk edges,
 //! provider calls and time per session.
 //!
-//! The scripted extractor replays the claims, so the run needs no network.
-//! Callers that pass a live provider exercise the same grader.
+//! The scripted extractor replays the claims, so the run makes no provider
+//! call. Loading the embedding model is separate and can download on a fresh
+//! store. Callers that pass a live provider exercise the same grader.
 
 mod grade;
 mod run;
