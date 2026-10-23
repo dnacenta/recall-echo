@@ -38,13 +38,39 @@ pub enum Extractor<'a> {
     Live(&'a dyn LlmProvider),
 }
 
-/// Ingest `script` into `pulse_root` and grade the resulting graph.
+/// Refuse `path` unless it is missing or an empty directory.
+///
+/// The harness writes archives and a graph. A directory that already holds
+/// anything is left untouched, so a real store cannot be graded by accident.
+pub fn require_scratch(path: &Path) -> Result<(), RecallError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(RecallError::Config(format!(
+            "{} is not a directory; bench writes needs a new or empty directory",
+            path.display()
+        )));
+    }
+    if fs::read_dir(path)?.next().is_some() {
+        return Err(RecallError::Config(format!(
+            "{} is not empty; bench writes needs a new or empty directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Ingest `script` into `work_dir` and grade the resulting graph.
+///
+/// `work_dir` must be missing or empty. The function creates `memory/` under it.
 pub async fn run(
     script: &FactScript,
-    pulse_root: &Path,
+    work_dir: &Path,
     extractor: Extractor<'_>,
 ) -> Result<WriteReport, RecallError> {
-    let memory_dir = pulse_root.join("memory");
+    require_scratch(work_dir)?;
+    let memory_dir = work_dir.join("memory");
     let written = write_archives(&memory_dir, script)?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -441,6 +467,28 @@ mod tests {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.yaml");
         crate::bench::writes::load_script(&path).unwrap()
+    }
+
+    #[test]
+    fn a_missing_or_empty_directory_is_a_scratch() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(require_scratch(tmp.path()).is_ok());
+        assert!(require_scratch(&tmp.path().join("absent")).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_populated_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("keep"), "real").unwrap();
+        let err = run(&history(), tmp.path(), Extractor::Scripted)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not empty"), "{err}");
+        assert!(!tmp.path().join("memory").exists());
+
+        let file = tmp.path().join("keep");
+        let err = require_scratch(&file).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
     }
 
     #[test]

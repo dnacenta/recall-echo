@@ -22,7 +22,7 @@ pub use grade::{
     grade, ExtractorLabel, JunkEdge, ObservedEdge, OpScore, OpTable, QuestionScore,
     SessionObservation, SessionReport, StepLog, WriteOp, WriteReport, WrongFact, WrongReason,
 };
-pub use run::{run, Extractor};
+pub use run::{require_scratch, run, Extractor};
 pub use script::{
     load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, ExpectedFact,
     FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker,
