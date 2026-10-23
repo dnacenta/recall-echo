@@ -56,6 +56,10 @@ pub struct ObservedEdge {
     pub alpha: f64,
     pub beta: f64,
     pub self_reinforcements: i64,
+    /// α at creation. Filled from β on the first snapshot that contained this
+    /// edge (`PRIOR_CONCENTRATION - β`) and kept on every later snapshot: a
+    /// contradiction moves β, so the running β is not the prior.
+    pub prior_alpha: f64,
 }
 
 /// Edges around one ingested session, plus what that session cost.
@@ -754,11 +758,9 @@ fn provenance_miss(
 /// evidence is whatever alpha remains after that prior and the self-weight
 /// tally are removed.
 fn has_user_evidence(edge: &ObservedEdge, weights: &ProvenanceWeights) -> bool {
-    let prior = crate::graph::confidence::ExtractionContext::Explicit.prior()
-        * crate::graph::confidence::PRIOR_CONCENTRATION;
     let steps = u32::try_from(edge.self_reinforcements.max(0)).unwrap_or(0);
     let self_alpha = weights.weight_self * f64::from(steps);
-    edge.alpha - prior - self_alpha >= weights.weight_user - EPS
+    edge.alpha - edge.prior_alpha - self_alpha >= weights.weight_user - EPS
 }
 
 fn junk(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<JunkEdge>, RecallError> {
@@ -899,6 +901,8 @@ mod tests {
             alpha,
             beta,
             self_reinforcements,
+            // Explicit. The scripted extractor always starts here.
+            prior_alpha: 9.0,
         }
     }
 
@@ -1106,6 +1110,7 @@ mod tests {
             alpha: 9.0,
             beta: 1.0,
             self_reinforcements: 0,
+            prior_alpha: 9.0,
         });
         sessions[5].after = after;
 
@@ -1357,6 +1362,64 @@ mod tests {
         )
         .unwrap();
         assert!(report.wrong_facts.is_empty());
+    }
+
+    #[test]
+    fn an_authoritative_edge_with_self_only_fails_mixed() {
+        let mut only_self = edge("pine", "pine", true, 10.0 + weights().weight_self, 0.0, 1);
+        only_self.prior_alpha = 10.0;
+        let report = grade_mixed(only_self);
+        assert!(report
+            .wrong_facts
+            .iter()
+            .any(|wrong| wrong.reason == WrongReason::Provenance));
+    }
+
+    #[test]
+    fn an_inferred_edge_with_user_and_self_passes_mixed() {
+        let weights = weights();
+        let mut both = edge(
+            "pine",
+            "pine",
+            true,
+            6.0 + weights.weight_user + weights.weight_self,
+            4.0,
+            1,
+        );
+        both.prior_alpha = 6.0;
+        let report = grade_mixed(both);
+        assert!(report.wrong_facts.is_empty());
+    }
+
+    fn grade_mixed(edge: ObservedEdge) -> WriteReport {
+        let script = FactScript {
+            name: "mixed".into(),
+            sessions: vec![session(
+                "s1",
+                turn(
+                    Speaker::User,
+                    "create",
+                    vec![claim(ClaimOp::Create, "host", None)],
+                    false,
+                ),
+            )],
+            facts: vec![fact("host", "pine")],
+            expect: vec![ExpectedFact {
+                fact: "host".into(),
+                live: true,
+                provenance: Some(EndProvenance::Mixed),
+                self_reinforcements: Some(1),
+            }],
+            questions: vec![],
+        };
+        grade(
+            &script,
+            &[obs("s1", vec![], vec![edge])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap()
     }
 
     #[test]
