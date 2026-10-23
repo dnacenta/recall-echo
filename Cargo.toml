@@ -17,8 +17,6 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# Fact scripts for write-level grading.
-serde_yaml = "0.9"
 dirs = "6"
 
 # Graph — knowledge graph with SurrealDB + fastembed

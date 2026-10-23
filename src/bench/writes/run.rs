@@ -465,7 +465,7 @@ mod tests {
 
     fn history() -> FactScript {
         let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.yaml");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.toml");
         crate::bench::writes::load_script(&path).unwrap()
     }
 

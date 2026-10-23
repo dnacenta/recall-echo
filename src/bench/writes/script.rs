@@ -202,10 +202,10 @@ pub fn load_script(path: &Path) -> Result<FactScript, RecallError> {
     parse_script(&text)
 }
 
-/// Parse a fact script from YAML text.
+/// Parse a fact script from TOML text.
 pub fn parse_script(text: &str) -> Result<FactScript, RecallError> {
-    let script: FactScript = serde_yaml::from_str(text)
-        .map_err(|err| RecallError::Config(format!("fact script: {err}")))?;
+    let script: FactScript =
+        toml::from_str(text).map_err(|err| RecallError::Config(format!("fact script: {err}")))?;
     validate(&script)?;
     Ok(script)
 }
@@ -384,7 +384,7 @@ mod tests {
     use super::*;
 
     fn history() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.yaml");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.toml");
         fs::read_to_string(path).unwrap()
     }
 
@@ -431,133 +431,156 @@ mod tests {
     }
 
     #[test]
-    fn malformed_yaml_is_rejected() {
-        let err = parse_script(":\n  - [").unwrap_err();
+    fn malformed_script_is_rejected() {
+        let err = parse_script("name = ").unwrap_err();
         assert!(err.to_string().contains("fact script"), "{err}");
     }
 
     #[test]
     fn an_unknown_operation_is_rejected() {
-        let yaml = r#"
-name: bad
-sessions:
-  - id: s1
-    date: "2026-01-01T00:00:00Z"
-    turns:
-      - role: user
-        text: "The deploy host is pine."
-        claims:
-          - op: forget
-            fact: host
-facts:
-  - id: host
-    subject: deploy
-    relation: setting
-    object: pine
-    subject_type: project
-    object_type: concept
-expect:
-  - fact: host
-    live: true
+        let text = r#"
+name = "bad"
+
+[[sessions]]
+id = "s1"
+date = "2026-01-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The deploy host is pine."
+
+[[sessions.turns.claims]]
+op = "forget"
+fact = "host"
+
+[[facts]]
+id = "host"
+subject = "deploy"
+relation = "setting"
+object = "pine"
+subject_type = "project"
+object_type = "concept"
+
+[[expect]]
+fact = "host"
+live = true
 "#;
-        assert!(parse_script(yaml).is_err());
+        assert!(parse_script(text).is_err());
     }
 
     #[test]
     fn an_empty_session_list_is_rejected() {
-        let yaml = "name: empty\nsessions: []\nfacts: []\nexpect: []\n";
-        let err = parse_script(yaml).unwrap_err();
+        let text = "name = \"empty\"\nsessions = []\nfacts = []\nexpect = []\n";
+        let err = parse_script(text).unwrap_err();
         assert!(err.to_string().contains("at least one session"), "{err}");
     }
 
     #[test]
     fn noise_cannot_carry_a_claim() {
-        let yaml = r#"
-name: noisy
-sessions:
-  - id: s1
-    date: "2026-01-01T00:00:00Z"
-    turns:
-      - role: user
-        text: "The kettle boiled."
-        noise: true
-        claims:
-          - op: create
-            fact: host
-facts:
-  - id: host
-    subject: deploy
-    relation: setting
-    object: pine
-    subject_type: project
-    object_type: concept
-expect:
-  - fact: host
-    live: false
+        let text = r#"
+name = "noisy"
+
+[[sessions]]
+id = "s1"
+date = "2026-01-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The kettle boiled."
+noise = true
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "host"
+
+[[facts]]
+id = "host"
+subject = "deploy"
+relation = "setting"
+object = "pine"
+subject_type = "project"
+object_type = "concept"
+
+[[expect]]
+fact = "host"
+live = false
 "#;
-        let err = parse_script(yaml).unwrap_err();
+        let err = parse_script(text).unwrap_err();
         assert!(err.to_string().contains("noise"), "{err}");
     }
 
     #[test]
     fn a_turn_that_contains_another_is_rejected() {
-        let yaml = r#"
-name: overlap
-sessions:
-  - id: s1
-    date: "2026-01-01T00:00:00Z"
-    turns:
-      - role: user
-        text: "pine"
-        claims:
-          - op: create
-            fact: host
-  - id: s2
-    date: "2026-01-02T00:00:00Z"
-    turns:
-      - role: user
-        text: "pine tree"
-        claims:
-          - op: corroborate
-            fact: host
-facts:
-  - id: host
-    subject: deploy
-    relation: setting
-    object: pine
-    subject_type: project
-    object_type: concept
-expect:
-  - fact: host
-    live: true
+        let text = r#"
+name = "overlap"
+
+[[sessions]]
+id = "s1"
+date = "2026-01-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "pine"
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "host"
+
+[[sessions]]
+id = "s2"
+date = "2026-01-02T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "pine tree"
+
+[[sessions.turns.claims]]
+op = "corroborate"
+fact = "host"
+
+[[facts]]
+id = "host"
+subject = "deploy"
+relation = "setting"
+object = "pine"
+subject_type = "project"
+object_type = "concept"
+
+[[expect]]
+fact = "host"
+live = true
 "#;
-        let err = parse_script(yaml).unwrap_err();
+        let err = parse_script(text).unwrap_err();
         assert!(err.to_string().contains("contain"), "{err}");
     }
 
     #[test]
     fn a_fact_missing_from_expect_is_rejected() {
-        let yaml = r#"
-name: gap
-sessions:
-  - id: s1
-    date: "2026-01-01T00:00:00Z"
-    turns:
-      - role: user
-        text: "The deploy host is pine."
-        claims:
-          - op: create
-            fact: host
-facts:
-  - id: host
-    subject: deploy
-    relation: setting
-    object: pine
-    subject_type: project
-    object_type: concept
-expect: []
+        let text = r#"
+name = "gap"
+expect = []
+
+[[sessions]]
+id = "s1"
+date = "2026-01-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The deploy host is pine."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "host"
+
+[[facts]]
+id = "host"
+subject = "deploy"
+relation = "setting"
+object = "pine"
+subject_type = "project"
+object_type = "concept"
 "#;
-        let err = parse_script(yaml).unwrap_err();
+        let err = parse_script(text).unwrap_err();
         assert!(err.to_string().contains("missing from expect"), "{err}");
     }
 }
