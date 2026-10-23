@@ -9,10 +9,11 @@
 //! 2. **Pulse-null** — called with in-memory Messages (behind feature flag)
 //!
 //! Both converge into `archive_conversation()` which writes the markdown file,
-//! updates ARCHIVE.md, and appends to EPHEMERAL.md.
+//! updates ARCHIVE.md, appends to EPHEMERAL.md, and writes a turns sidecar.
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::config;
@@ -137,7 +138,21 @@ pub fn archive_conversation(
     summary: &summarize::ConversationSummary,
     source: &str,
 ) -> Result<ArchiveResult, RecallError> {
-    write_archive(memory_dir, conv, summary, source, None)
+    write_archive(memory_dir, conv, summary, source, None, None)
+}
+
+/// [`archive_conversation`] with the session's working directory.
+///
+/// `cwd` is stored on the turns sidecar only. It is not a field of
+/// [`Conversation`].
+pub(crate) fn archive_conversation_with_cwd(
+    memory_dir: &Path,
+    conv: &Conversation,
+    summary: &summarize::ConversationSummary,
+    source: &str,
+    cwd: Option<&str>,
+) -> Result<ArchiveResult, RecallError> {
+    write_archive(memory_dir, conv, summary, source, None, cwd)
 }
 
 /// [`archive_conversation`] for a named pulse: the archive's frontmatter
@@ -150,7 +165,7 @@ pub fn archive_pulse_conversation(
     pulse_name: &str,
 ) -> Result<ArchiveResult, RecallError> {
     let pulse = Some(pulse_name).filter(|name| !name.trim().is_empty());
-    write_archive(memory_dir, conv, summary, source, pulse)
+    write_archive(memory_dir, conv, summary, source, pulse, None)
 }
 
 fn write_archive(
@@ -159,6 +174,7 @@ fn write_archive(
     summary: &summarize::ConversationSummary,
     source: &str,
     pulse: Option<&str>,
+    cwd: Option<&str>,
 ) -> Result<ArchiveResult, RecallError> {
     let conversations_dir = memory_dir.join("conversations");
     let archive_index = memory_dir.join("ARCHIVE.md");
@@ -181,8 +197,7 @@ fn write_archive(
 
     let next_num = highest_conversation_number(&conversations_dir) + 1;
 
-    let now = conversation::utc_now();
-    let date = conversation::date_from_timestamp(&now);
+    let (timestamp, date) = session_clock(conv.first_timestamp.as_deref());
     let duration = match (&conv.first_timestamp, &conv.last_timestamp) {
         (Some(start), Some(end)) => conversation::calculate_duration(start, end),
         _ => "unknown".to_string(),
@@ -192,7 +207,7 @@ fn write_archive(
     // Build frontmatter
     let fm = Frontmatter {
         log: next_num,
-        date: now.clone(),
+        date: timestamp.clone(),
         session_id: conv.session_id.clone(),
         message_count: total_messages,
         duration: duration.clone(),
@@ -241,6 +256,16 @@ fn write_archive(
     // Write conversation file
     let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
     fs::write(&conv_file, &full_content)?;
+    // The sidecar is a second record. A failure here must not throw away the
+    // archive that was just written.
+    write_sidecar_best_effort(
+        memory_dir,
+        next_num,
+        &conv.session_id,
+        &date,
+        cwd,
+        &conv.entries,
+    );
 
     // Append to ARCHIVE.md index
     append_index(
@@ -256,7 +281,7 @@ fn write_archive(
     // Append to EPHEMERAL.md
     let entry = EphemeralEntry {
         session_id: conv.session_id.clone(),
-        date: now,
+        date: timestamp,
         duration,
         message_count: total_messages,
         archive_file: format!("conversation-{next_num:03}.md"),
@@ -273,6 +298,99 @@ fn write_archive(
         full_content,
         session_id: conv.session_id.clone(),
     })
+}
+
+/// The archive's clock: the session's first timestamp when it is RFC 3339,
+/// otherwise the moment of import. The second value is the calendar day for
+/// the ARCHIVE.md column and the sidecar.
+///
+/// Chrono accepts a space or a lowercase `t` as the date/time separator. The
+/// day comes from the parsed value, so those forms still yield `YYYY-MM-DD`.
+/// An offset keeps that offset's calendar day rather than converting to UTC.
+fn session_clock(first: Option<&str>) -> (String, String) {
+    if let Some(ts) = first {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+            return (ts.to_string(), parsed.date_naive().to_string());
+        }
+    }
+    let now = conversation::utc_now();
+    let day = conversation::date_from_timestamp(&now);
+    (now, day)
+}
+
+/// Hook cwd, else the first transcript line that carries one, else the cwd
+/// discovery already recorded on the transcript.
+#[must_use]
+pub(crate) fn resolve_cwd(
+    hook_cwd: Option<&str>,
+    transcript: Option<&Path>,
+    recorded_cwd: Option<&str>,
+) -> Option<String> {
+    nonempty(hook_cwd)
+        .or_else(|| transcript.and_then(first_cwd_in_file))
+        .or_else(|| nonempty(recorded_cwd))
+}
+
+fn nonempty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn first_cwd_in_file(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = cwd_on_line(&value) {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+fn cwd_on_line(value: &serde_json::Value) -> Option<String> {
+    if let Some(cwd) = string_field(value, "cwd") {
+        return Some(cwd);
+    }
+    let object = value.as_object()?;
+    for child in object.values() {
+        if let Some(cwd) = string_field(child, "cwd") {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+pub(crate) fn write_sidecar_best_effort(
+    memory_dir: &Path,
+    log_number: u32,
+    session_id: &str,
+    date: &str,
+    cwd: Option<&str>,
+    entries: &[conversation::ConversationEntry],
+) {
+    if let Err(err) = crate::graph::v2::input::write_turns_sidecar(
+        memory_dir, log_number, session_id, date, cwd, entries,
+    ) {
+        eprintln!(
+            "recall-echo: conversation-{log_number:03} archived; turns sidecar not written: {err}"
+        );
+    }
 }
 
 /// Ingest an archive result into the knowledge graph.
@@ -421,8 +539,19 @@ pub fn archive_from_jsonl(
     session_id: &str,
     transcript_path: &str,
 ) -> Result<u32, RecallError> {
+    archive_jsonl(base_dir, session_id, transcript_path, None, None)
+}
+
+fn archive_jsonl(
+    base_dir: &Path,
+    session_id: &str,
+    transcript_path: &str,
+    hook_cwd: Option<&str>,
+    recorded_cwd: Option<&str>,
+) -> Result<u32, RecallError> {
     let conv = crate::jsonl::parse_transcript(transcript_path, session_id)?;
-    archive_and_ingest(base_dir, &conv, "jsonl")
+    let cwd = resolve_cwd(hook_cwd, Some(Path::new(transcript_path)), recorded_cwd);
+    archive_and_ingest(base_dir, &conv, "jsonl", cwd.as_deref())
 }
 
 /// Summarise, archive, and hand the result to the graph.
@@ -432,9 +561,10 @@ fn archive_and_ingest(
     base_dir: &Path,
     conv: &Conversation,
     source: &str,
+    cwd: Option<&str>,
 ) -> Result<u32, RecallError> {
     let summary = summarize::algorithmic_summary(conv);
-    let result = archive_conversation(base_dir, conv, &summary, source)?;
+    let result = archive_conversation_with_cwd(base_dir, conv, &summary, source, cwd)?;
     let log_number = result.log_number;
 
     graph_ingest(base_dir, &result);
@@ -543,10 +673,21 @@ pub fn run_with_hook_input(
             crate::jsonl::report_declined_subagent(transcript_path, "nothing archived");
         }
         HookTarget::ClaudeJsonl => {
-            archive_from_jsonl(base_dir, &hook_input.session_id, transcript_path)?;
+            archive_jsonl(
+                base_dir,
+                &hook_input.session_id,
+                transcript_path,
+                hook_input._cwd.as_deref(),
+                None,
+            )?;
         }
         HookTarget::GeminiSession(conv) => {
-            archive_and_ingest(base_dir, &conv, "gemini")?;
+            let cwd = resolve_cwd(
+                hook_input._cwd.as_deref(),
+                Some(Path::new(transcript_path)),
+                None,
+            );
+            archive_and_ingest(base_dir, &conv, "gemini", cwd.as_deref())?;
         }
         HookTarget::Unreadable => {
             eprintln!(
@@ -662,7 +803,13 @@ pub fn archive_all_with(
         }
 
         let path_str = transcript.path.to_string_lossy().to_string();
-        match archive_from_jsonl(memory_dir, session_id, &path_str) {
+        match archive_jsonl(
+            memory_dir,
+            session_id,
+            &path_str,
+            None,
+            transcript.cwd.as_deref(),
+        ) {
             Ok(_) => report.archived += 1,
             Err(e) => {
                 eprintln!("recall-echo: skipping {session_id} \u{2014} {e}");
@@ -1125,5 +1272,253 @@ mod tests {
             fs::read_dir(memory.join("conversations")).unwrap().count(),
             1
         );
+    }
+
+    fn memory_with_conversations() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        tmp
+    }
+
+    fn one_turn(session_id: &str, first: Option<&str>) -> Conversation {
+        Conversation {
+            session_id: session_id.to_string(),
+            first_timestamp: first.map(str::to_string),
+            last_timestamp: first.map(str::to_string),
+            user_message_count: 1,
+            assistant_message_count: 0,
+            entries: vec![conversation::ConversationEntry::UserMessage(
+                "hello".to_string(),
+            )],
+        }
+    }
+
+    #[test]
+    fn archive_date_is_session_start() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let summary = summarize::ConversationSummary::default();
+        let conv = one_turn("sess", Some("2026-09-28T09:10:37Z"));
+
+        archive_conversation(memory, &conv, &summary, "jsonl").unwrap();
+
+        let archived =
+            fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        let frontmatter = crate::frontmatter::parse(&archived).unwrap();
+        assert_eq!(frontmatter.date, "2026-09-28T09:10:37Z");
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("| 001 | 2026-09-28 | sess |"), "{index}");
+        let ephemeral = fs::read_to_string(memory.join("EPHEMERAL.md")).unwrap();
+        assert!(ephemeral.contains("2026-09-28"), "{ephemeral}");
+        assert!(!ephemeral.contains("2026-10-23"), "{ephemeral}");
+
+        let fractional = one_turn("frac", Some("2026-09-28T09:10:37.000Z"));
+        archive_conversation(memory, &fractional, &summary, "jsonl").unwrap();
+        let second = fs::read_to_string(memory.join("conversations/conversation-002.md")).unwrap();
+        assert!(
+            second.contains("date: \"2026-09-28T09:10:37.000Z\""),
+            "{second}"
+        );
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("| 002 | 2026-09-28 | frac |"), "{index}");
+
+        let before = conversation::utc_now();
+        let invalid = one_turn("bad", Some("not-a-timestamp"));
+        archive_conversation(memory, &invalid, &summary, "jsonl").unwrap();
+        let third = crate::frontmatter::parse(
+            &fs::read_to_string(memory.join("conversations/conversation-003.md")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(third.date, "not-a-timestamp");
+        assert!(chrono::DateTime::parse_from_rfc3339(&third.date).is_ok());
+        let day = &third.date[..10];
+        let after = conversation::utc_now();
+        assert!(
+            day == &before[..10] || day == &after[..10],
+            "fell back to {day}, import was {before}..{after}"
+        );
+    }
+
+    #[test]
+    fn archive_date_normalises_space_and_lowercase_separator() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let summary = summarize::ConversationSummary::default();
+
+        archive_conversation(
+            memory,
+            &one_turn("space", Some("2026-09-28 09:10:37Z")),
+            &summary,
+            "jsonl",
+        )
+        .unwrap();
+        archive_conversation(
+            memory,
+            &one_turn("lower", Some("2026-09-29t09:10:37Z")),
+            &summary,
+            "jsonl",
+        )
+        .unwrap();
+
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("| 001 | 2026-09-28 | space |"), "{index}");
+        assert!(index.contains("| 002 | 2026-09-29 | lower |"), "{index}");
+        assert!(!index.contains("09:10:37"), "{index}");
+
+        for (number, day) in [(1, "2026-09-28"), (2, "2026-09-29")] {
+            let raw =
+                fs::read_to_string(memory.join(format!("turns/conversation-{number:03}.json")))
+                    .unwrap();
+            let sidecar: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(sidecar["date"], day, "{raw}");
+        }
+    }
+
+    #[test]
+    fn sidecar_written_next_to_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let cwd = tmp.path().join("linkshelf");
+        fs::create_dir(&cwd).unwrap();
+        let conv = Conversation {
+            session_id: "sess".into(),
+            first_timestamp: Some("2026-09-28T09:10:37Z".into()),
+            last_timestamp: Some("2026-09-28T09:16:47Z".into()),
+            user_message_count: 2,
+            assistant_message_count: 2,
+            entries: vec![
+                conversation::ConversationEntry::UserMessage("one".into()),
+                conversation::ConversationEntry::UserMessage("two".into()),
+                conversation::ConversationEntry::UserMessage(String::new()),
+                conversation::ConversationEntry::AssistantText("on it".into()),
+                conversation::ConversationEntry::ToolUse {
+                    name: "Write".into(),
+                    input_summary: "secret-input".into(),
+                },
+                conversation::ConversationEntry::ToolUse {
+                    name: "Bash".into(),
+                    input_summary: "rm -rf".into(),
+                },
+                conversation::ConversationEntry::ToolUse {
+                    name: "Write".into(),
+                    input_summary: "again".into(),
+                },
+                conversation::ConversationEntry::ToolResult {
+                    content: "SECRET_OUTPUT".into(),
+                    is_error: false,
+                },
+                conversation::ConversationEntry::AssistantText("done".into()),
+                conversation::ConversationEntry::ToolUse {
+                    name: "Read".into(),
+                    input_summary: "notes.md".into(),
+                },
+            ],
+        };
+        archive_conversation_with_cwd(
+            memory,
+            &conv,
+            &summarize::ConversationSummary::default(),
+            "jsonl",
+            Some(cwd.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let conversations = fs::read_dir(memory.join("conversations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(conversations, vec!["conversation-001.md".to_string()]);
+
+        let raw = fs::read_to_string(memory.join("turns/conversation-001.json")).unwrap();
+        assert!(!raw.contains("secret-input"), "{raw}");
+        assert!(!raw.contains("rm -rf"), "{raw}");
+        assert!(!raw.contains("SECRET_OUTPUT"), "{raw}");
+        assert!(!raw.contains("again"), "{raw}");
+        assert!(!raw.contains("notes.md"), "{raw}");
+
+        let sidecar: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(sidecar["version"], 1);
+        assert_eq!(sidecar["session_id"], "sess");
+        assert_eq!(sidecar["date"], "2026-09-28");
+        assert_eq!(sidecar["cwd"], cwd.to_str().unwrap());
+        assert_eq!(sidecar["project"]["name"], "linkshelf");
+        assert_eq!(
+            sidecar["project"]["aliases"],
+            serde_json::json!(["linkshelf"])
+        );
+        assert_eq!(sidecar["turns"][0]["i"], 0);
+        assert_eq!(sidecar["turns"][0]["role"], "user");
+        assert_eq!(sidecar["turns"][0]["text"], "one");
+        assert!(sidecar["turns"][0]["ts"].is_null());
+        assert_eq!(sidecar["turns"][1]["text"], "two");
+        assert_eq!(sidecar["turns"][2]["role"], "assistant");
+        assert_eq!(sidecar["turns"][2]["text"], "on it");
+        assert_eq!(sidecar["turns"][3]["text"], "done");
+        assert_eq!(sidecar["turns"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            sidecar["tools"],
+            serde_json::json!([
+                {"before_turn": 3, "names": ["Write", "Bash"]},
+                {"before_turn": 4, "names": ["Read"]}
+            ])
+        );
+
+        let loaded = crate::graph::v2::input::load_session(memory, 1).unwrap();
+        assert_eq!(loaded.turns.len(), 4);
+    }
+
+    #[test]
+    fn unwritable_turns_directory_does_not_fail_archiving() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        fs::write(memory.join("turns"), "not a directory").unwrap();
+        let conv = one_turn("sess", Some("2026-09-28T09:10:37Z"));
+
+        let result = archive_conversation(
+            memory,
+            &conv,
+            &summarize::ConversationSummary::default(),
+            "jsonl",
+        )
+        .unwrap();
+
+        assert_eq!(result.log_number, 1);
+        assert!(memory.join("conversations/conversation-001.md").exists());
+        assert!(memory.join("ARCHIVE.md").exists());
+        assert!(memory.join("EPHEMERAL.md").exists());
+        assert!(memory.join("turns").is_file());
+    }
+
+    #[test]
+    fn cwd_prefers_hook_then_transcript_line_then_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = tmp.path().join("line.jsonl");
+        fs::write(&line, "{\"cwd\":\"/from/line\",\"type\":\"user\"}\n").unwrap();
+        let nested = tmp.path().join("codex.jsonl");
+        fs::write(
+            &nested,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/from/payload\"}}\n",
+        )
+        .unwrap();
+        let none = tmp.path().join("none.jsonl");
+        fs::write(&none, "{\"type\":\"user\"}\n").unwrap();
+
+        assert_eq!(
+            resolve_cwd(Some("/from/hook"), Some(&line), Some("/from/ref")).as_deref(),
+            Some("/from/hook")
+        );
+        assert_eq!(
+            resolve_cwd(Some("  "), Some(&line), Some("/from/ref")).as_deref(),
+            Some("/from/line")
+        );
+        assert_eq!(
+            resolve_cwd(None, Some(&nested), Some("/from/ref")).as_deref(),
+            Some("/from/payload")
+        );
+        assert_eq!(
+            resolve_cwd(None, Some(&none), Some("/from/ref")).as_deref(),
+            Some("/from/ref")
+        );
+        assert_eq!(resolve_cwd(None, None, None), None);
     }
 }

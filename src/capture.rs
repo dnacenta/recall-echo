@@ -218,8 +218,14 @@ pub fn archive_transcript(
         return Ok(None);
     }
     let summary = summarize::algorithmic_summary(&conv);
-    let result =
-        archive::archive_conversation(memory_dir, &conv, &summary, adapter.source().as_str())?;
+    let cwd = archive::resolve_cwd(None, Some(&transcript.path), transcript.cwd.as_deref());
+    let result = archive::archive_conversation_with_cwd(
+        memory_dir,
+        &conv,
+        &summary,
+        adapter.source().as_str(),
+        cwd.as_deref(),
+    )?;
     Ok(Some(result))
 }
 
