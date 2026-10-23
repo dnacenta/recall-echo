@@ -69,7 +69,9 @@ pub mod llm_provider;
 #[cfg(feature = "pulse-null")]
 pub mod pulse_null;
 
-#[cfg(feature = "bench")]
+// The bench command is optional, but `cargo test` does not enable optional
+// features. The writes harness lives here and has to compile in that run.
+#[cfg(any(test, feature = "bench"))]
 pub mod bench;
 
 #[cfg(feature = "self-update")]

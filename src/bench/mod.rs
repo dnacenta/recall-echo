@@ -15,11 +15,15 @@
 //! This module is intentionally a *thin* facade: every call ultimately drives
 //! the same code paths a pulse exercises at runtime. Score validity depends
 //! on that, so do not reimplement archive format, retrieval, or extraction here.
+//!
+//! [`writes`] grades each graph update against a scripted fact history, using
+//! those same archive and ingest paths.
 
 use serde::{Deserialize, Serialize};
 
 pub mod answer;
 pub mod ingest;
+pub mod writes;
 
 #[cfg(test)]
 mod tests;

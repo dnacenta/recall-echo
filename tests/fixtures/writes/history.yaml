@@ -1,0 +1,106 @@
+# One speaker per session. A chunk that contains an Assistant heading is
+# classified as self for every claim in it, so a user restatement is its own
+# session and can be graded at the user weight.
+name: host-history
+sessions:
+  - id: s1
+    date: "2026-01-01T00:00:00Z"
+    turns:
+      - role: user
+        text: "The deploy host is pine."
+        claims:
+          - op: create
+            fact: deploy-host
+  - id: s2
+    date: "2026-01-02T00:00:00Z"
+    turns:
+      - role: user
+        text: "I repeat that the deploy host is pine."
+        claims:
+          - op: corroborate
+            fact: deploy-host
+            by: user
+  - id: s3
+    date: "2026-01-03T00:00:00Z"
+    turns:
+      - role: assistant
+        text: "Noted that the deploy host is pine."
+        claims:
+          - op: corroborate
+            fact: deploy-host
+            by: assistant
+  - id: s4
+    date: "2026-01-04T00:00:00Z"
+    turns:
+      - role: user
+        text: "The deploy host changed to oak."
+        claims:
+          - op: supersede
+            fact: deploy-host
+            replacement: deploy-host-oak
+  - id: s5
+    date: "2026-01-05T00:00:00Z"
+    turns:
+      - role: user
+        text: "The deploy host is not oak."
+        claims:
+          - op: contradict
+            fact: deploy-host-oak
+  - id: s6
+    date: "2026-01-06T00:00:00Z"
+    turns:
+      - role: user
+        text: "Birch was rejected as a deploy host."
+        claims:
+          - op: reject
+            fact: deploy-host-birch
+  - id: s7
+    date: "2026-01-07T00:00:00Z"
+    turns:
+      - role: user
+        text: "The kettle boiled and the window is open."
+        noise: true
+facts:
+  - id: deploy-host
+    subject: deploy
+    relation: setting
+    object: pine
+    subject_type: project
+    object_type: concept
+    subject_abstract: "release destination hostname"
+    object_abstract: "conifer resin timber snowfall"
+  - id: deploy-host-oak
+    subject: deploy
+    relation: setting
+    object: oak
+    subject_type: project
+    object_type: concept
+    subject_abstract: "release destination hostname"
+    object_abstract: "barrel stave tannin cooperage"
+  - id: deploy-host-birch
+    subject: deploy
+    relation: setting
+    object: birch
+    subject_type: project
+    object_type: concept
+    subject_abstract: "release destination hostname"
+    object_abstract: "papyrus canoe peeling bark"
+expect:
+  - fact: deploy-host
+    live: false
+    provenance: mixed
+    self_reinforcements: 1
+  - fact: deploy-host-oak
+    live: true
+    provenance: user
+    self_reinforcements: 0
+  - fact: deploy-host-birch
+    live: false
+questions:
+  - text: "what changed about the host"
+    answer: oak
+    needs: [deploy-host-oak]
+    absent: [deploy-host]
+  - text: "how many times was pine the host"
+    answer: pine
+    needs: [deploy-host]

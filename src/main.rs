@@ -222,6 +222,21 @@ enum BenchCommands {
         #[arg(long)]
         no_episodes: bool,
     },
+    /// Grade graph writes against a fact script
+    Writes {
+        /// Fact script path
+        #[arg(long)]
+        script: PathBuf,
+        /// Directory to ingest into
+        #[arg(long, alias = "entity-root")]
+        pulse_root: PathBuf,
+        /// Provider to extract with. Omit to replay the script's own claims.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Provider model override
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1003,7 +1018,42 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 Ok::<_, recall_echo::error::RecallError>(())
             })
         }
+        BenchCommands::Writes {
+            script,
+            pulse_root,
+            provider,
+            model,
+        } => run_writes(script, pulse_root, provider, model),
     }
+}
+
+#[cfg(feature = "bench")]
+fn run_writes(
+    script: PathBuf,
+    pulse_root: PathBuf,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::bench::writes::{self, Extractor};
+
+    let script = writes::load_script(&script)?;
+    let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
+    let report = rt.block_on(async {
+        match provider {
+            Some(name) => {
+                let memory_dir = pulse_root.join("memory");
+                let (llm, _) = recall_echo::llm_provider::create_provider(
+                    &memory_dir,
+                    Some(&name),
+                    model.as_deref(),
+                )?;
+                writes::run(&script, &pulse_root, Extractor::Live(llm.as_ref())).await
+            }
+            None => writes::run(&script, &pulse_root, Extractor::Scripted).await,
+        }
+    })?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 #[cfg(feature = "bench")]
