@@ -21,14 +21,18 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "llm")]
 pub mod answer;
+#[cfg(feature = "llm")]
 pub mod ingest;
 pub mod writes;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llm"))]
 mod tests;
 
+#[cfg(feature = "llm")]
 pub use answer::{answer_question, AnswerOpts, BenchAnswer, RetrievedEpisode, RetrievedFact};
+#[cfg(feature = "llm")]
 pub use ingest::{ingest_conversation, IngestStats};
 
 // ── Dataset shape ────────────────────────────────────────────────────────

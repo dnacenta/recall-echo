@@ -597,6 +597,10 @@ mod tests {
         assert!(parsed.entities.is_empty());
     }
 
+    // Opening a store needs the embedded engine. Without it the binary
+    // compiles and this test is skipped; the same engine gap already fails
+    // the graph scan tests on a `--no-default-features` run.
+    #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     async fn scripted_run_classifies_every_claim() {
         let script = history();
@@ -682,6 +686,7 @@ mod tests {
         assert!(report.questions[1].keyword_hit);
     }
 
+    #[cfg(feature = "embedded")]
     fn counted(tp: u32, fp: u32, missed: u32) -> grade::OpScore {
         grade::OpScore {
             tp,

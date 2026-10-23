@@ -69,8 +69,9 @@ pub mod llm_provider;
 #[cfg(feature = "pulse-null")]
 pub mod pulse_null;
 
-// The bench command is optional, but `cargo test` does not enable optional
-// features. The writes harness lives here and has to compile in that run.
+// `cargo test` does not enable optional features, and the writes harness has
+// to compile in that run. `answer` calls the provider, so it stays behind
+// `llm` (which the `bench` feature enables) rather than every test build.
 #[cfg(any(test, feature = "bench"))]
 pub mod bench;
 
