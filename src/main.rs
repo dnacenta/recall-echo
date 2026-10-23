@@ -222,6 +222,21 @@ enum BenchCommands {
         #[arg(long)]
         no_episodes: bool,
     },
+    /// Grade graph writes against a fact script
+    Writes {
+        /// Fact script path
+        #[arg(long)]
+        script: PathBuf,
+        /// New or empty directory to ingest into. Omit for a fresh temporary directory.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Provider to extract with. Omit to replay the script's own claims.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Provider model override
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1003,7 +1018,88 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 Ok::<_, recall_echo::error::RecallError>(())
             })
         }
+        BenchCommands::Writes {
+            script,
+            work_dir,
+            provider,
+            model,
+        } => run_writes(script, work_dir, provider, model),
     }
+}
+
+#[cfg(feature = "bench")]
+fn run_writes(
+    script: PathBuf,
+    work_dir: Option<PathBuf>,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::bench::writes::{self, Extractor};
+
+    let script = writes::load_script(&script)?;
+    let scratch = match work_dir {
+        Some(dir) => {
+            writes::require_scratch(&dir)?;
+            Scratch::Kept(dir)
+        }
+        None => Scratch::Temporary(temporary_work_dir()?),
+    };
+    let root = scratch.path().to_path_buf();
+    let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
+    let report = rt.block_on(async {
+        match provider {
+            Some(name) => {
+                let memory_dir = root.join("memory");
+                let (llm, _) = recall_echo::llm_provider::create_provider(
+                    &memory_dir,
+                    Some(&name),
+                    model.as_deref(),
+                )?;
+                writes::run(&script, &root, Extractor::Live(llm.as_ref())).await
+            }
+            None => writes::run(&script, &root, Extractor::Scripted).await,
+        }
+    })?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[cfg(feature = "bench")]
+enum Scratch {
+    Kept(PathBuf),
+    Temporary(PathBuf),
+}
+
+#[cfg(feature = "bench")]
+impl Scratch {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Kept(path) | Self::Temporary(path) => path,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Self::Temporary(path) = self {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn temporary_work_dir() -> Result<PathBuf, recall_echo::error::RecallError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path =
+        std::env::temp_dir().join(format!("recall-echo-writes-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&path)?;
+    Ok(path)
 }
 
 #[cfg(feature = "bench")]

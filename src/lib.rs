@@ -69,7 +69,10 @@ pub mod llm_provider;
 #[cfg(feature = "pulse-null")]
 pub mod pulse_null;
 
-#[cfg(feature = "bench")]
+// `cargo test` does not enable optional features, and the writes harness has
+// to compile in that run. `answer` calls the provider, so it stays behind
+// `llm` (which the `bench` feature enables) rather than every test build.
+#[cfg(any(test, feature = "bench"))]
 pub mod bench;
 
 #[cfg(feature = "self-update")]
