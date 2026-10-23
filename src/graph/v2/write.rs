@@ -5,9 +5,10 @@
 //! Writes for the second pipeline: exact name-and-kind resolution, edges,
 //! slots, and reinforcement of an identical live fact.
 //!
-//! Nothing here retires or contradicts an edge. A repeated fact adds evidence
-//! and corroborates. That keeps the prior recovered from the edge's first β:
-//! the creating session never moves β.
+//! Nothing here retires or contradicts an edge. A repeated fact from another
+//! sighting adds evidence and corroborates. The same session, turn and quote
+//! is already stored, so a retry does not corroborate it. That keeps the prior
+//! recovered from the edge's first β: the creating session never moves β.
 
 use std::collections::HashMap;
 
@@ -35,6 +36,8 @@ pub(crate) struct WriteStats {
     pub edges: u32,
     pub slots: u32,
     pub reinforced: u32,
+    /// The fact was already stored with this session, turn and quote.
+    pub already_seen: u32,
 }
 
 /// Refuse a store this pipeline must not write, otherwise stamp it `v2`.
@@ -139,8 +142,10 @@ async fn write_edge(
 ) -> Result<(), GraphError> {
     let description = fact.role.map(|role| format!("role={}", role.as_str()));
     if let Some(existing) = find_edge(gm, subject, object, fact, description.as_deref()).await? {
-        reinforce_edge(gm, &existing, fact, session_id).await?;
-        stats.reinforced += 1;
+        match reinforce_edge(gm, &existing, fact, session_id).await? {
+            Sight::Recorded => stats.reinforced += 1,
+            Sight::AlreadySeen => stats.already_seen += 1,
+        }
         return Ok(());
     }
     create_edge(gm, session_id, fact, subject, object, description).await?;
@@ -223,7 +228,10 @@ async fn reinforce_edge(
     edge: &StoredEdge,
     fact: &Fact,
     session_id: &str,
-) -> Result<(), GraphError> {
+) -> Result<Sight, GraphError> {
+    if evidence_seen(edge.evidence.as_ref(), session_id, fact) {
+        return Ok(Sight::AlreadySeen);
+    }
     let (provenance, label) = provenance_of(fact.provenance);
     let mut state = EdgeEvidence::new(
         Evidence::from_stored(edge.alpha, edge.beta, edge.confidence),
@@ -253,7 +261,7 @@ async fn reinforce_edge(
         .bind(("evidence", evidence))
         .await?
         .check()?;
-    Ok(())
+    Ok(Sight::Recorded)
 }
 
 async fn write_slot(
@@ -268,12 +276,24 @@ async fn write_slot(
     let mut attributes = subject.attributes.clone();
     let v2 = v2_map(&mut attributes)?;
     let slots = slots_mut(v2)?;
-    if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
-        reinforce_slot(slot, gm, fact, session_id)?;
-        stats.reinforced += 1;
+    let persist = if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
+        match reinforce_slot(slot, gm, fact, session_id)? {
+            Sight::Recorded => {
+                stats.reinforced += 1;
+                true
+            }
+            Sight::AlreadySeen => {
+                stats.already_seen += 1;
+                false
+            }
+        }
     } else {
         slots.push(new_slot(session_id, date, fact));
         stats.slots += 1;
+        true
+    };
+    if !persist {
+        return Ok(());
     }
     gm.update_entity(
         &subject.id,
@@ -300,7 +320,10 @@ fn reinforce_slot(
     gm: &GraphMemory,
     fact: &Fact,
     session_id: &str,
-) -> Result<(), GraphError> {
+) -> Result<Sight, GraphError> {
+    if evidence_seen(slot.get("evidence"), session_id, fact) {
+        return Ok(Sight::AlreadySeen);
+    }
     let (provenance, label) = provenance_of(fact.provenance);
     let alpha = slot.get("alpha").and_then(Value::as_f64);
     let beta = slot.get("beta").and_then(Value::as_f64);
@@ -327,7 +350,46 @@ fn reinforce_slot(
         json!(state.self_reinforcements()),
     );
     object.insert("evidence".into(), evidence);
-    Ok(())
+    Ok(Sight::Recorded)
+}
+
+/// Whether this sighting was new or was already on the fact.
+enum Sight {
+    Recorded,
+    AlreadySeen,
+}
+
+/// True when this session, turn and quote is already an evidence item.
+fn evidence_seen(existing: Option<&Value>, session_id: &str, fact: &Fact) -> bool {
+    existing.and_then(Value::as_array).is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| same_evidence(item, session_id, fact))
+    })
+}
+
+fn same_evidence(item: &Value, session_id: &str, fact: &Fact) -> bool {
+    item.get("session").and_then(Value::as_str) == Some(session_id)
+        && item.get("quote").and_then(Value::as_str) == Some(fact.quote.as_str())
+        && json_usize(item.get("turn")) == Some(fact.turn)
+}
+
+fn json_usize(value: Option<&Value>) -> Option<usize> {
+    let value = value?;
+    value
+        .as_u64()
+        .and_then(|number| usize::try_from(number).ok())
+        .or_else(|| {
+            value
+                .as_i64()
+                .and_then(|number| usize::try_from(number).ok())
+        })
+        .or_else(|| {
+            let number = value.as_f64()?;
+            (number.is_finite() && number >= 0.0 && number.fract() == 0.0)
+                .then_some(number as u64)
+                .and_then(|number| usize::try_from(number).ok())
+        })
 }
 
 fn new_slot(session_id: &str, date: &str, fact: &Fact) -> Value {
@@ -677,9 +739,13 @@ mod tests {
         write_facts(&gm, "s1", "2026-01-02", &[slot.clone(), edge.clone()])
             .await
             .unwrap();
-        write_facts(&gm, "s1", "2026-01-02", &[slot, edge])
+        // A later session is a new sighting. The same session is covered by
+        // `retry_of_the_creating_session_does_not_corroborate`.
+        let again = write_facts(&gm, "s2", "2026-01-03", &[slot, edge])
             .await
             .unwrap();
+        assert_eq!(again.reinforced, 2);
+        assert_eq!(again.already_seen, 0);
 
         let entities = crud::list_entities(gm.db(), None).await.unwrap();
         let app = entities.iter().find(|entity| entity.name == "app").unwrap();
@@ -701,6 +767,72 @@ mod tests {
         let again = Evidence::from_stored(edges[0].alpha, edges[0].beta, edges[0].confidence);
         assert!((again.beta() - prior.beta()).abs() < 1e-9);
         assert!(again.alpha() > prior.alpha());
+    }
+
+    /// A retry writes the creating session again. The stored evidence already
+    /// holds that session, turn and quote, so neither the slot nor the edge moves.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn retry_of_the_creating_session_does_not_corroborate() {
+        let (_tmp, gm) = open_store().await;
+        let facts = [setting("redis"), uses_edge()];
+        write_facts(&gm, "s1", "2026-01-02", &facts).await.unwrap();
+        let before = stored_belief(&gm).await;
+
+        let retry = write_facts(&gm, "s1", "2026-01-02", &facts).await.unwrap();
+        assert_eq!(retry.already_seen, 2);
+        assert_eq!(retry.reinforced, 0);
+        assert_eq!(retry.slots, 0);
+        assert_eq!(retry.edges, 0);
+
+        let after = stored_belief(&gm).await;
+        assert_eq!(after, before);
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        assert_eq!(after.slot_evidence, 1);
+        assert_eq!(after.edge_evidence, 1);
+        assert_eq!(after.slot_self, 0);
+        assert_eq!(after.edge_self, 0);
+        assert!((after.slot_alpha - prior.alpha()).abs() < 1e-9);
+        assert!((after.slot_beta - prior.beta()).abs() < 1e-9);
+        assert!((after.edge_alpha - prior.alpha()).abs() < 1e-9);
+        assert!((after.edge_beta - prior.beta()).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn stored_belief(gm: &GraphMemory) -> Belief {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let app = entities.iter().find(|entity| entity.name == "app").unwrap();
+        let slot = &app.attributes.as_ref().unwrap()["v2"]["slots"][0];
+        let mut response = gm
+            .db()
+            .query("SELECT alpha, beta, self_reinforcements, evidence FROM relates_to")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let edge = rows.first().expect("edge");
+        Belief {
+            slot_alpha: slot["alpha"].as_f64().unwrap(),
+            slot_beta: slot["beta"].as_f64().unwrap(),
+            slot_self: slot["self_reinforcements"].as_i64().unwrap(),
+            slot_evidence: slot["evidence"].as_array().unwrap().len(),
+            edge_alpha: edge["alpha"].as_f64().unwrap(),
+            edge_beta: edge["beta"].as_f64().unwrap(),
+            edge_self: edge["self_reinforcements"].as_i64().unwrap(),
+            edge_evidence: edge["evidence"].as_array().unwrap().len(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[derive(Debug, PartialEq)]
+    struct Belief {
+        slot_alpha: f64,
+        slot_beta: f64,
+        slot_self: i64,
+        slot_evidence: usize,
+        edge_alpha: f64,
+        edge_beta: f64,
+        edge_self: i64,
+        edge_evidence: usize,
     }
 
     fn uses_edge() -> Fact {
