@@ -61,3 +61,8 @@ The transcripts use the JSON Lines format read by `src/jsonl.rs`: one entry per 
   `subject | relation | object`. They are a starting point, not an oracle: expect a few false
   hits, for example an old value quoted inside a bug description.
 - `unmatched` (live records that match no fact pattern) is only a proxy for junk.
+
+## Grading caveats
+
+- Rejected facts (F42) are graded found or missing only, so a stored rejected fact still reads as found. The op table and `wrong_facts` show the failure.
+- Some facts' core patterns also match another fact's record (for example F01 and F03 via F32, F13 and F14 via F43 and F46, F39 and F40 via F41), so pattern recall can be overstated until matching is one-to-one.

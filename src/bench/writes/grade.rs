@@ -1688,6 +1688,10 @@ mod tests {
     fn grade_mixed(edge: ObservedEdge) -> WriteReport {
         let script = FactScript {
             name: "mixed".into(),
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
             sessions: vec![session(
                 "s1",
                 turn(
