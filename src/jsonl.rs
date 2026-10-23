@@ -69,6 +69,9 @@ struct JsonlEntry {
     entry_type: String,
     timestamp: Option<String>,
     message: Option<RawMessage>,
+    /// Harness bookkeeping, not something the person typed.
+    #[serde(default, rename = "isMeta")]
+    is_meta: bool,
 }
 
 #[derive(Deserialize)]
@@ -254,6 +257,7 @@ pub fn parse_transcript(
         };
 
         match role {
+            "user" if entry.is_meta => parse_meta_user_content(&mut conv, content),
             "user" => parse_user_content(&mut conv, content),
             "assistant" => parse_assistant_content(&mut conv, content),
             _ => {}
@@ -270,6 +274,19 @@ fn parse_user_content(conv: &mut Conversation, content: ContentValue) {
     }
 }
 
+/// `isMeta` user text is the harness speaking (a skill expansion, for one).
+/// Tool results on that same entry are still the tool's output, so they stay.
+fn parse_meta_user_content(conv: &mut Conversation, content: ContentValue) {
+    let ContentValue::Blocks(blocks) = content else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            push_tool_result(conv, &block);
+        }
+    }
+}
+
 fn push_user_message(conv: &mut Conversation, text: String) {
     conv.user_message_count += 1;
     conv.entries.push(ConversationEntry::UserMessage(text));
@@ -278,7 +295,8 @@ fn push_user_message(conv: &mut Conversation, text: String) {
 /// Block-list user content. Consecutive `text` blocks are one user turn,
 /// joined with a blank line, so a prompt stored as blocks is archived.
 /// A tool result ends the run: the turn stays where it sits among results.
-/// Whitespace-only text is dropped. Image and other types stay ignored.
+/// Whitespace-only text is dropped, as is a harness interrupt notice.
+/// Image and other types stay ignored.
 fn parse_user_blocks(conv: &mut Conversation, blocks: Vec<serde_json::Value>) {
     let mut text_parts = Vec::new();
     for block in blocks {
@@ -294,11 +312,15 @@ fn parse_user_blocks(conv: &mut Conversation, blocks: Vec<serde_json::Value>) {
     flush_user_text(conv, &mut text_parts);
 }
 
+/// The harness writes this when it cancels a turn. It is not user speech.
+const INTERRUPTED_TURN_PREFIX: &str = "[Request interrupted by user";
+
 fn collect_user_text(parts: &mut Vec<String>, block: &serde_json::Value) {
     let Some(text) = block.get("text").and_then(|value| value.as_str()) else {
         return;
     };
-    if text.trim().is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with(INTERRUPTED_TURN_PREFIX) {
         return;
     }
     parts.push(text.to_string());
@@ -803,5 +825,75 @@ mod tests {
             &conv.entries[0],
             ConversationEntry::UserMessage(text) if text == "one\n\ntwo"
         ));
+    }
+
+    #[test]
+    fn is_meta_block_skill_expansion_is_not_a_user_message() {
+        let conv = parse_user_line(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /tmp/skill"}]}}"#,
+        );
+        assert_eq!(conv.user_message_count, 0);
+        assert!(conv.entries.is_empty());
+
+        let with_tool = parse_user_line(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /tmp/skill"},{"type":"tool_result","content":"ok"}]}}"#,
+        );
+        assert_eq!(with_tool.user_message_count, 0);
+        assert!(with_tool
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry, ConversationEntry::UserMessage(_))));
+        assert!(matches!(
+            &with_tool.entries[..],
+            [ConversationEntry::ToolResult { content, is_error: false }] if content == "ok"
+        ));
+    }
+
+    #[test]
+    fn is_meta_string_is_not_a_user_message() {
+        let conv = parse_user_line(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Base directory for this skill: /tmp/skill"}}"#,
+        );
+        assert_eq!(conv.user_message_count, 0);
+        assert!(conv.entries.is_empty());
+    }
+
+    #[test]
+    fn interrupt_marker_block_is_not_a_user_message() {
+        let conv = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"  [Request interrupted by user for tool use]"}]}}"#,
+        );
+        assert_eq!(conv.user_message_count, 0);
+        assert!(conv.entries.is_empty());
+
+        let kept = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep this [Request interrupted by user"}]}}"#,
+        );
+        assert_eq!(kept.user_message_count, 1);
+        assert!(matches!(
+            &kept.entries[..],
+            [ConversationEntry::UserMessage(text)] if text == "keep this [Request interrupted by user"
+        ));
+    }
+
+    #[test]
+    fn image_block_plus_text_block_keeps_the_text() {
+        let conv = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"aaaa"}},{"type":"text","text":"look at this"}]}}"#,
+        );
+        assert_eq!(conv.user_message_count, 1);
+        assert!(matches!(
+            &conv.entries[..],
+            [ConversationEntry::UserMessage(text)] if text == "look at this"
+        ));
+    }
+
+    #[test]
+    fn text_block_with_missing_or_non_string_text_adds_nothing() {
+        let conv = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text"},{"type":"text","text":null},{"type":"text","text":1}]}}"#,
+        );
+        assert_eq!(conv.user_message_count, 0);
+        assert!(conv.entries.is_empty());
     }
 }
