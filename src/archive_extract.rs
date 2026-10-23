@@ -23,6 +23,7 @@
 //!   └─ store (exclusive)
 //!        ├─ nothing of `log` pending  ─────────────▶ Ok(NothingPending)
 //!        ├─ every chunk failed        ─────────────▶ AllChunksFailed (left pending)
+//!        ├─ a v2 window failed         ─────────────▶ WindowsPending (left pending)
 //!        └─ extracted, then marked    ─────────────▶ Ok(Extracted)
 //! ```
 //!
@@ -91,6 +92,16 @@ pub enum ExtractArchiveError {
         /// What the failed calls are believed to have cost.
         tokens: u64,
     },
+    /// A v2 window failed after its retry. The archive is left pending so the
+    /// missing window is not dropped. A v1 partial yield is still extracted.
+    #[error("{failed} of {windows} windows failed, archive left pending; first: {first}")]
+    WindowsPending {
+        windows: u32,
+        failed: u32,
+        first: String,
+        /// What the calls are believed to have cost.
+        tokens: u64,
+    },
     /// Anything else: the store, the archive file, the graph.
     #[error(transparent)]
     Recall(#[from] RecallError),
@@ -102,7 +113,7 @@ impl ExtractArchiveError {
     #[must_use]
     pub fn tokens_spent(&self) -> u64 {
         match self {
-            Self::AllChunksFailed { tokens, .. } => *tokens,
+            Self::AllChunksFailed { tokens, .. } | Self::WindowsPending { tokens, .. } => *tokens,
             Self::ProviderUnavailable(_) | Self::Recall(_) => 0,
         }
     }
@@ -216,6 +227,14 @@ fn classify(
     if report.is_total_failure() {
         return Err(ExtractArchiveError::AllChunksFailed {
             chunks: report.chunks_failed,
+            first: report.errors.first().cloned().unwrap_or_default(),
+            tokens: report.total_tokens(),
+        });
+    }
+    if report.leaves_pending() {
+        return Err(ExtractArchiveError::WindowsPending {
+            windows: report.windows,
+            failed: report.chunks_failed,
             first: report.errors.first().cloned().unwrap_or_default(),
             tokens: report.total_tokens(),
         });
@@ -489,6 +508,31 @@ mod tests {
         assert_eq!(extraction.relationships_created, 2);
         assert_eq!(extraction.warnings, vec!["chunk 2 failed".to_string()]);
         assert_eq!(extraction.total_tokens(), 1_000);
+    }
+
+    #[test]
+    fn a_failed_v2_window_is_left_pending() {
+        let report = IngestionReport {
+            chunks_total: 2,
+            chunks_failed: 1,
+            windows: 2,
+            estimated_tokens: 40,
+            errors: vec!["parse failure: no JSON object".into()],
+            ..IngestionReport::default()
+        };
+        let err = classify(3, report, None).unwrap_err();
+        assert_eq!(err.tokens_spent(), 40);
+        assert!(
+            matches!(
+                err,
+                ExtractArchiveError::WindowsPending {
+                    failed: 1,
+                    windows: 2,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     /// A host spawns this onto its own runtime; it must be `Send`.

@@ -22,11 +22,19 @@ pub(crate) const DROP_CONFIDENCE: &str = "low_confidence";
 pub(crate) const DROP_QUOTE: &str = "quote";
 pub(crate) const DROP_VERSION: &str = "bad_version";
 pub(crate) const DROP_PARSE: &str = "parse";
+pub(crate) const DROP_TOO_LONG: &str = "too_long";
+pub(crate) const DROP_OVERFLOW: &str = "overflow";
 
 /// Confidence below this is not a durable fact.
 const MIN_CONFIDENCE: f64 = 0.6;
-/// Objects longer than this are not names or values we store.
+/// Strings from the model longer than this are not stored. The object cap
+/// uses the same limit and is counted as [`DROP_GENERIC`].
 const MAX_OBJECT_CHARS: usize = 300;
+/// Facts, bugs or releases past this in one section are not stored.
+pub(crate) const MAX_ITEMS: usize = 200;
+/// A quote shorter than this is not a verbatim span. The prompt asks for
+/// 3–20 words and does not set a character floor.
+const MIN_QUOTE_NON_WS: usize = 8;
 
 /// The six kinds v2 stores. Each one maps onto an existing [`EntityType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -269,56 +277,61 @@ pub(crate) struct Mention {
 
 /// Apply the remap / reject table in the specified order.
 ///
+/// Row 3 sees the object kind the model sent. A literal object type is
+/// promoted to technology only at row 5, after that reject has run, so
+/// `technology uses "1.75"` is not a technology-to-technology edge.
+///
 /// `Err(DROP_REJECTED)` is a counted drop. A `Fact` has already had its key
 /// canonicalised when it is a setting, and its role cleared when it is not a
 /// `uses` edge.
 pub(crate) fn remap(mention: Mention) -> Result<Fact, &'static str> {
     let mut mention = mention;
-    remap_predicate(&mut mention);
-    if rejected(&mention) {
-        return Err(DROP_REJECTED);
-    }
-    adjust_role_and_key(&mut mention);
-    literal_uses_becomes_setting(&mut mention);
-    Ok(finish(mention))
-}
-
-/// Rows that change the predicate or the object kind.
-fn remap_predicate(mention: &mut Mention) {
+    // 1. uses + component object => depends_on
     if mention.predicate == Predicate::Uses && mention.object_kind == Some(Kind::Component) {
         mention.predicate = Predicate::DependsOn;
     }
+    // 2. depends_on + technology object => uses, role library when none
     if mention.predicate == Predicate::DependsOn && mention.object_kind == Some(Kind::Technology) {
         mention.predicate = Predicate::Uses;
         if mention.role == Role::None {
             mention.role = Role::Library;
         }
     }
+    // 3. uses technology → technology => reject, on the original object kind
+    if mention.predicate == Predicate::Uses
+        && mention.subject_kind == Kind::Technology
+        && mention.object_kind == Some(Kind::Technology)
+    {
+        return Err(DROP_REJECTED);
+    }
+    // 4. rule / setting / prefers objects are literals
     if matches!(
         mention.predicate,
         Predicate::Rule | Predicate::Setting | Predicate::Prefers
     ) {
         mention.object_kind = None;
     }
+    // 5. uses + literal object type => technology
     if mention.predicate == Predicate::Uses && mention.object_kind.is_none() {
         mention.object_kind = Some(Kind::Technology);
     }
-}
-
-fn rejected(mention: &Mention) -> bool {
-    if mention.predicate == Predicate::Uses
-        && mention.subject_kind == Kind::Technology
-        && mention.object_kind == Some(Kind::Technology)
-    {
-        return true;
-    }
+    // 6. part_of + project subject => reject
     if mention.predicate == Predicate::PartOf && mention.subject_kind == Kind::Project {
-        return true;
+        return Err(DROP_REJECTED);
     }
+    // 7. part_of + technology object => reject
     if mention.predicate == Predicate::PartOf && mention.object_kind == Some(Kind::Technology) {
-        return true;
+        return Err(DROP_REJECTED);
     }
-    !subject_allowed(mention.predicate, mention.subject_kind)
+    // 8. subject kind not allowed => reject
+    if !subject_allowed(mention.predicate, mention.subject_kind) {
+        return Err(DROP_REJECTED);
+    }
+    // 9. uses role none => other. 10. non-setting clears key, non-uses clears role.
+    adjust_role_and_key(&mut mention);
+    // 11. a uses whose object looks literal becomes a setting
+    literal_uses_becomes_setting(&mut mention);
+    Ok(finish(mention))
 }
 
 /// `uses`, `setting` and `rule` also accept project, component and technology.
@@ -555,10 +568,16 @@ pub(crate) fn normalise(raw: &str) -> String {
     out
 }
 
+/// A model string past [`MAX_OBJECT_CHARS`].
+#[must_use]
+pub(crate) fn over_long(value: &str) -> bool {
+    value.chars().count() > MAX_OBJECT_CHARS
+}
+
 /// Generic object, object equal to the subject, or an object past the length cap.
 #[must_use]
 pub(crate) fn generic_object(object: &str, subject: &str) -> bool {
-    if object.chars().count() > MAX_OBJECT_CHARS {
+    if over_long(object) {
         return true;
     }
     let norm = normalise(object);
@@ -611,22 +630,35 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
 }
 
 /// Keep the quote when it is an exact substring of the cited turn.
-/// Otherwise re-cite the first other turn that contains it.
+///
+/// A quote that is missing there is re-cited onto another turn of the same
+/// speaker. The speaker is not changed: a quote that exists only in the other
+/// speaker's turn is ungrounded.
 pub(crate) fn recite(fact: &mut Fact, turns: &[Turn]) -> Result<(), &'static str> {
-    // An empty quote is not a verbatim substring. `str::contains("")` is true,
-    // so it has to be rejected before the search.
-    if fact.quote.is_empty() {
+    // `str::contains("")` is true, and a one-word quote is a substring of
+    // nearly every turn. Both are ungrounded.
+    if quote_non_ws(&fact.quote) < MIN_QUOTE_NON_WS {
         return Err(DROP_QUOTE);
     }
-    if quote_in(fact.turn, &fact.quote, turns) {
+    if quote_in(fact.turn, &fact.quote, turns)
+        && turns
+            .iter()
+            .any(|turn| turn.index == fact.turn && turn.role == fact.provenance)
+    {
         return Ok(());
     }
-    if let Some(turn) = turns.iter().find(|turn| turn.text.contains(&fact.quote)) {
+    if let Some(turn) = turns
+        .iter()
+        .find(|turn| turn.role == fact.provenance && turn.text.contains(&fact.quote))
+    {
         fact.turn = turn.index;
-        fact.provenance = turn.role;
         return Ok(());
     }
     Err(DROP_QUOTE)
+}
+
+fn quote_non_ws(quote: &str) -> usize {
+    quote.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
 fn quote_in(index: usize, quote: &str, turns: &[Turn]) -> bool {
@@ -807,6 +839,72 @@ mod tests {
         assert_eq!(remap(person_part).unwrap_err(), DROP_REJECTED);
         let person_uses = mention(Predicate::Uses, Kind::Person, Some(Kind::Technology));
         assert_eq!(remap(person_uses).unwrap_err(), DROP_REJECTED);
+
+        // technology + uses + literal object type is not row 3. A version
+        // becomes a setting; a name stays a uses edge.
+        let mut version = mention(Predicate::Uses, Kind::Technology, None);
+        version.subject = "Rust".into();
+        version.object = "1.75".into();
+        let fact = remap(version).unwrap();
+        assert_eq!(fact.predicate, Predicate::Setting);
+        assert_eq!(fact.key, "value");
+        assert_eq!(fact.object_kind, None);
+
+        let mut named = mention(Predicate::Uses, Kind::Technology, None);
+        named.subject = "Typer".into();
+        named.object = "Click".into();
+        let fact = remap(named).unwrap();
+        assert_eq!(fact.predicate, Predicate::Uses);
+        assert_eq!(fact.object_kind, Some(Kind::Technology));
+        assert_eq!(fact.object_name, "Click");
+    }
+
+    #[test]
+    fn recite_keeps_the_speaker_and_rejects_a_short_quote() {
+        let turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "Ship the shelf today.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Port 9000 is chosen.".into(),
+            },
+            Turn {
+                index: 2,
+                role: TurnRole::User,
+                text: "The chosen port is nine thousand.".into(),
+            },
+        ];
+        let mut cross = fact_at(0, TurnRole::User, "Port 9000 is chosen.");
+        assert_eq!(recite(&mut cross, &turns).unwrap_err(), DROP_QUOTE);
+
+        let mut same = fact_at(0, TurnRole::User, "The chosen port is nine thousand.");
+        recite(&mut same, &turns).unwrap();
+        assert_eq!(same.turn, 2);
+        assert_eq!(same.provenance, TurnRole::User);
+
+        let mut short = fact_at(1, TurnRole::Assistant, "Port");
+        assert_eq!(recite(&mut short, &turns).unwrap_err(), DROP_QUOTE);
+    }
+
+    fn fact_at(turn: usize, role: TurnRole, quote: &str) -> Fact {
+        Fact {
+            subject_name: "tidepool".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: "port".into(),
+            object_name: "9000".into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn,
+            quote: quote.into(),
+            confidence: 0.9,
+            provenance: role,
+        }
     }
 
     #[test]

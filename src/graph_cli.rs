@@ -495,13 +495,13 @@ async fn extract_ingested_v2(
             PipelineVersion::V2,
         )
         .await?;
-        if !report.is_total_failure() {
+        if !report.leaves_pending() {
             gm.mark_extracted(log).await?;
         }
         Ok(report)
     })
     .await?;
-    if report.is_total_failure() {
+    if report.leaves_pending() {
         let first = report
             .errors
             .first()
@@ -512,8 +512,11 @@ async fn extract_ingested_v2(
         )));
     }
     println!(
-        "  {GOOD}✓{RESET} pipeline v2: +{} entities, {} rels, {} slots",
-        report.entities_created, report.relationships_created, report.slots_written
+        "  {GOOD}✓{RESET} pipeline v2: +{} entities, {} rels, {} slots{}",
+        report.entities_created,
+        report.relationships_created,
+        report.slots_written,
+        v2_report_suffix(&report)
     );
     for err in &report.errors {
         println!("  {WARN}warning:{RESET} {err}");
@@ -870,6 +873,58 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// What `graph extract` does with an `Err` from one archive.
+#[cfg(feature = "llm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// Stamp refusal. Stop the run; do not retry or quarantine.
+    Stop,
+    /// v2 write or load error. One attempt, left pending.
+    LeavePending,
+    /// v1. Call once more, then quarantine.
+    Retry,
+}
+
+#[cfg(feature = "llm")]
+fn attempt_after_error(
+    pipeline: PipelineVersion,
+    err: &crate::graph::error::GraphError,
+) -> Attempt {
+    if pipeline != PipelineVersion::V2 {
+        return Attempt::Retry;
+    }
+    if crate::graph::v2::is_stamp_refusal(err) {
+        Attempt::Stop
+    } else {
+        Attempt::LeavePending
+    }
+}
+
+/// Windows, calls, candidates, drops by reason, and kept. Empty for v1,
+/// whose counters stay zero, so the v1 success line does not change.
+#[cfg(feature = "llm")]
+fn v2_report_suffix(report: &IngestionReport) -> String {
+    if report.windows == 0 && report.candidates == 0 && report.kept == 0 && report.drops.is_empty()
+    {
+        return String::new();
+    }
+    let drops = if report.drops.is_empty() {
+        "none".to_string()
+    } else {
+        let mut parts: Vec<_> = report.drops.iter().collect();
+        parts.sort_by(|left, right| left.0.cmp(right.0));
+        parts
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept",
+        report.windows, report.llm_calls, report.candidates, report.kept
+    )
+}
+
 /// Arguments for [`extract`]. One value, so the pipeline flag does not become
 /// a ninth parameter.
 #[cfg(feature = "llm")]
@@ -999,7 +1054,9 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
             let (session_id, _) = extract_archive_metadata(&content, &archive_path);
             let context = IngestContext::new(session_id, Some(*ln));
 
-            // Try extraction, retry once on failure, quarantine on second failure
+            // v1 retries once, then quarantines. v2 does not: a stamp refusal
+            // stops the run, and any other error (a write that already landed)
+            // is left pending without a second provider call.
             let report = match crate::graph::v2::extract_log(
                 &gm,
                 &memory,
@@ -1012,38 +1069,58 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
             .await
             {
                 Ok(r) => r,
-                Err(e) => {
-                    println!(
-                        "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
-                        idx + 1,
-                        total_count
-                    );
-                    match crate::graph::v2::extract_log(
-                        &gm,
-                        &memory,
-                        *ln,
-                        &content,
-                        &context,
-                        &*llm,
-                        pipeline,
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(e2) => {
-                            println!(
-                                "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
-                                idx + 1,
-                                total_count
-                            );
-                            totals.quarantined.push(*ln);
-                            totals
-                                .errors
-                                .push(format!("log {ln:03}: quarantined after retry: {e2}"));
-                            continue;
+                Err(e) => match attempt_after_error(pipeline, &e) {
+                    Attempt::Stop => {
+                        println!("\n{WARN}✗{RESET} {}", crate::graph::v2::V2_REFUSAL);
+                        return Err(RecallError::Other(
+                            crate::graph::v2::V2_REFUSAL.to_string(),
+                        ));
+                    }
+                    Attempt::LeavePending => {
+                        println!(
+                            "  {WARN}✗{RESET} [{}/{}] log {ln:03}: left pending ({e})",
+                            idx + 1,
+                            total_count
+                        );
+                        totals.left_pending.push(*ln);
+                        totals
+                            .errors
+                            .push(format!("log {ln:03}: left pending: {e}"));
+                        continue;
+                    }
+                    Attempt::Retry => {
+                        println!(
+                            "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
+                            idx + 1,
+                            total_count
+                        );
+                        match crate::graph::v2::extract_log(
+                            &gm,
+                            &memory,
+                            *ln,
+                            &content,
+                            &context,
+                            &*llm,
+                            pipeline,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e2) => {
+                                println!(
+                                    "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
+                                    idx + 1,
+                                    total_count
+                                );
+                                totals.quarantined.push(*ln);
+                                totals.errors.push(format!(
+                                    "log {ln:03}: quarantined after retry: {e2}"
+                                ));
+                                continue;
+                            }
                         }
                     }
-                }
+                },
             };
 
             // Whatever happened, the tokens were spent: keep the budget honest.
@@ -1057,16 +1134,32 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
             // "extracted, empty". Deliberately no retry here, unlike an Err
             // above: the user is watching and will re-run; the daemon has its
             // own ladder. Three in a row and we stop burning spawns.
-            if report.is_total_failure() {
-                println!(
-                    "  {WARN}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
-                    idx + 1,
-                    total_count,
-                    report.chunks_failed,
-                    report.errors.first().map_or("", String::as_str),
-                );
+            if report.leaves_pending() {
+                if report.is_total_failure() {
+                    println!(
+                        "  {WARN}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
+                        idx + 1,
+                        total_count,
+                        report.chunks_failed,
+                        report.errors.first().map_or("", String::as_str),
+                    );
+                } else {
+                    println!(
+                        "  {WARN}✗{RESET} [{}/{}] log {ln:03}: {} of {} windows failed — left pending ({})",
+                        idx + 1,
+                        total_count,
+                        report.chunks_failed,
+                        report.windows,
+                        report.errors.first().map_or("", String::as_str),
+                    );
+                }
                 totals.left_pending.push(*ln);
+                let total = report.is_total_failure();
                 totals.errors.extend(report.errors);
+                if !total {
+                    consecutive_total_failures = 0;
+                    continue;
+                }
                 consecutive_total_failures += 1;
                 if consecutive_total_failures >= MAX_CONSECUTIVE_TOTAL_FAILURES {
                     println!(
@@ -1095,8 +1188,9 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
             } else {
                 String::new()
             };
+            let v2_label = v2_report_suffix(&report);
             println!(
-                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels{slots_label} ({}){warn_label}",
+                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels{slots_label}{v2_label} ({}){warn_label}",
                 idx + 1,
                 total_count,
                 report.entities_created,
@@ -2101,6 +2195,50 @@ pub(crate) fn find_archive_file(
 #[cfg(all(test, feature = "llm"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stamp_refusal_stops_and_a_write_error_is_not_retried() {
+        use crate::graph::error::GraphError;
+        use crate::graph::v2::V2_REFUSAL;
+
+        let refusal = GraphError::Extraction(V2_REFUSAL.to_string());
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V2, &refusal),
+            Attempt::Stop
+        );
+        let write = GraphError::Extraction("database: write failed".into());
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V2, &write),
+            Attempt::LeavePending
+        );
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V1, &refusal),
+            Attempt::Retry
+        );
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V1, &write),
+            Attempt::Retry
+        );
+    }
+
+    #[test]
+    fn v2_counters_appear_on_the_extract_line_and_v1_stays_bare() {
+        let v1 = IngestionReport::default();
+        assert_eq!(v2_report_suffix(&v1), "");
+
+        let mut v2 = IngestionReport {
+            windows: 2,
+            llm_calls: 3,
+            candidates: 4,
+            kept: 3,
+            ..IngestionReport::default()
+        };
+        v2.drops.insert("parse".into(), 1);
+        assert_eq!(
+            v2_report_suffix(&v2),
+            ", 2 windows, 3 calls, 4 candidates, drops parse=1, 3 kept"
+        );
+    }
 
     /// The line a user reads must not claim a measurement it does not have.
     #[test]

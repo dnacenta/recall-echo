@@ -12,11 +12,13 @@ pub(crate) mod input;
 pub(crate) mod pass1;
 mod schema;
 mod write;
+
 use super::error::GraphError;
 use super::ingest::IngestContext;
 use super::llm::LlmProvider;
 use super::types::IngestionReport;
 use super::GraphMemory;
+pub(crate) use write::V2_REFUSAL;
 
 /// Which extraction pipeline a run uses.
 ///
@@ -88,6 +90,12 @@ pub(crate) fn pipeline_for_hook(memory_dir: &std::path::Path) -> PipelineVersion
             PipelineVersion::V1
         }
     }
+}
+
+/// The store refused this pipeline. The message is the rebuild line.
+#[must_use]
+pub(crate) fn is_stamp_refusal(err: &GraphError) -> bool {
+    err.to_string().contains(V2_REFUSAL)
 }
 
 /// Extract one archive with the pipeline this run selected.

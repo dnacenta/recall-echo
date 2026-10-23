@@ -796,10 +796,20 @@ impl IngestionReport {
     /// This is the run that must not be recorded as done. Marking it would
     /// make a broken provider look like an empty archive, and nothing would
     /// ever retry it. A partial failure (some chunks parsed) is a success
-    /// with warnings, and an archive with no chunks is simply empty.
+    /// with warnings for v1, and an archive with no chunks is simply empty.
     #[must_use]
     pub fn is_total_failure(&self) -> bool {
         self.chunks_total > 0 && self.chunks_failed == self.chunks_total
+    }
+
+    /// The session must stay pending.
+    ///
+    /// v1 stays on [`IngestionReport::is_total_failure`]: a partial chunk
+    /// failure is still marked. v2 (`windows > 0`) leaves the session pending
+    /// when any window failed, so that window can be extracted later.
+    #[must_use]
+    pub fn leaves_pending(&self) -> bool {
+        self.is_total_failure() || (self.windows > 0 && self.chunks_failed > 0)
     }
 }
 
@@ -846,6 +856,20 @@ mod tests {
     #[test]
     fn an_archive_with_no_chunks_is_not_a_failure() {
         assert!(!chunks(0, 0).is_total_failure());
+    }
+
+    #[test]
+    fn a_failed_v2_window_leaves_the_session_pending() {
+        let mut partial = chunks(2, 1);
+        assert!(!partial.leaves_pending());
+        partial.windows = 2;
+        assert!(partial.leaves_pending());
+        assert!(!partial.is_total_failure());
+
+        let mut total = chunks(2, 2);
+        total.windows = 2;
+        assert!(total.leaves_pending());
+        assert!(!chunks(3, 0).leaves_pending());
     }
 
     fn episode_with(embedding: Option<Vec<f32>>) -> Episode {

@@ -8,6 +8,7 @@
 //! here after the reply is read. A window that is not the root object is
 //! retried once. One bad element is a drop, so it does not fail the window.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -21,8 +22,9 @@ use super::super::types::IngestionReport;
 use super::super::GraphMemory;
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
-    affects_target, filter_fact, map_subject, recite, release_name, remap, Fact, Kind, Mention,
-    Predicate, Role, DROP_CONFIDENCE, DROP_PARSE, DROP_VERSION,
+    affects_target, filter_fact, map_subject, over_long, recite, release_name, remap, Fact, Kind,
+    Mention, Predicate, Role, DROP_CONFIDENCE, DROP_OVERFLOW, DROP_PARSE, DROP_TOO_LONG,
+    DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 
@@ -188,6 +190,10 @@ pub(crate) async fn extract_session(
             }
         }
     }
+    // Overlap repeats the last two turns. The same fact, session, turn and
+    // quote is one write: a second copy must not corroborate the fact in the
+    // session that created it.
+    let facts = dedupe_facts(facts);
 
     if !facts.is_empty() {
         let stats = write::write_facts(gm, ctx.session_id(), &session.date, &facts).await?;
@@ -263,8 +269,12 @@ fn facts_from_reply(
         let Some(items) = reply.get(section).and_then(Value::as_array) else {
             continue;
         };
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
             report.candidates += 1;
+            if index >= MAX_ITEMS {
+                count_drop(report, DROP_OVERFLOW);
+                continue;
+            }
             match accept_item(section, item, session) {
                 Ok(batch) => {
                     report.kept += 1;
@@ -311,13 +321,18 @@ fn mention_from(object: &Map<String, Value>, turns: &[Turn]) -> Result<Mention, 
         "literal" => None,
         other => Some(Kind::parse(other).ok_or(DROP_PARSE)?),
     };
+    let subject = text(object, "subject")?;
+    let key = text(object, "key")?;
+    if over_long(subject) || over_long(key) {
+        return Err(DROP_TOO_LONG);
+    }
     let turn = turn_of(object)?;
     Ok(Mention {
-        subject: text(object, "subject")?.to_string(),
+        subject: subject.to_string(),
         subject_kind,
         predicate,
         role,
-        key: text(object, "key")?.to_string(),
+        key: key.to_string(),
         object: text(object, "object")?.to_string(),
         object_kind,
         status: text(object, "status")?.to_string(),
@@ -340,6 +355,11 @@ fn expand_bug(
     if symptom.is_empty() {
         return Err(DROP_PARSE);
     }
+    let cause = text(object, "cause")?.trim();
+    let fix = text(object, "fix")?.trim();
+    if over_long(symptom) || over_long(cause) || over_long(fix) {
+        return Err(DROP_TOO_LONG);
+    }
     let mut carrier = carrier(object, &session.turns, confidence)?;
     recite(&mut carrier, &session.turns)?;
     let (target_name, target_kind) = affects_target(text(object, "component")?, &session.project);
@@ -350,7 +370,6 @@ fn expand_bug(
         symptom,
         &carrier,
     )];
-    let cause = text(object, "cause")?.trim();
     if !cause.is_empty() {
         facts.push(slot_fact(
             symptom,
@@ -360,7 +379,6 @@ fn expand_bug(
             &carrier,
         ));
     }
-    let fix = text(object, "fix")?.trim();
     if !fix.is_empty() {
         facts.push(slot_fact(
             symptom,
@@ -419,6 +437,9 @@ fn expand_release(
         &carrier,
     )];
     let contents = text(object, "contents")?.trim();
+    if over_long(contents) {
+        return Err(DROP_TOO_LONG);
+    }
     if !contents.is_empty() {
         facts.push(slot_fact(
             &name,
@@ -535,6 +556,47 @@ fn turn_of(object: &Map<String, Value>) -> Result<usize, &'static str> {
     Err(DROP_PARSE)
 }
 
+/// One write per fact identity, session, turn and quote. The session is the
+/// whole call, so it is not part of the key.
+fn dedupe_facts(facts: Vec<Fact>) -> Vec<Fact> {
+    let mut seen = HashSet::new();
+    let mut kept = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if seen.insert(fact_identity(&fact)) {
+            kept.push(fact);
+        }
+    }
+    kept
+}
+
+fn fact_identity(
+    fact: &Fact,
+) -> (
+    String,
+    &'static str,
+    &'static str,
+    &'static str,
+    String,
+    String,
+    &'static str,
+    String,
+    usize,
+    String,
+) {
+    (
+        fact.subject_name.clone(),
+        fact.subject_kind.as_str(),
+        fact.predicate.as_str(),
+        fact.role.map(Role::as_str).unwrap_or(""),
+        fact.key.clone(),
+        fact.object_name.clone(),
+        fact.object_kind.map(Kind::as_str).unwrap_or(""),
+        fact.status.clone(),
+        fact.turn,
+        fact.quote.clone(),
+    )
+}
+
 fn count_drop(report: &mut IngestionReport, reason: &str) {
     *report.drops.entry(reason.to_string()).or_insert(0) += 1;
 }
@@ -642,7 +704,10 @@ fn value_matches(value: &Value, schema: &Value) -> bool {
 mod tests {
     use super::*;
     use crate::graph::v2::input::{ProjectIdentity, Turn, TurnRole};
-    use crate::graph::v2::schema::{Predicate, DROP_QUOTE};
+    use crate::graph::v2::schema::{
+        Predicate, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG, MAX_ITEMS,
+    };
+    use serde_json::Value;
 
     fn session(turns: Vec<Turn>) -> SessionInput {
         SessionInput {
@@ -718,18 +783,34 @@ mod tests {
         let mut report = IngestionReport::default();
         let facts = facts_from_reply(&reply, &session(turns()), &mut report);
         assert_eq!(report.candidates, 2);
-        assert_eq!(report.kept, 2);
-        assert!(report.drops.is_empty());
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
         assert_eq!(facts[0].turn, 0);
         assert_eq!(facts[0].provenance, TurnRole::User);
-        assert_eq!(
-            facts[1].turn, 1,
-            "the quote is re-cited onto the turn that contains it"
+        assert_eq!(facts[0].predicate, Predicate::Setting);
+        assert_eq!(facts[0].key, "port");
+        assert_eq!(facts[0].object_name, "9000");
+
+        let mut same_speaker = turns();
+        same_speaker.push(Turn {
+            index: 2,
+            role: TurnRole::User,
+            text: "The chosen port is nine thousand.".into(),
+        });
+        let moved = serde_json::json!({
+            "facts": [fact_json(0, "The chosen port is nine thousand.")],
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            moved.as_object().expect("object"),
+            &session(same_speaker),
+            &mut report,
         );
-        assert_eq!(facts[1].provenance, TurnRole::Assistant);
-        assert_eq!(facts[1].predicate, Predicate::Setting);
-        assert_eq!(facts[1].key, "port");
-        assert_eq!(facts[1].object_name, "9000");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].turn, 2);
+        assert_eq!(facts[0].provenance, TurnRole::User);
 
         let empty = serde_json::json!({
             "facts": [fact_json(0, "")],
@@ -744,6 +825,68 @@ mod tests {
         );
         assert!(facts.is_empty());
         assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+    }
+
+    #[test]
+    fn long_fields_and_extra_items_are_counted_drops() {
+        let long = "x".repeat(301);
+        let mut subject = fact_json(0, "Ship the shelf.");
+        subject["subject"] = Value::String(long.clone());
+        let mut key = fact_json(0, "Ship the shelf.");
+        key["key"] = Value::String(long.clone());
+        let mut bug = serde_json::json!({
+            "symptom": long,
+            "cause": "",
+            "fix": "",
+            "status": "open",
+            "component": "cache",
+            "turn": 0,
+            "quote": "Ship the shelf.",
+            "confidence": 0.9
+        });
+        bug["cause"] = Value::String("y".repeat(301));
+        let mut release = serde_json::json!({
+            "version": "1.4.0",
+            "status": "released",
+            "contents": "z".repeat(301),
+            "turn": 1,
+            "quote": "Tag v1.4.0 today.",
+            "confidence": 0.9
+        });
+        let _ = &mut release;
+        let mut facts = Vec::new();
+        facts.push(fact_json(0, "Ship the shelf."));
+        for _ in 0..MAX_ITEMS {
+            facts.push(fact_json(0, "Ship the shelf."));
+        }
+        let reply = serde_json::json!({
+            "facts": [subject, key],
+            "bugs": [bug],
+            "releases": [release]
+        });
+        let mut report = IngestionReport::default();
+        let kept = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns()),
+            &mut report,
+        );
+        assert!(kept.is_empty());
+        assert_eq!(report.drops.get(DROP_TOO_LONG).copied(), Some(4));
+
+        let reply = serde_json::json!({
+            "facts": facts,
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let kept = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns()),
+            &mut report,
+        );
+        assert_eq!(kept.len(), MAX_ITEMS);
+        assert_eq!(report.candidates, MAX_ITEMS as u32 + 1);
+        assert_eq!(report.drops.get(DROP_OVERFLOW).copied(), Some(1));
     }
 
     #[test]
@@ -790,6 +933,126 @@ mod tests {
         assert!(facts
             .iter()
             .any(|fact| { fact.predicate == Predicate::PartOf && fact.object_name == "tidepool" }));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn overlap_does_not_corroborate_the_creating_session() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::conversation::ConversationEntry;
+        use crate::graph::confidence::{Evidence, ExtractionContext};
+
+        let quote = "the port is nine thousand";
+        let padding = "x".repeat(15_000);
+        let quoted = format!("{quote}. {padding}");
+        let filler = "y".repeat(15_000);
+        let entries = vec![
+            ConversationEntry::UserMessage(filler.clone()),
+            ConversationEntry::UserMessage(filler.clone()),
+            ConversationEntry::UserMessage(quoted),
+            ConversationEntry::UserMessage(filler),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        input::write_turns_sidecar(memory, 1, "s", "2026-01-02T00:00:00Z", None, &entries).unwrap();
+        let session = input::load_session(memory, 1).unwrap();
+        let windows = input::window(&session, WINDOW_CHARS);
+        assert!(
+            windows.len() > 1,
+            "session must exceed the window budget, got {} chars",
+            windows
+                .iter()
+                .map(|window| window.chars().count())
+                .sum::<usize>()
+        );
+        assert!(
+            windows
+                .iter()
+                .filter(|window| window.contains(quote))
+                .count()
+                > 1,
+            "the quoted turn must sit in the overlap"
+        );
+
+        struct HitProvider {
+            calls: AtomicU32,
+            hits: AtomicU32,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for HitProvider {
+            async fn complete(
+                &self,
+                _: &str,
+                user_message: &str,
+                _: u32,
+            ) -> Result<String, GraphError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if !user_message.contains("the port is nine thousand") {
+                    return Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string());
+                }
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                let turn = turn_index_of(user_message, "the port is nine thousand");
+                Ok(format!(
+                    r#"{{"facts":[{{"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":{turn},"quote":"the port is nine thousand","confidence":0.9}}],"bugs":[],"releases":[]}}"#
+                ))
+            }
+        }
+        fn turn_index_of(window: &str, needle: &str) -> usize {
+            let mut current = 0;
+            for line in window.lines() {
+                if let Some(rest) = line.strip_prefix("[T") {
+                    if let Some((num, _)) = rest.split_once(']') {
+                        if let Ok(index) = num.parse() {
+                            current = index;
+                        }
+                    }
+                }
+                if line.contains(needle) {
+                    return current;
+                }
+            }
+            0
+        }
+
+        let provider = HitProvider {
+            calls: AtomicU32::new(0),
+            hits: AtomicU32::new(0),
+        };
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let ctx = IngestContext::new("s", Some(1));
+        let report = extract_session(&gm, memory, 1, &ctx, &provider)
+            .await
+            .unwrap();
+        assert!(report.windows > 1);
+        assert_eq!(report.llm_calls, report.windows);
+        assert!(provider.hits.load(Ordering::SeqCst) > 1);
+        assert_eq!(report.slots_written, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let shelf = entities
+            .iter()
+            .find(|entity| entity.name == "shelf")
+            .expect("shelf");
+        let slots = shelf
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.get("v2"))
+            .and_then(|v2| v2.get("slots"))
+            .and_then(|slots| slots.as_array())
+            .expect("slots");
+        assert_eq!(slots.len(), 1);
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let alpha = slots[0]["alpha"].as_f64().unwrap();
+        let beta = slots[0]["beta"].as_f64().unwrap();
+        assert!((alpha - prior.alpha()).abs() < 1e-9, "alpha {alpha}");
+        assert!((beta - prior.beta()).abs() < 1e-9, "beta {beta}");
+        assert_eq!(slots[0]["evidence"].as_array().unwrap().len(), 1);
     }
 
     #[cfg(feature = "embedded")]

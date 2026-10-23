@@ -953,13 +953,13 @@ fn resolve_pulse_root(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| paths::pulse_root().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// The provenance override a `--external` flag asks for. Without the flag the
-/// class is inferred per chunk from conversation turn roles.
 fn parse_pipeline(raw: &str) -> Result<recall_echo::graph::PipelineVersion, String> {
     recall_echo::graph::PipelineVersion::parse(raw)
         .ok_or_else(|| format!("pipeline must be v1 or v2, not {raw}"))
 }
 
+/// The provenance override a `--external` flag asks for. Without the flag the
+/// class is inferred per chunk from conversation turn roles.
 fn external_provenance(external: bool) -> Option<recall_echo::graph::Provenance> {
     external.then_some(recall_echo::graph::Provenance::External)
 }

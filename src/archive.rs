@@ -413,73 +413,6 @@ pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
     )) {
         eprintln!("recall-echo: graph ingestion warning: {e}");
     }
-    #[cfg(feature = "llm")]
-    extract_v2_if_configured(memory_dir, result);
-}
-
-/// When `[graph] pipeline` is v2, extract the session that was just archived.
-/// A missing provider or a refused store is logged and the archive stays
-/// pending, so the daemon can retry it. v1 does not extract here.
-#[cfg(feature = "llm")]
-fn extract_v2_if_configured(memory_dir: &Path, result: &ArchiveResult) {
-    if result.log_number == 0
-        || crate::graph::v2::pipeline_for_hook(memory_dir) != crate::graph::PipelineVersion::V2
-    {
-        return;
-    }
-    let rt = match client_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("recall-echo: graph runtime error: {e}");
-            return;
-        }
-    };
-    if let Err(e) = rt.block_on(extract_v2_session(memory_dir, result)) {
-        eprintln!("recall-echo: pipeline v2 extraction warning: {e}");
-    }
-}
-
-#[cfg(feature = "llm")]
-async fn extract_v2_session(memory_dir: &Path, result: &ArchiveResult) -> Result<(), RecallError> {
-    if result.log_number == 0
-        || crate::graph::v2::pipeline_for_hook(memory_dir) != crate::graph::PipelineVersion::V2
-    {
-        return Ok(());
-    }
-    let (llm, _) = crate::llm_provider::create_provider(memory_dir, None, None)?;
-    let memory = memory_dir.to_path_buf();
-    let text = result.full_content.clone();
-    let session_id = result.session_id.clone();
-    let log = result.log_number;
-    let report = crate::serve_client::exclusive(memory_dir, |gm| async move {
-        let context = crate::graph::IngestContext::new(session_id, Some(log));
-        let report = crate::graph::v2::extract_log(
-            &gm,
-            &memory,
-            log,
-            &text,
-            &context,
-            llm.as_ref(),
-            crate::graph::PipelineVersion::V2,
-        )
-        .await?;
-        if !report.is_total_failure() {
-            gm.mark_extracted(log).await?;
-        }
-        Ok(report)
-    })
-    .await?;
-    if report.is_total_failure() {
-        let first = report
-            .errors
-            .first()
-            .map(String::as_str)
-            .unwrap_or("parse failure");
-        return Err(RecallError::Other(format!(
-            "log {log:03} left pending: {first}"
-        )));
-    }
-    Ok(())
 }
 
 /// A runtime for a client-side command: a handful of socket round-trips, plus
@@ -951,10 +884,6 @@ pub async fn archive_session(
         {
             eprintln!("recall-echo: graph ingestion warning: {e}");
         }
-        #[cfg(feature = "llm")]
-        if let Err(e) = extract_v2_session(memory_dir, &result).await {
-            eprintln!("recall-echo: pipeline v2 extraction warning: {e}");
-        }
         pipeline_sync_on_archive_async(memory_dir).await;
     }
 
@@ -964,6 +893,43 @@ pub async fn archive_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hooks ingest episodes. They do not extract, whatever `[graph] pipeline`
+    /// says: no provider call, no admin lock, and the daemon is not stopped.
+    #[test]
+    fn the_archive_hook_does_not_extract() {
+        let source = include_str!("archive.rs");
+        let production = source.split("mod tests").next().expect("tests");
+        assert!(
+            !production.contains("extract_log"),
+            "an archive hook must not run extraction"
+        );
+        assert!(
+            !production.contains("serve_client::exclusive"),
+            "an archive hook must not take the admin lock"
+        );
+        assert!(
+            !production.contains("create_provider"),
+            "an archive hook must not call the model"
+        );
+        assert!(production.contains("ingest_into_graph"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".recall-echo.toml"),
+            "[graph]\npipeline = \"v2\"\n",
+        )
+        .unwrap();
+        graph_ingest(
+            tmp.path(),
+            &ArchiveResult {
+                log_number: 3,
+                full_content: "### User\n\nShip the shelf.\n".into(),
+                session_id: "s".into(),
+            },
+        );
+        assert!(!tmp.path().join("graph").exists());
+    }
 
     #[test]
     fn highest_from_empty_dir() {
