@@ -265,32 +265,67 @@ pub fn parse_transcript(
 
 fn parse_user_content(conv: &mut Conversation, content: ContentValue) {
     match content {
-        ContentValue::Text(text) => {
-            conv.user_message_count += 1;
-            conv.entries.push(ConversationEntry::UserMessage(text));
-        }
-        ContentValue::Blocks(blocks) => {
-            for block in blocks {
-                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if block_type == "tool_result" {
-                    let raw_content = block.get("content");
-                    let text = match raw_content {
-                        Some(serde_json::Value::String(s)) => s.clone(),
-                        Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    let is_error = block
-                        .get("is_error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    conv.entries.push(ConversationEntry::ToolResult {
-                        content: crate::conversation::truncate(&text, 2000),
-                        is_error,
-                    });
-                }
+        ContentValue::Text(text) => push_user_message(conv, text),
+        ContentValue::Blocks(blocks) => parse_user_blocks(conv, blocks),
+    }
+}
+
+fn push_user_message(conv: &mut Conversation, text: String) {
+    conv.user_message_count += 1;
+    conv.entries.push(ConversationEntry::UserMessage(text));
+}
+
+/// Block-list user content. Consecutive `text` blocks are one user turn,
+/// joined with a blank line, so a prompt stored as blocks is archived.
+/// A tool result ends the run: the turn stays where it sits among results.
+/// Whitespace-only text is dropped. Image and other types stay ignored.
+fn parse_user_blocks(conv: &mut Conversation, blocks: Vec<serde_json::Value>) {
+    let mut text_parts = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "text" => collect_user_text(&mut text_parts, &block),
+            "tool_result" => {
+                flush_user_text(conv, &mut text_parts);
+                push_tool_result(conv, &block);
             }
+            _ => {}
         }
     }
+    flush_user_text(conv, &mut text_parts);
+}
+
+fn collect_user_text(parts: &mut Vec<String>, block: &serde_json::Value) {
+    let Some(text) = block.get("text").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    parts.push(text.to_string());
+}
+
+fn flush_user_text(conv: &mut Conversation, parts: &mut Vec<String>) {
+    if parts.is_empty() {
+        return;
+    }
+    push_user_message(conv, std::mem::take(parts).join("\n\n"));
+}
+
+fn push_tool_result(conv: &mut Conversation, block: &serde_json::Value) {
+    let raw_content = block.get("content");
+    let text = match raw_content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
+        None => String::new(),
+    };
+    let is_error = block
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    conv.entries.push(ConversationEntry::ToolResult {
+        content: crate::conversation::truncate(&text, 2000),
+        is_error,
+    });
 }
 
 fn parse_assistant_content(conv: &mut Conversation, content: ContentValue) {
@@ -688,5 +723,85 @@ mod tests {
     fn format_tool_input_grep() {
         let input: serde_json::Value = serde_json::json!({"pattern": "TODO", "path": "/src/"});
         assert_eq!(format_tool_input("Grep", Some(&input)), "`TODO` in `/src/`");
+    }
+
+    fn parse_user_line(line: &str) -> Conversation {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, line).unwrap();
+        parse_transcript(&path.to_string_lossy(), "sess").unwrap()
+    }
+
+    #[test]
+    fn ac1_text_block_is_one_user_message() {
+        let conv = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+
+        assert_eq!(conv.user_message_count, 1);
+        assert_eq!(conv.entries.len(), 1);
+        assert!(matches!(
+            &conv.entries[0],
+            ConversationEntry::UserMessage(text) if text == "hi"
+        ));
+    }
+
+    #[test]
+    fn ac2_tool_result_and_text_keep_block_order() {
+        let text_then_tool = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"before"},{"type":"tool_result","content":"file body"}]}}"#,
+        );
+        assert_eq!(text_then_tool.user_message_count, 1);
+        assert_eq!(text_then_tool.entries.len(), 2);
+        assert!(matches!(
+            &text_then_tool.entries[0],
+            ConversationEntry::UserMessage(text) if text == "before"
+        ));
+        assert!(matches!(
+            &text_then_tool.entries[1],
+            ConversationEntry::ToolResult { content, is_error: false } if content == "file body"
+        ));
+
+        let tool_then_text = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"file body"},{"type":"text","text":"after"}]}}"#,
+        );
+        assert_eq!(tool_then_text.user_message_count, 1);
+        assert_eq!(tool_then_text.entries.len(), 2);
+        assert!(matches!(
+            &tool_then_text.entries[0],
+            ConversationEntry::ToolResult { content, is_error: false } if content == "file body"
+        ));
+        assert!(matches!(
+            &tool_then_text.entries[1],
+            ConversationEntry::UserMessage(text) if text == "after"
+        ));
+    }
+
+    #[test]
+    fn ac3_tool_result_only_adds_no_user_message() {
+        let conv = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","is_error":false}]}}"#,
+        );
+
+        assert_eq!(conv.user_message_count, 0);
+        assert_eq!(conv.entries.len(), 1);
+        assert!(matches!(
+            &conv.entries[0],
+            ConversationEntry::ToolResult { content, is_error: false } if content == "ok"
+        ));
+    }
+
+    #[test]
+    fn ac4_two_text_blocks_join_with_a_blank_line() {
+        let conv = parse_user_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}}"#,
+        );
+
+        assert_eq!(conv.user_message_count, 1);
+        assert_eq!(conv.entries.len(), 1);
+        assert!(matches!(
+            &conv.entries[0],
+            ConversationEntry::UserMessage(text) if text == "one\n\ntwo"
+        ));
     }
 }
