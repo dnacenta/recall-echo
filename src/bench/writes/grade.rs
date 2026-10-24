@@ -72,6 +72,14 @@ pub struct SessionObservation {
     pub calls: u64,
     pub millis: u64,
     pub warnings: Vec<String>,
+    /// Windows the second pipeline sent. Zero on v1.
+    pub windows: u32,
+    /// Facts, bugs and releases returned, before the schema table.
+    pub candidates: u32,
+    /// Candidates handed to the writer.
+    pub kept: u32,
+    /// Drops by reason. Empty on v1, and when nothing was dropped.
+    pub drops: HashMap<String, u32>,
 }
 
 /// Precision and recall for one operation.
@@ -139,6 +147,22 @@ pub struct SessionReport {
     pub calls: u64,
     pub millis: u64,
     pub warnings: Vec<String>,
+    /// Windows the second pipeline sent.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub windows: u32,
+    /// Facts, bugs and releases returned, before the schema table.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub candidates: u32,
+    /// Candidates handed to the writer.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub kept: u32,
+    /// Drops by reason.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub drops: HashMap<String, u32>,
+}
+
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Keyword search versus the facts a derived question needs.
@@ -432,6 +456,10 @@ pub fn grade(
                 calls: s.calls,
                 millis: s.millis,
                 warnings: s.warnings.clone(),
+                windows: s.windows,
+                candidates: s.candidates,
+                kept: s.kept,
+                drops: s.drops.clone(),
             })
             .collect(),
         steps,
@@ -1551,6 +1579,10 @@ mod tests {
             calls: 1,
             millis: 5,
             warnings: Vec::new(),
+            windows: 0,
+            candidates: 0,
+            kept: 0,
+            drops: HashMap::new(),
         }
     }
 

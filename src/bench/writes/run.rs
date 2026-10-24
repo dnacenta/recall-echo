@@ -26,7 +26,7 @@ use crate::frontmatter::Frontmatter;
 use crate::graph::confidence::PRIOR_CONCENTRATION;
 use crate::graph::llm::{Completion, LlmProvider};
 use crate::graph::types::{ExtractedEntity, ExtractedRelationship, ExtractionResult};
-use crate::graph::{GraphMemory, IngestContext};
+use crate::graph::{GraphMemory, IngestContext, PipelineVersion};
 use crate::search;
 use crate::tags;
 
@@ -75,6 +75,7 @@ pub async fn run(
     script: &FactScript,
     work_dir: &Path,
     extractor: Extractor<'_>,
+    pipeline: PipelineVersion,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -88,7 +89,7 @@ pub async fn run(
     gm.embedder()?;
     let setup_millis = u64::try_from(setup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let sessions = collect_sessions(&gm, &written, &provider).await?;
+    let sessions = collect_sessions(&gm, &memory_dir, &written, &provider, pipeline).await?;
 
     let keyword_hits = script
         .questions
@@ -107,8 +108,10 @@ pub async fn run(
 /// first β is the starting prior on every later snapshot of the edge.
 async fn collect_sessions(
     gm: &GraphMemory,
+    memory_dir: &Path,
     written: &[WrittenArchive],
     provider: &Counting<'_>,
+    pipeline: PipelineVersion,
 ) -> Result<Vec<SessionObservation>, RecallError> {
     let mut first_beta = HashMap::new();
     let mut before = snapshot(gm, &mut first_beta).await?;
@@ -117,13 +120,40 @@ async fn collect_sessions(
         let text = fs::read_to_string(&archive.path)?;
         let calls_before = provider.calls();
         let started = Instant::now();
-        let report = gm
-            .ingest_archive(
-                &text,
-                &IngestContext::new(&archive.id, Some(archive.log_number)),
-                Some(provider.as_provider()),
-            )
-            .await?;
+        let context = IngestContext::new(&archive.id, Some(archive.log_number));
+        let report = match pipeline {
+            PipelineVersion::V1 => {
+                gm.ingest_archive(&text, &context, Some(provider.as_provider()))
+                    .await?
+            }
+            PipelineVersion::V2 => {
+                // Episodes stay a separate step, with no model call. The
+                // pass-1 calls are the only ones the run is billed for.
+                let mut report = gm.ingest_archive(&text, &context, None).await?;
+                let extracted = crate::graph::v2::extract_log(
+                    gm,
+                    memory_dir,
+                    archive.log_number,
+                    &text,
+                    &context,
+                    provider.as_provider(),
+                    PipelineVersion::V2,
+                )
+                .await?;
+                report.errors.extend(extracted.errors);
+                report.entities_created += extracted.entities_created;
+                report.relationships_created += extracted.relationships_created;
+                report.slots_written += extracted.slots_written;
+                report.estimated_tokens += extracted.estimated_tokens;
+                report.measured_tokens += extracted.measured_tokens;
+                report.llm_calls += extracted.llm_calls;
+                report.windows = extracted.windows;
+                report.candidates = extracted.candidates;
+                report.kept = extracted.kept;
+                report.drops = extracted.drops;
+                report
+            }
+        };
         let calls = provider.calls().saturating_sub(calls_before);
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let after = snapshot(gm, &mut first_beta).await?;
@@ -134,6 +164,10 @@ async fn collect_sessions(
             calls,
             millis,
             warnings: report.errors,
+            windows: report.windows,
+            candidates: report.candidates,
+            kept: report.kept,
+            drops: report.drops,
         });
         before = after;
     }
@@ -150,6 +184,7 @@ pub async fn run_repeat(
     parent: &Path,
     repeat: usize,
     extractor: Extractor<'_>,
+    pipeline: PipelineVersion,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -162,7 +197,7 @@ pub async fn run_repeat(
     for k in 1..=repeat {
         let dir = parent.join(format!("run-{k}"));
         fs::create_dir(&dir)?;
-        runs.push(run(script, &dir, extractor).await?);
+        runs.push(run(script, &dir, extractor, pipeline).await?);
     }
     Ok(RepeatReport::from_runs(runs))
 }
@@ -606,6 +641,7 @@ impl LlmProvider for BorrowedProvider<'_> {
 /// as extraction and answered from the turn whose text appears in the prompt.
 struct ScriptedExtractor {
     prepared: Vec<Prepared>,
+    v2: Vec<V2Item>,
 }
 
 struct Prepared {
@@ -613,9 +649,63 @@ struct Prepared {
     body: ExtractionResult,
 }
 
+enum V2Item {
+    Fact(V2Fact),
+    Bug(V2Bug),
+    Release(V2Release),
+}
+
+struct V2Fact {
+    needle: String,
+    subject: String,
+    subject_type: String,
+    predicate: String,
+    key: String,
+    object: String,
+    object_type: String,
+    status: &'static str,
+}
+
+struct V2Bug {
+    needle: String,
+    symptom: String,
+    cause: String,
+    fix: String,
+    component: String,
+}
+
+struct V2Release {
+    needle: String,
+    version: String,
+    status: &'static str,
+    contents: String,
+}
+
+/// How a fixture relation becomes a pass-1 item. `setting:` keeps its key.
+/// `rule:`, `decision:`, `feature:` and `reason:` are rules. `bug:` and
+/// `fix:` are bugs, so the expander runs. A `release:` or `plan:` that names
+/// a version is a release; the rest are rules.
+#[derive(Debug)]
+enum RelationMap {
+    Setting {
+        key: String,
+    },
+    Rule,
+    Bug {
+        symptom: String,
+        cause: String,
+        fix: String,
+    },
+    Release {
+        version: String,
+        status: &'static str,
+    },
+}
+
 impl ScriptedExtractor {
     fn new(script: &FactScript) -> Result<Self, RecallError> {
         let mut prepared = Vec::new();
+        let mut v2: Vec<V2Item> = Vec::new();
         for session in &script.sessions {
             if session.transcript.is_some() {
                 for claim in &session.claims {
@@ -625,6 +715,7 @@ impl ScriptedExtractor {
                             claim.fact, session.id
                         ))
                     })?;
+                    v2.push(v2_fact(script, claim, needle.clone())?);
                     prepared.push(Prepared {
                         needle,
                         body: extraction_for(script, claim)?,
@@ -638,6 +729,7 @@ impl ScriptedExtractor {
                 }
                 let mut body = ExtractionResult::default();
                 for claim in &turn.claims {
+                    v2.push(v2_fact(script, claim, turn.text.clone())?);
                     body.append(extraction_for(script, claim)?);
                 }
                 prepared.push(Prepared {
@@ -646,7 +738,7 @@ impl ScriptedExtractor {
                 });
             }
         }
-        Ok(Self { prepared })
+        Ok(Self { prepared, v2 })
     }
 
     fn extraction_json(
@@ -671,10 +763,243 @@ impl LlmProvider for ScriptedExtractor {
         user_message: &str,
         _max_tokens: u32,
     ) -> Result<String, crate::graph::error::GraphError> {
+        if system_prompt == crate::graph::v2::pass1::PASS1_SYSTEM {
+            return self.v2_json(user_message);
+        }
         if system_prompt.contains(crate::graph::dedup::DEDUP_SYSTEM_PROMPT) {
             return Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string());
         }
         self.extraction_json(user_message)
+    }
+}
+
+fn map_relation(relation: &str, object: &str) -> RelationMap {
+    let Some((prefix, rest)) = relation.split_once(':') else {
+        return if relation == "rule" {
+            RelationMap::Rule
+        } else {
+            RelationMap::Setting { key: String::new() }
+        };
+    };
+    match prefix {
+        "setting" => RelationMap::Setting {
+            key: rest.to_string(),
+        },
+        "rule" | "decision" | "feature" | "reason" => RelationMap::Rule,
+        "bug" => RelationMap::Bug {
+            symptom: symptom_label(rest),
+            cause: object.to_string(),
+            fix: String::new(),
+        },
+        "fix" => RelationMap::Bug {
+            symptom: symptom_label(rest),
+            cause: String::new(),
+            fix: object.to_string(),
+        },
+        "release" if looks_like_version(rest) => RelationMap::Release {
+            version: rest.to_string(),
+            status: "released",
+        },
+        "plan" => match first_version(object) {
+            Some(version) => RelationMap::Release {
+                version,
+                status: "planned",
+            },
+            None => RelationMap::Rule,
+        },
+        _ => RelationMap::Rule,
+    }
+}
+
+fn symptom_label(suffix: &str) -> String {
+    let label = suffix.replace('_', " ");
+    let label = label.trim();
+    if label.is_empty() {
+        "bug".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+fn looks_like_version(raw: &str) -> bool {
+    let trimmed = raw.trim().trim_start_matches(['v', 'V']);
+    !trimmed.is_empty()
+        && trimmed.chars().any(|ch| ch.is_ascii_digit())
+        && trimmed.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        && trimmed.contains('.')
+}
+
+fn first_version(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = if bytes[index] == b'v' || bytes[index] == b'V' {
+            index + 1
+        } else {
+            index
+        };
+        if start < bytes.len() && bytes[start].is_ascii_digit() {
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+                end += 1;
+            }
+            let version = &text[start..end];
+            if looks_like_version(version) {
+                return Some(version.to_string());
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn v2_fact(script: &FactScript, claim: &Claim, needle: String) -> Result<V2Item, RecallError> {
+    let fact_id = match claim.op {
+        ClaimOp::Supersede => claim.replacement.as_deref().ok_or_else(|| {
+            RecallError::Config(format!("supersede of '{}' has no replacement", claim.fact))
+        })?,
+        _ => claim.fact.as_str(),
+    };
+    let fact = script.fact(fact_id)?;
+    let status = if claim.op == ClaimOp::Reject {
+        "rejected"
+    } else {
+        "decided"
+    };
+    Ok(match map_relation(&fact.relation, &fact.object) {
+        RelationMap::Bug {
+            symptom,
+            cause,
+            fix,
+        } => V2Item::Bug(V2Bug {
+            needle,
+            symptom,
+            cause,
+            fix,
+            component: fact.subject.clone(),
+        }),
+        RelationMap::Release {
+            version,
+            status: release_status,
+        } => V2Item::Release(V2Release {
+            needle,
+            version,
+            status: release_status,
+            contents: fact.object.clone(),
+        }),
+        mapped => {
+            let (predicate, key) = match mapped {
+                RelationMap::Setting { key } => ("setting".to_string(), key),
+                RelationMap::Rule => ("rule".to_string(), String::new()),
+                RelationMap::Bug { .. } | RelationMap::Release { .. } => unreachable!(),
+            };
+            let object_type = if matches!(predicate.as_str(), "setting" | "rule" | "prefers") {
+                "literal".to_string()
+            } else {
+                fact.object_type.clone()
+            };
+            let subject_type = match fact.subject_type.as_str() {
+                "project" | "component" | "technology" | "person" => fact.subject_type.clone(),
+                _ => "project".to_string(),
+            };
+            V2Item::Fact(V2Fact {
+                needle,
+                subject: fact.subject.clone(),
+                subject_type,
+                predicate,
+                key,
+                object: fact.object.clone(),
+                object_type,
+                status,
+            })
+        }
+    })
+}
+
+fn turn_index(window: &str, needle: &str) -> Option<i64> {
+    let mut current = None;
+    let mut found = None;
+    for line in window.lines() {
+        if let Some(rest) = line.strip_prefix("[T") {
+            if let Some((num, after)) = rest.split_once(']') {
+                if after.starts_with(" USER:") || after.starts_with(" ASSISTANT:") {
+                    if let Ok(index) = num.parse::<i64>() {
+                        current = Some(index);
+                    }
+                }
+            }
+        }
+        if found.is_none() && line.contains(needle) {
+            found = current;
+        }
+    }
+    found
+}
+
+impl V2Item {
+    fn needle(&self) -> &str {
+        match self {
+            Self::Fact(fact) => &fact.needle,
+            Self::Bug(bug) => &bug.needle,
+            Self::Release(release) => &release.needle,
+        }
+    }
+}
+
+impl ScriptedExtractor {
+    fn v2_json(&self, user_message: &str) -> Result<String, crate::graph::error::GraphError> {
+        let mut facts = Vec::new();
+        let mut bugs = Vec::new();
+        let mut releases = Vec::new();
+        for item in &self.v2 {
+            let needle = item.needle();
+            if !user_message.contains(needle) {
+                continue;
+            }
+            let Some(turn) = turn_index(user_message, needle) else {
+                continue;
+            };
+            match item {
+                V2Item::Fact(item) => facts.push(serde_json::json!({
+                    "subject": item.subject,
+                    "subject_type": item.subject_type,
+                    "predicate": item.predicate,
+                    "role": "none",
+                    "key": item.key,
+                    "object": item.object,
+                    "object_type": item.object_type,
+                    "status": item.status,
+                    "replaces": "",
+                    "turn": turn,
+                    "quote": item.needle,
+                    "confidence": 0.9,
+                })),
+                V2Item::Bug(item) => bugs.push(serde_json::json!({
+                    "symptom": item.symptom,
+                    "cause": item.cause,
+                    "fix": item.fix,
+                    "status": "open",
+                    "component": item.component,
+                    "turn": turn,
+                    "quote": item.needle,
+                    "confidence": 0.9,
+                })),
+                V2Item::Release(item) => releases.push(serde_json::json!({
+                    "version": item.version,
+                    "status": item.status,
+                    "contents": item.contents,
+                    "turn": turn,
+                    "quote": item.needle,
+                    "confidence": 0.9,
+                })),
+            }
+        }
+        serde_json::to_string(&serde_json::json!({
+            "facts": facts,
+            "bugs": bugs,
+            "releases": releases,
+        }))
+        .map_err(crate::graph::error::GraphError::from)
     }
 }
 
@@ -721,6 +1046,7 @@ fn extracted_entity(fact: &ScriptFact, side: Side) -> Result<ExtractedEntity, Re
 mod tests {
     use super::super::script::ScriptTurn;
     use super::*;
+    use super::{map_relation, RelationMap};
     use crate::graph::extract::chunk_conversation;
     use crate::graph::{Provenance, ProvenancePolicy};
 
@@ -741,9 +1067,14 @@ mod tests {
     async fn a_populated_directory_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("keep"), "real").unwrap();
-        let err = run(&history(), tmp.path(), Extractor::Scripted)
-            .await
-            .unwrap_err();
+        let err = run(
+            &history(),
+            tmp.path(),
+            Extractor::Scripted,
+            PipelineVersion::V1,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("not empty"), "{err}");
         assert!(!tmp.path().join("memory").exists());
 
@@ -888,7 +1219,14 @@ mod tests {
     async fn scripted_run_classifies_every_claim() {
         let script = history();
         let tmp = tempfile::tempdir().unwrap();
-        let report = run(&script, tmp.path(), Extractor::Scripted).await.unwrap();
+        let report = run(
+            &script,
+            tmp.path(),
+            Extractor::Scripted,
+            PipelineVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.extractor, ExtractorLabel::Scripted);
         assert_eq!(report.sessions.len(), script.sessions.len());
@@ -974,9 +1312,15 @@ mod tests {
     async fn repeat_refuses_a_non_empty_work_dir_before_writing() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("keep"), "real").unwrap();
-        let err = run_repeat(&history(), tmp.path(), 3, Extractor::Scripted)
-            .await
-            .unwrap_err();
+        let err = run_repeat(
+            &history(),
+            tmp.path(),
+            3,
+            Extractor::Scripted,
+            PipelineVersion::V1,
+        )
+        .await
+        .unwrap_err();
         let message = err.to_string();
         assert!(
             message.contains(&tmp.path().display().to_string()),
@@ -987,9 +1331,15 @@ mod tests {
         assert!(!tmp.path().join("memory").exists());
         assert_eq!(fs::read_to_string(tmp.path().join("keep")).unwrap(), "real");
 
-        let err = run_repeat(&history(), tmp.path(), 0, Extractor::Scripted)
-            .await
-            .unwrap_err();
+        let err = run_repeat(
+            &history(),
+            tmp.path(),
+            0,
+            Extractor::Scripted,
+            PipelineVersion::V1,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("at least 1"), "{err}");
         assert!(!tmp.path().join("run-1").exists());
     }
@@ -1053,7 +1403,14 @@ mod tests {
             .join("tests/fixtures/writes/linkshelf/script.toml");
         let script = crate::bench::writes::load_script(&path).unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let report = run(&script, tmp.path(), Extractor::Scripted).await.unwrap();
+        let report = run(
+            &script,
+            tmp.path(),
+            Extractor::Scripted,
+            PipelineVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.extractor, ExtractorLabel::Scripted);
         assert_eq!(
@@ -1142,7 +1499,9 @@ mod tests {
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
         gm.embedder().unwrap();
         let (_label, provider) = provider_for(&script, Extractor::Scripted).unwrap();
-        let sessions = collect_sessions(&gm, &written, &provider).await.unwrap();
+        let sessions = collect_sessions(&gm, &memory_dir, &written, &provider, PipelineVersion::V1)
+            .await
+            .unwrap();
 
         assert_eq!(sessions.len(), 2);
         assert!(sessions[0].before.is_empty());
@@ -1233,6 +1592,263 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1, "edges: {edges:?}");
         found[0]
+    }
+
+    #[test]
+    fn fixture_prefixes_map_onto_v2_shapes() {
+        assert!(matches!(
+            map_relation("setting:port", "9000"),
+            RelationMap::Setting { key } if key == "port"
+        ));
+        assert!(
+            matches!(map_relation("setting", "pine"), RelationMap::Setting { key } if key.is_empty())
+        );
+        assert!(matches!(
+            map_relation("rule:typing", "hints"),
+            RelationMap::Rule
+        ));
+        assert!(matches!(
+            map_relation("decision:refresh", "cap at 8"),
+            RelationMap::Rule
+        ));
+        assert!(matches!(
+            map_relation("feature:tag_commands", "tag"),
+            RelationMap::Rule
+        ));
+        assert!(matches!(
+            map_relation("reason:serve_port", "clash"),
+            RelationMap::Rule
+        ));
+        assert!(matches!(
+            map_relation("release:publishing", "pypi"),
+            RelationMap::Rule
+        ));
+        match map_relation("bug:concurrent_add", "the store corrupted") {
+            RelationMap::Bug {
+                symptom,
+                cause,
+                fix,
+            } => {
+                assert_eq!(symptom, "concurrent add");
+                assert_eq!(cause, "the store corrupted");
+                assert!(fix.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        match map_relation("fix:concurrent_add", "move to SQLite") {
+            RelationMap::Bug { symptom, fix, .. } => {
+                assert_eq!(symptom, "concurrent add");
+                assert_eq!(fix, "move to SQLite");
+            }
+            other => panic!("{other:?}"),
+        }
+        match map_relation("release:v0.2.0", "sqlite and tags") {
+            RelationMap::Release { version, status } => {
+                assert_eq!(version, "v0.2.0");
+                assert_eq!(status, "released");
+            }
+            other => panic!("{other:?}"),
+        }
+        match map_relation("plan:next_release", "v0.3: import bookmarks") {
+            RelationMap::Release { version, status } => {
+                assert_eq!(version, "0.3");
+                assert_eq!(status, "planned");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn linkshelf_scripted_v2() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/linkshelf/script.toml");
+        let script = crate::bench::writes::load_script(&path).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let report = run(
+            &script,
+            tmp.path(),
+            Extractor::Scripted,
+            PipelineVersion::V2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.calls, 14);
+        assert_eq!(report.sessions.len(), 14);
+        assert!(report.sessions.iter().all(|session| session.calls == 1));
+        assert!(report.sessions.iter().all(|session| session.windows == 1));
+        assert!(report
+            .sessions
+            .iter()
+            .all(|session| session.warnings.is_empty()));
+        let candidates: u32 = report
+            .sessions
+            .iter()
+            .map(|session| session.candidates)
+            .sum();
+        let kept: u32 = report.sessions.iter().map(|session| session.kept).sum();
+        assert_eq!(candidates, 46);
+        assert_eq!(kept, 46);
+        assert!(report
+            .sessions
+            .iter()
+            .all(|session| session.drops.is_empty()));
+        assert!(report.patterns.is_some(), "linkshelf carries match blocks");
+
+        let store = v2_store(tmp.path()).await;
+        assert_eq!(store.edges, 6, "edges {:?}", store.edge_types);
+        assert_eq!(
+            store
+                .edge_types
+                .iter()
+                .filter(|rel| rel.as_str() == "affects")
+                .count(),
+            4,
+            "{:?}",
+            store.edge_types
+        );
+        assert_eq!(
+            store
+                .edge_types
+                .iter()
+                .filter(|rel| rel.as_str() == "part_of")
+                .count(),
+            2,
+            "{:?}",
+            store.edge_types
+        );
+        assert!(
+            store.names.iter().all(|name| !store.literal.is_match(name)),
+            "literal names in {:?}",
+            store.names
+        );
+        assert_eq!(
+            store.names,
+            vec![
+                "concurrent add".to_string(),
+                "export timestamps".to_string(),
+                "fetch encoding".to_string(),
+                "linkshelf".to_string(),
+                "linkshelf v0.2.0".to_string(),
+                "linkshelf v0.3".to_string(),
+                "refresh rate limit".to_string(),
+            ]
+        );
+        assert_eq!(store.slots, 60, "slots {:?}", store.slot_predicates);
+        let pred = |name: &str| {
+            store
+                .slot_predicates
+                .iter()
+                .filter(|item| item.as_str() == name)
+                .count()
+        };
+        // 20 setting facts, plus rule/decision/feature/reason and the two
+        // release rows that are process notes rather than a version.
+        assert_eq!(pred("setting"), 20);
+        assert_eq!(pred("rule"), 16);
+        // Each bug writes symptom, cause and status. The later fix writes
+        // the fix and a second status value, so both status slots remain.
+        assert_eq!(pred("issue_symptom"), 4);
+        assert_eq!(pred("issue_cause"), 4);
+        assert_eq!(pred("issue_fix"), 4);
+        assert_eq!(pred("issue_status"), 8);
+        assert_eq!(pred("release_status"), 2);
+        assert_eq!(pred("release_contents"), 2);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_scripted_v2() {
+        let script = history();
+        let tmp = tempfile::tempdir().unwrap();
+        let report = run(
+            &script,
+            tmp.path(),
+            Extractor::Scripted,
+            PipelineVersion::V2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.calls, 7);
+        assert_eq!(report.sessions.len(), 7);
+        assert!(report.sessions.iter().all(|session| session.calls == 1));
+        assert!(report.patterns.is_none());
+        let store = v2_store(tmp.path()).await;
+        assert_eq!(store.edges, 0, "edges {:?}", store.edge_types);
+        assert!(
+            store.names.iter().all(|name| !store.literal.is_match(name)),
+            "{:?}",
+            store.names
+        );
+        assert_eq!(store.names, vec!["deploy".to_string()]);
+        assert_eq!(store.slots, 3, "slots {:?}", store.slot_keys);
+        assert!(store.slot_keys.iter().all(|key| key == "value"));
+    }
+
+    #[cfg(feature = "embedded")]
+    struct V2Store {
+        names: Vec<String>,
+        edges: usize,
+        edge_types: Vec<String>,
+        slots: usize,
+        slot_keys: Vec<String>,
+        slot_predicates: Vec<String>,
+        literal: regex::Regex,
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn v2_store(work_dir: &Path) -> V2Store {
+        let gm = GraphMemory::open(&work_dir.join("memory/graph"))
+            .await
+            .unwrap();
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let mut names: Vec<String> = entities.iter().map(|entity| entity.name.clone()).collect();
+        names.sort();
+        let mut slots = 0;
+        let mut slot_keys = Vec::new();
+        let mut slot_predicates = Vec::new();
+        for entity in &entities {
+            let Some(list) = entity
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs.get("v2"))
+                .and_then(|v2| v2.get("slots"))
+                .and_then(|slots| slots.as_array())
+            else {
+                continue;
+            };
+            slots += list.len();
+            for slot in list {
+                if let Some(key) = slot.get("key").and_then(|key| key.as_str()) {
+                    slot_keys.push(key.to_string());
+                }
+                if let Some(predicate) = slot
+                    .get("predicate")
+                    .and_then(|predicate| predicate.as_str())
+                {
+                    slot_predicates.push(predicate.to_string());
+                }
+            }
+        }
+        let relationships = crate::graph::crud::list_all_relationships(gm.db())
+            .await
+            .unwrap();
+        V2Store {
+            names,
+            edges: relationships.len(),
+            edge_types: relationships
+                .iter()
+                .map(|edge| edge.rel_type.clone())
+                .collect(),
+            slots,
+            slot_keys,
+            slot_predicates,
+            literal: regex::Regex::new(r"^[\d.]+[a-z%]*$|[/~=(%]|^v?\d+(\.\d+)+").unwrap(),
+        }
     }
 
     #[cfg(feature = "embedded")]

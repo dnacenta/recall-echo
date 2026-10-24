@@ -628,6 +628,11 @@ pub struct GraphSection {
     /// [`GraphDedupConfig`] for the bands and their defaults.
     #[serde(default)]
     pub dedup: GraphDedupConfig,
+    /// Extraction pipeline, `"v1"` or `"v2"`. Absent means v1, and a value
+    /// that is neither is left for the caller to reject so a typo does not
+    /// wipe the rest of the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
 }
 
 impl Default for GraphSection {
@@ -642,6 +647,7 @@ impl Default for GraphSection {
             scoring: GraphScoringConfig::default(),
             provenance: ProvenanceWeights::default(),
             dedup: GraphDedupConfig::default(),
+            pipeline: None,
         }
     }
 }
@@ -1135,6 +1141,15 @@ impl Config {
             }
             "graph.dedup.review_similarity" => {
                 self.graph_section().dedup.review_similarity = parse_similarity(value)?;
+                Ok(())
+            }
+            "graph.pipeline" => {
+                if value != "v1" && value != "v2" {
+                    return Err(RecallError::Config(
+                        "graph.pipeline must be \"v1\" or \"v2\"".into(),
+                    ));
+                }
+                self.graph_section().pipeline = Some(value.to_string());
                 Ok(())
             }
             "graph.dedup.max_candidates" => {
@@ -1824,6 +1839,27 @@ mod tests {
             .set_key("graph.dedup.review_similarity", "-0.1")
             .is_err());
         assert!(cfg.set_key("graph.dedup.max_candidates", "0").is_err());
+    }
+
+    #[test]
+    fn graph_pipeline_is_v1_or_v2() {
+        let absent: Config = toml::from_str("[graph]\nmode = \"embedded\"\n").expect("parse");
+        assert!(absent.graph.expect("graph").pipeline.is_none());
+
+        let present: Config =
+            toml::from_str("[graph]\npipeline = \"v2\"\n").expect("parse pipeline");
+        assert_eq!(
+            present.graph.expect("graph").pipeline.as_deref(),
+            Some("v2")
+        );
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.pipeline", "v2").unwrap();
+        assert_eq!(
+            cfg.graph.as_ref().expect("graph").pipeline.as_deref(),
+            Some("v2")
+        );
+        assert!(cfg.set_key("graph.pipeline", "v3").is_err());
     }
 
     #[test]

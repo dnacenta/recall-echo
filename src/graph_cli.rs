@@ -11,7 +11,7 @@ use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport, EdgeCor
 use crate::graph::edge_view::EdgeView;
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::*;
-use crate::graph::{IngestContext, Provenance};
+use crate::graph::{IngestContext, PipelineVersion, Provenance};
 use crate::serve::{
     AddEntityArgs, CorrectArgs, IngestArchiveArgs, QueryArgs, RelateArgs, Request, SearchArgs,
     TraverseArgs,
@@ -413,16 +413,20 @@ pub async fn search(
     Ok(())
 }
 
-/// Ingest a single archive file into the graph (episodes only, no LLM extraction).
+/// Ingest a single archive file into the graph.
 ///
-/// `provenance` forces an authorship class on every episode of the run — how
-/// `--external` marks genuinely external material. `None` infers per chunk
-/// from conversation turn roles.
+/// Episodes are always written, with no model call. `pipeline` v2 then
+/// extracts the session; v1 leaves extraction to `graph extract` and the
+/// daemon, as before. `provenance` forces an authorship class on every
+/// episode of the run — how `--external` marks genuinely external material.
+/// `None` infers per chunk from conversation turn roles.
 pub async fn ingest(
     memory_dir: &Path,
     archive_path: &Path,
     provenance: Option<Provenance>,
+    pipeline: Option<PipelineVersion>,
 ) -> Result<(), RecallError> {
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -434,10 +438,11 @@ pub async fn ingest(
 
     // Extract session_id and log_number from frontmatter if available
     let (session_id, log_number) = extract_archive_metadata(&content, archive_path);
+    let v2_text = (pipeline == PipelineVersion::V2).then(|| content.clone());
 
     let request = Request::IngestArchive(IngestArchiveArgs {
         content,
-        session_id,
+        session_id: session_id.clone(),
         log_number,
         provenance,
     });
@@ -455,7 +460,80 @@ pub async fn ingest(
             println!("  {WARN}warning:{RESET} {err}");
         }
     }
+    if let Some(text) = v2_text {
+        extract_ingested_v2(memory_dir, &text, &session_id, log_number).await?;
+    }
     Ok(())
+}
+
+/// Run pipeline v2 on an archive whose episodes were just ingested.
+#[cfg(feature = "llm")]
+async fn extract_ingested_v2(
+    memory_dir: &Path,
+    text: &str,
+    session_id: &str,
+    log_number: Option<u32>,
+) -> Result<(), RecallError> {
+    let Some(log) = log_number else {
+        return Err(RecallError::Config(
+            "pipeline v2 needs a conversation-NNN archive so the session can be loaded".into(),
+        ));
+    };
+    let (llm, _) = crate::llm_provider::create_provider(memory_dir, None, None)?;
+    let memory = memory_dir.to_path_buf();
+    let text = text.to_string();
+    let session_id = session_id.to_string();
+    let report = serve_client::exclusive(memory_dir, |gm| async move {
+        let context = IngestContext::new(session_id, Some(log));
+        let report = crate::graph::v2::extract_log(
+            &gm,
+            &memory,
+            log,
+            &text,
+            &context,
+            llm.as_ref(),
+            PipelineVersion::V2,
+        )
+        .await?;
+        if !report.leaves_pending() {
+            gm.mark_extracted(log).await?;
+        }
+        Ok(report)
+    })
+    .await?;
+    if report.leaves_pending() {
+        let first = report
+            .errors
+            .first()
+            .map(String::as_str)
+            .unwrap_or("parse failure");
+        return Err(RecallError::Other(format!(
+            "pipeline v2 left log {log:03} pending: {first}"
+        )));
+    }
+    println!(
+        "  {GOOD}✓{RESET} pipeline v2: +{} entities, {} rels, {} slots{}",
+        report.entities_created,
+        report.relationships_created,
+        report.slots_written,
+        v2_report_suffix(&report)
+    );
+    for err in &report.errors {
+        println!("  {WARN}warning:{RESET} {err}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "llm"))]
+async fn extract_ingested_v2(
+    _memory_dir: &Path,
+    _text: &str,
+    _session_id: &str,
+    _log_number: Option<u32>,
+) -> Result<(), RecallError> {
+    Err(RecallError::Config(
+        "pipeline v2 extracts with an LLM provider, which this build does not include".into(),
+    ))
 }
 
 /// How an ingest run's provenance choice reads in its summary line.
@@ -795,19 +873,95 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// What `graph extract` does with an `Err` from one archive.
+#[cfg(feature = "llm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// Stamp refusal. Stop the run; do not retry or quarantine.
+    Stop,
+    /// v2 write or load error. One attempt, left pending.
+    LeavePending,
+    /// v1. Call once more, then quarantine.
+    Retry,
+}
+
+#[cfg(feature = "llm")]
+fn attempt_after_error(
+    pipeline: PipelineVersion,
+    err: &crate::graph::error::GraphError,
+) -> Attempt {
+    if pipeline != PipelineVersion::V2 {
+        return Attempt::Retry;
+    }
+    if crate::graph::v2::is_stamp_refusal(err) {
+        Attempt::Stop
+    } else {
+        Attempt::LeavePending
+    }
+}
+
+/// Windows, calls, candidates, drops by reason, and kept. Empty for v1,
+/// whose counters stay zero, so the v1 success line does not change.
+#[cfg(feature = "llm")]
+fn v2_report_suffix(report: &IngestionReport) -> String {
+    if report.windows == 0 && report.candidates == 0 && report.kept == 0 && report.drops.is_empty()
+    {
+        return String::new();
+    }
+    let drops = if report.drops.is_empty() {
+        "none".to_string()
+    } else {
+        let mut parts: Vec<_> = report.drops.iter().collect();
+        parts.sort_by(|left, right| left.0.cmp(right.0));
+        parts
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept",
+        report.windows, report.llm_calls, report.candidates, report.kept
+    )
+}
+
+/// Arguments for [`extract`]. One value, so the pipeline flag does not become
+/// a ninth parameter.
+#[cfg(feature = "llm")]
+pub struct ExtractOptions {
+    /// One archive, by log number.
+    pub log: Option<u32>,
+    /// Every archive that has not been extracted.
+    pub all: bool,
+    /// List the archives and call nothing.
+    pub dry_run: bool,
+    /// Provider model override.
+    pub model: Option<String>,
+    /// Provider override.
+    pub provider: Option<String>,
+    /// Milliseconds to wait between archives.
+    pub delay_ms: u64,
+    /// Spend cap across the run. Zero means no cap.
+    pub max_tokens: u64,
+    /// Flag value. `None` reads `[graph] pipeline`, which defaults to v1.
+    pub pipeline: Option<PipelineVersion>,
+}
+
 /// Extract entities from already-ingested archives using an LLM.
 #[cfg(feature = "llm")]
-#[allow(clippy::too_many_arguments)]
-pub async fn extract(
-    memory_dir: &Path,
-    log: Option<u32>,
-    all: bool,
-    dry_run: bool,
-    model_override: Option<String>,
-    provider_override: Option<String>,
-    delay_ms: u64,
-    max_tokens: u64,
-) -> Result<(), RecallError> {
+pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), RecallError> {
+    let ExtractOptions {
+        log,
+        all,
+        dry_run,
+        model: model_override,
+        provider: provider_override,
+        delay_ms,
+        max_tokens,
+        pipeline,
+    } = options;
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
+    let memory = memory_dir.to_path_buf();
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -900,31 +1054,73 @@ pub async fn extract(
             let (session_id, _) = extract_archive_metadata(&content, &archive_path);
             let context = IngestContext::new(session_id, Some(*ln));
 
-            // Try extraction, retry once on failure, quarantine on second failure
-            let report = match gm.extract_from_archive(&content, &context, &*llm).await {
+            // v1 retries once, then quarantines. v2 does not: a stamp refusal
+            // stops the run, and any other error (a write that already landed)
+            // is left pending without a second provider call.
+            let report = match crate::graph::v2::extract_log(
+                &gm,
+                &memory,
+                *ln,
+                &content,
+                &context,
+                &*llm,
+                pipeline,
+            )
+            .await
+            {
                 Ok(r) => r,
-                Err(e) => {
-                    println!(
-                        "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
-                        idx + 1,
-                        total_count
-                    );
-                    match gm.extract_from_archive(&content, &context, &*llm).await {
-                        Ok(r) => r,
-                        Err(e2) => {
-                            println!(
-                                "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
-                                idx + 1,
-                                total_count
-                            );
-                            totals.quarantined.push(*ln);
-                            totals
-                                .errors
-                                .push(format!("log {ln:03}: quarantined after retry: {e2}"));
-                            continue;
+                Err(e) => match attempt_after_error(pipeline, &e) {
+                    Attempt::Stop => {
+                        println!("\n{WARN}✗{RESET} {}", crate::graph::v2::V2_REFUSAL);
+                        return Err(RecallError::Other(
+                            crate::graph::v2::V2_REFUSAL.to_string(),
+                        ));
+                    }
+                    Attempt::LeavePending => {
+                        println!(
+                            "  {WARN}✗{RESET} [{}/{}] log {ln:03}: left pending ({e})",
+                            idx + 1,
+                            total_count
+                        );
+                        totals.left_pending.push(*ln);
+                        totals
+                            .errors
+                            .push(format!("log {ln:03}: left pending: {e}"));
+                        continue;
+                    }
+                    Attempt::Retry => {
+                        println!(
+                            "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
+                            idx + 1,
+                            total_count
+                        );
+                        match crate::graph::v2::extract_log(
+                            &gm,
+                            &memory,
+                            *ln,
+                            &content,
+                            &context,
+                            &*llm,
+                            pipeline,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e2) => {
+                                println!(
+                                    "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
+                                    idx + 1,
+                                    total_count
+                                );
+                                totals.quarantined.push(*ln);
+                                totals.errors.push(format!(
+                                    "log {ln:03}: quarantined after retry: {e2}"
+                                ));
+                                continue;
+                            }
                         }
                     }
-                }
+                },
             };
 
             // Whatever happened, the tokens were spent: keep the budget honest.
@@ -938,16 +1134,32 @@ pub async fn extract(
             // "extracted, empty". Deliberately no retry here, unlike an Err
             // above: the user is watching and will re-run; the daemon has its
             // own ladder. Three in a row and we stop burning spawns.
-            if report.is_total_failure() {
-                println!(
-                    "  {WARN}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
-                    idx + 1,
-                    total_count,
-                    report.chunks_failed,
-                    report.errors.first().map_or("", String::as_str),
-                );
+            if report.leaves_pending() {
+                if report.is_total_failure() {
+                    println!(
+                        "  {WARN}✗{RESET} [{}/{}] log {ln:03}: every chunk failed ({}), nothing extracted — left pending ({})",
+                        idx + 1,
+                        total_count,
+                        report.chunks_failed,
+                        report.errors.first().map_or("", String::as_str),
+                    );
+                } else {
+                    println!(
+                        "  {WARN}✗{RESET} [{}/{}] log {ln:03}: {} of {} windows failed — left pending ({})",
+                        idx + 1,
+                        total_count,
+                        report.chunks_failed,
+                        report.windows,
+                        report.errors.first().map_or("", String::as_str),
+                    );
+                }
                 totals.left_pending.push(*ln);
+                let total = report.is_total_failure();
                 totals.errors.extend(report.errors);
+                if !total {
+                    consecutive_total_failures = 0;
+                    continue;
+                }
                 consecutive_total_failures += 1;
                 if consecutive_total_failures >= MAX_CONSECUTIVE_TOTAL_FAILURES {
                     println!(
@@ -971,8 +1183,14 @@ pub async fn extract(
                     if report.errors.len() == 1 { "" } else { "s" }
                 )
             };
+            let slots_label = if report.slots_written > 0 {
+                format!(", {} slots", report.slots_written)
+            } else {
+                String::new()
+            };
+            let v2_label = v2_report_suffix(&report);
             println!(
-                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels ({}){warn_label}",
+                "  {GOOD}✓{RESET} [{}/{}] log {ln:03}: +{} entities, ~{} merged, -{} skipped, {} rels{slots_label}{v2_label} ({}){warn_label}",
                 idx + 1,
                 total_count,
                 report.entities_created,
@@ -1977,6 +2195,50 @@ pub(crate) fn find_archive_file(
 #[cfg(all(test, feature = "llm"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stamp_refusal_stops_and_a_write_error_is_not_retried() {
+        use crate::graph::error::GraphError;
+        use crate::graph::v2::V2_REFUSAL;
+
+        let refusal = GraphError::Extraction(V2_REFUSAL.to_string());
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V2, &refusal),
+            Attempt::Stop
+        );
+        let write = GraphError::Extraction("database: write failed".into());
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V2, &write),
+            Attempt::LeavePending
+        );
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V1, &refusal),
+            Attempt::Retry
+        );
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V1, &write),
+            Attempt::Retry
+        );
+    }
+
+    #[test]
+    fn v2_counters_appear_on_the_extract_line_and_v1_stays_bare() {
+        let v1 = IngestionReport::default();
+        assert_eq!(v2_report_suffix(&v1), "");
+
+        let mut v2 = IngestionReport {
+            windows: 2,
+            llm_calls: 3,
+            candidates: 4,
+            kept: 3,
+            ..IngestionReport::default()
+        };
+        v2.drops.insert("parse".into(), 1);
+        assert_eq!(
+            v2_report_suffix(&v2),
+            ", 2 windows, 3 calls, 4 candidates, drops parse=1, 3 kept"
+        );
+    }
 
     /// The line a user reads must not claim a measurement it does not have.
     #[test]

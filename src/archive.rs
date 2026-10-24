@@ -894,6 +894,43 @@ pub async fn archive_session(
 mod tests {
     use super::*;
 
+    /// Hooks ingest episodes. They do not extract, whatever `[graph] pipeline`
+    /// says: no provider call, no admin lock, and the daemon is not stopped.
+    #[test]
+    fn the_archive_hook_does_not_extract() {
+        let source = include_str!("archive.rs");
+        let production = source.split("mod tests").next().expect("tests");
+        assert!(
+            !production.contains("extract_log"),
+            "an archive hook must not run extraction"
+        );
+        assert!(
+            !production.contains("serve_client::exclusive"),
+            "an archive hook must not take the admin lock"
+        );
+        assert!(
+            !production.contains("create_provider"),
+            "an archive hook must not call the model"
+        );
+        assert!(production.contains("ingest_into_graph"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".recall-echo.toml"),
+            "[graph]\npipeline = \"v2\"\n",
+        )
+        .unwrap();
+        graph_ingest(
+            tmp.path(),
+            &ArchiveResult {
+                log_number: 3,
+                full_content: "### User\n\nShip the shelf.\n".into(),
+                session_id: "s".into(),
+            },
+        );
+        assert!(!tmp.path().join("graph").exists());
+    }
+
     #[test]
     fn highest_from_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();

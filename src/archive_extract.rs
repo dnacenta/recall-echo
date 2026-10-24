@@ -23,6 +23,7 @@
 //!   └─ store (exclusive)
 //!        ├─ nothing of `log` pending  ─────────────▶ Ok(NothingPending)
 //!        ├─ every chunk failed        ─────────────▶ AllChunksFailed (left pending)
+//!        ├─ a v2 window failed         ─────────────▶ WindowsPending (left pending)
 //!        └─ extracted, then marked    ─────────────▶ Ok(Extracted)
 //! ```
 //!
@@ -91,6 +92,16 @@ pub enum ExtractArchiveError {
         /// What the failed calls are believed to have cost.
         tokens: u64,
     },
+    /// A v2 window failed after its retry. The archive is left pending so the
+    /// missing window is not dropped. A v1 partial yield is still extracted.
+    #[error("{failed} of {windows} windows failed, archive left pending; first: {first}")]
+    WindowsPending {
+        windows: u32,
+        failed: u32,
+        first: String,
+        /// What the calls are believed to have cost.
+        tokens: u64,
+    },
     /// Anything else: the store, the archive file, the graph.
     #[error(transparent)]
     Recall(#[from] RecallError),
@@ -102,7 +113,7 @@ impl ExtractArchiveError {
     #[must_use]
     pub fn tokens_spent(&self) -> u64 {
         match self {
-            Self::AllChunksFailed { tokens, .. } => *tokens,
+            Self::AllChunksFailed { tokens, .. } | Self::WindowsPending { tokens, .. } => *tokens,
             Self::ProviderUnavailable(_) | Self::Recall(_) => 0,
         }
     }
@@ -137,8 +148,9 @@ pub async fn extract_archive(
     let llm = handle.llm;
     let binary = handle.binary;
 
+    let memory = memory_dir.to_path_buf();
     crate::serve_client::exclusive(memory_dir, |graph| async move {
-        Ok(extract_into(&graph, llm.as_ref(), &archive, binary).await)
+        Ok(extract_into(&graph, &memory, llm.as_ref(), &archive, binary).await)
     })
     .await?
 }
@@ -169,6 +181,7 @@ impl ArchiveFile {
 /// only when the provider actually answered.
 pub(crate) async fn extract_into(
     graph: &GraphMemory,
+    memory_dir: &Path,
     llm: &dyn LlmProvider,
     archive: &ArchiveFile,
     binary: Option<PathBuf>,
@@ -183,10 +196,18 @@ pub(crate) async fn extract_into(
     }
 
     let context = IngestContext::new(archive.session_id.clone(), Some(log_number));
-    let report = graph
-        .extract_from_archive(&archive.content, &context, llm)
-        .await
-        .map_err(RecallError::from)?;
+    let pipeline = crate::graph::v2::pipeline_for_hook(memory_dir);
+    let report = crate::graph::v2::extract_log(
+        graph,
+        memory_dir,
+        log_number,
+        &archive.content,
+        &context,
+        llm,
+        pipeline,
+    )
+    .await
+    .map_err(RecallError::from)?;
     let extraction = classify(log_number, report, binary)?;
 
     graph
@@ -206,6 +227,14 @@ fn classify(
     if report.is_total_failure() {
         return Err(ExtractArchiveError::AllChunksFailed {
             chunks: report.chunks_failed,
+            first: report.errors.first().cloned().unwrap_or_default(),
+            tokens: report.total_tokens(),
+        });
+    }
+    if report.leaves_pending() {
+        return Err(ExtractArchiveError::WindowsPending {
+            windows: report.windows,
+            failed: report.chunks_failed,
             first: report.errors.first().cloned().unwrap_or_default(),
             tokens: report.total_tokens(),
         });
@@ -313,10 +342,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_extracted_archive_is_marked_and_reports_what_it_spent() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
         let binary = Some(PathBuf::from("/opt/grok"));
 
-        let outcome = extract_into(&graph, &EmptyModel, &archive(7), binary.clone())
+        let outcome = extract_into(&graph, tmp.path(), &EmptyModel, &archive(7), binary.clone())
             .await
             .unwrap();
 
@@ -334,15 +363,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_archive_with_nothing_pending_costs_nothing() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
         graph.mark_extracted(7).await.unwrap();
 
-        let outcome = extract_into(&graph, &NoModel, &archive(7), None)
+        let outcome = extract_into(&graph, tmp.path(), &NoModel, &archive(7), None)
             .await
             .unwrap();
         assert_eq!(outcome, ExtractOutcome::NothingPending);
 
-        let never_ingested = extract_into(&graph, &NoModel, &archive(8), None)
+        let never_ingested = extract_into(&graph, tmp.path(), &NoModel, &archive(8), None)
             .await
             .unwrap();
         assert_eq!(never_ingested, ExtractOutcome::NothingPending);
@@ -350,9 +379,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_provider_that_fails_every_chunk_leaves_the_archive_pending() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
 
-        let err = extract_into(&graph, &BrokenModel, &archive(7), None)
+        let err = extract_into(&graph, tmp.path(), &BrokenModel, &archive(7), None)
             .await
             .unwrap_err();
 
@@ -367,9 +396,9 @@ mod tests {
     /// says what the answers were rather than quoting them.
     #[tokio::test]
     async fn unusable_answers_are_billed_and_classified() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
 
-        let err = extract_into(&graph, &ProseModel, &archive(7), None)
+        let err = extract_into(&graph, tmp.path(), &ProseModel, &archive(7), None)
             .await
             .unwrap_err();
 
@@ -385,12 +414,12 @@ mod tests {
     /// named among the warnings.
     #[tokio::test]
     async fn a_recovered_chunk_is_extracted_with_a_warning() {
-        let (_tmp, graph) = store_with_pending(7).await;
+        let (tmp, graph) = store_with_pending(7).await;
         let model = GlitchOnceModel {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let outcome = extract_into(&graph, &model, &archive(7), None)
+        let outcome = extract_into(&graph, tmp.path(), &model, &archive(7), None)
             .await
             .unwrap();
 
@@ -479,6 +508,31 @@ mod tests {
         assert_eq!(extraction.relationships_created, 2);
         assert_eq!(extraction.warnings, vec!["chunk 2 failed".to_string()]);
         assert_eq!(extraction.total_tokens(), 1_000);
+    }
+
+    #[test]
+    fn a_failed_v2_window_is_left_pending() {
+        let report = IngestionReport {
+            chunks_total: 2,
+            chunks_failed: 1,
+            windows: 2,
+            estimated_tokens: 40,
+            errors: vec!["parse failure: no JSON object".into()],
+            ..IngestionReport::default()
+        };
+        let err = classify(3, report, None).unwrap_err();
+        assert_eq!(err.tokens_spent(), 40);
+        assert!(
+            matches!(
+                err,
+                ExtractArchiveError::WindowsPending {
+                    failed: 1,
+                    windows: 2,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     /// A host spawns this onto its own runtime; it must be `Send`.
