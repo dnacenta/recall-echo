@@ -31,9 +31,11 @@ const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
 /// Five minutes: longer than any pause inside a working session, short enough
 /// that a session ended at lunchtime is memory by the afternoon.
 const DEFAULT_CAPTURE_SETTLE_SECS: u64 = 300;
-/// Context window sent on Ollama's native chat route. 16384 is enough for one
-/// session window plus the pass-1 prompt; the server default (4096) truncates
-/// the tail.
+/// Configured floor for Ollama's native chat route. A structured call raises
+/// this to fit the prompt (one token per three characters, rounded up) plus
+/// the reserved reply, and that automatic raise stops at 32768. A higher
+/// configured value is kept. The server default (4096) truncates the tail of
+/// a pass-1 window.
 const DEFAULT_NUM_CTX: u32 = 16384;
 
 pub(crate) fn default_num_ctx() -> u32 {
@@ -42,6 +44,18 @@ pub(crate) fn default_num_ctx() -> u32 {
 
 fn is_default_num_ctx(value: &u32) -> bool {
     *value == DEFAULT_NUM_CTX
+}
+
+/// `0` is not a context window. The message is the one `config set` and a
+/// rejected file both surface.
+fn require_nonzero_num_ctx(n: u32) -> Result<(), crate::error::RecallError> {
+    if n == 0 {
+        Err(crate::error::RecallError::Config(
+            "llm.num_ctx must be at least 1".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// `"ollama"` or `"openai"`, stored in the spelling the wire format uses.
@@ -562,8 +576,11 @@ pub struct LlmSection {
     pub model: String,
     #[serde(default)]
     pub api_base: String,
-    /// Context length for Ollama's native chat route. Absent means 16384, and
-    /// that default is left out of a saved file.
+    /// Context length for Ollama's native chat route. Absent means 16384.
+    /// That value is a floor: a structured native call may send a larger
+    /// `num_ctx`, capped at 32768, so a full v2 window is not truncated. A
+    /// higher configured value is kept. The default is left out of a saved
+    /// file. `0` is rejected.
     #[serde(
         default = "default_num_ctx",
         skip_serializing_if = "is_default_num_ctx"
@@ -1009,7 +1026,10 @@ pub fn load_from_dir(dir: &Path) -> Config {
 }
 
 /// Load config from .recall-echo.toml in the base dir.
-/// Returns defaults if file doesn't exist or is malformed.
+///
+/// Returns defaults if the file doesn't exist, is malformed, or sets
+/// `llm.num_ctx` to 0. A zero context window is rejected: the error is
+/// printed and the rest of that file is not applied.
 #[must_use]
 pub fn load(base: &Path) -> Config {
     let path = config_path(base);
@@ -1023,7 +1043,13 @@ pub fn load(base: &Path) -> Config {
     };
 
     match toml::from_str(&content) {
-        Ok(cfg) => validate(cfg),
+        Ok(cfg) => match validate(cfg) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("recall-echo: {err}");
+                Config::default()
+            }
+        },
         Err(_) => Config::default(),
     }
 }
@@ -1042,11 +1068,12 @@ pub fn exists(base: &Path) -> bool {
     config_path(base).exists()
 }
 
-fn validate(mut cfg: Config) -> Config {
+fn validate(mut cfg: Config) -> Result<Config, crate::error::RecallError> {
     if !(1..=50).contains(&cfg.ephemeral.max_entries) {
         cfg.ephemeral.max_entries = DEFAULT_MAX_ENTRIES;
     }
-    cfg
+    require_nonzero_num_ctx(cfg.llm.num_ctx)?;
+    Ok(cfg)
 }
 
 // ── Config mutation helpers ──────────────────────────────────────────────
@@ -1078,9 +1105,11 @@ impl Config {
                 Ok(())
             }
             "llm.num_ctx" | "num_ctx" => {
-                self.llm.num_ctx = value
+                let n: u32 = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                require_nonzero_num_ctx(n)?;
+                self.llm.num_ctx = n;
                 Ok(())
             }
             "llm.api_style" | "api_style" => {
@@ -1433,6 +1462,46 @@ mod tests {
     }
 
     #[test]
+    fn num_ctx_zero_is_rejected_at_set_key_and_load() {
+        let mut cfg = Config::default();
+        let err = cfg.set_key("llm.num_ctx", "0").unwrap_err();
+        assert!(
+            err.to_string().contains("llm.num_ctx must be at least 1"),
+            "{err}"
+        );
+        assert_eq!(cfg.llm.num_ctx, 16_384);
+        let err = cfg.set_key("num_ctx", "0").unwrap_err();
+        assert!(
+            err.to_string().contains("llm.num_ctx must be at least 1"),
+            "{err}"
+        );
+
+        let err = validate(Config {
+            llm: LlmSection {
+                num_ctx: 0,
+                provider: Provider::Openai,
+                ..LlmSection::default()
+            },
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("llm.num_ctx must be at least 1"),
+            "{err}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            config_path(tmp.path()),
+            "[llm]\nprovider = \"openai\"\nnum_ctx = 0\n",
+        )
+        .unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(loaded.llm.num_ctx, 16_384);
+        assert_eq!(loaded.llm.provider, Provider::Anthropic);
+    }
+
+    #[test]
     fn set_key_unknown_fails() {
         let mut cfg = Config::default();
         assert!(cfg.set_key("nonexistent.key", "value").is_err());
@@ -1696,7 +1765,8 @@ mod tests {
         let cfg = validate(Config {
             ephemeral: EphemeralConfig { max_entries: 100 },
             ..Config::default()
-        });
+        })
+        .unwrap();
         assert_eq!(cfg.ephemeral.max_entries, 5);
     }
 

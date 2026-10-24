@@ -208,7 +208,9 @@ pub struct HttpConfig {
     pub api_style: ApiStyle,
     pub max_retries: u32,
     pub retry_delay_ms: u64,
-    /// Context window sent as `options.num_ctx` on the native chat route.
+    /// Configured floor for `options.num_ctx` on the native chat route.
+    /// A structured call may raise it to cover the prompt plus the reserved
+    /// reply, up to 32768. A higher configured value is kept.
     pub num_ctx: u32,
     /// Style for [`LlmProvider::complete_structured`]. Equal to `api_style`
     /// except when `[llm] api_style` is unset and the base URL's port is
@@ -429,9 +431,10 @@ impl HttpLlmProvider {
         schema: Option<&serde_json::Value>,
     ) -> Result<Completion, GraphError> {
         let url = openai_chat_url(&self.config.api_base);
-        // One shot with the schema, then — if this server refuses the field —
-        // one shot without it. The refusal is remembered so the next call
-        // does not pay for the 400 again.
+        // One shot with the schema, then — if this server refuses the field
+        // (400 or 422 naming `response_format`) — one shot without it. The
+        // refusal is remembered so the next call does not pay for that error
+        // again.
         let mut schema = schema.filter(|_| !self.openai_schema_rejected.load(Ordering::Relaxed));
         for _ in 0..2 {
             let body = openai_body(
@@ -442,7 +445,7 @@ impl HttpLlmProvider {
                 schema,
             );
             let (status, text) = self.post_json(&url, Auth::Bearer, &body).await?;
-            if schema.is_some() && status.as_u16() == 400 && text.contains("response_format") {
+            if schema.is_some() && response_format_was_rejected(status, &text) {
                 self.openai_schema_rejected.store(true, Ordering::Relaxed);
                 schema = None;
                 continue;
@@ -461,17 +464,29 @@ impl HttpLlmProvider {
         max_tokens: u32,
         schema: Option<&serde_json::Value>,
     ) -> Result<Completion, GraphError> {
+        let num_ctx = match schema {
+            Some(_) => effective_num_ctx(
+                self.config.num_ctx,
+                system_prompt.len().saturating_add(user_message.len()),
+                max_tokens,
+            ),
+            None => self.config.num_ctx,
+        };
         let body = ollama_body(
             &self.config.model,
             system_prompt,
             user_message,
             max_tokens,
-            self.config.num_ctx,
+            num_ctx,
             schema,
         );
         let url = ollama_chat_url(&self.config.api_base);
         let (status, text) = self.post_json(&url, Auth::Bearer, &body).await?;
-        ollama_completion(status, &text)
+        let completion = ollama_completion(status, &text)?;
+        if schema.is_some() {
+            warn_if_prompt_truncated(&completion, num_ctx, max_tokens);
+        }
+        Ok(completion)
     }
 
     fn is_retryable(err: &GraphError) -> bool {
@@ -600,6 +615,12 @@ fn ollama_chat_url(api_base: &str) -> String {
 
 fn openai_chat_url(api_base: &str) -> String {
     format!("{}/chat/completions", api_base.trim_end_matches('/'))
+}
+
+/// A 400 or 422 whose body names `response_format` is this server refusing
+/// the schema field. Other statuses and other bodies are returned as-is.
+fn response_format_was_rejected(status: reqwest::StatusCode, body: &str) -> bool {
+    matches!(status.as_u16(), 400 | 422) && body.contains("response_format")
 }
 
 fn openai_body(
@@ -760,6 +781,41 @@ fn truncate_str(text: &str, max: usize) -> &str {
         i -= 1;
     }
     &text[..i]
+}
+
+/// Automatic raise of a structured native `num_ctx` stops here.
+/// The configured value is a floor and may sit above this.
+const NUM_CTX_CAP: u32 = 32_768;
+
+/// Tokens to budget for a prompt: one per three characters, rounded up.
+fn estimated_prompt_tokens(prompt_chars: usize) -> u32 {
+    u32::try_from(prompt_chars.div_ceil(3)).unwrap_or(u32::MAX)
+}
+
+/// `num_ctx` for one structured native call.
+///
+/// `configured` is a floor. The window is at least the estimated prompt plus
+/// the reserved reply, and the automatic raise never exceeds [`NUM_CTX_CAP`].
+fn effective_num_ctx(configured: u32, prompt_chars: usize, max_tokens: u32) -> u32 {
+    let needed = estimated_prompt_tokens(prompt_chars).saturating_add(max_tokens);
+    configured.max(needed.min(NUM_CTX_CAP))
+}
+
+/// The prompt filled the window left after reserving the reply.
+fn prompt_may_be_truncated(prompt_eval_count: u64, num_ctx: u32, max_tokens: u32) -> bool {
+    prompt_eval_count >= u64::from(num_ctx.saturating_sub(max_tokens))
+}
+
+fn warn_if_prompt_truncated(completion: &Completion, num_ctx: u32, max_tokens: u32) {
+    let Some(usage) = completion.usage else {
+        return;
+    };
+    if prompt_may_be_truncated(usage.input_tokens, num_ctx, max_tokens) {
+        eprintln!(
+            "recall-echo: prompt may have been truncated (prompt_eval_count {count} >= num_ctx {num_ctx} - max_tokens {max_tokens})",
+            count = usage.input_tokens,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1132,5 +1188,145 @@ mod tests {
         assert!(recorded[0].body.get("response_format").is_none());
         assert!(recorded[0].body.get("format").is_none());
         assert_eq!(recorded[0].body["max_tokens"], 32);
+    }
+
+    #[test]
+    fn short_prompt_keeps_the_configured_num_ctx() {
+        assert_eq!(estimated_prompt_tokens(0), 0);
+        assert_eq!(estimated_prompt_tokens(1), 1);
+        assert_eq!(estimated_prompt_tokens(3), 1);
+        assert_eq!(estimated_prompt_tokens(4), 2);
+        assert_eq!(effective_num_ctx(16_384, 20, 128), 16_384);
+        assert_eq!(effective_num_ctx(8_192, 20, 128), 8_192);
+    }
+
+    #[test]
+    fn a_full_v2_window_raises_num_ctx_within_the_cap() {
+        let chars = 48_000 + crate::graph::v2::pass1::PASS1_SYSTEM.len();
+        let effective = effective_num_ctx(16_384, chars, 4_096);
+        let estimated = u32::try_from(chars.div_ceil(3)).unwrap();
+        let expected = 16_384u32.max(estimated.saturating_add(4_096).min(32_768));
+        assert_eq!(effective, expected);
+        assert!(effective > 16_384, "{effective}");
+        assert!(effective <= 32_768, "{effective}");
+    }
+
+    #[test]
+    fn an_absurd_prompt_is_capped_and_a_higher_floor_is_kept() {
+        let chars = 10_000_000;
+        assert_eq!(effective_num_ctx(16_384, chars, 4_096), 32_768);
+        assert_eq!(effective_num_ctx(40_000, chars, 4_096), 40_000);
+    }
+
+    #[test]
+    fn prompt_truncation_warning_fires_at_the_reserved_boundary() {
+        let num_ctx = 16_384;
+        let max_tokens = 4_096;
+        let limit = u64::from(num_ctx - max_tokens);
+        assert!(!prompt_may_be_truncated(limit - 1, num_ctx, max_tokens));
+        assert!(prompt_may_be_truncated(limit, num_ctx, max_tokens));
+        assert!(prompt_may_be_truncated(limit + 50, num_ctx, max_tokens));
+        assert!(prompt_may_be_truncated(0, 100, 4_096));
+    }
+
+    #[tokio::test]
+    async fn ollama_native_structured_round_trip() {
+        let (base, requests) = scripted_server(vec![ScriptedReply {
+            status: 200,
+            body: r#"{"message":{"role":"assistant","content":"{\"facts\":[]}"},"prompt_eval_count":120,"eval_count":4}"#.into(),
+        }])
+        .await;
+        let provider = http_provider(
+            &format!("{base}/v1"),
+            ApiStyle::OpenAiCompat,
+            ApiStyle::OllamaNative,
+        );
+        let completion = provider
+            .complete_structured("sys", "user", &schema(), 64)
+            .await
+            .unwrap();
+        assert_eq!(completion.text, r#"{"facts":[]}"#);
+        assert_eq!(
+            completion.usage,
+            Some(TokenUsage {
+                input_tokens: 120,
+                output_tokens: 4,
+            })
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded[0].path, "/api/chat");
+        assert_eq!(recorded[0].body["format"], schema());
+        assert_eq!(recorded[0].body["options"]["num_ctx"], 16_384);
+        assert_eq!(recorded[0].body["messages"][0]["role"], "system");
+        assert_eq!(recorded[0].body["messages"][0]["content"], "sys");
+        assert_eq!(recorded[0].body["messages"][1]["role"], "user");
+        assert_eq!(recorded[0].body["messages"][1]["content"], "user");
+    }
+
+    #[tokio::test]
+    async fn anthropic_structured_round_trip() {
+        let (base, requests) = scripted_server(vec![ScriptedReply {
+            status: 200,
+            body: r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"usage":{"input_tokens":3,"output_tokens":2}}"#.into(),
+        }])
+        .await;
+        let provider = http_provider(&base, ApiStyle::Anthropic, ApiStyle::Anthropic);
+        let completion = provider
+            .complete_structured("sys", "hi", &schema(), 32)
+            .await
+            .unwrap();
+        assert_eq!(completion.text, r#"{"ok":true}"#);
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded[0].path, "/");
+        assert_eq!(
+            recorded[0].body["output_config"]["format"]["type"],
+            "json_schema"
+        );
+        assert_eq!(
+            recorded[0].body["output_config"]["format"]["schema"],
+            schema()
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_422_naming_response_format_retries_without_it() {
+        let ok = r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#;
+        let (base, requests) = scripted_server(vec![
+            ScriptedReply {
+                status: 422,
+                body: r#"{"error":{"message":"response_format is unsupported"}}"#.into(),
+            },
+            ScriptedReply {
+                status: 200,
+                body: ok.into(),
+            },
+        ])
+        .await;
+        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OpenAiCompat);
+        let completion = provider
+            .complete_structured("sys", "user", &schema(), 128)
+            .await
+            .unwrap();
+        assert_eq!(completion.text, r#"{"ok":true}"#);
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].body["response_format"]["type"], "json_schema");
+        assert!(recorded[1].body.get("response_format").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_422_that_does_not_name_response_format_is_returned() {
+        let (base, requests) = scripted_server(vec![ScriptedReply {
+            status: 422,
+            body: r#"{"error":"model not found"}"#.into(),
+        }])
+        .await;
+        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OpenAiCompat);
+        let err = provider
+            .complete_structured("sys", "user", &schema(), 32)
+            .await
+            .expect_err("422");
+        assert!(err.to_string().contains("API 422"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }
