@@ -110,6 +110,24 @@ pub trait LlmProvider: Send + Sync {
             .await?;
         Ok(Completion::unmeasured(text))
     }
+
+    /// Ask for a reply whose text is JSON matching `schema`.
+    ///
+    /// The reply text is JSON that should match `schema`; callers still parse
+    /// defensively. The default is [`LlmProvider::complete_measured`], which
+    /// sends the prompt and does not constrain the backend, so an implementor
+    /// that only knows [`LlmProvider::complete`] keeps compiling and answering.
+    async fn complete_structured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
+        let _ = schema;
+        self.complete_measured(system_prompt, user_message, max_tokens)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +154,36 @@ mod tests {
     fn total_sums_both_sides() {
         let usage = TokenUsage::from_counts(Some(13_658), Some(5)).unwrap();
         assert_eq!(usage.total(), 13_663);
+    }
+
+    /// The default method is what an existing implementor runs. It must answer
+    /// from `complete` and report no usage of its own.
+    #[tokio::test]
+    async fn only_complete_still_answers_complete_structured() {
+        struct OnlyComplete;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for OnlyComplete {
+            async fn complete(
+                &self,
+                _system_prompt: &str,
+                user_message: &str,
+                _max_tokens: u32,
+            ) -> Result<String, GraphError> {
+                Ok(format!("echo:{user_message}"))
+            }
+        }
+
+        let completion = OnlyComplete
+            .complete_structured(
+                "system",
+                "hello",
+                &serde_json::json!({"type": "object"}),
+                32,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "echo:hello");
+        assert_eq!(completion.usage, None);
     }
 }

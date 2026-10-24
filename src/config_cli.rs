@@ -56,6 +56,19 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
                 "custom"
             }
         );
+        eprintln!(
+            "  num_ctx  = {} {DIM}({}){RESET}",
+            cfg.llm.num_ctx,
+            if cfg.llm.num_ctx == config::default_num_ctx() {
+                "default"
+            } else {
+                "custom"
+            }
+        );
+        eprintln!(
+            "  api_style = {}",
+            cfg.llm.api_style.as_deref().unwrap_or("(default)")
+        );
     }
 
     show_capture_section(&cfg.capture);

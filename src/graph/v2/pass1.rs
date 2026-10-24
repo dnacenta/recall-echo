@@ -4,9 +4,10 @@
 
 //! One structured pass over a session window.
 //!
-//! The provider trait has no schema channel, so the schema below is checked
-//! here after the reply is read. A window that is not the root object is
-//! retried once. One bad element is a drop, so it does not fail the window.
+//! The provider is asked for JSON matching the schema below. The reply is
+//! still checked here, because a backend may ignore the schema. A window
+//! that is not the root object is retried once. One bad element is a drop,
+//! so it does not fail the window.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -215,7 +216,7 @@ async fn call_window(
     for _ in 0..2 {
         report.llm_calls += 1;
         let completion = match llm
-            .complete_measured(PASS1_SYSTEM, &message, MAX_TOKENS)
+            .complete_structured(PASS1_SYSTEM, &message, pass1_schema(), MAX_TOKENS)
             .await
         {
             Ok(completion) => completion,
@@ -735,6 +736,43 @@ mod tests {
                 text: "Port 9000 is chosen. Tag v1.4.0 today.".into(),
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn pass1_calls_complete_structured() {
+        struct Seen(std::sync::Mutex<Option<Value>>);
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Seen {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Err(GraphError::Llm("plain complete was called".into()))
+            }
+
+            async fn complete_structured(
+                &self,
+                system: &str,
+                user: &str,
+                schema: &Value,
+                max_tokens: u32,
+            ) -> Result<crate::graph::llm::Completion, GraphError> {
+                assert_eq!(system, PASS1_SYSTEM);
+                assert!(user.contains("tidepool"), "{user}");
+                assert_eq!(max_tokens, MAX_TOKENS);
+                *self.0.lock().expect("lock") = Some(schema.clone());
+                Ok(crate::graph::llm::Completion::unmeasured(
+                    r#"{"facts":[],"bugs":[],"releases":[]}"#,
+                ))
+            }
+        }
+
+        let seen = Seen(std::sync::Mutex::new(None));
+        let mut report = IngestionReport::default();
+        let object = call_window(&seen, &session(turns()), "[T0] USER: hi", &mut report)
+            .await
+            .expect("structured reply");
+        assert!(object.get("facts").is_some());
+        assert_eq!(seen.0.lock().expect("lock").as_ref(), Some(pass1_schema()));
+        assert_eq!(report.llm_calls, 1);
     }
 
     fn fact_json(turn: usize, quote: &str) -> Value {

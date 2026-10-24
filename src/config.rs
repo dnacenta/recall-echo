@@ -31,6 +31,29 @@ const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
 /// Five minutes: longer than any pause inside a working session, short enough
 /// that a session ended at lunchtime is memory by the afternoon.
 const DEFAULT_CAPTURE_SETTLE_SECS: u64 = 300;
+/// Context window sent on Ollama's native chat route. 16384 is enough for one
+/// session window plus the pass-1 prompt; the server default (4096) truncates
+/// the tail.
+const DEFAULT_NUM_CTX: u32 = 16384;
+
+pub(crate) fn default_num_ctx() -> u32 {
+    DEFAULT_NUM_CTX
+}
+
+fn is_default_num_ctx(value: &u32) -> bool {
+    *value == DEFAULT_NUM_CTX
+}
+
+/// `"ollama"` or `"openai"`, stored in the spelling the wire format uses.
+pub(crate) fn canonical_api_style(value: &str) -> Result<String, crate::error::RecallError> {
+    match value.to_ascii_lowercase().as_str() {
+        "ollama" => Ok("ollama".to_string()),
+        "openai" => Ok("openai".to_string()),
+        other => Err(crate::error::RecallError::Config(format!(
+            "llm.api_style must be \"ollama\" or \"openai\" (got {other})"
+        ))),
+    }
+}
 
 // ── Provider enum ────────────────────────────────────────────────────────
 
@@ -539,6 +562,19 @@ pub struct LlmSection {
     pub model: String,
     #[serde(default)]
     pub api_base: String,
+    /// Context length for Ollama's native chat route. Absent means 16384, and
+    /// that default is left out of a saved file.
+    #[serde(
+        default = "default_num_ctx",
+        skip_serializing_if = "is_default_num_ctx"
+    )]
+    pub num_ctx: u32,
+    /// Wire format for an OpenAI-compatible provider: `"ollama"` or `"openai"`.
+    /// Absent leaves the default. A base URL on port 11434 then uses native
+    /// chat for structured calls only; v1 stays on `/v1/chat/completions`
+    /// unless this is set to `"ollama"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_style: Option<String>,
     /// Overrides for the spawned agent CLI. Serialized only when non-empty, so
     /// a config that never touches it stays byte-identical.
     #[serde(default, skip_serializing_if = "CliSection::is_empty")]
@@ -551,6 +587,8 @@ impl Default for LlmSection {
             provider: Provider::Anthropic,
             model: String::new(),
             api_base: String::new(),
+            num_ctx: default_num_ctx(),
+            api_style: None,
             cli: CliSection::default(),
         }
     }
@@ -1039,6 +1077,20 @@ impl Config {
                 self.llm.api_base = value.to_string();
                 Ok(())
             }
+            "llm.num_ctx" | "num_ctx" => {
+                self.llm.num_ctx = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+                Ok(())
+            }
+            "llm.api_style" | "api_style" => {
+                if value.is_empty() {
+                    self.llm.api_style = None;
+                } else {
+                    self.llm.api_style = Some(canonical_api_style(value)?);
+                }
+                Ok(())
+            }
             "ephemeral.max_entries" => {
                 let n: usize = value
                     .parse()
@@ -1355,6 +1407,29 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_key("llm.model", "claude-sonnet-4-6").unwrap();
         assert_eq!(cfg.llm.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn num_ctx_defaults_to_16384_and_api_style_is_optional() {
+        let cfg: Config = toml::from_str("[llm]\nprovider = \"openai\"\n").unwrap();
+        assert_eq!(cfg.llm.num_ctx, 16_384);
+        assert!(cfg.llm.api_style.is_none());
+        let rendered = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!rendered.contains("num_ctx"), "{rendered}");
+        assert!(!rendered.contains("api_style"), "{rendered}");
+    }
+
+    #[test]
+    fn set_key_num_ctx_and_api_style() {
+        let mut cfg = Config::default();
+        cfg.set_key("llm.num_ctx", "32768").unwrap();
+        cfg.set_key("llm.api_style", "Ollama").unwrap();
+        assert_eq!(cfg.llm.num_ctx, 32_768);
+        assert_eq!(cfg.llm.api_style.as_deref(), Some("ollama"));
+        cfg.set_key("api_style", "").unwrap();
+        assert!(cfg.llm.api_style.is_none());
+        assert!(cfg.set_key("llm.api_style", "xml").is_err());
+        assert!(cfg.set_key("llm.num_ctx", "big").is_err());
     }
 
     #[test]
