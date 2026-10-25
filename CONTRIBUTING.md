@@ -4,17 +4,16 @@ Contributions are welcome. This document explains the workflow.
 
 ## Licensing your contribution
 
-recall-echo is [MPL-2.0](LICENSE). Your contribution is licensed under
-MPL-2.0, and the project may also offer it under other terms — a commercial
-licence, a future relicense, or a dual-licensed release.
+recall-echo is [MPL-2.0](LICENSE). By opening a pull request and by
+signing off each commit you agree that your contribution is licensed under
+MPL-2.0, and that the project may also offer it under other terms — a
+commercial licence, a future relicense, or a dual-licensed release.
 
 That second part is the one worth being explicit about. The project has had a
 single copyright holder so far, which is what made the move from AGPL-3.0 to
 MPL-2.0 possible at all. Once code lands from several people with no shared
 understanding about it, nobody can change the terms without tracking every
-contributor down. Saying so up front keeps the option open. The Developer
-Certificate of Origin below records that agreement per commit. It replaces a
-Contributor License Agreement: there is no CLA.
+contributor down. Saying so up front keeps the option open.
 
 You keep the copyright to what you write. If you would rather your
 contribution stay MPL-2.0 only, say so in the PR — that is a perfectly
