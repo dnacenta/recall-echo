@@ -26,6 +26,8 @@ A setting whose value contains a number has to name its key in the quote or in t
 
 `.` `!` and `?` end a sentence only when the next byte is whitespace or the text ends. A newline always does. The window stops at a boundary the quote itself ends on.
 
+**Agreement.** When that check fails, a user turn can still bind the setting from the assistant turn immediately before or after it. Every number of the value has to occur in the trimmed quote. Only those two neighbours are examined, and the neighbour has to be an assistant turn. One of its sentences has to contain every specific key token as a whole token (the key needs at least one; a `_version` key does not require the trailing `version` token when another specific token is present), every stem token of a `_version` key (an empty stem fails), and every number of the value, with no other number in that sentence. Repeats of the same number are allowed. The fact keeps the cited turn, the quote and the provenance. A user turn "9123 is good." followed by "Default port is now 9123." keeps `port` = `9123`.
+
 ## Gate 4 — replaces
 
 `replaces` stays only on a decided fact, and only when one of its content tokens occurs in the cited turn. Otherwise the field is cleared and the fact stays.

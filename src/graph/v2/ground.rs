@@ -38,6 +38,12 @@
 //! turn are checked together, so a fix turn can restate a symptom that was
 //! said earlier. A turn after the citation is not support. A number still has
 //! to occur in the text that is checked.
+//!
+//! When the quote and its sentence do not bind a numbered key, a user turn
+//! can still bind it from the assistant turn immediately before or after it.
+//! The trimmed quote has to contain every number of the value. One sentence
+//! of that assistant turn has to name the key and those numbers, and no other
+//! number. The citation stays on the user turn.
 
 use super::input::{Turn, TurnRole};
 use super::schema::{normalise, DROP_QUOTE};
@@ -205,31 +211,46 @@ impl SessionGround {
     /// A key whose tokens are all generic has nothing to bind, so the setting
     /// fails. The number is still required to occur in the turn by
     /// [`SessionGround::supports_value`]. A `_version` key also needs every
-    /// stem token, and an empty stem fails.
+    /// stem token, and an empty stem fails. When that check fails, a user
+    /// agreement can bind from one sentence of an adjacent assistant turn.
     #[must_use]
     pub(crate) fn key_bound(&self, key: &str, value: &str, turn: usize, quote: &str) -> bool {
         if numbers_in(value).is_empty() {
             return true;
         }
-        let Some(turn) = self.turn(turn) else {
+        let Some(cited) = self.turn(turn) else {
             return false;
         };
-        let sentence = sentence_containing(&turn.text, quote);
-        let texts = [quote, sentence];
-        if let Some(stem) = version_stem(key) {
-            let stem_tokens: Vec<&str> =
-                stem.split('_').filter(|token| !token.is_empty()).collect();
-            if stem_tokens.is_empty()
-                || !stem_tokens.iter().all(|token| token_occurs(token, &texts))
-            {
-                return false;
-            }
+        let sentence = sentence_containing(&cited.text, quote);
+        if direct_key_bound(key, &[quote, sentence]) {
+            return true;
         }
-        let specific: Vec<&str> = key
-            .split('_')
-            .filter(|token| !token.is_empty() && !is_generic_key(token))
-            .collect();
-        !specific.is_empty() && specific.iter().any(|token| token_occurs(token, &texts))
+        match self
+            .turns
+            .iter()
+            .position(|candidate| candidate.index == turn)
+        {
+            Some(cited_pos) => self.agreement_binds(key, value, cited_pos, quote),
+            None => false,
+        }
+    }
+
+    /// User agreement: the value's numbers are in the quote, and one adjacent
+    /// assistant sentence names the key and only those numbers.
+    #[must_use]
+    fn agreement_binds(&self, key: &str, value: &str, cited_pos: usize, quote: &str) -> bool {
+        let Some(cited) = self.turns.get(cited_pos) else {
+            return false;
+        };
+        if cited.role != TurnRole::User || !quote_states_numbers(value, quote) {
+            return false;
+        }
+        [cited_pos.checked_sub(1), cited_pos.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|pos| self.turns.get(pos))
+            .filter(|turn| turn.role == TurnRole::Assistant)
+            .any(|turn| sentences(&turn.text).any(|sentence| sentence_binds(key, value, sentence)))
     }
 
     /// A replacement stays only on a decided fact that names it in the turn.
@@ -380,6 +401,82 @@ fn version_stem(key: &str) -> Option<&str> {
     key.strip_suffix("_version")
 }
 
+fn direct_key_bound(key: &str, texts: &[&str]) -> bool {
+    if !version_stem_ok(key, texts) {
+        return false;
+    }
+    let specific = specific_key_tokens(key);
+    !specific.is_empty() && specific.iter().any(|token| token_occurs(token, texts))
+}
+
+fn version_stem_ok(key: &str, texts: &[&str]) -> bool {
+    let Some(stem) = version_stem(key) else {
+        return true;
+    };
+    let stem_tokens: Vec<&str> = stem.split('_').filter(|token| !token.is_empty()).collect();
+    !stem_tokens.is_empty() && stem_tokens.iter().all(|token| token_occurs(token, texts))
+}
+
+fn specific_key_tokens(key: &str) -> Vec<&str> {
+    key.split('_')
+        .filter(|token| !token.is_empty() && !is_generic_key(token))
+        .collect()
+}
+
+/// Every number of `value` occurs in the trimmed quote.
+fn quote_states_numbers(value: &str, quote: &str) -> bool {
+    let wanted = numbers_in(value);
+    if wanted.is_empty() {
+        return false;
+    }
+    let found = numbers_in(quote.trim());
+    wanted
+        .iter()
+        .all(|number| found.iter().any(|have| have == number))
+}
+
+fn sentence_binds(key: &str, value: &str, sentence: &str) -> bool {
+    exclusive_numbers(value, sentence) && agreement_tokens(key, sentence)
+}
+
+/// The sentence carries every number of the value and no other number.
+///
+/// A repeat of a value number is still that number.
+fn exclusive_numbers(value: &str, sentence: &str) -> bool {
+    let wanted = numbers_in(value);
+    let found = numbers_in(sentence);
+    !wanted.is_empty()
+        && wanted
+            .iter()
+            .all(|number| found.iter().any(|have| have == number))
+        && found
+            .iter()
+            .all(|number| wanted.iter().any(|have| have == number))
+}
+
+fn agreement_tokens(key: &str, sentence: &str) -> bool {
+    let specific = specific_key_tokens(key);
+    if specific.is_empty() || !version_stem_ok(key, &[sentence]) {
+        return false;
+    }
+    // Drop the trailing `version` token only when another specific token
+    // remains. If it is the only one, citing this sentence would fail the
+    // direct check unless that token occurs.
+    tokens_required(key, &specific)
+        .iter()
+        .all(|token| token_occurs(token, &[sentence]))
+}
+
+fn tokens_required<'a>(key: &str, specific: &'a [&'a str]) -> &'a [&'a str] {
+    if version_stem(key).is_none() {
+        return specific;
+    }
+    match specific.split_last() {
+        Some((last, rest)) if *last == "version" && !rest.is_empty() => rest,
+        _ => specific,
+    }
+}
+
 fn content_tokens(value: &str) -> Vec<String> {
     words_of(&normalise(value))
         .into_iter()
@@ -528,6 +625,33 @@ fn is_boundary(bytes: &[u8], index: usize) -> bool {
         }
         _ => false,
     }
+}
+
+fn sentences(text: &str) -> impl Iterator<Item = &str> {
+    let mut start = 0usize;
+    let mut index = 0usize;
+    std::iter::from_fn(move || {
+        let bytes = text.as_bytes();
+        loop {
+            if start >= bytes.len() {
+                return None;
+            }
+            while index < bytes.len() && !is_boundary(bytes, index) {
+                index += 1;
+            }
+            let end = index.min(bytes.len());
+            let sentence = text[start..end].trim();
+            if index < bytes.len() {
+                index += 1;
+                start = index;
+            } else {
+                start = bytes.len();
+            }
+            if !sentence.is_empty() {
+                return Some(sentence);
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -898,5 +1022,224 @@ mod tests {
                 assert_eq!(field, FieldCredit::Drop, "{symptom}");
             }
         }
+    }
+
+    fn bind(lines: &[(&str, TurnRole)], key: &str, value: &str, turn: usize, quote: &str) -> bool {
+        ground(lines).key_bound(key, value, turn, quote)
+    }
+
+    #[test]
+    fn agreement_fallback_cases() {
+        let u = TurnRole::User;
+        let a = TurnRole::Assistant;
+        // AC1, including neighbours by turn order when indexes have a gap.
+        assert!(bind(
+            &[("9123 is good.", u), ("Default port is now 9123.", a)],
+            "port",
+            "9123",
+            0,
+            "9123 is good."
+        ));
+        let gapped = SessionGround::prepare(&[
+            Turn {
+                index: 4,
+                role: u,
+                text: "9123 is good.".into(),
+            },
+            Turn {
+                index: 9,
+                role: a,
+                text: "Default port is now 9123.".into(),
+            },
+        ]);
+        assert!(gapped.key_bound("port", "9123", 4, "9123 is good."));
+        // AC2
+        assert!(bind(
+            &[("Should the port be 9123?", a), ("9123 is good.", u)],
+            "port",
+            "9123",
+            1,
+            "9123 is good."
+        ));
+        // AC3. A repeated value number is still allowed.
+        assert!(!bind(
+            &[
+                ("9123 is good.", u),
+                ("Port 9123 is taken, so I used 9124.", a)
+            ],
+            "port",
+            "9123",
+            0,
+            "9123 is good."
+        ));
+        assert!(bind(
+            &[("9123 is good.", u), ("Port 9123 is now 9123.", a)],
+            "port",
+            "9123",
+            0,
+            "9123 is good."
+        ));
+        // AC4
+        let split = [("30 is fine.", u), ("Port stays 8080. Timeout 30 s?", a)];
+        assert!(!bind(&split, "port", "30", 0, "30 is fine."));
+        assert!(bind(&split, "timeout", "30", 0, "30 is fine."));
+        // AC5
+        assert!(!bind(
+            &[
+                ("9123 is good.", u),
+                ("Noted.", a),
+                ("Thanks for that.", u),
+                ("Default port is now 9123.", a),
+            ],
+            "port",
+            "9123",
+            0,
+            "9123 is good."
+        ));
+        // AC6, and a user neighbour is not a context turn.
+        assert!(!bind(
+            &[("The port is 9123.", u), ("9123 works.", a)],
+            "port",
+            "9123",
+            1,
+            "9123 works."
+        ));
+        assert!(!bind(
+            &[("Default port is now 9123.", u), ("9123 is good.", u)],
+            "port",
+            "9123",
+            1,
+            "9123 is good."
+        ));
+        // AC7
+        assert!(!bind(
+            &[("Sounds good.", u), ("Default port is now 9123.", a)],
+            "port",
+            "9123",
+            0,
+            "Sounds good."
+        ));
+        // AC8
+        assert!(!bind(
+            &[("9123 is good.", u), ("Default port is now 9123.", a)],
+            "serve_port",
+            "9123",
+            0,
+            "9123 is good."
+        ));
+        // AC9. The trailing version token stays required when it is the only specific token.
+        assert!(bind(
+            &[("3.12 then.", u), ("Python 3.12 it is.", a)],
+            "python_version",
+            "3.12",
+            0,
+            "3.12 then."
+        ));
+        assert!(!bind(
+            &[("3.12 then.", u), ("Version 3.12 it is.", a)],
+            "_version",
+            "3.12",
+            0,
+            "3.12 then."
+        ));
+        assert!(!bind(
+            &[("3.12 then.", u), ("Min 3.12 it is.", a)],
+            "min_version",
+            "3.12",
+            0,
+            "3.12 then."
+        ));
+        assert!(bind(
+            &[("3.12 then.", u), ("Min version 3.12 it is.", a)],
+            "min_version",
+            "3.12",
+            0,
+            "3.12 then."
+        ));
+    }
+
+    #[test]
+    fn agreement_keep_implies_citing_the_assistant_sentence() {
+        for n in 0..200 {
+            for number in [n.to_string(), format!("{n}.5"), format!("-{n}")] {
+                for assistant_first in [false, true] {
+                    check_agreement_number(&number, assistant_first, false);
+                    check_agreement_number(&number, assistant_first, true);
+                }
+                let bare = agreement_session(
+                    "Sounds good.",
+                    &format!("Default port is now {number}."),
+                    false,
+                );
+                assert!(
+                    !bare.key_bound("port", &number, 0, "Sounds good."),
+                    "{number}"
+                );
+            }
+        }
+        for (stated, value) in [
+            ("4242", "42"),
+            ("4242", "2"),
+            ("4242", "4"),
+            ("4242", "24"),
+            ("4242", "242"),
+            ("4242", "424"),
+            ("4242", "42420"),
+            ("1", "-1"),
+            ("0.2.0", "0.2"),
+        ] {
+            let session = agreement_session(
+                &format!("{stated} is good."),
+                &format!("Default port is now {value}."),
+                false,
+            );
+            assert!(
+                !session.key_bound("port", value, 0, &format!("{stated} is good.")),
+                "{value} from {stated}"
+            );
+        }
+    }
+
+    fn check_agreement_number(number: &str, assistant_first: bool, distractor: bool) {
+        let user = format!("{number} is good.");
+        let assistant = if distractor {
+            format!("Port {number} is taken, so I used {number}0.")
+        } else {
+            format!("Default port is now {number}.")
+        };
+        let session = agreement_session(&user, &assistant, assistant_first);
+        let user_at = usize::from(assistant_first);
+        let assistant_at = 1 - user_at;
+        if distractor {
+            assert!(
+                !session.key_bound("port", number, user_at, &user),
+                "{number}"
+            );
+            return;
+        }
+        assert!(
+            session.key_bound("port", number, user_at, &user),
+            "{number}"
+        );
+        let sentence = format!("Default port is now {number}");
+        assert!(
+            session.key_bound("port", number, assistant_at, &sentence),
+            "{number} cited to the assistant sentence"
+        );
+        let cited = session.turn_text(user_at).expect("cited turn");
+        assert!(
+            numbers_in(number)
+                .iter()
+                .all(|part| numbers_in(cited).iter().any(|have| have == part)),
+            "{number} absent from the cited turn"
+        );
+    }
+
+    fn agreement_session(user: &str, assistant: &str, assistant_first: bool) -> SessionGround {
+        let mut lines = [(user, TurnRole::User), (assistant, TurnRole::Assistant)];
+        if assistant_first {
+            lines.swap(0, 1);
+        }
+        ground(&lines)
     }
 }
