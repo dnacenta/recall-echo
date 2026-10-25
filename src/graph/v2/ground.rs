@@ -34,9 +34,10 @@
 //! that is scored.
 //!
 //! A bug symptom is checked against the cited turn. When that turn is later
-//! than another turn of the same session, the joined session text is checked
-//! too, so a fix turn can restate a symptom that was said earlier. A number
-//! still has to occur in the text that is checked.
+//! than another turn of the same session, the cited turn and every earlier
+//! turn are checked together, so a fix turn can restate a symptom that was
+//! said earlier. A turn after the citation is not support. A number still has
+//! to occur in the text that is checked.
 
 use super::input::{Turn, TurnRole};
 use super::schema::{normalise, DROP_QUOTE};
@@ -185,15 +186,15 @@ impl SessionGround {
         FieldCredit::Drop
     }
 
-    /// Symptom support. The cited turn wins. A later turn of this session may
-    /// use the joined session text. The first turn may not: the symptom has
-    /// to be in that turn. A symptom that appears in neither drops.
+    /// Symptom support. The cited turn wins. A later turn may also use the
+    /// cited turn and every earlier turn. A turn after the citation does not
+    /// count, and the first turn cannot borrow from a later one.
     #[must_use]
     pub(crate) fn credit_symptom(&self, value: &str, turn: usize, quote: &str) -> FieldCredit {
         if self.supports_value(value, turn, quote, ValueShape::Literal) {
             return FieldCredit::Turn;
         }
-        if self.turn_is_later(turn) && self.session_supports(value) {
+        if self.turn_is_later(turn) && self.prefix_supports(value, turn) {
             return FieldCredit::Session;
         }
         FieldCredit::Drop
@@ -270,6 +271,32 @@ impl SessionGround {
             &self.session_norm,
             &self.session_words,
             &self.session_numbers,
+            None,
+            ValueShape::Literal,
+        )
+    }
+
+    /// The cited turn and every turn with a smaller index. Later turns are left out.
+    fn prefix_supports(&self, value: &str, cited: usize) -> bool {
+        let mut normalised = String::new();
+        let mut words = Vec::new();
+        let mut numbers = Vec::new();
+        for turn in &self.turns {
+            if turn.index > cited {
+                continue;
+            }
+            if !normalised.is_empty() && !turn.normalised.is_empty() {
+                normalised.push(' ');
+            }
+            normalised.push_str(&turn.normalised);
+            words.extend(turn.words.iter().cloned());
+            numbers.extend(turn.numbers.iter().cloned());
+        }
+        supported(
+            value,
+            &normalised,
+            &words,
+            &numbers,
             None,
             ValueShape::Literal,
         )
@@ -804,6 +831,36 @@ mod tests {
         // A fix that restates the symptom is a field: the session can support it.
         assert_eq!(
             session.credit_field("dropped rows patched", 1, "The patch landed"),
+            FieldCredit::Session
+        );
+    }
+
+    #[test]
+    fn turns_after_the_citation_do_not_support_a_symptom() {
+        let thanks = ground(&[
+            ("Morning.", TurnRole::User),
+            ("Thanks", TurnRole::User),
+            ("The reader dropped rows.", TurnRole::Assistant),
+        ]);
+        assert_eq!(
+            thanks.credit_symptom("dropped rows", 1, "Thanks"),
+            FieldCredit::Drop
+        );
+        let later_number = ground(&[
+            ("The reader dropped rows.", TurnRole::User),
+            ("Patched the reader.", TurnRole::Assistant),
+            ("Retry count is 17.", TurnRole::User),
+        ]);
+        assert_eq!(
+            later_number.credit_symptom("dropped rows 17", 1, "Patched the reader"),
+            FieldCredit::Drop
+        );
+        let earlier_number = ground(&[
+            ("The reader dropped rows near 17.", TurnRole::User),
+            ("Patched the reader.", TurnRole::Assistant),
+        ]);
+        assert_eq!(
+            earlier_number.credit_symptom("dropped rows 17", 1, "Patched the reader"),
             FieldCredit::Session
         );
     }

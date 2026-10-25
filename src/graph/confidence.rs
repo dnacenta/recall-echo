@@ -104,7 +104,7 @@ pub enum Provenance {
     /// default for anything unlabelled, so unknown evidence never earns full
     /// weight. Pipeline v2 also uses this for a fact that is not quotable
     /// from one turn, including a bug symptom the cited turn does not support
-    /// and the rest of the session does.
+    /// and an earlier turn of the same session does.
     #[default]
     #[serde(rename = "self")]
     SelfGenerated,

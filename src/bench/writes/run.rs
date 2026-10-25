@@ -1907,7 +1907,7 @@ mod tests {
         let kept: u32 = report.sessions.iter().map(|session| session.kept).sum();
         assert_eq!(candidates, 46);
         // Nine candidates fail outright. A bug cited from a later turn keeps
-        // a symptom that appears elsewhere in the same session, so five bugs
+        // a symptom that appears in that turn or an earlier one, so five bugs
         // that used to drop stay. A component that is the project name is the
         // project fallback, so those affects edges stay and are not drops.
         // This fixture has no partial field drops.

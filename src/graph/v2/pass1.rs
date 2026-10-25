@@ -446,10 +446,10 @@ fn expand_bug(
         return Err(DROP_TOO_LONG);
     }
     let mut carrier = carrier(object, confidence, &cited)?;
-    // The cited turn is checked first. A later turn may use the joined session
-    // text, so a fix turn can restate a symptom said earlier. Nowhere in the
-    // session drops the whole bug. The quote was already required to be in
-    // the cited turn.
+    // The cited turn is checked first. A later turn may use that turn and
+    // every earlier turn, so a fix turn can restate a symptom said earlier.
+    // A turn after the citation is not support. Nowhere in that text drops
+    // the whole bug. The quote was already required to be in the cited turn.
     let symptom_credit = ground.credit_symptom(symptom, carrier.turn, &carrier.quote);
     if symptom_credit == FieldCredit::Drop {
         return Err(DROP_VALUE_SUPPORT);
@@ -1519,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn symptom_number_may_come_from_any_turn() {
+    fn symptom_support_stops_at_the_cited_turn() {
         let turns = vec![
             Turn {
                 index: 0,
@@ -1540,13 +1540,60 @@ mod tests {
         let mut report = IngestionReport::default();
         let facts = facts_from_reply(
             &bug_reply("dropped rows 17", "", "", "", 1, "Patched the reader"),
-            &session(turns),
+            &session(turns.clone()),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_candidate_balance(&report);
+
+        let mut earlier = turns;
+        earlier[0].text = "The reader dropped rows near 17.".into();
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply("dropped rows 17", "", "", "", 1, "Patched the reader"),
+            &session(earlier),
             &mut report,
         );
         assert_eq!(report.kept, 1, "{:?}", report.drops);
-        assert!(facts
+        let symptom = facts
             .iter()
-            .any(|fact| fact.object_name == "dropped rows 17"));
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom");
+        assert_eq!(symptom.object_name, "dropped rows 17");
+        assert_eq!(symptom.provenance, Provenance::SelfGenerated);
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn symptom_only_stated_after_the_citation_is_dropped() {
+        let turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "Morning.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: "Thanks".into(),
+            },
+            Turn {
+                index: 2,
+                role: TurnRole::Assistant,
+                text: "The reader dropped rows.".into(),
+            },
+        ];
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply("dropped rows", "", "", "", 1, "Thanks"),
+            &session(turns),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
         assert_candidate_balance(&report);
     }
 

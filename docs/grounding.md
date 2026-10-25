@@ -18,7 +18,7 @@ Content tokens are the normalised tokens longer than one character, or digits, m
 
 Three content tokens or fewer need at least half of them in the turn and at least one in the quote. A longer literal, and a longer entity name, need at least half of their content tokens in the turn.
 
-A release whose version is not in the cited turn drops as `bad_version`. That is the release form of this gate: the version string has to occur in the cited turn, and the drop is still a whole candidate. The reason stays `bad_version`.
+A release whose version does not occur in the cited turn drops as `bad_version`. The drop is a whole candidate. The check is not the number rule above: one leading `v` is removed, the remainder must contain a digit, and that remainder must be a plain substring of the cited turn. `1.0` therefore matches inside `Ship 1.0.0`.
 
 ## Gate 3 — key binding
 
@@ -36,11 +36,11 @@ A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object
 
 ## Symptom on a later turn
 
-A bug symptom is a literal. The cited turn is checked first. When that turn is later than another turn of the same session, the joined session text is checked too. A fix turn can therefore carry a symptom that was said earlier in the session. The opening turn cannot: the symptom has to be in that turn.
+A bug symptom is a literal. The cited turn is checked first. When that turn is later than another turn of the same session, the cited turn and every earlier turn are checked together. A fix turn can therefore carry a symptom that was said earlier. Turns after the citation are not support. The opening turn cannot borrow a symptom from a later turn.
 
-The quote still has to be in the cited turn (gate 1, including re-cite). Every number in the symptom has to occur in the session text. A number that occurs only inside a longer number does not. A symptom that appears nowhere in the session drops the whole bug as `value_support`.
+The quote still has to be in the cited turn (gate 1, including re-cite). Every number in the symptom has to occur in that supporting text. A number that occurs only inside a longer number does not. A symptom that appears nowhere there drops the whole bug as `value_support`.
 
-Support may sit in any turn of the session, including a turn after the citation. A symptom the cited turn does not support is inferred (`self`). One the cited turn does support keeps that turn's role.
+A symptom the cited turn does not support is inferred (`self`). One the cited turn does support keeps that turn's role.
 
 Cause, fix and release contents already use the cited turn and, failing that, the joined session, on every turn. A fix that restates the symptom is kept when that text supports it. When it does not, the field drops as `value_support_partial` and the bug stays. A named component is still checked only against the cited turn.
 
