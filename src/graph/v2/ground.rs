@@ -42,11 +42,13 @@
 //! When the quote and its sentence do not bind a numbered key, a user turn
 //! can still bind it from the assistant turn immediately before or after it.
 //! The trimmed quote has to contain every number of the value. The sentence
-//! that contains the quote states those numbers and no other number, and the
-//! word immediately before one is not `not`, `no`, or another content word
-//! (`yes`, `sure`, `ok` and `okay` stay allowed). One sentence of that
-//! assistant turn has to name the key and those numbers, and no other
-//! number. The citation stays on the user turn.
+//! that contains the quote states those numbers and no other number. The word
+//! immediately before one blocks the fallback unless it is a stop word or an
+//! agreement word (`yes`, `sure`, `ok`, `okay`, `please`, `prefer`, `keep`,
+//! and the other ordinary agreement words). `not`, `no`, `don't`, `never`
+//! and `avoid` block.
+//! One sentence of that assistant turn has to name the key and those numbers,
+//! and no other number. The citation stays on the user turn.
 
 use super::input::{Turn, TurnRole};
 use super::schema::{normalise, DROP_QUOTE};
@@ -217,7 +219,7 @@ impl SessionGround {
     /// stem token, and an empty stem fails. When that check fails, a user
     /// agreement can bind from one sentence of an adjacent assistant turn,
     /// provided the user's own sentence states only the value's numbers and
-    /// does not put `not`, `no`, or another content word immediately before one.
+    /// the word before one is a stop word or an agreement word, not a negation.
     #[must_use]
     pub(crate) fn key_bound(&self, key: &str, value: &str, turn: usize, quote: &str) -> bool {
         if numbers_in(value).is_empty() {
@@ -240,9 +242,9 @@ impl SessionGround {
         }
     }
 
-    /// User agreement: the cited sentence states only the value's numbers and
-    /// does not lead one with `not`, `no`, or another content word, and one
-    /// adjacent assistant sentence names the key and only those numbers.
+    /// User agreement: the cited sentence states only the value's numbers, the
+    /// word before one is allowed, and one adjacent assistant sentence names
+    /// the key and only those numbers.
     #[must_use]
     fn agreement_binds(&self, key: &str, value: &str, cited_pos: usize, quote: &str) -> bool {
         let Some(cited) = self.turns.get(cited_pos) else {
@@ -466,9 +468,10 @@ fn exclusive_numbers(value: &str, sentence: &str) -> bool {
 
 /// The user's sentence states the value and does not negate or retarget it.
 ///
-/// `not` and `no` negate the number they precede. Any other content word in
-/// that position names something else (`timeout`). An affirmation, a stop
-/// word, or no word at all leaves the number as the agreement.
+/// A negation before the number blocks. Any other word in that position
+/// blocks unless it is a stop word or an agreement word (`please`, `prefer`).
+/// A different number in the sentence blocks on its own. No word at all
+/// leaves the number as the agreement.
 fn user_states_agreement(value: &str, sentence: &str) -> bool {
     exclusive_numbers(value, sentence)
         && number_spans(sentence)
@@ -480,30 +483,90 @@ fn preceding_word_blocks(text: &str, number_start: usize) -> bool {
     let Some(word) = word_before(text, number_start) else {
         return false;
     };
-    let word = word.to_ascii_lowercase();
-    match word.as_str() {
-        "not" | "no" => true,
-        "yes" | "sure" | "ok" | "okay" => false,
-        other => !is_stop(other),
+    let word = fold_word(word);
+    if word.is_empty() {
+        return false;
     }
+    if is_negation(&word) {
+        return true;
+    }
+    !(is_stop(&word) || is_agreement_word(&word))
 }
 
-/// Alphanumeric word immediately before `index`, skipping space and punctuation.
+/// `not` and `no` are stop words, so the negation check has to win first.
 ///
-/// A run of digits is a number, not a word. The span start of a signed number
-/// is the hyphen, so the sign is skipped with the other punctuation.
+/// An apostrophe is removed before the match, so `don't` is `dont`.
+fn is_negation(word: &str) -> bool {
+    matches!(word, "not" | "no" | "dont" | "never" | "avoid")
+}
+
+fn is_agreement_word(word: &str) -> bool {
+    matches!(
+        word,
+        "yes"
+            | "sure"
+            | "ok"
+            | "okay"
+            | "yeah"
+            | "yep"
+            | "alright"
+            | "please"
+            | "fine"
+            | "agreed"
+            | "great"
+            | "perfect"
+            | "thanks"
+            | "good"
+            | "sounds"
+            | "right"
+            | "then"
+            | "let"
+            | "lets"
+            | "go"
+            | "do"
+            | "try"
+            | "keep"
+            | "pick"
+            | "choose"
+            | "take"
+            | "make"
+            | "set"
+            | "switch"
+            | "change"
+            | "prefer"
+            | "say"
+            | "works"
+    )
+}
+
+fn fold_word(word: &str) -> String {
+    let mut folded = String::with_capacity(word.len());
+    for ch in word.chars() {
+        if ch == '\'' || ch == '\u{2019}' {
+            continue;
+        }
+        folded.extend(ch.to_lowercase());
+    }
+    folded
+}
+
+/// Word immediately before `index`, skipping space and punctuation.
+///
+/// An apostrophe stays inside the word, so `don't` is one word. A run of
+/// digits is a number, not a word. The span start of a signed number is the
+/// hyphen, so the sign is skipped with the other punctuation.
 fn word_before(text: &str, index: usize) -> Option<&str> {
     let mut end = index;
     loop {
         let ch = char_before(text, end)?;
-        if ch.is_alphanumeric() {
+        if is_word_char(ch) {
             break;
         }
         end -= ch.len_utf8();
     }
     let mut start = end;
     while let Some(ch) = char_before(text, start) {
-        if !ch.is_alphanumeric() {
+        if !is_word_char(ch) {
             break;
         }
         start -= ch.len_utf8();
@@ -514,6 +577,10 @@ fn word_before(text: &str, index: usize) -> Option<&str> {
     } else {
         Some(word)
     }
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '\'' || ch == '\u{2019}'
 }
 
 fn agreement_tokens(key: &str, sentence: &str) -> bool {
@@ -1236,6 +1303,9 @@ mod tests {
         for user in [
             "Not 9123, use 9124.",
             "No, 9123 is taken.",
+            "Never 9123.",
+            "Avoid 9123.",
+            "Don't 9123.",
             "Timeout 9123 ms is fine.",
         ] {
             assert!(
@@ -1243,9 +1313,32 @@ mod tests {
                 "{user}"
             );
         }
-        for user in ["Yes, 9123.", "Sure, 9123 works.", "OK, 9123."] {
+        for user in [
+            "Yes, 9123.",
+            "Sure, 9123 works.",
+            "OK, 9123.",
+            "Yes please, 9123.",
+            "I prefer 9123.",
+            "Fine, 9123.",
+            "Let's do 9123.",
+            "Keep 9123.",
+        ] {
             assert!(
                 bind(&[(question, a), (user, u)], "port", "9123", 1, user),
+                "{user}"
+            );
+        }
+    }
+
+    #[test]
+    fn agreement_user_sentence_drops_a_second_number_on_its_own() {
+        let question = "Should the port be 9123?";
+        let a = TurnRole::Assistant;
+        let u = TurnRole::User;
+        // The word before the value is a stop word, so only the extra number drops these.
+        for user in ["Use 30 and 9123.", "9123 or 9124?"] {
+            assert!(
+                !bind(&[(question, a), (user, u)], "port", "9123", 1, user),
                 "{user}"
             );
         }
