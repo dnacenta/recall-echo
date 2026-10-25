@@ -66,6 +66,17 @@ pub(crate) struct WriteStats {
     pub retirements_skipped: u32,
 }
 
+/// Runs after a conflict rolls the attempt back, before the next attempt.
+///
+/// Production writes leave this empty. The conflict test uses it to commit
+/// a slot on the main connection between the two attempts.
+pub(crate) trait ConflictHook: Send + Sync {
+    fn between_attempts<'a>(
+        &'a self,
+        gm: &'a GraphMemory,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphError>> + Send + 'a>>;
+}
+
 /// What one session's write needs besides the facts.
 pub(crate) struct WriteCtx<'a> {
     pub llm: &'a dyn LlmProvider,
@@ -77,6 +88,10 @@ pub(crate) struct WriteCtx<'a> {
     /// Decremented when the next commit should fail as a conflict. Stays zero
     /// outside the conflict test: a real conflict still retries once.
     pub conflict_budget: &'a AtomicU32,
+    /// Midnight UTC of `date`, when `date` is a calendar day. None skips
+    /// every retirement and still writes the facts.
+    pub valid_until: Option<String>,
+    pub on_conflict: Option<&'a dyn ConflictHook>,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -94,6 +109,8 @@ impl<'a> WriteCtx<'a> {
             date,
             turns,
             conflict_budget: &NO_CONFLICTS,
+            valid_until: session_midnight(date),
+            on_conflict: None,
         }
     }
 }
@@ -169,7 +186,12 @@ pub(crate) async fn write_facts(
     loop {
         match write_attempt(gm, ctx, facts, &resolution).await {
             Ok(stats) => return Ok(stats),
-            Err(err) if attempt == 0 && is_write_conflict(&err) => attempt += 1,
+            Err(err) if attempt == 0 && is_write_conflict(&err) => {
+                attempt += 1;
+                if let Some(hook) = ctx.on_conflict {
+                    hook.between_attempts(gm).await?;
+                }
+            }
             Err(err) => return Err(err),
         }
     }
@@ -189,6 +211,12 @@ async fn write_attempt(
         ..WriteStats::default()
     };
     let mut catalog = Catalog::from_resolution(resolution);
+    // The catalog above was read before this transaction. Re-read inside it
+    // so a retry sees slots another writer committed after the first attempt.
+    if let Err(err) = refresh_catalog(&tx, &mut catalog).await {
+        let _ = tx.cancel().await;
+        return Err(err);
+    }
     let applied = apply_all(gm, &tx, ctx, &mut catalog, &mut stats, facts).await;
     if let Err(err) = applied {
         let _ = tx.cancel().await;
@@ -217,6 +245,8 @@ async fn apply_all(
         catalog,
         stats,
         names: HashMap::new(),
+        edges: HashMap::new(),
+        scope: HashMap::new(),
     };
     for index in ordered_indexes(facts) {
         attempt.apply(&facts[index]).await?;
@@ -283,6 +313,10 @@ struct Attempt<'a> {
     catalog: &'a mut Catalog,
     stats: &'a mut WriteStats,
     names: HashMap<String, String>,
+    /// Live outgoing edges of one subject, for this attempt.
+    edges: HashMap<String, Vec<StoredEdge>>,
+    /// Component ids in a project's scope, for this attempt.
+    scope: HashMap<String, Vec<String>>,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -351,6 +385,7 @@ impl<'a> Attempt<'a> {
         self.names
             .insert(subject.id.clone(), source.subject_name.clone());
         let mut fact = source.clone();
+        fact.key = fold_key(&fact.key);
         if fact.status == "rejected" {
             self.retire_rejected(&fact, &subject).await?;
         } else if fact.status == "decided" {
@@ -390,7 +425,7 @@ impl<'a> Attempt<'a> {
             .find_edge(subject, object, fact, description.as_deref())
             .await?
         {
-            match self.reinforce_edge(&existing, fact).await? {
+            match self.reinforce_edge(&subject.id, &existing, fact).await? {
                 Sight::Recorded => self.stats.reinforced += 1,
                 Sight::AlreadySeen => self.stats.already_seen += 1,
             }
@@ -402,7 +437,7 @@ impl<'a> Attempt<'a> {
     }
 
     async fn find_edge(
-        &self,
+        &mut self,
         subject: &Stored,
         object: &Stored,
         fact: &Fact,
@@ -419,7 +454,7 @@ impl<'a> Attempt<'a> {
     }
 
     async fn create_edge(
-        &self,
+        &mut self,
         fact: &Fact,
         subject: &Stored,
         object: &Stored,
@@ -462,10 +497,16 @@ impl<'a> Attempt<'a> {
             .bind(("evidence", json!([item])))
             .await?
             .check()?;
+        self.forget_edges(&subject.id, &object.id);
         Ok(())
     }
 
-    async fn reinforce_edge(&self, edge: &StoredEdge, fact: &Fact) -> Result<Sight, GraphError> {
+    async fn reinforce_edge(
+        &mut self,
+        subject_id: &str,
+        edge: &StoredEdge,
+        fact: &Fact,
+    ) -> Result<Sight, GraphError> {
         if evidence_seen(edge.evidence.as_ref(), self.ctx.session_id, fact) {
             return Ok(Sight::AlreadySeen);
         }
@@ -498,6 +539,7 @@ impl<'a> Attempt<'a> {
             .bind(("evidence", evidence))
             .await?
             .check()?;
+        self.forget_edges(subject_id, &record_id(&edge.to_id));
         Ok(Sight::Recorded)
     }
 
@@ -551,7 +593,13 @@ impl<'a> Attempt<'a> {
         if fact.predicate == Predicate::Setting {
             fact.key = preferred_key(&fact.key, &slots);
         }
-        let until = session_midnight(self.ctx.date);
+        let Some(until) = self.ctx.valid_until.clone() else {
+            let session_id = self.ctx.session_id;
+            self.skip_matches(&slots, |slot| {
+                supersede_target(slot, fact) && !opened_here(slot.get("evidence"), session_id)
+            });
+            return Ok(());
+        };
         let ended_by = format!("{}:{SUPERSEDED}", self.ctx.session_id);
         let mut changed = false;
         for slot in &mut slots {
@@ -564,22 +612,13 @@ impl<'a> Attempt<'a> {
             {
                 continue;
             }
-            let old_value = slot_str(slot, "value").unwrap_or("").to_string();
-            let predicate = slot_str(slot, "predicate")
-                .unwrap_or(fact.predicate.as_str())
-                .to_string();
+            let closed = closed_of(slot, fact);
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
             changed = true;
             let subject_name = self.label(&stored.id, &fact.subject_name).await?;
-            self.record(
-                SUPERSEDED,
-                &subject_name,
-                &predicate,
-                &old_value,
-                &fact.object_name,
-            );
+            self.record(SUPERSEDED, &subject_name, closed, &fact.object_name);
         }
         if changed {
             self.store_slots(&stored.id, &stored.attributes, slots)
@@ -600,7 +639,13 @@ impl<'a> Attempt<'a> {
         let Some((stored, mut slots)) = self.load_slots(&subject.id).await? else {
             return Ok(());
         };
-        let until = session_midnight(self.ctx.date);
+        let Some(until) = self.ctx.valid_until.clone() else {
+            let session_id = self.ctx.session_id;
+            self.skip_matches(&slots, |slot| {
+                considered_same_slot(slot, fact) && !opened_here(slot.get("evidence"), session_id)
+            });
+            return Ok(());
+        };
         let ended_by = format!("{}:{PROMOTED}", self.ctx.session_id);
         let mut changed = false;
         for slot in &mut slots {
@@ -613,19 +658,13 @@ impl<'a> Attempt<'a> {
             {
                 continue;
             }
-            let old_value = slot_str(slot, "value").unwrap_or("").to_string();
+            let closed = closed_of(slot, fact);
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
             changed = true;
             let subject_name = self.label(&stored.id, &fact.subject_name).await?;
-            self.record(
-                PROMOTED,
-                &subject_name,
-                fact.predicate.as_str(),
-                &old_value,
-                &fact.object_name,
-            );
+            self.record(PROMOTED, &subject_name, closed, &fact.object_name);
         }
         if changed {
             self.store_slots(&stored.id, &stored.attributes, slots)
@@ -672,10 +711,13 @@ impl<'a> Attempt<'a> {
         object_id: Option<&str>,
     ) -> Result<(), GraphError> {
         if !fact.predicate.is_edge() {
+            // A rejected setting closes that key only. The same value on
+            // another key stays live.
             self.close_slots(id, fact, REJECTED, "", |slot| {
                 open_status(slot, &["decided", "considered"])
                     && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
                     && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name)
+                    && rejected_key_ok(slot, fact)
             })
             .await?;
         }
@@ -716,8 +758,12 @@ impl<'a> Attempt<'a> {
     ) -> Result<(), GraphError> {
         let replaces = fact.replaces.clone();
         let new_value = fact.object_name.clone();
+        // A literal replacement closes settings and the single-valued issue
+        // and release-status slots. A rule, a preference, or release contents
+        // stays live even when its text contains the needle.
         self.close_slots(id, fact, REPLACED, &new_value, |slot| {
             open_status(slot, &["decided", "considered"])
+                && literal_slot_ok(slot)
                 && literal_matches(slot_str(slot, "value").unwrap_or(""), &replaces)
                 && !same_decided_slot(slot, fact)
         })
@@ -751,7 +797,13 @@ impl<'a> Attempt<'a> {
         let Some((stored, mut slots)) = self.load_slots(id).await? else {
             return Ok(());
         };
-        let until = session_midnight(self.ctx.date);
+        let session_id = self.ctx.session_id;
+        let Some(until) = self.ctx.valid_until.clone() else {
+            self.skip_matches(&slots, |slot| {
+                matches(slot) && !opened_here(slot.get("evidence"), session_id)
+            });
+            return Ok(());
+        };
         let ended_by = format!("{}:{reason}", self.ctx.session_id);
         let mut changed = false;
         let mut notes = Vec::new();
@@ -763,22 +815,19 @@ impl<'a> Attempt<'a> {
             if !matches(slot) || opened_here(slot.get("evidence"), self.ctx.session_id) {
                 continue;
             }
-            let old_value = slot_str(slot, "value").unwrap_or("").to_string();
-            let predicate = slot_str(slot, "predicate")
-                .unwrap_or(fact.predicate.as_str())
-                .to_string();
+            let closed = closed_of(slot, fact);
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
             changed = true;
-            notes.push((predicate, old_value));
+            notes.push(closed);
         }
         if changed {
             let subject_name = self.label(&stored.id, &fact.subject_name).await?;
             self.store_slots(&stored.id, &stored.attributes, slots)
                 .await?;
-            for (predicate, old_value) in notes {
-                self.record(reason, &subject_name, &predicate, &old_value, new_value);
+            for closed in notes {
+                self.record(reason, &subject_name, closed, new_value);
             }
         }
         Ok(())
@@ -812,7 +861,10 @@ impl<'a> Attempt<'a> {
         if crud::edge_already_closed(row.get("valid_until")) {
             return Ok(());
         }
-        let until = session_midnight(self.ctx.date);
+        let Some(until) = self.ctx.valid_until.clone() else {
+            self.stats.retirements_skipped += 1;
+            return Ok(());
+        };
         let ended_by = format!("{}:{reason}", self.ctx.session_id);
         let mut response = self
             .tx
@@ -828,25 +880,47 @@ impl<'a> Attempt<'a> {
         let object_id = record_id(&edge.to_id);
         let old_value = self.label(&object_id, &object_id).await?;
         let subject_name = self.label(subject_id, subject_id).await?;
-        self.record(reason, &subject_name, &edge.rel_type, &old_value, new_value);
+        self.record(
+            reason,
+            &subject_name,
+            Closed {
+                predicate: edge.rel_type.clone(),
+                key: String::new(),
+                old_value,
+            },
+            new_value,
+        );
+        self.forget_edges(subject_id, &object_id);
         Ok(())
     }
 
-    fn record(
-        &mut self,
-        reason: &str,
-        subject: &str,
-        predicate: &str,
-        old_value: &str,
-        new_value: &str,
-    ) {
+    fn record(&mut self, reason: &str, subject: &str, closed: Closed, new_value: &str) {
         self.stats.retirements.push(Retirement {
             reason: reason.to_string(),
             subject: subject.to_string(),
-            predicate: predicate.to_string(),
-            old_value: old_value.to_string(),
+            predicate: closed.predicate,
+            key: closed.key,
+            old_value: closed.old_value,
             new_value: new_value.to_string(),
         });
+    }
+
+    /// A retirement that would have been stamped, counted and left in place.
+    fn skip_matches(&mut self, slots: &[Value], matches: impl Fn(&Value) -> bool) {
+        for slot in slots {
+            if !slot.is_object() {
+                self.stats.retirements_skipped += 1;
+                continue;
+            }
+            if matches(slot) {
+                self.stats.retirements_skipped += 1;
+            }
+        }
+    }
+
+    fn forget_edges(&mut self, subject_id: &str, object_id: &str) {
+        self.edges.remove(subject_id);
+        self.scope.remove(object_id);
     }
 
     async fn project_scope(
@@ -854,16 +928,17 @@ impl<'a> Attempt<'a> {
         subject: &Stored,
         kind: Kind,
     ) -> Result<Vec<String>, GraphError> {
+        if let Some(ids) = self.scope.get(&subject.id) {
+            return Ok(ids.clone());
+        }
         let mut ids = vec![subject.id.clone()];
         if kind != Kind::Project {
+            self.scope.insert(subject.id.clone(), ids.clone());
             return Ok(ids);
         }
         let mut response = self
             .tx
-            .query(
-                "SELECT in FROM relates_to WHERE out = type::record($id) \
-                 AND rel_type = 'part_of' AND valid_until = NONE",
-            )
+            .query(SCOPE_PART_OF)
             .bind(("id", subject.id.clone()))
             .await?;
         let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
@@ -879,6 +954,7 @@ impl<'a> Attempt<'a> {
                 ids.push(id);
             }
         }
+        self.scope.insert(subject.id.clone(), ids.clone());
         Ok(ids)
     }
 
@@ -1015,15 +1091,28 @@ impl<'a> Attempt<'a> {
         Ok(name)
     }
 
-    async fn live_edges(&self, subject_id: &str) -> Result<Vec<StoredEdge>, GraphError> {
+    async fn live_edges(&mut self, subject_id: &str) -> Result<Vec<StoredEdge>, GraphError> {
+        if let Some(edges) = self.edges.get(subject_id) {
+            return Ok(edges.clone());
+        }
         let mut response = self
             .tx
-            .query("SELECT * FROM relates_to WHERE in = type::record($id) AND valid_until = NONE")
+            .query(LIVE_EDGES_OF)
             .bind(("id", subject_id.to_string()))
             .await?;
-        deserialize_take(&mut response, 0)
+        let edges: Vec<StoredEdge> = deserialize_take(&mut response, 0)?;
+        self.edges.insert(subject_id.to_string(), edges.clone());
+        Ok(edges)
     }
 }
+
+/// Outgoing live edges of one record. A graph-edge scan, not a table scan.
+const LIVE_EDGES_OF: &str =
+    "SELECT * FROM type::record($id)->(relates_to WHERE valid_until = NONE)";
+
+/// Live `part_of` edges that point at one record. A graph-edge scan.
+const SCOPE_PART_OF: &str = "SELECT in FROM type::record($id)<-(relates_to \
+     WHERE rel_type = 'part_of' AND valid_until = NONE)";
 
 const CLOSE_EDGE: &str = r#"
     UPDATE type::record($id) SET
@@ -1111,9 +1200,38 @@ fn alphanumeric_runs(text: &str) -> Vec<String> {
     runs
 }
 
-fn session_midnight(date: &str) -> String {
-    let day = date.split('T').next().unwrap_or(date);
-    format!("{day}T00:00:00Z")
+/// Midnight UTC of a calendar day, or none when `date` is not one.
+///
+/// `YYYY-MM-DD` and a `T` timestamp of that day both stamp the day. A blank
+/// date or a time written with a space is not a day, and a retirement that
+/// needed one is skipped rather than failing the session.
+fn session_midnight(date: &str) -> Option<String> {
+    let day = match date.split_once('T') {
+        Some((day, _)) => day,
+        None => date,
+    };
+    if day.len() != 10 {
+        return None;
+    }
+    let mut parts = day.split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let dom: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !is_calendar_day(year, month, dom) {
+        return None;
+    }
+    Some(format!("{day}T00:00:00Z"))
+}
+
+fn is_calendar_day(year: i32, month: u32, day: u32) -> bool {
+    let max = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=max).contains(&day)
 }
 
 /// Keys name one setting when they are equal, or when the tokens left after
@@ -1123,12 +1241,19 @@ fn session_midnight(date: &str) -> String {
 /// sharing a token is not a family. A new key is rewritten onto the live key
 /// it repeats, and a different value closes that live setting.
 fn keys_match(left: &str, right: &str) -> bool {
+    let left = fold_key(left);
+    let right = fold_key(right);
     if left == right {
         return true;
     }
-    let left_stem = key_stem(left);
-    let right_stem = key_stem(right);
+    let left_stem = key_stem(&left);
+    let right_stem = key_stem(&right);
     !left_stem.is_empty() && left_stem == right_stem
+}
+
+/// The key stored on a new slot: trimmed and lower case.
+fn fold_key(key: &str) -> String {
+    key.trim().to_lowercase()
 }
 
 fn key_stem(key: &str) -> Vec<String> {
@@ -1139,6 +1264,7 @@ fn key_stem(key: &str) -> Vec<String> {
 }
 
 fn preferred_key(incoming: &str, slots: &[Value]) -> String {
+    let incoming = fold_key(incoming);
     let mut matches: Vec<&str> = slots
         .iter()
         .filter_map(|slot| {
@@ -1149,17 +1275,19 @@ fn preferred_key(incoming: &str, slots: &[Value]) -> String {
                 return None;
             }
             let key = slot_str(slot, "key")?;
-            keys_match(incoming, key).then_some(key)
+            keys_match(&incoming, key).then_some(key)
         })
         .collect();
-    if matches.contains(&incoming) {
-        return incoming.to_string();
+    // An exact key, or the same key with different case, is stored folded.
+    // A longer family member is rewritten onto the shortest live key.
+    if matches.iter().any(|key| fold_key(key) == incoming) {
+        return incoming;
     }
     matches.sort_by(|left, right| left.len().cmp(&right.len()).then(left.cmp(right)));
     matches
         .first()
         .map(|key| (*key).to_string())
-        .unwrap_or_else(|| incoming.to_string())
+        .unwrap_or(incoming)
 }
 
 fn supersede_target(slot: &Value, fact: &Fact) -> bool {
@@ -1182,15 +1310,39 @@ fn considered_same_slot(slot: &Value, fact: &Fact) -> bool {
     slot_live(slot)
         && slot_str(slot, "status") == Some("considered")
         && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
-        && slot_str(slot, "key") == Some(fact.key.as_str())
+        && slot_key_matches(slot, fact)
         && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name)
 }
 
 fn same_decided_slot(slot: &Value, fact: &Fact) -> bool {
     slot_str(slot, "status") == Some("decided")
         && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
-        && slot_str(slot, "key") == Some(fact.key.as_str())
+        && slot_key_matches(slot, fact)
         && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name)
+}
+
+/// A rejected setting must name the same key. Other slot predicates match on
+/// the predicate and the value.
+fn rejected_key_ok(slot: &Value, fact: &Fact) -> bool {
+    fact.predicate != Predicate::Setting || slot_key_matches(slot, fact)
+}
+
+/// Literal `replaces` closes only the single-valued slots.
+fn literal_slot_ok(slot: &Value) -> bool {
+    slot_str(slot, "predicate")
+        .and_then(Predicate::parse)
+        .is_some_and(single_valued)
+}
+
+fn slot_key_matches(slot: &Value, fact: &Fact) -> bool {
+    let key = slot_str(slot, "key").unwrap_or("");
+    if fact.predicate == Predicate::Setting {
+        keys_match(key, &fact.key)
+    } else if single_valued(fact.predicate) {
+        fold_key(key) == fold_key(&fact.key)
+    } else {
+        key == fact.key
+    }
 }
 
 fn same_decided_edge(edge: &StoredEdge, fact: &Fact, object_id: &str) -> bool {
@@ -1212,30 +1364,61 @@ fn status_is(edge: &StoredEdge, allowed: &[&str]) -> bool {
 }
 
 fn values_equal(left: &str, right: &str) -> bool {
-    normalise(left) == normalise(right)
+    fold_value(left) == fold_value(right)
 }
 
-/// Whole value, one path segment, or a contiguous token run.
+/// Lower case, with whitespace collapsed. `-`, `+`, `#`, `.` and `/` stay,
+/// so a sign, a version dot and a path separator still distinguish values.
+/// Any other punctuation becomes whitespace.
+fn fold_value(value: &str) -> String {
+    let mut folded = String::new();
+    let mut spaced = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            spaced = true;
+            continue;
+        }
+        if ch.is_alphanumeric() || matches!(ch, '-' | '+' | '#' | '.' | '/') {
+            if spaced && !folded.is_empty() {
+                folded.push(' ');
+            }
+            spaced = false;
+            for lower in ch.to_lowercase() {
+                folded.push(lower);
+            }
+        } else {
+            spaced = true;
+        }
+    }
+    folded
+}
+
+/// Whole folded value, one whole path segment, or a contiguous run of two
+/// or more tokens. One token is not a substring and not a token inside a
+/// longer value: `json` matches a value that is `json`, and a path segment
+/// `json`, and does not match `JSON logs`.
 fn literal_matches(value: &str, replaces: &str) -> bool {
-    let needle = normalise(replaces);
+    let needle = fold_value(replaces);
     if needle.is_empty() {
         return false;
     }
-    if normalise(value) == needle {
+    if fold_value(value) == needle {
         return true;
     }
     if value
         .split(['/', '\\'])
-        .any(|segment| normalise(segment) == needle)
+        .any(|segment| fold_value(segment) == needle)
     {
         return true;
     }
-    let value_tokens = alphanumeric_runs(value);
     let needle_tokens = alphanumeric_runs(replaces);
-    !needle_tokens.is_empty()
-        && value_tokens
-            .windows(needle_tokens.len())
-            .any(|window| window == needle_tokens.as_slice())
+    if needle_tokens.len() < 2 {
+        return false;
+    }
+    let value_tokens = alphanumeric_runs(value);
+    value_tokens
+        .windows(needle_tokens.len())
+        .any(|window| window == needle_tokens.as_slice())
 }
 
 fn slot_live(slot: &Value) -> bool {
@@ -1297,10 +1480,58 @@ fn stored_kind(attributes: &Value) -> Option<Kind> {
 
 fn same_slot(slot: &Value, fact: &Fact) -> bool {
     let live = slot.get("valid_until").is_none_or(Value::is_null);
-    live && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
-        && slot_str(slot, "key") == Some(fact.key.as_str())
+    if !(live
+        && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
+        && slot_str(slot, "status") == Some(fact.status.as_str()))
+    {
+        return false;
+    }
+    // A single-valued slot reinforces when the folded values agree. A rule,
+    // a preference or release contents stays exact, so two wordings remain
+    // two facts.
+    if single_valued(fact.predicate) {
+        return slot_key_matches(slot, fact)
+            && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name);
+    }
+    slot_str(slot, "key") == Some(fact.key.as_str())
         && slot_str(slot, "value") == Some(fact.object_name.as_str())
-        && slot_str(slot, "status") == Some(fact.status.as_str())
+}
+
+struct Closed {
+    predicate: String,
+    key: String,
+    old_value: String,
+}
+
+fn closed_of(slot: &Value, fact: &Fact) -> Closed {
+    Closed {
+        predicate: slot_str(slot, "predicate")
+            .unwrap_or(fact.predicate.as_str())
+            .to_string(),
+        key: slot_str(slot, "key").unwrap_or("").to_string(),
+        old_value: slot_str(slot, "value").unwrap_or("").to_string(),
+    }
+}
+
+async fn refresh_catalog(tx: &Transaction<Db>, catalog: &mut Catalog) -> Result<(), GraphError> {
+    let ids: Vec<String> = catalog.by_id.keys().cloned().collect();
+    for id in ids {
+        let mut response = tx
+            .query("SELECT attributes FROM type::record($id)")
+            .bind(("id", id.clone()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let Some(row) = rows.into_iter().next() else {
+            continue;
+        };
+        let attributes = row
+            .get("attributes")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        catalog.set_attributes(&id, attributes);
+    }
+    Ok(())
 }
 
 fn reinforce_slot(
@@ -1935,6 +2166,8 @@ mod tests {
                 date,
                 turns,
                 conflict_budget: budget,
+                valid_until: session_midnight(date),
+                on_conflict: None,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -2499,6 +2732,537 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert!(slot_named(&slots, "port", "8080")["valid_until"].is_null());
         assert!(slots.iter().all(|slot| slot["value"] != "8765"));
+    }
+
+    #[test]
+    fn folded_values_keep_sign_version_and_path_marks() {
+        assert_eq!(
+            session_midnight("2026-04-11").as_deref(),
+            Some("2026-04-11T00:00:00Z")
+        );
+        assert_eq!(
+            session_midnight("2026-04-11T15:04:05Z").as_deref(),
+            Some("2026-04-11T00:00:00Z")
+        );
+        assert_eq!(session_midnight("2026-04-11 10:00"), None);
+        assert_eq!(session_midnight(""), None);
+        assert_eq!(session_midnight("2026-02-29"), None);
+        assert_eq!(
+            session_midnight("2024-02-29").as_deref(),
+            Some("2024-02-29T00:00:00Z")
+        );
+
+        assert!(values_equal("true", "True"));
+        assert!(values_equal("Port", "port"));
+        assert!(!values_equal("1", "-1"));
+        assert!(!values_equal("c", "c++"));
+        assert!(!values_equal("v1.2", "v12"));
+        assert!(keys_match("Port", "port"));
+        assert!(keys_match("port", "port_value_setting"));
+        assert!(!keys_match("storage", "tag_storage"));
+        assert!(!keys_match("port", "serve_port"));
+
+        // One token matches the whole value or one path segment, not a token
+        // inside a longer value. Two tokens still match a contiguous run.
+        assert!(literal_matches("json", "json"));
+        assert!(literal_matches("dir/json/file", "json"));
+        assert!(literal_matches("~/.local/share/x/shelf.json", "shelf.json"));
+        assert!(!literal_matches("Errors are returned as JSON", "json"));
+        assert!(!literal_matches("JSON logs", "json"));
+        assert!(!literal_matches("json lines", "json"));
+        assert!(literal_matches("please drop shelf json now", "shelf json"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_setting_keeps_a_different_key_with_the_same_value() {
+        let (_tmp, gm) = open_store().await;
+        let part = Fact {
+            subject_name: "worker".into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: None,
+            key: String::new(),
+            object_name: "app".into(),
+            object_kind: Some(Kind::Project),
+            status: "decided".into(),
+            turn: 1,
+            quote: "worker is part of app".into(),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        };
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                project_setting("app", Kind::Project, "cache_enabled", "true", "decided", 1),
+                project_setting("app", Kind::Project, "debug", "true", "decided", 2),
+                project_setting("worker", Kind::Component, "debug", "true", "decided", 3),
+                part,
+            ],
+        )
+        .await
+        .unwrap();
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[project_setting(
+                "app",
+                Kind::Project,
+                "debug",
+                "true",
+                "rejected",
+                1,
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.retirements.len(), 2, "{:?}", stats.retirements);
+        assert!(stats.retirements.iter().all(|item| {
+            item.reason == "rejected" && item.key == "debug" && item.old_value == "true"
+        }));
+        assert!(stats.retirements.iter().any(|item| item.subject == "app"));
+        assert!(stats
+            .retirements
+            .iter()
+            .any(|item| item.subject == "worker"));
+        let app = slots_of(&gm, "app").await;
+        let worker = slots_of(&gm, "worker").await;
+        assert!(slot_named(&app, "cache_enabled", "true")["valid_until"].is_null());
+        assert_eq!(slot_named(&app, "debug", "true")["ended_by"], "s2:rejected");
+        assert_eq!(
+            slot_named(&worker, "debug", "true")["ended_by"],
+            "s2:rejected"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn one_word_replaces_does_not_close_rules_or_preferences() {
+        let (_tmp, gm) = open_store().await;
+        let mut rule = project_setting(
+            "app",
+            Kind::Project,
+            "",
+            "Errors are returned as JSON",
+            "decided",
+            1,
+        );
+        rule.predicate = Predicate::Rule;
+        let mut prefers = project_setting("app", Kind::Project, "", "JSON logs", "decided", 2);
+        prefers.predicate = Predicate::Prefers;
+        let mut exact_rule = project_setting("app", Kind::Project, "", "json", "decided", 3);
+        exact_rule.predicate = Predicate::Rule;
+        let mut contents = project_setting("app", Kind::Project, "", "json", "decided", 4);
+        contents.predicate = Predicate::ReleaseContents;
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                rule,
+                prefers,
+                exact_rule,
+                contents,
+                project_setting("app", Kind::Project, "log_format", "json", "decided", 5),
+                project_setting("app", Kind::Project, "detail", "json lines", "decided", 6),
+            ],
+        )
+        .await
+        .unwrap();
+        let turns = [Turn {
+            index: 4,
+            role: TurnRole::User,
+            text: "uses SQLite replaces json".into(),
+        }];
+        let mut fact = uses_named("app", Kind::Project, "SQLite", "decided", "json", 4);
+        fact.quote = turns[0].text.clone();
+        let stats = write_turns(&gm, "s2", "2026-04-11", &turns, &[fact], None)
+            .await
+            .unwrap();
+        // A one-word needle closes a setting when the whole folded value is
+        // that word. `log_format=json` closes for that reason. `json lines`
+        // only contains the token, so it stays. A rule, a preference and
+        // release contents stay even when the value is exactly `json`.
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].predicate, "setting");
+        assert_eq!(stats.retirements[0].key, "log_format");
+        assert_eq!(stats.retirements[0].old_value, "json");
+        let slots = app_slots(&gm).await;
+        assert!(!slot_named(&slots, "log_format", "json")["valid_until"].is_null());
+        assert!(slot_named(&slots, "detail", "json lines")["valid_until"].is_null());
+        for predicate in ["rule", "prefers", "release_contents"] {
+            let live = slots
+                .iter()
+                .any(|slot| slot["predicate"] == predicate && slot["valid_until"].is_null());
+            assert!(live, "{predicate} closed: {slots:?}");
+        }
+        assert!(slots.iter().any(|slot| {
+            slot["predicate"] == "rule"
+                && slot["value"] == "Errors are returned as JSON"
+                && slot["valid_until"].is_null()
+        }));
+        assert!(slots.iter().any(|slot| {
+            slot["predicate"] == "prefers"
+                && slot["value"] == "JSON logs"
+                && slot["valid_until"].is_null()
+        }));
+        assert!(slots.iter().any(|slot| {
+            slot["predicate"] == "rule" && slot["value"] == "json" && slot["valid_until"].is_null()
+        }));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn bad_session_date_skips_retirements_and_still_writes() {
+        for date in ["2026-04-11 10:00", ""] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[
+                    decided_slot("port", "8080", 1),
+                    uses_named("app", Kind::Project, "requests", "decided", "", 2),
+                ],
+            )
+            .await
+            .unwrap();
+            let facts = [
+                decided_slot("port", "8765", 1),
+                uses_named("app", Kind::Project, "requests", "rejected", "", 2),
+            ];
+            let stats = write_turns(&gm, "s2", date, &[], &facts, None)
+                .await
+                .unwrap();
+            assert!(
+                stats.retirements.is_empty(),
+                "{date}: {:?}",
+                stats.retirements
+            );
+            assert!(
+                stats.retirements_skipped >= 2,
+                "{date}: skipped {}",
+                stats.retirements_skipped
+            );
+            assert!(stats.slots >= 1, "{date}");
+            let slots = app_slots(&gm).await;
+            assert!(slot_named(&slots, "port", "8080")["valid_until"].is_null());
+            assert!(slot_named(&slots, "port", "8765")["valid_until"].is_null());
+            assert!(
+                closed_uses(&gm, "decided").await.is_empty(),
+                "{date}: the edge was retired"
+            );
+            write_turns(&gm, "s2", date, &[], &facts, None)
+                .await
+                .expect("a bad date fails the same way on retry");
+            assert!(slot_named(&app_slots(&gm).await, "port", "8080")["valid_until"].is_null());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn case_variants_reinforce_and_marked_values_stay_different() {
+        let (_tmp, gm) = open_store().await;
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                decided_slot("enabled", "true", 1),
+                decided_slot("Port", "keep", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        let folded = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                decided_slot("enabled", "True", 1),
+                decided_slot("port", "keep", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(folded.reinforced, 2, "{:?}", folded.retirements);
+        assert!(folded.retirements.is_empty());
+        let slots = app_slots(&gm).await;
+        let enabled: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot["key"] == "enabled" && slot["valid_until"].is_null())
+            .collect();
+        assert_eq!(enabled.len(), 1, "{slots:?}");
+        assert_eq!(enabled[0]["value"], "true");
+        assert_eq!(enabled[0]["evidence"].as_array().unwrap().len(), 2);
+        let ports: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot["key"] == "port" && slot["value"] == "keep")
+            .collect();
+        assert_eq!(ports.len(), 1, "{slots:?}");
+        assert!(slots.iter().all(|slot| slot["key"] != "Port"));
+
+        write_session(
+            &gm,
+            "s3",
+            "2026-05-01",
+            &[
+                decided_slot("num", "1", 1),
+                decided_slot("lang", "c", 2),
+                decided_slot("ver", "v1.2", 3),
+            ],
+        )
+        .await
+        .unwrap();
+        let distinct = write_session(
+            &gm,
+            "s4",
+            "2026-05-02",
+            &[
+                decided_slot("num", "-1", 1),
+                decided_slot("lang", "c++", 2),
+                decided_slot("ver", "v12", 3),
+            ],
+        )
+        .await
+        .unwrap();
+        // `1`/`-1`, `c`/`c++` and `v1.2`/`v12` are different values, so the
+        // later write supersedes. A fold that dropped the sign, the pluses
+        // or the dot would reinforce instead.
+        assert_eq!(distinct.reinforced, 0);
+        assert_eq!(distinct.retirements.len(), 3, "{:?}", distinct.retirements);
+        let slots = app_slots(&gm).await;
+        assert_eq!(slot_named(&slots, "num", "1")["ended_by"], "s4:superseded");
+        assert!(slot_named(&slots, "num", "-1")["valid_until"].is_null());
+        assert_eq!(slot_named(&slots, "lang", "c")["ended_by"], "s4:superseded");
+        assert!(slot_named(&slots, "lang", "c++")["valid_until"].is_null());
+        assert_eq!(
+            slot_named(&slots, "ver", "v1.2")["ended_by"],
+            "s4:superseded"
+        );
+        assert!(slot_named(&slots, "ver", "v12")["valid_until"].is_null());
+    }
+
+    /// Another writer commits a slot after attempt 1 rolls back. Attempt 2
+    /// re-reads the entity inside its transaction and keeps that slot.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn retry_rereads_attributes_committed_between_attempts() {
+        let (_tmp, gm) = open_store().await;
+        write_session(&gm, "s1", "2026-04-03", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        let budget = AtomicU32::new(1);
+        let hook = InsertOwner;
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let date = "2026-04-11";
+        let ctx = WriteCtx {
+            llm: &llm,
+            project: &project,
+            session_id: "s2",
+            date,
+            turns: &[],
+            conflict_budget: &budget,
+            valid_until: session_midnight(date),
+            on_conflict: Some(&hook),
+        };
+        let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
+            .await
+            .unwrap();
+        assert_eq!(stats.slots, 1);
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+        let slots = app_slots(&gm).await;
+        assert!(slot_named(&slots, "port", "8080")["valid_until"].is_null());
+        assert!(slot_named(&slots, "theme", "dark")["valid_until"].is_null());
+        assert!(
+            slot_named(&slots, "owner", "ada")["valid_until"].is_null(),
+            "the slot written between attempts was overwritten: {slots:?}"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn live_edge_lookup_is_a_graph_scan_of_one_subject() {
+        let (_tmp, gm) = open_store().await;
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("app", Kind::Project, "redis", "decided", "", 1),
+                uses_named("other", Kind::Project, "postgres", "decided", "", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let app = entities.iter().find(|entity| entity.name == "app").unwrap();
+        let app_id = app.id_string();
+        let mut response = gm
+            .db()
+            .query(LIVE_EDGES_OF)
+            .bind(("id", app_id.clone()))
+            .await
+            .unwrap();
+        let rows: Vec<StoredEdge> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let all = crud::list_all_relationships(gm.db()).await.unwrap();
+        assert_eq!(all.len(), 2, "the store holds an unrelated edge");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the lookup returned unrelated edges: {rows:?}"
+        );
+        assert_eq!(rows[0].rel_type, "uses");
+
+        let plan = explain_full(gm.db(), LIVE_EDGES_OF, &app_id).await;
+        assert!(
+            plan_has_operator(&plan, "GraphEdgeScan"),
+            "live edges must be a graph-edge scan. Plan: {plan}"
+        );
+        assert!(
+            !plan_has_operator(&plan, "TableScan"),
+            "live edges scanned the table. Plan: {plan}"
+        );
+        let plan = explain_full(gm.db(), SCOPE_PART_OF, &app_id).await;
+        assert!(
+            plan_has_operator(&plan, "GraphEdgeScan"),
+            "scope must be a graph-edge scan. Plan: {plan}"
+        );
+        assert!(
+            !plan_has_operator(&plan, "TableScan"),
+            "scope scanned the table. Plan: {plan}"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn explain_full(
+        db: &surrealdb::Surreal<crate::graph::store::Db>,
+        sql: &str,
+        id: &str,
+    ) -> Value {
+        let mut response = db
+            .query(format!("{sql} EXPLAIN FULL"))
+            .bind(("id", id.to_string()))
+            .await
+            .expect("explain");
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).expect("plan");
+        Value::Array(rows)
+    }
+
+    fn plan_has_operator(node: &Value, operator: &str) -> bool {
+        match node {
+            Value::Array(items) => items.iter().any(|item| plan_has_operator(item, operator)),
+            Value::Object(map) => {
+                map.get("operator").and_then(Value::as_str) == Some(operator)
+                    || map.values().any(|value| plan_has_operator(value, operator))
+            }
+            _ => false,
+        }
+    }
+
+    fn project_setting(
+        subject: &str,
+        kind: Kind,
+        key: &str,
+        value: &str,
+        status: &str,
+        turn: usize,
+    ) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: kind,
+            predicate: Predicate::Setting,
+            role: None,
+            key: key.into(),
+            object_name: value.into(),
+            object_kind: None,
+            status: status.into(),
+            turn,
+            quote: format!("{subject} {key} is {value}"),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    struct InsertOwner;
+
+    #[cfg(feature = "embedded")]
+    impl ConflictHook for InsertOwner {
+        fn between_attempts<'a>(
+            &'a self,
+            gm: &'a GraphMemory,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphError>> + Send + 'a>>
+        {
+            Box::pin(async move { self.insert(gm).await })
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    impl InsertOwner {
+        async fn insert(&self, gm: &GraphMemory) -> Result<(), GraphError> {
+            let entities = crud::list_entities(gm.db(), None).await?;
+            let app = entities
+                .iter()
+                .find(|entity| entity.name == "app")
+                .expect("app");
+            let mut attributes = app.attributes.clone().unwrap_or_else(|| json!({}));
+            let v2 = attributes
+                .get_mut("v2")
+                .and_then(Value::as_object_mut)
+                .expect("v2");
+            let slots = v2
+                .get_mut("slots")
+                .and_then(Value::as_array_mut)
+                .expect("slots");
+            slots.push(json!({
+                "predicate": "setting",
+                "key": "owner",
+                "value": "ada",
+                "status": "decided",
+                "valid_from": "2026-04-10",
+                "valid_until": Value::Null,
+                "ended_by": Value::Null,
+                "alpha": 1.0,
+                "beta": 1.0,
+                "self_reinforcements": 0,
+                "evidence": [{
+                    "session": "other",
+                    "turn": 0,
+                    "quote": "owner is ada",
+                    "role": "user"
+                }]
+            }));
+            gm.db()
+                .query("UPDATE type::record($id) SET attributes = $attributes")
+                .bind(("id", app.id_string()))
+                .bind(("attributes", attributes))
+                .await?
+                .check()?;
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn slots_of(gm: &GraphMemory, name: &str) -> Vec<Value> {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        entity.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap()
+            .clone()
     }
 
     #[cfg(feature = "embedded")]

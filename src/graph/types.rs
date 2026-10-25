@@ -764,12 +764,17 @@ pub struct RejectedMatch {
 ///
 /// `reason` is `superseded`, `rejected`, `replaced`, or `promoted`.
 /// `old_value` is the record that was closed. `new_value` is the fact that
-/// closed it, empty when a rejection names no replacement.
+/// closed it, empty when a rejection names no replacement. `key` is the
+/// setting key that was closed, empty for an edge and for a slot that has
+/// none, so two retirements of one value stay distinguishable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retirement {
     pub reason: String,
     pub subject: String,
     pub predicate: String,
+    /// Absent in reports written before this field existed.
+    #[serde(default)]
+    pub key: String,
     pub old_value: String,
     pub new_value: String,
 }
