@@ -31,7 +31,7 @@ use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
 use super::input::{ProjectIdentity, Turn};
 use super::resolve::{self, MentionDraft};
-use super::schema::{normalise, Fact, Kind, Predicate};
+use super::schema::{key_is_empty, normalise, Fact, Kind, Predicate};
 
 /// Production writes never fail a commit on purpose.
 pub(crate) static NO_CONFLICTS: AtomicU32 = AtomicU32::new(0);
@@ -1323,9 +1323,14 @@ fn is_calendar_day(year: i32, month: u32, day: u32) -> bool {
 /// the listed affixes are the same non-empty list.
 ///
 /// `port` and `port_value_setting` match. `storage` and `tag_storage` do not:
-/// sharing a token is not a family. A new key is rewritten onto the live key
-/// it repeats, and a different value closes that live setting.
+/// sharing a token is not a family. An empty key matches nothing, including
+/// another empty key: a shared empty slot is not a replacement. A new usable
+/// key is rewritten onto the live key it repeats, and a different value
+/// closes that live setting.
 fn keys_match(left: &str, right: &str) -> bool {
+    if key_is_empty(left) || key_is_empty(right) {
+        return false;
+    }
     let left = fold_key(left);
     let right = fold_key(right);
     if left == right {
@@ -1386,7 +1391,13 @@ fn supersede_target(slot: &Value, fact: &Fact) -> bool {
         return false;
     }
     if fact.predicate == Predicate::Setting {
-        return keys_match(slot_str(slot, "key").unwrap_or(""), &fact.key);
+        let slot_key = slot_str(slot, "key").unwrap_or("");
+        // No usable key on either side: store the new fact and leave the old
+        // one active. A named `replaces` is a separate path.
+        if key_is_empty(slot_key) || key_is_empty(&fact.key) {
+            return false;
+        }
+        return keys_match(slot_key, &fact.key);
     }
     true
 }
@@ -1422,8 +1433,14 @@ fn literal_slot_ok(slot: &Value) -> bool {
 fn slot_key_matches(slot: &Value, fact: &Fact) -> bool {
     let key = slot_str(slot, "key").unwrap_or("");
     if fact.predicate == Predicate::Setting {
-        keys_match(key, &fact.key)
-    } else if single_valued(fact.predicate) {
+        // Supersede refuses an empty key. The same stored key is still one
+        // fact, so a repeat reinforces and a rejection closes that value only.
+        if key_is_empty(key) || key_is_empty(&fact.key) {
+            return fold_key(key) == fold_key(&fact.key);
+        }
+        return keys_match(key, &fact.key);
+    }
+    if single_valued(fact.predicate) {
         fold_key(key) == fold_key(&fact.key)
     } else {
         key == fact.key
@@ -2489,6 +2506,161 @@ mod tests {
         assert!((live["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
     }
 
+    /// Two settings with no usable key and different values both stay active.
+    ///
+    /// The stored fallback, a blank key, and whitespace are the same emptiness
+    /// decision. A keyed setting written beside them is not retired either.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn keyless_settings_with_different_values_both_stay_active() {
+        let (_tmp, gm) = open_store().await;
+        let fallback = crate::graph::v2::schema::canon_key("");
+        assert!(crate::graph::v2::schema::key_is_empty(&fallback));
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                decided_slot(&fallback, "north", 1),
+                decided_slot("", "east", 2),
+                decided_slot("   ", "west", 3),
+                decided_slot("port", "8080", 4),
+            ],
+        )
+        .await
+        .unwrap();
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                decided_slot(&fallback, "south", 1),
+                decided_slot("", "inland", 2),
+                decided_slot("   ", "upland", 3),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = app_slots(&gm).await;
+        for (key, value) in [
+            (fallback.as_str(), "north"),
+            (fallback.as_str(), "south"),
+            ("", "east"),
+            ("", "west"),
+            ("", "inland"),
+            ("", "upland"),
+            ("port", "8080"),
+        ] {
+            assert!(
+                slot_named(&slots, key, value)["valid_until"].is_null(),
+                "{key}={value} retired: {slots:?}"
+            );
+        }
+    }
+
+    /// An explicit `replaces` still retires a key-less setting. The shared
+    /// empty slot does not.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn keyless_setting_with_explicit_replaces_retires_the_named_value() {
+        let (_tmp, gm) = open_store().await;
+        let fallback = crate::graph::v2::schema::canon_key("");
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                decided_slot(&fallback, "north", 1),
+                decided_slot("", "east", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        let turns = [Turn {
+            index: 1,
+            role: TurnRole::User,
+            text: "drop north for south, and drop east for inland".into(),
+        }];
+        let mut south = decided_slot(&fallback, "south", 1);
+        south.replaces = "north".into();
+        south.quote = turns[0].text.clone();
+        let mut inland = decided_slot("", "inland", 1);
+        inland.replaces = "east".into();
+        inland.quote = turns[0].text.clone();
+        let stats = write_turns(&gm, "s2", "2026-04-11", &turns, &[south, inland], None)
+            .await
+            .unwrap();
+        assert_eq!(stats.retirements.len(), 2, "{:?}", stats.retirements);
+        assert!(stats
+            .retirements
+            .iter()
+            .all(|item| item.reason == "replaced"));
+        let slots = app_slots(&gm).await;
+        assert_eq!(
+            slot_named(&slots, &fallback, "north")["ended_by"],
+            "s2:replaced"
+        );
+        assert!(slot_named(&slots, &fallback, "south")["valid_until"].is_null());
+        assert_eq!(slot_named(&slots, "", "east")["ended_by"], "s2:replaced");
+        assert!(slot_named(&slots, "", "inland")["valid_until"].is_null());
+    }
+
+    /// Keyed settings still retire the previous value of that key.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn keyed_settings_retire_a_changed_value() {
+        let (_tmp, gm) = open_store().await;
+        let fallback = crate::graph::v2::schema::canon_key("");
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                decided_slot("port", "8080", 1),
+                decided_slot("formatter", "tabs", 2),
+                decided_slot(&fallback, "north", 3),
+            ],
+        )
+        .await
+        .unwrap();
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                decided_slot("port", "8765", 1),
+                decided_slot("formatter", "spaces", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.retirements.len(), 2, "{:?}", stats.retirements);
+        assert!(stats
+            .retirements
+            .iter()
+            .all(|item| item.reason == "superseded"));
+        let mut retired_keys: Vec<&str> = stats
+            .retirements
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect();
+        retired_keys.sort_unstable();
+        assert_eq!(retired_keys, ["formatter", "port"]);
+        let slots = app_slots(&gm).await;
+        assert_eq!(
+            slot_named(&slots, "port", "8080")["ended_by"],
+            "s2:superseded"
+        );
+        assert!(slot_named(&slots, "port", "8765")["valid_until"].is_null());
+        assert_eq!(
+            slot_named(&slots, "formatter", "tabs")["ended_by"],
+            "s2:superseded"
+        );
+        assert!(slot_named(&slots, "formatter", "spaces")["valid_until"].is_null());
+        assert!(slot_named(&slots, &fallback, "north")["valid_until"].is_null());
+    }
+
     #[cfg(feature = "embedded")]
     #[tokio::test]
     async fn key_family_match_retires_sibling_key() {
@@ -2991,8 +3163,14 @@ mod tests {
         assert!(!values_equal("v1.2", "v12"));
         assert!(keys_match("Port", "port"));
         assert!(keys_match("port", "port_value_setting"));
+        assert!(keys_match("formatter", "formatter"));
         assert!(!keys_match("storage", "tag_storage"));
         assert!(!keys_match("port", "serve_port"));
+        assert!(!keys_match("value", "value"));
+        assert!(!keys_match("", ""));
+        assert!(!keys_match("   ", "value"));
+        assert!(!keys_match("value", "port"));
+        assert!(!keys_match("formatter", ""));
 
         // One token matches the whole value or one path segment, not a token
         // inside a longer value. Two tokens still match a contiguous run.

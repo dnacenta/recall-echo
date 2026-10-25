@@ -434,9 +434,36 @@ fn literal_shape() -> Option<&'static Regex> {
         .as_ref()
 }
 
+/// Stored fallback when a setting key names nothing.
+///
+/// Matching must not treat this as a real key. [`key_is_empty`] is that check.
+const KEY_FALLBACK: &str = "value";
+
 /// Lower snake case; one listed prefix and one listed suffix, when a remainder exists.
+///
+/// Empty text, whitespace, and the literal fallback `value` store as [`KEY_FALLBACK`].
+/// That stored form is not a slot name.
 #[must_use]
 pub(crate) fn canon_key(raw: &str) -> String {
+    let named = named_key(raw);
+    if named.is_empty() {
+        KEY_FALLBACK.to_string()
+    } else {
+        named
+    }
+}
+
+/// `true` when `raw` has no usable setting name.
+///
+/// Empty text, whitespace, and the literal fallback `value` are empty, including
+/// a key [`canon_key`] reduces to that fallback. This is the only emptiness check.
+#[must_use]
+pub(crate) fn key_is_empty(raw: &str) -> bool {
+    named_key(raw).is_empty()
+}
+
+/// Affixes peeled. Empty when nothing usable remains, so the fallback is not a name.
+fn named_key(raw: &str) -> String {
     let snake = to_snake(raw);
     let without_prefix = strip_one(&snake, &["default_", "current_", "new_"], Strip::Prefix);
     let without_suffix = strip_one(
@@ -444,8 +471,8 @@ pub(crate) fn canon_key(raw: &str) -> String {
         &["_value", "_number", "_setting", "_used"],
         Strip::Suffix,
     );
-    if without_suffix.is_empty() {
-        "value".to_string()
+    if without_suffix.is_empty() || without_suffix == KEY_FALLBACK {
+        String::new()
     } else {
         without_suffix
     }
@@ -843,8 +870,19 @@ mod tests {
         assert_eq!(super::canon_key("formatter_used"), "formatter");
         assert_eq!(super::canon_key("Default_Port_Setting"), "port");
         assert_eq!(super::canon_key(""), "value");
+        assert_eq!(super::canon_key("   "), "value");
+        assert_eq!(super::canon_key("value"), "value");
+        assert_eq!(super::canon_key("Value"), "value");
+        assert_eq!(super::canon_key("default_value"), "value");
         assert_eq!(super::canon_key("default_"), "default");
         assert_eq!(super::canon_key("port_value_number"), "port_value");
+        for raw in ["", "   ", "\t", "value", "Value", "VALUE", "default_value"] {
+            assert!(super::key_is_empty(raw), "{raw}");
+        }
+        assert!(!super::key_is_empty("port"));
+        assert!(!super::key_is_empty("formatter"));
+        assert!(!super::key_is_empty("port_value"));
+        assert!(!super::key_is_empty("default_"));
     }
 
     #[test]

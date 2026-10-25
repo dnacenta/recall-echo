@@ -2031,30 +2031,32 @@ mod tests {
         assert_eq!(store.names, vec!["deploy".to_string()]);
         assert_eq!(store.slots, 3, "slots {:?}", store.slot_keys);
         assert!(store.slot_keys.iter().all(|key| key == "value"));
-        // Supersede closes pine when oak is written. The reject of birch is a
-        // no-op: the rejected slot is stored and is not a live record. The
-        // contradict claim is still a reinforcement, because the scripted
+        // The host facts have no setting key, so oak is stored and pine stays
+        // active. That supersede is a missed retirement. The reject of birch
+        // is a no-op: the rejected slot is stored and is not a live record.
+        // The contradict claim is still a reinforcement, because the scripted
         // extractor emits the decided value again, so that step stays a
         // contradict miss and the extra reinforcement stays the corroborate
         // false positive. The assistant restatement adds the assistant weight
         // (0.3) and one tally. That is the v2 speaker fit, so the assistant
-        // step is a true positive beside the user corroboration, with no
-        // further miss or false positive.
+        // step is a true positive beside the user corroboration.
         assert_eq!(report.operations.create, counted(1, 0, 0));
         assert_eq!(report.operations.corroborate, counted(2, 1, 0));
-        assert_eq!(report.operations.supersede, counted(1, 0, 0));
+        assert_eq!(report.operations.supersede, counted(0, 0, 1));
         assert_eq!(report.operations.contradict, counted(0, 0, 1));
         assert_eq!(report.operations.no_op, counted(2, 0, 0));
         assert_eq!(report.operations.removed, counted(0, 0, 0));
         assert_eq!(report.operations.revived, counted(0, 0, 0));
-        assert!(
-            report.wrong_facts.is_empty(),
-            "wrong facts {:?}",
-            report.wrong_facts
+        assert_eq!(
+            report.wrong_facts,
+            vec![grade::WrongFact {
+                fact: "deploy-host".into(),
+                reason: grade::WrongReason::StillLive,
+            }]
         );
         assert!(report.junk_edges.is_empty(), "{:?}", report.junk_edges);
-        assert!(report.questions[0].graph_hit);
-        assert!(!report.questions[1].graph_hit);
+        assert!(!report.questions[0].graph_hit);
+        assert!(report.questions[1].graph_hit);
         assert!(
             report.sessions.iter().all(|session| {
                 let Some(timing) = session.timing else {
