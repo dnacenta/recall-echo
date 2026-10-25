@@ -35,6 +35,10 @@ pub const DEFAULT_WEIGHT_EXTERNAL: f64 = 1.0;
 /// Default evidence weight of an observation authored by the human.
 pub const DEFAULT_WEIGHT_USER: f64 = 0.8;
 
+/// Default evidence weight of an assistant turn. Between the human and a
+/// later restatement of the same belief.
+pub const DEFAULT_WEIGHT_ASSISTANT: f64 = 0.3;
+
 /// Default evidence weight of the agent restating itself.
 pub const DEFAULT_WEIGHT_SELF: f64 = 0.05;
 
@@ -80,8 +84,8 @@ impl std::str::FromStr for ExtractionContext {
 // Who authored the text an observation came from. Recorded at write time
 // because it cannot be recovered afterwards: nothing in a store of unlabelled
 // episodes distinguishes an independent report from the agent restating
-// itself. Collapsing three classes into two at scoring time is always
-// possible; splitting one class back into three is not.
+// itself. Collapsing four classes into fewer at scoring time is always
+// possible; splitting one class back into four is not.
 
 /// The authorship class of an episode, and of every confidence-moving
 /// observation drawn from it.
@@ -93,9 +97,13 @@ pub enum Provenance {
     External,
     /// Statements authored by the human in conversation.
     User,
+    /// A turn the assistant wrote. Distinct from a later restatement of a
+    /// belief the store already holds.
+    Assistant,
     /// The agent's own summaries, reflections and re-assertions — and the
     /// default for anything unlabelled, so unknown evidence never earns full
-    /// weight.
+    /// weight. Pipeline v2 also uses this for a fact that is not quotable
+    /// from one turn.
     #[default]
     #[serde(rename = "self")]
     SelfGenerated,
@@ -121,6 +129,7 @@ impl Provenance {
         match self {
             Self::External => "external",
             Self::User => "user",
+            Self::Assistant => "assistant",
             Self::SelfGenerated => "self",
         }
     }
@@ -133,6 +142,7 @@ impl std::str::FromStr for Provenance {
         match s.trim().to_lowercase().as_str() {
             "external" | "document" => Ok(Self::External),
             "user" | "human" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
             "self" | "agent" | "self-generated" => Ok(Self::SelfGenerated),
             other => Err(format!("unknown provenance: {other}")),
         }
@@ -161,6 +171,8 @@ pub struct ProvenanceWeights {
     pub weight_external: f64,
     /// Weight of a [`Provenance::User`] observation. Default `0.8`.
     pub weight_user: f64,
+    /// Weight of a [`Provenance::Assistant`] observation. Default `0.3`.
+    pub weight_assistant: f64,
     /// Weight of a [`Provenance::SelfGenerated`] observation. Default `0.05`.
     pub weight_self: f64,
 }
@@ -170,6 +182,7 @@ impl Default for ProvenanceWeights {
         Self {
             weight_external: DEFAULT_WEIGHT_EXTERNAL,
             weight_user: DEFAULT_WEIGHT_USER,
+            weight_assistant: DEFAULT_WEIGHT_ASSISTANT,
             weight_self: DEFAULT_WEIGHT_SELF,
         }
     }
@@ -186,6 +199,7 @@ impl ProvenanceWeights {
         Self {
             weight_external: weight,
             weight_user: weight,
+            weight_assistant: weight,
             weight_self: weight,
         }
     }
@@ -196,6 +210,7 @@ impl ProvenanceWeights {
         match provenance {
             Provenance::External => self.weight_external,
             Provenance::User => self.weight_user,
+            Provenance::Assistant => self.weight_assistant,
             Provenance::SelfGenerated => self.weight_self,
         }
     }
@@ -400,7 +415,12 @@ impl EdgeEvidence {
     pub fn corroborate(&mut self, provenance: Provenance, weights: &ProvenanceWeights) {
         self.evidence
             .corroborate(weights.for_provenance(provenance));
-        if provenance == Provenance::SelfGenerated {
+        // Assistant text and an inferred fact are both authored by the agent.
+        // The human and an external source are not.
+        if matches!(
+            provenance,
+            Provenance::Assistant | Provenance::SelfGenerated
+        ) {
             self.self_reinforcements += 1;
         }
     }
@@ -658,8 +678,13 @@ mod tests {
             weights.for_provenance(Provenance::SelfGenerated),
             DEFAULT_WEIGHT_SELF
         ));
+        assert!(approx_eq(
+            weights.for_provenance(Provenance::Assistant),
+            DEFAULT_WEIGHT_ASSISTANT
+        ));
         assert!(weights.weight_external > weights.weight_user);
-        assert!(weights.weight_user > weights.weight_self);
+        assert!(weights.weight_user > weights.weight_assistant);
+        assert!(weights.weight_assistant > weights.weight_self);
     }
 
     #[test]
@@ -668,6 +693,7 @@ mod tests {
         for provenance in [
             Provenance::External,
             Provenance::User,
+            Provenance::Assistant,
             Provenance::SelfGenerated,
         ] {
             assert_eq!(
@@ -690,7 +716,76 @@ mod tests {
 
         assert_eq!(Provenance::External.to_string(), "external");
         assert_eq!(Provenance::User.to_string(), "user");
+        assert_eq!(Provenance::Assistant.to_string(), "assistant");
         assert_eq!(Provenance::SelfGenerated.to_string(), "self");
+    }
+
+    #[test]
+    fn assistant_weight_and_tally() {
+        let weights = ProvenanceWeights::default();
+        assert!(approx_eq(weights.weight_assistant, 0.3));
+        let mut edge = EdgeEvidence::new(Evidence::from_prior(0.6), 0);
+        edge.corroborate(Provenance::Assistant, &weights);
+        assert!(approx_eq(edge.evidence().alpha(), 6.3));
+        assert!(approx_eq(edge.evidence().beta(), 4.0));
+        assert_eq!(edge.self_reinforcements(), 1);
+        edge.corroborate(Provenance::User, &weights);
+        assert_eq!(edge.self_reinforcements(), 1);
+        assert!(approx_eq(
+            edge.evidence().alpha(),
+            6.3 + DEFAULT_WEIGHT_USER
+        ));
+    }
+
+    #[test]
+    fn assistant_round_trips_and_unknown_is_self() {
+        assert_eq!(
+            Provenance::from_stored(Some("assistant")),
+            Provenance::Assistant
+        );
+        assert_eq!(
+            "assistant".parse::<Provenance>().unwrap(),
+            Provenance::Assistant
+        );
+        assert_eq!(
+            serde_json::to_string(&Provenance::Assistant).unwrap(),
+            "\"assistant\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Provenance>("\"assistant\"").unwrap(),
+            Provenance::Assistant
+        );
+        assert_eq!(
+            Provenance::from_stored(Some("nope")),
+            Provenance::SelfGenerated
+        );
+        // The previous release had no assistant class. Its parser is copied
+        // here so a store written by this build still reads as self there.
+        assert_eq!(
+            legacy_from_stored(Some("assistant")),
+            Provenance::SelfGenerated
+        );
+        assert_eq!(legacy_from_stored(Some("user")), Provenance::User);
+        assert_eq!(legacy_from_stored(None), Provenance::SelfGenerated);
+
+        let weights: ProvenanceWeights =
+            serde_json::from_str(r#"{"weight_user":0.8,"weight_self":0.05}"#).unwrap();
+        assert!(approx_eq(
+            weights.weight_assistant,
+            DEFAULT_WEIGHT_ASSISTANT
+        ));
+        assert!(approx_eq(weights.weight_external, DEFAULT_WEIGHT_EXTERNAL));
+    }
+
+    /// `from_stored` as it shipped before `assistant` was a class.
+    fn legacy_from_stored(stored: Option<&str>) -> Provenance {
+        let parsed = stored.and_then(|raw| match raw.trim().to_lowercase().as_str() {
+            "external" | "document" => Some(Provenance::External),
+            "user" | "human" => Some(Provenance::User),
+            "self" | "agent" | "self-generated" => Some(Provenance::SelfGenerated),
+            _ => None,
+        });
+        parsed.unwrap_or(Provenance::SelfGenerated)
     }
 
     #[test]
@@ -712,6 +807,7 @@ mod tests {
         for (provenance, wire) in [
             (Provenance::External, "\"external\""),
             (Provenance::User, "\"user\""),
+            (Provenance::Assistant, "\"assistant\""),
             (Provenance::SelfGenerated, "\"self\""),
         ] {
             assert_eq!(serde_json::to_string(&provenance).unwrap(), wire);

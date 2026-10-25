@@ -12,14 +12,17 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use super::super::confidence::Provenance;
 use super::super::types::EntityType;
-use super::input::{ProjectIdentity, Turn, TurnRole};
+use super::input::{ProjectIdentity, TurnRole};
 
 /// Why a candidate was not written. Stable names, counted on the report.
 pub(crate) const DROP_REJECTED: &str = "rejected";
 pub(crate) const DROP_GENERIC: &str = "generic_object";
 pub(crate) const DROP_CONFIDENCE: &str = "low_confidence";
 pub(crate) const DROP_QUOTE: &str = "quote";
+pub(crate) const DROP_VALUE_SUPPORT: &str = "value_support";
+pub(crate) const DROP_KEY_BINDING: &str = "key_binding";
 pub(crate) const DROP_VERSION: &str = "bad_version";
 pub(crate) const DROP_PARSE: &str = "parse";
 pub(crate) const DROP_TOO_LONG: &str = "too_long";
@@ -33,9 +36,6 @@ const MIN_CONFIDENCE: f64 = 0.6;
 const MAX_OBJECT_CHARS: usize = 300;
 /// Facts, bugs or releases past this in one section are not stored.
 pub(crate) const MAX_ITEMS: usize = 200;
-/// A quote shorter than this is not a verbatim span. The prompt asks for
-/// 3–20 words and does not set a character floor.
-const MIN_QUOTE_NON_WS: usize = 8;
 
 /// The six kinds v2 stores. Each one maps onto an existing [`EntityType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -256,7 +256,9 @@ pub(crate) struct Fact {
     pub turn: usize,
     pub quote: String,
     pub confidence: f64,
-    pub provenance: TurnRole,
+    /// Who the verified quote is credited to. A fact that is not quotable
+    /// from one turn is [`Provenance::SelfGenerated`].
+    pub provenance: Provenance,
     /// The value this fact replaces, when the model named one. Empty when
     /// it does not. A name that appears only here is not an entity.
     pub replaces: String,
@@ -412,7 +414,10 @@ fn finish(mention: Mention) -> Fact {
         turn: mention.turn,
         quote: mention.quote,
         confidence: mention.confidence,
-        provenance: mention.provenance,
+        provenance: match mention.provenance {
+            TurnRole::User => Provenance::User,
+            TurnRole::Assistant => Provenance::Assistant,
+        },
         replaces: String::new(),
     }
 }
@@ -634,47 +639,6 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Keep the quote when it is an exact substring of the cited turn.
-///
-/// A quote that is missing there is re-cited onto another turn of the same
-/// speaker. The speaker is not changed: a quote that exists only in the other
-/// speaker's turn is ungrounded.
-pub(crate) fn recite(fact: &mut Fact, turns: &[Turn]) -> Result<(), &'static str> {
-    // `str::contains("")` is true, and a one-word quote is a substring of
-    // nearly every turn. Both are ungrounded.
-    if quote_non_ws(&fact.quote) < MIN_QUOTE_NON_WS {
-        return Err(DROP_QUOTE);
-    }
-    if quote_in(fact.turn, &fact.quote, turns)
-        && turns
-            .iter()
-            .any(|turn| turn.index == fact.turn && turn.role == fact.provenance)
-    {
-        return Ok(());
-    }
-    if let Some(turn) = turns
-        .iter()
-        .find(|turn| turn.role == fact.provenance && turn.text.contains(&fact.quote))
-    {
-        fact.turn = turn.index;
-        return Ok(());
-    }
-    Err(DROP_QUOTE)
-}
-
-fn quote_non_ws(quote: &str) -> usize {
-    quote.chars().filter(|ch| !ch.is_whitespace()).count()
-}
-
-fn quote_in(index: usize, quote: &str, turns: &[Turn]) -> bool {
-    if quote.is_empty() {
-        return false;
-    }
-    turns
-        .iter()
-        .any(|turn| turn.index == index && turn.text.contains(quote))
-}
-
 /// Version with one leading `v` removed. It must contain a digit and occur
 /// in the cited turn. The stored release is `<project> v<version>`.
 pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Option<String> {
@@ -865,55 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn recite_keeps_the_speaker_and_rejects_a_short_quote() {
-        let turns = vec![
-            Turn {
-                index: 0,
-                role: TurnRole::User,
-                text: "Ship the shelf today.".into(),
-            },
-            Turn {
-                index: 1,
-                role: TurnRole::Assistant,
-                text: "Port 9000 is chosen.".into(),
-            },
-            Turn {
-                index: 2,
-                role: TurnRole::User,
-                text: "The chosen port is nine thousand.".into(),
-            },
-        ];
-        let mut cross = fact_at(0, TurnRole::User, "Port 9000 is chosen.");
-        assert_eq!(recite(&mut cross, &turns).unwrap_err(), DROP_QUOTE);
-
-        let mut same = fact_at(0, TurnRole::User, "The chosen port is nine thousand.");
-        recite(&mut same, &turns).unwrap();
-        assert_eq!(same.turn, 2);
-        assert_eq!(same.provenance, TurnRole::User);
-
-        let mut short = fact_at(1, TurnRole::Assistant, "Port");
-        assert_eq!(recite(&mut short, &turns).unwrap_err(), DROP_QUOTE);
-    }
-
-    fn fact_at(turn: usize, role: TurnRole, quote: &str) -> Fact {
-        Fact {
-            subject_name: "tidepool".into(),
-            subject_kind: Kind::Project,
-            predicate: Predicate::Setting,
-            role: None,
-            key: "port".into(),
-            object_name: "9000".into(),
-            object_kind: None,
-            status: "decided".into(),
-            turn,
-            quote: quote.into(),
-            confidence: 0.9,
-            provenance: role,
-            replaces: String::new(),
-        }
-    }
-
-    #[test]
     fn canon_key() {
         assert_eq!(super::canon_key("Port"), "port");
         assert_eq!(super::canon_key("Go Version"), "go_version");
@@ -1011,7 +926,7 @@ mod tests {
             turn: 0,
             quote: "quote".into(),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         }
     }

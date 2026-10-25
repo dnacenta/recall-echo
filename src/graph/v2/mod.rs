@@ -8,6 +8,7 @@
 //! writes edges and slots through a closed schema. The two never share a store:
 //! v2 stamps `meta:pipeline` and refuses a store it did not build.
 
+pub(crate) mod ground;
 pub(crate) mod input;
 pub(crate) mod pass1;
 pub(crate) mod resolve;

@@ -41,6 +41,7 @@ max_candidates = 3            # existing entities compared per candidate
 [graph.provenance]
 weight_external = 1.0         # independent sources
 weight_user = 0.8             # the human, and `graph correct --wrong`
+weight_assistant = 0.3        # an assistant turn
 weight_self = 0.05            # the agent restating its own belief
 
 [serve]

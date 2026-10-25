@@ -96,7 +96,8 @@ pub async fn run(
         .iter()
         .map(|question| keyword_hit(&memory_dir, &question.text, &question.answer))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut report = grade::grade(script, &sessions, &weights, &keyword_hits, label)?;
+    let mut report =
+        grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
     report.setup_millis = setup_millis;
     Ok(report)
 }
@@ -511,6 +512,7 @@ async fn snapshot(
     // Names live on the entity records, not on the edge. The same lookup the
     // inspect path uses keeps a dangling id visible instead of dropping it.
     let relationships = crate::graph::crud::list_all_relationships(gm.db()).await?;
+    let edge_evidence = edge_evidence(gm).await?;
     let mut names = crate::graph::edge_view::NameCache::new();
     let mut edges = Vec::with_capacity(relationships.len());
     for relationship in &relationships {
@@ -520,6 +522,7 @@ async fn snapshot(
         let id = relationship.id_string();
         let beta = evidence.beta();
         let prior_alpha = starting_alpha(&id, beta, first_beta);
+        let (assistant_steps, self_steps) = corroboration_steps(edge_evidence.get(&id));
         edges.push(ObservedEdge {
             id,
             subject: names.name_of(gm.db(), &from_id).await?,
@@ -530,6 +533,8 @@ async fn snapshot(
             beta,
             self_reinforcements: relationship.self_reinforcements.unwrap_or(0).max(0),
             prior_alpha,
+            assistant_steps,
+            self_steps,
         });
     }
     // Slots are the literal facts. Rejected rows stay in the store and out of
@@ -585,6 +590,7 @@ async fn snapshot(
             let until = slot.get("valid_until");
             let live = until
                 .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty));
+            let (assistant_steps, self_steps) = corroboration_steps(slot.get("evidence"));
             edges.push(ObservedEdge {
                 id,
                 subject: entity.name.clone(),
@@ -595,6 +601,8 @@ async fn snapshot(
                 beta,
                 self_reinforcements: json_i64(slot.get("self_reinforcements")).max(0),
                 prior_alpha,
+                assistant_steps,
+                self_steps,
             });
         }
     }
@@ -633,7 +641,54 @@ fn json_i64(value: Option<&serde_json::Value>) -> i64 {
         .unwrap_or(0)
 }
 
-/// α the edge was created at. β at first sight is the prior's β.
+/// Agent-authored corroborations after the creating sighting.
+///
+/// The first evidence item is the create. It does not move α, so it is not
+/// a step. Missing evidence leaves both counts at zero and the grader treats
+/// the whole tally as the self class.
+fn corroboration_steps(evidence: Option<&serde_json::Value>) -> (u32, u32) {
+    let Some(items) = evidence.and_then(serde_json::Value::as_array) else {
+        return (0, 0);
+    };
+    let mut assistant = 0u32;
+    let mut inferred = 0u32;
+    for item in items.iter().skip(1) {
+        match item.get("role").and_then(serde_json::Value::as_str) {
+            Some("assistant") => assistant += 1,
+            Some("self") => inferred += 1,
+            _ => {}
+        }
+    }
+    (assistant, inferred)
+}
+
+async fn edge_evidence(
+    gm: &GraphMemory,
+) -> Result<HashMap<String, serde_json::Value>, RecallError> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: serde_json::Value,
+        #[serde(default)]
+        evidence: Option<serde_json::Value>,
+    }
+    let mut response = gm
+        .db()
+        .query("SELECT id, evidence FROM relates_to")
+        .await
+        .map_err(crate::graph::error::GraphError::from)?;
+    let rows: Vec<Row> = crate::graph::deserialize_take(&mut response, 0)?;
+    let mut by_id = HashMap::new();
+    for row in rows {
+        let Some(evidence) = row.evidence else {
+            continue;
+        };
+        by_id.insert(crate::graph::edge_view::record_id(&row.id), evidence);
+    }
+    Ok(by_id)
+}
+
+/// α the record was created at. β at first sight is the class prior's β, so
+/// this is the creating α for every provenance class.
 fn starting_alpha(id: &str, beta: f64, first_beta: &mut HashMap<String, f64>) -> f64 {
     let beta_first = match first_beta.get(id) {
         Some(seen) => *seen,
@@ -1845,17 +1900,29 @@ mod tests {
             .sum();
         let kept: u32 = report.sessions.iter().map(|session| session.kept).sum();
         assert_eq!(candidates, 46);
-        assert_eq!(kept, 46);
-        assert!(report
-            .sessions
-            .iter()
-            .all(|session| session.drops.is_empty()));
+        // 14 candidates fail outright. A component that is the project name
+        // is the project fallback, so those affects edges stay and are not
+        // counted as drops.
+        assert_eq!(kept, 32);
+        let mut drops: HashMap<&str, u32> = HashMap::new();
+        for session in &report.sessions {
+            for (reason, count) in &session.drops {
+                *drops.entry(reason.as_str()).or_insert(0) += count;
+            }
+        }
+        assert_eq!(drops.get("value_support").copied(), Some(12));
+        assert_eq!(drops.get("key_binding").copied(), Some(2));
+        assert_eq!(drops.len(), 2, "{drops:?}");
         let patterns = report.patterns.expect("linkshelf carries match blocks");
         assert_eq!(patterns.pairs, 6);
+        // A pair retires only when both facts were kept. The replacements
+        // whose values or keys failed the gate leave the old fact in place.
         assert_eq!(
-            patterns.retired.count, 6,
-            "retired {:?}",
-            patterns.retired.ids
+            patterns.retired.ids,
+            ["F04->F14", "F09->F15", "F10->F22"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             patterns.premature.count, 0,
@@ -1864,14 +1931,14 @@ mod tests {
         );
 
         let store = v2_store(tmp.path()).await;
-        assert_eq!(store.edges, 6, "edges {:?}", store.edge_types);
+        assert_eq!(store.edges, 4, "edges {:?}", store.edge_types);
         assert_eq!(
             store
                 .edge_types
                 .iter()
                 .filter(|rel| rel.as_str() == "affects")
                 .count(),
-            4,
+            2,
             "{:?}",
             store.edge_types
         );
@@ -1893,8 +1960,6 @@ mod tests {
         assert_eq!(
             store.names,
             vec![
-                "concurrent add".to_string(),
-                "export timestamps".to_string(),
                 "fetch encoding".to_string(),
                 "linkshelf".to_string(),
                 "linkshelf v0.2.0".to_string(),
@@ -1910,7 +1975,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(store.slots, 60, "slots {:?}", store.slot_predicates);
+        assert_eq!(store.slots, 39, "slots {:?}", store.slot_predicates);
         let pred = |name: &str| {
             store
                 .slot_predicates
@@ -1918,17 +1983,16 @@ mod tests {
                 .filter(|item| item.as_str() == name)
                 .count()
         };
-        // 20 setting facts, plus rule/decision/feature/reason and the two
-        // release rows that are process notes rather than a version.
-        assert_eq!(pred("setting"), 20);
-        assert_eq!(pred("rule"), 16);
-        // Each bug writes symptom, cause and status. The later fix writes
-        // the fix and a second status value. Both status rows remain; the
-        // earlier one is closed on the session date.
-        assert_eq!(pred("issue_symptom"), 4);
-        assert_eq!(pred("issue_cause"), 4);
-        assert_eq!(pred("issue_fix"), 4);
-        assert_eq!(pred("issue_status"), 8);
+        // A dot inside a file name does not end the binding sentence, so the
+        // migration setting is kept. Rules are unchanged.
+        assert_eq!(pred("setting"), 15);
+        assert_eq!(pred("rule"), 12);
+        // A bug whose symptom is not in the cited turn is dropped whole.
+        // A kept bug whose component is the project keeps the fallback edge.
+        assert_eq!(pred("issue_symptom"), 2);
+        assert_eq!(pred("issue_cause"), 2);
+        assert_eq!(pred("issue_fix"), 1);
+        assert_eq!(pred("issue_status"), 3);
         assert_eq!(pred("release_status"), 2);
         assert_eq!(pred("release_contents"), 2);
     }
@@ -1964,7 +2028,12 @@ mod tests {
         // Supersede closes pine when oak is written. The reject of birch is a
         // no-op: the rejected slot is stored and is not a live record. The
         // contradict claim is still a reinforcement, because the scripted
-        // extractor emits the decided value again.
+        // extractor emits the decided value again, so that step stays a
+        // contradict miss and the extra reinforcement stays the corroborate
+        // false positive. The assistant restatement adds the assistant weight
+        // (0.3) and one tally. That is the v2 speaker fit, so the assistant
+        // step is a true positive beside the user corroboration, with no
+        // further miss or false positive.
         assert_eq!(report.operations.create, counted(1, 0, 0));
         assert_eq!(report.operations.corroborate, counted(2, 1, 0));
         assert_eq!(report.operations.supersede, counted(1, 0, 0));

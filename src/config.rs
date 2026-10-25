@@ -673,8 +673,8 @@ pub struct GraphSection {
     /// Evidence weights per provenance class.
     ///
     /// Maps to the `[graph.provenance]` section of `.recall-echo.toml`. When
-    /// absent, defaults are 1.0 external / 0.8 user / 0.05 self. See
-    /// [`ProvenanceWeights`] for details.
+    /// absent, defaults are 1.0 external / 0.8 user / 0.3 assistant / 0.05 self.
+    /// See [`ProvenanceWeights`] for details.
     #[serde(default)]
     pub provenance: ProvenanceWeights,
     /// Similarity bands that decide when entity dedup pays for a model call.
@@ -1210,6 +1210,10 @@ impl Config {
             }
             "graph.provenance.weight_user" => {
                 self.graph_section().provenance.weight_user = parse_weight(value)?;
+                Ok(())
+            }
+            "graph.provenance.weight_assistant" => {
+                self.graph_section().provenance.weight_assistant = parse_weight(value)?;
                 Ok(())
             }
             "graph.provenance.weight_self" => {
@@ -1877,6 +1881,7 @@ mod tests {
         assert_eq!(section.provenance, defaults);
         assert!((defaults.weight_external - 1.0).abs() < f64::EPSILON);
         assert!((defaults.weight_user - 0.8).abs() < f64::EPSILON);
+        assert!((defaults.weight_assistant - 0.3).abs() < f64::EPSILON);
         assert!((defaults.weight_self - 0.05).abs() < f64::EPSILON);
     }
 
@@ -1888,6 +1893,7 @@ mod tests {
         assert!((provenance.weight_self - 0.5).abs() < f64::EPSILON);
         assert!((provenance.weight_external - 1.0).abs() < f64::EPSILON);
         assert!((provenance.weight_user - 0.8).abs() < f64::EPSILON);
+        assert!((provenance.weight_assistant - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1895,6 +1901,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_key("graph.provenance.weight_self", "0.2").unwrap();
         cfg.set_key("graph.provenance.weight_user", "0").unwrap();
+        cfg.set_key("graph.provenance.weight_assistant", "0.4")
+            .unwrap();
         cfg.set_key("graph.provenance.weight_external", "1.5")
             .unwrap();
 
@@ -1905,10 +1913,30 @@ mod tests {
             .provenance;
         assert!((provenance.weight_self - 0.2).abs() < f64::EPSILON);
         assert!(provenance.weight_user.abs() < f64::EPSILON);
+        assert!((provenance.weight_assistant - 0.4).abs() < f64::EPSILON);
         assert!((provenance.weight_external - 1.5).abs() < f64::EPSILON);
 
         assert!(cfg.set_key("graph.provenance.weight_self", "-1").is_err());
         assert!(cfg.set_key("graph.provenance.weight_self", "lots").is_err());
+    }
+
+    #[test]
+    fn weight_assistant_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.set_key("graph.provenance.weight_assistant", "0.4")
+            .unwrap();
+        let rendered = toml::to_string_pretty(&cfg).expect("render");
+        assert!(rendered.contains("weight_assistant"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse");
+        let provenance = parsed.graph.expect("graph section survives").provenance;
+        assert!((provenance.weight_assistant - 0.4).abs() < f64::EPSILON);
+        assert!((provenance.weight_user - 0.8).abs() < f64::EPSILON);
+        assert!((provenance.weight_self - 0.05).abs() < f64::EPSILON);
+
+        let partial: Config =
+            toml::from_str("[graph.provenance]\nweight_user = 0.8\n").expect("parse");
+        let provenance = partial.graph.expect("graph section").provenance;
+        assert!((provenance.weight_assistant - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

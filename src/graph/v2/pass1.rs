@@ -21,13 +21,15 @@ use super::super::llm::{LlmProvider, TokenUsage};
 use super::super::llm_json::{self, JsonFailure};
 use super::super::types::IngestionReport;
 use super::super::GraphMemory;
+use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
-    affects_target, filter_fact, map_subject, over_long, recite, release_name, remap, Fact, Kind,
-    Mention, Predicate, Role, DROP_CONFIDENCE, DROP_OVERFLOW, DROP_PARSE, DROP_TOO_LONG,
-    DROP_UNRESOLVED, DROP_VERSION, MAX_ITEMS,
+    affects_target, filter_fact, map_subject, over_long, release_name, remap, Fact, Kind, Mention,
+    Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_TOO_LONG,
+    DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
+use crate::graph::Provenance;
 
 /// Pass-1 system prompt. Verbatim, with no trailing newline.
 pub(crate) const PASS1_SYSTEM: &str = r#"You extract durable project memory from a coding-session transcript between a USER and a coding ASSISTANT.
@@ -181,10 +183,11 @@ pub(crate) async fn extract_session(
     report.windows = u32::try_from(windows.len()).unwrap_or(u32::MAX);
     report.chunks_total = report.windows;
 
+    let ground = SessionGround::prepare(&session.turns);
     let mut facts = Vec::new();
     for window in &windows {
         match call_window(llm, &session, window, &mut report).await {
-            Ok(reply) => facts.extend(facts_from_reply(&reply, &session, &mut report)),
+            Ok(reply) => facts.extend(collect_facts(&reply, &session, &ground, &mut report)),
             Err(reason) => {
                 report.errors.push(reason);
                 report.chunks_failed += 1;
@@ -274,9 +277,20 @@ fn parsed_root(text: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
+#[cfg(test)]
 fn facts_from_reply(
     reply: &Map<String, Value>,
     session: &SessionInput,
+    report: &mut IngestionReport,
+) -> Vec<Fact> {
+    let ground = SessionGround::prepare(&session.turns);
+    collect_facts(reply, session, &ground, report)
+}
+
+fn collect_facts(
+    reply: &Map<String, Value>,
+    session: &SessionInput,
+    ground: &SessionGround,
     report: &mut IngestionReport,
 ) -> Vec<Fact> {
     let mut facts = Vec::new();
@@ -290,7 +304,7 @@ fn facts_from_reply(
                 count_drop(report, DROP_OVERFLOW);
                 continue;
             }
-            match accept_item(section, item, session) {
+            match accept_item(section, item, session, ground, report) {
                 Ok(batch) => {
                     report.kept += 1;
                     facts.extend(batch);
@@ -306,21 +320,30 @@ fn accept_item(
     section: &str,
     item: &Value,
     session: &SessionInput,
+    ground: &SessionGround,
+    report: &mut IngestionReport,
 ) -> Result<Vec<Fact>, &'static str> {
     if !element_matches(section, item) {
         return Err(DROP_PARSE);
     }
     let object = item.as_object().ok_or(DROP_PARSE)?;
     match section {
-        "facts" => accept_fact(object, session).map(|fact| vec![fact]),
-        "bugs" => expand_bug(object, session),
-        "releases" => expand_release(object, session),
+        "facts" => accept_fact(object, session, ground).map(|fact| vec![fact]),
+        "bugs" => expand_bug(object, session, ground, report),
+        "releases" => expand_release(object, session, ground, report),
         _ => Err(DROP_PARSE),
     }
 }
 
-fn accept_fact(object: &Map<String, Value>, session: &SessionInput) -> Result<Fact, &'static str> {
-    let mention = mention_from(object, &session.turns)?;
+fn accept_fact(
+    object: &Map<String, Value>,
+    session: &SessionInput,
+    ground: &SessionGround,
+) -> Result<Fact, &'static str> {
+    let cited = cite_object(object, ground)?;
+    let mut mention = mention_from(object, &session.turns)?;
+    mention.turn = cited.turn;
+    mention.provenance = cited.role;
     let mut fact = remap(mention)?;
     fact.replaces = object
         .get("replaces")
@@ -329,8 +352,23 @@ fn accept_fact(object: &Map<String, Value>, session: &SessionInput) -> Result<Fa
         .trim()
         .to_string();
     map_subject(&mut fact, &session.project);
+    let shape = if fact.object_kind.is_some() {
+        ValueShape::Entity
+    } else {
+        ValueShape::Literal
+    };
+    if !ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape) {
+        return Err(DROP_VALUE_SUPPORT);
+    }
+    if fact.predicate == Predicate::Setting
+        && !ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
+    {
+        return Err(DROP_KEY_BINDING);
+    }
+    if !ground.replaces_grounded(&fact.replaces, &fact.status, fact.turn) {
+        fact.replaces.clear();
+    }
     filter_fact(&fact)?;
-    recite(&mut fact, &session.turns)?;
     Ok(fact)
 }
 
@@ -358,7 +396,7 @@ fn mention_from(object: &Map<String, Value>, turns: &[Turn]) -> Result<Mention, 
         object_kind,
         status: text(object, "status")?.to_string(),
         turn,
-        quote: text(object, "quote")?.to_string(),
+        quote: text(object, "quote")?.trim().to_string(),
         confidence: confidence_of(object)?,
         provenance: role_at(turn, turns),
     })
@@ -367,7 +405,10 @@ fn mention_from(object: &Map<String, Value>, turns: &[Turn]) -> Result<Mention, 
 fn expand_bug(
     object: &Map<String, Value>,
     session: &SessionInput,
+    ground: &SessionGround,
+    report: &mut IngestionReport,
 ) -> Result<Vec<Fact>, &'static str> {
+    let cited = cite_object(object, ground)?;
     let confidence = confidence_of(object)?;
     if confidence < 0.6 {
         return Err(DROP_CONFIDENCE);
@@ -381,9 +422,17 @@ fn expand_bug(
     if over_long(symptom) || over_long(cause) || over_long(fix) {
         return Err(DROP_TOO_LONG);
     }
-    let mut carrier = carrier(object, &session.turns, confidence)?;
-    recite(&mut carrier, &session.turns)?;
-    let (target_name, target_kind) = affects_target(text(object, "component")?, &session.project);
+    let mut carrier = carrier(object, confidence, &cited)?;
+    // The symptom is a literal of the cited turn. A number or token it does
+    // not support drops the whole bug.
+    if !ground.supports_value(symptom, carrier.turn, &carrier.quote, ValueShape::Literal) {
+        return Err(DROP_VALUE_SUPPORT);
+    }
+    // Cause and fix are slots of the symptom, the same subject as the symptom slot.
+    carrier.subject_name = symptom.to_string();
+    carrier.subject_kind = Kind::Issue;
+    let component = text(object, "component")?.trim();
+    let (target_name, target_kind) = affects_target(component, &session.project);
     let mut facts = vec![slot_fact(
         symptom,
         Kind::Issue,
@@ -391,43 +440,63 @@ fn expand_bug(
         symptom,
         &carrier,
     )];
-    if !cause.is_empty() {
-        facts.push(slot_fact(
-            symptom,
-            Kind::Issue,
-            Predicate::IssueCause,
-            cause,
-            &carrier,
-        ));
-    }
-    if !fix.is_empty() {
-        facts.push(slot_fact(
-            symptom,
-            Kind::Issue,
-            Predicate::IssueFix,
-            fix,
-            &carrier,
-        ));
-    }
-    // The model's open/fixed/wont_fix is not stored. A fix on the record is
-    // `fixed`; anything else, including a fix that was never stated, is `open`.
-    let status_value = if fix.is_empty() { "open" } else { "fixed" };
-    facts.push(slot_fact(
+    push_field(
+        &mut facts,
+        report,
+        ground,
+        cause,
+        &carrier,
+        Predicate::IssueCause,
+    );
+    push_field(
+        &mut facts,
+        report,
+        ground,
+        fix,
+        &carrier,
+        Predicate::IssueFix,
+    );
+    // The model's open/fixed/wont_fix is not stored. A fix that stayed on the
+    // record is `fixed`; a fix that was never stated, or that failed support,
+    // is not on the record, so the status is `open`.
+    let kept_fix = facts
+        .iter()
+        .any(|fact| fact.predicate == Predicate::IssueFix);
+    let status_value = if kept_fix { "fixed" } else { "open" };
+    facts.push(inferred(slot_fact(
         symptom,
         Kind::Issue,
         Predicate::IssueStatus,
         status_value,
         &carrier,
-    ));
+    )));
     if !target_name.is_empty() {
-        facts.push(edge_fact(
-            symptom,
-            Kind::Issue,
-            Predicate::Affects,
-            &target_name,
-            Some(target_kind),
-            &carrier,
-        ));
+        // A named component is an entity of the cited turn. An empty, generic
+        // or project-name component is the project fallback: that edge is
+        // synthetic, so it is inferred and it is not a drop.
+        if target_kind == Kind::Component {
+            if ground.supports_value(component, carrier.turn, &carrier.quote, ValueShape::Entity) {
+                facts.push(edge_fact(
+                    symptom,
+                    Kind::Issue,
+                    Predicate::Affects,
+                    &target_name,
+                    Some(target_kind),
+                    &carrier,
+                ));
+            } else {
+                count_drop(report, DROP_VALUE_SUPPORT);
+            }
+        } else {
+            facts.push(inferred(edge_fact(
+                symptom,
+                Kind::Issue,
+                Predicate::Affects,
+                &target_name,
+                Some(target_kind),
+                &carrier,
+            )));
+        }
     }
     Ok(facts)
 }
@@ -435,60 +504,98 @@ fn expand_bug(
 fn expand_release(
     object: &Map<String, Value>,
     session: &SessionInput,
+    ground: &SessionGround,
+    report: &mut IngestionReport,
 ) -> Result<Vec<Fact>, &'static str> {
+    let cited = cite_object(object, ground)?;
     let confidence = confidence_of(object)?;
     if confidence < 0.6 {
         return Err(DROP_CONFIDENCE);
     }
-    let mut carrier = carrier(object, &session.turns, confidence)?;
-    recite(&mut carrier, &session.turns)?;
-    let turn_text = session
-        .turns
-        .iter()
-        .find(|turn| turn.index == carrier.turn)
-        .map(|turn| turn.text.as_str())
-        .unwrap_or("");
+    let mut carrier = carrier(object, confidence, &cited)?;
+    let turn_text = ground.turn_text(carrier.turn).unwrap_or("");
     let name = release_name(&session.project.name, text(object, "version")?, turn_text)
         .ok_or(DROP_VERSION)?;
-    let mut facts = vec![slot_fact(
+    let contents = text(object, "contents")?.trim();
+    if over_long(contents) {
+        return Err(DROP_TOO_LONG);
+    }
+    // Status, contents and part_of all belong to the release, not the carrier default.
+    carrier.subject_name = name.clone();
+    carrier.subject_kind = Kind::Release;
+    let mut facts = vec![inferred(slot_fact(
         &name,
         Kind::Release,
         Predicate::ReleaseStatus,
         text(object, "status")?,
         &carrier,
-    )];
-    let contents = text(object, "contents")?.trim();
-    if over_long(contents) {
-        return Err(DROP_TOO_LONG);
-    }
-    if !contents.is_empty() {
-        facts.push(slot_fact(
-            &name,
-            Kind::Release,
-            Predicate::ReleaseContents,
-            contents,
-            &carrier,
-        ));
-    }
+    ))];
+    push_field(
+        &mut facts,
+        report,
+        ground,
+        contents,
+        &carrier,
+        Predicate::ReleaseContents,
+    );
     if !session.project.name.is_empty() {
-        facts.push(edge_fact(
+        facts.push(inferred(edge_fact(
             &name,
             Kind::Release,
             Predicate::PartOf,
             &session.project.name,
             Some(Kind::Project),
             &carrier,
-        ));
+        )));
     }
     Ok(facts)
 }
 
+fn cite_object(
+    object: &Map<String, Value>,
+    ground: &SessionGround,
+) -> Result<super::ground::Cited, &'static str> {
+    ground.cite(turn_of(object)?, text(object, "quote")?)
+}
+
+fn push_field(
+    facts: &mut Vec<Fact>,
+    report: &mut IngestionReport,
+    ground: &SessionGround,
+    value: &str,
+    carrier: &Fact,
+    predicate: Predicate,
+) {
+    if value.is_empty() {
+        return;
+    }
+    let mut fact = slot_fact(
+        &carrier.subject_name,
+        carrier.subject_kind,
+        predicate,
+        value,
+        carrier,
+    );
+    match ground.credit_field(value, carrier.turn, &carrier.quote) {
+        FieldCredit::Turn => facts.push(fact),
+        FieldCredit::Session => {
+            fact.provenance = Provenance::SelfGenerated;
+            facts.push(fact);
+        }
+        FieldCredit::Drop => count_drop(report, DROP_VALUE_SUPPORT),
+    }
+}
+
+fn inferred(mut fact: Fact) -> Fact {
+    fact.provenance = Provenance::SelfGenerated;
+    fact
+}
+
 fn carrier(
     object: &Map<String, Value>,
-    turns: &[Turn],
     confidence: f64,
+    cited: &super::ground::Cited,
 ) -> Result<Fact, &'static str> {
-    let turn = turn_of(object)?;
     Ok(Fact {
         subject_name: String::new(),
         subject_kind: Kind::Issue,
@@ -498,12 +605,19 @@ fn carrier(
         object_name: String::new(),
         object_kind: None,
         status: "decided".to_string(),
-        turn,
-        quote: text(object, "quote")?.to_string(),
+        turn: cited.turn,
+        quote: text(object, "quote")?.trim().to_string(),
         confidence,
-        provenance: role_at(turn, turns),
+        provenance: from_role(cited.role),
         replaces: String::new(),
     })
+}
+
+fn from_role(role: TurnRole) -> Provenance {
+    match role {
+        TurnRole::User => Provenance::User,
+        TurnRole::Assistant => Provenance::Assistant,
+    }
 }
 
 fn slot_fact(subject: &str, kind: Kind, predicate: Predicate, value: &str, carrier: &Fact) -> Fact {
@@ -731,8 +845,10 @@ mod tests {
     use super::*;
     use crate::graph::v2::input::{ProjectIdentity, Turn, TurnRole};
     use crate::graph::v2::schema::{
-        Predicate, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG, MAX_ITEMS,
+        Kind, Predicate, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG, DROP_VALUE_SUPPORT,
+        DROP_VERSION, MAX_ITEMS,
     };
+    use crate::graph::Provenance;
     use serde_json::Value;
 
     fn session(turns: Vec<Turn>) -> SessionInput {
@@ -847,12 +963,14 @@ mod tests {
         let facts = facts_from_reply(&reply, &session(turns()), &mut report);
         assert_eq!(report.candidates, 2);
         assert_eq!(report.kept, 1);
-        assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
-        assert_eq!(facts[0].turn, 0);
-        assert_eq!(facts[0].provenance, TurnRole::User);
+        // 9000 is not in "Ship the shelf.", so that fact fails value support.
+        // The other quote lives in the assistant turn, so it is re-cited.
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_eq!(facts[0].turn, 1);
+        assert_eq!(facts[0].provenance, Provenance::Assistant);
         assert_eq!(facts[0].predicate, Predicate::Setting);
 
-        let mut bare = fact_json(0, "Ship the shelf.");
+        let mut bare = fact_json(1, "Port 9000 is chosen.");
         bare.as_object_mut().expect("object").remove("replaces");
         let reply = serde_json::json!({
             "facts": [bare],
@@ -866,6 +984,7 @@ mod tests {
         assert!(facts[0].replaces.is_empty());
         assert_eq!(facts[0].key, "port");
         assert_eq!(facts[0].object_name, "9000");
+        assert_eq!(facts[0].provenance, Provenance::Assistant);
 
         let mut same_speaker = turns();
         same_speaker.push(Turn {
@@ -873,8 +992,10 @@ mod tests {
             role: TurnRole::User,
             text: "The chosen port is nine thousand.".into(),
         });
+        let mut moved_fact = fact_json(0, "The chosen port is nine thousand.");
+        moved_fact["object"] = Value::String("thousand".into());
         let moved = serde_json::json!({
-            "facts": [fact_json(0, "The chosen port is nine thousand.")],
+            "facts": [moved_fact],
             "bugs": [],
             "releases": []
         });
@@ -886,7 +1007,8 @@ mod tests {
         );
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].turn, 2);
-        assert_eq!(facts[0].provenance, TurnRole::User);
+        assert_eq!(facts[0].provenance, Provenance::User);
+        assert_eq!(facts[0].object_name, "thousand");
 
         let empty = serde_json::json!({
             "facts": [fact_json(0, "")],
@@ -931,9 +1053,9 @@ mod tests {
         });
         let _ = &mut release;
         let mut facts = Vec::new();
-        facts.push(fact_json(0, "Ship the shelf."));
+        facts.push(fact_json(1, "Port 9000 is chosen."));
         for _ in 0..MAX_ITEMS {
-            facts.push(fact_json(0, "Ship the shelf."));
+            facts.push(fact_json(1, "Port 9000 is chosen."));
         }
         let reply = serde_json::json!({
             "facts": [subject, key],
@@ -1009,6 +1131,236 @@ mod tests {
         assert!(facts
             .iter()
             .any(|fact| { fact.predicate == Predicate::PartOf && fact.object_name == "tidepool" }));
+        let contents = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::ReleaseContents)
+            .expect("contents slot");
+        assert_eq!(contents.subject_name, "tidepool v1.4.0");
+        assert_eq!(contents.subject_kind, Kind::Release);
+        // "shelf" is not in the cited turn. It is in another turn, so the
+        // field is kept and the provenance is inferred.
+        assert_eq!(contents.provenance, Provenance::SelfGenerated);
+        assert_eq!(status.provenance, Provenance::SelfGenerated);
+    }
+
+    #[test]
+    fn unsupported_cause_is_dropped_and_the_bug_kept() {
+        let turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "The cache returned stale entries.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "The TTL was ignored in the reader.".into(),
+            },
+        ];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "stale entries",
+                "cause": "the TTL was ignored",
+                "fix": "invented remedy nowhere",
+                "status": "fixed",
+                "component": "cache",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        let symptom = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom");
+        assert_eq!(symptom.provenance, Provenance::User);
+        assert_eq!(symptom.subject_name, "stale entries");
+        let cause = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueCause)
+            .expect("cause");
+        assert_eq!(cause.object_name, "the TTL was ignored");
+        assert_eq!(cause.subject_name, "stale entries");
+        assert_eq!(cause.provenance, Provenance::SelfGenerated);
+        assert!(facts
+            .iter()
+            .all(|fact| fact.predicate != Predicate::IssueFix));
+        let status = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueStatus)
+            .expect("status");
+        assert_eq!(status.object_name, "open");
+        assert_eq!(status.provenance, Provenance::SelfGenerated);
+        let affects = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::Affects)
+            .expect("affects");
+        assert_eq!(affects.object_name, "cache");
+        assert_eq!(affects.provenance, Provenance::User);
+        assert_eq!(affects.subject_kind, Kind::Issue);
+    }
+
+    #[test]
+    fn ungrounded_symptom_number_drops_the_bug() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "server crashes on port 9090 under load",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "cache",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn verbatim_symptom_is_kept() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "stale entries",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "cache",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        let symptom = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom");
+        assert_eq!(symptom.object_name, "stale entries");
+        assert_eq!(symptom.provenance, Provenance::User);
+        let affects = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::Affects)
+            .expect("affects");
+        assert_eq!(affects.object_name, "cache");
+        assert_eq!(affects.object_kind, Some(Kind::Component));
+        assert_eq!(affects.provenance, Provenance::User);
+    }
+
+    #[test]
+    fn bug_without_a_component_keeps_the_project_edge() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        for component in ["", "project", "tidepool"] {
+            let reply = serde_json::json!({
+                "facts": [],
+                "bugs": [{
+                    "symptom": "stale entries",
+                    "cause": "",
+                    "fix": "",
+                    "status": "open",
+                    "component": component,
+                    "turn": 0,
+                    "quote": "The cache returned stale entries.",
+                    "confidence": 0.9
+                }],
+                "releases": []
+            });
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                reply.as_object().expect("object"),
+                &session(turns.clone()),
+                &mut report,
+            );
+            assert_eq!(report.kept, 1, "{component}");
+            assert!(report.drops.is_empty(), "{component} {:?}", report.drops);
+            let affects = facts
+                .iter()
+                .find(|fact| fact.predicate == Predicate::Affects)
+                .unwrap_or_else(|| panic!("affects for {component}"));
+            assert_eq!(affects.object_name, "tidepool");
+            assert_eq!(affects.object_kind, Some(Kind::Project));
+            assert_eq!(affects.provenance, Provenance::SelfGenerated);
+        }
+    }
+
+    #[test]
+    fn ungrounded_component_drops_only_the_edge() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "stale entries",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "payments gateway",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.predicate == Predicate::IssueSymptom));
+        assert!(facts
+            .iter()
+            .all(|fact| fact.predicate != Predicate::Affects));
     }
 
     #[cfg(feature = "embedded")]
@@ -1019,7 +1371,7 @@ mod tests {
         use crate::conversation::ConversationEntry;
         use crate::graph::confidence::{Evidence, ExtractionContext};
 
-        let quote = "the port is nine thousand";
+        let quote = "the port is 9000";
         let padding = "x".repeat(15_000);
         let quoted = format!("{quote}. {padding}");
         let filler = "y".repeat(15_000);
@@ -1064,13 +1416,13 @@ mod tests {
                 _: u32,
             ) -> Result<String, GraphError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                if !user_message.contains("the port is nine thousand") {
+                if !user_message.contains("the port is 9000") {
                     return Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string());
                 }
                 self.hits.fetch_add(1, Ordering::SeqCst);
-                let turn = turn_index_of(user_message, "the port is nine thousand");
+                let turn = turn_index_of(user_message, "the port is 9000");
                 Ok(format!(
-                    r#"{{"facts":[{{"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":{turn},"quote":"the port is nine thousand","confidence":0.9}}],"bugs":[],"releases":[]}}"#
+                    r#"{{"facts":[{{"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":{turn},"quote":"the port is 9000","confidence":0.9}}],"bugs":[],"releases":[]}}"#
                 ))
             }
         }
