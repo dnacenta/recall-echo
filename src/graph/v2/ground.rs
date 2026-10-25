@@ -15,9 +15,10 @@
 //! in transcript order wins when several others contain it.
 //!
 //! A number is a maximal `\d+(\.\d+)*`. A `-` directly before the first digit
-//! is part of that number, unless the hyphen sits between two digits, which is
-//! a range. `8080` does not occur inside `18080`, `0.2` does not occur inside
-//! `0.2.0`, and `-1` does not occur as `1` or inside `3-5`.
+//! is part of that number when the character before the hyphen is absent or
+//! is not alphanumeric. A hyphen after a letter or a digit is a range or an
+//! identifier, not a sign. `8080` does not occur inside `18080`, `0.2` does
+//! not occur inside `0.2.0`, and `-1` does not occur as `1`.
 //!
 //! Content tokens are the normalised tokens that are longer than one character
 //! or are digits, minus the stop list. A token longer than three characters
@@ -392,16 +393,40 @@ fn numbers_in(text: &str) -> Vec<String> {
             index += 1;
             continue;
         }
-        // A hyphen between two digits is a range. A hyphen directly before a
-        // digit, with no digit before the hyphen, is a sign.
-        let signed = index > 0
-            && bytes[index - 1] == b'-'
-            && (index == 1 || !bytes[index - 2].is_ascii_digit());
+        // A hyphen is a sign only when nothing alphanumeric precedes it.
+        // `bug-10` and `3-5` keep the plain numbers. ` -1` and `(-1)` do not.
+        let signed = hyphen_is_sign(text, index);
         let start = if signed { index - 1 } else { index };
         index = end_of_number(bytes, index);
         out.push(text[start..index].to_string());
     }
     out
+}
+
+/// Whether the `-` immediately before this digit is a sign.
+///
+/// The character before the hyphen must be absent or not alphanumeric.
+/// A letter or a digit there is an identifier or a range.
+fn hyphen_is_sign(text: &str, digit_index: usize) -> bool {
+    let bytes = text.as_bytes();
+    if digit_index == 0 || bytes[digit_index - 1] != b'-' {
+        return false;
+    }
+    match char_before(text, digit_index - 1) {
+        None => true,
+        Some(ch) => !ch.is_alphanumeric(),
+    }
+}
+
+fn char_before(text: &str, index: usize) -> Option<char> {
+    if index == 0 {
+        return None;
+    }
+    let mut start = index - 1;
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    text[start..index].chars().next()
 }
 
 fn end_of_number(bytes: &[u8], mut index: usize) -> usize {
@@ -503,10 +528,18 @@ mod tests {
         assert!(!plain.supports_value("-1", 0, "Retries: 1", ValueShape::Literal));
         let signed = ground(&[("Retries: -1 attempt.", TurnRole::User)]);
         assert!(signed.supports_value("-1", 0, "Retries: -1", ValueShape::Literal));
+        let wrapped = ground(&[("Keep the offset (-1) here.", TurnRole::User)]);
+        assert!(wrapped.supports_value("-1", 0, "offset (-1)", ValueShape::Literal));
         let range = ground(&[("Use ports 3-5 today.", TurnRole::User)]);
         assert!(range.supports_value("3", 0, "ports 3-5", ValueShape::Literal));
         assert!(range.supports_value("5", 0, "ports 3-5", ValueShape::Literal));
         assert!(!range.supports_value("-5", 0, "ports 3-5", ValueShape::Literal));
+        let bug = ground(&[("Ship bug-10 today.", TurnRole::User)]);
+        assert!(bug.supports_value("10", 0, "bug-10", ValueShape::Literal));
+        assert!(!bug.supports_value("-10", 0, "bug-10", ValueShape::Literal));
+        let node = ground(&[("Use node-18 here.", TurnRole::User)]);
+        assert!(node.supports_value("18", 0, "node-18", ValueShape::Literal));
+        assert!(!node.supports_value("-18", 0, "node-18", ValueShape::Literal));
     }
 
     #[test]
