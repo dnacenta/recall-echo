@@ -515,6 +515,36 @@ async fn dry_run_writes_nothing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_rebuild_without_a_flag_leaves_a_v1_store_byte_identical() {
+    for configured in [None, Some("v1")] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let memory = dir.path();
+        let before_graph = seed(memory, false).await;
+        if let Some(value) = configured {
+            let path = memory.join(".recall-echo.toml");
+            let text = std::fs::read_to_string(&path).expect("config");
+            std::fs::write(
+                &path,
+                text.replace(
+                    "[graph]\nmode = \"embedded\"\n",
+                    &format!("[graph]\nmode = \"embedded\"\npipeline = \"{value}\"\n"),
+                ),
+            )
+            .expect("config v1");
+        }
+        let mut opts = options(PipelineVersion::V2, false);
+        opts.pipeline = None;
+        let stop = IdleStop::new();
+        let err = rebuild(memory, opts, &stop, Some(&Scripted::answering()))
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains("pipeline v2"), "{err}");
+        assert!(!stop.called());
+        assert_eq!(snapshot(&memory.join("graph")), before_graph);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pipeline_v1_is_refused_before_anything_is_touched() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();

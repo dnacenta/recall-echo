@@ -124,13 +124,19 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
         eprintln!("  Archives        {DIM}not initialized{RESET}");
     }
 
-    // Graph — the flat-file status command deliberately does not open the
-    // store (the daemon may hold it); `graph status` reports real counts.
+    // Graph — counts stay with `graph status` (this command does not take the
+    // store). The pipeline line reads the stamp only when the directory is
+    // already a SurrealKV store, or from a daemon that already holds it.
     let graph_dir = memory.join("graph");
     if graph_dir.exists() {
         eprintln!(
             "  Graph           {DIM}present — run `recall-echo graph status` for counts{RESET}"
         );
+        let pipeline = pipeline_report(&memory);
+        eprintln!("  Pipeline        {}", pipeline.summary);
+        if let Some(warning) = pipeline.warning {
+            issues.push(warning);
+        }
     }
 
     // Issues
@@ -145,6 +151,87 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
     eprintln!();
 
     Ok(())
+}
+
+struct PipelineReport {
+    summary: String,
+    warning: Option<String>,
+}
+
+/// What `status` knows about the stamp without opening the store.
+enum ObservedStamp {
+    /// A daemon read `meta:pipeline` and found a value.
+    Stamped(String),
+    /// A daemon read `meta:pipeline` and found no row.
+    Unstamped,
+    /// Shown as the store label. No mismatch warning.
+    Unknown(String),
+}
+
+/// Configured pipeline beside the store stamp. A missing config counts as v1,
+/// which is what extraction runs. An unstamped store is not a mismatch: v1
+/// has never written the stamp. The stamp comes from a running daemon.
+/// SurrealKV has no read-only open, so a missing daemon is `unknown` and the
+/// store directory is left untouched.
+fn pipeline_report(memory: &Path) -> PipelineReport {
+    let configured = config::load(memory)
+        .graph
+        .and_then(|section| section.pipeline);
+    format_pipeline(configured.as_deref(), observed_stamp(memory))
+}
+
+fn format_pipeline(configured: Option<&str>, observed: ObservedStamp) -> PipelineReport {
+    let configured_label = configured.unwrap_or("unset");
+    let comparable = configured.unwrap_or("v1");
+    let (store_label, warning) = match observed {
+        ObservedStamp::Stamped(stamp) => {
+            let warning = if stamp != comparable {
+                Some(format!(
+                    "pipeline config is {configured_label} but the store is stamped {stamp}"
+                ))
+            } else {
+                None
+            };
+            (stamp, warning)
+        }
+        ObservedStamp::Unstamped => ("unstamped".to_string(), None),
+        ObservedStamp::Unknown(label) => (label, None),
+    };
+    PipelineReport {
+        summary: format!("configured {configured_label}, store {store_label}"),
+        warning,
+    }
+}
+
+fn observed_stamp(memory: &Path) -> ObservedStamp {
+    // `block_on` panics inside a runtime. `status` is a sync command; an
+    // async host gets an unknown stamp instead of a nested-runtime panic.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return ObservedStamp::Unknown("unknown (called from async code)".to_string());
+    }
+    let mode = config::load(memory)
+        .graph
+        .map(|section| section.mode)
+        .unwrap_or_else(|| "embedded".to_string());
+    if mode == "server" {
+        return ObservedStamp::Unknown("unknown (server mode)".to_string());
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => return ObservedStamp::Unknown(format!("unknown ({err})")),
+    };
+    match runtime.block_on(crate::serve_client::daemon_info(memory)) {
+        Ok(None) => ObservedStamp::Unknown("unknown (daemon not running)".to_string()),
+        Ok(Some(info)) => match info.pipeline_stamp {
+            crate::serve::PipelineStamp::Stamped(stamp) => ObservedStamp::Stamped(stamp),
+            crate::serve::PipelineStamp::Unstamped => ObservedStamp::Unstamped,
+            crate::serve::PipelineStamp::Unknown => ObservedStamp::Unknown("unknown".to_string()),
+        },
+        Err(err) => ObservedStamp::Unknown(format!("unknown ({err})")),
+    }
 }
 
 fn count_conversations(dir: &Path) -> (usize, u64) {
@@ -282,5 +369,173 @@ mod tests {
         fs::write(tmp.path().join("notes.md"), "ignore").unwrap();
         let (count, _) = count_conversations(tmp.path());
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn status_warns_when_the_store_stamp_and_the_config_differ() {
+        let report = format_pipeline(Some("v1"), ObservedStamp::Stamped("v2".to_string()));
+        assert!(
+            report.summary.contains("configured v1"),
+            "{}",
+            report.summary
+        );
+        assert!(report.summary.contains("store v2"), "{}", report.summary);
+        let warning = report.warning.expect("mismatch");
+        assert!(warning.contains("config is v1"), "{warning}");
+        assert!(warning.contains("stamped v2"), "{warning}");
+        assert!(format_pipeline(None, ObservedStamp::Unstamped)
+            .warning
+            .is_none());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn status_with_no_daemon_leaves_the_store_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        fs::write(memory.join("MEMORY.md"), "# m\n").unwrap();
+        fs::write(memory.join("EPHEMERAL.md"), "").unwrap();
+        fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\npipeline = \"v1\"\n",
+        )
+        .unwrap();
+        {
+            let gm = crate::graph::GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        }
+        let graph = memory.join("graph");
+        let before = settle_files(&graph).await;
+        let memory_for_report = memory.clone();
+        // A plain thread has no runtime context, which is how `status` runs.
+        let report = std::thread::spawn(move || pipeline_report(&memory_for_report))
+            .join()
+            .unwrap();
+        assert!(
+            report.summary.contains("unknown (daemon not running)"),
+            "{}",
+            report.summary
+        );
+        assert!(report.warning.is_none(), "{:?}", report.warning);
+        assert_eq!(snapshot_files(&graph), before);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn status_from_async_code_does_not_panic_or_open_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("MEMORY.md"), "# m\n").unwrap();
+        fs::write(memory.join("EPHEMERAL.md"), "").unwrap();
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        {
+            let gm = crate::graph::GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        }
+        let graph = memory.join("graph");
+        let before = settle_files(&graph).await;
+        let report = pipeline_report(&memory);
+        assert!(
+            report.summary.contains("unknown (called from async code)"),
+            "{}",
+            report.summary
+        );
+        assert_eq!(snapshot_files(&graph), before);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn status_does_not_create_a_store_to_read_the_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        let graph = memory.join("graph");
+        fs::create_dir_all(graph.join("surreal")).unwrap();
+        let before: Vec<_> = walk_files(&graph);
+        let report = pipeline_report(&memory);
+        assert!(
+            report.summary.contains("unknown (daemon not running)"),
+            "{}",
+            report.summary
+        );
+        assert!(report.warning.is_none(), "{:?}", report.warning);
+        assert_eq!(walk_files(&graph), before);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn snapshot_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if path.is_dir() {
+                    out.push((name, Vec::new()));
+                    walk(root, &path, out);
+                } else {
+                    out.push((name, fs::read(&path).unwrap()));
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn settle_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut previous = snapshot_files(root);
+        let mut stable = 0u32;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let current = snapshot_files(root);
+            if current == previous {
+                stable += 1;
+                if stable == 4 {
+                    return current;
+                }
+            } else {
+                stable = 0;
+                previous = current;
+            }
+        }
+        panic!("store at {} did not settle", root.display());
+    }
+
+    #[cfg(feature = "embedded")]
+    fn walk_files(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+                if path.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out
     }
 }

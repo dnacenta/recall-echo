@@ -67,6 +67,11 @@ pub async fn sync_vigil_signals(
         return Ok(report);
     }
 
+    if let Some(message) = super::v2::v1_sync_block(gm, "vigil sync").await? {
+        report.errors.push(message);
+        return Ok(report);
+    }
+
     // Get existing measurements to dedup by timestamp
     let existing = get_vigil_entities(gm, "measurement").await?;
     let existing_timestamps: Vec<String> = existing
@@ -153,6 +158,11 @@ pub async fn sync_outcomes(
     let outcomes: Vec<OutcomeRecord> = serde_json::from_str(&content).map_err(GraphError::Json)?;
 
     if outcomes.is_empty() {
+        return Ok(report);
+    }
+
+    if let Some(message) = super::v2::v1_sync_block(gm, "vigil sync").await? {
+        report.errors.push(message);
         return Ok(report);
     }
 
@@ -313,5 +323,37 @@ fn format_signal_abstract(signals: &Signals, trigger: &str) -> String {
             parts.join(", "),
             trigger
         )
+    }
+}
+
+#[cfg(all(test, feature = "embedded"))]
+mod tests {
+    #[tokio::test]
+    async fn a_v2_store_skips_vigil_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signals = tmp.path().join("signals.json");
+        std::fs::write(
+            &signals,
+            r#"[{"timestamp":"2026-03-01T00:00:00Z","trigger":"turn","signals":{"vocabulary_diversity":0.5}}]"#,
+        )
+        .unwrap();
+        let outcomes = tmp.path().join("outcomes.json");
+        std::fs::write(&outcomes, "[]").unwrap();
+        let gm = super::super::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        super::super::v2::ensure_v2_store(&gm).await.unwrap();
+        let report = super::sync_vigil(&gm, &signals, &outcomes).await.unwrap();
+        assert_eq!(report.measurements_created, 0);
+        assert_eq!(report.relationships_created, 0);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.contains("stamped pipeline v2")),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(gm.stats().await.unwrap().entity_count, 0);
     }
 }

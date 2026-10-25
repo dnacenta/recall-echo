@@ -42,4 +42,10 @@ pub enum GraphError {
 
     #[error("schema migration: {0}")]
     Migration(String),
+
+    /// A v1 write met a store stamped for the other pipeline.
+    ///
+    /// The text is the whole message: callers match this variant, not the wording.
+    #[error("{0}")]
+    PipelineRefused(&'static str),
 }

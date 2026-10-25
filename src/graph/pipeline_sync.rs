@@ -31,6 +31,11 @@ pub async fn sync_pipeline(
         return Ok(report);
     }
 
+    if let Some(message) = super::v2::v1_sync_block(gm, "pipeline sync").await? {
+        report.errors.push(message);
+        return Ok(report);
+    }
+
     // 2. Get existing pipeline entities from graph
     let existing = get_pipeline_entities(gm).await?;
 
@@ -325,5 +330,49 @@ mod tests {
         };
 
         assert!(entity_needs_update(&entry, &existing));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_v2_store_skips_pipeline_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = super::super::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        super::super::v2::ensure_v2_store(&gm).await.unwrap();
+        let report = super::sync_pipeline(&gm, &learning_docs()).await.unwrap();
+        assert_eq!(report.entities_created, 0);
+        assert_eq!(report.relationships_created, 0);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.contains("stamped pipeline v2")),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(gm.stats().await.unwrap().entity_count, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_unstamped_store_still_syncs_pipeline_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = super::super::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        let report = super::sync_pipeline(&gm, &learning_docs()).await.unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.entities_created, 1);
+        assert_eq!(gm.stats().await.unwrap().entity_count, 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn learning_docs() -> super::super::types::PipelineDocuments {
+        super::super::types::PipelineDocuments {
+            learning: "## Active Threads\n\n### Shelf service (2026-03-01)\n\nKeep it in Rust.\n"
+                .into(),
+            ..Default::default()
+        }
     }
 }

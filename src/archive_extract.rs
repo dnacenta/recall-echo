@@ -196,7 +196,7 @@ pub(crate) async fn extract_into(
     }
 
     let context = IngestContext::new(archive.session_id.clone(), Some(log_number));
-    let pipeline = crate::graph::v2::pipeline_for_hook(memory_dir);
+    let pipeline = crate::graph::v2::pipeline_for_hook(memory_dir, graph.db()).await;
     let report = crate::graph::v2::extract_log(
         graph,
         memory_dir,
