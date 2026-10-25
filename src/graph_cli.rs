@@ -902,14 +902,13 @@ impl RebuildStop for LiveDaemonStop {
         memory_dir: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, RecallError>> + Send + 'a>>
     {
-        Box::pin(serve_client::stop_daemon(memory_dir))
+        Box::pin(serve_client::stop_daemon_for_admin(memory_dir))
     }
 }
 
 #[cfg(feature = "llm")]
 struct RebuildPlan {
     conversations: PathBuf,
-    logs: Vec<u32>,
     pending: Vec<u32>,
     resume: bool,
 }
@@ -918,6 +917,24 @@ struct RebuildPlan {
 struct BuildTotals {
     finished: bool,
     facts: u32,
+    archives: u32,
+}
+
+/// One archive after its episodes were brought up to the chunk count.
+#[cfg(feature = "llm")]
+enum BuiltArchive {
+    /// Extraction ran.
+    Done(Box<IngestionReport>),
+    /// `chunk_conversation` produced nothing. There is no episode to mark
+    /// and no provider call; a later resume must not try again.
+    NoChunks,
+}
+
+/// Episode rows for one log, grouped once from the scan.
+#[cfg(feature = "llm")]
+struct EpisodeRows {
+    count: usize,
+    all_extracted: bool,
 }
 
 /// Re-extract every archive into `graph.v2-build/` and swap it over `graph/`.
@@ -926,10 +943,15 @@ struct BuildTotals {
 /// not touch a running daemon passes its own stopper. `llm` overrides
 /// provider construction; `None` reads the memory directory config.
 ///
-/// Server mode, a pipeline other than v2, and a build directory that is not
-/// already stamped v2 are refused before the old store is touched. A stamped
-/// build directory is a resume of its unextracted logs. `--dry-run` lists
-/// archives and estimated calls and writes nothing.
+/// Server mode, a pipeline other than v2, a config that cannot be saved, and
+/// a build directory that is not already stamped v2 are refused before the
+/// daemon is stopped and before the old store is touched. A stamped build
+/// directory is a resume of its unfinished logs. `--dry-run` lists archives
+/// and estimated calls and does not stop the daemon.
+///
+/// The build, the catch-up of logs that appear while it runs, the swap, and
+/// the config write all hold the admin lock. `stop` runs under that lock;
+/// the CLI's stop is `stop_daemon_for_admin`.
 #[cfg(feature = "llm")]
 pub async fn rebuild(
     memory_dir: &Path,
@@ -941,24 +963,35 @@ pub async fn rebuild(
     if options.dry_run {
         return print_rebuild_dry_run(memory_dir, &plan);
     }
-    stop_for_rebuild(memory_dir, stop).await?;
-    if plan.pending.is_empty() {
-        return swap_and_record(memory_dir, archive_count(&plan), 0);
-    }
+    serve_client::exclusive_without_store(
+        memory_dir,
+        || stop_for_rebuild(memory_dir, stop),
+        || finish_rebuild(memory_dir, &plan, &options, llm),
+    )
+    .await
+}
+
+#[cfg(feature = "llm")]
+async fn finish_rebuild(
+    memory_dir: &Path,
+    plan: &RebuildPlan,
+    options: &ExtractOptions,
+    llm: Option<&dyn crate::graph::llm::LlmProvider>,
+) -> Result<(), RecallError> {
     let totals = if let Some(provider) = llm {
-        drive_rebuild(memory_dir, &plan, provider, options.max_tokens).await?
+        drive_rebuild(memory_dir, plan, provider, options).await?
     } else {
         let (owned, _) = crate::llm_provider::create_provider(
             memory_dir,
             options.provider.as_deref(),
             options.model.as_deref(),
         )?;
-        drive_rebuild(memory_dir, &plan, owned.as_ref(), options.max_tokens).await?
+        drive_rebuild(memory_dir, plan, owned.as_ref(), options).await?
     };
     if !totals.finished {
         return Ok(());
     }
-    swap_and_record(memory_dir, archive_count(&plan), totals.facts)
+    swap_and_record(memory_dir, totals.archives, totals.facts)
 }
 
 #[cfg(feature = "llm")]
@@ -972,16 +1005,28 @@ async fn prepare_rebuild(
             "rebuild requires pipeline v2; pass --pipeline v2".into(),
         ));
     }
-    if serve_client::graph_mode(memory_dir) == "server" {
-        return Err(RecallError::Config(
-            "rebuild refuses [graph] mode = \"server\": there is no embedded directory to swap, so nothing was changed".into(),
-        ));
-    }
-    let graph_dir = memory_dir.join("graph");
-    if !graph_dir.is_dir() {
-        return Err(RecallError::NotInitialized(
-            "Graph store not initialized. Run `recall-echo graph init` first.".into(),
-        ));
+    // Same parse-and-validate `set_graph_pipeline` uses, before the daemon
+    // stops or any directory is opened. `mode` is read from that parse:
+    // `load` drops a file it cannot validate, which would hide `mode = "server"`.
+    if let Some(parsed) = crate::config::read_config_file(memory_dir)? {
+        let mode = parsed
+            .graph
+            .as_ref()
+            .map(|graph| graph.mode.clone())
+            .unwrap_or_else(|| "embedded".to_string());
+        let mut problems = Vec::new();
+        if mode == "server" {
+            problems.push(
+                "rebuild refuses [graph] mode = \"server\": there is no embedded directory to swap, so nothing was changed"
+                    .to_string(),
+            );
+        }
+        if let Err(err) = crate::config::validate_for_rewrite(memory_dir, parsed) {
+            problems.push(err.to_string());
+        }
+        if !problems.is_empty() {
+            return Err(RecallError::Config(problems.join("; ")));
+        }
     }
     let conversations = find_conversations_dir(memory_dir)?;
     let logs = conversation_logs(&conversations)?;
@@ -990,21 +1035,118 @@ async fn prepare_rebuild(
             "no conversation archives found to rebuild".into(),
         ));
     }
-    let (resume, pending) = pending_in_build(&memory_dir.join(V2_BUILD_DIR), &logs).await?;
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.is_dir() {
+        if let Some(message) = half_swap_refusal(memory_dir, &conversations, &logs).await? {
+            return Err(RecallError::Other(message));
+        }
+        return Err(RecallError::NotInitialized(
+            "Graph store not initialized. Run `recall-echo graph init` first.".into(),
+        ));
+    }
+    let (resume, pending) =
+        pending_in_build(&memory_dir.join(V2_BUILD_DIR), &conversations, &logs).await?;
     Ok(RebuildPlan {
         conversations,
-        logs,
         pending,
         resume,
     })
 }
 
+/// Crash between the two renames: `graph/` is gone, a backup holds it, and
+/// the build is a finished v2 store. Refuse, with the commands to finish or
+/// roll back. Do not rename anything.
 #[cfg(feature = "llm")]
-async fn pending_in_build(build: &Path, logs: &[u32]) -> Result<(bool, Vec<u32>), RecallError> {
-    if !build.exists() {
-        return Ok((false, logs.to_vec()));
+async fn half_swap_refusal(
+    memory_dir: &Path,
+    conversations: &Path,
+    logs: &[u32],
+) -> Result<Option<String>, RecallError> {
+    let Some(backup) = newest_backup(memory_dir)? else {
+        return Ok(None);
+    };
+    let build = memory_dir.join(V2_BUILD_DIR);
+    if !build_is_complete(&build, conversations, logs).await? {
+        return Ok(None);
     }
-    if !build.join("surreal").is_dir() {
+    Ok(Some(half_swap_message(
+        &memory_dir.join("graph"),
+        &build,
+        &backup,
+    )))
+}
+
+#[cfg(feature = "llm")]
+fn newest_backup(memory_dir: &Path) -> Result<Option<PathBuf>, RecallError> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(memory_dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("graph.v1-backup-") {
+            continue;
+        }
+        let modified = path.metadata().and_then(|meta| meta.modified()).ok();
+        found.push((modified, path));
+    }
+    found.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(found.pop().map(|(_, path)| path))
+}
+
+/// A v2-stamped build whose every current archive is fully stored.
+#[cfg(feature = "llm")]
+async fn build_is_complete(
+    build: &Path,
+    conversations: &Path,
+    logs: &[u32],
+) -> Result<bool, RecallError> {
+    if !has_kv_manifest(build) {
+        return Ok(false);
+    }
+    let db = crate::graph::store::open(build).await?;
+    let stamp = crate::graph::v2::read_stamp(&db).await.unwrap_or(None);
+    if stamp.as_deref() != Some("v2") {
+        return Ok(false);
+    }
+    let pending = pending_logs(&db, conversations, logs).await?;
+    Ok(pending.is_empty())
+}
+
+#[cfg(feature = "llm")]
+fn half_swap_message(graph: &Path, build: &Path, backup: &Path) -> String {
+    let graph = shell_quote(graph);
+    let build = shell_quote(build);
+    let backup = shell_quote(backup);
+    format!(
+        "rebuild stopped between the two renames, so nothing was finished automatically. \
+         {graph} is missing, {backup} holds the previous store, and {build} is a complete v2 build.\n\
+         To finish the swap:\n  \
+         mv {build} {graph}\n  \
+         [graph]\n  \
+         pipeline = \"v2\"\n\
+         To roll back:\n  \
+         mv {backup} {graph}\n  \
+         [graph]\n  \
+         pipeline = \"v1\""
+    )
+}
+
+#[cfg(feature = "llm")]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+#[cfg(feature = "llm")]
+async fn pending_in_build(
+    build: &Path,
+    conversations: &Path,
+    logs: &[u32],
+) -> Result<(bool, Vec<u32>), RecallError> {
+    if !build.exists() {
+        return Ok((false, logs_with_chunks(conversations, logs)?));
+    }
+    if !build.join("surreal").is_dir() || !has_kv_manifest(build) {
         return Err(RecallError::Other(removal_hint(build)));
     }
     let db = crate::graph::store::open(build).await?;
@@ -1020,13 +1162,38 @@ async fn pending_in_build(build: &Path, logs: &[u32]) -> Result<(bool, Vec<u32>)
     if stamp.as_deref() != Some("v2") {
         return Err(RecallError::Other(removal_hint(build)));
     }
-    let pending = pending_logs(&db, logs).await?;
+    let pending = pending_logs(&db, conversations, logs).await?;
     Ok((true, pending))
+}
+
+/// SurrealKV writes `surreal/manifest/*.manifest`. An unrelated `surreal/`
+/// directory has none, and opening it would create a store there.
+#[cfg(feature = "llm")]
+fn has_kv_manifest(store: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(store.join("surreal").join("manifest")) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("manifest"))
+}
+
+/// Logs that have at least one chunk. A zero-chunk log is not pending work.
+#[cfg(feature = "llm")]
+fn logs_with_chunks(conversations: &Path, logs: &[u32]) -> Result<Vec<u32>, RecallError> {
+    let mut pending = Vec::new();
+    for log in logs {
+        if expected_chunks(conversations, *log)? > 0 {
+            pending.push(*log);
+        }
+    }
+    Ok(pending)
 }
 
 #[cfg(feature = "llm")]
 async fn pending_logs(
     db: &surrealdb::Surreal<crate::graph::store::Db>,
+    conversations: &Path,
     logs: &[u32],
 ) -> Result<Vec<u32>, RecallError> {
     let mut response = db
@@ -1034,26 +1201,58 @@ async fn pending_logs(
         .await
         .map_err(crate::graph::error::GraphError::from)?;
     let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
-    Ok(logs
-        .iter()
-        .copied()
-        .filter(|log| !log_fully_extracted(*log, &rows))
-        .collect())
+    let grouped = group_episodes(&rows);
+    let mut pending = Vec::new();
+    for log in logs {
+        let expected = expected_chunks(conversations, *log)?;
+        if !log_is_complete(grouped.get(log), expected) {
+            pending.push(*log);
+        }
+    }
+    Ok(pending)
 }
 
 #[cfg(feature = "llm")]
-fn log_fully_extracted(log: u32, rows: &[serde_json::Value]) -> bool {
-    let mut saw = false;
+fn group_episodes(rows: &[serde_json::Value]) -> std::collections::HashMap<u32, EpisodeRows> {
+    let mut grouped = std::collections::HashMap::new();
     for row in rows {
-        if json_u32(row.get("log_number")) != Some(log) {
+        let Some(log) = json_u32(row.get("log_number")) else {
             continue;
-        }
-        saw = true;
+        };
+        let entry = grouped.entry(log).or_insert(EpisodeRows {
+            count: 0,
+            all_extracted: true,
+        });
+        entry.count += 1;
         if row.get("extracted").and_then(serde_json::Value::as_bool) != Some(true) {
-            return false;
+            entry.all_extracted = false;
         }
     }
-    saw
+    grouped
+}
+
+/// `expected == 0` is complete: there is nothing to extract, and a resume
+/// must not call the provider for that log again.
+#[cfg(feature = "llm")]
+fn log_is_complete(rows: Option<&EpisodeRows>, expected: usize) -> bool {
+    if expected == 0 {
+        return true;
+    }
+    match rows {
+        Some(rows) => rows.count >= expected && rows.all_extracted,
+        None => false,
+    }
+}
+
+#[cfg(feature = "llm")]
+fn expected_chunks(conversations: &Path, log: u32) -> Result<usize, RecallError> {
+    let archive = find_archive_file(conversations, log)?;
+    let content = std::fs::read_to_string(&archive)?;
+    Ok(crate::graph::extract::chunk_conversation(
+        &content,
+        crate::graph::ingest::INGEST_CHUNK_TOKENS,
+    )
+    .len())
 }
 
 #[cfg(feature = "llm")]
@@ -1160,7 +1359,7 @@ async fn drive_rebuild(
     memory_dir: &Path,
     plan: &RebuildPlan,
     llm: &dyn crate::graph::llm::LlmProvider,
-    max_tokens: u64,
+    options: &ExtractOptions,
 ) -> Result<BuildTotals, RecallError> {
     if plan.resume {
         println!(
@@ -1169,60 +1368,125 @@ async fn drive_rebuild(
         );
     }
     let build = memory_dir.join(V2_BUILD_DIR);
-    let gm = crate::graph::GraphMemory::open_embedded(&build).await?;
-    crate::graph::v2::ensure_v2_store(&gm).await?;
+    let gm = match crate::graph::GraphMemory::open_embedded(&build).await {
+        Ok(gm) => gm,
+        Err(err) => {
+            return Err(stopped_opening(
+                memory_dir,
+                &format!("could not open the build store: {err}"),
+            ));
+        }
+    };
+    if let Err(err) = crate::graph::v2::ensure_v2_store(&gm).await {
+        return Err(stopped_opening(memory_dir, &err.to_string()));
+    }
     let mut measured = 0u64;
     let mut estimated = 0u64;
     let mut facts = 0u32;
-    let total = plan.pending.len();
-    for (index, log) in plan.pending.iter().copied().enumerate() {
-        let spent = measured.saturating_add(estimated);
-        if max_tokens > 0 && spent >= max_tokens {
-            println!(
-                "\n{WARN}⚠ Token budget exhausted ({} of {}). Stopping.{RESET}",
-                format_token_bill(measured, estimated),
-                format_tokens(max_tokens),
-            );
-            println!(
-                "  Partial build left at {}. {} was not modified. Re-run to resume.",
-                build.display(),
-                memory_dir.join("graph").display()
-            );
-            return Ok(BuildTotals {
-                finished: false,
-                facts,
-            });
+    let mut batch = plan.pending.clone();
+    let mut processed = false;
+    loop {
+        if batch.is_empty() {
+            batch = pending_logs(
+                gm.db(),
+                &plan.conversations,
+                &conversation_logs(&plan.conversations)?,
+            )
+            .await?;
+            if batch.is_empty() {
+                break;
+            }
+            if options.delay_ms > 0 && processed {
+                tokio::time::sleep(std::time::Duration::from_millis(options.delay_ms)).await;
+            }
         }
-        let report = match rebuild_archive(&gm, memory_dir, &plan.conversations, log, llm).await {
-            Ok(report) => report,
-            Err(err) => return Err(stopped(memory_dir, log, &err.to_string())),
-        };
-        measured = measured.saturating_add(report.measured_tokens);
-        estimated = estimated.saturating_add(report.estimated_tokens);
-        if report.leaves_pending() {
-            let detail = report
-                .errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "extraction left the archive pending".to_string());
-            return Err(stopped(memory_dir, log, &detail));
+        let total = batch.len();
+        for (index, log) in batch.iter().copied().enumerate() {
+            let spent = measured.saturating_add(estimated);
+            if options.max_tokens > 0 && spent >= options.max_tokens {
+                println!(
+                    "\n{WARN}⚠ Token budget exhausted ({} of {}). Stopping.{RESET}",
+                    format_token_bill(measured, estimated),
+                    format_tokens(options.max_tokens),
+                );
+                println!(
+                    "  Partial build left at {}. {} was not modified. Re-run to resume.",
+                    build.display(),
+                    memory_dir.join("graph").display()
+                );
+                return Ok(BuildTotals {
+                    finished: false,
+                    facts,
+                    archives: 0,
+                });
+            }
+            let built =
+                match rebuild_with_retry(&gm, memory_dir, &plan.conversations, log, llm).await {
+                    Ok(built) => built,
+                    Err(err) => return Err(stopped(memory_dir, log, &err.to_string())),
+                };
+            if let BuiltArchive::Done(report) = built {
+                measured = measured.saturating_add(report.measured_tokens);
+                estimated = estimated.saturating_add(report.estimated_tokens);
+                if report.leaves_pending() {
+                    let detail = report
+                        .errors
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "extraction left the archive pending".to_string());
+                    return Err(stopped(memory_dir, log, &detail));
+                }
+                gm.mark_extracted(log)
+                    .await
+                    .map_err(|err| stopped(memory_dir, log, &err.to_string()))?;
+                let written = report
+                    .slots_written
+                    .saturating_add(report.relationships_created);
+                facts = facts.saturating_add(written);
+                println!(
+                    "  {GOOD}✓{RESET} [{}/{}] log {log:03}: {written} facts{}",
+                    index + 1,
+                    total,
+                    v2_report_suffix(&report),
+                );
+            }
+            processed = true;
+            if options.delay_ms > 0 && index + 1 != total {
+                tokio::time::sleep(std::time::Duration::from_millis(options.delay_ms)).await;
+            }
         }
-        gm.mark_extracted(log).await?;
-        let written = report
-            .slots_written
-            .saturating_add(report.relationships_created);
-        facts = facts.saturating_add(written);
-        println!(
-            "  {GOOD}✓{RESET} [{}/{}] log {log:03}: {written} facts{}",
-            index + 1,
-            total,
-            v2_report_suffix(&report),
-        );
+        batch.clear();
     }
+    let archives = conversation_logs(&plan.conversations)?;
     Ok(BuildTotals {
         finished: true,
         facts,
+        archives: u32::try_from(archives.len()).unwrap_or(u32::MAX),
     })
+}
+
+/// One attempt, and on a non-stamp failure exactly one more. The second
+/// failure stops the rebuild; it is not quarantined.
+#[cfg(feature = "llm")]
+async fn rebuild_with_retry(
+    gm: &crate::graph::GraphMemory,
+    memory_dir: &Path,
+    conversations: &Path,
+    log: u32,
+    llm: &dyn crate::graph::llm::LlmProvider,
+) -> Result<BuiltArchive, RecallError> {
+    let first = rebuild_archive(gm, memory_dir, conversations, log, llm).await;
+    if let Err(err) = &first {
+        if err.to_string().contains(crate::graph::v2::V2_REFUSAL) {
+            return first;
+        }
+        println!("  {WARN}⚠{RESET} log {log:03}: failed, retrying... ({err})");
+    }
+    let retry = first.is_err();
+    retry_once(first, retry, || {
+        rebuild_archive(gm, memory_dir, conversations, log, llm)
+    })
+    .await
 }
 
 #[cfg(feature = "llm")]
@@ -1232,15 +1496,20 @@ async fn rebuild_archive(
     conversations: &Path,
     log: u32,
     llm: &dyn crate::graph::llm::LlmProvider,
-) -> Result<IngestionReport, RecallError> {
+) -> Result<BuiltArchive, RecallError> {
     let archive = find_archive_file(conversations, log)?;
     let content = std::fs::read_to_string(&archive)?;
+    let chunks = crate::graph::extract::chunk_conversation(
+        &content,
+        crate::graph::ingest::INGEST_CHUNK_TOKENS,
+    );
+    if chunks.is_empty() {
+        return Ok(BuiltArchive::NoChunks);
+    }
     let (session_id, _) = extract_archive_metadata(&content, &archive);
     let context = IngestContext::new(session_id, Some(log));
-    if gm.get_episode_by_log_number(log).await?.is_none() {
-        gm.ingest_archive(&content, &context, None).await?;
-    }
-    Ok(crate::graph::v2::extract_log(
+    ensure_episodes(gm, log, &content, &chunks, &context).await?;
+    let report = crate::graph::v2::extract_log(
         gm,
         memory_dir,
         log,
@@ -1249,13 +1518,71 @@ async fn rebuild_archive(
         llm,
         PipelineVersion::V2,
     )
-    .await?)
+    .await?;
+    Ok(BuiltArchive::Done(Box::new(report)))
+}
+
+/// Bring the log's episode count up to `chunks.len()`. A short prefix is
+/// extended; a full set is left alone. Ingest errors stop the archive.
+#[cfg(feature = "llm")]
+async fn ensure_episodes(
+    gm: &crate::graph::GraphMemory,
+    log: u32,
+    content: &str,
+    chunks: &[String],
+    context: &IngestContext,
+) -> Result<(), RecallError> {
+    let have = episode_count(gm, log).await?;
+    if have >= chunks.len() {
+        return Ok(());
+    }
+    let report = if have == 0 {
+        gm.ingest_archive(content, context, None).await?
+    } else {
+        crate::graph::ingest::ingest_remaining_episodes(gm, &chunks[have..], context, have).await?
+    };
+    if report.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(RecallError::Other(report.errors.join("; ")))
+    }
+}
+
+#[cfg(feature = "llm")]
+async fn episode_count(gm: &crate::graph::GraphMemory, log: u32) -> Result<usize, RecallError> {
+    let mut response = gm
+        .db()
+        .query("SELECT count() AS count FROM episode WHERE log_number = $ln GROUP ALL")
+        .bind(("ln", i64::from(log)))
+        .await
+        .map_err(crate::graph::error::GraphError::from)?;
+    let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .first()
+        .and_then(|row| json_u32(row.get("count")))
+        .unwrap_or(0) as usize)
 }
 
 #[cfg(feature = "llm")]
 fn stopped(memory_dir: &Path, log: u32, detail: &str) -> RecallError {
+    unfinished(memory_dir, Some(log), detail)
+}
+
+/// The build store could not be opened. No archive has run, so there is no
+/// log number; the sentence is the one [`stopped`] uses.
+#[cfg(feature = "llm")]
+fn stopped_opening(memory_dir: &Path, detail: &str) -> RecallError {
+    unfinished(memory_dir, None, detail)
+}
+
+#[cfg(feature = "llm")]
+fn unfinished(memory_dir: &Path, log: Option<u32>, detail: &str) -> RecallError {
+    let place = match log {
+        Some(log) => format!("on log {log:03}: "),
+        None => String::new(),
+    };
     RecallError::Other(format!(
-        "rebuild stopped on log {log:03}: {detail}; {} was not modified; partial build is at {}",
+        "rebuild stopped {place}{detail}; {} was not modified; partial build is at {}",
         memory_dir.join("graph").display(),
         memory_dir.join(V2_BUILD_DIR).display()
     ))
@@ -1265,18 +1592,16 @@ fn stopped(memory_dir: &Path, log: u32, detail: &str) -> RecallError {
 fn swap_and_record(memory_dir: &Path, archives: u32, facts: u32) -> Result<(), RecallError> {
     let backup = swap_store(memory_dir)?;
     if let Err(err) = crate::config::set_graph_pipeline(memory_dir, "v2") {
+        let config = crate::config::config_path(memory_dir);
         return Err(RecallError::Config(format!(
-            "swapped the v2 store into place ({} holds the previous store) but did not set [graph] pipeline: {err}",
-            backup.display()
+            "swapped the v2 store into place ({} holds the previous store) but did not set [graph] pipeline: {err}\n\
+             Recovery: set [graph] pipeline = \"v2\" in {}",
+            shell_quote(&backup),
+            shell_quote(&config)
         )));
     }
     print_swapped(memory_dir, &backup, archives, facts);
     Ok(())
-}
-
-#[cfg(feature = "llm")]
-fn archive_count(plan: &RebuildPlan) -> u32 {
-    u32::try_from(plan.logs.len()).unwrap_or(u32::MAX)
 }
 
 #[cfg(feature = "llm")]
@@ -1342,12 +1667,41 @@ fn io_msg(message: String) -> RecallError {
 
 #[cfg(feature = "llm")]
 fn print_swapped(memory_dir: &Path, backup: &Path, archives: u32, facts: u32) {
+    print!("{}", swap_report(memory_dir, backup, archives, facts));
+}
+
+#[cfg(feature = "llm")]
+fn swap_report(memory_dir: &Path, backup: &Path, archives: u32, facts: u32) -> String {
     let graph = memory_dir.join("graph");
     let build = memory_dir.join(V2_BUILD_DIR);
-    println!("\n{GOOD}✓{RESET} Rebuilt {archives} archives, {facts} facts written.");
-    println!("Rollback (stop the daemon first):");
-    println!("  mv {} {}", graph.display(), build.display());
-    println!("  mv {} {}", backup.display(), graph.display());
+    format!(
+        "\n{GOOD}✓{RESET} Rebuilt {archives} archives, {facts} facts written.\n\
+         A symlinked graph/ becomes a real directory in memory/.\n\
+         Rollback (stop the daemon first):\n  \
+         mv {graph} {build}\n  \
+         mv {backup} {graph}\n\
+         After a rollback, set [graph] pipeline = \"v1\".\n",
+        graph = shell_quote(&graph),
+        build = shell_quote(&build),
+        backup = shell_quote(backup),
+    )
+}
+
+/// Call `again` once when `first` failed and `retry` is set.
+///
+/// Extract quarantines the second failure. Rebuild stops. Neither path
+/// makes a third call.
+#[cfg(feature = "llm")]
+async fn retry_once<T, E, F, Fut>(first: Result<T, E>, retry: bool, again: F) -> Result<T, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    match first {
+        Ok(value) => Ok(value),
+        Err(err) if !retry => Err(err),
+        Err(_) => again().await,
+    }
 }
 
 /// What `graph extract` does with an `Err` from one archive.
@@ -1574,8 +1928,10 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
 
             // v1 retries once, then quarantines. v2 does not: a stamp refusal
             // stops the run, and any other error (a write that already landed)
-            // is left pending without a second provider call.
-            let report = match crate::graph::v2::extract_log(
+            // is left pending without a second provider call. The second call
+            // goes through `retry_once`, which rebuild also uses; rebuild
+            // stops on that second failure instead of quarantining.
+            let first = crate::graph::v2::extract_log(
                 &gm,
                 &memory,
                 *ln,
@@ -1584,10 +1940,9 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
                 &*llm,
                 pipeline,
             )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => match attempt_after_error(pipeline, &e) {
+            .await;
+            if let Err(ref err) = first {
+                match attempt_after_error(pipeline, err) {
                     Attempt::Stop => {
                         println!("\n{WARN}✗{RESET} {}", crate::graph::v2::V2_REFUSAL);
                         return Err(RecallError::Other(
@@ -1596,49 +1951,55 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
                     }
                     Attempt::LeavePending => {
                         println!(
-                            "  {WARN}✗{RESET} [{}/{}] log {ln:03}: left pending ({e})",
+                            "  {WARN}✗{RESET} [{}/{}] log {ln:03}: left pending ({err})",
                             idx + 1,
                             total_count
                         );
                         totals.left_pending.push(*ln);
                         totals
                             .errors
-                            .push(format!("log {ln:03}: left pending: {e}"));
+                            .push(format!("log {ln:03}: left pending: {err}"));
                         continue;
                     }
                     Attempt::Retry => {
                         println!(
-                            "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({e})",
+                            "  {WARN}⚠{RESET} [{}/{}] log {ln:03}: failed, retrying... ({err})",
                             idx + 1,
                             total_count
                         );
-                        match crate::graph::v2::extract_log(
-                            &gm,
-                            &memory,
-                            *ln,
-                            &content,
-                            &context,
-                            &*llm,
-                            pipeline,
-                        )
-                        .await
-                        {
-                            Ok(r) => r,
-                            Err(e2) => {
-                                println!(
-                                    "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({e2})",
-                                    idx + 1,
-                                    total_count
-                                );
-                                totals.quarantined.push(*ln);
-                                totals.errors.push(format!(
-                                    "log {ln:03}: quarantined after retry: {e2}"
-                                ));
-                                continue;
-                            }
-                        }
                     }
-                },
+                }
+            }
+            let retry = matches!(
+                first.as_ref().err().map(|err| attempt_after_error(pipeline, err)),
+                Some(Attempt::Retry)
+            );
+            let report = match retry_once(first, retry, || {
+                crate::graph::v2::extract_log(
+                    &gm,
+                    &memory,
+                    *ln,
+                    &content,
+                    &context,
+                    &*llm,
+                    pipeline,
+                )
+            })
+            .await
+            {
+                Ok(report) => report,
+                Err(err) => {
+                    println!(
+                        "  {WARN}✗{RESET} [{}/{}] log {ln:03}: quarantined ({err})",
+                        idx + 1,
+                        total_count
+                    );
+                    totals.quarantined.push(*ln);
+                    totals
+                        .errors
+                        .push(format!("log {ln:03}: quarantined after retry: {err}"));
+                    continue;
+                }
             };
 
             // Whatever happened, the tokens were spent: keep the budget honest.
@@ -2981,6 +3342,113 @@ mod tests {
         assert!(empty.has_sidecar);
         assert_eq!(empty.windows, 0);
         assert_eq!(empty.calls, crate::graph::v2::RESOLVER_CALL_BOUND);
+    }
+
+    #[test]
+    fn a_swap_report_quotes_paths_and_sends_the_pipeline_back_to_v1() {
+        let memory = PathBuf::from("/tmp/memory");
+        let backup = memory.join("graph.v1-backup-20261025-1200");
+        let text = swap_report(&memory, &backup, 3, 4);
+        assert!(
+            text.contains("mv '/tmp/memory/graph' '/tmp/memory/graph.v2-build'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mv '/tmp/memory/graph.v1-backup-20261025-1200' '/tmp/memory/graph'"),
+            "{text}"
+        );
+        assert!(text.contains("pipeline = \"v1\""), "{text}");
+        assert!(text.contains("symlinked graph/"), "{text}");
+        assert!(text.contains("real directory in memory/"), "{text}");
+    }
+
+    #[test]
+    fn a_half_swap_message_quotes_both_renames_and_both_pipeline_lines() {
+        let graph = PathBuf::from("/tmp/memory/graph");
+        let build = PathBuf::from("/tmp/memory/graph.v2-build");
+        let backup = PathBuf::from("/tmp/memory/graph.v1-backup-20261025-1200");
+        let text = half_swap_message(&graph, &build, &backup);
+        assert!(
+            text.contains("mv '/tmp/memory/graph.v2-build' '/tmp/memory/graph'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mv '/tmp/memory/graph.v1-backup-20261025-1200' '/tmp/memory/graph'"),
+            "{text}"
+        );
+        assert!(text.contains("pipeline = \"v2\""), "{text}");
+        assert!(text.contains("pipeline = \"v1\""), "{text}");
+        assert!(
+            text.contains("nothing was finished automatically"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_zero_chunk_log_is_complete_and_a_short_log_is_not() {
+        assert!(log_is_complete(None, 0));
+        assert!(!log_is_complete(None, 2));
+        let short = EpisodeRows {
+            count: 1,
+            all_extracted: true,
+        };
+        assert!(!log_is_complete(Some(&short), 2));
+        let full = EpisodeRows {
+            count: 2,
+            all_extracted: true,
+        };
+        assert!(log_is_complete(Some(&full), 2));
+        let pending = EpisodeRows {
+            count: 2,
+            all_extracted: false,
+        };
+        assert!(!log_is_complete(Some(&pending), 2));
+    }
+
+    #[test]
+    fn episode_rows_are_grouped_once() {
+        let rows = [
+            serde_json::json!({"log_number": 1, "extracted": true}),
+            serde_json::json!({"log_number": 1, "extracted": false}),
+            serde_json::json!({"log_number": 2, "extracted": true}),
+        ];
+        let grouped = group_episodes(&rows);
+        assert_eq!(grouped.get(&1).expect("log 1").count, 2);
+        assert!(!grouped.get(&1).expect("log 1").all_extracted);
+        assert!(grouped.get(&2).expect("log 2").all_extracted);
+        assert_eq!(grouped.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_is_retried_once() {
+        let mut calls = 0u32;
+        let err = retry_once(Err::<(), &str>("first"), true, || {
+            calls += 1;
+            async { Err::<(), &str>("second") }
+        })
+        .await
+        .expect_err("second failure");
+        assert_eq!(err, "second");
+        assert_eq!(calls, 1);
+
+        let kept = retry_once(Err::<(), &str>("kept"), false, || async {
+            panic!("a non-retry must not call the archive again");
+            #[allow(unreachable_code)]
+            Ok::<(), &str>(())
+        })
+        .await
+        .expect_err("original");
+        assert_eq!(kept, "kept");
+
+        let mut calls = 0u32;
+        let value = retry_once(Ok::<u32, &str>(7), true, || {
+            calls += 1;
+            async { Ok::<u32, &str>(9) }
+        })
+        .await
+        .expect("first success");
+        assert_eq!(value, 7);
+        assert_eq!(calls, 0);
     }
 
     #[test]

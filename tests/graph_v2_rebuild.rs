@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 const RUST: &str = "Use Rust for the shelf service.";
 const PYTHON: &str = "Use Python for the shelf service.";
 const GO: &str = "Use Go for the shelf service.";
+const ZIG: &str = "Use Zig for the shelf service.";
 
 struct IdleStop {
     called: AtomicBool,
@@ -120,6 +121,7 @@ impl LlmProvider for Scripted {
             message if message.contains(RUST) => ("Rust", RUST),
             message if message.contains(PYTHON) => ("Python", PYTHON),
             message if message.contains(GO) => ("Go", GO),
+            message if message.contains(ZIG) => ("Zig", ZIG),
             _ => {
                 return Err(GraphError::Llm(format!(
                     "no scripted fact for {user_message}"
@@ -160,13 +162,18 @@ fn sidecar(log: u32, sentence: &str) -> String {
 
 fn write_config(memory: &Path, server: bool) {
     let mode = if server { "server" } else { "embedded" };
+    let run = memory.join("run");
+    std::fs::create_dir_all(&run).expect("socket dir");
+    let socket = run.join("graph.sock");
     std::fs::write(
         memory.join(".recall-echo.toml"),
         format!(
             "[llm]\nmodel = \"kept-model\"\nnum_ctx = 4096\n\n\
              [capture]\nenabled = false\n\n\
              [graph]\nmode = \"{mode}\"\n\n\
-             [graph.provenance]\nweight_user = 0.5\n"
+             [graph.provenance]\nweight_user = 0.5\n\n\
+             [serve]\nsocket_path = \"{}\"\n",
+            socket.display()
         ),
     )
     .expect("config");
@@ -589,5 +596,356 @@ async fn an_unstamped_build_directory_is_refused() {
     let message = err.to_string();
     assert!(message.contains("rm -r"), "{message}");
     assert!(!stop.called());
+    assert_unchanged(&memory.join("graph"), &before_graph);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_concurrent_exclusive_blocks_and_a_mid_build_log_is_in_the_new_store() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    let before = seed(memory, false).await;
+    let stop = IdleStop::new();
+    let probe = LockProbe {
+        inner: Scripted::answering(),
+        memory: memory.to_path_buf(),
+        blocked: Mutex::new(None),
+    };
+    let mut opts = options(PipelineVersion::V2, false);
+    opts.delay_ms = 0;
+    rebuild(memory, opts, &stop, Some(&probe))
+        .await
+        .expect("rebuild");
+    assert!(stop.called());
+    let outcome = probe
+        .blocked
+        .lock()
+        .expect("blocked")
+        .clone()
+        .expect("probe ran");
+    assert_eq!(outcome, "blocked", "{outcome}");
+
+    let backup = backups(memory);
+    assert_eq!(backup.len(), 1, "{backup:?}");
+    assert_eq!(
+        snapshot(&backup[0]),
+        before,
+        "backup changed during the build"
+    );
+    assert!(probe.inner.saw(ZIG), "mid-build log was not extracted");
+    let episodes = query(
+        &memory.join("graph"),
+        "SELECT log_number, extracted FROM episode",
+    )
+    .await;
+    assert!(
+        episodes
+            .iter()
+            .any(|row| log_number(row) == Some(4) && extracted(row)),
+        "{episodes:?}"
+    );
+}
+
+struct LockProbe {
+    inner: Scripted,
+    memory: PathBuf,
+    blocked: Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl LlmProvider for LockProbe {
+    async fn complete(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+    ) -> Result<String, GraphError> {
+        if !system_prompt.starts_with("You link NEW MENTIONS")
+            && self.blocked.lock().expect("blocked").is_none()
+        {
+            std::fs::write(
+                self.memory.join("conversations/conversation-004.md"),
+                markdown(4, ZIG),
+            )
+            .expect("mid-build log");
+            let memory = self.memory.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let outcome = runtime.block_on(async {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        recall_echo::serve_client::exclusive(&memory, |_graph| async {
+                            Ok::<(), RecallError>(())
+                        }),
+                    )
+                    .await
+                    {
+                        Err(_) => "blocked".to_string(),
+                        Ok(Ok(())) => "acquired".to_string(),
+                        Ok(Err(err)) => format!("finished: {err}"),
+                    }
+                });
+                let _ = tx.send(outcome);
+            });
+            let outcome = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap_or_else(|err| format!("probe did not finish: {err}"))
+            })
+            .await
+            .expect("probe join");
+            *self.blocked.lock().expect("blocked") = Some(outcome);
+        }
+        self.inner
+            .complete(system_prompt, user_message, max_tokens)
+            .await
+    }
+}
+
+fn log_number(row: &serde_json::Value) -> Option<u64> {
+    row.get("log_number")
+        .and_then(|value| value.as_u64().or_else(|| value.as_i64().map(|n| n as u64)))
+}
+
+fn extracted(row: &serde_json::Value) -> bool {
+    row.get("extracted") == Some(&serde_json::Value::Bool(true))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_half_finished_swap_is_refused_with_the_commands() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("rebuild");
+    let backup = backups(memory).remove(0);
+    let graph = memory.join("graph");
+    let build = memory.join("graph.v2-build");
+    std::fs::rename(&graph, &build).expect("move graph back to the build name");
+    assert!(!graph.exists());
+
+    let stop = IdleStop::new();
+    for dry_run in [true, false] {
+        let err = rebuild(
+            memory,
+            options(PipelineVersion::V2, dry_run),
+            &stop,
+            Some(&Scripted::answering()),
+        )
+        .await
+        .expect_err("half swap");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("mv '{}' '{}'", build.display(), graph.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("mv '{}' '{}'", backup.display(), graph.display())),
+            "{message}"
+        );
+        assert!(message.contains("pipeline = \"v2\""), "{message}");
+        assert!(message.contains("pipeline = \"v1\""), "{message}");
+        assert!(
+            message.contains("nothing was finished automatically"),
+            "{message}"
+        );
+        assert!(!stop.called(), "dry_run={dry_run}");
+        assert!(!graph.exists());
+        assert!(build.is_dir());
+        assert!(backup.is_dir());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_zero_context_and_server_mode_refuse_before_the_daemon_stops() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    let before_graph = seed(memory, false).await;
+    let socket = memory.join("run/graph.sock");
+    std::fs::write(
+        memory.join(".recall-echo.toml"),
+        format!(
+            "[llm]\nnum_ctx = 0\nmodel = \"kept-model\"\n\n\
+             [capture]\nenabled = false\n\n\
+             [graph]\nmode = \"server\"\n\n\
+             [graph.provenance]\nweight_user = 0.5\n\n\
+             [serve]\nsocket_path = \"{}\"\n",
+            socket.display()
+        ),
+    )
+    .expect("bad config");
+    let before = snapshot(memory);
+    let stop = IdleStop::new();
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &stop,
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect_err("invalid config");
+    let message = err.to_string();
+    assert!(message.contains("server"), "{message}");
+    assert!(message.contains("nothing was changed"), "{message}");
+    assert!(message.contains("num_ctx"), "{message}");
+    assert!(message.contains("refusing to rewrite"), "{message}");
+    assert!(!stop.called());
+    assert_unchanged(memory, &before);
+    assert_unchanged(&memory.join("graph"), &before_graph);
+    assert!(!memory.join("graph.v2-build").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_short_episode_count_is_filled_on_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    write_config(memory, false);
+    {
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .expect("v1 store");
+        drop(gm);
+    }
+    std::fs::write(memory.join("graph/KEEP"), b"keep").expect("sentinel");
+    let conversations = memory.join("conversations");
+    std::fs::create_dir_all(&conversations).expect("conversations");
+    let paragraph = "Use Rust for the shelf service. ".repeat(80);
+    let text = format!(
+        "---\nlog: 1\ndate: \"2026-03-01T00:00:00Z\"\nsession_id: \"s1\"\n---\n\n### User\n\n{paragraph}\n---\n\n### User\n\n{paragraph}\n"
+    );
+    std::fs::write(conversations.join("conversation-001.md"), &text).expect("archive");
+    let chunks = recall_echo::graph::extract::chunk_conversation(&text, 500);
+    assert!(chunks.len() >= 2, "{}", chunks.len());
+    let build = memory.join("graph.v2-build");
+    {
+        let gm = GraphMemory::open_embedded(&build).await.expect("build");
+        gm.add_episode(recall_echo::graph::types::NewEpisode {
+            session_id: "s1".into(),
+            abstract_text: "partial".into(),
+            overview: None,
+            content: Some("partial".into()),
+            log_number: Some(1),
+        })
+        .await
+        .expect("one episode");
+    }
+    {
+        let db = store::open(&build).await.expect("stamp");
+        db.query("UPSERT meta:pipeline SET pipeline = $pipeline")
+            .bind(("pipeline", "v2"))
+            .await
+            .expect("upsert")
+            .check()
+            .expect("stamp check");
+    }
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("resume fills the short log");
+    let episodes = query(
+        &memory.join("graph"),
+        "SELECT log_number, extracted FROM episode",
+    )
+    .await;
+    let mine: Vec<_> = episodes
+        .iter()
+        .filter(|row| log_number(row) == Some(1))
+        .collect();
+    assert_eq!(mine.len(), chunks.len(), "{episodes:?}");
+    assert!(mine.iter().all(|row| extracted(row)), "{mine:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_zero_chunk_log_is_not_extracted_again_on_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    write_config(memory, false);
+    {
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .expect("v1 store");
+        drop(gm);
+    }
+    let conversations = memory.join("conversations");
+    std::fs::create_dir_all(&conversations).expect("conversations");
+    std::fs::write(conversations.join("conversation-001.md"), markdown(1, RUST)).expect("log 1");
+    std::fs::write(conversations.join("conversation-002.md"), "\n").expect("empty log");
+    std::fs::write(
+        conversations.join("conversation-003.md"),
+        markdown(3, PYTHON),
+    )
+    .expect("log 3");
+    let turns = memory.join("turns");
+    std::fs::create_dir_all(&turns).expect("turns");
+    std::fs::write(turns.join("conversation-001.json"), sidecar(1, RUST)).expect("sidecar 1");
+    std::fs::write(turns.join("conversation-002.json"), sidecar(2, ZIG)).expect("sidecar 2");
+
+    let first = Scripted::failing(PYTHON);
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&first),
+    )
+    .await
+    .expect_err("later log fails");
+    assert!(err.to_string().contains("log 003"), "{err}");
+    assert!(first.saw(RUST));
+    assert!(first.saw(PYTHON));
+    assert!(!first.saw(ZIG), "zero-chunk log was sent to the provider");
+
+    let second = Scripted::failing(PYTHON);
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&second),
+    )
+    .await
+    .expect_err("resume still fails the later log");
+    assert!(err.to_string().contains("log 003"), "{err}");
+    assert!(!second.saw(RUST), "extracted log was sent again");
+    assert!(second.saw(PYTHON));
+    assert!(!second.saw(ZIG), "zero-chunk log was sent again on resume");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unrelated_surreal_directory_is_not_opened() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    let before_graph = seed(memory, false).await;
+    let surreal = memory.join("graph.v2-build/surreal");
+    std::fs::create_dir_all(&surreal).expect("surreal");
+    std::fs::write(surreal.join("note.txt"), b"unrelated").expect("note");
+    let stop = IdleStop::new();
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &stop,
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect_err("not a store");
+    let message = err.to_string();
+    assert!(message.contains("rm -r"), "{message}");
+    assert!(!stop.called());
+    let mut names: Vec<_> = std::fs::read_dir(&surreal)
+        .expect("surreal")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![std::ffi::OsString::from("note.txt")]);
     assert_unchanged(&memory.join("graph"), &before_graph);
 }

@@ -79,9 +79,14 @@ pub(crate) fn chosen_pipeline(
     memory_dir: &std::path::Path,
     flag: Option<PipelineVersion>,
 ) -> Result<PipelineVersion, crate::error::RecallError> {
-    let configured = crate::config::load_from_dir(memory_dir)
-        .graph
-        .and_then(|section| section.pipeline);
+    // A flag wins, so a broken file is not read: `load` would drop it and print
+    // a warning for a value this call does not use.
+    let configured = match flag {
+        Some(_) => None,
+        None => crate::config::load_from_dir(memory_dir)
+            .graph
+            .and_then(|section| section.pipeline),
+    };
     PipelineVersion::resolve(flag, configured.as_deref()).map_err(crate::error::RecallError::Config)
 }
 

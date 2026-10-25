@@ -1063,21 +1063,8 @@ pub(crate) fn set_graph_pipeline(
     base: &Path,
     pipeline: &str,
 ) -> Result<(), crate::error::RecallError> {
-    let path = config_path(base);
-    if path.exists() {
-        let content = fs::read_to_string(&path)?;
-        let parsed: Config = toml::from_str(&content).map_err(|err| {
-            crate::error::RecallError::Config(format!(
-                "refusing to rewrite {}: {err}",
-                path.display()
-            ))
-        })?;
-        validate(parsed).map_err(|err| {
-            crate::error::RecallError::Config(format!(
-                "refusing to rewrite {}: {err}",
-                path.display()
-            ))
-        })?;
+    if let Some(parsed) = read_config_file(base)? {
+        validate_for_rewrite(base, parsed)?;
     }
     let mut cfg = load(base);
     cfg.set_key("graph.pipeline", pipeline)?;
@@ -1096,6 +1083,39 @@ pub fn save(base: &Path, config: &Config) -> Result<(), crate::error::RecallErro
 #[must_use]
 pub fn exists(base: &Path) -> bool {
     config_path(base).exists()
+}
+
+/// Parse `.recall-echo.toml` without applying [`load`]'s fallback to defaults.
+///
+/// `Ok(None)` when the file is absent. A file that does not parse is `Err`:
+/// [`load`] would drop it, and a later save would erase the caller's keys.
+/// The returned config is not validated; [`validate_for_rewrite`] does that,
+/// so a caller can read `mode` from a file that validation will still reject.
+pub(crate) fn read_config_file(base: &Path) -> Result<Option<Config>, crate::error::RecallError> {
+    let path = config_path(base);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)?;
+    let parsed = toml::from_str(&content).map_err(|err| {
+        crate::error::RecallError::Config(format!("refusing to rewrite {}: {err}", path.display()))
+    })?;
+    Ok(Some(parsed))
+}
+
+/// The same rejection [`set_graph_pipeline`] uses before it writes.
+///
+/// A file that fails this must be left untouched.
+pub(crate) fn validate_for_rewrite(
+    base: &Path,
+    cfg: Config,
+) -> Result<(), crate::error::RecallError> {
+    validate(cfg).map(|_| ()).map_err(|err| {
+        crate::error::RecallError::Config(format!(
+            "refusing to rewrite {}: {err}",
+            config_path(base).display()
+        ))
+    })
 }
 
 fn validate(mut cfg: Config) -> Result<Config, crate::error::RecallError> {
