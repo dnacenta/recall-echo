@@ -7,6 +7,8 @@
 //! recall-graph defines its own trait to stay independent of pulse-system-types.
 //! Callers implement this to bridge their actual LLM backend.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use super::error::GraphError;
@@ -106,7 +108,7 @@ impl Message {
     }
 }
 
-/// Last user turn. Earlier turns are a demonstration and are not folded in.
+/// Last user turn.
 fn last_user_content(messages: &[Message]) -> &str {
     messages
         .iter()
@@ -114,6 +116,37 @@ fn last_user_content(messages: &[Message]) -> &str {
         .find(|message| message.role == "user")
         .map(|message| message.content.as_str())
         .unwrap_or("")
+}
+
+/// System prompt for a provider that only accepts one user message.
+///
+/// A single turn is left unchanged. Earlier turns of a longer list are the
+/// worked example: the example user turn and the example reply, same text as
+/// the chat turns, under `EXAMPLE` and `Output:`.
+fn folded_prompt<'a>(system_prompt: &'a str, messages: &'a [Message]) -> (Cow<'a, str>, &'a str) {
+    let user_message = last_user_content(messages);
+    let Some(last) = messages.iter().rposition(|message| message.role == "user") else {
+        return (Cow::Borrowed(system_prompt), user_message);
+    };
+    if last == 0 {
+        return (Cow::Borrowed(system_prompt), user_message);
+    }
+    let earlier = &messages[..last];
+    let example_user = join_role(earlier, "user");
+    let example_reply = join_role(earlier, "assistant");
+    let system = format!("{system_prompt}\n\nEXAMPLE\n{example_user}\nOutput:\n{example_reply}");
+    (Cow::Owned(system), user_message)
+}
+
+fn join_role(messages: &[Message], role: &str) -> String {
+    let mut text = String::new();
+    for message in messages.iter().filter(|message| message.role == role) {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&message.content);
+    }
+    text
 }
 
 /// Minimal LLM provider for extraction and deduplication.
@@ -171,9 +204,10 @@ pub trait LlmProvider: Send + Sync {
 
     /// JSON matching `schema`, with chat turns after the system prompt.
     ///
-    /// The default keeps the last user turn and calls
-    /// [`LlmProvider::complete_structured`], so a provider without chat sends
-    /// the same request it sends today.
+    /// One turn is the user message. A longer list folds the earlier turns
+    /// back into the system prompt as an `EXAMPLE` / `Output:` block and sends
+    /// the last user turn, so a provider without chat still sees the worked
+    /// example.
     async fn complete_structured_chat(
         &self,
         system_prompt: &str,
@@ -181,8 +215,8 @@ pub trait LlmProvider: Send + Sync {
         schema: &serde_json::Value,
         max_tokens: u32,
     ) -> Result<Completion, GraphError> {
-        let user_message = last_user_content(messages);
-        self.complete_structured(system_prompt, user_message, schema, max_tokens)
+        let (system_prompt, user_message) = folded_prompt(system_prompt, messages);
+        self.complete_structured(&system_prompt, user_message, schema, max_tokens)
             .await
     }
 }
@@ -242,5 +276,67 @@ mod tests {
             .unwrap();
         assert_eq!(completion.text, "echo:hello");
         assert_eq!(completion.usage, None);
+    }
+
+    /// Records the system prompt and user message a default chat call sends.
+    struct Recorded {
+        seen: std::sync::Mutex<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Recorded {
+        async fn complete(
+            &self,
+            system_prompt: &str,
+            user_message: &str,
+            _max_tokens: u32,
+        ) -> Result<String, GraphError> {
+            *self.seen.lock().expect("lock") =
+                (system_prompt.to_string(), user_message.to_string());
+            Ok("{}".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn one_chat_turn_stays_the_system_prompt_and_that_turn() {
+        let recorded = Recorded {
+            seen: std::sync::Mutex::new((String::new(), String::new())),
+        };
+        recorded
+            .complete_structured_chat(
+                "instructions",
+                &[Message::user("only")],
+                &serde_json::json!({}),
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded.seen.lock().expect("lock").clone(),
+            ("instructions".to_string(), "only".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_turns_fold_into_an_example_block() {
+        let recorded = Recorded {
+            seen: std::sync::Mutex::new((String::new(), String::new())),
+        };
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant("example-reply"),
+            Message::user("real-user"),
+        ];
+        recorded
+            .complete_structured_chat("instructions", &messages, &serde_json::json!({}), 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded.seen.lock().expect("lock").clone(),
+            (
+                "instructions\n\nEXAMPLE\nexample-user\nOutput:\nexample-reply".to_string(),
+                "real-user".to_string(),
+            )
+        );
     }
 }

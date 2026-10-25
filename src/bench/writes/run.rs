@@ -853,8 +853,9 @@ impl LlmProvider for BorrowedProvider<'_> {
 /// The provider trait only receives prompt text, so a dedup prompt is told
 /// apart by the sentence `graph::dedup` opens with. Anything else is treated
 /// as extraction and answered from the turn whose text appears in the prompt.
-/// A pass-1 chat call is reduced to its last user message before that match,
-/// so the worked example is not scanned for claims.
+/// A pass-1 chat call folds the worked example into the system prompt and
+/// keeps the last user message. Claims are matched on that message, so the
+/// example is not scanned.
 struct ScriptedExtractor {
     prepared: Vec<Prepared>,
     v2: Vec<V2Item>,
@@ -979,7 +980,7 @@ impl LlmProvider for ScriptedExtractor {
         user_message: &str,
         _max_tokens: u32,
     ) -> Result<String, crate::graph::error::GraphError> {
-        if system_prompt == crate::graph::v2::pass1::PASS1_SYSTEM {
+        if system_prompt.starts_with(crate::graph::v2::pass1::PASS1_SYSTEM) {
             return self.v2_json(user_message);
         }
         if system_prompt == crate::graph::v2::resolve::PASS2_SYSTEM {
@@ -1293,6 +1294,50 @@ mod tests {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.toml");
         crate::bench::writes::load_script(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn counting_forwards_the_chat_call() {
+        struct Inner(std::sync::Arc<std::sync::Mutex<Vec<Message>>>);
+
+        #[async_trait]
+        impl LlmProvider for Inner {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Err(crate::graph::error::GraphError::Llm(
+                    "plain complete was called".into(),
+                ))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                _: &str,
+                messages: &[Message],
+                _: &serde_json::Value,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                *self.0.lock().expect("lock") = messages.to_vec();
+                Ok(Completion::unmeasured("{}"))
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counting = Counting::new(Box::new(Inner(std::sync::Arc::clone(&seen))));
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant("example-reply"),
+            Message::user("real-user"),
+        ];
+        counting
+            .complete_structured_chat("sys", &messages, &serde_json::json!({}), 8)
+            .await
+            .unwrap();
+        assert_eq!(counting.calls(), 1);
+        assert_eq!(seen.lock().expect("lock").as_slice(), &messages);
     }
 
     #[test]

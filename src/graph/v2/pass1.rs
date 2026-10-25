@@ -58,9 +58,7 @@ BUGS (section "bugs"): one entry per bug or problem: symptom = what went wrong (
 RELEASES (section "releases"): one entry per version that was released or is planned: version (e.g. 1.4.0), status = released or planned, contents = what it contains or will contain (short, comma separated).
 
 Evidence (every entry): turn = the N of the [TN] turn that states it; quote = an exact verbatim copy of 3-20 consecutive words from that turn that contains the value (copy characters exactly).
-confidence: 0.0-1.0 that this is a durable, correctly stated fact.
-
-"#;
+confidence: 0.0-1.0 that this is a durable, correctly stated fact."#;
 
 /// Worked example, in the same shape as [`user_message`].
 pub(crate) const PASS1_EXAMPLE_USER: &str = r#"Project: tidepool

@@ -1375,9 +1375,10 @@ mod tests {
         assert_eq!(invocation.stdin.as_deref(), Some(USER));
     }
 
-    /// Chat on a CLI is today's single-message argv and stdin: the last user turn.
+    /// A CLI has no chat turns. The worked example goes back into the system
+    /// argument and stdin stays the last user turn.
     #[tokio::test]
-    async fn structured_chat_matches_the_single_message_invocation() {
+    async fn structured_chat_keeps_the_example_in_the_system_argument() {
         let mock =
             MockCli::new(r#"printf '%s' '{"type":"result","structured_output":{"ok":true}}'"#);
         let provider = mock.provider(
@@ -1388,9 +1389,10 @@ mod tests {
             "sonnet",
         );
         let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let example_reply = r#"{"facts":["tidepool"],"bugs":[],"releases":[]}"#;
         let messages = [
             Message::user("example-user"),
-            Message::assistant("{}"),
+            Message::assistant(example_reply),
             Message::user(USER),
         ];
         provider
@@ -1398,17 +1400,15 @@ mod tests {
             .await
             .unwrap();
         let chat_argv = mock.recorded_argv();
-        let chat_stdin = mock.recorded_stdin();
-        provider
-            .complete_structured(SYSTEM, USER, &schema, 128)
-            .await
-            .unwrap();
-        assert_eq!(mock.recorded_argv(), chat_argv);
-        assert_eq!(chat_stdin, USER);
-        assert_eq!(mock.recorded_stdin(), chat_stdin);
+        let system = chat_argv
+            .iter()
+            .position(|arg| arg == "--system-prompt")
+            .and_then(|index| chat_argv.get(index + 1))
+            .expect("system prompt argument");
+        assert!(system.contains(example_reply), "{system}");
+        assert!(system.contains("EXAMPLE\nexample-user\nOutput:\n"));
+        assert_eq!(mock.recorded_stdin(), USER);
         assert!(chat_argv.iter().any(|arg| arg == "--json-schema"));
-        assert!(!chat_argv.iter().any(|arg| arg.contains("example")));
-        assert!(!chat_stdin.contains("example"));
     }
 
     #[test]

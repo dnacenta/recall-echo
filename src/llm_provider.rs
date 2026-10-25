@@ -1292,6 +1292,36 @@ mod tests {
         assert_eq!(effective_num_ctx(8_192, 20, 128), 8_192);
     }
 
+    /// Structured native `num_ctx` is sized from [`prompt_chars`], which counts
+    /// every turn, including the worked example.
+    #[test]
+    fn prompt_chars_counts_the_example_turns_in_num_ctx() {
+        let system = "sys";
+        let example_user = "example-user";
+        let example_reply = "example-reply-0123456789abcdef";
+        let real_user = "real";
+        let messages = [
+            Message::user(example_user),
+            Message::assistant(example_reply),
+            Message::user(real_user),
+        ];
+        let chars = prompt_chars(system, &messages);
+        assert_eq!(
+            chars,
+            system.len() + example_user.len() + example_reply.len() + real_user.len()
+        );
+        let without_example = prompt_chars(system, &[Message::user(real_user)]);
+        let floor = 8;
+        let max_tokens = 1;
+        assert_eq!(effective_num_ctx(floor, without_example, max_tokens), floor);
+        let raised = effective_num_ctx(floor, chars, max_tokens);
+        assert!(raised > floor, "{raised}");
+        assert_eq!(
+            raised,
+            estimated_prompt_tokens(chars).saturating_add(max_tokens)
+        );
+    }
+
     #[test]
     fn a_full_v2_window_raises_num_ctx_within_the_cap() {
         let chars = 48_000 + crate::graph::v2::pass1::PASS1_SYSTEM.len();
@@ -1353,6 +1383,44 @@ mod tests {
         assert_eq!(recorded[0].body["messages"][0]["content"], "sys");
         assert_eq!(recorded[0].body["messages"][1]["role"], "user");
         assert_eq!(recorded[0].body["messages"][1]["content"], "user");
+    }
+
+    /// The posted body, not the body builder, carries the four turns in order.
+    #[tokio::test]
+    async fn posted_chat_body_has_four_messages_in_order() {
+        let (base, requests) = scripted_server(vec![ScriptedReply {
+            status: 200,
+            body: r#"{"message":{"role":"assistant","content":"{}"}}"#.into(),
+        }])
+        .await;
+        let provider = http_provider(
+            &format!("{base}/v1"),
+            ApiStyle::OpenAiCompat,
+            ApiStyle::OllamaNative,
+        );
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant("example-reply"),
+            Message::user("real-user"),
+        ];
+        provider
+            .complete_structured_chat("sys", &messages, &schema(), 64)
+            .await
+            .unwrap();
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, "/api/chat");
+        let posted = &recorded[0].body["messages"];
+        assert_eq!(posted.as_array().map(Vec::len), Some(4));
+        assert_eq!(posted[0]["role"], "system");
+        assert_eq!(posted[0]["content"], "sys");
+        assert_eq!(posted[1]["role"], "user");
+        assert_eq!(posted[1]["content"], "example-user");
+        assert_eq!(posted[2]["role"], "assistant");
+        assert_eq!(posted[2]["content"], "example-reply");
+        assert_eq!(posted[3]["role"], "user");
+        assert_eq!(posted[3]["content"], "real-user");
+        assert_eq!(recorded[0].body["format"], schema());
     }
 
     #[tokio::test]
