@@ -76,6 +76,46 @@ impl Completion {
     }
 }
 
+/// One chat turn after the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// `user` or `assistant`.
+    pub role: String,
+    /// The turn text.
+    pub content: String,
+}
+
+impl Message {
+    fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    /// A user turn.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    /// An assistant turn.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+}
+
+/// Last user turn. Earlier turns are a demonstration and are not folded in.
+fn last_user_content(messages: &[Message]) -> &str {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .unwrap_or("")
+}
+
 /// Minimal LLM provider for extraction and deduplication.
 ///
 /// Implementors bridge this to their actual LLM backend:
@@ -126,6 +166,23 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<Completion, GraphError> {
         let _ = schema;
         self.complete_measured(system_prompt, user_message, max_tokens)
+            .await
+    }
+
+    /// JSON matching `schema`, with chat turns after the system prompt.
+    ///
+    /// The default keeps the last user turn and calls
+    /// [`LlmProvider::complete_structured`], so a provider without chat sends
+    /// the same request it sends today.
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
+        let user_message = last_user_content(messages);
+        self.complete_structured(system_prompt, user_message, schema, max_tokens)
             .await
     }
 }

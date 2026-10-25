@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::graph::error::GraphError;
-use crate::graph::llm::{Completion, LlmProvider, TokenUsage};
+use crate::graph::llm::{Completion, LlmProvider, Message, TokenUsage};
 
 use crate::cli_provider::{CliOverrides, CliProvider, CliSpec};
 use crate::config::{self, Provider};
@@ -313,7 +313,7 @@ impl HttpLlmProvider {
     async fn dispatch(
         &self,
         system_prompt: &str,
-        user_message: &str,
+        messages: &[Message],
         max_tokens: u32,
         requested: Requested<'_>,
     ) -> Result<Completion, GraphError> {
@@ -323,15 +323,15 @@ impl HttpLlmProvider {
         };
         match style {
             ApiStyle::Anthropic => {
-                self.complete_anthropic(system_prompt, user_message, max_tokens, schema)
+                self.complete_anthropic(system_prompt, messages, max_tokens, schema)
                     .await
             }
             ApiStyle::OpenAiCompat => {
-                self.complete_openai(system_prompt, user_message, max_tokens, schema)
+                self.complete_openai(system_prompt, messages, max_tokens, schema)
                     .await
             }
             ApiStyle::OllamaNative => {
-                self.complete_ollama(system_prompt, user_message, max_tokens, schema)
+                self.complete_ollama(system_prompt, messages, max_tokens, schema)
                     .await
             }
         }
@@ -340,7 +340,7 @@ impl HttpLlmProvider {
     async fn with_retries(
         &self,
         system_prompt: &str,
-        user_message: &str,
+        messages: &[Message],
         max_tokens: u32,
         requested: Requested<'_>,
     ) -> Result<Completion, GraphError> {
@@ -355,7 +355,7 @@ impl HttpLlmProvider {
             }
 
             match self
-                .dispatch(system_prompt, user_message, max_tokens, requested)
+                .dispatch(system_prompt, messages, max_tokens, requested)
                 .await
             {
                 Ok(completion) => return Ok(completion),
@@ -406,14 +406,14 @@ impl HttpLlmProvider {
     async fn complete_anthropic(
         &self,
         system_prompt: &str,
-        user_message: &str,
+        messages: &[Message],
         max_tokens: u32,
         schema: Option<&serde_json::Value>,
     ) -> Result<Completion, GraphError> {
         let body = anthropic_body(
             &self.config.model,
             system_prompt,
-            user_message,
+            messages,
             max_tokens,
             schema,
         );
@@ -426,7 +426,7 @@ impl HttpLlmProvider {
     async fn complete_openai(
         &self,
         system_prompt: &str,
-        user_message: &str,
+        messages: &[Message],
         max_tokens: u32,
         schema: Option<&serde_json::Value>,
     ) -> Result<Completion, GraphError> {
@@ -440,7 +440,7 @@ impl HttpLlmProvider {
             let body = openai_body(
                 &self.config.model,
                 system_prompt,
-                user_message,
+                messages,
                 max_tokens,
                 schema,
             );
@@ -460,14 +460,14 @@ impl HttpLlmProvider {
     async fn complete_ollama(
         &self,
         system_prompt: &str,
-        user_message: &str,
+        messages: &[Message],
         max_tokens: u32,
         schema: Option<&serde_json::Value>,
     ) -> Result<Completion, GraphError> {
         let num_ctx = match schema {
             Some(_) => effective_num_ctx(
                 self.config.num_ctx,
-                system_prompt.len().saturating_add(user_message.len()),
+                prompt_chars(system_prompt, messages),
                 max_tokens,
             ),
             None => self.config.num_ctx,
@@ -475,7 +475,7 @@ impl HttpLlmProvider {
         let body = ollama_body(
             &self.config.model,
             system_prompt,
-            user_message,
+            messages,
             max_tokens,
             num_ctx,
             schema,
@@ -521,7 +521,8 @@ impl LlmProvider for HttpLlmProvider {
         user_message: &str,
         max_tokens: u32,
     ) -> Result<Completion, GraphError> {
-        self.with_retries(system_prompt, user_message, max_tokens, Requested::Text)
+        let messages = [Message::user(user_message)];
+        self.with_retries(system_prompt, &messages, max_tokens, Requested::Text)
             .await
     }
 
@@ -532,9 +533,27 @@ impl LlmProvider for HttpLlmProvider {
         schema: &serde_json::Value,
         max_tokens: u32,
     ) -> Result<Completion, GraphError> {
+        let messages = [Message::user(user_message)];
         self.with_retries(
             system_prompt,
-            user_message,
+            &messages,
+            max_tokens,
+            Requested::Structured(schema),
+        )
+        .await
+    }
+
+    /// Every HTTP style sends the turns. The system prompt stays where that API puts it.
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
+        self.with_retries(
+            system_prompt,
+            messages,
             max_tokens,
             Requested::Structured(schema),
         )
@@ -623,20 +642,45 @@ fn response_format_was_rejected(status: reqwest::StatusCode, body: &str) -> bool
     matches!(status.as_u16(), 400 | 422) && body.contains("response_format")
 }
 
+fn turn_json(role: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({"role": role, "content": content})
+}
+
+fn messages_with_system(system_prompt: &str, messages: &[Message]) -> Vec<serde_json::Value> {
+    let mut turns = Vec::with_capacity(messages.len() + 1);
+    turns.push(turn_json("system", system_prompt));
+    turns.extend(
+        messages
+            .iter()
+            .map(|message| turn_json(&message.role, &message.content)),
+    );
+    turns
+}
+
+fn turn_values(messages: &[Message]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| turn_json(&message.role, &message.content))
+        .collect()
+}
+
+fn prompt_chars(system_prompt: &str, messages: &[Message]) -> usize {
+    messages.iter().fold(system_prompt.len(), |total, message| {
+        total.saturating_add(message.content.len())
+    })
+}
+
 fn openai_body(
     model: &str,
     system_prompt: &str,
-    user_message: &str,
+    messages: &[Message],
     max_tokens: u32,
     schema: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
+        "messages": messages_with_system(system_prompt, messages),
     });
     if let Some(schema) = schema {
         body["response_format"] = serde_json::json!({
@@ -653,7 +697,7 @@ fn openai_body(
 fn anthropic_body(
     model: &str,
     system_prompt: &str,
-    user_message: &str,
+    messages: &[Message],
     max_tokens: u32,
     schema: Option<&serde_json::Value>,
 ) -> serde_json::Value {
@@ -661,7 +705,7 @@ fn anthropic_body(
         "model": model,
         "max_tokens": max_tokens,
         "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
+        "messages": turn_values(messages),
     });
     if let Some(schema) = schema {
         body["output_config"] = serde_json::json!({
@@ -677,15 +721,12 @@ fn anthropic_body(
 fn ollama_body(
     model: &str,
     system_prompt: &str,
-    user_message: &str,
+    messages: &[Message],
     max_tokens: u32,
     num_ctx: u32,
     schema: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    let messages = serde_json::json!([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]);
+    let messages = messages_with_system(system_prompt, messages);
     let options = serde_json::json!({
         "num_ctx": num_ctx,
         "temperature": 0,
@@ -860,7 +901,8 @@ mod tests {
 
     #[test]
     fn ollama_native_body_has_format_and_num_ctx() {
-        let body = ollama_body("qwen", "sys", "user", 4096, 24_576, Some(&schema()));
+        let user = [Message::user("user")];
+        let body = ollama_body("qwen", "sys", &user, 4096, 24_576, Some(&schema()));
         assert_eq!(body["stream"], false);
         assert_eq!(body["format"], schema());
         assert_eq!(body["options"]["num_ctx"], 24_576);
@@ -871,7 +913,7 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "user");
 
-        let plain = ollama_body("qwen", "sys", "user", 4096, 24_576, None);
+        let plain = ollama_body("qwen", "sys", &user, 4096, 24_576, None);
         assert!(plain.get("format").is_none(), "{plain}");
     }
 
@@ -915,19 +957,21 @@ mod tests {
 
     #[test]
     fn anthropic_body_has_output_config() {
-        let body = anthropic_body("claude", "sys", "user", 100, Some(&schema()));
+        let user = [Message::user("user")];
+        let body = anthropic_body("claude", "sys", &user, 100, Some(&schema()));
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["output_config"]["format"]["schema"], schema());
         assert_eq!(body["system"], "sys");
         assert_eq!(body["max_tokens"], 100);
 
-        let plain = anthropic_body("claude", "sys", "user", 100, None);
+        let plain = anthropic_body("claude", "sys", &user, 100, None);
         assert!(plain.get("output_config").is_none(), "{plain}");
     }
 
     #[test]
     fn openai_body_has_response_format() {
-        let body = openai_body("llama3.2", "sys", "user", 800, Some(&schema()));
+        let user = [Message::user("user")];
+        let body = openai_body("llama3.2", "sys", &user, 800, Some(&schema()));
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["name"], "extraction");
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema());
@@ -942,7 +986,8 @@ mod tests {
 
     #[test]
     fn plain_openai_body_matches_the_pre_schema_shape() {
-        let body = openai_body("llama3.2", "sys", "user", 800, None);
+        let user = [Message::user("user")];
+        let body = openai_body("llama3.2", "sys", &user, 800, None);
         assert_eq!(
             body,
             serde_json::json!({
@@ -954,6 +999,53 @@ mod tests {
                 ],
             })
         );
+    }
+
+    /// The worked example is a real turn on every HTTP style. Ollama's options
+    /// and schema field stay where a single-turn call puts them.
+    #[test]
+    fn chat_bodies_emit_the_turns_in_order() {
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant("example-assistant"),
+            Message::user("real-user"),
+        ];
+        let expected = [
+            ("user", "example-user"),
+            ("assistant", "example-assistant"),
+            ("user", "real-user"),
+        ];
+
+        let ollama = ollama_body("qwen", "sys", &messages, 4096, 24_576, Some(&schema()));
+        assert_eq!(ollama["format"], schema());
+        assert_eq!(ollama["stream"], false);
+        assert_eq!(ollama["options"]["num_ctx"], 24_576);
+        assert_eq!(ollama["options"]["temperature"], 0);
+        assert_eq!(ollama["options"]["num_predict"], 4096);
+        assert_eq!(ollama["messages"].as_array().map(Vec::len), Some(4));
+        assert_eq!(ollama["messages"][0]["role"], "system");
+        assert_eq!(ollama["messages"][0]["content"], "sys");
+        assert_roles(&ollama["messages"], 1, &expected);
+
+        let openai = openai_body("llama3.2", "sys", &messages, 800, Some(&schema()));
+        assert_eq!(openai["messages"].as_array().map(Vec::len), Some(4));
+        assert_eq!(openai["messages"][0]["role"], "system");
+        assert_eq!(openai["messages"][0]["content"], "sys");
+        assert_roles(&openai["messages"], 1, &expected);
+        assert_eq!(openai["response_format"]["json_schema"]["schema"], schema());
+
+        let anthropic = anthropic_body("claude", "sys", &messages, 100, Some(&schema()));
+        assert_eq!(anthropic["system"], "sys");
+        assert_eq!(anthropic["messages"].as_array().map(Vec::len), Some(3));
+        assert_roles(&anthropic["messages"], 0, &expected);
+        assert_eq!(anthropic["output_config"]["format"]["schema"], schema());
+    }
+
+    fn assert_roles(messages: &serde_json::Value, start: usize, expected: &[(&str, &str)]) {
+        for (offset, (role, content)) in expected.iter().enumerate() {
+            assert_eq!(messages[start + offset]["role"], *role);
+            assert_eq!(messages[start + offset]["content"], *content);
+        }
     }
 
     #[test]

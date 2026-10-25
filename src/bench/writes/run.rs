@@ -24,7 +24,7 @@ use crate::ephemeral::{self, EphemeralEntry};
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
 use crate::graph::confidence::PRIOR_CONCENTRATION;
-use crate::graph::llm::{Completion, LlmProvider};
+use crate::graph::llm::{Completion, LlmProvider, Message};
 use crate::graph::types::{ExtractedEntity, ExtractedRelationship, ExtractionResult};
 use crate::graph::{GraphMemory, IngestContext, PipelineVersion};
 use crate::search;
@@ -781,6 +781,20 @@ impl LlmProvider for Counting<'_> {
             .complete_structured(system_prompt, user_message, schema, max_tokens)
             .await
     }
+
+    /// The default would drop every turn but the last before the inner provider.
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, crate::graph::error::GraphError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .complete_structured_chat(system_prompt, messages, schema, max_tokens)
+            .await
+    }
 }
 
 struct BorrowedProvider<'a>(&'a dyn LlmProvider);
@@ -820,6 +834,18 @@ impl LlmProvider for BorrowedProvider<'_> {
             .complete_structured(system_prompt, user_message, schema, max_tokens)
             .await
     }
+
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, crate::graph::error::GraphError> {
+        self.0
+            .complete_structured_chat(system_prompt, messages, schema, max_tokens)
+            .await
+    }
 }
 
 /// Replays the script's claims.
@@ -827,6 +853,8 @@ impl LlmProvider for BorrowedProvider<'_> {
 /// The provider trait only receives prompt text, so a dedup prompt is told
 /// apart by the sentence `graph::dedup` opens with. Anything else is treated
 /// as extraction and answered from the turn whose text appears in the prompt.
+/// A pass-1 chat call is reduced to its last user message before that match,
+/// so the worked example is not scanned for claims.
 struct ScriptedExtractor {
     prepared: Vec<Prepared>,
     v2: Vec<V2Item>,

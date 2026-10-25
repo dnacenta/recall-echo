@@ -1093,6 +1093,7 @@ fn truncate_str(text: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::llm::Message;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1372,6 +1373,42 @@ mod tests {
             ]
         );
         assert_eq!(invocation.stdin.as_deref(), Some(USER));
+    }
+
+    /// Chat on a CLI is today's single-message argv and stdin: the last user turn.
+    #[tokio::test]
+    async fn structured_chat_matches_the_single_message_invocation() {
+        let mock =
+            MockCli::new(r#"printf '%s' '{"type":"result","structured_output":{"ok":true}}'"#);
+        let provider = mock.provider(
+            CliSection {
+                preset: Some(CliPreset::ClaudeCode),
+                ..CliSection::default()
+            },
+            "sonnet",
+        );
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant("{}"),
+            Message::user(USER),
+        ];
+        provider
+            .complete_structured_chat(SYSTEM, &messages, &schema, 128)
+            .await
+            .unwrap();
+        let chat_argv = mock.recorded_argv();
+        let chat_stdin = mock.recorded_stdin();
+        provider
+            .complete_structured(SYSTEM, USER, &schema, 128)
+            .await
+            .unwrap();
+        assert_eq!(mock.recorded_argv(), chat_argv);
+        assert_eq!(chat_stdin, USER);
+        assert_eq!(mock.recorded_stdin(), chat_stdin);
+        assert!(chat_argv.iter().any(|arg| arg == "--json-schema"));
+        assert!(!chat_argv.iter().any(|arg| arg.contains("example")));
+        assert!(!chat_stdin.contains("example"));
     }
 
     #[test]

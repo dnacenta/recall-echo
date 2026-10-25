@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 use super::super::error::GraphError;
 use super::super::ingest::IngestContext;
-use super::super::llm::{LlmProvider, TokenUsage};
+use super::super::llm::{LlmProvider, Message, TokenUsage};
 use super::super::llm_json::{self, JsonFailure};
 use super::super::types::{IngestionReport, StageTiming};
 use super::super::GraphMemory;
@@ -31,7 +31,7 @@ use super::schema::{
 use super::write;
 use crate::graph::Provenance;
 
-/// Pass-1 system prompt. Verbatim, with no trailing newline.
+/// Pass-1 instructions. The worked example is sent as its own turns.
 pub(crate) const PASS1_SYSTEM: &str = r#"You extract durable project memory from a coding-session transcript between a USER and a coding ASSISTANT.
 Extract EVERY fact worth remembering in a future session, one fact per distinct value: decisions, chosen technologies and tools, settings and their values (ports, versions, paths, commands, limits, thresholds, formats), project rules and conventions, plans, and people's durable preferences. Bugs and releases go in their own sections (below).
 
@@ -60,29 +60,24 @@ RELEASES (section "releases"): one entry per version that was released or is pla
 Evidence (every entry): turn = the N of the [TN] turn that states it; quote = an exact verbatim copy of 3-20 consecutive words from that turn that contains the value (copy characters exactly).
 confidence: 0.0-1.0 that this is a durable, correctly stated fact.
 
-EXAMPLE (a different project)
-Project: tidepool
+"#;
+
+/// Worked example, in the same shape as [`user_message`].
+pub(crate) const PASS1_EXAMPLE_USER: &str = r#"Project: tidepool
+Session date: 2026-01-02
+Transcript:
 [T0] USER: Let's build tidepool, a Go 1.22 service. Use chi for routing.
 [T1] ASSISTANT: Sure. We could also look at gorilla/mux. Default port 3000?
 [T2] USER: Port 9000. And never log request bodies.
 [T3] ASSISTANT: Found a bug: the cache returned stale entries because the TTL was ignored. Fixed by checking expires_at on read.
 [T4] USER: Let's move from Postgres to SQLite, Postgres is overkill here.
 [T5] USER: Tag v1.4.0 with the SQLite move and the cache fix. Metrics export is planned for v1.5.
-Output:
-{"facts":[
-{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"language","key":"","object":"Go","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"a Go 1.22 service","confidence":0.9},
-{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"go_version","object":"1.22","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"a Go 1.22 service","confidence":0.9},
-{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"web_framework","key":"","object":"chi","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"Use chi for routing","confidence":0.9},
-{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"web_framework","key":"","object":"gorilla/mux","object_type":"technology","status":"considered","replaces":"","turn":1,"quote":"We could also look at gorilla/mux","confidence":0.7},
-{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":2,"quote":"Port 9000.","confidence":0.9},
-{"subject":"tidepool","subject_type":"project","predicate":"rule","role":"none","key":"","object":"Never log request bodies.","object_type":"literal","status":"decided","replaces":"","turn":2,"quote":"never log request bodies","confidence":0.9},
-{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"database","key":"","object":"SQLite","object_type":"technology","status":"decided","replaces":"PostgreSQL","turn":4,"quote":"move from Postgres to SQLite","confidence":0.9},
-{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"database","key":"","object":"PostgreSQL","object_type":"technology","status":"rejected","replaces":"","turn":4,"quote":"move from Postgres to SQLite","confidence":0.9}],
-"bugs":[
-{"symptom":"cache returned stale entries","cause":"the TTL was ignored","fix":"check expires_at on read","status":"fixed","component":"cache","turn":3,"quote":"the cache returned stale entries because the TTL was ignored","confidence":0.8}],
-"releases":[
-{"version":"1.4.0","status":"released","contents":"SQLite move, cache fix","turn":5,"quote":"Tag v1.4.0 with the SQLite move and the cache fix","confidence":0.9},
-{"version":"1.5","status":"planned","contents":"metrics export","turn":5,"quote":"Metrics export is planned for v1.5","confidence":0.8}]}"#;
+
+Extract the durable facts, bugs and releases as JSON."#;
+
+/// Compact reply for [`PASS1_EXAMPLE_USER`]. Keys follow the order the schema
+/// has once it is serialised for the provider.
+pub(crate) const PASS1_EXAMPLE_REPLY: &str = r#"{"bugs":[{"cause":"the TTL was ignored","component":"cache","confidence":0.8,"fix":"check expires_at on read","quote":"the cache returned stale entries because the TTL was ignored","status":"fixed","symptom":"cache returned stale entries","turn":3}],"facts":[{"confidence":0.9,"key":"","object":"Go","object_type":"technology","predicate":"uses","quote":"a Go 1.22 service","replaces":"","role":"language","status":"decided","subject":"tidepool","subject_type":"project","turn":0},{"confidence":0.9,"key":"go_version","object":"1.22","object_type":"literal","predicate":"setting","quote":"a Go 1.22 service","replaces":"","role":"none","status":"decided","subject":"tidepool","subject_type":"project","turn":0},{"confidence":0.9,"key":"","object":"chi","object_type":"technology","predicate":"uses","quote":"Use chi for routing","replaces":"","role":"web_framework","status":"decided","subject":"tidepool","subject_type":"project","turn":0},{"confidence":0.7,"key":"","object":"gorilla/mux","object_type":"technology","predicate":"uses","quote":"We could also look at gorilla/mux","replaces":"","role":"web_framework","status":"considered","subject":"tidepool","subject_type":"project","turn":1},{"confidence":0.9,"key":"port","object":"9000","object_type":"literal","predicate":"setting","quote":"Port 9000.","replaces":"","role":"none","status":"decided","subject":"tidepool","subject_type":"project","turn":2},{"confidence":0.9,"key":"","object":"Never log request bodies.","object_type":"literal","predicate":"rule","quote":"never log request bodies","replaces":"","role":"none","status":"decided","subject":"tidepool","subject_type":"project","turn":2},{"confidence":0.9,"key":"","object":"SQLite","object_type":"technology","predicate":"uses","quote":"move from Postgres to SQLite","replaces":"PostgreSQL","role":"database","status":"decided","subject":"tidepool","subject_type":"project","turn":4},{"confidence":0.9,"key":"","object":"PostgreSQL","object_type":"technology","predicate":"uses","quote":"move from Postgres to SQLite","replaces":"","role":"database","status":"rejected","subject":"tidepool","subject_type":"project","turn":4}],"releases":[{"confidence":0.9,"contents":"SQLite move, cache fix","quote":"Tag v1.4.0 with the SQLite move and the cache fix","status":"released","turn":5,"version":"1.4.0"},{"confidence":0.8,"contents":"metrics export","quote":"Metrics export is planned for v1.5","status":"planned","turn":5,"version":"1.5"}]}"#;
 
 /// Output cap for one window.
 const MAX_TOKENS: u32 = 4096;
@@ -252,11 +247,16 @@ async fn call_window(
     report: &mut IngestionReport,
 ) -> Result<Map<String, Value>, String> {
     let message = user_message(&session.project.name, &session.date, window);
+    let messages = [
+        Message::user(PASS1_EXAMPLE_USER),
+        Message::assistant(PASS1_EXAMPLE_REPLY),
+        Message::user(message.clone()),
+    ];
     let mut last = String::new();
     for _ in 0..2 {
         report.llm_calls += 1;
         let completion = match llm
-            .complete_structured(PASS1_SYSTEM, &message, pass1_schema(), MAX_TOKENS)
+            .complete_structured_chat(PASS1_SYSTEM, &messages, pass1_schema(), MAX_TOKENS)
             .await
         {
             Ok(completion) => completion,
@@ -275,7 +275,11 @@ fn bill(report: &mut IngestionReport, usage: Option<TokenUsage>, message: &str, 
     match usage {
         Some(usage) => report.measured_tokens += usage.total(),
         None => {
-            let chars = PASS1_SYSTEM.len() + message.len() + reply.len();
+            let chars = PASS1_SYSTEM.len()
+                + PASS1_EXAMPLE_USER.len()
+                + PASS1_EXAMPLE_REPLY.len()
+                + message.len()
+                + reply.len();
             report.estimated_tokens += u64::try_from(chars / 4).unwrap_or(0);
         }
     }
@@ -920,16 +924,22 @@ mod tests {
                 Err(GraphError::Llm("plain complete was called".into()))
             }
 
-            async fn complete_structured(
+            async fn complete_structured_chat(
                 &self,
                 system: &str,
-                user: &str,
+                messages: &[Message],
                 schema: &Value,
                 max_tokens: u32,
             ) -> Result<crate::graph::llm::Completion, GraphError> {
                 assert_eq!(system, PASS1_SYSTEM);
-                assert!(user.contains("tidepool"), "{user}");
                 assert_eq!(max_tokens, MAX_TOKENS);
+                assert_eq!(messages.len(), 3);
+                assert_eq!(messages[0], Message::user(PASS1_EXAMPLE_USER));
+                assert_eq!(messages[1], Message::assistant(PASS1_EXAMPLE_REPLY));
+                assert_eq!(
+                    messages[2],
+                    Message::user(user_message("tidepool", "2026-01-02", "[T0] USER: hi"))
+                );
                 *self.0.lock().expect("lock") = Some(schema.clone());
                 Ok(crate::graph::llm::Completion::unmeasured(
                     r#"{"facts":[],"bugs":[],"releases":[]}"#,
@@ -966,14 +976,30 @@ mod tests {
 
     #[test]
     fn parses_reply_and_recites_quote() {
-        let example = PASS1_SYSTEM
-            .split_once("Output:\n")
-            .expect("prompt example")
-            .1;
-        let example = parsed_root(example).expect("prompt example matches the schema");
-        assert!(element_matches("facts", &example["facts"][0]));
-        assert!(element_matches("bugs", &example["bugs"][0]));
-        assert!(element_matches("releases", &example["releases"][0]));
+        let example = parsed_root(PASS1_EXAMPLE_REPLY).expect("prompt example matches the schema");
+        assert_eq!(
+            PASS1_EXAMPLE_REPLY,
+            serde_json::to_string(&example).expect("canonical"),
+            "example reply is compact JSON in serialised key order"
+        );
+        for section in ["facts", "bugs", "releases"] {
+            let items = example[section].as_array().expect(section);
+            assert!(!items.is_empty(), "{section}");
+            for item in items {
+                assert!(element_matches(section, item), "{section}: {item}");
+            }
+        }
+        let transcript = PASS1_EXAMPLE_USER
+            .split_once("Transcript:\n")
+            .expect("transcript")
+            .1
+            .strip_suffix("\n\nExtract the durable facts, bugs and releases as JSON.")
+            .expect("closing line");
+        assert_eq!(
+            PASS1_EXAMPLE_USER,
+            user_message("tidepool", "2026-01-02", transcript)
+        );
+        assert!(!PASS1_SYSTEM.contains("EXAMPLE"));
         let mut extra = example["facts"][0].clone();
         extra
             .as_object_mut()
@@ -1054,6 +1080,36 @@ mod tests {
         );
         assert!(facts.is_empty());
         assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn unmeasured_bill_includes_the_example() {
+        struct Bare;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Bare {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string())
+            }
+        }
+
+        let window = "[T0] USER: hi";
+        let mut report = IngestionReport::default();
+        call_window(&Bare, &session(turns()), window, &mut report)
+            .await
+            .expect("reply");
+        let message = user_message("tidepool", "2026-01-02", window);
+        let reply = r#"{"facts":[],"bugs":[],"releases":[]}"#;
+        let chars = PASS1_SYSTEM.len()
+            + PASS1_EXAMPLE_USER.len()
+            + PASS1_EXAMPLE_REPLY.len()
+            + message.len()
+            + reply.len();
+        assert_eq!(report.measured_tokens, 0);
+        assert_eq!(
+            report.estimated_tokens,
+            u64::try_from(chars / 4).unwrap_or(0)
+        );
     }
 
     #[test]
