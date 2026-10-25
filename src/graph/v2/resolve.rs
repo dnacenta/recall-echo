@@ -17,7 +17,7 @@ use super::super::crud;
 use super::super::error::GraphError;
 use super::super::llm::LlmProvider;
 use super::super::llm_json;
-use super::super::types::NewEntity;
+use super::super::types::{NewEntity, RejectedMatch, ResolveStats};
 use super::super::GraphMemory;
 use super::input::ProjectIdentity;
 use super::schema::{self, Kind};
@@ -30,7 +30,12 @@ For each NEW MENTION, if it is certainly the same real-world thing as a STORE en
 Never match different things just because they are related: a library is not the project that uses it, a component is not its project, two different libraries are different, a file is not the tool that reads it.
 When unsure, return "" (a new entity is created; that is always safe). One entry per NEW MENTION."#;
 
-const RESOLVER_MAX_TOKENS: u32 = 1024;
+const RESOLVER_TOKEN_BASE: u32 = 256;
+const RESOLVER_TOKENS_PER_MENTION: u32 = 64;
+const RESOLVER_TOKEN_CAP: u32 = 4096;
+/// Mentions that fit in [`RESOLVER_TOKEN_CAP`]. The rest become new entities.
+const RESOLVER_MENTION_CAP: usize =
+    ((RESOLVER_TOKEN_CAP - RESOLVER_TOKEN_BASE) / RESOLVER_TOKENS_PER_MENTION) as usize;
 const SIMILAR_RATIO: f64 = 0.8;
 const SUBSET_CHARS: usize = 4;
 
@@ -71,23 +76,7 @@ pub(crate) struct Resolved {
 }
 
 /// Mentions, tier hits, and what the resolver was allowed to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolveReport {
-    pub mentions: u32,
-    pub tier_name_kind: u32,
-    pub tier_alias: u32,
-    pub tier_name_any: u32,
-    pub resolver_called: u32,
-    pub accepted: u32,
-    pub rejected: Vec<RejectedProposal>,
-}
-
-/// A model proposal the guard refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RejectedProposal {
-    pub mention: String,
-    pub match_id: String,
-}
+pub(crate) type ResolveReport = ResolveStats;
 
 #[derive(Clone)]
 struct OpenMention {
@@ -111,7 +100,18 @@ struct Row {
 
 struct Index {
     rows: Vec<Row>,
+    by_id: HashMap<String, usize>,
+    by_norm: HashMap<String, Vec<usize>>,
     alias_of: HashMap<String, String>,
+}
+
+struct PromptGroup {
+    mention: OpenMention,
+    rows: Vec<usize>,
+}
+
+struct PromptPlan {
+    groups: Vec<PromptGroup>,
 }
 
 enum Tier {
@@ -137,23 +137,48 @@ pub(crate) fn ratio(left: &str, right: &str) -> f64 {
     }
 }
 
-/// True when two normalised names are the same thing under the guard.
+/// True when two names are the same thing under the guard.
 ///
 /// A character substring of one token is not a token match: `uv` does not
 /// share a token with `uvicorn`. The ratio can still hold for a longer prefix.
+/// An acronym matches only when the long side has at least two tokens: plain
+/// initials (`aws` / `amazon web services`, `ga` / `github actions`) or the
+/// same initials with one compound hump (`gha` / `github actions`). A single
+/// token is never an acronym, so `pt` is not `postgres`.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn similar(left: &str, right: &str) -> bool {
-    let left = normalise(left);
-    let right = normalise(right);
+    similar_norm(&normalise(left), &normalise(right))
+}
+
+/// `left` and `right` are already normalised.
+fn similar_norm(left: &str, right: &str) -> bool {
     if left.is_empty() || right.is_empty() {
         return false;
     }
-    if left == right || same_tokens(&left, &right) {
+    if left == right || same_tokens(left, right) {
         return true;
     }
-    token_subset(&left, &right)
-        || initials_match(&left, &right)
-        || ratio(&left, &right) >= SIMILAR_RATIO
+    if token_subset(left, right) || initials_match(left, right) {
+        return true;
+    }
+    // The ratio cannot reach 0.8 when the shorter string is under two thirds
+    // of the longer one. Skipping it does not change the result: the other
+    // clauses have already been tried. A first-token reject is not used,
+    // because `aws` / `amazon web services` and `postgres` / `postgresql`
+    // do not share a first token and are still similar.
+    ratio_can_reach(left, right) && ratio(left, right) >= SIMILAR_RATIO
+}
+
+fn ratio_can_reach(left: &str, right: &str) -> bool {
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let (short, long) = if left_len <= right_len {
+        (left_len, right_len)
+    } else {
+        (right_len, left_len)
+    };
+    3 * short >= 2 * long
 }
 
 /// Resolve every mention for this session. At most one resolver call.
@@ -165,15 +190,11 @@ pub(crate) async fn resolve_session(
 ) -> Result<Resolution, GraphError> {
     let mut index = Index::load(gm).await?;
     seed_project(gm, &mut index, project).await?;
-    let mut report = ResolveReport {
+    let mut report = ResolveStats {
         mentions: u32::try_from(mentions.len()).unwrap_or(u32::MAX),
-        tier_name_kind: 0,
-        tier_alias: 0,
-        tier_name_any: 0,
-        resolver_called: 0,
-        accepted: 0,
-        rejected: Vec::new(),
+        ..ResolveStats::default()
     };
+    let project_norm = normalise(&project.name);
     let mut created = 0u32;
     let mut bound: HashMap<(String, Kind), String> = HashMap::new();
     let mut seen = HashSet::new();
@@ -203,8 +224,11 @@ pub(crate) async fn resolve_session(
         if take_tier(gm, &mut index, &mut bound, &mut report, &mention).await? {
             continue;
         }
-        create_entity(gm, &mut index, &mut bound, project, &mention).await?;
+        create_entity(gm, &mut index, &mut bound, &mention).await?;
         created += 1;
+        if mention.kind == Kind::Project && mention.norm == project_norm {
+            seed_project(gm, &mut index, project).await?;
+        }
     }
     Ok(Resolution {
         bindings: snapshot(&index, &bound),
@@ -266,32 +290,47 @@ async fn ask_resolver(
     report: &mut ResolveReport,
     pending: &mut Vec<OpenMention>,
 ) -> Result<(), GraphError> {
-    let prompted: Vec<OpenMention> = pending
-        .iter()
-        .filter(|mention| sends_to_resolver(mention.kind) && index.has_candidate(mention))
-        .cloned()
-        .collect();
-    if prompted.is_empty() {
+    let plan = index.prompt_plan(pending);
+    if plan.groups.is_empty() {
         return Ok(());
     }
-    let candidates = index.candidate_rows(&prompted);
-    if candidates.is_empty() {
+    let prompted = cap_prompt(plan.groups, report);
+    let mut row_idxs = Vec::new();
+    let mut seen_rows = HashSet::new();
+    for group in &prompted {
+        for idx in &group.rows {
+            if seen_rows.insert(*idx) {
+                row_idxs.push(*idx);
+            }
+        }
+    }
+    row_idxs.sort_by(|&left, &right| index.rows[left].id.cmp(&index.rows[right].id));
+    if row_idxs.is_empty() {
         return Ok(());
     }
+    let prompted: Vec<OpenMention> = prompted.into_iter().map(|group| group.mention).collect();
     report.resolver_called = 1;
-    let message = resolver_message(&candidates, &prompted);
-    let completion = llm
-        .complete_structured(
-            PASS2_SYSTEM,
-            &message,
-            resolver_schema(),
-            RESOLVER_MAX_TOKENS,
-        )
-        .await?;
+    let message = resolver_message(&index.rows_at(&row_idxs), &prompted);
+    let tokens = resolver_tokens(prompted.len());
+    let completion = match llm
+        .complete_structured(PASS2_SYSTEM, &message, resolver_schema(), tokens)
+        .await
+    {
+        Ok(completion) => completion,
+        Err(_) => {
+            report
+                .notes
+                .push("resolver unavailable; leftovers created as new entities".to_string());
+            return Ok(());
+        }
+    };
     let Some(answers) = parse_answers(&completion.text) else {
         return Ok(());
     };
-    let candidate_ids: HashSet<String> = candidates.iter().map(|row| row.id.clone()).collect();
+    let candidate_ids: HashSet<String> = row_idxs
+        .iter()
+        .map(|idx| index.rows[*idx].id.clone())
+        .collect();
     apply_answers(
         gm,
         index,
@@ -328,7 +367,7 @@ async fn apply_answers(
             report.accepted += 1;
             pending.retain(|item| !(item.norm == mention.norm && item.kind == mention.kind));
         } else {
-            report.rejected.push(RejectedProposal {
+            report.rejected.push(RejectedMatch {
                 mention: mention.name.clone(),
                 match_id,
             });
@@ -351,22 +390,40 @@ fn accept_match(
     if mention.kind != Kind::Project && row.kind == Kind::Project {
         return None;
     }
-    let names = row.names();
-    names
-        .iter()
-        .any(|name| similar(&mention.norm, name))
-        .then_some(id)
+    let matched = similar_norm(&mention.norm, &row.norm)
+        || row
+            .aliases
+            .iter()
+            .any(|alias| similar_norm(&mention.norm, alias));
+    matched.then_some(id)
 }
 
 fn sends_to_resolver(kind: Kind) -> bool {
     !matches!(kind, Kind::Issue | Kind::Release)
 }
 
+fn cap_prompt(mut groups: Vec<PromptGroup>, report: &mut ResolveStats) -> Vec<PromptGroup> {
+    if groups.len() > RESOLVER_MENTION_CAP {
+        let held = groups.len() - RESOLVER_MENTION_CAP;
+        report.notes.push(format!(
+            "{held} mentions were not sent to the resolver and were created as new entities"
+        ));
+        groups.truncate(RESOLVER_MENTION_CAP);
+    }
+    groups
+}
+
+fn resolver_tokens(mentions: usize) -> u32 {
+    let mentions = u32::try_from(mentions).unwrap_or(u32::MAX);
+    RESOLVER_TOKEN_BASE
+        .saturating_add(mentions.saturating_mul(RESOLVER_TOKENS_PER_MENTION))
+        .min(RESOLVER_TOKEN_CAP)
+}
+
 async fn create_entity(
     gm: &GraphMemory,
     index: &mut Index,
     bound: &mut HashMap<(String, Kind), String>,
-    project: &ProjectIdentity,
     mention: &OpenMention,
 ) -> Result<(), GraphError> {
     let attributes = json!({ "v2": { "kind": mention.kind.as_str(), "slots": [] } });
@@ -382,7 +439,7 @@ async fn create_entity(
         })
         .await?;
     let id = entity.id_string();
-    index.rows.push(Row {
+    index.push_row(Row {
         id: id.clone(),
         name: mention.name.clone(),
         norm: mention.norm.clone(),
@@ -391,7 +448,7 @@ async fn create_entity(
         aliases: Vec::new(),
     });
     bound.insert((mention.norm.clone(), mention.kind), id);
-    seed_project(gm, index, project).await
+    Ok(())
 }
 
 async fn maybe_upgrade(
@@ -595,21 +652,43 @@ fn token_set(text: &str) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Acronym match. The long side must have at least two tokens. The short
+/// side, spaces removed, equals either the plain initials of those tokens
+/// or the initials where a compound token may also contribute its hump
+/// letter. `github` contributes `g` and `h`, so `gha` matches `github
+/// actions` and `ga` matches the plain initials. A one-token name is never
+/// an acronym: `pt` does not match `postgres`.
 fn initials_match(left: &str, right: &str) -> bool {
-    let left_flat: String = left.chars().filter(|ch| *ch != ' ').collect();
-    let right_flat: String = right.chars().filter(|ch| *ch != ' ').collect();
-    let left_initials = initials_of(left);
-    let right_initials = initials_of(right);
-    (!left_initials.is_empty() && left_initials == right_flat)
-        || (!right_initials.is_empty() && right_initials == left_flat)
+    acronym_of(left, right) || acronym_of(right, left)
 }
 
-/// First letter of each word. A closed compound also contributes the first
-/// letter of its trailing piece, so "github actions" yields "gha".
-fn initials_of(text: &str) -> String {
+fn acronym_of(short: &str, long: &str) -> bool {
+    let tokens: Vec<&str> = long
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.len() < 2 {
+        return false;
+    }
+    let flat: String = short.chars().filter(|ch| *ch != ' ').collect();
+    if flat.is_empty() {
+        return false;
+    }
+    flat == plain_initials(&tokens) || flat == hump_initials(&tokens)
+}
+
+fn plain_initials(tokens: &[&str]) -> String {
+    tokens
+        .iter()
+        .filter_map(|token| token.chars().next())
+        .collect()
+}
+
+/// First letter of each token, plus one compound hump when the token has one.
+fn hump_initials(tokens: &[&str]) -> String {
     let mut out = String::new();
-    for word in text.split_whitespace() {
-        let chars: Vec<char> = word.chars().collect();
+    for token in tokens {
+        let chars: Vec<char> = token.chars().collect();
         let Some(first) = chars.first() else {
             continue;
         };
@@ -741,9 +820,18 @@ fn collapse_blocks(blocks: Vec<(usize, usize, usize)>) -> Vec<Span> {
 }
 
 impl Index {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            by_id: HashMap::new(),
+            by_norm: HashMap::new(),
+            alias_of: HashMap::new(),
+        }
+    }
+
     async fn load(gm: &GraphMemory) -> Result<Self, GraphError> {
         let entities = crud::list_entities(gm.db(), None).await?;
-        let mut rows = Vec::new();
+        let mut index = Self::new();
         for entity in entities {
             let Some(kind) = entity
                 .attributes
@@ -755,7 +843,7 @@ impl Index {
             else {
                 continue;
             };
-            rows.push(Row {
+            index.push_row(Row {
                 id: entity.id_string(),
                 norm: normalise(&entity.name),
                 name: entity.name.clone(),
@@ -764,51 +852,68 @@ impl Index {
                 aliases: Vec::new(),
             });
         }
-        let mut alias_of = HashMap::new();
         for (name, entity) in crud::list_aliases(gm.db()).await? {
-            if let Some(row) = rows.iter_mut().find(|row| ids_match(&row.id, &entity)) {
-                row.aliases.push(name.clone());
-                alias_of.insert(name, row.id.clone());
-            }
+            index.note_alias(&name, &entity);
         }
-        Ok(Self { rows, alias_of })
+        Ok(index)
+    }
+
+    fn push_row(&mut self, row: Row) {
+        let idx = self.rows.len();
+        self.by_id.insert(canonical_id(&row.id), idx);
+        self.by_norm.entry(row.norm.clone()).or_default().push(idx);
+        self.rows.push(row);
     }
 
     fn hit(&self, mention: &OpenMention) -> Option<(String, Tier)> {
-        if let Some(row) = self
-            .rows
-            .iter()
-            .find(|row| row.norm == mention.norm && row.kind == mention.kind)
-        {
-            return Some((row.id.clone(), Tier::NameKind));
+        if let Some(indexes) = self.by_norm.get(&mention.norm) {
+            if let Some(row) = indexes
+                .iter()
+                .map(|idx| &self.rows[*idx])
+                .find(|row| row.kind == mention.kind)
+            {
+                return Some((row.id.clone(), Tier::NameKind));
+            }
         }
         if let Some(id) = self.alias_of.get(&mention.norm) {
             return Some((id.clone(), Tier::Alias));
         }
-        self.rows
-            .iter()
-            .filter(|row| row.norm == mention.norm)
-            .max_by_key(|row| row.kind.priority())
-            .map(|row| (row.id.clone(), Tier::NameAny))
+        self.by_norm.get(&mention.norm).and_then(|indexes| {
+            indexes
+                .iter()
+                .map(|idx| &self.rows[*idx])
+                .max_by_key(|row| row.kind.priority())
+                .map(|row| (row.id.clone(), Tier::NameAny))
+        })
     }
 
-    fn has_candidate(&self, mention: &OpenMention) -> bool {
-        self.rows.iter().any(|row| self.is_candidate(row, mention))
+    /// One pass: each leftover that has a candidate, with the row indexes it matched.
+    fn prompt_plan(&self, pending: &[OpenMention]) -> PromptPlan {
+        let mut groups = Vec::new();
+        for mention in pending {
+            if !sends_to_resolver(mention.kind) {
+                continue;
+            }
+            let rows: Vec<usize> = self
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| self.is_candidate(row, mention))
+                .map(|(idx, _)| idx)
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            groups.push(PromptGroup {
+                mention: mention.clone(),
+                rows,
+            });
+        }
+        PromptPlan { groups }
     }
 
-    fn candidate_rows(&self, mentions: &[OpenMention]) -> Vec<&Row> {
-        let mut rows: Vec<&Row> = self
-            .rows
-            .iter()
-            .filter(|row| {
-                mentions
-                    .iter()
-                    .any(|mention| self.is_candidate(row, mention))
-            })
-            .collect();
-        rows.sort_by(|left, right| left.id.cmp(&right.id));
-        rows.dedup_by(|left, right| left.id == right.id);
-        rows
+    fn rows_at(&self, indexes: &[usize]) -> Vec<&Row> {
+        indexes.iter().map(|idx| &self.rows[*idx]).collect()
     }
 
     fn is_candidate(&self, row: &Row, mention: &OpenMention) -> bool {
@@ -818,25 +923,32 @@ impl Index {
         if mention.kind != Kind::Project && row.kind == Kind::Project {
             return false;
         }
-        row.names().iter().any(|name| similar(&mention.norm, name))
+        similar_norm(&mention.norm, &row.norm)
+            || row
+                .aliases
+                .iter()
+                .any(|alias| similar_norm(&mention.norm, alias))
     }
 
     fn project_id(&self, norm: &str) -> Option<String> {
-        self.rows
-            .iter()
-            .find(|row| row.kind == Kind::Project && row.norm == norm)
-            .map(|row| row.id.clone())
+        self.by_norm.get(norm).and_then(|indexes| {
+            indexes.iter().find_map(|idx| {
+                let row = &self.rows[*idx];
+                (row.kind == Kind::Project).then(|| row.id.clone())
+            })
+        })
+    }
+
+    fn row_index(&self, id: &str) -> Option<usize> {
+        self.by_id.get(&canonical_id(id)).copied()
     }
 
     fn row(&self, id: &str) -> Option<&Row> {
-        self.rows.iter().find(|row| ids_match(&row.id, id))
+        self.row_index(id).map(|idx| &self.rows[idx])
     }
 
     fn find_id(&self, match_id: &str) -> Option<String> {
-        self.rows
-            .iter()
-            .find(|row| ids_match(&row.id, match_id))
-            .map(|row| row.id.clone())
+        self.row(match_id).map(|row| row.id.clone())
     }
 
     fn norm_of(&self, id: &str) -> String {
@@ -854,38 +966,24 @@ impl Index {
     }
 
     fn set_kind(&mut self, id: &str, kind: Kind, attributes: Value) {
-        if let Some(row) = self.rows.iter_mut().find(|row| ids_match(&row.id, id)) {
-            row.kind = kind;
-            row.attributes = attributes;
-        }
+        let Some(idx) = self.row_index(id) else {
+            return;
+        };
+        self.rows[idx].kind = kind;
+        self.rows[idx].attributes = attributes;
     }
 
     fn note_alias(&mut self, folded: &str, entity_id: &str) {
-        let Some(row) = self
-            .rows
-            .iter_mut()
-            .find(|row| ids_match(&row.id, entity_id))
-        else {
+        let Some(idx) = self.row_index(entity_id) else {
             return;
         };
+        let row = &mut self.rows[idx];
         if !row.aliases.iter().any(|alias| alias == folded) {
             row.aliases.push(folded.to_string());
         }
         let id = row.id.clone();
         self.alias_of.insert(folded.to_string(), id);
     }
-}
-
-impl Row {
-    fn names(&self) -> Vec<String> {
-        let mut names = vec![self.norm.clone()];
-        names.extend(self.aliases.iter().cloned());
-        names
-    }
-}
-
-fn ids_match(stored: &str, other: &str) -> bool {
-    canonical_id(stored) == canonical_id(other)
 }
 
 fn canonical_id(raw: &str) -> String {
@@ -1063,6 +1161,124 @@ mod tests {
     }
 
     #[test]
+    fn acronyms_need_two_tokens() {
+        for (left, right) in [
+            ("aws", "amazon web services"),
+            ("gcp", "google cloud platform"),
+            ("ci", "continuous integration"),
+            ("ga", "github actions"),
+            ("gha", "github actions"),
+        ] {
+            assert!(similar(left, right), "{left} / {right}");
+            assert!(similar(right, left), "{right} / {left}");
+        }
+        for (left, right) in [
+            ("pt", "postgres"),
+            ("kr", "kubernetes"),
+            ("uc", "uvicorn"),
+            ("ft", "fastapi"),
+            ("db", "database"),
+            ("uv", "uvicorn"),
+            ("pg", "pgvector"),
+        ] {
+            assert!(!similar(left, right), "{left} / {right}");
+            assert!(!similar(right, left), "{right} / {left}");
+        }
+    }
+
+    #[test]
+    fn length_gate_does_not_change_similarity() {
+        let words = [
+            "uv",
+            "uvicorn",
+            "pg",
+            "pgvector",
+            "postgres",
+            "postgresql",
+            "gha",
+            "ga",
+            "github actions",
+            "typer",
+            "typer cli",
+            "aws",
+            "amazon web services",
+            "gcp",
+            "google cloud platform",
+            "ci",
+            "continuous integration",
+            "pt",
+            "kr",
+            "kubernetes",
+            "uc",
+            "ft",
+            "fastapi",
+            "db",
+            "database",
+            "kitten",
+            "sitting",
+            "redis",
+            "nginx",
+            "linkshelf",
+            "shelf",
+            "a",
+            "b",
+            "",
+            "abc",
+        ];
+        for left in words {
+            for right in words {
+                assert_eq!(
+                    similar(left, right),
+                    similar_without_length_gate(left, right),
+                    "{left} / {right}"
+                );
+            }
+        }
+    }
+
+    fn similar_without_length_gate(left: &str, right: &str) -> bool {
+        let left = normalise(left);
+        let right = normalise(right);
+        if left.is_empty() || right.is_empty() {
+            return false;
+        }
+        if left == right || same_tokens(&left, &right) {
+            return true;
+        }
+        token_subset(&left, &right)
+            || initials_match(&left, &right)
+            || ratio(&left, &right) >= SIMILAR_RATIO
+    }
+
+    #[test]
+    fn resolver_budget_scales_and_caps() {
+        assert_eq!(resolver_tokens(1), 320);
+        assert_eq!(resolver_tokens(RESOLVER_MENTION_CAP), RESOLVER_TOKEN_CAP);
+        assert_eq!(
+            resolver_tokens(RESOLVER_MENTION_CAP + 10),
+            RESOLVER_TOKEN_CAP
+        );
+        let groups = (0..=RESOLVER_MENTION_CAP)
+            .map(|index| PromptGroup {
+                mention: OpenMention {
+                    norm: format!("n{index}"),
+                    name: format!("n{index}"),
+                    kind: Kind::Technology,
+                    subject: "app".into(),
+                    predicate: "uses".into(),
+                    object: format!("n{index}"),
+                },
+                rows: vec![0],
+            })
+            .collect();
+        let mut report = ResolveStats::default();
+        let capped = cap_prompt(groups, &mut report);
+        assert_eq!(capped.len(), RESOLVER_MENTION_CAP);
+        assert_eq!(report.notes.len(), 1);
+        assert!(report.notes[0].contains("1 mentions"));
+    }
+
+    #[test]
     fn ratcliff_ratio_matches_sequence_matcher() {
         // 2 * matched / (len a + len b), longest blocks, no autojunk.
         assert!((ratio("", "") - 1.0).abs() < 1e-12);
@@ -1207,7 +1423,7 @@ mod tests {
             .unwrap()
             .id_string();
         let llm = FixedId {
-            id: uv_id,
+            id: uv_id.clone(),
             calls: AtomicUsize::new(0),
         };
         let resolved =
@@ -1217,6 +1433,8 @@ mod tests {
         assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
         assert_eq!(resolved.report.accepted, 0);
         assert_eq!(resolved.report.rejected.len(), 1);
+        assert_eq!(resolved.report.rejected[0].mention, "uvicorn");
+        assert_eq!(resolved.report.rejected[0].match_id, uv_id);
         assert_eq!(resolved.entities_created, 1);
         let found = names(&gm).await;
         assert!(found.iter().any(|name| name == "uv"));
@@ -1374,5 +1592,178 @@ mod tests {
             edge["alpha"].as_f64().unwrap(),
             edge["beta"].as_f64().unwrap(),
         )
+    }
+
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Down {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            Err(GraphError::Llm("provider down".into()))
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn resolver_provider_error_still_writes_the_fact() {
+        let (_tmp, gm) = open_store().await;
+        let project = empty_project();
+        let quiet = Reply::new("nope");
+        resolve_session(
+            &gm,
+            &quiet,
+            &project,
+            &[mention("uvicorn worker", Kind::Technology)],
+        )
+        .await
+        .unwrap();
+        let ctx = WriteCtx {
+            llm: &Down,
+            project: &project,
+            session_id: "s1",
+            date: "2026-01-02",
+        };
+        let stats = write_facts(&gm, &ctx, &[uses("uvicorn")]).await.unwrap();
+        assert_eq!(stats.edges, 1);
+        assert_eq!(stats.resolve.resolver_called, 1);
+        assert!(stats
+            .resolve
+            .notes
+            .iter()
+            .any(|note| note.contains("unavailable")));
+        assert!(names(&gm).await.iter().any(|name| name == "uvicorn"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_proposal_is_on_the_write_report() {
+        let (_tmp, gm) = open_store().await;
+        let project = empty_project();
+        let quiet = Reply::new("nope");
+        resolve_session(&gm, &quiet, &project, &[mention("uv", Kind::Technology)])
+            .await
+            .unwrap();
+        resolve_session(
+            &gm,
+            &quiet,
+            &project,
+            &[mention("uvicorn worker", Kind::Technology)],
+        )
+        .await
+        .unwrap();
+        let uv_id = crud::list_entities(gm.db(), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "uv")
+            .unwrap()
+            .id_string();
+        let llm = FixedId {
+            id: uv_id.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let ctx = WriteCtx {
+            llm: &llm,
+            project: &project,
+            session_id: "s1",
+            date: "2026-01-02",
+        };
+        let stats = write_facts(&gm, &ctx, &[uses("uvicorn")]).await.unwrap();
+        assert_eq!(stats.edges, 1);
+        assert_eq!(stats.resolve.rejected.len(), 1);
+        assert_eq!(stats.resolve.rejected[0].mention, "uvicorn");
+        assert_eq!(stats.resolve.rejected[0].match_id, uv_id);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn alias_resolves_after_reopening_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("graph");
+        {
+            let gm = GraphMemory::open_embedded(&path).await.unwrap();
+            let llm = Reply::new("nope");
+            let project = empty_project();
+            let first = resolve_session(&gm, &llm, &project, &[mention("Postgres", Kind::Project)])
+                .await
+                .unwrap();
+            let id = first.bindings[0].entity.id.clone();
+            crud::put_alias(gm.db(), "postgresql", &id).await.unwrap();
+        }
+        let gm = GraphMemory::open_embedded(&path).await.unwrap();
+        let llm = Reply::new("nope");
+        let project = empty_project();
+        let again = resolve_session(
+            &gm,
+            &llm,
+            &project,
+            &[mention("PostgreSQL", Kind::Technology)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.report.tier_alias, 1);
+        assert_eq!(again.report.resolver_called, 0);
+        assert_eq!(again.entities_created, 0);
+        assert_eq!(llm.calls(), 0);
+        assert_eq!(names(&gm).await, vec!["Postgres".to_string()]);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn project_identity_aliases_are_seeded_once() {
+        let (_tmp, gm) = open_store().await;
+        let llm = Reply::new("nope");
+        let project = ProjectIdentity {
+            name: "linkshelf".into(),
+            aliases: vec!["shelf".into()],
+        };
+        resolve_session(&gm, &llm, &project, &[mention("linkshelf", Kind::Project)])
+            .await
+            .unwrap();
+        let again = resolve_session(&gm, &llm, &project, &[mention("shelf", Kind::Component)])
+            .await
+            .unwrap();
+        assert_eq!(again.report.tier_alias, 1);
+        assert_eq!(again.entities_created, 0);
+        assert_eq!(llm.calls(), 0);
+        assert_eq!(names(&gm).await, vec!["linkshelf".to_string()]);
+        assert_eq!(crud::list_aliases(gm.db()).await.unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn resolver_match_upgrades_kind() {
+        let (_tmp, gm) = open_store().await;
+        let project = empty_project();
+        let quiet = Reply::new("nope");
+        resolve_session(
+            &gm,
+            &quiet,
+            &project,
+            &[mention("Postgres", Kind::Technology)],
+        )
+        .await
+        .unwrap();
+        let matcher = MatchNamed {
+            target: "Postgres".into(),
+            calls: AtomicUsize::new(0),
+        };
+        let upgraded = resolve_session(
+            &gm,
+            &matcher,
+            &project,
+            &[mention("PostgreSQL", Kind::Project)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(upgraded.report.accepted, 1);
+        assert_eq!(upgraded.entities_created, 0);
+        assert_eq!(kind_of(&gm, "Postgres").await, Kind::Project);
+        let entity = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(entity.len(), 1);
+        assert_eq!(
+            entity[0].entity_type,
+            crate::graph::types::EntityType::Project
+        );
     }
 }

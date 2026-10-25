@@ -80,6 +80,8 @@ pub struct SessionObservation {
     pub kept: u32,
     /// Drops by reason. Empty on v1, and when nothing was dropped.
     pub drops: HashMap<String, u32>,
+    /// Entity resolution for a v2 session. Blank on v1.
+    pub resolve: crate::graph::types::ResolveStats,
 }
 
 /// Precision and recall for one operation.
@@ -159,6 +161,12 @@ pub struct SessionReport {
     /// Drops by reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
+    /// Entity resolution. Blank on v1, and omitted from the printed report then.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::ResolveStats::is_blank"
+    )]
+    pub resolve: crate::graph::types::ResolveStats,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -460,6 +468,7 @@ pub fn grade(
                 candidates: s.candidates,
                 kept: s.kept,
                 drops: s.drops.clone(),
+                resolve: s.resolve.clone(),
             })
             .collect(),
         steps,
@@ -1583,6 +1592,7 @@ mod tests {
             candidates: 0,
             kept: 0,
             drops: HashMap::new(),
+            resolve: crate::graph::types::ResolveStats::default(),
         }
     }
 

@@ -168,6 +168,7 @@ async fn collect_sessions(
             candidates: report.candidates,
             kept: report.kept,
             drops: report.drops,
+            resolve: report.resolve,
         });
         before = after;
     }

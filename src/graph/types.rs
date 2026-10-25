@@ -717,6 +717,49 @@ pub struct PipelineEntry {
     pub sub_type: Option<String>,
 }
 
+/// What entity resolution did in one session.
+///
+/// Tier hits, whether the resolver ran, and the proposals it made that the
+/// guard refused. Empty on a v1 ingest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveStats {
+    pub mentions: u32,
+    pub tier_name_kind: u32,
+    pub tier_alias: u32,
+    pub tier_name_any: u32,
+    /// `1` when the resolver was called, `0` otherwise.
+    pub resolver_called: u32,
+    pub accepted: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedMatch>,
+    /// Truncation and a resolver that could not be called. The leftovers
+    /// were still written as new entities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl ResolveStats {
+    /// Nothing was resolved. v1 reports stay bare.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.mentions == 0
+            && self.tier_name_kind == 0
+            && self.tier_alias == 0
+            && self.tier_name_any == 0
+            && self.resolver_called == 0
+            && self.accepted == 0
+            && self.rejected.is_empty()
+            && self.notes.is_empty()
+    }
+}
+
+/// A resolver proposal the guard refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedMatch {
+    pub mention: String,
+    pub match_id: String,
+}
+
 /// Result of a full ingestion run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionReport {
@@ -776,6 +819,9 @@ pub struct IngestionReport {
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
+    /// Entity resolution for this session. Blank on v1.
+    #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
+    pub resolve: ResolveStats,
 }
 
 fn u32_is_zero(value: &u32) -> bool {

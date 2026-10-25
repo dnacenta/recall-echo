@@ -920,8 +920,43 @@ fn v2_report_suffix(report: &IngestionReport) -> String {
             .join(",")
     };
     format!(
-        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept",
-        report.windows, report.llm_calls, report.candidates, report.kept
+        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept{}",
+        report.windows,
+        report.llm_calls,
+        report.candidates,
+        report.kept,
+        resolve_suffix(&report.resolve)
+    )
+}
+
+#[cfg(feature = "llm")]
+fn resolve_suffix(stats: &ResolveStats) -> String {
+    if stats.is_blank() {
+        return String::new();
+    }
+    let rejected = if stats.rejected.is_empty() {
+        "none".to_string()
+    } else {
+        stats
+            .rejected
+            .iter()
+            .map(|item| format!("{}->{}", item.mention, item.match_id))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let notes = if stats.notes.is_empty() {
+        String::new()
+    } else {
+        format!(", notes {}", stats.notes.join("; "))
+    };
+    format!(
+        ", resolve mentions {}, tier {}/{}/{}, called {}, accepted {}, rejected {rejected}{notes}",
+        stats.mentions,
+        stats.tier_name_kind,
+        stats.tier_alias,
+        stats.tier_name_any,
+        stats.resolver_called,
+        stats.accepted
     )
 }
 
@@ -2237,6 +2272,18 @@ mod tests {
         assert_eq!(
             v2_report_suffix(&v2),
             ", 2 windows, 3 calls, 4 candidates, drops parse=1, 3 kept"
+        );
+
+        v2.resolve.rejected.push(RejectedMatch {
+            mention: "uvicorn".into(),
+            match_id: "entity:uv".into(),
+        });
+        v2.resolve.mentions = 2;
+        v2.resolve.resolver_called = 1;
+        assert!(
+            v2_report_suffix(&v2).contains("rejected uvicorn->entity:uv"),
+            "{}",
+            v2_report_suffix(&v2)
         );
     }
 

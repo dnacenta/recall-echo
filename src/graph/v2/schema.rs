@@ -24,6 +24,7 @@ pub(crate) const DROP_VERSION: &str = "bad_version";
 pub(crate) const DROP_PARSE: &str = "parse";
 pub(crate) const DROP_TOO_LONG: &str = "too_long";
 pub(crate) const DROP_OVERFLOW: &str = "overflow";
+pub(crate) const DROP_UNRESOLVED: &str = "unresolved";
 
 /// Confidence below this is not a durable fact.
 const MIN_CONFIDENCE: f64 = 0.6;

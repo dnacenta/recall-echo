@@ -31,7 +31,7 @@ pub(crate) const V2_REFUSAL: &str = "this graph was built by pipeline v1; re-ext
 const STAMP_V2: &str = "v2";
 
 /// What one batch of facts did to the store.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WriteStats {
     pub entities_created: u32,
     pub edges: u32,
@@ -41,6 +41,10 @@ pub(crate) struct WriteStats {
     pub already_seen: u32,
     /// Resolver calls made while binding mentions. Zero or one.
     pub resolver_calls: u32,
+    /// Facts dropped because a mention had no binding. The session still writes.
+    pub unresolved: u32,
+    /// Tier hits and rejected resolver proposals for this batch.
+    pub resolve: resolve::ResolveReport,
 }
 
 /// What one session's write needs besides the facts.
@@ -116,6 +120,7 @@ pub(crate) async fn write_facts(
     let mut stats = WriteStats {
         entities_created: resolution.entities_created,
         resolver_calls: resolution.report.resolver_called,
+        resolve: resolution.report.clone(),
         ..WriteStats::default()
     };
     let mut catalog = Catalog::from_resolution(&resolution);
@@ -132,7 +137,12 @@ fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
         if push_endpoint(&mut drafts, &fact.subject_name, fact.subject_kind, fact) {
             creating.insert(normalise(&fact.subject_name));
         }
-        if let Some(kind) = fact.object_kind {
+        if fact.predicate.is_edge() {
+            let kind = fact.object_kind.unwrap_or(Kind::Technology);
+            if push_endpoint(&mut drafts, &fact.object_name, kind, fact) {
+                creating.insert(normalise(&fact.object_name));
+            }
+        } else if let Some(kind) = fact.object_kind {
             if push_endpoint(&mut drafts, &fact.object_name, kind, fact) {
                 creating.insert(normalise(&fact.object_name));
             }
@@ -180,13 +190,34 @@ async fn write_one(
     fact: &Fact,
     stats: &mut WriteStats,
 ) -> Result<(), GraphError> {
-    let subject = catalog.get(&fact.subject_name, fact.subject_kind)?;
+    let Some(subject) = bound(catalog, &fact.subject_name, fact.subject_kind, stats)? else {
+        return Ok(());
+    };
     if fact.predicate.is_edge() {
         let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
-        let object = catalog.get(&fact.object_name, object_kind)?;
+        let Some(object) = bound(catalog, &fact.object_name, object_kind, stats)? else {
+            return Ok(());
+        };
         write_edge(gm, session_id, fact, &subject, &object, stats).await
     } else {
         write_slot(gm, catalog, session_id, date, fact, &subject, stats).await
+    }
+}
+
+/// A missing binding drops this fact. Any other error still fails the session.
+fn bound(
+    catalog: &Catalog,
+    name: &str,
+    kind: Kind,
+    stats: &mut WriteStats,
+) -> Result<Option<Stored>, GraphError> {
+    match catalog.get(name, kind) {
+        Ok(stored) => Ok(Some(stored)),
+        Err(GraphError::NotFound(_)) => {
+            stats.unresolved += 1;
+            Ok(None)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -879,5 +910,70 @@ mod tests {
         assert_eq!(read_stamp(gm.db()).await.unwrap().as_deref(), Some("v2"));
         // A second pass does not refuse a store this pipeline already stamped.
         ensure_v2_store(&gm).await.unwrap();
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn literal_object_edges_become_technology() {
+        let (_tmp, gm) = open_store().await;
+        let facts = [
+            raw_edge(Predicate::PartOf, "api", Kind::Component, "linkshelf"),
+            raw_edge(Predicate::DependsOn, "worker", Kind::Component, "queue"),
+            raw_edge(Predicate::WorksOn, "ada", Kind::Person, "release-bot"),
+        ];
+        let stats = write_session(&gm, "s1", "2026-01-02", &facts)
+            .await
+            .unwrap();
+        assert_eq!(stats.edges, 3);
+        assert_eq!(stats.unresolved, 0);
+        for name in ["linkshelf", "queue", "release-bot"] {
+            let entity = crud::list_entities(gm.db(), None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let kind = entity
+                .attributes
+                .as_ref()
+                .unwrap()
+                .pointer("/v2/kind")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(kind, Some("technology"), "{name}");
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_missing_binding_drops_one_fact() {
+        let (_tmp, gm) = open_store().await;
+        let mut blank = setting("9000");
+        blank.subject_name = "   ".into();
+        blank.quote = "blank subject".into();
+        let stats = write_session(&gm, "s1", "2026-01-02", &[blank, setting("redis")])
+            .await
+            .unwrap();
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(stats.slots, 1);
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert!(entities.iter().any(|entity| entity.name == "app"));
+    }
+
+    fn raw_edge(predicate: Predicate, subject: &str, subject_kind: Kind, object: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind,
+            predicate,
+            role: None,
+            key: String::new(),
+            object_name: object.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 1,
+            quote: format!("{subject} links {object}"),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        }
     }
 }
