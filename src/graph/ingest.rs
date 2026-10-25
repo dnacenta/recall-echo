@@ -269,11 +269,11 @@ async fn process_extraction(
     llm: &dyn LlmProvider,
     report: &mut IngestionReport,
 ) -> Result<(), GraphError> {
-    // Once per session, before any provider call or entity write. The archive
-    // file is the caller's: this error does not remove it. The same guard
-    // sits on the v1 entity and edge writes, so a path that skips this
-    // function still cannot land a v1 row.
-    super::v2::refuse_v1_write(gm).await?;
+    // Once per session, before any provider call or entity write. Re-read the
+    // stamp: this connection may have cached "unstamped" before another
+    // process stamped the store. The archive file is the caller's: this error
+    // does not remove it.
+    super::v2::refuse_v1_session(gm).await?;
     let session_id = context.session_id.as_str();
     let log_number = context.log_number;
     report.chunks_total += u32::try_from(chunks.len()).unwrap_or(u32::MAX);
@@ -847,5 +847,70 @@ mod tests {
                 .as_deref(),
             Some("v2")
         );
+    }
+
+    /// The connection cached "no stamp" before the store was stamped. Both
+    /// entry points re-read and refuse. Embedded SurrealKV will not open a
+    /// second handle on the same directory, so the peer write is the stamp
+    /// upsert, which does not touch this connection's cache.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_stamp_written_after_open_is_refused_by_extraction() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Calls(AtomicU32);
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Calls {
+            async fn complete(
+                &self,
+                _system_prompt: &str,
+                _user_message: &str,
+                _max_tokens: u32,
+            ) -> Result<String, GraphError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("{}".into())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        assert!(gm.cached_pipeline_stamp().await.unwrap().is_none());
+        gm.db()
+            .query("UPSERT meta:pipeline SET pipeline = $pipeline")
+            .bind(("pipeline", "v2".to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let llm = Calls(AtomicU32::new(0));
+        let context = IngestContext::new("s1", Some(1));
+        let text = "---\nlog: 1\n---\n\n### User\n\nThe shelf service uses Rust.\n";
+        let chunks = vec![text.to_string()];
+        let mut report = IngestionReport::default();
+        let err = process_extraction(&gm, &chunks, &context, &llm, &mut report)
+            .await
+            .expect_err("process_extraction");
+        assert!(
+            err.to_string().contains(super::super::v2::V1_REFUSAL),
+            "{err}"
+        );
+
+        // Stale again, so this call is not saved by the refresh above.
+        gm.remember_pipeline_stamp(None);
+        let err = extract_from_archive(&gm, text, &context, &llm)
+            .await
+            .expect_err("extract_from_archive");
+        assert!(
+            err.to_string().contains(super::super::v2::V1_REFUSAL),
+            "{err}"
+        );
+        assert_eq!(llm.0.load(Ordering::SeqCst), 0, "provider was called");
+        let after = gm.stats().await.unwrap();
+        assert_eq!(after.entity_count, 0);
+        assert_eq!(after.relationship_count, 0);
     }
 }

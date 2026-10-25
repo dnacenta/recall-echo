@@ -46,16 +46,17 @@ pub(crate) const V2_REFUSAL: &str = "this graph was built by pipeline v1; re-ext
 
 /// Shown when v1 is asked to write into a store v2 built.
 ///
-/// Writing v1 rows into that store mixes the two schemas. The way back is the
-/// rebuild rollback: stop the daemon, move the backup into place, and set
-/// `[graph] pipeline = "v1"`.
+/// A rebuilt store can be put back by moving `graph.v1-backup-*` into place.
+/// A store first stamped by a v2 extraction has no such backup and no
+/// supported way back.
 pub(crate) const V1_REFUSAL: &str = "\
 this store is stamped pipeline v2 and v1 writes are refused. \
 To keep using v2, leave the store as it is; where a command takes --pipeline, pass --pipeline v2. \
 To go back to v1 after a rebuild, stop the daemon first (`recall-echo graph daemon stop`), \
 move the backup directory `graph.v1-backup-*` (it sits next to `graph/` and exists only when this store was rebuilt; the name is `graph.v1-backup-<YYYYMMDD-HHMM>`, with `-<N>` if that name was taken) over `graph/`, \
 then set [graph] pipeline = \"v1\". \
-Setting [graph] pipeline = \"v1\" alone does not change the stamp.";
+Setting [graph] pipeline = \"v1\" alone does not change the stamp. \
+A store first stamped by a v2 extraction has no `graph.v1-backup-*` and no supported way back to v1 writes.";
 
 const STAMP_V2: &str = "v2";
 
@@ -155,24 +156,50 @@ pub(crate) async fn ensure_v2_store(gm: &GraphMemory) -> Result<(), GraphError> 
 
 /// Refuse a v1-shaped write when this open connection's store is stamped v2.
 ///
-/// The stamp is read once per connection and remembered. A v2-shaped entity
-/// (one that already carries `attributes.v2`) is the v2 writer's own row and
-/// is not checked here.
+/// Embedded SurrealKV is process-exclusive, so another process cannot stamp
+/// under this connection, and [`ensure_v2_store`] updates the cache when this
+/// process stamps. A server connection can be stamped by a peer, so that case
+/// re-reads. Extraction does not use this: it re-reads once per session.
 pub(crate) async fn refuse_v1_write(gm: &GraphMemory) -> Result<(), GraphError> {
-    if gm.cached_pipeline_stamp().await?.as_deref() == Some(STAMP_V2) {
+    let stamp = if gm.is_remote() {
+        gm.refresh_pipeline_stamp().await?
+    } else {
+        gm.cached_pipeline_stamp().await?
+    };
+    refuse_stamp(stamp)
+}
+
+/// Re-read `meta:pipeline` for one extraction session and refuse a v2 stamp.
+///
+/// One query per session. The cache is refreshed so later writes on this
+/// connection see the same value. A stamp written by another connection after
+/// this one cached "unstamped" is visible here.
+pub(crate) async fn refuse_v1_session(gm: &GraphMemory) -> Result<(), GraphError> {
+    refuse_stamp(gm.refresh_pipeline_stamp().await?)
+}
+
+fn refuse_stamp(stamp: Option<String>) -> Result<(), GraphError> {
+    if stamp.as_deref() == Some(STAMP_V2) {
         Err(GraphError::PipelineRefused(V1_REFUSAL))
     } else {
         Ok(())
     }
 }
 
-/// `attributes.v2` is the closed record the v2 writer stores on an entity.
+/// A v2 entity carries `attributes.v2.kind` set to one of the six v2 kinds.
+///
+/// An object under `v2` with any other kind is still a v1-shaped row.
 #[must_use]
 pub(crate) fn carries_v2_record(attributes: &Option<serde_json::Value>) -> bool {
-    attributes
+    let Some(kind) = attributes
         .as_ref()
         .and_then(|value| value.get("v2"))
-        .is_some_and(serde_json::Value::is_object)
+        .and_then(|record| record.get("kind"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    Kind::parse(kind).is_some()
 }
 
 /// The pipeline stamp on `meta:pipeline`, if one was written.

@@ -1300,9 +1300,10 @@ async fn handle_connection(
         let (response, stop) = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Hello) => {
                 let mut info = context.info();
-                // Cached for the life of this open. A rebuild stops the daemon
-                // before the directory changes, and `ensure_v2_store` updates
-                // the cache when this process stamps the store.
+                // Cached for the life of this open. The daemon holds the embedded
+                // file lock, so a peer cannot stamp under it. A rebuild stops
+                // the daemon before the directory changes, and `ensure_v2_store`
+                // updates the cache when this process stamps the store.
                 match graph.cached_pipeline_stamp().await {
                     Ok(None) => info.pipeline_stamp = PipelineStamp::Unstamped,
                     Ok(Some(stamp)) => info.pipeline_stamp = PipelineStamp::Stamped(stamp),

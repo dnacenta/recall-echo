@@ -29,7 +29,8 @@ use super::GraphMemory;
 use crate::error::RecallError;
 pub(crate) use resolve::RESOLVER_CALL_BOUND;
 pub(crate) use write::{
-    carries_v2_record, ensure_v2_store, read_stamp, refuse_v1_write, V1_REFUSAL, V2_REFUSAL,
+    carries_v2_record, ensure_v2_store, read_stamp, refuse_v1_session, refuse_v1_write, V1_REFUSAL,
+    V2_REFUSAL,
 };
 
 /// Which extraction pipeline a run uses.
@@ -512,5 +513,52 @@ mod tests {
         let version = chosen_pipeline(tmp.path(), None, None).await.unwrap();
         assert_eq!(version, PipelineVersion::V1);
         assert_eq!(list_files(&graph), before);
+    }
+
+    #[tokio::test]
+    async fn add_entity_on_a_v2_store_accepts_only_a_real_v2_kind() {
+        use super::super::types::{EntityType, NewEntity};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = stamp_v2(tmp.path()).await;
+        let bogus = NewEntity {
+            name: "shelf".into(),
+            entity_type: EntityType::Project,
+            abstract_text: "a shelf".into(),
+            overview: None,
+            content: None,
+            attributes: Some(serde_json::json!({"v2": {"kind": "thread", "slots": []}})),
+            source: None,
+        };
+        let err = gm.add_entity(bogus).await.expect_err("not a v2 kind");
+        assert!(err.to_string().contains(V1_REFUSAL), "{err}");
+        let empty = NewEntity {
+            name: "empty".into(),
+            entity_type: EntityType::Project,
+            abstract_text: "no kind".into(),
+            overview: None,
+            content: None,
+            attributes: Some(serde_json::json!({"v2": {}})),
+            source: None,
+        };
+        let err = gm
+            .add_entity(empty)
+            .await
+            .expect_err("v2 object without a kind");
+        assert!(err.to_string().contains(V1_REFUSAL), "{err}");
+        assert_eq!(gm.stats().await.unwrap().entity_count, 0);
+
+        gm.add_entity(NewEntity {
+            name: "pine".into(),
+            entity_type: EntityType::Project,
+            abstract_text: "project pine".into(),
+            overview: None,
+            content: None,
+            attributes: Some(serde_json::json!({"v2": {"kind": "project", "slots": []}})),
+            source: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(gm.stats().await.unwrap().entity_count, 1);
     }
 }

@@ -72,10 +72,11 @@ pub(crate) fn deserialize_take_opt<T: serde::de::DeserializeOwned>(
 
 /// `meta:pipeline` for this open connection.
 ///
-/// Unread until the first guarded write or hello. [`v2::ensure_v2_store`]
-/// fills it when it stamps, so a later write sees v2 without another query.
-/// The stamp cannot change under a live daemon except through that helper:
-/// a rebuild stops the daemon before it swaps the directory.
+/// Unread until the first cached read. Embedded SurrealKV holds the file
+/// lock for the life of the connection, so a peer cannot stamp underneath it;
+/// [`v2::ensure_v2_store`] updates the cache when this process stamps.
+/// Extraction re-reads once per session instead of trusting this. A server
+/// connection re-reads on each v1 write, because a peer can stamp it.
 #[derive(Clone)]
 enum StampCache {
     Unread,
@@ -90,6 +91,9 @@ pub struct GraphMemory {
     scoring: crate::config::GraphScoringConfig,
     provenance: confidence::ProvenanceWeights,
     dedup: crate::config::GraphDedupConfig,
+    /// A SurrealDB server. Other processes can stamp it while this connection
+    /// is open. Embedded SurrealKV cannot.
+    remote: bool,
     pipeline_stamp: std::sync::Mutex<StampCache>,
 }
 
@@ -139,6 +143,7 @@ impl GraphMemory {
             scoring: graph_config.scoring,
             provenance: graph_config.provenance,
             dedup: graph_config.dedup,
+            remote: false,
             pipeline_stamp: std::sync::Mutex::new(StampCache::Unread),
         })
     }
@@ -214,6 +219,7 @@ impl GraphMemory {
             scoring: crate::config::GraphScoringConfig::default(),
             provenance: confidence::ProvenanceWeights::default(),
             dedup: crate::config::GraphDedupConfig::default(),
+            remote: true,
             pipeline_stamp: std::sync::Mutex::new(StampCache::Unread),
         })
     }
@@ -243,7 +249,18 @@ impl GraphMemory {
         &self.db
     }
 
+    /// This connection talks to a SurrealDB server, which a peer can stamp.
+    #[must_use]
+    pub(crate) fn is_remote(&self) -> bool {
+        self.remote
+    }
+
     /// The pipeline stamp, read once per open and then remembered.
+    ///
+    /// Safe for the embedded hot paths (daemon hello, `add_entity`): the file
+    /// lock stops another process from stamping, and a stamp this process
+    /// writes is recorded with [`Self::remember_pipeline_stamp`]. Extraction
+    /// uses [`Self::refresh_pipeline_stamp`] instead.
     pub(crate) async fn cached_pipeline_stamp(&self) -> Result<Option<String>, GraphError> {
         if let StampCache::Ready(stamp) = self
             .pipeline_stamp
@@ -258,6 +275,13 @@ impl GraphMemory {
             .pipeline_stamp
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = StampCache::Ready(stamp.clone());
+        Ok(stamp)
+    }
+
+    /// Read `meta:pipeline` and replace the cache with that value.
+    pub(crate) async fn refresh_pipeline_stamp(&self) -> Result<Option<String>, GraphError> {
+        let stamp = v2::read_stamp(&self.db).await?;
+        self.remember_pipeline_stamp(stamp.clone());
         Ok(stamp)
     }
 
@@ -295,8 +319,8 @@ impl GraphMemory {
 
     /// Add a new entity to the graph.
     ///
-    /// A v1-shaped entity (no `attributes.v2` record) is refused on a store
-    /// stamped v2. The v2 writer sets that record, so its own creates proceed.
+    /// A v1-shaped entity is refused on a store stamped v2. A row counts as v2
+    /// only when `attributes.v2.kind` is one of the six v2 kinds.
     pub async fn add_entity(&self, entity: NewEntity) -> Result<Entity, GraphError> {
         if !v2::carries_v2_record(&entity.attributes) {
             v2::refuse_v1_write(self).await?;
