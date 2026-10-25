@@ -396,7 +396,7 @@ fn mention_from(object: &Map<String, Value>, turns: &[Turn]) -> Result<Mention, 
         object_kind,
         status: text(object, "status")?.to_string(),
         turn,
-        quote: text(object, "quote")?.to_string(),
+        quote: text(object, "quote")?.trim().to_string(),
         confidence: confidence_of(object)?,
         provenance: role_at(turn, turns),
     })
@@ -423,10 +423,16 @@ fn expand_bug(
         return Err(DROP_TOO_LONG);
     }
     let mut carrier = carrier(object, confidence, &cited)?;
+    // The symptom is a literal of the cited turn. A number or token it does
+    // not support drops the whole bug.
+    if !ground.supports_value(symptom, carrier.turn, &carrier.quote, ValueShape::Literal) {
+        return Err(DROP_VALUE_SUPPORT);
+    }
     // Cause and fix are slots of the symptom, the same subject as the symptom slot.
     carrier.subject_name = symptom.to_string();
     carrier.subject_kind = Kind::Issue;
-    let (target_name, target_kind) = affects_target(text(object, "component")?, &session.project);
+    let component = text(object, "component")?.trim();
+    let (target_name, target_kind) = affects_target(component, &session.project);
     let mut facts = vec![slot_fact(
         symptom,
         Kind::Issue,
@@ -465,14 +471,19 @@ fn expand_bug(
         &carrier,
     )));
     if !target_name.is_empty() {
-        facts.push(edge_fact(
-            symptom,
-            Kind::Issue,
-            Predicate::Affects,
-            &target_name,
-            Some(target_kind),
-            &carrier,
-        ));
+        // The component is an entity. A failure drops only this edge.
+        if ground.supports_value(component, carrier.turn, &carrier.quote, ValueShape::Entity) {
+            facts.push(edge_fact(
+                symptom,
+                Kind::Issue,
+                Predicate::Affects,
+                &target_name,
+                Some(target_kind),
+                &carrier,
+            ));
+        } else {
+            count_drop(report, DROP_VALUE_SUPPORT);
+        }
     }
     Ok(facts)
 }
@@ -582,7 +593,7 @@ fn carrier(
         object_kind: None,
         status: "decided".to_string(),
         turn: cited.turn,
-        quote: text(object, "quote")?.to_string(),
+        quote: text(object, "quote")?.trim().to_string(),
         confidence,
         provenance: from_role(cited.role),
         replaces: String::new(),
@@ -1184,6 +1195,117 @@ mod tests {
         assert_eq!(affects.object_name, "cache");
         assert_eq!(affects.provenance, Provenance::User);
         assert_eq!(affects.subject_kind, Kind::Issue);
+    }
+
+    #[test]
+    fn ungrounded_symptom_number_drops_the_bug() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "server crashes on port 9090 under load",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "cache",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn verbatim_symptom_is_kept() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "stale entries",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "cache",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        let symptom = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom");
+        assert_eq!(symptom.object_name, "stale entries");
+        assert_eq!(symptom.provenance, Provenance::User);
+        let affects = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::Affects)
+            .expect("affects");
+        assert_eq!(affects.object_name, "cache");
+    }
+
+    #[test]
+    fn ungrounded_component_drops_only_the_edge() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "stale entries",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "payments gateway",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.predicate == Predicate::IssueSymptom));
+        assert!(facts
+            .iter()
+            .all(|fact| fact.predicate != Predicate::Affects));
     }
 
     #[cfg(feature = "embedded")]

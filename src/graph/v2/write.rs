@@ -1985,6 +1985,76 @@ mod tests {
         assert!((after.edge_beta - prior.beta()).abs() < 1e-9);
     }
 
+    /// An assistant create stores the inferred prior and does not tally. A
+    /// later user sighting adds the user weight only. A later assistant
+    /// sighting adds the assistant weight and one tally.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn assistant_create_then_user_and_assistant_sightings() {
+        let (_tmp, gm) = open_store().await;
+        let weights = *gm.provenance_weights();
+        assert!((weights.weight_user - 0.8).abs() < 1e-9);
+        assert!((weights.weight_assistant - 0.3).abs() < 1e-9);
+        let prior = Evidence::from_prior(ExtractionContext::Inferred.prior());
+
+        let mut created = setting("redis");
+        created.provenance = Provenance::Assistant;
+        created.turn = 1;
+        created.quote = "cache is redis".into();
+        write_session(&gm, "s1", "2026-01-02", &[created])
+            .await
+            .unwrap();
+        let slot = cache_slot(&gm).await;
+        assert_close(slot["alpha"].as_f64().unwrap(), prior.alpha());
+        assert_close(slot["beta"].as_f64().unwrap(), prior.beta());
+        assert_eq!(slot["self_reinforcements"], 0);
+        assert_eq!(slot["provenance"], "assistant");
+        assert_eq!(slot["evidence"].as_array().unwrap().len(), 1);
+
+        let mut user = setting("redis");
+        user.provenance = Provenance::User;
+        user.turn = 2;
+        user.quote = "the cache stays redis".into();
+        write_session(&gm, "s2", "2026-01-03", &[user])
+            .await
+            .unwrap();
+        let slot = cache_slot(&gm).await;
+        assert_close(
+            slot["alpha"].as_f64().unwrap(),
+            prior.alpha() + weights.weight_user,
+        );
+        assert_close(slot["beta"].as_f64().unwrap(), prior.beta());
+        assert_eq!(slot["self_reinforcements"], 0);
+        assert_eq!(slot["evidence"].as_array().unwrap().len(), 2);
+
+        let mut assistant = setting("redis");
+        assistant.provenance = Provenance::Assistant;
+        assistant.turn = 3;
+        assistant.quote = "noted that the cache is redis".into();
+        write_session(&gm, "s3", "2026-01-04", &[assistant])
+            .await
+            .unwrap();
+        let slot = cache_slot(&gm).await;
+        assert_close(
+            slot["alpha"].as_f64().unwrap(),
+            prior.alpha() + weights.weight_user + weights.weight_assistant,
+        );
+        assert_close(slot["beta"].as_f64().unwrap(), prior.beta());
+        assert_eq!(slot["self_reinforcements"], 1);
+        assert_eq!(slot["evidence"].as_array().unwrap().len(), 3);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn cache_slot(gm: &GraphMemory) -> Value {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let app = entities.iter().find(|entity| entity.name == "app").unwrap();
+        app.attributes.as_ref().unwrap()["v2"]["slots"][0].clone()
+    }
+
+    fn assert_close(got: f64, want: f64) {
+        assert!((got - want).abs() < 1e-9, "{got} != {want}");
+    }
+
     #[cfg(feature = "embedded")]
     async fn stored_belief(gm: &GraphMemory) -> Belief {
         let entities = crud::list_entities(gm.db(), None).await.unwrap();

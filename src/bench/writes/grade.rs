@@ -18,7 +18,7 @@ use super::script::{
     ScriptSession, ScriptTurn, Speaker, SupersededPair,
 };
 use crate::error::RecallError;
-use crate::graph::ProvenanceWeights;
+use crate::graph::{PipelineVersion, ProvenanceWeights};
 
 const EPS: f64 = 1e-6;
 
@@ -425,6 +425,28 @@ pub fn grade(
     keyword_hits: &[bool],
     extractor: ExtractorLabel,
 ) -> Result<WriteReport, RecallError> {
+    grade_with_pipeline(
+        script,
+        sessions,
+        weights,
+        keyword_hits,
+        extractor,
+        PipelineVersion::V1,
+    )
+}
+
+/// Grade `sessions` against `script` for one pipeline.
+///
+/// v1 scores an assistant turn at the self weight. v2 scores it at the
+/// assistant weight. The rest of the fit is the same.
+pub fn grade_with_pipeline(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+    weights: &ProvenanceWeights,
+    keyword_hits: &[bool],
+    extractor: ExtractorLabel,
+    pipeline: PipelineVersion,
+) -> Result<WriteReport, RecallError> {
     if sessions.len() != script.sessions.len() {
         return Err(RecallError::Config(format!(
             "expected {} session observations, got {}",
@@ -449,7 +471,9 @@ pub fn grade(
                 observed.id, session.id
             )));
         }
-        grade_session(script, session, observed, weights, &mut tally, &mut steps)?;
+        grade_session(
+            script, session, observed, weights, pipeline, &mut tally, &mut steps,
+        )?;
     }
 
     let final_edges = sessions.last().map(|s| s.after.as_slice()).unwrap_or(&[]);
@@ -503,6 +527,7 @@ struct Score<'a> {
     script: &'a FactScript,
     session: &'a ScriptSession,
     weights: &'a ProvenanceWeights,
+    pipeline: PipelineVersion,
     tally: &'a mut Tally,
     steps: &'a mut Vec<StepLog>,
     unused: &'a mut [(Effect, bool)],
@@ -530,6 +555,7 @@ fn grade_session(
     session: &ScriptSession,
     observed: &SessionObservation,
     weights: &ProvenanceWeights,
+    pipeline: PipelineVersion,
     tally: &mut Tally,
     steps: &mut Vec<StepLog>,
 ) -> Result<(), RecallError> {
@@ -543,6 +569,7 @@ fn grade_session(
             script,
             session,
             weights,
+            pipeline,
             tally,
             steps,
             unused: &mut unused,
@@ -602,15 +629,21 @@ fn score_corroborate(
 ) -> Result<(), RecallError> {
     let key = fact_key(ctx.script.fact(&claim.fact)?);
     let weights = ctx.weights;
+    let pipeline = ctx.pipeline;
     let matched = take(ctx.unused, |effect| match effect {
         Effect::Corroborated {
             key: got,
             delta_alpha,
             delta_self,
             delta_beta,
-        } if *got == key => {
-            corroboration_fits(*delta_alpha, *delta_self, *delta_beta, speaker, weights)
-        }
+        } if *got == key => corroboration_fits(
+            *delta_alpha,
+            *delta_self,
+            *delta_beta,
+            speaker,
+            weights,
+            pipeline,
+        ),
         _ => false,
     });
     // A corroboration at the wrong provenance weight is still a corroboration.
@@ -665,7 +698,7 @@ fn score_contradict(
     claim: &Claim,
 ) -> Result<(), RecallError> {
     let key = fact_key(ctx.script.fact(&claim.fact)?);
-    let weight = speaker_weight(speaker, ctx.weights);
+    let weight = speaker_weight(speaker, ctx.weights, ctx.pipeline);
     let matched = take(ctx.unused, |effect| match effect {
         Effect::Contradicted {
             key: got,
@@ -762,11 +795,12 @@ fn corroboration_fits(
     delta_beta: f64,
     speaker: Speaker,
     weights: &ProvenanceWeights,
+    pipeline: PipelineVersion,
 ) -> bool {
     if delta_beta.abs() > EPS {
         return false;
     }
-    let weight = speaker_weight(speaker, weights);
+    let weight = speaker_weight(speaker, weights, pipeline);
     match speaker {
         // One claim is one reinforcement. A larger jump is a different event.
         Speaker::Assistant => delta_self == 1 && approx(delta_alpha, weight),
@@ -774,10 +808,16 @@ fn corroboration_fits(
     }
 }
 
-fn speaker_weight(speaker: Speaker, weights: &ProvenanceWeights) -> f64 {
+fn speaker_weight(speaker: Speaker, weights: &ProvenanceWeights, pipeline: PipelineVersion) -> f64 {
     match speaker {
         Speaker::User => weights.weight_user,
-        Speaker::Assistant => weights.weight_self,
+        // v1 has no assistant class. An assistant turn stays at the self
+        // weight there, so a v1 grade does not move. v2 uses the assistant
+        // weight.
+        Speaker::Assistant => match pipeline {
+            PipelineVersion::V2 => weights.weight_assistant,
+            PipelineVersion::V1 => weights.weight_self,
+        },
     }
 }
 

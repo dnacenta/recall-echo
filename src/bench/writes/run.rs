@@ -96,7 +96,8 @@ pub async fn run(
         .iter()
         .map(|question| keyword_hit(&memory_dir, &question.text, &question.answer))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut report = grade::grade(script, &sessions, &weights, &keyword_hits, label)?;
+    let mut report =
+        grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
     report.setup_millis = setup_millis;
     Ok(report)
 }
@@ -1899,17 +1900,18 @@ mod tests {
             .sum();
         let kept: u32 = report.sessions.iter().map(|session| session.kept).sum();
         assert_eq!(candidates, 46);
-        // Ten candidates name a value the cited turn does not support, or a
-        // numbered setting whose key is not in the quote's sentence.
-        assert_eq!(kept, 36);
+        // 14 candidates fail outright. Three further value_support counts are
+        // partial: the bug stayed, and only its affects edge was dropped
+        // because the component is not supported by the cited turn.
+        assert_eq!(kept, 32);
         let mut drops: HashMap<&str, u32> = HashMap::new();
         for session in &report.sessions {
             for (reason, count) in &session.drops {
                 *drops.entry(reason.as_str()).or_insert(0) += count;
             }
         }
-        assert_eq!(drops.get("value_support").copied(), Some(7));
-        assert_eq!(drops.get("key_binding").copied(), Some(3));
+        assert_eq!(drops.get("value_support").copied(), Some(15));
+        assert_eq!(drops.get("key_binding").copied(), Some(2));
         assert_eq!(drops.len(), 2, "{drops:?}");
         let patterns = report.patterns.expect("linkshelf carries match blocks");
         assert_eq!(patterns.pairs, 6);
@@ -1929,14 +1931,14 @@ mod tests {
         );
 
         let store = v2_store(tmp.path()).await;
-        assert_eq!(store.edges, 6, "edges {:?}", store.edge_types);
+        assert_eq!(store.edges, 2, "edges {:?}", store.edge_types);
         assert_eq!(
             store
                 .edge_types
                 .iter()
                 .filter(|rel| rel.as_str() == "affects")
                 .count(),
-            4,
+            0,
             "{:?}",
             store.edge_types
         );
@@ -1958,8 +1960,6 @@ mod tests {
         assert_eq!(
             store.names,
             vec![
-                "concurrent add".to_string(),
-                "export timestamps".to_string(),
                 "fetch encoding".to_string(),
                 "linkshelf".to_string(),
                 "linkshelf v0.2.0".to_string(),
@@ -1975,7 +1975,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(store.slots, 50, "slots {:?}", store.slot_predicates);
+        assert_eq!(store.slots, 39, "slots {:?}", store.slot_predicates);
         let pred = |name: &str| {
             store
                 .slot_predicates
@@ -1983,16 +1983,16 @@ mod tests {
                 .filter(|item| item.as_str() == name)
                 .count()
         };
-        // The ten drops are settings and rules. Bug and release rows are unchanged.
-        assert_eq!(pred("setting"), 14);
+        // A dot inside a file name does not end the binding sentence, so the
+        // migration setting is kept. Rules are unchanged.
+        assert_eq!(pred("setting"), 15);
         assert_eq!(pred("rule"), 12);
-        // Each bug writes symptom, cause and status. The later fix writes
-        // the fix and a second status value. Both status rows remain; the
-        // earlier one is closed on the session date.
-        assert_eq!(pred("issue_symptom"), 4);
-        assert_eq!(pred("issue_cause"), 4);
-        assert_eq!(pred("issue_fix"), 4);
-        assert_eq!(pred("issue_status"), 8);
+        // A bug whose symptom is not in the cited turn is dropped whole.
+        // A kept bug whose component is not supported drops only the edge.
+        assert_eq!(pred("issue_symptom"), 2);
+        assert_eq!(pred("issue_cause"), 2);
+        assert_eq!(pred("issue_fix"), 1);
+        assert_eq!(pred("issue_status"), 3);
         assert_eq!(pred("release_status"), 2);
         assert_eq!(pred("release_contents"), 2);
     }
@@ -2028,11 +2028,14 @@ mod tests {
         // Supersede closes pine when oak is written. The reject of birch is a
         // no-op: the rejected slot is stored and is not a live record. The
         // contradict claim is still a reinforcement, because the scripted
-        // extractor emits the decided value again. The assistant restatement
-        // corroborates at the assistant weight, so it does not fit the
-        // speaker check, which still expects the self weight.
+        // extractor emits the decided value again, so that step stays a
+        // contradict miss and the extra reinforcement stays the corroborate
+        // false positive. The assistant restatement adds the assistant weight
+        // (0.3) and one tally. That is the v2 speaker fit, so the assistant
+        // step is a true positive beside the user corroboration, with no
+        // further miss or false positive.
         assert_eq!(report.operations.create, counted(1, 0, 0));
-        assert_eq!(report.operations.corroborate, counted(1, 2, 1));
+        assert_eq!(report.operations.corroborate, counted(2, 1, 0));
         assert_eq!(report.operations.supersede, counted(1, 0, 0));
         assert_eq!(report.operations.contradict, counted(0, 0, 1));
         assert_eq!(report.operations.no_op, counted(2, 0, 0));

@@ -8,10 +8,11 @@
 //! the cost stays linear in the session. Tool lines are not turns and are
 //! never passed in, so tool output cannot ground a fact.
 //!
-//! A quote is an exact, case-sensitive substring. Fewer than three characters
-//! is not a span. A quote found only in a different turn is re-cited to that
-//! turn, and the fact takes that turn's role. The first turn in transcript
-//! order wins when several others contain it.
+//! A quote is an exact, case-sensitive substring of a turn. The check uses the
+//! trimmed quote. Fewer than three characters, or a span with no alphanumeric
+//! character, is not a span. A quote found only in a different turn is
+//! re-cited to that turn, and the fact takes that turn's role. The first turn
+//! in transcript order wins when several others contain it.
 //!
 //! A number is a maximal `\d+(\.\d+)*`. `8080` does not occur inside `18080`,
 //! and `0.2` does not occur inside `0.2.0`.
@@ -19,13 +20,15 @@
 //! Content tokens are the normalised tokens that are longer than one character
 //! or are digits, minus the stop list. A token longer than three characters
 //! may match as a case-insensitive substring of the normalised text. A shorter
-//! token must equal a whole normalised token. Key tokens are whole tokens
-//! only: a four-character key token does not match inside a longer word.
+//! token must equal a whole normalised token. A digit-only token also matches
+//! when that same maximal number occurs in the raw text. Key tokens are whole
+//! tokens only: a four-character key token does not match inside a longer word.
 //!
 //! The sentence that contains the quote runs from the previous boundary to the
-//! next. Boundaries are `.`, `!`, `?` and newline. A dot between digits is a
-//! decimal or version dot, not a boundary. The first occurrence of the quote
-//! is the one that is scored.
+//! next, and it stops at a boundary the quote itself ends on. `.`, `!` and `?`
+//! are boundaries only when the next byte is whitespace or the text ends. A
+//! newline is always a boundary. The first occurrence of the quote is the one
+//! that is scored.
 
 use super::input::{Turn, TurnRole};
 use super::schema::{normalise, DROP_QUOTE};
@@ -36,7 +39,7 @@ const MIN_QUOTE_CHARS: usize = 3;
 /// How a stored value is shaped for the token rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueShape {
-    /// An entity name. Only a short one needs token overlap.
+    /// An entity name. A long one needs half its content tokens, as a literal does.
     Entity,
     /// A literal. A long one needs half its tokens in the text.
     Literal,
@@ -114,7 +117,8 @@ impl SessionGround {
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
     pub(crate) fn cite(&self, cited: usize, quote: &str) -> Result<Cited, &'static str> {
-        if quote.chars().count() < MIN_QUOTE_CHARS {
+        let quote = quote.trim();
+        if quote.chars().count() < MIN_QUOTE_CHARS || !quote.chars().any(char::is_alphanumeric) {
             return Err(DROP_QUOTE);
         }
         if let Some(turn) = self.found(cited, quote) {
@@ -179,8 +183,10 @@ impl SessionGround {
 
     /// A numbered setting must name its key in the quote or that sentence.
     ///
-    /// A key whose tokens are all generic has nothing to bind. The number is
-    /// still required to occur in the turn by [`SessionGround::supports_value`].
+    /// A key whose tokens are all generic has nothing to bind, so the setting
+    /// fails. The number is still required to occur in the turn by
+    /// [`SessionGround::supports_value`]. A `_version` key also needs every
+    /// stem token, and an empty stem fails.
     #[must_use]
     pub(crate) fn key_bound(&self, key: &str, value: &str, turn: usize, quote: &str) -> bool {
         if numbers_in(value).is_empty() {
@@ -192,7 +198,11 @@ impl SessionGround {
         let sentence = sentence_containing(&turn.text, quote);
         let texts = [quote, sentence];
         if let Some(stem) = version_stem(key) {
-            if stem.is_empty() || !token_occurs(stem, &texts) {
+            let stem_tokens: Vec<&str> =
+                stem.split('_').filter(|token| !token.is_empty()).collect();
+            if stem_tokens.is_empty()
+                || !stem_tokens.iter().all(|token| token_occurs(token, &texts))
+            {
                 return false;
             }
         }
@@ -200,7 +210,7 @@ impl SessionGround {
             .split('_')
             .filter(|token| !token.is_empty() && !is_generic_key(token))
             .collect();
-        specific.is_empty() || specific.iter().any(|token| token_occurs(token, &texts))
+        !specific.is_empty() && specific.iter().any(|token| token_occurs(token, &texts))
     }
 
     /// A replacement stays only on a decided fact that names it in the turn.
@@ -214,7 +224,7 @@ impl SessionGround {
         };
         content_tokens(replaces)
             .iter()
-            .any(|token| token_in(token, &turn.normalised, &turn.words))
+            .any(|token| token_in(token, &turn.normalised, &turn.words, &turn.numbers))
     }
 
     fn found(&self, index: usize, quote: &str) -> Option<Cited> {
@@ -249,13 +259,13 @@ fn supported(
     }
     if tokens.len() <= 3 {
         let quoted = quote.is_none_or(|quote| one_in_quote(&tokens, quote));
-        return fraction_met(&tokens, normalised, words) && quoted;
+        return fraction_met(&tokens, normalised, words, numbers) && quoted;
     }
+    // A long entity needs the same half-token support as a long literal.
     match shape {
-        // A long entity is kept when its numbers are in the text. The
-        // token-fraction rule is only stated for long literals.
-        ValueShape::Entity => true,
-        ValueShape::Literal => fraction_met(&tokens, normalised, words),
+        ValueShape::Entity | ValueShape::Literal => {
+            fraction_met(&tokens, normalised, words, numbers)
+        }
     }
 }
 
@@ -265,10 +275,10 @@ fn numbers_ok(value: &str, numbers: &[String]) -> bool {
         .all(|number| numbers.iter().any(|have| have == number))
 }
 
-fn fraction_met(tokens: &[String], normalised: &str, words: &[String]) -> bool {
+fn fraction_met(tokens: &[String], normalised: &str, words: &[String], numbers: &[String]) -> bool {
     let matched = tokens
         .iter()
-        .filter(|token| token_in(token, normalised, words))
+        .filter(|token| token_in(token, normalised, words, numbers))
         .count();
     matched * 2 >= tokens.len()
 }
@@ -276,12 +286,17 @@ fn fraction_met(tokens: &[String], normalised: &str, words: &[String]) -> bool {
 fn one_in_quote(tokens: &[String], quote: &str) -> bool {
     let normalised = normalise(quote);
     let words = words_of(&normalised);
+    let numbers = numbers_in(quote);
     tokens
         .iter()
-        .any(|token| token_in(token, &normalised, &words))
+        .any(|token| token_in(token, &normalised, &words, &numbers))
 }
 
-fn token_in(token: &str, normalised: &str, words: &[String]) -> bool {
+fn token_in(token: &str, normalised: &str, words: &[String], numbers: &[String]) -> bool {
+    let digit = !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit());
+    if digit && numbers.iter().any(|number| number == token) {
+        return true;
+    }
     if token.chars().count() > 3 {
         normalised.contains(token)
     } else {
@@ -405,7 +420,9 @@ fn sentence_containing<'a>(text: &'a str, quote: &str) -> &'a str {
     while from > 0 && !is_boundary(bytes, from - 1) {
         from -= 1;
     }
-    let mut to = end;
+    // Start on the quote's last byte. A terminator inside the quote ends the
+    // window there, so the next sentence stays outside it.
+    let mut to = end.saturating_sub(1);
     while to < bytes.len() && !is_boundary(bytes, to) {
         to += 1;
     }
@@ -414,11 +431,10 @@ fn sentence_containing<'a>(text: &'a str, quote: &str) -> &'a str {
 
 fn is_boundary(bytes: &[u8], index: usize) -> bool {
     match bytes[index] {
-        b'\n' | b'!' | b'?' => true,
-        b'.' => {
-            let prev_digit = index > 0 && bytes[index - 1].is_ascii_digit();
-            let next_digit = index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit();
-            !(prev_digit && next_digit)
+        b'\n' => true,
+        b'.' | b'!' | b'?' => {
+            let next = index + 1;
+            next >= bytes.len() || bytes[next].is_ascii_whitespace()
         }
         _ => false,
     }
@@ -546,7 +562,10 @@ mod tests {
         let session = ground(&[("abc is enough.", TurnRole::User)]);
         assert_eq!(session.cite(0, "").unwrap_err(), DROP_QUOTE);
         assert_eq!(session.cite(0, "ab").unwrap_err(), DROP_QUOTE);
+        assert_eq!(session.cite(0, "   ").unwrap_err(), DROP_QUOTE);
+        assert_eq!(session.cite(0, "...").unwrap_err(), DROP_QUOTE);
         assert!(session.cite(0, "abc").is_ok());
+        assert!(session.cite(0, "  abc  ").is_ok());
     }
 
     #[test]
@@ -580,6 +599,8 @@ mod tests {
     fn key_token_is_limited_to_the_quote_sentence() {
         let later = ground(&[("Coverage is 88%. The line length is 100.", TurnRole::User)]);
         assert!(!later.key_bound("line_length", "88", 0, "Coverage is 88%"));
+        // The quote's own full stop is the end of the window.
+        assert!(!later.key_bound("line_length", "88", 0, "Coverage is 88%."));
         let version = ground(&[("Use Python 3.12 today.", TurnRole::User)]);
         assert!(version.key_bound("python_version", "3.12", 0, "Python 3.12"));
         let split = ground(&[("Python is ready. 3.12 ships tomorrow.", TurnRole::User)]);
@@ -587,9 +608,62 @@ mod tests {
     }
 
     #[test]
-    fn generic_key_does_not_bind_and_numberless_value_skips_it() {
+    fn filename_dots_stay_inside_the_sentence() {
+        let one = ground(&[(
+            "Copy shelf.json beside x.py before the timeout 9.",
+            TurnRole::User,
+        )]);
+        assert!(one.key_bound("timeout", "9", 0, "Copy shelf"));
+        let two = ground(&[("Copy shelf.json now. The timeout is 9.", TurnRole::User)]);
+        assert!(!two.key_bound("timeout", "9", 0, "Copy shelf"));
+    }
+
+    #[test]
+    fn version_stem_needs_every_token() {
+        let hyphen = ground(&[("Use scikit-learn 1.5 here.", TurnRole::User)]);
+        assert!(hyphen.key_bound("scikit_learn_version", "1.5", 0, "scikit-learn 1.5"));
+        let underscore = ground(&[("Use scikit_learn 1.5 here.", TurnRole::User)]);
+        assert!(underscore.key_bound("scikit_learn_version", "1.5", 0, "scikit_learn 1.5"));
+        let partial = ground(&[("Use learn 1.5 here.", TurnRole::User)]);
+        assert!(!partial.key_bound("scikit_learn_version", "1.5", 0, "learn 1.5"));
+        let empty = ground(&[("Version 1.5 is tagged.", TurnRole::User)]);
+        assert!(!empty.key_bound("_version", "1.5", 0, "Version 1.5"));
+    }
+
+    #[test]
+    fn digit_token_matches_a_glued_number() {
+        let seconds = ground(&[("Set the timeout to 30s.", TurnRole::User)]);
+        assert!(seconds.supports_value("30", 0, "timeout to 30s", ValueShape::Literal));
+        assert!(seconds.supports_value("timeout = 30", 0, "timeout to 30s", ValueShape::Literal));
+        assert!(!seconds.supports_value("3", 0, "timeout to 30s", ValueShape::Literal));
+        assert!(!seconds.supports_value("300", 0, "timeout to 30s", ValueShape::Literal));
+        let longer = ground(&[("Wait 300s then retry.", TurnRole::User)]);
+        assert!(!longer.supports_value("30", 0, "Wait 300s", ValueShape::Literal));
+        let retry = ground(&[("Wait 30s then retry.", TurnRole::User)]);
+        assert!(retry.supports_value("30", 0, "Wait 30s then", ValueShape::Literal));
+    }
+
+    #[test]
+    fn long_entity_half_tokens() {
+        let session = ground(&[("alpha beta are kept here", TurnRole::User)]);
+        assert!(session.supports_value(
+            "alpha beta gamma delta",
+            0,
+            "kept here",
+            ValueShape::Entity
+        ));
+        assert!(!session.supports_value(
+            "alpha gamma delta epsilon",
+            0,
+            "kept here",
+            ValueShape::Entity
+        ));
+    }
+
+    #[test]
+    fn generic_key_fails_binding_and_numberless_value_skips_it() {
         let session = ground(&[("Port 9000.", TurnRole::User)]);
-        assert!(session.key_bound("value", "9000", 0, "Port 9000."));
+        assert!(!session.key_bound("value", "9000", 0, "Port 9000."));
         assert!(session.key_bound("line_length", "wide", 0, "Port 9000."));
     }
 
