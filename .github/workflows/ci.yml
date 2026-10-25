@@ -36,3 +36,18 @@ jobs:
 
       - name: E9 check
         run: cargo run --example e9_provenance_ablation -- check
+
+  dco:
+    name: dco
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Developer Certificate of Origin
+        env:
+          DCO_BASE_REF: ${{ github.base_ref }}
+          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/check-dco.sh
