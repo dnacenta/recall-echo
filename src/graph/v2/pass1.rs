@@ -471,18 +471,31 @@ fn expand_bug(
         &carrier,
     )));
     if !target_name.is_empty() {
-        // The component is an entity. A failure drops only this edge.
-        if ground.supports_value(component, carrier.turn, &carrier.quote, ValueShape::Entity) {
-            facts.push(edge_fact(
+        // A named component is an entity of the cited turn. An empty, generic
+        // or project-name component is the project fallback: that edge is
+        // synthetic, so it is inferred and it is not a drop.
+        if target_kind == Kind::Component {
+            if ground.supports_value(component, carrier.turn, &carrier.quote, ValueShape::Entity) {
+                facts.push(edge_fact(
+                    symptom,
+                    Kind::Issue,
+                    Predicate::Affects,
+                    &target_name,
+                    Some(target_kind),
+                    &carrier,
+                ));
+            } else {
+                count_drop(report, DROP_VALUE_SUPPORT);
+            }
+        } else {
+            facts.push(inferred(edge_fact(
                 symptom,
                 Kind::Issue,
                 Predicate::Affects,
                 &target_name,
                 Some(target_kind),
                 &carrier,
-            ));
-        } else {
-            count_drop(report, DROP_VALUE_SUPPORT);
+            )));
         }
     }
     Ok(facts)
@@ -1269,6 +1282,48 @@ mod tests {
             .find(|fact| fact.predicate == Predicate::Affects)
             .expect("affects");
         assert_eq!(affects.object_name, "cache");
+        assert_eq!(affects.object_kind, Some(Kind::Component));
+        assert_eq!(affects.provenance, Provenance::User);
+    }
+
+    #[test]
+    fn bug_without_a_component_keeps_the_project_edge() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        for component in ["", "project", "tidepool"] {
+            let reply = serde_json::json!({
+                "facts": [],
+                "bugs": [{
+                    "symptom": "stale entries",
+                    "cause": "",
+                    "fix": "",
+                    "status": "open",
+                    "component": component,
+                    "turn": 0,
+                    "quote": "The cache returned stale entries.",
+                    "confidence": 0.9
+                }],
+                "releases": []
+            });
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                reply.as_object().expect("object"),
+                &session(turns.clone()),
+                &mut report,
+            );
+            assert_eq!(report.kept, 1, "{component}");
+            assert!(report.drops.is_empty(), "{component} {:?}", report.drops);
+            let affects = facts
+                .iter()
+                .find(|fact| fact.predicate == Predicate::Affects)
+                .unwrap_or_else(|| panic!("affects for {component}"));
+            assert_eq!(affects.object_name, "tidepool");
+            assert_eq!(affects.object_kind, Some(Kind::Project));
+            assert_eq!(affects.provenance, Provenance::SelfGenerated);
+        }
     }
 
     #[test]

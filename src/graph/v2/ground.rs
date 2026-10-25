@@ -14,8 +14,10 @@
 //! re-cited to that turn, and the fact takes that turn's role. The first turn
 //! in transcript order wins when several others contain it.
 //!
-//! A number is a maximal `\d+(\.\d+)*`. `8080` does not occur inside `18080`,
-//! and `0.2` does not occur inside `0.2.0`.
+//! A number is a maximal `\d+(\.\d+)*`. A `-` directly before the first digit
+//! is part of that number, unless the hyphen sits between two digits, which is
+//! a range. `8080` does not occur inside `18080`, `0.2` does not occur inside
+//! `0.2.0`, and `-1` does not occur as `1` or inside `3-5`.
 //!
 //! Content tokens are the normalised tokens that are longer than one character
 //! or are digits, minus the stop list. A token longer than three characters
@@ -390,7 +392,12 @@ fn numbers_in(text: &str) -> Vec<String> {
             index += 1;
             continue;
         }
-        let start = index;
+        // A hyphen between two digits is a range. A hyphen directly before a
+        // digit, with no digit before the hyphen, is a sign.
+        let signed = index > 0
+            && bytes[index - 1] == b'-'
+            && (index == 1 || !bytes[index - 2].is_ascii_digit());
+        let start = if signed { index - 1 } else { index };
         index = end_of_number(bytes, index);
         out.push(text[start..index].to_string());
     }
@@ -488,6 +495,18 @@ mod tests {
             session.cite(0, "port 9000 is chosen").unwrap_err(),
             DROP_QUOTE
         );
+    }
+
+    #[test]
+    fn a_leading_minus_is_part_of_the_number() {
+        let plain = ground(&[("Retries: 1 attempt.", TurnRole::User)]);
+        assert!(!plain.supports_value("-1", 0, "Retries: 1", ValueShape::Literal));
+        let signed = ground(&[("Retries: -1 attempt.", TurnRole::User)]);
+        assert!(signed.supports_value("-1", 0, "Retries: -1", ValueShape::Literal));
+        let range = ground(&[("Use ports 3-5 today.", TurnRole::User)]);
+        assert!(range.supports_value("3", 0, "ports 3-5", ValueShape::Literal));
+        assert!(range.supports_value("5", 0, "ports 3-5", ValueShape::Literal));
+        assert!(!range.supports_value("-5", 0, "ports 3-5", ValueShape::Literal));
     }
 
     #[test]
