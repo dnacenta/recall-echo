@@ -32,6 +32,11 @@
 //! are boundaries only when the next byte is whitespace or the text ends. A
 //! newline is always a boundary. The first occurrence of the quote is the one
 //! that is scored.
+//!
+//! A bug symptom is checked against the cited turn. When that turn is later
+//! than another turn of the same session, the joined session text is checked
+//! too, so a fix turn can restate a symptom that was said earlier. A number
+//! still has to occur in the text that is checked.
 
 use super::input::{Turn, TurnRole};
 use super::schema::{normalise, DROP_QUOTE};
@@ -166,19 +171,29 @@ impl SessionGround {
     }
 
     /// Cause, fix and release contents: the cited turn, else the session.
+    ///
+    /// A fix that restates a symptom is covered here. The session check does
+    /// not depend on the cited turn being later; a symptom does.
     #[must_use]
     pub(crate) fn credit_field(&self, value: &str, turn: usize, quote: &str) -> FieldCredit {
         if self.supports_value(value, turn, quote, ValueShape::Literal) {
             return FieldCredit::Turn;
         }
-        if supported(
-            value,
-            &self.session_norm,
-            &self.session_words,
-            &self.session_numbers,
-            None,
-            ValueShape::Literal,
-        ) {
+        if self.session_supports(value) {
+            return FieldCredit::Session;
+        }
+        FieldCredit::Drop
+    }
+
+    /// Symptom support. The cited turn wins. A later turn of this session may
+    /// use the joined session text. The first turn may not: the symptom has
+    /// to be in that turn. A symptom that appears in neither drops.
+    #[must_use]
+    pub(crate) fn credit_symptom(&self, value: &str, turn: usize, quote: &str) -> FieldCredit {
+        if self.supports_value(value, turn, quote, ValueShape::Literal) {
+            return FieldCredit::Turn;
+        }
+        if self.turn_is_later(turn) && self.session_supports(value) {
             return FieldCredit::Session;
         }
         FieldCredit::Drop
@@ -242,6 +257,22 @@ impl SessionGround {
 
     fn turn(&self, index: usize) -> Option<&TurnGround> {
         self.turns.iter().find(|turn| turn.index == index)
+    }
+
+    /// Some earlier turn of this session exists. Index order is transcript order.
+    fn turn_is_later(&self, index: usize) -> bool {
+        self.turns.iter().any(|turn| turn.index < index)
+    }
+
+    fn session_supports(&self, value: &str) -> bool {
+        supported(
+            value,
+            &self.session_norm,
+            &self.session_words,
+            &self.session_numbers,
+            None,
+            ValueShape::Literal,
+        )
     }
 }
 
@@ -745,5 +776,70 @@ mod tests {
             session.credit_field("stale entries", 0, "stale entries"),
             FieldCredit::Turn
         );
+    }
+
+    #[test]
+    fn later_turn_symptom_can_use_the_session() {
+        let session = ground(&[
+            ("The reader dropped rows.", TurnRole::User),
+            ("The patch landed in the reader.", TurnRole::Assistant),
+        ]);
+        assert_eq!(
+            session.credit_symptom("dropped rows", 1, "The patch landed"),
+            FieldCredit::Session
+        );
+        assert_eq!(
+            session.credit_symptom("dropped rows", 0, "The reader dropped rows."),
+            FieldCredit::Turn
+        );
+        assert_eq!(
+            session.credit_symptom("invented outage", 1, "The patch landed"),
+            FieldCredit::Drop
+        );
+        // The opening turn does not borrow a symptom that shows up only later.
+        assert_eq!(
+            session.credit_symptom("patch landed", 0, "dropped rows"),
+            FieldCredit::Drop
+        );
+        // A fix that restates the symptom is a field: the session can support it.
+        assert_eq!(
+            session.credit_field("dropped rows patched", 1, "The patch landed"),
+            FieldCredit::Session
+        );
+    }
+
+    #[test]
+    fn session_support_never_admits_an_unstated_number() {
+        let session = ground(&[
+            ("The reader dropped rows near 4242.", TurnRole::User),
+            ("The patch landed in the reader.", TurnRole::Assistant),
+        ]);
+        let stated =
+            numbers_in("The reader dropped rows near 4242. The patch landed in the reader.");
+        let mut samples = vec!["4242".to_string(), "42".to_string(), "42420".to_string()];
+        for n in 0..200 {
+            samples.push(n.to_string());
+            samples.push(format!("{n}.5"));
+            samples.push(format!("-{n}"));
+        }
+        for number in samples {
+            let symptom = format!("dropped rows {number}");
+            let occurs = numbers_in(&symptom)
+                .iter()
+                .all(|have| stated.iter().any(|got| got == have));
+            assert!(
+                !session.supports_value(&symptom, 1, "The patch landed", ValueShape::Literal),
+                "{symptom} must not be supported by the later turn alone"
+            );
+            let credit = session.credit_symptom(&symptom, 1, "The patch landed");
+            let field = session.credit_field(&symptom, 1, "The patch landed");
+            if occurs {
+                assert_eq!(credit, FieldCredit::Session, "{symptom}");
+                assert_eq!(field, FieldCredit::Session, "{symptom}");
+            } else {
+                assert_eq!(credit, FieldCredit::Drop, "{symptom}");
+                assert_eq!(field, FieldCredit::Drop, "{symptom}");
+            }
+        }
     }
 }

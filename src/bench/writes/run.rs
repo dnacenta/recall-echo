@@ -1906,19 +1906,23 @@ mod tests {
             .sum();
         let kept: u32 = report.sessions.iter().map(|session| session.kept).sum();
         assert_eq!(candidates, 46);
-        // 14 candidates fail outright. A component that is the project name
-        // is the project fallback, so those affects edges stay and are not
-        // counted as drops.
-        assert_eq!(kept, 32);
+        // Nine candidates fail outright. A bug cited from a later turn keeps
+        // a symptom that appears elsewhere in the same session, so five bugs
+        // that used to drop stay. A component that is the project name is the
+        // project fallback, so those affects edges stay and are not drops.
+        // This fixture has no partial field drops.
+        assert_eq!(kept, 37);
         let mut drops: HashMap<&str, u32> = HashMap::new();
         for session in &report.sessions {
             for (reason, count) in &session.drops {
                 *drops.entry(reason.as_str()).or_insert(0) += count;
             }
         }
-        assert_eq!(drops.get("value_support").copied(), Some(12));
+        assert_eq!(drops.get("value_support").copied(), Some(7));
         assert_eq!(drops.get("key_binding").copied(), Some(2));
+        assert!(!drops.contains_key("value_support_partial"));
         assert_eq!(drops.len(), 2, "{drops:?}");
+        assert_eq!(kept + drops.values().sum::<u32>(), candidates);
         let patterns = report.patterns.expect("linkshelf carries match blocks");
         assert_eq!(patterns.pairs, 6);
         // A pair retires only when both facts were kept. The replacements
@@ -1937,14 +1941,14 @@ mod tests {
         );
 
         let store = v2_store(tmp.path()).await;
-        assert_eq!(store.edges, 4, "edges {:?}", store.edge_types);
+        assert_eq!(store.edges, 6, "edges {:?}", store.edge_types);
         assert_eq!(
             store
                 .edge_types
                 .iter()
                 .filter(|rel| rel.as_str() == "affects")
                 .count(),
-            2,
+            4,
             "{:?}",
             store.edge_types
         );
@@ -1966,6 +1970,8 @@ mod tests {
         assert_eq!(
             store.names,
             vec![
+                "concurrent add".to_string(),
+                "export timestamps".to_string(),
                 "fetch encoding".to_string(),
                 "linkshelf".to_string(),
                 "linkshelf v0.2.0".to_string(),
@@ -1981,7 +1987,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(store.slots, 39, "slots {:?}", store.slot_predicates);
+        assert_eq!(store.slots, 51, "slots {:?}", store.slot_predicates);
         let pred = |name: &str| {
             store
                 .slot_predicates
@@ -1993,12 +1999,12 @@ mod tests {
         // migration setting is kept. Rules are unchanged.
         assert_eq!(pred("setting"), 15);
         assert_eq!(pred("rule"), 12);
-        // A bug whose symptom is not in the cited turn is dropped whole.
+        // A later citation keeps a symptom said earlier in the session.
         // A kept bug whose component is the project keeps the fallback edge.
-        assert_eq!(pred("issue_symptom"), 2);
-        assert_eq!(pred("issue_cause"), 2);
-        assert_eq!(pred("issue_fix"), 1);
-        assert_eq!(pred("issue_status"), 3);
+        assert_eq!(pred("issue_symptom"), 4);
+        assert_eq!(pred("issue_cause"), 4);
+        assert_eq!(pred("issue_fix"), 4);
+        assert_eq!(pred("issue_status"), 8);
         assert_eq!(pred("release_status"), 2);
         assert_eq!(pred("release_contents"), 2);
     }

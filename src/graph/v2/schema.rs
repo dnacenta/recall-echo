@@ -22,6 +22,9 @@ pub(crate) const DROP_GENERIC: &str = "generic_object";
 pub(crate) const DROP_CONFIDENCE: &str = "low_confidence";
 pub(crate) const DROP_QUOTE: &str = "quote";
 pub(crate) const DROP_VALUE_SUPPORT: &str = "value_support";
+/// A cause, fix, release contents field, or named `affects` edge failed value
+/// support. The candidate stayed. Left out of `kept + whole drops`.
+pub(crate) const DROP_VALUE_SUPPORT_PARTIAL: &str = "value_support_partial";
 pub(crate) const DROP_KEY_BINDING: &str = "key_binding";
 pub(crate) const DROP_VERSION: &str = "bad_version";
 pub(crate) const DROP_PARSE: &str = "parse";

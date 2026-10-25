@@ -26,7 +26,7 @@ use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
     affects_target, filter_fact, map_subject, over_long, release_name, remap, Fact, Kind, Mention,
     Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_TOO_LONG,
-    DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VERSION, MAX_ITEMS,
+    DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -446,9 +446,12 @@ fn expand_bug(
         return Err(DROP_TOO_LONG);
     }
     let mut carrier = carrier(object, confidence, &cited)?;
-    // The symptom is a literal of the cited turn. A number or token it does
-    // not support drops the whole bug.
-    if !ground.supports_value(symptom, carrier.turn, &carrier.quote, ValueShape::Literal) {
+    // The cited turn is checked first. A later turn may use the joined session
+    // text, so a fix turn can restate a symptom said earlier. Nowhere in the
+    // session drops the whole bug. The quote was already required to be in
+    // the cited turn.
+    let symptom_credit = ground.credit_symptom(symptom, carrier.turn, &carrier.quote);
+    if symptom_credit == FieldCredit::Drop {
         return Err(DROP_VALUE_SUPPORT);
     }
     // Cause and fix are slots of the symptom, the same subject as the symptom slot.
@@ -456,13 +459,18 @@ fn expand_bug(
     carrier.subject_kind = Kind::Issue;
     let component = text(object, "component")?.trim();
     let (target_name, target_kind) = affects_target(component, &session.project);
-    let mut facts = vec![slot_fact(
+    let mut symptom_fact = slot_fact(
         symptom,
         Kind::Issue,
         Predicate::IssueSymptom,
         symptom,
         &carrier,
-    )];
+    );
+    // Not supported by the cited turn: the slot is inferred. The quote stays.
+    if symptom_credit == FieldCredit::Session {
+        symptom_fact.provenance = Provenance::SelfGenerated;
+    }
+    let mut facts = vec![symptom_fact];
     push_field(
         &mut facts,
         report,
@@ -508,7 +516,7 @@ fn expand_bug(
                     &carrier,
                 ));
             } else {
-                count_drop(report, DROP_VALUE_SUPPORT);
+                count_drop(report, DROP_VALUE_SUPPORT_PARTIAL);
             }
         } else {
             facts.push(inferred(edge_fact(
@@ -605,7 +613,7 @@ fn push_field(
             fact.provenance = Provenance::SelfGenerated;
             facts.push(fact);
         }
-        FieldCredit::Drop => count_drop(report, DROP_VALUE_SUPPORT),
+        FieldCredit::Drop => count_drop(report, DROP_VALUE_SUPPORT_PARTIAL),
     }
 }
 
@@ -869,7 +877,7 @@ mod tests {
     use crate::graph::v2::input::{ProjectIdentity, Turn, TurnRole};
     use crate::graph::v2::schema::{
         Kind, Predicate, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG, DROP_VALUE_SUPPORT,
-        DROP_VERSION, MAX_ITEMS,
+        DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
     };
     use crate::graph::Provenance;
     use serde_json::Value;
@@ -1142,6 +1150,7 @@ mod tests {
         );
         assert_eq!(report.drops.get(DROP_VERSION).copied(), Some(1));
         assert_eq!(report.kept, 1);
+        assert_candidate_balance(&report);
         assert!(facts
             .iter()
             .any(|fact| fact.subject_name == "tidepool v1.4.0"));
@@ -1201,7 +1210,12 @@ mod tests {
             &mut report,
         );
         assert_eq!(report.kept, 1);
-        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_eq!(
+            report.drops.get(DROP_VALUE_SUPPORT_PARTIAL).copied(),
+            Some(1)
+        );
+        assert!(!report.drops.contains_key(DROP_VALUE_SUPPORT));
+        assert_candidate_balance(&report);
         let symptom = facts
             .iter()
             .find(|fact| fact.predicate == Predicate::IssueSymptom)
@@ -1377,13 +1391,380 @@ mod tests {
             &mut report,
         );
         assert_eq!(report.kept, 1);
-        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_eq!(
+            report.drops.get(DROP_VALUE_SUPPORT_PARTIAL).copied(),
+            Some(1)
+        );
+        assert!(!report.drops.contains_key(DROP_VALUE_SUPPORT));
+        assert_candidate_balance(&report);
         assert!(facts
             .iter()
             .any(|fact| fact.predicate == Predicate::IssueSymptom));
         assert!(facts
             .iter()
             .all(|fact| fact.predicate != Predicate::Affects));
+    }
+
+    fn assert_candidate_balance(report: &IngestionReport) {
+        let partial = report
+            .drops
+            .get(DROP_VALUE_SUPPORT_PARTIAL)
+            .copied()
+            .unwrap_or(0);
+        let listed: u32 = report.drops.values().copied().sum();
+        assert_eq!(
+            report.kept + listed - partial,
+            report.candidates,
+            "kept {} drops {:?}",
+            report.kept,
+            report.drops
+        );
+    }
+
+    fn bug_reply(
+        symptom: &str,
+        cause: &str,
+        fix: &str,
+        component: &str,
+        turn: usize,
+        quote: &str,
+    ) -> Map<String, Value> {
+        serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": symptom,
+                "cause": cause,
+                "fix": fix,
+                "status": "fixed",
+                "component": component,
+                "turn": turn,
+                "quote": quote,
+                "confidence": 0.9
+            }],
+            "releases": []
+        })
+        .as_object()
+        .expect("object")
+        .clone()
+    }
+
+    fn reader_turns() -> Vec<Turn> {
+        vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "The reader dropped rows near 4242 before the backup.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Patched the reader and shipped it.".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn later_turn_keeps_a_symptom_said_earlier_in_the_session() {
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply(
+                "dropped rows",
+                "",
+                "dropped rows patched",
+                "",
+                1,
+                "Patched the reader",
+            ),
+            &session(reader_turns()),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        assert_candidate_balance(&report);
+        let symptom = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom");
+        assert_eq!(symptom.object_name, "dropped rows");
+        assert_eq!(symptom.provenance, Provenance::SelfGenerated);
+        assert_eq!(symptom.turn, 1);
+        let fix = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueFix)
+            .expect("fix");
+        assert_eq!(fix.object_name, "dropped rows patched");
+        assert_eq!(fix.provenance, Provenance::SelfGenerated);
+        let status = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueStatus)
+            .expect("status");
+        assert_eq!(status.object_name, "fixed");
+    }
+
+    #[test]
+    fn later_turn_that_states_the_symptom_keeps_its_role() {
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply("patched the reader", "", "", "", 1, "Patched the reader"),
+            &session(reader_turns()),
+            &mut report,
+        );
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        let symptom = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom");
+        assert_eq!(symptom.provenance, Provenance::Assistant);
+        assert_eq!(symptom.object_name, "patched the reader");
+    }
+
+    #[test]
+    fn symptom_number_may_come_from_any_turn() {
+        let turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "The reader dropped rows.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Patched the reader.".into(),
+            },
+            Turn {
+                index: 2,
+                role: TurnRole::User,
+                text: "Retry count is 17.".into(),
+            },
+        ];
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply("dropped rows 17", "", "", "", 1, "Patched the reader"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert!(facts
+            .iter()
+            .any(|fact| fact.object_name == "dropped rows 17"));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn first_turn_does_not_take_a_symptom_from_a_later_turn() {
+        let turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "Patched the reader and shipped it.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "The reader dropped rows near 4242.".into(),
+            },
+        ];
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply("dropped rows", "", "", "", 0, "Patched the reader"),
+            &session(turns),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn symptom_absent_from_the_session_still_drops_the_bug() {
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply(
+                "invented outage",
+                "",
+                "dropped rows patched",
+                "",
+                1,
+                "Patched the reader",
+            ),
+            &session(reader_turns()),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(!report.drops.contains_key(DROP_VALUE_SUPPORT_PARTIAL));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn quote_must_still_be_in_a_turn() {
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply(
+                "dropped rows",
+                "",
+                "",
+                "",
+                1,
+                "this sentence was never said",
+            ),
+            &session(reader_turns()),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn partial_drops_stay_out_of_the_candidate_total() {
+        let reply = serde_json::json!({
+            "facts": [fact_json(1, "Patched the reader")],
+            "bugs": [
+                {
+                    "symptom": "dropped rows",
+                    "cause": "",
+                    "fix": "invented remedy nowhere",
+                    "status": "open",
+                    "component": "billing ledger",
+                    "turn": 1,
+                    "quote": "Patched the reader",
+                    "confidence": 0.9
+                },
+                {
+                    "symptom": "dropped rows on 9991",
+                    "cause": "",
+                    "fix": "",
+                    "status": "open",
+                    "component": "",
+                    "turn": 1,
+                    "quote": "Patched the reader",
+                    "confidence": 0.9
+                }
+            ],
+            "releases": [{
+                "version": "4242",
+                "status": "released",
+                "contents": "unrelated payload",
+                "turn": 0,
+                "quote": "near 4242 before",
+                "confidence": 0.9
+            }]
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(reader_turns()),
+            &mut report,
+        );
+        // The setting names 9000, which is not in the session. The second bug's
+        // number is not in the session. The release is kept; its contents, the
+        // first bug's fix, and that bug's component are partial drops.
+        assert_eq!(report.candidates, 4);
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(2));
+        assert!(!report.drops.contains_key(DROP_VERSION));
+        assert_eq!(
+            report.drops.get(DROP_VALUE_SUPPORT_PARTIAL).copied(),
+            Some(3)
+        );
+        assert_candidate_balance(&report);
+        assert!(facts
+            .iter()
+            .any(|fact| fact.predicate == Predicate::IssueSymptom));
+        assert!(facts
+            .iter()
+            .all(|fact| fact.predicate != Predicate::IssueFix));
+        assert!(facts
+            .iter()
+            .all(|fact| fact.predicate != Predicate::ReleaseContents));
+        assert!(facts.iter().all(|fact| fact.predicate != Predicate::Affects
+            || fact.object_kind != Some(Kind::Component)));
+    }
+
+    #[test]
+    fn kept_values_never_carry_an_unstated_number() {
+        let turns = reader_turns();
+        let raw = format!("{} {}", turns[0].text, turns[1].text);
+        let session = session(turns);
+        for n in 0..200 {
+            for number in [n.to_string(), format!("{n}.5"), format!("-{n}")] {
+                if raw.contains(&number) {
+                    continue;
+                }
+                let mut report = IngestionReport::default();
+                let facts = facts_from_reply(
+                    &bug_reply(
+                        &format!("dropped rows {number}"),
+                        &format!("cause rows {number}"),
+                        &format!("patched rows {number}"),
+                        "",
+                        1,
+                        "Patched the reader",
+                    ),
+                    &session,
+                    &mut report,
+                );
+                assert!(
+                    facts.is_empty(),
+                    "{number} was admitted: {:?}",
+                    facts
+                        .iter()
+                        .map(|fact| fact.object_name.as_str())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    report.drops.get(DROP_VALUE_SUPPORT).copied(),
+                    Some(1),
+                    "{number}"
+                );
+                assert_candidate_balance(&report);
+            }
+        }
+        // A digit run inside a longer number is not that number.
+        for symptom in [
+            "dropped rows 42",
+            "dropped rows 2",
+            "dropped rows 4",
+            "dropped rows 24",
+            "dropped rows 242",
+            "dropped rows 424",
+            "dropped rows 42420",
+            "dropped rows -1",
+            "dropped rows 0.2",
+        ] {
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                &bug_reply(symptom, "", "", "", 1, "Patched the reader"),
+                &session,
+                &mut report,
+            );
+            assert!(facts.is_empty(), "{symptom}");
+            assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        }
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply(
+                "dropped rows 4242",
+                "",
+                "patched rows 9991",
+                "",
+                1,
+                "Patched the reader",
+            ),
+            &session,
+            &mut report,
+        );
+        assert!(facts
+            .iter()
+            .any(|fact| fact.object_name == "dropped rows 4242"));
+        assert!(facts.iter().all(|fact| !fact.object_name.contains("9991")));
+        assert_eq!(
+            report.drops.get(DROP_VALUE_SUPPORT_PARTIAL).copied(),
+            Some(1)
+        );
+        assert_candidate_balance(&report);
     }
 
     #[cfg(feature = "embedded")]
