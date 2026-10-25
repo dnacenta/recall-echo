@@ -632,7 +632,15 @@ impl<'a> Attempt<'a> {
         let mut attributes = subject.attributes.clone();
         let v2 = v2_map(&mut attributes)?;
         let slots = slots_mut(v2)?;
-        let persist = if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
+        let persist = if slots
+            .iter()
+            .any(|slot| evidence_already_stored(slot, fact, self.ctx.session_id))
+        {
+            // The sighting is already on a slot of this fact, live or closed.
+            // Reinforce would otherwise attach it to a later live value.
+            self.stats.already_seen += 1;
+            false
+        } else if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
             match reinforce_slot(slot, self.gm, fact, self.ctx.session_id)? {
                 Sight::Recorded => {
                     self.stats.reinforced += 1;
@@ -681,7 +689,9 @@ impl<'a> Attempt<'a> {
         let Some(until) = self.ctx.valid_until.clone() else {
             let session_id = self.ctx.session_id;
             self.skip_matches(&slots, |slot| {
-                supersede_target(slot, fact) && !opened_here(slot.get("evidence"), session_id)
+                supersede_target(slot, fact)
+                    && (!opened_here(slot.get("evidence"), session_id)
+                        || same_session_status_close(slot, fact, session_id))
             });
             return Ok(());
         };
@@ -693,7 +703,8 @@ impl<'a> Attempt<'a> {
                 continue;
             }
             if !supersede_target(slot, fact)
-                || opened_here(slot.get("evidence"), self.ctx.session_id)
+                || (opened_here(slot.get("evidence"), self.ctx.session_id)
+                    && !same_session_status_close(slot, fact, self.ctx.session_id))
             {
                 continue;
             }
@@ -1535,7 +1546,8 @@ fn edge_closed(valid_until: Option<&Value>) -> bool {
 ///
 /// Rejected facts run before decided facts of the same turn, so a rejection
 /// does not see the decided fact beside it. A later turn does not close an
-/// earlier fact of this session either.
+/// earlier fact of this session either, except the synthetic status close in
+/// [`same_session_status_close`].
 fn opened_here(evidence: Option<&Value>, session_id: &str) -> bool {
     let Some(items) = evidence.and_then(Value::as_array) else {
         return false;
@@ -1544,6 +1556,37 @@ fn opened_here(evidence: Option<&Value>, session_id: &str) -> bool {
         return false;
     };
     first.get("session").and_then(Value::as_str) == Some(session_id)
+}
+
+/// The fix is the session's own words, so a later synthetic `fixed` may close
+/// the synthetic `open` this session wrote on an earlier turn.
+#[must_use]
+fn same_session_status_close(slot: &Value, fact: &Fact, session_id: &str) -> bool {
+    if fact.predicate != Predicate::IssueStatus || fold_value(&fact.object_name) != "fixed" {
+        return false;
+    }
+    if !slot_live(slot)
+        || slot_str(slot, "predicate") != Some("issue_status")
+        || slot_str(slot, "status") != Some("decided")
+        || fold_value(slot_str(slot, "value").unwrap_or("")) != "open"
+        || slot_str(slot, "provenance") != Some("self")
+    {
+        return false;
+    }
+    let Some(first) = slot
+        .get("evidence")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    else {
+        return false;
+    };
+    first.get("session").and_then(Value::as_str) == Some(session_id)
+        && json_usize(first.get("turn")).is_some_and(|turn| turn < fact.turn)
+}
+
+/// This session, turn and quote is already stored on this fact, live or closed.
+fn evidence_already_stored(slot: &Value, fact: &Fact, session_id: &str) -> bool {
+    same_fact(slot, fact) && evidence_seen(slot.get("evidence"), session_id, fact)
 }
 
 fn stamp_slot(slot: &mut Value, until: &str, ended_by: &str) -> bool {
@@ -1581,9 +1624,11 @@ fn stored_kind(attributes: &Value) -> Option<Kind> {
 }
 
 fn same_slot(slot: &Value, fact: &Fact) -> bool {
-    let live = slot.get("valid_until").is_none_or(Value::is_null);
-    if !(live
-        && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
+    slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
+}
+
+fn same_fact(slot: &Value, fact: &Fact) -> bool {
+    if !(slot_str(slot, "predicate") == Some(fact.predicate.as_str())
         && slot_str(slot, "status") == Some(fact.status.as_str()))
     {
         return false;
@@ -2369,6 +2414,52 @@ mod tests {
         }
     }
 
+    fn issue_status(symptom: &str, value: &str, turn: usize, provenance: Provenance) -> Fact {
+        let mut fact = decided_slot("", value, turn);
+        fact.subject_name = symptom.into();
+        fact.subject_kind = Kind::Issue;
+        fact.predicate = Predicate::IssueStatus;
+        fact.key.clear();
+        fact.provenance = provenance;
+        fact.quote = format!("{symptom} is {value} on turn {turn}");
+        fact
+    }
+
+    fn synth(value: &str, turn: usize) -> Fact {
+        issue_status("login fails", value, turn, Provenance::SelfGenerated)
+    }
+
+    async fn run_status(date: &str, facts: &[Fact]) -> (WriteStats, Vec<Value>) {
+        let (_tmp, gm) = open_store().await;
+        let stats = write_session(&gm, "s", date, facts).await.unwrap();
+        (stats, slots_of(&gm, "login fails").await)
+    }
+
+    fn status_slots(slots: &[Value]) -> Vec<&Value> {
+        slots
+            .iter()
+            .filter(|slot| slot["predicate"] == "issue_status")
+            .collect()
+    }
+
+    fn live_count(slots: &[Value], value: &str) -> usize {
+        status_slots(slots)
+            .iter()
+            .filter(|slot| slot["value"] == value && slot["valid_until"].is_null())
+            .count()
+    }
+
+    async fn both_live(date: &str, facts: [Fact; 2], skipped: u32) -> Vec<Value> {
+        let (stats, slots) = run_status(date, &facts).await;
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        assert_eq!(stats.retirements_skipped, skipped);
+        assert_eq!(
+            (live_count(&slots, "open"), live_count(&slots, "fixed")),
+            (1, 1)
+        );
+        slots
+    }
+
     fn uses_named(
         subject: &str,
         kind: Kind,
@@ -3074,6 +3165,200 @@ mod tests {
             "s2:superseded"
         );
         assert!(slot_named(&slots, "port", "9000")["valid_until"].is_null());
+    }
+
+    /// One live `fixed`, and the synthetic `open` stamped superseded.
+    fn assert_open_closed(slots: &[Value]) -> (f64, f64) {
+        let status = status_slots(slots);
+        assert_eq!(status.len(), 2, "{slots:?}");
+        assert_eq!(live_count(slots, "fixed"), 1);
+        assert_eq!(live_count(slots, "open"), 0);
+        let closed = status
+            .iter()
+            .find(|slot| slot["value"] == "open")
+            .expect("open slot");
+        assert_eq!(closed["ended_by"], "s:superseded");
+        assert_eq!(closed["valid_until"], "2026-04-03T00:00:00Z");
+        assert_eq!(closed["provenance"], "self");
+        let prior = Evidence::from_prior(ExtractionContext::Speculative.prior());
+        for slot in &status {
+            assert!((slot["alpha"].as_f64().unwrap() - prior.alpha()).abs() < 1e-9);
+            assert!((slot["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
+            assert_eq!(slot["evidence"].as_array().unwrap().len(), 1);
+        }
+        (
+            closed["alpha"].as_f64().unwrap(),
+            closed["beta"].as_f64().unwrap(),
+        )
+    }
+
+    /// AC1 and AC6. A later synthetic `fixed` closes the earlier synthetic
+    /// `open`. Writing the session again does not retire it a second time.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn later_fixed_closes_same_session_synthetic_open() {
+        let (_tmp, gm) = open_store().await;
+        let open = synth("open", 1);
+        let fixed = synth("fixed", 4);
+        let stats = write_session(&gm, "s", "2026-04-03", &[open.clone(), fixed.clone()])
+            .await
+            .unwrap();
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        let row = &stats.retirements[0];
+        assert_eq!(row.reason, "superseded");
+        assert_eq!(row.subject, "login fails");
+        assert_eq!(row.predicate, "issue_status");
+        assert_eq!(
+            (row.old_value.as_str(), row.new_value.as_str()),
+            ("open", "fixed")
+        );
+        let (alpha, beta) = assert_open_closed(&slots_of(&gm, "login fails").await);
+        let retry = write_session(&gm, "s", "2026-04-03", &[open, fixed])
+            .await
+            .unwrap();
+        assert!(retry.retirements.is_empty(), "{:?}", retry.retirements);
+        assert_eq!(
+            (retry.already_seen, retry.slots, retry.reinforced),
+            (2, 0, 0)
+        );
+        let (again_alpha, again_beta) = assert_open_closed(&slots_of(&gm, "login fails").await);
+        assert!((again_alpha - alpha).abs() < 1e-9 && (again_beta - beta).abs() < 1e-9);
+    }
+
+    /// AC2. A later `open` does not close an earlier `fixed` in this session.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn later_open_does_not_close_same_session_fixed() {
+        both_live("2026-04-03", [synth("fixed", 1), synth("open", 4)], 0).await;
+    }
+
+    /// AC3. Two status entries that cite the same turn both stay live.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn same_turn_status_entries_both_stay_live() {
+        both_live("2026-04-03", [synth("open", 2), synth("fixed", 2)], 0).await;
+    }
+
+    /// AC4. A `fixed` on a different issue does not close this one.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn different_issue_status_is_not_closed() {
+        let (_tmp, gm) = open_store().await;
+        let stats = write_session(
+            &gm,
+            "s",
+            "2026-04-03",
+            &[
+                issue_status("login fails", "open", 1, Provenance::SelfGenerated),
+                issue_status("search times out", "fixed", 4, Provenance::SelfGenerated),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let login = slots_of(&gm, "login fails").await;
+        let search = slots_of(&gm, "search times out").await;
+        assert_eq!(
+            (live_count(&login, "open"), live_count(&login, "fixed")),
+            (1, 0)
+        );
+        assert_eq!(
+            (live_count(&search, "open"), live_count(&search, "fixed")),
+            (0, 1)
+        );
+    }
+
+    /// A non-synthetic `open` stays live. Removing the provenance check closes it.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn user_open_is_not_closed_by_same_session_fixed() {
+        let slots = both_live(
+            "2026-04-03",
+            [
+                issue_status("login fails", "open", 1, Provenance::User),
+                synth("fixed", 4),
+            ],
+            0,
+        )
+        .await;
+        let open = status_slots(&slots)
+            .into_iter()
+            .find(|slot| slot["value"] == "open")
+            .expect("open slot");
+        assert_eq!(open["provenance"], "user");
+    }
+
+    /// AC7. An invalid session date counts the close and stamps nothing.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn bad_date_skips_the_same_session_status_close() {
+        let slots = both_live("2026-04-11 10:00", [synth("open", 1), synth("fixed", 4)], 1).await;
+        assert!(status_slots(&slots)
+            .iter()
+            .all(|slot| slot["ended_by"].is_null()));
+    }
+
+    fn fact_counts(slot: &Value) -> (f64, f64, usize) {
+        (
+            slot["alpha"].as_f64().unwrap(),
+            slot["beta"].as_f64().unwrap(),
+            slot["evidence"].as_array().unwrap().len(),
+        )
+    }
+
+    /// A later `open` in the same session stays. Re-writing must not reinforce it
+    /// with the earlier quote that already sits on the closed slot.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn re_run_of_open_fixed_open_does_not_reinforce() {
+        let (_tmp, gm) = open_store().await;
+        let facts = [synth("open", 1), synth("fixed", 4), synth("open", 6)];
+        let stats = write_session(&gm, "s", "2026-04-03", &facts).await.unwrap();
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.reinforced, 0);
+        let slots = slots_of(&gm, "login fails").await;
+        assert_eq!(status_slots(&slots).len(), 3, "{slots:?}");
+        assert_eq!(live_count(&slots, "open"), 1);
+        assert_eq!(live_count(&slots, "fixed"), 1);
+        let before: Vec<_> = status_slots(&slots).into_iter().map(fact_counts).collect();
+        assert!(before.iter().all(|(_, _, evidence)| *evidence == 1));
+        let retry = write_session(&gm, "s", "2026-04-03", &facts).await.unwrap();
+        assert!(retry.retirements.is_empty(), "{:?}", retry.retirements);
+        assert_eq!(
+            (retry.already_seen, retry.slots, retry.reinforced),
+            (3, 0, 0)
+        );
+        let slots = slots_of(&gm, "login fails").await;
+        let after: Vec<_> = status_slots(&slots).into_iter().map(fact_counts).collect();
+        assert_eq!(after, before);
+    }
+
+    /// A later session's `open` is a new sighting, so it is stored.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn later_session_open_inserts_a_live_slot() {
+        let (_tmp, gm) = open_store().await;
+        write_session(&gm, "s1", "2026-04-03", &[synth("open", 1)])
+            .await
+            .unwrap();
+        write_session(&gm, "s2", "2026-04-11", &[synth("fixed", 1)])
+            .await
+            .unwrap();
+        let stats = write_session(&gm, "s3", "2026-04-18", &[synth("open", 1)])
+            .await
+            .unwrap();
+        assert_eq!(stats.slots, 1, "{stats:?}");
+        assert_eq!(stats.already_seen, 0);
+        assert_eq!(stats.reinforced, 0);
+        let slots = slots_of(&gm, "login fails").await;
+        let live: Vec<_> = status_slots(&slots)
+            .into_iter()
+            .filter(|slot| slot["value"] == "open" && slot["valid_until"].is_null())
+            .collect();
+        assert_eq!(live.len(), 1, "{slots:?}");
+        let evidence = live[0]["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["session"], "s3");
     }
 
     #[cfg(feature = "embedded")]

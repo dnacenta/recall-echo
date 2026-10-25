@@ -2004,7 +2004,12 @@ mod tests {
         assert_eq!(pred("issue_symptom"), 4);
         assert_eq!(pred("issue_cause"), 4);
         assert_eq!(pred("issue_fix"), 4);
+        // A later `fixed` closes the synthetic `open` from an earlier turn.
+        // The closed slot stays stored, so the count is still two statuses
+        // per kept bug. One pair cites both quotes in a single assistant
+        // turn, so both of those statuses stay live.
         assert_eq!(pred("issue_status"), 8);
+        assert_eq!(store.open_and_fixed, vec!["fetch encoding".to_string()]);
         assert_eq!(pred("release_status"), 2);
         assert_eq!(pred("release_contents"), 2);
     }
@@ -2087,6 +2092,7 @@ mod tests {
         slots: usize,
         slot_keys: Vec<String>,
         slot_predicates: Vec<String>,
+        open_and_fixed: Vec<String>,
         literal: regex::Regex,
     }
 
@@ -2103,6 +2109,7 @@ mod tests {
         let mut slots = 0;
         let mut slot_keys = Vec::new();
         let mut slot_predicates = Vec::new();
+        let mut open_and_fixed = Vec::new();
         for entity in &entities {
             let Some(list) = entity
                 .attributes
@@ -2114,6 +2121,18 @@ mod tests {
                 continue;
             };
             slots += list.len();
+            let live_status = |value: &str| {
+                list.iter().any(|slot| {
+                    slot.get("predicate").and_then(|item| item.as_str()) == Some("issue_status")
+                        && slot.get("value").and_then(|item| item.as_str()) == Some(value)
+                        && slot.get("valid_until").is_none_or(|until| {
+                            until.is_null() || until.as_str().is_some_and(str::is_empty)
+                        })
+                })
+            };
+            if live_status("open") && live_status("fixed") {
+                open_and_fixed.push(entity.name.clone());
+            }
             for slot in list {
                 if let Some(key) = slot.get("key").and_then(|key| key.as_str()) {
                     slot_keys.push(key.to_string());
@@ -2126,6 +2145,7 @@ mod tests {
                 }
             }
         }
+        open_and_fixed.sort();
         let relationships = crate::graph::crud::list_all_relationships(gm.db())
             .await
             .unwrap();
@@ -2139,6 +2159,7 @@ mod tests {
             slots,
             slot_keys,
             slot_predicates,
+            open_and_fixed,
             literal: regex::Regex::new(r"^[\d.]+[a-z%]*$|[/~=(%]|^v?\d+(\.\d+)+").unwrap(),
         }
     }

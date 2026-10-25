@@ -44,6 +44,8 @@ A symptom the cited turn does not support is inferred (`self`). One the cited tu
 
 Cause, fix and release contents already use the cited turn and, failing that, the joined session, on every turn. A fix that restates the symptom is kept when that text supports it. When it does not, the field drops as `value_support_partial` and the bug stays. A named component is still checked only against the cited turn.
 
+A fact stored in the current session stays live for the rest of that session, so a later turn leaves a setting that was opened earlier untouched. Issue status is the one exception. Pass 1 writes `issue_status` as `open` when no fix was kept and as `fixed` when a fix stayed, and that value is inferred (`self`). A decided `fixed` closes a live synthetic `open` of the same issue when that slot was opened in this session on a strictly earlier turn. The stamp is `valid_until` and `ended_by` with reason `superseded`, and the closed slot keeps its counts. A later `open` leaves an earlier `fixed` in place. Two entries that cite the same turn both stay. Every other predicate keeps the session protection.
+
 ## Reports
 
 `kept` plus the whole-candidate drop counts equals `candidates`. Cause, fix, release contents, and a named `affects` edge that fail value support count as `value_support_partial`. They are listed separately and are not part of that sum. An empty optional field is not a drop. `unresolved` is counted at write time on a candidate that was already kept, so it sits outside the pass-1 sum.
