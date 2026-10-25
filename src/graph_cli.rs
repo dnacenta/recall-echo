@@ -426,7 +426,7 @@ pub async fn ingest(
     provenance: Option<Provenance>,
     pipeline: Option<PipelineVersion>,
 ) -> Result<(), RecallError> {
-    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline, None).await?;
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -999,7 +999,14 @@ async fn prepare_rebuild(
     memory_dir: &Path,
     options: &ExtractOptions,
 ) -> Result<RebuildPlan, RecallError> {
-    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, options.pipeline)?;
+    // Explicit v1 is already refused. Reading the stamp to rephrase that
+    // refusal would open the store this check promises not to touch.
+    if options.pipeline == Some(PipelineVersion::V1) {
+        return Err(RecallError::Config(
+            "rebuild requires pipeline v2; pass --pipeline v2".into(),
+        ));
+    }
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, options.pipeline, None).await?;
     if pipeline != PipelineVersion::V2 {
         return Err(RecallError::Config(
             "rebuild requires pipeline v2; pass --pipeline v2".into(),
@@ -1101,7 +1108,7 @@ async fn build_is_complete(
     conversations: &Path,
     logs: &[u32],
 ) -> Result<bool, RecallError> {
-    if !has_kv_manifest(build) {
+    if !crate::graph::store::has_kv_manifest(build) {
         return Ok(false);
     }
     let db = crate::graph::store::open(build).await?;
@@ -1146,7 +1153,7 @@ async fn pending_in_build(
     if !build.exists() {
         return Ok((false, logs_with_chunks(conversations, logs)?));
     }
-    if !build.join("surreal").is_dir() || !has_kv_manifest(build) {
+    if !build.join("surreal").is_dir() || !crate::graph::store::has_kv_manifest(build) {
         return Err(RecallError::Other(removal_hint(build)));
     }
     let db = crate::graph::store::open(build).await?;
@@ -1164,18 +1171,6 @@ async fn pending_in_build(
     }
     let pending = pending_logs(&db, conversations, logs).await?;
     Ok((true, pending))
-}
-
-/// SurrealKV writes `surreal/manifest/*.manifest`. An unrelated `surreal/`
-/// directory has none, and opening it would create a store there.
-#[cfg(feature = "llm")]
-fn has_kv_manifest(store: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(store.join("surreal").join("manifest")) else {
-        return false;
-    };
-    entries
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("manifest"))
 }
 
 /// Logs that have at least one chunk. A zero-chunk log is not pending work.
@@ -1721,6 +1716,11 @@ fn attempt_after_error(
     pipeline: PipelineVersion,
     err: &crate::graph::error::GraphError,
 ) -> Attempt {
+    // v1 into a v2 store is a refusal, not a flaky write. Retrying would
+    // call the provider again and still write nothing.
+    if err.to_string().contains(crate::graph::v2::V1_REFUSAL) {
+        return Attempt::Stop;
+    }
     if pipeline != PipelineVersion::V2 {
         return Attempt::Retry;
     }
@@ -1728,6 +1728,15 @@ fn attempt_after_error(
         Attempt::Stop
     } else {
         Attempt::LeavePending
+    }
+}
+
+#[cfg(feature = "llm")]
+fn refusal_text(err: &crate::graph::error::GraphError) -> &'static str {
+    if err.to_string().contains(crate::graph::v2::V1_REFUSAL) {
+        crate::graph::v2::V1_REFUSAL
+    } else {
+        crate::graph::v2::V2_REFUSAL
     }
 }
 
@@ -1832,7 +1841,7 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
         pipeline,
         rebuild: _,
     } = options;
-    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
+    let pipeline_flag = pipeline;
     let memory = memory_dir.to_path_buf();
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
@@ -1842,6 +1851,10 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
     }
 
     serve_client::exclusive(memory_dir, |gm| async move {
+        // The store is already open, so the stamp is read from it. A refusal
+        // happens before any archive is marked or rewritten.
+        let pipeline =
+            crate::graph::v2::chosen_pipeline(&memory, pipeline_flag, Some(gm.db())).await?;
         // Determine which log numbers to process
         let log_numbers: Vec<u32> = if let Some(ln) = log {
             vec![ln]
@@ -1944,10 +1957,9 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
             if let Err(ref err) = first {
                 match attempt_after_error(pipeline, err) {
                     Attempt::Stop => {
-                        println!("\n{WARN}✗{RESET} {}", crate::graph::v2::V2_REFUSAL);
-                        return Err(RecallError::Other(
-                            crate::graph::v2::V2_REFUSAL.to_string(),
-                        ));
+                        let message = refusal_text(err);
+                        println!("\n{WARN}✗{RESET} {message}");
+                        return Err(RecallError::Other(message.to_string()));
                     }
                     Attempt::LeavePending => {
                         println!(
@@ -3097,6 +3109,11 @@ mod tests {
         assert_eq!(
             attempt_after_error(PipelineVersion::V1, &write),
             Attempt::Retry
+        );
+        let v1_into_v2 = GraphError::Extraction(crate::graph::v2::V1_REFUSAL.to_string());
+        assert_eq!(
+            attempt_after_error(PipelineVersion::V1, &v1_into_v2),
+            Attempt::Stop
         );
     }
 

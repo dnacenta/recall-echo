@@ -365,6 +365,10 @@ pub struct DaemonInfo {
     pub uptime_secs: u64,
     #[serde(default)]
     pub extraction: ExtractionStatus,
+    /// `meta:pipeline` on the store this daemon has open. Absent on a daemon
+    /// that predates the field, and on a store that was never stamped.
+    #[serde(default)]
+    pub pipeline_stamp: Option<String>,
 }
 
 /// What this daemon's background extraction worker has done so far.
@@ -936,6 +940,7 @@ impl DaemonContext {
             socket_path: self.socket_path.display().to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
             extraction: self.extraction.snapshot(Instant::now()),
+            pipeline_stamp: None,
         }
     }
 }
@@ -1261,12 +1266,19 @@ async fn handle_connection(
         }
 
         let (response, stop) = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Hello) => (
-                Response::success(
-                    serde_json::to_value(context.info()).unwrap_or(serde_json::Value::Null),
-                ),
-                false,
-            ),
+            Ok(Request::Hello) => {
+                let mut info = context.info();
+                match crate::graph::v2::read_stamp(graph.db()).await {
+                    Ok(stamp) => info.pipeline_stamp = stamp,
+                    Err(err) => log.log(&format!("pipeline stamp unreadable: {err}")),
+                }
+                (
+                    Response::success(
+                        serde_json::to_value(info).unwrap_or(serde_json::Value::Null),
+                    ),
+                    false,
+                )
+            }
             Ok(Request::Shutdown) => (
                 Response::success(serde_json::json!({ "stopping": true })),
                 true,
@@ -1750,6 +1762,7 @@ mod tests {
         .expect("older daemon info");
         assert_eq!(info.extraction, ExtractionStatus::default());
         assert!(!info.extraction.enabled);
+        assert!(info.pipeline_stamp.is_none());
     }
 
     #[test]

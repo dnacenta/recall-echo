@@ -117,6 +117,18 @@ fn is_conflict_message(msg: &str) -> bool {
     msg.contains("conflict") || msg.contains("please retry")
 }
 
+/// SurrealKV writes `surreal/manifest/*.manifest`. An unrelated `surreal/`
+/// directory has none, and opening it would create a store there.
+#[must_use]
+pub(crate) fn has_kv_manifest(store: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(store.join("surreal").join("manifest")) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("manifest"))
+}
+
 /// Open (or create) a SurrealDB embedded store at the given path.
 ///
 /// Retries briefly if another process holds the store lock, then fails with

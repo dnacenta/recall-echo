@@ -44,6 +44,13 @@ const PROMOTED: &str = "promoted";
 /// Shown when v2 is asked to write into a store it did not build.
 pub(crate) const V2_REFUSAL: &str = "this graph was built by pipeline v1; re-extract into a fresh store with: recall-echo graph extract --pipeline v2 --rebuild";
 
+/// Shown when v1 is asked to write into a store v2 built.
+///
+/// Writing v1 rows into that store mixes the two schemas. The way back is the
+/// rebuild rollback: stop the daemon, move the backup into place, and set
+/// `[graph] pipeline = "v1"`.
+pub(crate) const V1_REFUSAL: &str = "this graph was built by pipeline v2; refusing pipeline v1. Roll back the rebuild (stop the daemon first) and set [graph] pipeline = \"v1\", or pass --pipeline v2";
+
 const STAMP_V2: &str = "v2";
 
 /// What one batch of facts did to the store.

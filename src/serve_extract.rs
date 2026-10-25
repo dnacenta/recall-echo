@@ -434,7 +434,7 @@ impl ExtractionUnit for GraphExtractionUnit {
         let content = std::fs::read_to_string(&path)?;
         let (session_id, _) = crate::graph_cli::extract_archive_metadata(&content, &path);
         let context = IngestContext::new(session_id, Some(log_number));
-        let pipeline = crate::graph::v2::pipeline_for_hook(&self.memory_dir);
+        let pipeline = crate::graph::v2::pipeline_for_hook(&self.memory_dir, self.graph.db()).await;
 
         let report = crate::graph::v2::extract_log(
             &self.graph,

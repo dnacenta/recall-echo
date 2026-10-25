@@ -124,13 +124,19 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
         eprintln!("  Archives        {DIM}not initialized{RESET}");
     }
 
-    // Graph — the flat-file status command deliberately does not open the
-    // store (the daemon may hold it); `graph status` reports real counts.
+    // Graph — counts stay with `graph status` (this command does not take the
+    // store). The pipeline line reads the stamp only when the directory is
+    // already a SurrealKV store, or from a daemon that already holds it.
     let graph_dir = memory.join("graph");
     if graph_dir.exists() {
         eprintln!(
             "  Graph           {DIM}present — run `recall-echo graph status` for counts{RESET}"
         );
+        let pipeline = pipeline_report(&memory);
+        eprintln!("  Pipeline        {}", pipeline.summary);
+        if let Some(warning) = pipeline.warning {
+            issues.push(warning);
+        }
     }
 
     // Issues
@@ -145,6 +151,49 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
     eprintln!();
 
     Ok(())
+}
+
+struct PipelineReport {
+    summary: String,
+    warning: Option<String>,
+}
+
+/// Configured pipeline beside the store stamp. A missing config counts as v1,
+/// which is what extraction runs. An unstamped store is not a mismatch: v1
+/// has never written the stamp.
+fn pipeline_report(memory: &Path) -> PipelineReport {
+    let configured = config::load(memory)
+        .graph
+        .and_then(|section| section.pipeline);
+    let configured_label = configured.as_deref().unwrap_or("unset");
+    let stamp = match read_stamp_blocking(memory) {
+        Ok(stamp) => stamp,
+        Err(err) => {
+            return PipelineReport {
+                summary: format!("configured {configured_label}, store unread ({err})"),
+                warning: None,
+            };
+        }
+    };
+    let store_label = stamp.as_deref().unwrap_or("unstamped");
+    let comparable = configured.as_deref().unwrap_or("v1");
+    let warning = stamp
+        .as_deref()
+        .filter(|stamp| *stamp != comparable)
+        .map(|stamp| {
+            format!("pipeline config is {configured_label} but the store is stamped {stamp}")
+        });
+    PipelineReport {
+        summary: format!("configured {configured_label}, store {store_label}"),
+        warning,
+    }
+}
+
+fn read_stamp_blocking(memory: &Path) -> Result<Option<String>, RecallError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(crate::graph::v2::read_embedded_stamp(memory))
 }
 
 fn count_conversations(dir: &Path) -> (usize, u64) {
@@ -282,5 +331,85 @@ mod tests {
         fs::write(tmp.path().join("notes.md"), "ignore").unwrap();
         let (count, _) = count_conversations(tmp.path());
         assert_eq!(count, 2);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn status_warns_when_the_store_stamp_and_the_config_differ() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        fs::write(memory.join("MEMORY.md"), "# m\n").unwrap();
+        fs::write(memory.join("EPHEMERAL.md"), "").unwrap();
+        fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\npipeline = \"v1\"\n",
+        )
+        .unwrap();
+        {
+            let gm = crate::graph::GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        }
+        // `pipeline_report` builds its own runtime. That cannot run on this
+        // one, and the stamp write has to drop its connection here first so
+        // the report's open is not the lock this runtime still holds.
+        let memory_for_report = memory.clone();
+        let report = tokio::task::spawn_blocking(move || pipeline_report(&memory_for_report))
+            .await
+            .unwrap();
+        assert!(
+            report.summary.contains("configured v1"),
+            "{}",
+            report.summary
+        );
+        assert!(report.summary.contains("store v2"), "{}", report.summary);
+        let warning = report.warning.expect("mismatch");
+        assert!(warning.contains("config is v1"), "{warning}");
+        assert!(warning.contains("stamped v2"), "{warning}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn status_does_not_create_a_store_to_read_the_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        let graph = memory.join("graph");
+        fs::create_dir_all(graph.join("surreal")).unwrap();
+        let before: Vec<_> = walk_files(&graph);
+        let report = pipeline_report(&memory);
+        assert!(
+            report.summary.contains("store unstamped"),
+            "{}",
+            report.summary
+        );
+        assert!(report.warning.is_none(), "{:?}", report.warning);
+        assert_eq!(walk_files(&graph), before);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn walk_files(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+                if path.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out
     }
 }
