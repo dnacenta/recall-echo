@@ -670,9 +670,10 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Version with one leading `v` removed. It must contain a digit, occur in
-/// the cited turn, and each of its numbers must occur there as a maximal
-/// number. The stored release is `<project> v<version>`.
+/// Version with one leading `v` or `V` removed. It must contain a digit, occur
+/// in the cited turn without running into a digit, a letter other than a
+/// leading `v` or `V`, or a dotted number, and each of its numbers must occur
+/// there as a maximal number. The stored release is `<project> v<version>`.
 pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Option<String> {
     let version = version.trim();
     let version = version
@@ -693,12 +694,30 @@ pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Opt
     {
         return None;
     }
+    if !occurs_whole(version, turn_text) {
+        return None;
+    }
     let name = if project.is_empty() {
         format!("v{version}")
     } else {
         format!("{project} v{version}")
     };
     Some(name)
+}
+
+fn occurs_whole(version: &str, text: &str) -> bool {
+    let b = text.as_bytes();
+    text.match_indices(version).any(|(start, _)| {
+        let end = start + version.len();
+        let glued_before = start > 0
+            && (b[start - 1].is_ascii_digit()
+                || (b[start - 1].is_ascii_alphabetic() && !matches!(b[start - 1], b'v' | b'V'))
+                || (b[start - 1] == b'.' && start > 1 && b[start - 2].is_ascii_digit()));
+        let glued_after = end < b.len()
+            && (b[end].is_ascii_alphanumeric()
+                || (b[end] == b'.' && end + 1 < b.len() && b[end + 1].is_ascii_digit()));
+        !glued_before && !glued_after
+    })
 }
 
 /// Component name that is generic or the project itself affects the project.
@@ -992,6 +1011,22 @@ mod tests {
             None
         );
         assert_eq!(release_name("proj", "10", "release 110 next"), None);
+    }
+
+    #[test]
+    fn release_version_run_into_a_longer_token_drops() {
+        assert_eq!(
+            release_name(
+                "proj",
+                "1.4.0-rc1",
+                "cut 1.4.0-rc12 tonight, it fixes 1 regression"
+            ),
+            None
+        );
+        assert_eq!(
+            release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc1b tonight"),
+            None
+        );
     }
 
     fn fact(predicate: Predicate, kind: Kind, subject: &str) -> Fact {
