@@ -18,7 +18,7 @@ Content tokens are the normalised tokens longer than one character, or digits, m
 
 Three content tokens or fewer need at least half of them in the turn and at least one in the quote. A longer literal, and a longer entity name, need at least half of their content tokens in the turn.
 
-A release whose version does not occur in the cited turn drops as `bad_version`. The drop is a whole candidate. One leading `v` is removed. The remainder must be non-empty, contain a digit, and occur as a plain substring of the cited turn, so the non-numeric part of a version such as `1.4.0-rc1` or `2024.10b` is still stated. Every number in that remainder must also occur there as a maximal number, under the number rule above. `1.0` therefore drops inside `Ship 1.0.0`.
+A release whose version does not occur in the cited turn drops as `bad_version`. The drop is a whole candidate. One leading `v` or `V` is removed. The remainder must be non-empty, contain a digit, and occur as a plain substring of the cited turn, so the non-numeric part of a version such as `1.4.0-rc1` or `2024.10b` is still stated. At least one of those occurrences must not run into a digit, a letter other than a leading `v` or `V`, or a dotted number. Every number in that remainder must also occur there as a maximal number, under the number rule above. `1.0` therefore drops inside `Ship 1.0.0`.
 
 ## Gate 3 — key binding
 
