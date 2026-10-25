@@ -14,6 +14,7 @@ use regex::Regex;
 
 use super::super::confidence::Provenance;
 use super::super::types::EntityType;
+use super::ground::numbers_in;
 use super::input::{ProjectIdentity, TurnRole};
 
 /// Why a candidate was not written. Stable names, counted on the report.
@@ -669,8 +670,9 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Version with one leading `v` removed. It must contain a digit and occur
-/// in the cited turn. The stored release is `<project> v<version>`.
+/// Version with one leading `v` removed. It must contain a digit, occur in
+/// the cited turn, and each of its numbers must occur there as a maximal
+/// number. The stored release is `<project> v<version>`.
 pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Option<String> {
     let version = version.trim();
     let version = version
@@ -681,6 +683,14 @@ pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Opt
         return None;
     }
     if !turn_text.contains(version) {
+        return None;
+    }
+    // A shorter number is a substring of a longer one, and is not stated.
+    let stated = numbers_in(turn_text);
+    if numbers_in(version)
+        .iter()
+        .any(|number| !stated.contains(number))
+    {
         return None;
     }
     let name = if project.is_empty() {
@@ -952,6 +962,36 @@ mod tests {
         let mut long = fact(Predicate::Setting, Kind::Project, "linkshelf");
         long.object_name = "x".repeat(301);
         assert_eq!(filter_fact(&long).unwrap_err(), DROP_GENERIC);
+    }
+
+    #[test]
+    fn release_version_uses_the_number_rule() {
+        assert_eq!(
+            release_name("proj", "1.0", "Ship 1.0.0 with the exporters."),
+            None
+        );
+        assert_eq!(release_name("proj", "2.4", "Tag v2.4.0."), None);
+        assert_eq!(
+            release_name("proj", "2.4.0", "Tag v2.4.0.").as_deref(),
+            Some("proj v2.4.0")
+        );
+        assert_eq!(
+            release_name("proj", "v1.4.0", "Tag v1.4.0 today.").as_deref(),
+            Some("proj v1.4.0")
+        );
+        assert_eq!(
+            release_name("proj", "V1.4.0", "Tag v1.4.0 today.").as_deref(),
+            Some("proj v1.4.0")
+        );
+        assert_eq!(
+            release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc1 tonight").as_deref(),
+            Some("proj v1.4.0-rc1")
+        );
+        assert_eq!(
+            release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc12 tonight"),
+            None
+        );
+        assert_eq!(release_name("proj", "10", "release 110 next"), None);
     }
 
     fn fact(predicate: Predicate, kind: Kind, subject: &str) -> Fact {
