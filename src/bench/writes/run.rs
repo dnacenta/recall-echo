@@ -605,6 +605,21 @@ impl LlmProvider for Counting<'_> {
             .complete_measured(system_prompt, user_message, max_tokens)
             .await
     }
+
+    /// The default would call `complete_measured` on this wrapper and drop
+    /// the schema before the inner provider saw it.
+    async fn complete_structured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, crate::graph::error::GraphError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .complete_structured(system_prompt, user_message, schema, max_tokens)
+            .await
+    }
 }
 
 struct BorrowedProvider<'a>(&'a dyn LlmProvider);
@@ -630,6 +645,18 @@ impl LlmProvider for BorrowedProvider<'_> {
     ) -> Result<Completion, crate::graph::error::GraphError> {
         self.0
             .complete_measured(system_prompt, user_message, max_tokens)
+            .await
+    }
+
+    async fn complete_structured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, crate::graph::error::GraphError> {
+        self.0
+            .complete_structured(system_prompt, user_message, schema, max_tokens)
             .await
     }
 }

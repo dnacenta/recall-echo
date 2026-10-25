@@ -82,6 +82,13 @@ pub struct CliSpec {
     pub timeout: Option<Duration>,
     /// Variables unset before spawning.
     pub env_remove: Vec<String>,
+    /// Flag that carries a JSON schema. Empty means this CLI has no verified
+    /// schema channel, and structured calls fall back to the prompt.
+    pub schema_flag: String,
+    /// Dotted path of the structured object inside a JSON envelope. Empty
+    /// means there is no verified path. The value is serialised back to a
+    /// JSON string for the caller.
+    pub structured_json_path: String,
 }
 
 /// One resolved call: the exact argv, and what to write to stdin.
@@ -127,6 +134,10 @@ impl CliSpec {
                 usage_output_paths: JsonPaths::default(),
                 ndjson_match: LineMatchers::default(),
                 extra_args: vec!["--no-session-persistence".into()],
+                // `--json-schema` with `--output-format json` returns an
+                // envelope; the answer is the `structured_output` object.
+                schema_flag: "--json-schema".into(),
+                structured_json_path: "structured_output".into(),
                 timeout: default_timeout(),
                 env_remove: vec!["CLAUDECODE".into()],
             },
@@ -162,6 +173,8 @@ impl CliSpec {
                 ]),
                 ndjson_match: LineMatchers::default(),
                 extra_args: Vec::new(),
+                schema_flag: String::new(),
+                structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
             },
@@ -194,6 +207,10 @@ impl CliSpec {
                 ]),
                 ndjson_match: LineMatchers::default(),
                 extra_args: Vec::new(),
+                // `--json-schema` is documented for streaming output only, so
+                // structured calls stay on the prompt.
+                schema_flag: String::new(),
+                structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
             },
@@ -227,6 +244,8 @@ impl CliSpec {
                     "item.type=agent_message".into(),
                 ]),
                 extra_args: vec!["--skip-git-repo-check".into()],
+                schema_flag: String::new(),
+                structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
             },
@@ -248,6 +267,8 @@ impl CliSpec {
                 usage_output_paths: JsonPaths::default(),
                 ndjson_match: LineMatchers::default(),
                 extra_args: Vec::new(),
+                schema_flag: String::new(),
+                structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
             },
@@ -404,6 +425,32 @@ impl CliSpec {
     /// Build the exact argv and stdin payload for one completion.
     #[must_use]
     pub fn invocation(&self, model: &str, system_prompt: &str, user_message: &str) -> Invocation {
+        self.build_invocation(model, system_prompt, user_message, None)
+    }
+
+    /// Argv for a schema-constrained call, when this CLI has both a schema
+    /// flag and a path to the structured object. `None` means the caller
+    /// should send the prompt alone.
+    fn invocation_structured(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_message: &str,
+        schema: &serde_json::Value,
+    ) -> Option<Invocation> {
+        if self.schema_flag.is_empty() || self.structured_json_path.is_empty() {
+            return None;
+        }
+        Some(self.build_invocation(model, system_prompt, user_message, Some(schema)))
+    }
+
+    fn build_invocation(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_message: &str,
+        schema: Option<&serde_json::Value>,
+    ) -> Invocation {
         let mut argv = vec![self.resolve_command()];
         argv.extend(self.args.iter().cloned());
 
@@ -412,11 +459,22 @@ impl CliSpec {
             argv.push(model.to_string());
         }
         // A value-less output flag is a boolean switch (`codex --json`).
+        // A structured call that already has a value asks for JSON.
         if !self.output_format_flag.is_empty() {
             argv.push(self.output_format_flag.clone());
-            if !self.output_format_value.is_empty() {
-                argv.push(self.output_format_value.clone());
+            let value = match schema {
+                Some(_) if !self.output_format_value.is_empty() => "json",
+                _ => self.output_format_value.as_str(),
+            };
+            if !value.is_empty() {
+                argv.push(value.to_string());
             }
+        }
+        if let Some(schema) = schema {
+            argv.push(self.schema_flag.clone());
+            // A `Value` always serialises. The fallback is only here so a
+            // failure does not panic on the way to the process.
+            argv.push(serde_json::to_string(schema).unwrap_or_else(|_| "null".to_string()));
         }
 
         let prompt = if self.system_prompt_flag.is_empty() {
@@ -729,6 +787,31 @@ impl LlmProvider for CliProvider {
             usage,
         ))
     }
+
+    /// Schema-constrained call for CLIs that have a verified flag and an
+    /// envelope path. Everyone else gets the prompt-only default.
+    async fn complete_structured(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, GraphError> {
+        let Some(invocation) =
+            self.spec
+                .invocation_structured(&self.model, system_prompt, user_message, schema)
+        else {
+            return self
+                .complete_measured(system_prompt, user_message, max_tokens)
+                .await;
+        };
+        let output = self.run(&invocation).await?;
+        let usage = extract_usage(&output, &self.spec);
+        Ok(Completion::measured(
+            extract_structured(&output, &self.spec)?,
+            usage,
+        ))
+    }
 }
 
 impl CliProvider {
@@ -821,6 +904,27 @@ fn failure_detail(stderr: &[u8], stdout: &[u8]) -> String {
 }
 
 // ── Output handling ──────────────────────────────────────────────────────
+
+/// The structured object at `spec.structured_json_path`, as a JSON string.
+///
+/// A string at that path is already text and is returned as-is. An object or
+/// array is serialised compactly so the caller can parse it the same way it
+/// parses a prompt-only reply. A missing path is an error: the envelope is
+/// not an answer.
+fn extract_structured(stdout: &str, spec: &CliSpec) -> Result<String, GraphError> {
+    let path = spec.structured_json_path.as_str();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|err| GraphError::Llm(format!("CLI structured output is not JSON: {err}")))?;
+    let Some(node) = lookup(&json, path) else {
+        return Err(reported_error(&json)
+            .unwrap_or_else(|| GraphError::Llm(format!("CLI response has no `{path}`"))));
+    };
+    match node {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        other => serde_json::to_string(other)
+            .map_err(|err| GraphError::Llm(format!("CLI structured output: {err}"))),
+    }
+}
 
 /// Pull the answer out of a CLI's stdout, according to its [`OutputMode`].
 ///
@@ -1237,6 +1341,63 @@ mod tests {
             ]
         );
         assert_eq!(invocation.stdin.as_deref(), Some(USER));
+    }
+
+    #[test]
+    fn claude_code_structured_argv_has_json_schema() {
+        let spec = spec_for(Provider::ClaudeCode);
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+        });
+        let invocation = spec
+            .invocation_structured("sonnet", SYSTEM, USER, &schema)
+            .expect("claude-code has a schema channel");
+        let schema_json = serde_json::to_string(&schema).unwrap();
+
+        assert_eq!(
+            invocation.argv,
+            [
+                "claude",
+                "-p",
+                "--model",
+                "sonnet",
+                "--output-format",
+                "json",
+                "--json-schema",
+                schema_json.as_str(),
+                "--system-prompt",
+                SYSTEM,
+                "--no-session-persistence",
+            ]
+        );
+        assert_eq!(invocation.stdin.as_deref(), Some(USER));
+    }
+
+    #[test]
+    fn structured_output_is_read_from_the_envelope() {
+        let spec = spec_for(Provider::ClaudeCode);
+        let stdout =
+            r#"{"type":"result","structured_output":{"facts":[],"bugs":[],"releases":[]}}"#;
+        let text = extract_structured(stdout, &spec).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!({"facts": [], "bugs": [], "releases": []})
+        );
+        assert!(!text.contains("\"type\""), "{text}");
+    }
+
+    #[test]
+    fn presets_without_a_verified_schema_flag_stay_on_the_prompt() {
+        let schema = serde_json::json!({});
+        for provider in [Provider::Gemini, Provider::Grok, Provider::Codex] {
+            let spec = spec_for(provider.clone());
+            assert!(
+                spec.invocation_structured("", SYSTEM, USER, &schema)
+                    .is_none(),
+                "{provider}"
+            );
+        }
     }
 
     #[test]
