@@ -24,7 +24,7 @@ use crate::ephemeral::{self, EphemeralEntry};
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
 use crate::graph::confidence::PRIOR_CONCENTRATION;
-use crate::graph::llm::{Completion, LlmProvider};
+use crate::graph::llm::{Completion, LlmProvider, Message};
 use crate::graph::types::{ExtractedEntity, ExtractedRelationship, ExtractionResult};
 use crate::graph::{GraphMemory, IngestContext, PipelineVersion};
 use crate::search;
@@ -781,6 +781,20 @@ impl LlmProvider for Counting<'_> {
             .complete_structured(system_prompt, user_message, schema, max_tokens)
             .await
     }
+
+    /// The default would drop every turn but the last before the inner provider.
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, crate::graph::error::GraphError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .complete_structured_chat(system_prompt, messages, schema, max_tokens)
+            .await
+    }
 }
 
 struct BorrowedProvider<'a>(&'a dyn LlmProvider);
@@ -820,6 +834,18 @@ impl LlmProvider for BorrowedProvider<'_> {
             .complete_structured(system_prompt, user_message, schema, max_tokens)
             .await
     }
+
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<Completion, crate::graph::error::GraphError> {
+        self.0
+            .complete_structured_chat(system_prompt, messages, schema, max_tokens)
+            .await
+    }
 }
 
 /// Replays the script's claims.
@@ -827,6 +853,9 @@ impl LlmProvider for BorrowedProvider<'_> {
 /// The provider trait only receives prompt text, so a dedup prompt is told
 /// apart by the sentence `graph::dedup` opens with. Anything else is treated
 /// as extraction and answered from the turn whose text appears in the prompt.
+/// A pass-1 chat call folds the worked example into the system prompt and
+/// keeps the last user message. Claims are matched on that message, so the
+/// example is not scanned.
 struct ScriptedExtractor {
     prepared: Vec<Prepared>,
     v2: Vec<V2Item>,
@@ -951,7 +980,7 @@ impl LlmProvider for ScriptedExtractor {
         user_message: &str,
         _max_tokens: u32,
     ) -> Result<String, crate::graph::error::GraphError> {
-        if system_prompt == crate::graph::v2::pass1::PASS1_SYSTEM {
+        if system_prompt.starts_with(crate::graph::v2::pass1::PASS1_SYSTEM) {
             return self.v2_json(user_message);
         }
         if system_prompt == crate::graph::v2::resolve::PASS2_SYSTEM {
@@ -1265,6 +1294,50 @@ mod tests {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.toml");
         crate::bench::writes::load_script(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn counting_forwards_the_chat_call() {
+        struct Inner(std::sync::Arc<std::sync::Mutex<Vec<Message>>>);
+
+        #[async_trait]
+        impl LlmProvider for Inner {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Err(crate::graph::error::GraphError::Llm(
+                    "plain complete was called".into(),
+                ))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                _: &str,
+                messages: &[Message],
+                _: &serde_json::Value,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                *self.0.lock().expect("lock") = messages.to_vec();
+                Ok(Completion::unmeasured("{}"))
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counting = Counting::new(Box::new(Inner(std::sync::Arc::clone(&seen))));
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant("example-reply"),
+            Message::user("real-user"),
+        ];
+        counting
+            .complete_structured_chat("sys", &messages, &serde_json::json!({}), 8)
+            .await
+            .unwrap();
+        assert_eq!(counting.calls(), 1);
+        assert_eq!(seen.lock().expect("lock").as_slice(), &messages);
     }
 
     #[test]

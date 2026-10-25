@@ -1093,6 +1093,7 @@ fn truncate_str(text: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::llm::Message;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1372,6 +1373,42 @@ mod tests {
             ]
         );
         assert_eq!(invocation.stdin.as_deref(), Some(USER));
+    }
+
+    /// A CLI has no chat turns. The worked example goes back into the system
+    /// argument and stdin stays the last user turn.
+    #[tokio::test]
+    async fn structured_chat_keeps_the_example_in_the_system_argument() {
+        let mock =
+            MockCli::new(r#"printf '%s' '{"type":"result","structured_output":{"ok":true}}'"#);
+        let provider = mock.provider(
+            CliSection {
+                preset: Some(CliPreset::ClaudeCode),
+                ..CliSection::default()
+            },
+            "sonnet",
+        );
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let example_reply = r#"{"facts":["tidepool"],"bugs":[],"releases":[]}"#;
+        let messages = [
+            Message::user("example-user"),
+            Message::assistant(example_reply),
+            Message::user(USER),
+        ];
+        provider
+            .complete_structured_chat(SYSTEM, &messages, &schema, 128)
+            .await
+            .unwrap();
+        let chat_argv = mock.recorded_argv();
+        let system = chat_argv
+            .iter()
+            .position(|arg| arg == "--system-prompt")
+            .and_then(|index| chat_argv.get(index + 1))
+            .expect("system prompt argument");
+        assert!(system.contains(example_reply), "{system}");
+        assert!(system.contains("EXAMPLE\nexample-user\nOutput:\n"));
+        assert_eq!(mock.recorded_stdin(), USER);
+        assert!(chat_argv.iter().any(|arg| arg == "--json-schema"));
     }
 
     #[test]
