@@ -541,6 +541,7 @@ fn provenance_label(provenance: Option<Provenance>) -> &'static str {
     match provenance {
         Some(Provenance::External) => "external",
         Some(Provenance::User) => "user",
+        Some(Provenance::Assistant) => "assistant",
         Some(Provenance::SelfGenerated) => "self",
         None => "per turn role",
     }

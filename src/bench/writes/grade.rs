@@ -59,8 +59,14 @@ pub struct ObservedEdge {
     pub self_reinforcements: i64,
     /// α at creation. Filled from β on the first snapshot that contained this
     /// edge (`PRIOR_CONCENTRATION - β`) and kept on every later snapshot: a
-    /// contradiction moves β, so the running β is not the prior.
+    /// contradiction moves β, so the running β is not the prior. β at first
+    /// sight is the class prior's β, so this is the creating α for a user
+    /// fact (0.9), an assistant fact (0.6) and an inferred fact (0.3).
     pub prior_alpha: f64,
+    /// Assistant corroborations after the creating sighting.
+    pub assistant_steps: u32,
+    /// Inferred (`self`) corroborations after the creating sighting.
+    pub self_steps: u32,
 }
 
 /// Edges around one ingested session, plus what that session cost.
@@ -878,13 +884,22 @@ fn provenance_miss(
     !tally_ok || !role_ok
 }
 
-/// Create stores the extraction prior and does not apply provenance. User
-/// evidence is whatever alpha remains after that prior and the self-weight
-/// tally are removed.
+/// Create stores the class prior and does not apply provenance. User
+/// evidence is whatever alpha remains after that prior and the agent-authored
+/// corroborations are removed. Assistant steps weigh `weight_assistant`;
+/// inferred steps weigh `weight_self`. A tally the class split does not
+/// cover is treated as the self class, which is what a snapshot without
+/// evidence roles recorded.
 fn has_user_evidence(edge: &ObservedEdge, weights: &ProvenanceWeights) -> bool {
-    let steps = u32::try_from(edge.self_reinforcements.max(0)).unwrap_or(0);
-    let self_alpha = weights.weight_self * f64::from(steps);
-    edge.alpha - edge.prior_alpha - self_alpha >= weights.weight_user - EPS
+    edge.alpha - edge.prior_alpha - authored_alpha(edge, weights) >= weights.weight_user - EPS
+}
+
+fn authored_alpha(edge: &ObservedEdge, weights: &ProvenanceWeights) -> f64 {
+    let assistant = f64::from(edge.assistant_steps);
+    let inferred = f64::from(edge.self_steps);
+    let tally = f64::from(u32::try_from(edge.self_reinforcements.max(0)).unwrap_or(u32::MAX));
+    let unsplit = (tally - assistant - inferred).max(0.0);
+    weights.weight_assistant * assistant + weights.weight_self * (inferred + unsplit)
 }
 
 fn junk(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<JunkEdge>, RecallError> {
@@ -1589,6 +1604,8 @@ mod tests {
             self_reinforcements,
             // Explicit. The scripted extractor always starts here.
             prior_alpha: 9.0,
+            assistant_steps: 0,
+            self_steps: 0,
         }
     }
 
@@ -1811,6 +1828,8 @@ mod tests {
             beta: 1.0,
             self_reinforcements: 0,
             prior_alpha: 9.0,
+            assistant_steps: 0,
+            self_steps: 0,
         });
         sessions[5].after = after;
 
@@ -2111,7 +2130,45 @@ mod tests {
         assert!(report.wrong_facts.is_empty());
     }
 
+    #[test]
+    fn mixed_with_assistant_steps() {
+        let weights = weights();
+        // Four assistant steps at 0.3. Subtracting only the self weight would
+        // leave 1.0, which looks like a user corroboration.
+        let mut assistant_only = edge(
+            "pine",
+            "pine",
+            true,
+            9.0 + weights.weight_assistant * 4.0,
+            1.0,
+            4,
+        );
+        assistant_only.assistant_steps = 4;
+        let report = grade_mixed_tally(assistant_only, 4);
+        assert!(report
+            .wrong_facts
+            .iter()
+            .any(|wrong| wrong.reason == WrongReason::Provenance));
+
+        let mut mixed = edge(
+            "pine",
+            "pine",
+            true,
+            9.0 + weights.weight_user + weights.weight_assistant * 2.0 + weights.weight_self,
+            1.0,
+            3,
+        );
+        mixed.assistant_steps = 2;
+        mixed.self_steps = 1;
+        let report = grade_mixed_tally(mixed, 3);
+        assert!(report.wrong_facts.is_empty());
+    }
+
     fn grade_mixed(edge: ObservedEdge) -> WriteReport {
+        grade_mixed_tally(edge, 1)
+    }
+
+    fn grade_mixed_tally(edge: ObservedEdge, tally: i64) -> WriteReport {
         let script = FactScript {
             name: "mixed".into(),
             project: None,
@@ -2132,7 +2189,7 @@ mod tests {
                 fact: "host".into(),
                 live: true,
                 provenance: Some(EndProvenance::Mixed),
-                self_reinforcements: Some(1),
+                self_reinforcements: Some(tally),
             }],
             questions: vec![],
         };

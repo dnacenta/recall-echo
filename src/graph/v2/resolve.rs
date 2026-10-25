@@ -998,7 +998,6 @@ fn canonical_id(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::graph::confidence::{Evidence, ExtractionContext};
-    use crate::graph::v2::input::TurnRole;
     use crate::graph::v2::schema::{Fact, Predicate, Role};
     use crate::graph::v2::write::{write_facts, WriteCtx};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1549,7 +1548,7 @@ mod tests {
             turn: 1,
             quote: "app uses the database".into(),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: crate::graph::Provenance::User,
             replaces: String::new(),
         }
     }

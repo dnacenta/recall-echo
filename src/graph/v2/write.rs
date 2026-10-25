@@ -28,7 +28,7 @@ use super::super::llm::LlmProvider;
 use super::super::store::Db;
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
-use super::input::{ProjectIdentity, Turn, TurnRole};
+use super::input::{ProjectIdentity, Turn};
 use super::resolve::{self, MentionDraft};
 use super::schema::{normalise, Fact, Kind, Predicate};
 
@@ -460,8 +460,8 @@ impl<'a> Attempt<'a> {
         object: &Stored,
         description: Option<String>,
     ) -> Result<(), GraphError> {
-        let (_, label) = provenance_of(fact.provenance);
-        let evidence = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let (provenance, label) = provenance_of(fact.provenance);
+        let evidence = prior_evidence(provenance);
         let item = evidence_item(self.ctx.session_id, fact, label);
         self.tx
             .query(
@@ -1612,8 +1612,8 @@ fn json_usize(value: Option<&Value>) -> Option<usize> {
 }
 
 fn new_slot(session_id: &str, date: &str, fact: &Fact) -> Value {
-    let evidence = Evidence::from_prior(ExtractionContext::Explicit.prior());
-    let (_, label) = provenance_of(fact.provenance);
+    let (provenance, label) = provenance_of(fact.provenance);
+    let evidence = prior_evidence(provenance);
     json!({
         "predicate": fact.predicate.as_str(),
         "key": fact.key,
@@ -1630,11 +1630,22 @@ fn new_slot(session_id: &str, date: &str, fact: &Fact) -> Value {
     })
 }
 
-fn provenance_of(role: TurnRole) -> (Provenance, &'static str) {
-    match role {
-        TurnRole::User => (Provenance::User, "user"),
-        TurnRole::Assistant => (Provenance::SelfGenerated, "self"),
-    }
+fn provenance_of(provenance: Provenance) -> (Provenance, &'static str) {
+    (provenance, provenance.as_str())
+}
+
+/// The creating sighting stores this prior and does not corroborate.
+///
+/// User text is explicit (0.9). An assistant turn is inferred (0.6). A fact
+/// that is not quotable from one turn is speculative (0.3). v2 does not write
+/// an external class; that arm keeps the explicit prior.
+fn prior_evidence(provenance: Provenance) -> Evidence {
+    let mean = match provenance {
+        Provenance::User | Provenance::External => ExtractionContext::Explicit.prior(),
+        Provenance::Assistant => ExtractionContext::Inferred.prior(),
+        Provenance::SelfGenerated => ExtractionContext::Speculative.prior(),
+    };
+    Evidence::from_prior(mean)
 }
 
 fn evidence_item(session_id: &str, fact: &Fact, role: &str) -> Value {
@@ -1764,6 +1775,7 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::graph::crud;
+    use crate::graph::v2::input::TurnRole;
     use crate::graph::v2::schema::{remap, Fact, Kind, Mention, Predicate, Role};
 
     fn setting(value: &str) -> Fact {
@@ -1798,6 +1810,71 @@ mod tests {
             .await
             .unwrap();
         (tmp, gm)
+    }
+
+    #[test]
+    fn create_stores_the_class_prior_and_does_not_corroborate() {
+        let user = setting("redis");
+        assert_eq!(user.provenance, Provenance::User);
+        let slot = new_slot("s1", "2026-01-02", &user);
+        assert_slot_prior(&slot, "user", 9.0, 1.0);
+
+        let mut assistant = user.clone();
+        assistant.provenance = Provenance::Assistant;
+        let slot = new_slot("s1", "2026-01-02", &assistant);
+        assert_slot_prior(&slot, "assistant", 6.0, 4.0);
+
+        let mut inferred = user.clone();
+        inferred.provenance = Provenance::SelfGenerated;
+        let slot = new_slot("s1", "2026-01-02", &inferred);
+        assert_slot_prior(&slot, "self", 3.0, 7.0);
+    }
+
+    fn assert_slot_prior(slot: &Value, label: &str, alpha: f64, beta: f64) {
+        assert_eq!(slot["provenance"], label);
+        let got_alpha = slot["alpha"].as_f64().expect("alpha");
+        let got_beta = slot["beta"].as_f64().expect("beta");
+        assert!((got_alpha - alpha).abs() < 1e-9, "{got_alpha} != {alpha}");
+        assert!((got_beta - beta).abs() < 1e-9, "{got_beta} != {beta}");
+        assert_eq!(slot["self_reinforcements"], 0);
+        let keys: std::collections::BTreeSet<_> =
+            slot.as_object().expect("slot").keys().cloned().collect();
+        assert_eq!(
+            keys,
+            [
+                "alpha",
+                "beta",
+                "ended_by",
+                "evidence",
+                "key",
+                "predicate",
+                "provenance",
+                "self_reinforcements",
+                "status",
+                "valid_from",
+                "valid_until",
+                "value",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+        let evidence = slot["evidence"].as_array().expect("evidence");
+        assert_eq!(evidence.len(), 1);
+        let item_keys: std::collections::BTreeSet<_> = evidence[0]
+            .as_object()
+            .expect("item")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            item_keys,
+            ["quote", "role", "session", "turn"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(evidence[0]["role"], label);
     }
 
     #[cfg(feature = "embedded")]
@@ -2097,7 +2174,7 @@ mod tests {
             turn: 1,
             quote: format!("{subject} links {object}"),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         }
     }
@@ -2115,7 +2192,7 @@ mod tests {
             turn,
             quote: format!("{key} is {value}"),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         }
     }
@@ -2140,7 +2217,7 @@ mod tests {
             turn,
             quote: format!("{subject} uses {object}"),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: replaces.into(),
         }
     }
@@ -2366,7 +2443,7 @@ mod tests {
             turn: 1,
             quote: "worker is part of app".into(),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         };
         write_session(
@@ -2459,7 +2536,7 @@ mod tests {
             turn: 1,
             quote: "worker is part of app".into(),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         };
         write_session(
@@ -2789,7 +2866,7 @@ mod tests {
             turn: 1,
             quote: "worker is part of app".into(),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         };
         write_session(
@@ -3188,7 +3265,7 @@ mod tests {
             turn,
             quote: format!("{subject} {key} is {value}"),
             confidence: 0.9,
-            provenance: TurnRole::User,
+            provenance: Provenance::User,
             replaces: String::new(),
         }
     }
