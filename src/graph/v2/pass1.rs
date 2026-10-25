@@ -197,18 +197,21 @@ pub(crate) async fn extract_session(
     let facts = dedupe_facts(facts);
 
     if !facts.is_empty() {
-        let write_ctx = write::WriteCtx {
+        let write_ctx = write::WriteCtx::new(
             llm,
-            project: &session.project,
-            session_id: ctx.session_id(),
-            date: &session.date,
-        };
+            &session.project,
+            ctx.session_id(),
+            &session.date,
+            &session.turns,
+        );
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         report.entities_created = stats.entities_created;
         report.relationships_created = stats.edges;
         report.slots_written = stats.slots;
         report.llm_calls += stats.resolver_calls;
         report.resolve = stats.resolve;
+        report.retirements = stats.retirements;
+        report.retirements_skipped = stats.retirements_skipped;
         if stats.unresolved > 0 {
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }

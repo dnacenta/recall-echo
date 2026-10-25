@@ -151,6 +151,9 @@ async fn collect_sessions(
                 report.candidates = extracted.candidates;
                 report.kept = extracted.kept;
                 report.drops = extracted.drops;
+                report.resolve = extracted.resolve;
+                report.retirements = extracted.retirements;
+                report.retirements_skipped = extracted.retirements_skipped;
                 report
             }
         };
@@ -169,6 +172,8 @@ async fn collect_sessions(
             kept: report.kept,
             drops: report.drops,
             resolve: report.resolve,
+            retirements: report.retirements,
+            retirements_skipped: report.retirements_skipped,
         });
         before = after;
     }
@@ -527,7 +532,105 @@ async fn snapshot(
             prior_alpha,
         });
     }
+    // Slots are the literal facts. Rejected rows stay in the store and out of
+    // the diff, so a rejection is a no-op rather than a new record. Retired
+    // decided and considered rows stay visible with live = false.
+    let entities = crate::graph::crud::list_entities(gm.db(), None).await?;
+    for entity in &entities {
+        let Some(list) = entity
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.get("v2"))
+            .and_then(|v2| v2.get("slots"))
+            .and_then(|slots| slots.as_array())
+        else {
+            continue;
+        };
+        let mut seen = HashMap::new();
+        for slot in list {
+            let status = slot
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if status != "decided" && status != "considered" {
+                continue;
+            }
+            let predicate = slot
+                .get("predicate")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let key = slot
+                .get("key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let value = slot
+                .get("value")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let valid_from = slot
+                .get("valid_from")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let mut id = format!(
+                "{}|{predicate}|{key}|{value}|{valid_from}",
+                entity.id_string()
+            );
+            let count = seen.entry(id.clone()).or_insert(0u32);
+            *count += 1;
+            if *count > 1 {
+                id = format!("{id}|{count}");
+            }
+            let beta = json_number(slot.get("beta"));
+            let prior_alpha = starting_alpha(&id, beta, first_beta);
+            let until = slot.get("valid_until");
+            let live = until
+                .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty));
+            edges.push(ObservedEdge {
+                id,
+                subject: entity.name.clone(),
+                relation: slot_relation(predicate, key),
+                object: value.to_string(),
+                live,
+                alpha: json_number(slot.get("alpha")),
+                beta,
+                self_reinforcements: json_i64(slot.get("self_reinforcements")).max(0),
+                prior_alpha,
+            });
+        }
+    }
     Ok(edges)
+}
+
+/// A setting whose key is empty or `value` is the bare `setting` relation.
+fn slot_relation(predicate: &str, key: &str) -> String {
+    if predicate == "setting" && (key.is_empty() || key == "value") {
+        "setting".to_string()
+    } else if predicate == "setting" {
+        format!("setting:{key}")
+    } else {
+        predicate.to_string()
+    }
+}
+
+fn json_number(value: Option<&serde_json::Value>) -> f64 {
+    let Some(value) = value else {
+        return 0.0;
+    };
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|number| number as f64))
+        .unwrap_or(0.0)
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> i64 {
+    let Some(value) = value else {
+        return 0;
+    };
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| value.as_f64().map(|number| number as i64))
+        .unwrap_or(0)
 }
 
 /// α the edge was created at. β at first sight is the prior's β.
@@ -1747,7 +1850,18 @@ mod tests {
             .sessions
             .iter()
             .all(|session| session.drops.is_empty()));
-        assert!(report.patterns.is_some(), "linkshelf carries match blocks");
+        let patterns = report.patterns.expect("linkshelf carries match blocks");
+        assert_eq!(patterns.pairs, 6);
+        assert_eq!(
+            patterns.retired.count, 6,
+            "retired {:?}",
+            patterns.retired.ids
+        );
+        assert_eq!(
+            patterns.premature.count, 0,
+            "premature {:?}",
+            patterns.premature.ids
+        );
 
         let store = v2_store(tmp.path()).await;
         assert_eq!(store.edges, 6, "edges {:?}", store.edge_types);
@@ -1809,7 +1923,8 @@ mod tests {
         assert_eq!(pred("setting"), 20);
         assert_eq!(pred("rule"), 16);
         // Each bug writes symptom, cause and status. The later fix writes
-        // the fix and a second status value, so both status slots remain.
+        // the fix and a second status value. Both status rows remain; the
+        // earlier one is closed on the session date.
         assert_eq!(pred("issue_symptom"), 4);
         assert_eq!(pred("issue_cause"), 4);
         assert_eq!(pred("issue_fix"), 4);
@@ -1846,6 +1961,25 @@ mod tests {
         assert_eq!(store.names, vec!["deploy".to_string()]);
         assert_eq!(store.slots, 3, "slots {:?}", store.slot_keys);
         assert!(store.slot_keys.iter().all(|key| key == "value"));
+        // Supersede closes pine when oak is written. The reject of birch is a
+        // no-op: the rejected slot is stored and is not a live record. The
+        // contradict claim is still a reinforcement, because the scripted
+        // extractor emits the decided value again.
+        assert_eq!(report.operations.create, counted(1, 0, 0));
+        assert_eq!(report.operations.corroborate, counted(2, 1, 0));
+        assert_eq!(report.operations.supersede, counted(1, 0, 0));
+        assert_eq!(report.operations.contradict, counted(0, 0, 1));
+        assert_eq!(report.operations.no_op, counted(2, 0, 0));
+        assert_eq!(report.operations.removed, counted(0, 0, 0));
+        assert_eq!(report.operations.revived, counted(0, 0, 0));
+        assert!(
+            report.wrong_facts.is_empty(),
+            "wrong facts {:?}",
+            report.wrong_facts
+        );
+        assert!(report.junk_edges.is_empty(), "{:?}", report.junk_edges);
+        assert!(report.questions[0].graph_hit);
+        assert!(!report.questions[1].graph_hit);
     }
 
     #[cfg(feature = "embedded")]

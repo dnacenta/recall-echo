@@ -1489,20 +1489,10 @@ mod tests {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
         let quiet = Reply::new("nope");
-        let first = WriteCtx {
-            llm: &quiet,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let first = WriteCtx::new(&quiet, &project, "s1", "2026-01-02", &[]);
         write_facts(&gm, &first, &[uses("Postgres")]).await.unwrap();
         let garbage = Reply::new("this is not json");
-        let second = WriteCtx {
-            llm: &garbage,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let second = WriteCtx::new(&garbage, &project, "s1", "2026-01-02", &[]);
         let stats = write_facts(&gm, &second, &[uses("PostgreSQL")])
             .await
             .unwrap();
@@ -1518,24 +1508,14 @@ mod tests {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
         let quiet = Reply::new("nope");
-        let first = WriteCtx {
-            llm: &quiet,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let first = WriteCtx::new(&quiet, &project, "s1", "2026-01-02", &[]);
         write_facts(&gm, &first, &[uses("Postgres")]).await.unwrap();
         let matcher = MatchNamed {
             target: "Postgres".into(),
             calls: AtomicUsize::new(0),
         };
         let postgres_fact = uses("PostgreSQL");
-        let second = WriteCtx {
-            llm: &matcher,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let second = WriteCtx::new(&matcher, &project, "s1", "2026-01-02", &[]);
         write_facts(&gm, &second, std::slice::from_ref(&postgres_fact))
             .await
             .unwrap();
@@ -1545,12 +1525,7 @@ mod tests {
         assert!((before.1 - prior.beta()).abs() < 1e-9);
         assert_eq!(crud::list_aliases(gm.db()).await.unwrap().len(), 1);
 
-        let third = WriteCtx {
-            llm: &matcher,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let third = WriteCtx::new(&matcher, &project, "s1", "2026-01-02", &[]);
         let retry = write_facts(&gm, &third, &[postgres_fact]).await.unwrap();
         assert_eq!(retry.already_seen, 1);
         assert_eq!(retry.reinforced, 0);
@@ -1617,12 +1592,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let ctx = WriteCtx {
-            llm: &Down,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let ctx = WriteCtx::new(&Down, &project, "s1", "2026-01-02", &[]);
         let stats = write_facts(&gm, &ctx, &[uses("uvicorn")]).await.unwrap();
         assert_eq!(stats.edges, 1);
         assert_eq!(stats.resolve.resolver_called, 1);
@@ -1662,12 +1632,7 @@ mod tests {
             id: uv_id.clone(),
             calls: AtomicUsize::new(0),
         };
-        let ctx = WriteCtx {
-            llm: &llm,
-            project: &project,
-            session_id: "s1",
-            date: "2026-01-02",
-        };
+        let ctx = WriteCtx::new(&llm, &project, "s1", "2026-01-02", &[]);
         let stats = write_facts(&gm, &ctx, &[uses("uvicorn")]).await.unwrap();
         assert_eq!(stats.edges, 1);
         assert_eq!(stats.resolve.rejected.len(), 1);

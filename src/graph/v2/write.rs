@@ -5,25 +5,40 @@
 //! Writes for the second pipeline: resolved entities, edges, slots, and
 //! reinforcement of an identical live fact.
 //!
-//! Nothing here retires or contradicts an edge. A repeated fact from another
-//! sighting adds evidence and corroborates. The same session, turn and quote
-//! is already stored, so a retry does not corroborate it. That keeps the prior
-//! recovered from the edge's first β: the creating session never moves β.
+//! A repeated fact from another sighting adds evidence and corroborates.
+//! The same session, turn and quote is already stored, so a retry does not
+//! corroborate it and does not move a retirement. That keeps the prior
+//! recovered from the record's first β: the creating session never moves β.
+//!
+//! Single-valued slots, an explicit rejection, and an explicit replacement
+//! close the live record they succeed. The close is stamped with the session
+//! date and a reason. A record that is already closed keeps its first stamp.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::{json, Value};
+use surrealdb::method::Transaction;
+use surrealdb::Surreal;
 
 use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Provenance};
+use super::super::crud;
 use super::super::error::GraphError;
 use super::super::llm::LlmProvider;
 use super::super::store::Db;
-use super::super::types::EntityUpdate;
+use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
-use super::input::{ProjectIdentity, TurnRole};
+use super::input::{ProjectIdentity, Turn, TurnRole};
 use super::resolve::{self, MentionDraft};
-use super::schema::{normalise, Fact, Kind};
-use surrealdb::Surreal;
+use super::schema::{normalise, Fact, Kind, Predicate};
+
+/// Production writes never fail a commit on purpose.
+pub(crate) static NO_CONFLICTS: AtomicU32 = AtomicU32::new(0);
+
+const SUPERSEDED: &str = "superseded";
+const REJECTED: &str = "rejected";
+const REPLACED: &str = "replaced";
+const PROMOTED: &str = "promoted";
 
 /// Shown when v2 is asked to write into a store it did not build.
 pub(crate) const V2_REFUSAL: &str = "this graph was built by pipeline v1; re-extract into a fresh store with: recall-echo graph extract --pipeline v2 --rebuild";
@@ -45,6 +60,10 @@ pub(crate) struct WriteStats {
     pub unresolved: u32,
     /// Tier hits and rejected resolver proposals for this batch.
     pub resolve: resolve::ResolveReport,
+    /// Facts this batch closed, in the order it closed them.
+    pub retirements: Vec<Retirement>,
+    /// A retirement whose target was missing or whose slot was not an object.
+    pub retirements_skipped: u32,
 }
 
 /// What one session's write needs besides the facts.
@@ -53,6 +72,30 @@ pub(crate) struct WriteCtx<'a> {
     pub project: &'a ProjectIdentity,
     pub session_id: &'a str,
     pub date: &'a str,
+    /// Turns of the session, so `replaces` can be checked against the cited one.
+    pub turns: &'a [Turn],
+    /// Decremented when the next commit should fail as a conflict. Stays zero
+    /// outside the conflict test: a real conflict still retries once.
+    pub conflict_budget: &'a AtomicU32,
+}
+
+impl<'a> WriteCtx<'a> {
+    pub(crate) fn new(
+        llm: &'a dyn LlmProvider,
+        project: &'a ProjectIdentity,
+        session_id: &'a str,
+        date: &'a str,
+        turns: &'a [Turn],
+    ) -> Self {
+        Self {
+            llm,
+            project,
+            session_id,
+            date,
+            turns,
+            conflict_budget: &NO_CONFLICTS,
+        }
+    }
 }
 
 /// Refuse a store this pipeline must not write, otherwise stamp it `v2`.
@@ -111,23 +154,135 @@ fn json_u64(value: &Value) -> Option<u64> {
 }
 
 /// Resolve every fact and write the edge or slot it asks for.
+///
+/// Resolution commits on its own, before this function's transaction: an
+/// alias or a new entity is already durable, and a retry binds the same
+/// rows. The session's edges, slots and retirements then commit together.
+/// A conflict rolls that transaction back and the write runs once more.
 pub(crate) async fn write_facts(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     facts: &[Fact],
 ) -> Result<WriteStats, GraphError> {
     let resolution = resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?;
+    let mut attempt = 0u8;
+    loop {
+        match write_attempt(gm, ctx, facts, &resolution).await {
+            Ok(stats) => return Ok(stats),
+            Err(err) if attempt == 0 && is_write_conflict(&err) => attempt += 1,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn write_attempt(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    resolution: &resolve::Resolution,
+) -> Result<WriteStats, GraphError> {
+    let tx = gm.db().clone().begin().await?;
     let mut stats = WriteStats {
         entities_created: resolution.entities_created,
         resolver_calls: resolution.report.resolver_called,
         resolve: resolution.report.clone(),
         ..WriteStats::default()
     };
-    let mut catalog = Catalog::from_resolution(&resolution);
-    for fact in facts {
-        write_one(gm, &mut catalog, ctx.session_id, ctx.date, fact, &mut stats).await?;
+    let mut catalog = Catalog::from_resolution(resolution);
+    let applied = apply_all(gm, &tx, ctx, &mut catalog, &mut stats, facts).await;
+    if let Err(err) = applied {
+        let _ = tx.cancel().await;
+        return Err(err);
     }
+    if take_conflict(ctx.conflict_budget) {
+        tx.cancel().await?;
+        return Err(conflict_error());
+    }
+    tx.commit().await?;
     Ok(stats)
+}
+
+async fn apply_all(
+    gm: &GraphMemory,
+    tx: &Transaction<Db>,
+    ctx: &WriteCtx<'_>,
+    catalog: &mut Catalog,
+    stats: &mut WriteStats,
+    facts: &[Fact],
+) -> Result<(), GraphError> {
+    let mut attempt = Attempt {
+        gm,
+        tx,
+        ctx,
+        catalog,
+        stats,
+        names: HashMap::new(),
+    };
+    for index in ordered_indexes(facts) {
+        attempt.apply(&facts[index]).await?;
+    }
+    Ok(())
+}
+
+fn ordered_indexes(facts: &[Fact]) -> Vec<usize> {
+    let mut indexes: Vec<usize> = (0..facts.len()).collect();
+    indexes.sort_by(|&left, &right| {
+        facts[left]
+            .turn
+            .cmp(&facts[right].turn)
+            .then_with(|| status_rank(&facts[left].status).cmp(&status_rank(&facts[right].status)))
+            .then(left.cmp(&right))
+    });
+    indexes
+}
+
+/// Rejected facts run before a decided fact of the same turn, so a rejection
+/// closes the previous value and the decided fact is what gets stored.
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "rejected" => 0,
+        "considered" => 1,
+        "decided" => 2,
+        _ => 3,
+    }
+}
+
+fn take_conflict(budget: &AtomicU32) -> bool {
+    let mut current = budget.load(Ordering::SeqCst);
+    loop {
+        if current == 0 {
+            return false;
+        }
+        match budget.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn conflict_error() -> GraphError {
+    GraphError::Db(surrealdb::Error::thrown(
+        "transaction conflict: please retry".to_string(),
+    ))
+}
+
+fn is_write_conflict(err: &GraphError) -> bool {
+    match err {
+        GraphError::Db(inner) => {
+            let message = inner.to_string().to_lowercase();
+            message.contains("conflict") || message.contains("please retry")
+        }
+        _ => false,
+    }
+}
+
+struct Attempt<'a> {
+    gm: &'a GraphMemory,
+    tx: &'a Transaction<Db>,
+    ctx: &'a WriteCtx<'a>,
+    catalog: &'a mut Catalog,
+    stats: &'a mut WriteStats,
+    names: HashMap<String, String>,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -182,102 +337,100 @@ fn mention_draft(name: &str, kind: Kind, fact: &Fact, creates: bool) -> MentionD
     }
 }
 
-async fn write_one(
-    gm: &GraphMemory,
-    catalog: &mut Catalog,
-    session_id: &str,
-    date: &str,
-    fact: &Fact,
-    stats: &mut WriteStats,
-) -> Result<(), GraphError> {
-    let Some(subject) = bound(catalog, &fact.subject_name, fact.subject_kind, stats)? else {
-        return Ok(());
-    };
-    if fact.predicate.is_edge() {
-        let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
-        let Some(object) = bound(catalog, &fact.object_name, object_kind, stats)? else {
+impl<'a> Attempt<'a> {
+    async fn apply(&mut self, source: &Fact) -> Result<(), GraphError> {
+        let Some(subject) = bound(
+            self.catalog,
+            &source.subject_name,
+            source.subject_kind,
+            self.stats,
+        )?
+        else {
             return Ok(());
         };
-        write_edge(gm, session_id, fact, &subject, &object, stats).await
-    } else {
-        write_slot(gm, catalog, session_id, date, fact, &subject, stats).await
-    }
-}
-
-/// A missing binding drops this fact. Any other error still fails the session.
-fn bound(
-    catalog: &Catalog,
-    name: &str,
-    kind: Kind,
-    stats: &mut WriteStats,
-) -> Result<Option<Stored>, GraphError> {
-    match catalog.get(name, kind) {
-        Ok(stored) => Ok(Some(stored)),
-        Err(GraphError::NotFound(_)) => {
-            stats.unresolved += 1;
-            Ok(None)
+        self.names
+            .insert(subject.id.clone(), source.subject_name.clone());
+        let mut fact = source.clone();
+        if fact.status == "rejected" {
+            self.retire_rejected(&fact, &subject).await?;
+        } else if fact.status == "decided" {
+            if replaces_supported(&fact, self.ctx.turns) {
+                self.retire_replaced(&fact, &subject).await?;
+            }
+            if single_valued(fact.predicate) {
+                self.supersede_slot(&mut fact, &subject).await?;
+            }
+            self.promote(&fact, &subject).await?;
         }
-        Err(err) => Err(err),
-    }
-}
-
-async fn write_edge(
-    gm: &GraphMemory,
-    session_id: &str,
-    fact: &Fact,
-    subject: &Stored,
-    object: &Stored,
-    stats: &mut WriteStats,
-) -> Result<(), GraphError> {
-    let description = fact.role.map(|role| format!("role={}", role.as_str()));
-    if let Some(existing) = find_edge(gm, subject, object, fact, description.as_deref()).await? {
-        match reinforce_edge(gm, &existing, fact, session_id).await? {
-            Sight::Recorded => stats.reinforced += 1,
-            Sight::AlreadySeen => stats.already_seen += 1,
+        let Some(subject) = self.catalog.by_id.get(&subject.id).cloned() else {
+            return Ok(());
+        };
+        if fact.predicate.is_edge() {
+            let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
+            let Some(object) = bound(self.catalog, &fact.object_name, object_kind, self.stats)?
+            else {
+                return Ok(());
+            };
+            self.names
+                .insert(object.id.clone(), fact.object_name.clone());
+            self.write_edge(&fact, &subject, &object).await
+        } else {
+            self.write_slot(&fact, &subject).await
         }
-        return Ok(());
     }
-    create_edge(gm, session_id, fact, subject, object, description).await?;
-    stats.edges += 1;
-    Ok(())
-}
 
-async fn find_edge(
-    gm: &GraphMemory,
-    subject: &Stored,
-    object: &Stored,
-    fact: &Fact,
-    description: Option<&str>,
-) -> Result<Option<StoredEdge>, GraphError> {
-    let mut response = gm
-        .db()
-        .query("SELECT * FROM relates_to WHERE in = type::record($id) AND valid_until = NONE")
-        .bind(("id", subject.id.clone()))
-        .await?;
-    let edges: Vec<StoredEdge> = deserialize_take(&mut response, 0)?;
-    Ok(edges.into_iter().find(|edge| {
-        edge.rel_type == fact.predicate.as_str()
-            && edge.status.as_deref() == Some(fact.status.as_str())
-            && edge.description.as_deref() == description
-            && record_id(&edge.to_id) == object.id
-            && edge.valid_until.is_none()
-    }))
-}
+    async fn write_edge(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        object: &Stored,
+    ) -> Result<(), GraphError> {
+        let description = fact.role.map(|role| format!("role={}", role.as_str()));
+        if let Some(existing) = self
+            .find_edge(subject, object, fact, description.as_deref())
+            .await?
+        {
+            match self.reinforce_edge(&existing, fact).await? {
+                Sight::Recorded => self.stats.reinforced += 1,
+                Sight::AlreadySeen => self.stats.already_seen += 1,
+            }
+            return Ok(());
+        }
+        self.create_edge(fact, subject, object, description).await?;
+        self.stats.edges += 1;
+        Ok(())
+    }
 
-async fn create_edge(
-    gm: &GraphMemory,
-    session_id: &str,
-    fact: &Fact,
-    subject: &Stored,
-    object: &Stored,
-    description: Option<String>,
-) -> Result<(), GraphError> {
-    let (_, label) = provenance_of(fact.provenance);
-    let evidence = Evidence::from_prior(ExtractionContext::Explicit.prior());
-    let item = evidence_item(session_id, fact, label);
-    gm.db()
-        .query(
-            r#"
+    async fn find_edge(
+        &self,
+        subject: &Stored,
+        object: &Stored,
+        fact: &Fact,
+        description: Option<&str>,
+    ) -> Result<Option<StoredEdge>, GraphError> {
+        let edges = self.live_edges(&subject.id).await?;
+        Ok(edges.into_iter().find(|edge| {
+            edge.rel_type == fact.predicate.as_str()
+                && edge.status.as_deref() == Some(fact.status.as_str())
+                && edge.description.as_deref() == description
+                && record_id(&edge.to_id) == object.id
+                && !edge_closed(edge.valid_until.as_ref())
+        }))
+    }
+
+    async fn create_edge(
+        &self,
+        fact: &Fact,
+        subject: &Stored,
+        object: &Stored,
+        description: Option<String>,
+    ) -> Result<(), GraphError> {
+        let (_, label) = provenance_of(fact.provenance);
+        let evidence = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let item = evidence_item(self.ctx.session_id, fact, label);
+        self.tx
+            .query(
+                r#"
             LET $from = type::record($from_id);
             LET $to = type::record($to_id);
             RELATE $from -> relates_to -> $to SET
@@ -296,104 +449,850 @@ async fn create_edge(
                 ended_by = NONE,
                 evidence = $evidence
             "#,
-        )
-        .bind(("from_id", subject.id.clone()))
-        .bind(("to_id", object.id.clone()))
-        .bind(("rel_type", fact.predicate.as_str().to_string()))
-        .bind(("description", description))
-        .bind(("confidence", evidence.mean()))
-        .bind(("alpha", evidence.alpha()))
-        .bind(("beta", evidence.beta()))
-        .bind(("status", fact.status.clone()))
-        .bind(("provenance", label.to_string()))
-        .bind(("evidence", json!([item])))
-        .await?
-        .check()?;
-    Ok(())
-}
-
-async fn reinforce_edge(
-    gm: &GraphMemory,
-    edge: &StoredEdge,
-    fact: &Fact,
-    session_id: &str,
-) -> Result<Sight, GraphError> {
-    if evidence_seen(edge.evidence.as_ref(), session_id, fact) {
-        return Ok(Sight::AlreadySeen);
+            )
+            .bind(("from_id", subject.id.clone()))
+            .bind(("to_id", object.id.clone()))
+            .bind(("rel_type", fact.predicate.as_str().to_string()))
+            .bind(("description", description))
+            .bind(("confidence", evidence.mean()))
+            .bind(("alpha", evidence.alpha()))
+            .bind(("beta", evidence.beta()))
+            .bind(("status", fact.status.clone()))
+            .bind(("provenance", label.to_string()))
+            .bind(("evidence", json!([item])))
+            .await?
+            .check()?;
+        Ok(())
     }
-    let (provenance, label) = provenance_of(fact.provenance);
-    let mut state = EdgeEvidence::new(
-        Evidence::from_stored(edge.alpha, edge.beta, edge.confidence),
-        edge.self_reinforcements.unwrap_or(0),
-    );
-    state.corroborate(provenance, gm.provenance_weights());
-    let evidence = push_evidence(
-        edge.evidence.clone(),
-        evidence_item(session_id, fact, label),
-    );
-    let id = record_id(&edge.id);
-    gm.db()
-        .query(
-            r#"UPDATE type::record($id) SET
+
+    async fn reinforce_edge(&self, edge: &StoredEdge, fact: &Fact) -> Result<Sight, GraphError> {
+        if evidence_seen(edge.evidence.as_ref(), self.ctx.session_id, fact) {
+            return Ok(Sight::AlreadySeen);
+        }
+        let (provenance, label) = provenance_of(fact.provenance);
+        let mut state = EdgeEvidence::new(
+            Evidence::from_stored(edge.alpha, edge.beta, edge.confidence),
+            edge.self_reinforcements.unwrap_or(0),
+        );
+        state.corroborate(provenance, self.gm.provenance_weights());
+        let evidence = push_evidence(
+            edge.evidence.clone(),
+            evidence_item(self.ctx.session_id, fact, label),
+        );
+        let id = record_id(&edge.id);
+        self.tx
+            .query(
+                r#"UPDATE type::record($id) SET
                 confidence = $confidence,
                 alpha = $alpha,
                 beta = $beta,
                 self_reinforcements = $self_reinforcements,
                 evidence = $evidence,
                 last_reinforced = time::now()"#,
-        )
-        .bind(("id", id))
-        .bind(("confidence", state.evidence().mean()))
-        .bind(("alpha", state.evidence().alpha()))
-        .bind(("beta", state.evidence().beta()))
-        .bind(("self_reinforcements", state.self_reinforcements()))
-        .bind(("evidence", evidence))
-        .await?
-        .check()?;
-    Ok(Sight::Recorded)
-}
+            )
+            .bind(("id", id))
+            .bind(("confidence", state.evidence().mean()))
+            .bind(("alpha", state.evidence().alpha()))
+            .bind(("beta", state.evidence().beta()))
+            .bind(("self_reinforcements", state.self_reinforcements()))
+            .bind(("evidence", evidence))
+            .await?
+            .check()?;
+        Ok(Sight::Recorded)
+    }
 
-async fn write_slot(
-    gm: &GraphMemory,
-    catalog: &mut Catalog,
-    session_id: &str,
-    date: &str,
-    fact: &Fact,
-    subject: &Stored,
-    stats: &mut WriteStats,
-) -> Result<(), GraphError> {
-    let mut attributes = subject.attributes.clone();
-    let v2 = v2_map(&mut attributes)?;
-    let slots = slots_mut(v2)?;
-    let persist = if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
-        match reinforce_slot(slot, gm, fact, session_id)? {
-            Sight::Recorded => {
-                stats.reinforced += 1;
-                true
+    async fn write_slot(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
+        let mut attributes = subject.attributes.clone();
+        let v2 = v2_map(&mut attributes)?;
+        let slots = slots_mut(v2)?;
+        let persist = if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
+            match reinforce_slot(slot, self.gm, fact, self.ctx.session_id)? {
+                Sight::Recorded => {
+                    self.stats.reinforced += 1;
+                    true
+                }
+                Sight::AlreadySeen => {
+                    self.stats.already_seen += 1;
+                    false
+                }
             }
-            Sight::AlreadySeen => {
-                stats.already_seen += 1;
-                false
+        } else {
+            slots.push(new_slot(self.ctx.session_id, self.ctx.date, fact));
+            self.stats.slots += 1;
+            true
+        };
+        if !persist {
+            return Ok(());
+        }
+        self.persist(&subject.id, attributes).await
+    }
+
+    async fn persist(&mut self, id: &str, attributes: Value) -> Result<(), GraphError> {
+        self.tx
+            .query(
+                "UPDATE type::record($id) SET attributes = $attributes, updated_at = time::now()",
+            )
+            .bind(("id", id.to_string()))
+            .bind(("attributes", attributes.clone()))
+            .await?
+            .check()?;
+        self.catalog.set_attributes(id, attributes);
+        Ok(())
+    }
+
+    async fn supersede_slot(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        let Some((stored, mut slots)) = self.load_slots(&subject.id).await? else {
+            return Ok(());
+        };
+        if fact.predicate == Predicate::Setting {
+            fact.key = preferred_key(&fact.key, &slots);
+        }
+        let until = session_midnight(self.ctx.date);
+        let ended_by = format!("{}:{SUPERSEDED}", self.ctx.session_id);
+        let mut changed = false;
+        for slot in &mut slots {
+            if !slot.is_object() {
+                self.stats.retirements_skipped += 1;
+                continue;
+            }
+            if !supersede_target(slot, fact)
+                || opened_here(slot.get("evidence"), self.ctx.session_id)
+            {
+                continue;
+            }
+            let old_value = slot_str(slot, "value").unwrap_or("").to_string();
+            let predicate = slot_str(slot, "predicate")
+                .unwrap_or(fact.predicate.as_str())
+                .to_string();
+            if !stamp_slot(slot, &until, &ended_by) {
+                continue;
+            }
+            changed = true;
+            let subject_name = self.label(&stored.id, &fact.subject_name).await?;
+            self.record(
+                SUPERSEDED,
+                &subject_name,
+                &predicate,
+                &old_value,
+                &fact.object_name,
+            );
+        }
+        if changed {
+            self.store_slots(&stored.id, &stored.attributes, slots)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn promote(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
+        if fact.predicate.is_edge() {
+            self.promote_edge(fact, subject).await
+        } else {
+            self.promote_slot(fact, subject).await
+        }
+    }
+
+    async fn promote_slot(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
+        let Some((stored, mut slots)) = self.load_slots(&subject.id).await? else {
+            return Ok(());
+        };
+        let until = session_midnight(self.ctx.date);
+        let ended_by = format!("{}:{PROMOTED}", self.ctx.session_id);
+        let mut changed = false;
+        for slot in &mut slots {
+            if !slot.is_object() {
+                self.stats.retirements_skipped += 1;
+                continue;
+            }
+            if !considered_same_slot(slot, fact)
+                || opened_here(slot.get("evidence"), self.ctx.session_id)
+            {
+                continue;
+            }
+            let old_value = slot_str(slot, "value").unwrap_or("").to_string();
+            if !stamp_slot(slot, &until, &ended_by) {
+                continue;
+            }
+            changed = true;
+            let subject_name = self.label(&stored.id, &fact.subject_name).await?;
+            self.record(
+                PROMOTED,
+                &subject_name,
+                fact.predicate.as_str(),
+                &old_value,
+                &fact.object_name,
+            );
+        }
+        if changed {
+            self.store_slots(&stored.id, &stored.attributes, slots)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn promote_edge(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
+        let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
+        let Ok(object) = self.catalog.get(&fact.object_name, object_kind) else {
+            return Ok(());
+        };
+        let description = fact.role.map(|role| format!("role={}", role.as_str()));
+        let edges = self.live_edges(&subject.id).await?;
+        for edge in edges {
+            if edge.rel_type != fact.predicate.as_str()
+                || edge.status.as_deref() != Some("considered")
+                || edge.description.as_deref() != description.as_deref()
+                || record_id(&edge.to_id) != object.id
+                || opened_here(edge.evidence.as_ref(), self.ctx.session_id)
+            {
+                continue;
+            }
+            self.close_edge(&subject.id, &edge, PROMOTED, &fact.object_name)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_rejected(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
+        let scope = self.project_scope(subject, fact.subject_kind).await?;
+        let object_id = self.bound_object_id(fact);
+        for id in scope {
+            self.rejected_on(&id, fact, object_id.as_deref()).await?;
+        }
+        Ok(())
+    }
+
+    async fn rejected_on(
+        &mut self,
+        id: &str,
+        fact: &Fact,
+        object_id: Option<&str>,
+    ) -> Result<(), GraphError> {
+        if !fact.predicate.is_edge() {
+            self.close_slots(id, fact, REJECTED, "", |slot| {
+                open_status(slot, &["decided", "considered"])
+                    && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
+                    && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name)
+            })
+            .await?;
+        }
+        let Some(object_id) = object_id else {
+            return Ok(());
+        };
+        let edges = self.live_edges(id).await?;
+        for edge in edges {
+            if edge.rel_type != fact.predicate.as_str()
+                || !status_is(&edge, &["decided", "considered"])
+                || record_id(&edge.to_id) != object_id
+                || opened_here(edge.evidence.as_ref(), self.ctx.session_id)
+            {
+                continue;
+            }
+            self.close_edge(id, &edge, REJECTED, "").await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_replaced(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
+        let scope = self.project_scope(subject, fact.subject_kind).await?;
+        let entity_id = self.replacement_entity(&fact.replaces).await?;
+        let object_id = self.bound_object_id(fact);
+        for id in scope {
+            self.replaced_on(&id, fact, entity_id.as_deref(), object_id.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn replaced_on(
+        &mut self,
+        id: &str,
+        fact: &Fact,
+        entity_id: Option<&str>,
+        object_id: Option<&str>,
+    ) -> Result<(), GraphError> {
+        let replaces = fact.replaces.clone();
+        let new_value = fact.object_name.clone();
+        self.close_slots(id, fact, REPLACED, &new_value, |slot| {
+            open_status(slot, &["decided", "considered"])
+                && literal_matches(slot_str(slot, "value").unwrap_or(""), &replaces)
+                && !same_decided_slot(slot, fact)
+        })
+        .await?;
+        let Some(entity_id) = entity_id else {
+            return Ok(());
+        };
+        let edges = self.live_edges(id).await?;
+        for edge in edges {
+            if edge.rel_type != fact.predicate.as_str()
+                || !status_is(&edge, &["decided", "considered"])
+                || record_id(&edge.to_id) != entity_id
+                || opened_here(edge.evidence.as_ref(), self.ctx.session_id)
+                || object_id.is_some_and(|object| same_decided_edge(&edge, fact, object))
+            {
+                continue;
+            }
+            self.close_edge(id, &edge, REPLACED, &new_value).await?;
+        }
+        Ok(())
+    }
+
+    async fn close_slots(
+        &mut self,
+        id: &str,
+        fact: &Fact,
+        reason: &str,
+        new_value: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<(), GraphError> {
+        let Some((stored, mut slots)) = self.load_slots(id).await? else {
+            return Ok(());
+        };
+        let until = session_midnight(self.ctx.date);
+        let ended_by = format!("{}:{reason}", self.ctx.session_id);
+        let mut changed = false;
+        let mut notes = Vec::new();
+        for slot in &mut slots {
+            if !slot.is_object() {
+                self.stats.retirements_skipped += 1;
+                continue;
+            }
+            if !matches(slot) || opened_here(slot.get("evidence"), self.ctx.session_id) {
+                continue;
+            }
+            let old_value = slot_str(slot, "value").unwrap_or("").to_string();
+            let predicate = slot_str(slot, "predicate")
+                .unwrap_or(fact.predicate.as_str())
+                .to_string();
+            if !stamp_slot(slot, &until, &ended_by) {
+                continue;
+            }
+            changed = true;
+            notes.push((predicate, old_value));
+        }
+        if changed {
+            let subject_name = self.label(&stored.id, &fact.subject_name).await?;
+            self.store_slots(&stored.id, &stored.attributes, slots)
+                .await?;
+            for (predicate, old_value) in notes {
+                self.record(reason, &subject_name, &predicate, &old_value, new_value);
             }
         }
-    } else {
-        slots.push(new_slot(session_id, date, fact));
-        stats.slots += 1;
-        true
-    };
-    if !persist {
-        return Ok(());
+        Ok(())
     }
-    gm.update_entity(
-        &subject.id,
-        EntityUpdate {
-            attributes: Some(attributes.clone()),
-            ..EntityUpdate::default()
-        },
+
+    async fn close_edge(
+        &mut self,
+        subject_id: &str,
+        edge: &StoredEdge,
+        reason: &str,
+        new_value: &str,
+    ) -> Result<(), GraphError> {
+        let id = record_id(&edge.id);
+        if id.is_empty() {
+            self.stats.retirements_skipped += 1;
+            return Ok(());
+        }
+        if edge_closed(edge.valid_until.as_ref()) {
+            return Ok(());
+        }
+        let mut response = self
+            .tx
+            .query("SELECT valid_until FROM type::record($id)")
+            .bind(("id", id.clone()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let Some(row) = rows.into_iter().next() else {
+            self.stats.retirements_skipped += 1;
+            return Ok(());
+        };
+        if crud::edge_already_closed(row.get("valid_until")) {
+            return Ok(());
+        }
+        let until = session_midnight(self.ctx.date);
+        let ended_by = format!("{}:{reason}", self.ctx.session_id);
+        let mut response = self
+            .tx
+            .query(CLOSE_EDGE)
+            .bind(("id", id))
+            .bind(("valid_until", until))
+            .bind(("ended_by", ended_by))
+            .await?;
+        let closed: Vec<Value> = deserialize_take(&mut response, 0)?;
+        if closed.is_empty() {
+            return Ok(());
+        }
+        let object_id = record_id(&edge.to_id);
+        let old_value = self.label(&object_id, &object_id).await?;
+        let subject_name = self.label(subject_id, subject_id).await?;
+        self.record(reason, &subject_name, &edge.rel_type, &old_value, new_value);
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        reason: &str,
+        subject: &str,
+        predicate: &str,
+        old_value: &str,
+        new_value: &str,
+    ) {
+        self.stats.retirements.push(Retirement {
+            reason: reason.to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            old_value: old_value.to_string(),
+            new_value: new_value.to_string(),
+        });
+    }
+
+    async fn project_scope(
+        &mut self,
+        subject: &Stored,
+        kind: Kind,
+    ) -> Result<Vec<String>, GraphError> {
+        let mut ids = vec![subject.id.clone()];
+        if kind != Kind::Project {
+            return Ok(ids);
+        }
+        let mut response = self
+            .tx
+            .query(
+                "SELECT in FROM relates_to WHERE out = type::record($id) \
+                 AND rel_type = 'part_of' AND valid_until = NONE",
+            )
+            .bind(("id", subject.id.clone()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let mut incoming = Vec::new();
+        for row in rows {
+            let Some(link) = row.get("in") else {
+                continue;
+            };
+            incoming.push(record_id(link));
+        }
+        for id in incoming {
+            if self.is_component(&id).await? {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn is_component(&mut self, id: &str) -> Result<bool, GraphError> {
+        let Some(stored) = self.ensure_entity(id).await? else {
+            return Ok(false);
+        };
+        Ok(stored_kind(&stored.attributes) == Some(Kind::Component))
+    }
+
+    fn bound_object_id(&mut self, fact: &Fact) -> Option<String> {
+        if !fact.predicate.is_edge() {
+            return None;
+        }
+        let kind = fact.object_kind.unwrap_or(Kind::Technology);
+        let stored = self.catalog.get(&fact.object_name, kind).ok()?;
+        self.names
+            .insert(stored.id.clone(), fact.object_name.clone());
+        Some(stored.id)
+    }
+
+    async fn replacement_entity(&mut self, replaces: &str) -> Result<Option<String>, GraphError> {
+        if let Ok(stored) = self.catalog.get(replaces, Kind::Technology) {
+            return Ok(Some(stored.id));
+        }
+        let folded = normalise(replaces);
+        if folded.is_empty() {
+            return Ok(None);
+        }
+        if let Some(id) = crud::get_alias(self.gm.db(), &folded).await? {
+            return Ok(Some(id));
+        }
+        let mut response = self
+            .tx
+            .query("SELECT id, attributes FROM entity WHERE name = $name")
+            .bind(("name", replaces.trim().to_string()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let mut found = Vec::new();
+        for row in rows {
+            let Some(id) = row.get("id") else {
+                continue;
+            };
+            let kind = stored_kind(row.get("attributes").unwrap_or(&Value::Null));
+            found.push((record_id(id), kind));
+        }
+        if let Some((id, _)) = found
+            .iter()
+            .find(|(_, kind)| *kind == Some(Kind::Technology))
+        {
+            return Ok(Some(id.clone()));
+        }
+        if found.len() == 1 {
+            return Ok(Some(found[0].0.clone()));
+        }
+        Ok(None)
+    }
+
+    async fn load_slots(&mut self, id: &str) -> Result<Option<(Stored, Vec<Value>)>, GraphError> {
+        let Some(stored) = self.ensure_entity(id).await? else {
+            self.stats.retirements_skipped += 1;
+            return Ok(None);
+        };
+        match slot_list(&stored.attributes) {
+            Ok(slots) => Ok(Some((stored, slots))),
+            Err(()) => {
+                self.stats.retirements_skipped += 1;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn store_slots(
+        &mut self,
+        id: &str,
+        attributes: &Value,
+        slots: Vec<Value>,
+    ) -> Result<(), GraphError> {
+        let mut attributes = attributes.clone();
+        let v2 = v2_map(&mut attributes)?;
+        v2.insert("slots".to_string(), Value::Array(slots));
+        self.persist(id, attributes).await
+    }
+
+    async fn ensure_entity(&mut self, id: &str) -> Result<Option<Stored>, GraphError> {
+        if let Some(stored) = self.catalog.by_id.get(id) {
+            return Ok(Some(stored.clone()));
+        }
+        let mut response = self
+            .tx
+            .query("SELECT name, attributes FROM type::record($id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        if let Some(name) = row.get("name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                self.names.insert(id.to_string(), name.to_string());
+            }
+        }
+        let attributes = row.get("attributes").cloned().unwrap_or_else(|| json!({}));
+        let stored = Stored {
+            id: id.to_string(),
+            attributes,
+        };
+        self.catalog.by_id.insert(id.to_string(), stored.clone());
+        Ok(Some(stored))
+    }
+
+    async fn label(&mut self, id: &str, fallback: &str) -> Result<String, GraphError> {
+        if let Some(name) = self.names.get(id) {
+            if !name.is_empty() {
+                return Ok(name.clone());
+            }
+        }
+        let mut response = self
+            .tx
+            .query("SELECT name FROM type::record($id)")
+            .bind(("id", id.to_string()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let name = rows
+            .into_iter()
+            .find_map(|row| {
+                row.get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| fallback.to_string());
+        self.names.insert(id.to_string(), name.clone());
+        Ok(name)
+    }
+
+    async fn live_edges(&self, subject_id: &str) -> Result<Vec<StoredEdge>, GraphError> {
+        let mut response = self
+            .tx
+            .query("SELECT * FROM relates_to WHERE in = type::record($id) AND valid_until = NONE")
+            .bind(("id", subject_id.to_string()))
+            .await?;
+        deserialize_take(&mut response, 0)
+    }
+}
+
+const CLOSE_EDGE: &str = r#"
+    UPDATE type::record($id) SET
+        valid_until = type::datetime($valid_until),
+        ended_by = $ended_by
+    WHERE valid_until = NONE
+    RETURN BEFORE
+"#;
+
+/// Affixes `canon_key` peels one of. A family peels every copy.
+const KEY_AFFIXES: &[&str] = &[
+    "default", "current", "new", "value", "number", "setting", "used",
+];
+
+/// A missing binding drops this fact. Any other error still fails the session.
+fn bound(
+    catalog: &Catalog,
+    name: &str,
+    kind: Kind,
+    stats: &mut WriteStats,
+) -> Result<Option<Stored>, GraphError> {
+    match catalog.get(name, kind) {
+        Ok(stored) => Ok(Some(stored)),
+        Err(GraphError::NotFound(_)) => {
+            stats.unresolved += 1;
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn single_valued(predicate: Predicate) -> bool {
+    matches!(
+        predicate,
+        Predicate::Setting
+            | Predicate::IssueSymptom
+            | Predicate::IssueStatus
+            | Predicate::IssueCause
+            | Predicate::IssueFix
+            | Predicate::ReleaseStatus
     )
-    .await?;
-    catalog.set_attributes(&subject.id, attributes);
-    Ok(())
+}
+
+/// `true` when `replaces` has a content token in the cited turn.
+///
+/// A content token is an alphanumeric run of at least three characters. The
+/// cited turn is the one the fact names; the quote stands in when that turn
+/// is not in the session.
+fn replaces_supported(fact: &Fact, turns: &[Turn]) -> bool {
+    let tokens = content_tokens(&fact.replaces);
+    if tokens.is_empty() {
+        return false;
+    }
+    let text = turns
+        .iter()
+        .find(|turn| turn.index == fact.turn)
+        .map(|turn| turn.text.as_str())
+        .unwrap_or(fact.quote.as_str());
+    let present = content_tokens(text);
+    tokens
+        .iter()
+        .any(|token| present.iter().any(|item| item == token))
+}
+
+fn content_tokens(text: &str) -> Vec<String> {
+    alphanumeric_runs(text)
+        .into_iter()
+        .filter(|token| token.chars().count() >= 3)
+        .collect()
+}
+
+fn alphanumeric_runs(text: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+fn session_midnight(date: &str) -> String {
+    let day = date.split('T').next().unwrap_or(date);
+    format!("{day}T00:00:00Z")
+}
+
+/// Keys name one setting when they are equal, or when the tokens left after
+/// the listed affixes are the same non-empty list.
+///
+/// `port` and `port_value_setting` match. `storage` and `tag_storage` do not:
+/// sharing a token is not a family. A new key is rewritten onto the live key
+/// it repeats, and a different value closes that live setting.
+fn keys_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_stem = key_stem(left);
+    let right_stem = key_stem(right);
+    !left_stem.is_empty() && left_stem == right_stem
+}
+
+fn key_stem(key: &str) -> Vec<String> {
+    key.split('_')
+        .filter(|token| !token.is_empty() && !KEY_AFFIXES.contains(token))
+        .map(str::to_string)
+        .collect()
+}
+
+fn preferred_key(incoming: &str, slots: &[Value]) -> String {
+    let mut matches: Vec<&str> = slots
+        .iter()
+        .filter_map(|slot| {
+            if !slot_live(slot)
+                || slot_str(slot, "predicate") != Some("setting")
+                || slot_str(slot, "status") != Some("decided")
+            {
+                return None;
+            }
+            let key = slot_str(slot, "key")?;
+            keys_match(incoming, key).then_some(key)
+        })
+        .collect();
+    if matches.contains(&incoming) {
+        return incoming.to_string();
+    }
+    matches.sort_by(|left, right| left.len().cmp(&right.len()).then(left.cmp(right)));
+    matches
+        .first()
+        .map(|key| (*key).to_string())
+        .unwrap_or_else(|| incoming.to_string())
+}
+
+fn supersede_target(slot: &Value, fact: &Fact) -> bool {
+    if !slot_live(slot) || slot_str(slot, "status") != Some("decided") {
+        return false;
+    }
+    if slot_str(slot, "predicate") != Some(fact.predicate.as_str()) {
+        return false;
+    }
+    if values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name) {
+        return false;
+    }
+    if fact.predicate == Predicate::Setting {
+        return keys_match(slot_str(slot, "key").unwrap_or(""), &fact.key);
+    }
+    true
+}
+
+fn considered_same_slot(slot: &Value, fact: &Fact) -> bool {
+    slot_live(slot)
+        && slot_str(slot, "status") == Some("considered")
+        && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
+        && slot_str(slot, "key") == Some(fact.key.as_str())
+        && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name)
+}
+
+fn same_decided_slot(slot: &Value, fact: &Fact) -> bool {
+    slot_str(slot, "status") == Some("decided")
+        && slot_str(slot, "predicate") == Some(fact.predicate.as_str())
+        && slot_str(slot, "key") == Some(fact.key.as_str())
+        && values_equal(slot_str(slot, "value").unwrap_or(""), &fact.object_name)
+}
+
+fn same_decided_edge(edge: &StoredEdge, fact: &Fact, object_id: &str) -> bool {
+    let description = fact.role.map(|role| format!("role={}", role.as_str()));
+    edge.status.as_deref() == Some("decided")
+        && edge.rel_type == fact.predicate.as_str()
+        && edge.description.as_deref() == description.as_deref()
+        && record_id(&edge.to_id) == object_id
+}
+
+fn open_status(slot: &Value, allowed: &[&str]) -> bool {
+    slot_live(slot) && slot_str(slot, "status").is_some_and(|status| allowed.contains(&status))
+}
+
+fn status_is(edge: &StoredEdge, allowed: &[&str]) -> bool {
+    edge.status
+        .as_deref()
+        .is_some_and(|status| allowed.contains(&status))
+}
+
+fn values_equal(left: &str, right: &str) -> bool {
+    normalise(left) == normalise(right)
+}
+
+/// Whole value, one path segment, or a contiguous token run.
+fn literal_matches(value: &str, replaces: &str) -> bool {
+    let needle = normalise(replaces);
+    if needle.is_empty() {
+        return false;
+    }
+    if normalise(value) == needle {
+        return true;
+    }
+    if value
+        .split(['/', '\\'])
+        .any(|segment| normalise(segment) == needle)
+    {
+        return true;
+    }
+    let value_tokens = alphanumeric_runs(value);
+    let needle_tokens = alphanumeric_runs(replaces);
+    !needle_tokens.is_empty()
+        && value_tokens
+            .windows(needle_tokens.len())
+            .any(|window| window == needle_tokens.as_slice())
+}
+
+fn slot_live(slot: &Value) -> bool {
+    !edge_closed(slot.get("valid_until"))
+}
+
+fn edge_closed(valid_until: Option<&Value>) -> bool {
+    crud::edge_already_closed(valid_until)
+}
+
+/// A fact stored in this session stays live for the rest of the session.
+///
+/// Rejected facts run before decided facts of the same turn, so a rejection
+/// does not see the decided fact beside it. A later turn does not close an
+/// earlier fact of this session either.
+fn opened_here(evidence: Option<&Value>, session_id: &str) -> bool {
+    let Some(items) = evidence.and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(first) = items.first() else {
+        return false;
+    };
+    first.get("session").and_then(Value::as_str) == Some(session_id)
+}
+
+fn stamp_slot(slot: &mut Value, until: &str, ended_by: &str) -> bool {
+    if !slot_live(slot) {
+        return false;
+    }
+    let Some(object) = slot.as_object_mut() else {
+        return false;
+    };
+    object.insert("valid_until".to_string(), json!(until));
+    object.insert("ended_by".to_string(), json!(ended_by));
+    true
+}
+
+fn slot_list(attributes: &Value) -> Result<Vec<Value>, ()> {
+    let Some(v2) = attributes.get("v2") else {
+        return Ok(Vec::new());
+    };
+    if !v2.is_object() {
+        return Err(());
+    }
+    match v2.get("slots") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(items)) => Ok(items.clone()),
+        Some(_) => Err(()),
+    }
+}
+
+fn stored_kind(attributes: &Value) -> Option<Kind> {
+    attributes
+        .get("v2")
+        .and_then(|v2| v2.get("kind"))
+        .and_then(Value::as_str)
+        .and_then(Kind::parse)
 }
 
 fn same_slot(slot: &Value, fact: &Fact) -> bool {
@@ -866,12 +1765,7 @@ mod tests {
             aliases: Vec::new(),
         };
         let llm = Quiet;
-        let ctx = WriteCtx {
-            llm: &llm,
-            project: &project,
-            session_id,
-            date,
-        };
+        let ctx = WriteCtx::new(&llm, &project, session_id, date, &[]);
         write_facts(gm, &ctx, facts).await
     }
 
@@ -975,5 +1869,713 @@ mod tests {
             provenance: TurnRole::User,
             replaces: String::new(),
         }
+    }
+
+    fn decided_slot(key: &str, value: &str, turn: usize) -> Fact {
+        Fact {
+            subject_name: "app".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: key.into(),
+            object_name: value.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn,
+            quote: format!("{key} is {value}"),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        }
+    }
+
+    fn uses_named(
+        subject: &str,
+        kind: Kind,
+        object: &str,
+        status: &str,
+        replaces: &str,
+        turn: usize,
+    ) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: kind,
+            predicate: Predicate::Uses,
+            role: Some(Role::Library),
+            key: String::new(),
+            object_name: object.into(),
+            object_kind: Some(Kind::Technology),
+            status: status.into(),
+            turn,
+            quote: format!("{subject} uses {object}"),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: replaces.into(),
+        }
+    }
+
+    async fn write_turns(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        budget: Option<&AtomicU32>,
+    ) -> Result<WriteStats, GraphError> {
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let ctx = match budget {
+            Some(budget) => WriteCtx {
+                llm: &llm,
+                project: &project,
+                session_id,
+                date,
+                turns,
+                conflict_budget: budget,
+            },
+            None => WriteCtx::new(&llm, &project, session_id, date, turns),
+        };
+        write_facts(gm, &ctx, facts).await
+    }
+
+    async fn app_slots(gm: &GraphMemory) -> Vec<Value> {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let app = entities.iter().find(|entity| entity.name == "app").unwrap();
+        app.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn slot_named<'a>(slots: &'a [Value], key: &str, value: &str) -> &'a Value {
+        slots
+            .iter()
+            .find(|slot| slot["key"] == key && slot["value"] == value)
+            .unwrap_or_else(|| panic!("missing {key}={value} in {slots:?}"))
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn setting_slot_retires_old_value_on_session_date() {
+        let (_tmp, gm) = open_store().await;
+        write_turns(
+            &gm,
+            "s03",
+            "2026-04-03",
+            &[],
+            &[decided_slot("port", "8080", 1)],
+            None,
+        )
+        .await
+        .unwrap();
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let first = write_turns(
+            &gm,
+            "s11",
+            "2026-04-11",
+            &[],
+            &[decided_slot("port", "8765", 1)],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.retirements.len(), 1);
+        assert_eq!(first.retirements[0].reason, "superseded");
+        assert_eq!(first.retirements[0].subject, "app");
+        assert_eq!(first.retirements[0].predicate, "setting");
+        assert_eq!(first.retirements[0].old_value, "8080");
+        assert_eq!(first.retirements[0].new_value, "8765");
+
+        let slots = app_slots(&gm).await;
+        let old = slot_named(&slots, "port", "8080");
+        let live = slot_named(&slots, "port", "8765");
+        assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+        assert_eq!(old["ended_by"], "s11:superseded");
+        assert!((old["alpha"].as_f64().unwrap() - prior.alpha()).abs() < 1e-9);
+        assert!((old["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
+        assert_eq!(old["evidence"].as_array().unwrap().len(), 1);
+        assert!(live["valid_until"].is_null());
+        assert!(live["ended_by"].is_null());
+        let live_alpha = live["alpha"].as_f64().unwrap();
+
+        let retry = write_turns(
+            &gm,
+            "s11",
+            "2026-04-11",
+            &[],
+            &[decided_slot("port", "8765", 1)],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(retry.retirements.is_empty());
+        assert_eq!(retry.already_seen, 1);
+        assert_eq!(retry.reinforced, 0);
+        let slots = app_slots(&gm).await;
+        let old = slot_named(&slots, "port", "8080");
+        let live = slot_named(&slots, "port", "8765");
+        assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+        assert_eq!(old["ended_by"], "s11:superseded");
+        assert_eq!(old["evidence"].as_array().unwrap().len(), 1);
+        assert!((live["alpha"].as_f64().unwrap() - live_alpha).abs() < 1e-9);
+        assert!((live["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn key_family_match_retires_sibling_key() {
+        let (_tmp, gm) = open_store().await;
+        write_session(&gm, "s1", "2026-04-03", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[decided_slot("port_value_setting", "8765", 1)],
+        )
+        .await
+        .unwrap();
+        let slots = app_slots(&gm).await;
+        assert!(slots.iter().all(|slot| slot["key"] == "port"), "{slots:?}");
+        let old = slot_named(&slots, "port", "8080");
+        let live = slot_named(&slots, "port", "8765");
+        assert_eq!(old["ended_by"], "s2:superseded");
+        assert!(live["valid_until"].is_null());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn distinct_keys_sharing_a_token_stay_live() {
+        let (_tmp, gm) = open_store().await;
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                decided_slot("storage", "shelf.json", 1),
+                decided_slot("port", "8080", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                decided_slot("tag_storage", "join table", 1),
+                decided_slot("serve_port", "8765", 2),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = app_slots(&gm).await;
+        for (key, value) in [
+            ("storage", "shelf.json"),
+            ("tag_storage", "join table"),
+            ("port", "8080"),
+            ("serve_port", "8765"),
+        ] {
+            assert!(slot_named(&slots, key, value)["valid_until"].is_null());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn uses_never_auto_retires() {
+        let (_tmp, gm) = open_store().await;
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[uses_named(
+                "app",
+                Kind::Project,
+                "requests",
+                "decided",
+                "",
+                1,
+            )],
+        )
+        .await
+        .unwrap();
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[uses_named("app", Kind::Project, "httpx", "decided", "", 1)],
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let edges = live_uses(&gm).await;
+        assert_eq!(edges.len(), 2, "{edges:?}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_retires_across_components() {
+        let (_tmp, gm) = open_store().await;
+        let part = Fact {
+            subject_name: "worker".into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: None,
+            key: String::new(),
+            object_name: "app".into(),
+            object_kind: Some(Kind::Project),
+            status: "decided".into(),
+            turn: 1,
+            quote: "worker is part of app".into(),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        };
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("app", Kind::Project, "requests", "decided", "", 1),
+                uses_named("worker", Kind::Component, "requests", "decided", "", 2),
+                part,
+            ],
+        )
+        .await
+        .unwrap();
+        let before = edge_beliefs(&gm).await;
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[uses_named(
+                "app",
+                Kind::Project,
+                "requests",
+                "rejected",
+                "",
+                1,
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.retirements.len(), 2, "{:?}", stats.retirements);
+        assert!(stats
+            .retirements
+            .iter()
+            .all(|item| item.reason == "rejected"));
+        assert!(stats
+            .retirements
+            .iter()
+            .all(|item| item.new_value.is_empty()));
+        assert!(stats
+            .retirements
+            .iter()
+            .any(|item| item.subject == "app" && item.old_value == "requests"));
+        assert!(stats
+            .retirements
+            .iter()
+            .any(|item| item.subject == "worker" && item.old_value == "requests"));
+        let closed = closed_uses(&gm, "decided").await;
+        assert_eq!(closed.len(), 2, "{closed:?}");
+        assert!(closed
+            .iter()
+            .all(|row| row.ended_by.as_deref() == Some("s2:rejected")));
+        assert!(closed
+            .iter()
+            .all(|row| row.until.contains("2026-04-11T00:00:00")));
+        let after = edge_beliefs(&gm).await;
+        assert_eq!(after, before, "retirement does not move alpha or beta");
+        let retry = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[uses_named(
+                "app",
+                Kind::Project,
+                "requests",
+                "rejected",
+                "",
+                1,
+            )],
+        )
+        .await
+        .unwrap();
+        assert!(retry.retirements.is_empty(), "{:?}", retry.retirements);
+        assert_eq!(closed_uses(&gm, "decided").await, closed);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn replaces_retires_uses_on_the_project_and_its_component() {
+        let (_tmp, gm) = open_store().await;
+        let part = Fact {
+            subject_name: "worker".into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: None,
+            key: String::new(),
+            object_name: "app".into(),
+            object_kind: Some(Kind::Project),
+            status: "decided".into(),
+            turn: 1,
+            quote: "worker is part of app".into(),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        };
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("app", Kind::Project, "requests", "decided", "", 1),
+                uses_named("worker", Kind::Component, "requests", "decided", "", 2),
+                part,
+            ],
+        )
+        .await
+        .unwrap();
+        let turns = [Turn {
+            index: 3,
+            role: TurnRole::User,
+            text: "switch the client to httpx instead of requests".into(),
+        }];
+        let mut next = uses_named("app", Kind::Project, "httpx", "decided", "requests", 3);
+        next.quote = turns[0].text.clone();
+        let stats = write_turns(&gm, "s2", "2026-04-11", &turns, &[next], None)
+            .await
+            .unwrap();
+        assert_eq!(stats.retirements.len(), 2, "{:?}", stats.retirements);
+        assert!(stats
+            .retirements
+            .iter()
+            .all(|item| item.reason == "replaced"));
+        assert!(stats
+            .retirements
+            .iter()
+            .all(|item| item.new_value == "httpx"));
+        let closed = closed_uses(&gm, "decided").await;
+        assert_eq!(closed.len(), 2, "{closed:?}");
+        assert!(closed
+            .iter()
+            .all(|row| row.ended_by.as_deref() == Some("s2:replaced")));
+        assert_eq!(live_uses(&gm).await.len(), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn replaces_retires_setting_value_across_predicates() {
+        let (_tmp, gm) = open_store().await;
+        let mut path = decided_slot("storage_path", "~/.local/share/x/shelf.json", 1);
+        path.quote = "the shelf file is ~/.local/share/x/shelf.json".into();
+        write_session(&gm, "s1", "2026-04-03", &[path])
+            .await
+            .unwrap();
+        let turns = [Turn {
+            index: 4,
+            role: TurnRole::User,
+            text: "move storage onto SQLite and drop shelf.json".into(),
+        }];
+        let mut fact = uses_named("app", Kind::Project, "SQLite", "decided", "shelf.json", 4);
+        fact.quote = turns[0].text.clone();
+        let stats = write_turns(&gm, "s2", "2026-04-11", &turns, &[fact], None)
+            .await
+            .unwrap();
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "replaced");
+        assert_eq!(stats.retirements[0].predicate, "setting");
+        assert_eq!(
+            stats.retirements[0].old_value,
+            "~/.local/share/x/shelf.json"
+        );
+        assert_eq!(stats.retirements[0].new_value, "SQLite");
+        let slots = app_slots(&gm).await;
+        let old = slot_named(&slots, "storage_path", "~/.local/share/x/shelf.json");
+        assert_eq!(old["ended_by"], "s2:replaced");
+        assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn replaces_without_support_in_turn_is_ignored() {
+        let (_tmp, gm) = open_store().await;
+        let path = decided_slot("storage_path", "~/.local/share/x/shelf.json", 1);
+        write_session(&gm, "s1", "2026-04-03", &[path])
+            .await
+            .unwrap();
+        let turns = [Turn {
+            index: 4,
+            role: TurnRole::User,
+            text: "switch the store to SQLite tomorrow".into(),
+        }];
+        let mut fact = uses_named("app", Kind::Project, "SQLite", "decided", "shelf.json", 4);
+        fact.quote = turns[0].text.clone();
+        let stats = write_turns(&gm, "s2", "2026-04-11", &turns, &[fact], None)
+            .await
+            .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = app_slots(&gm).await;
+        assert!(
+            slot_named(&slots, "storage_path", "~/.local/share/x/shelf.json")["valid_until"]
+                .is_null()
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn considered_to_decided_promotion() {
+        let (_tmp, gm) = open_store().await;
+        let mut considered = decided_slot("port", "8080", 1);
+        considered.status = "considered".into();
+        write_session(&gm, "s1", "2026-04-03", &[considered])
+            .await
+            .unwrap();
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let stats = write_session(&gm, "s2", "2026-04-11", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        assert_eq!(stats.retirements.len(), 1);
+        assert_eq!(stats.retirements[0].reason, "promoted");
+        let slots = app_slots(&gm).await;
+        let old = slots
+            .iter()
+            .find(|slot| slot["status"] == "considered")
+            .unwrap();
+        let live = slots
+            .iter()
+            .find(|slot| slot["status"] == "decided")
+            .unwrap();
+        assert_eq!(old["ended_by"], "s2:promoted");
+        assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+        assert!((old["alpha"].as_f64().unwrap() - prior.alpha()).abs() < 1e-9);
+        assert!((old["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
+        assert_eq!(old["evidence"].as_array().unwrap().len(), 1);
+        assert!(live["valid_until"].is_null());
+        let retry = write_session(&gm, "s2", "2026-04-11", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        assert!(retry.retirements.is_empty());
+        assert_eq!(retry.already_seen, 1);
+        let slots = app_slots(&gm).await;
+        let old = slots
+            .iter()
+            .find(|slot| slot["status"] == "considered")
+            .unwrap();
+        assert_eq!(old["ended_by"], "s2:promoted");
+        assert_eq!(old["evidence"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn retired_record_is_never_reinforced() {
+        let (_tmp, gm) = open_store().await;
+        write_session(&gm, "s1", "2026-04-03", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        write_session(&gm, "s2", "2026-04-11", &[decided_slot("port", "8765", 1)])
+            .await
+            .unwrap();
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let stats = write_session(&gm, "s3", "2026-05-01", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        assert_eq!(stats.reinforced, 0);
+        assert_eq!(stats.slots, 1);
+        let slots = app_slots(&gm).await;
+        let retired: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot["value"] == "8080" && !slot["valid_until"].is_null())
+            .collect();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0]["ended_by"], "s2:superseded");
+        assert_eq!(retired[0]["valid_until"], "2026-04-11T00:00:00Z");
+        assert_eq!(retired[0]["evidence"].as_array().unwrap().len(), 1);
+        assert!((retired[0]["alpha"].as_f64().unwrap() - prior.alpha()).abs() < 1e-9);
+        let revived: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot["value"] == "8080" && slot["valid_until"].is_null())
+            .collect();
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0]["evidence"][0]["session"], "s3");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn later_turn_does_not_retire_a_fact_from_this_session() {
+        let (_tmp, gm) = open_store().await;
+        let stats = write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                decided_slot("port", "8080", 0),
+                decided_slot("port", "8765", 1),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = app_slots(&gm).await;
+        assert!(slot_named(&slots, "port", "8080")["valid_until"].is_null());
+        assert!(slot_named(&slots, "port", "8765")["valid_until"].is_null());
+        write_session(&gm, "s2", "2026-04-11", &[decided_slot("port", "9000", 1)])
+            .await
+            .unwrap();
+        let slots = app_slots(&gm).await;
+        assert_eq!(
+            slot_named(&slots, "port", "8080")["ended_by"],
+            "s2:superseded"
+        );
+        assert_eq!(
+            slot_named(&slots, "port", "8765")["ended_by"],
+            "s2:superseded"
+        );
+        assert!(slot_named(&slots, "port", "9000")["valid_until"].is_null());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn commit_conflict_retries_once_and_retires_once() {
+        let (_tmp, gm) = open_store().await;
+        write_session(&gm, "s03", "2026-04-03", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        let budget = AtomicU32::new(1);
+        let stats = write_turns(
+            &gm,
+            "s11",
+            "2026-04-11",
+            &[],
+            &[decided_slot("port", "8765", 1)],
+            Some(&budget),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.retirements.len(), 1);
+        assert_eq!(stats.slots, 1);
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let slots = app_slots(&gm).await;
+        let old = slot_named(&slots, "port", "8080");
+        let live = slot_named(&slots, "port", "8765");
+        assert_eq!(old["ended_by"], "s11:superseded");
+        assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+        assert!(live["valid_until"].is_null());
+        assert!((live["alpha"].as_f64().unwrap() - prior.alpha()).abs() < 1e-9);
+        assert_eq!(live["evidence"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            slots.iter().filter(|slot| slot["value"] == "8765").count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn commit_conflict_twice_leaves_prior_session() {
+        let (_tmp, gm) = open_store().await;
+        write_session(&gm, "s03", "2026-04-03", &[decided_slot("port", "8080", 1)])
+            .await
+            .unwrap();
+        let budget = AtomicU32::new(2);
+        let err = write_turns(
+            &gm,
+            "s11",
+            "2026-04-11",
+            &[],
+            &[decided_slot("port", "8765", 1)],
+            Some(&budget),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("conflict"), "{err}");
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+        let slots = app_slots(&gm).await;
+        assert_eq!(slots.len(), 1);
+        assert!(slot_named(&slots, "port", "8080")["valid_until"].is_null());
+        assert!(slots.iter().all(|slot| slot["value"] != "8765"));
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn live_uses(gm: &GraphMemory) -> Vec<String> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT out, valid_until FROM relates_to WHERE rel_type = 'uses' AND valid_until = NONE",
+            )
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        rows.iter()
+            .map(|row| record_id(row.get("out").unwrap_or(&Value::Null)))
+            .collect()
+    }
+
+    #[cfg(feature = "embedded")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ClosedUse {
+        until: String,
+        ended_by: Option<String>,
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn closed_uses(gm: &GraphMemory, status: &str) -> Vec<ClosedUse> {
+        let mut response = gm
+            .db()
+            .query("SELECT status, valid_until, ended_by FROM relates_to WHERE rel_type = 'uses'")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let mut closed = Vec::new();
+        for row in rows {
+            if row.get("status").and_then(Value::as_str) != Some(status) {
+                continue;
+            }
+            let until = row
+                .get("valid_until")
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            if until.is_empty() || until == "null" {
+                continue;
+            }
+            closed.push(ClosedUse {
+                until,
+                ended_by: row
+                    .get("ended_by")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+        closed.sort_by(|left, right| left.ended_by.cmp(&right.ended_by));
+        closed
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn edge_beliefs(gm: &GraphMemory) -> Vec<(String, String)> {
+        let mut response = gm
+            .db()
+            .query("SELECT alpha, beta, status FROM relates_to WHERE rel_type = 'uses'")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let mut beliefs = rows
+            .iter()
+            .filter(|row| row.get("status").and_then(Value::as_str) == Some("decided"))
+            .map(|row| {
+                (
+                    row.get("alpha")
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    row.get("beta").map(ToString::to_string).unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        beliefs.sort();
+        beliefs
     }
 }
