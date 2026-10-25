@@ -14,6 +14,7 @@ use regex::Regex;
 
 use super::super::confidence::Provenance;
 use super::super::types::EntityType;
+use super::ground::numbers_in;
 use super::input::{ProjectIdentity, TurnRole};
 
 /// Why a candidate was not written. Stable names, counted on the report.
@@ -669,8 +670,10 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Version with one leading `v` removed. It must contain a digit and occur
-/// in the cited turn. The stored release is `<project> v<version>`.
+/// Version with one leading `v` or `V` removed. It must contain a digit, occur
+/// in the cited turn without running into a digit, a letter other than a
+/// leading `v` or `V`, or a dotted number, and each of its numbers must occur
+/// there as a maximal number. The stored release is `<project> v<version>`.
 pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Option<String> {
     let version = version.trim();
     let version = version
@@ -683,12 +686,38 @@ pub(crate) fn release_name(project: &str, version: &str, turn_text: &str) -> Opt
     if !turn_text.contains(version) {
         return None;
     }
+    // A shorter number is a substring of a longer one, and is not stated.
+    let stated = numbers_in(turn_text);
+    if numbers_in(version)
+        .iter()
+        .any(|number| !stated.contains(number))
+    {
+        return None;
+    }
+    if !occurs_whole(version, turn_text) {
+        return None;
+    }
     let name = if project.is_empty() {
         format!("v{version}")
     } else {
         format!("{project} v{version}")
     };
     Some(name)
+}
+
+fn occurs_whole(version: &str, text: &str) -> bool {
+    let b = text.as_bytes();
+    text.match_indices(version).any(|(start, _)| {
+        let end = start + version.len();
+        let glued_before = start > 0
+            && (b[start - 1].is_ascii_digit()
+                || (b[start - 1].is_ascii_alphabetic() && !matches!(b[start - 1], b'v' | b'V'))
+                || (b[start - 1] == b'.' && start > 1 && b[start - 2].is_ascii_digit()));
+        let glued_after = end < b.len()
+            && (b[end].is_ascii_alphanumeric()
+                || (b[end] == b'.' && end + 1 < b.len() && b[end + 1].is_ascii_digit()));
+        !glued_before && !glued_after
+    })
 }
 
 /// Component name that is generic or the project itself affects the project.
@@ -952,6 +981,52 @@ mod tests {
         let mut long = fact(Predicate::Setting, Kind::Project, "linkshelf");
         long.object_name = "x".repeat(301);
         assert_eq!(filter_fact(&long).unwrap_err(), DROP_GENERIC);
+    }
+
+    #[test]
+    fn release_version_uses_the_number_rule() {
+        assert_eq!(
+            release_name("proj", "1.0", "Ship 1.0.0 with the exporters."),
+            None
+        );
+        assert_eq!(release_name("proj", "2.4", "Tag v2.4.0."), None);
+        assert_eq!(
+            release_name("proj", "2.4.0", "Tag v2.4.0.").as_deref(),
+            Some("proj v2.4.0")
+        );
+        assert_eq!(
+            release_name("proj", "v1.4.0", "Tag v1.4.0 today.").as_deref(),
+            Some("proj v1.4.0")
+        );
+        assert_eq!(
+            release_name("proj", "V1.4.0", "Tag v1.4.0 today.").as_deref(),
+            Some("proj v1.4.0")
+        );
+        assert_eq!(
+            release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc1 tonight").as_deref(),
+            Some("proj v1.4.0-rc1")
+        );
+        assert_eq!(
+            release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc12 tonight"),
+            None
+        );
+        assert_eq!(release_name("proj", "10", "release 110 next"), None);
+    }
+
+    #[test]
+    fn release_version_run_into_a_longer_token_drops() {
+        assert_eq!(
+            release_name(
+                "proj",
+                "1.4.0-rc1",
+                "cut 1.4.0-rc12 tonight, it fixes 1 regression"
+            ),
+            None
+        );
+        assert_eq!(
+            release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc1b tonight"),
+            None
+        );
     }
 
     fn fact(predicate: Predicate, kind: Kind, subject: &str) -> Fact {

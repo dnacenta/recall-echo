@@ -1232,6 +1232,38 @@ mod tests {
     }
 
     #[test]
+    fn release_version_inside_a_longer_number_is_bad_version() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "Ship 1.0.0 with the exporters.".into(),
+        }];
+        let reply = serde_json::json!({
+            "facts": [],
+            "bugs": [],
+            "releases": [{
+                "version": "1.0",
+                "status": "released",
+                "contents": "the exporters",
+                "turn": 0,
+                "quote": "Ship 1.0.0 with the exporters.",
+                "confidence": 0.9
+            }]
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.candidates, 1);
+        assert_eq!(report.drops.get(DROP_VERSION).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
     fn unsupported_cause_is_dropped_and_the_bug_kept() {
         let turns = vec![
             Turn {
