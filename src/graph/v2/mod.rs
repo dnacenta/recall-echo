@@ -15,12 +15,15 @@ pub(crate) mod resolve;
 pub(crate) mod schema;
 mod write;
 
+use std::path::Path;
+
 use super::error::GraphError;
 use super::ingest::IngestContext;
 use super::llm::LlmProvider;
 use super::types::IngestionReport;
 use super::GraphMemory;
-pub(crate) use write::V2_REFUSAL;
+pub(crate) use resolve::RESOLVER_CALL_BOUND;
+pub(crate) use write::{ensure_v2_store, read_stamp, V2_REFUSAL};
 
 /// Which extraction pipeline a run uses.
 ///
@@ -76,9 +79,14 @@ pub(crate) fn chosen_pipeline(
     memory_dir: &std::path::Path,
     flag: Option<PipelineVersion>,
 ) -> Result<PipelineVersion, crate::error::RecallError> {
-    let configured = crate::config::load_from_dir(memory_dir)
-        .graph
-        .and_then(|section| section.pipeline);
+    // A flag wins, so a broken file is not read: `load` would drop it and print
+    // a warning for a value this call does not use.
+    let configured = match flag {
+        Some(_) => None,
+        None => crate::config::load_from_dir(memory_dir)
+            .graph
+            .and_then(|section| section.pipeline),
+    };
     PipelineVersion::resolve(flag, configured.as_deref()).map_err(crate::error::RecallError::Config)
 }
 
@@ -98,6 +106,33 @@ pub(crate) fn pipeline_for_hook(memory_dir: &std::path::Path) -> PipelineVersion
 #[must_use]
 pub(crate) fn is_stamp_refusal(err: &GraphError) -> bool {
     err.to_string().contains(V2_REFUSAL)
+}
+
+/// What a rebuild dry-run quotes for one archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionEstimate {
+    /// `turns/conversation-NNN.json` is present.
+    pub has_sidecar: bool,
+    /// Windows the structured pass would send.
+    pub windows: u32,
+    /// `windows` plus [`RESOLVER_CALL_BOUND`].
+    pub calls: u32,
+}
+
+/// Windows and provider calls for one archive, without opening a store.
+///
+/// # Errors
+///
+/// The archive cannot be loaded. The same failure extraction would hit.
+pub(crate) fn estimate_session(memory_dir: &Path, log: u32) -> Result<SessionEstimate, GraphError> {
+    let has_sidecar = input::turns_sidecar(memory_dir, log).is_file();
+    let session = input::load_session(memory_dir, log)?;
+    let windows = u32::try_from(pass1::window_count(&session)).unwrap_or(u32::MAX);
+    Ok(SessionEstimate {
+        has_sidecar,
+        windows,
+        calls: windows.saturating_add(RESOLVER_CALL_BOUND),
+    })
 }
 
 /// Extract one archive with the pipeline this run selected.

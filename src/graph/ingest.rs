@@ -22,6 +22,9 @@ use super::GraphMemory;
 /// Maximum number of concurrent LLM calls during extraction and dedup.
 const LLM_CONCURRENCY: usize = 10;
 
+/// Chunk size `ingest_archive` uses. Rebuild compares episode rows to this.
+pub(crate) const INGEST_CHUNK_TOKENS: usize = 500;
+
 /// Role headings written by the archive pipeline, lower-cased.
 const USER_TURN_HEADING: &str = "### user";
 const ASSISTANT_TURN_HEADING: &str = "### assistant";
@@ -142,33 +145,14 @@ pub async fn ingest_archive(
 ) -> Result<IngestionReport, GraphError> {
     let mut report = IngestionReport::default();
 
-    let chunks = extract::chunk_conversation(archive_text, 500);
+    let chunks = extract::chunk_conversation(archive_text, INGEST_CHUNK_TOKENS);
     if chunks.is_empty() {
         return Ok(report);
     }
 
     // Create episodes for each chunk, each stamped with its own authorship —
     // one archive can hold both the human's words and the agent's.
-    for (i, chunk) in chunks.iter().enumerate() {
-        let abstract_text = build_episode_abstract(chunk);
-        let episode = NewEpisode {
-            session_id: context.session_id.clone(),
-            abstract_text,
-            overview: None,
-            content: Some(chunk.clone()),
-            log_number: context.log_number,
-        };
-
-        match gm
-            .add_episode_from(episode, context.provenance.classify(chunk))
-            .await
-        {
-            Ok(_) => report.episodes_created += 1,
-            Err(e) => {
-                report.errors.push(format!("episode chunk {i}: {e}"));
-            }
-        }
-    }
+    write_episodes(gm, &chunks, context, 0, &mut report).await;
 
     // If LLM provided, run extraction on all chunks
     if let Some(llm) = llm {
@@ -190,7 +174,7 @@ pub async fn extract_from_archive(
 ) -> Result<IngestionReport, GraphError> {
     let mut report = IngestionReport::default();
 
-    let chunks = extract::chunk_conversation(archive_text, 500);
+    let chunks = extract::chunk_conversation(archive_text, INGEST_CHUNK_TOKENS);
     if chunks.is_empty() {
         return Ok(report);
     }
@@ -198,6 +182,51 @@ pub async fn extract_from_archive(
     process_extraction(gm, &chunks, context, llm, &mut report).await?;
 
     Ok(report)
+}
+
+/// Create episodes for `chunks`, numbering errors from `index_base`.
+///
+/// A resume that already stored a prefix of the archive passes the missing
+/// tail and the index those chunks had in the full archive, so a second
+/// ingest does not duplicate the episodes that landed.
+pub(crate) async fn ingest_remaining_episodes(
+    gm: &GraphMemory,
+    chunks: &[String],
+    context: &IngestContext,
+    index_base: usize,
+) -> Result<IngestionReport, GraphError> {
+    let mut report = IngestionReport::default();
+    write_episodes(gm, chunks, context, index_base, &mut report).await;
+    Ok(report)
+}
+
+async fn write_episodes(
+    gm: &GraphMemory,
+    chunks: &[String],
+    context: &IngestContext,
+    index_base: usize,
+    report: &mut IngestionReport,
+) {
+    for (offset, chunk) in chunks.iter().enumerate() {
+        let index = index_base + offset;
+        let episode = NewEpisode {
+            session_id: context.session_id.clone(),
+            abstract_text: build_episode_abstract(chunk),
+            overview: None,
+            content: Some(chunk.clone()),
+            log_number: context.log_number,
+        };
+
+        match gm
+            .add_episode_from(episode, context.provenance.classify(chunk))
+            .await
+        {
+            Ok(_) => report.episodes_created += 1,
+            Err(e) => {
+                report.errors.push(format!("episode chunk {index}: {e}"));
+            }
+        }
+    }
 }
 
 /// Extract one chunk, tagged with its index.

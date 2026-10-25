@@ -14,7 +14,7 @@
 //! them when it extracts. This module still only loads and renders.
 
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -131,10 +131,18 @@ pub(crate) fn write_turns_sidecar(
     Ok(())
 }
 
+/// `turns/conversation-NNN.json`, the sidecar [`load_session`] prefers.
+#[must_use]
+pub(crate) fn turns_sidecar(memory_dir: &Path, log_number: u32) -> PathBuf {
+    memory_dir
+        .join("turns")
+        .join(format!("conversation-{log_number:03}.json"))
+}
+
 /// Sidecar when one was written, otherwise the markdown archive.
 pub(crate) fn load_session(memory_dir: &Path, log_number: u32) -> Result<SessionInput, GraphError> {
     let stem = format!("conversation-{log_number:03}");
-    let sidecar = memory_dir.join("turns").join(format!("{stem}.json"));
+    let sidecar = turns_sidecar(memory_dir, log_number);
     if sidecar.is_file() {
         return read_sidecar(&sidecar);
     }

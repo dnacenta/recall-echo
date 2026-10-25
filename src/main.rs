@@ -405,6 +405,9 @@ enum GraphCommands {
         /// the config key, which defaults to v1.
         #[arg(long, value_parser = parse_pipeline)]
         pipeline: Option<recall_echo::graph::PipelineVersion>,
+        /// Rebuild a fresh pipeline v2 store beside the current one and swap it into place
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Pipeline operations — sync, status, flow, stale detection
     Pipeline {
@@ -775,6 +778,7 @@ fn main() {
                                 delay_ms,
                                 max_tokens,
                                 pipeline,
+                                rebuild,
                             } => {
                                 graph_cli::extract(
                                     &memory_dir,
@@ -787,6 +791,7 @@ fn main() {
                                         delay_ms,
                                         max_tokens,
                                         pipeline,
+                                        rebuild,
                                     },
                                 )
                                 .await

@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use surrealdb::method::Transaction;
@@ -64,6 +65,10 @@ pub(crate) struct WriteStats {
     pub retirements: Vec<Retirement>,
     /// A retirement whose target was missing or whose slot was not an object.
     pub retirements_skipped: u32,
+    /// Milliseconds spent resolving mentions, measured around that call.
+    pub resolve_ms: u64,
+    /// Milliseconds spent committing edges, slots and retirements.
+    pub write_ms: u64,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -181,11 +186,18 @@ pub(crate) async fn write_facts(
     ctx: &WriteCtx<'_>,
     facts: &[Fact],
 ) -> Result<WriteStats, GraphError> {
+    let resolve_started = Instant::now();
     let resolution = resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?;
+    let resolve_ms = elapsed_ms(resolve_started);
+    let write_started = Instant::now();
     let mut attempt = 0u8;
     loop {
         match write_attempt(gm, ctx, facts, &resolution).await {
-            Ok(stats) => return Ok(stats),
+            Ok(mut stats) => {
+                stats.resolve_ms = resolve_ms;
+                stats.write_ms = elapsed_ms(write_started);
+                return Ok(stats);
+            }
             Err(err) if attempt == 0 && is_write_conflict(&err) => {
                 attempt += 1;
                 if let Some(hook) = ctx.on_conflict {
@@ -294,6 +306,10 @@ fn conflict_error() -> GraphError {
     GraphError::Db(surrealdb::Error::thrown(
         "transaction conflict: please retry".to_string(),
     ))
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn is_write_conflict(err: &GraphError) -> bool {

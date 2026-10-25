@@ -245,12 +245,46 @@ where
     result
 }
 
+/// Admin lock and daemon stop without opening `graph/`.
+///
+/// [`exclusive`] opens the store after the stop. A rebuild writes a different
+/// directory and must not open `graph/` until the swap, so this holds the same
+/// lock across `stop`, the caller's build, and the swap. The CLI passes
+/// [`stop_daemon_for_admin`] as `stop`. The lock drops when this function
+/// returns, after `stop` and `operation` have finished, including when either
+/// fails.
+pub(crate) async fn exclusive_without_store<T, S, SF, F, Fut>(
+    memory_dir: &Path,
+    stop: S,
+    operation: F,
+) -> Result<T, RecallError>
+where
+    S: FnOnce() -> SF,
+    SF: std::future::Future<Output = Result<(), RecallError>>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, RecallError>>,
+{
+    let socket = socket_path(memory_dir)?;
+    let admin = acquire_admin_lock(&socket, Instant::now() + ADMIN_WAIT_TIMEOUT).await?;
+    let result = async {
+        stop().await?;
+        operation().await
+    }
+    .await;
+    drop(admin);
+    result
+}
+
 /// Stop the daemon, and any daemon that races in behind it.
-async fn stop_daemon_for_admin(memory_dir: &Path) -> Result<(), RecallError> {
+///
+/// `Ok(true)` when a daemon was stopped. `Ok(false)` when none was running.
+pub(crate) async fn stop_daemon_for_admin(memory_dir: &Path) -> Result<bool, RecallError> {
+    let mut stopped = false;
     for _ in 0..MAX_STOP_ROUNDS {
         if !stop_daemon(memory_dir).await? {
-            return Ok(());
+            return Ok(stopped);
         }
+        stopped = true;
     }
     Err(RecallError::Daemon(format!(
         "a graph daemon for {} keeps restarting; cannot take the store exclusively",

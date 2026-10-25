@@ -19,7 +19,7 @@ use super::super::error::GraphError;
 use super::super::ingest::IngestContext;
 use super::super::llm::{LlmProvider, TokenUsage};
 use super::super::llm_json::{self, JsonFailure};
-use super::super::types::IngestionReport;
+use super::super::types::{IngestionReport, StageTiming};
 use super::super::GraphMemory;
 use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
@@ -163,6 +163,12 @@ pub(crate) fn user_message(project: &str, date: &str, window: &str) -> String {
     )
 }
 
+/// Windows [`extract_session`] would send for this session.
+#[must_use]
+pub(crate) fn window_count(session: &SessionInput) -> usize {
+    input::window(session, WINDOW_CHARS).len()
+}
+
 /// Read one session and write what the schema table keeps.
 ///
 /// The store is checked before any provider call. A window whose reply is
@@ -176,6 +182,7 @@ pub(crate) async fn extract_session(
     ctx: &IngestContext,
     llm: &dyn LlmProvider,
 ) -> Result<IngestionReport, GraphError> {
+    let total_started = std::time::Instant::now();
     write::ensure_v2_store(gm).await?;
     let session = input::load_session(memory_dir, log)?;
     let windows = input::window(&session, WINDOW_CHARS);
@@ -183,6 +190,7 @@ pub(crate) async fn extract_session(
     report.windows = u32::try_from(windows.len()).unwrap_or(u32::MAX);
     report.chunks_total = report.windows;
 
+    let pass1_started = std::time::Instant::now();
     let ground = SessionGround::prepare(&session.turns);
     let mut facts = Vec::new();
     for window in &windows {
@@ -198,7 +206,10 @@ pub(crate) async fn extract_session(
     // quote is one write: a second copy must not corroborate the fact in the
     // session that created it.
     let facts = dedupe_facts(facts);
+    let pass1_ms = elapsed_ms(pass1_started);
 
+    let mut resolve_ms = 0;
+    let mut write_ms = 0;
     if !facts.is_empty() {
         let write_ctx = write::WriteCtx::new(
             llm,
@@ -208,6 +219,8 @@ pub(crate) async fn extract_session(
             &session.turns,
         );
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
+        resolve_ms = stats.resolve_ms;
+        write_ms = stats.write_ms;
         report.entities_created = stats.entities_created;
         report.relationships_created = stats.edges;
         report.slots_written = stats.slots;
@@ -219,7 +232,17 @@ pub(crate) async fn extract_session(
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }
     }
+    report.timing = Some(StageTiming {
+        pass1_ms,
+        resolve_ms,
+        write_ms,
+        total_ms: elapsed_ms(total_started),
+    });
     Ok(report)
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn call_window(
@@ -1504,6 +1527,15 @@ mod tests {
             .unwrap();
         assert_eq!(report.llm_calls, 2);
         assert!(report.is_total_failure());
+        let timing = report.timing.expect("v2 timing");
+        assert!(
+            timing.total_ms >= timing.pass1_ms,
+            "pass1 {} resolve {} write {} total {}",
+            timing.pass1_ms,
+            timing.resolve_ms,
+            timing.write_ms,
+            timing.total_ms
+        );
         assert!(
             report
                 .errors
