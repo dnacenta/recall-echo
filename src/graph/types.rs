@@ -779,6 +779,22 @@ pub struct Retirement {
     pub new_value: String,
 }
 
+/// Monotonic durations of one pipeline v2 extraction.
+///
+/// `total_ms` wraps every stage, so it is at least [`StageTiming::pass1_ms`].
+/// v1 leaves [`IngestionReport::timing`] empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageTiming {
+    /// The structured pass over the session windows.
+    pub pass1_ms: u64,
+    /// Entity resolution for the facts that pass kept.
+    pub resolve_ms: u64,
+    /// Edges, slots and retirements committed after resolution.
+    pub write_ms: u64,
+    /// From the start of the v2 extraction through the write.
+    pub total_ms: u64,
+}
+
 /// Result of a full ingestion run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionReport {
@@ -847,6 +863,9 @@ pub struct IngestionReport {
     /// Retirements that could not be applied. The session still commits.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub retirements_skipped: u32,
+    /// Stage durations for pipeline v2. Absent on v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<StageTiming>,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -927,6 +946,11 @@ mod tests {
     #[test]
     fn an_archive_with_no_chunks_is_not_a_failure() {
         assert!(!chunks(0, 0).is_total_failure());
+    }
+
+    #[test]
+    fn a_v1_report_carries_no_stage_timing() {
+        assert!(IngestionReport::default().timing.is_none());
     }
 
     #[test]

@@ -30,6 +30,9 @@ For each NEW MENTION, if it is certainly the same real-world thing as a STORE en
 Never match different things just because they are related: a library is not the project that uses it, a component is not its project, two different libraries are different, a file is not the tool that reads it.
 When unsure, return "" (a new entity is created; that is always safe). One entry per NEW MENTION."#;
 
+/// A session asks the resolver at most once. Dry-run estimates add this bound.
+pub(crate) const RESOLVER_CALL_BOUND: u32 = 1;
+
 const RESOLVER_TOKEN_BASE: u32 = 256;
 const RESOLVER_TOKENS_PER_MENTION: u32 = 64;
 const RESOLVER_TOKEN_CAP: u32 = 4096;

@@ -92,6 +92,8 @@ pub struct SessionObservation {
     pub retirements: Vec<crate::graph::types::Retirement>,
     /// Retirements that could not be applied.
     pub retirements_skipped: u32,
+    /// Pipeline v2 stage durations. Absent on v1.
+    pub timing: Option<crate::graph::types::StageTiming>,
 }
 
 /// Precision and recall for one operation.
@@ -183,6 +185,9 @@ pub struct SessionReport {
     /// Retirements that could not be applied.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub retirements_skipped: u32,
+    /// Pipeline v2 stage durations. Omitted on v1, where it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<crate::graph::types::StageTiming>,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -511,6 +516,7 @@ pub fn grade_with_pipeline(
                 resolve: s.resolve.clone(),
                 retirements: s.retirements.clone(),
                 retirements_skipped: s.retirements_skipped,
+                timing: s.timing,
             })
             .collect(),
         steps,
@@ -1664,6 +1670,7 @@ mod tests {
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
+            timing: None,
         }
     }
 

@@ -874,6 +874,482 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+#[cfg(feature = "llm")]
+const V2_BUILD_DIR: &str = "graph.v2-build";
+
+/// Stops the graph daemon the way `graph daemon stop` does.
+///
+/// The CLI passes that stop. A caller that must not touch a running daemon
+/// passes its own implementation.
+#[cfg(feature = "llm")]
+pub trait RebuildStop: Send + Sync {
+    /// `Ok(true)` when a daemon was stopped, `Ok(false)` when none was
+    /// running, `Err` when it could not be stopped.
+    fn stop<'a>(
+        &'a self,
+        memory_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, RecallError>> + Send + 'a>>;
+}
+
+/// The stopper `graph daemon stop` uses.
+#[cfg(feature = "llm")]
+struct LiveDaemonStop;
+
+#[cfg(feature = "llm")]
+impl RebuildStop for LiveDaemonStop {
+    fn stop<'a>(
+        &'a self,
+        memory_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, RecallError>> + Send + 'a>>
+    {
+        Box::pin(serve_client::stop_daemon(memory_dir))
+    }
+}
+
+#[cfg(feature = "llm")]
+struct RebuildPlan {
+    conversations: PathBuf,
+    logs: Vec<u32>,
+    pending: Vec<u32>,
+    resume: bool,
+}
+
+#[cfg(feature = "llm")]
+struct BuildTotals {
+    finished: bool,
+    facts: u32,
+}
+
+/// Re-extract every archive into `graph.v2-build/` and swap it over `graph/`.
+///
+/// `stop` is the same operation as `graph daemon stop`. A caller that must
+/// not touch a running daemon passes its own stopper. `llm` overrides
+/// provider construction; `None` reads the memory directory config.
+///
+/// Server mode, a pipeline other than v2, and a build directory that is not
+/// already stamped v2 are refused before the old store is touched. A stamped
+/// build directory is a resume of its unextracted logs. `--dry-run` lists
+/// archives and estimated calls and writes nothing.
+#[cfg(feature = "llm")]
+pub async fn rebuild(
+    memory_dir: &Path,
+    options: ExtractOptions,
+    stop: &impl RebuildStop,
+    llm: Option<&dyn crate::graph::llm::LlmProvider>,
+) -> Result<(), RecallError> {
+    let plan = prepare_rebuild(memory_dir, &options).await?;
+    if options.dry_run {
+        return print_rebuild_dry_run(memory_dir, &plan);
+    }
+    stop_for_rebuild(memory_dir, stop).await?;
+    if plan.pending.is_empty() {
+        return swap_and_record(memory_dir, archive_count(&plan), 0);
+    }
+    let totals = if let Some(provider) = llm {
+        drive_rebuild(memory_dir, &plan, provider, options.max_tokens).await?
+    } else {
+        let (owned, _) = crate::llm_provider::create_provider(
+            memory_dir,
+            options.provider.as_deref(),
+            options.model.as_deref(),
+        )?;
+        drive_rebuild(memory_dir, &plan, owned.as_ref(), options.max_tokens).await?
+    };
+    if !totals.finished {
+        return Ok(());
+    }
+    swap_and_record(memory_dir, archive_count(&plan), totals.facts)
+}
+
+#[cfg(feature = "llm")]
+async fn prepare_rebuild(
+    memory_dir: &Path,
+    options: &ExtractOptions,
+) -> Result<RebuildPlan, RecallError> {
+    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, options.pipeline)?;
+    if pipeline != PipelineVersion::V2 {
+        return Err(RecallError::Config(
+            "rebuild requires pipeline v2; pass --pipeline v2".into(),
+        ));
+    }
+    if serve_client::graph_mode(memory_dir) == "server" {
+        return Err(RecallError::Config(
+            "rebuild refuses [graph] mode = \"server\": there is no embedded directory to swap, so nothing was changed".into(),
+        ));
+    }
+    let graph_dir = memory_dir.join("graph");
+    if !graph_dir.is_dir() {
+        return Err(RecallError::NotInitialized(
+            "Graph store not initialized. Run `recall-echo graph init` first.".into(),
+        ));
+    }
+    let conversations = find_conversations_dir(memory_dir)?;
+    let logs = conversation_logs(&conversations)?;
+    if logs.is_empty() {
+        return Err(RecallError::Other(
+            "no conversation archives found to rebuild".into(),
+        ));
+    }
+    let (resume, pending) = pending_in_build(&memory_dir.join(V2_BUILD_DIR), &logs).await?;
+    Ok(RebuildPlan {
+        conversations,
+        logs,
+        pending,
+        resume,
+    })
+}
+
+#[cfg(feature = "llm")]
+async fn pending_in_build(build: &Path, logs: &[u32]) -> Result<(bool, Vec<u32>), RecallError> {
+    if !build.exists() {
+        return Ok((false, logs.to_vec()));
+    }
+    if !build.join("surreal").is_dir() {
+        return Err(RecallError::Other(removal_hint(build)));
+    }
+    let db = crate::graph::store::open(build).await?;
+    let stamp = match crate::graph::v2::read_stamp(&db).await {
+        Ok(stamp) => stamp,
+        Err(err) => {
+            return Err(RecallError::Other(format!(
+                "{}; {err}",
+                removal_hint(build)
+            )));
+        }
+    };
+    if stamp.as_deref() != Some("v2") {
+        return Err(RecallError::Other(removal_hint(build)));
+    }
+    let pending = pending_logs(&db, logs).await?;
+    Ok((true, pending))
+}
+
+#[cfg(feature = "llm")]
+async fn pending_logs(
+    db: &surrealdb::Surreal<crate::graph::store::Db>,
+    logs: &[u32],
+) -> Result<Vec<u32>, RecallError> {
+    let mut response = db
+        .query("SELECT log_number, extracted FROM episode")
+        .await
+        .map_err(crate::graph::error::GraphError::from)?;
+    let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
+    Ok(logs
+        .iter()
+        .copied()
+        .filter(|log| !log_fully_extracted(*log, &rows))
+        .collect())
+}
+
+#[cfg(feature = "llm")]
+fn log_fully_extracted(log: u32, rows: &[serde_json::Value]) -> bool {
+    let mut saw = false;
+    for row in rows {
+        if json_u32(row.get("log_number")) != Some(log) {
+            continue;
+        }
+        saw = true;
+        if row.get("extracted").and_then(serde_json::Value::as_bool) != Some(true) {
+            return false;
+        }
+    }
+    saw
+}
+
+#[cfg(feature = "llm")]
+fn json_u32(value: Option<&serde_json::Value>) -> Option<u32> {
+    let value = value?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+#[cfg(feature = "llm")]
+fn removal_hint(path: &Path) -> String {
+    format!(
+        "{display} exists and is not a v2 build store to resume (resume continues only when that store is stamped v2). Remove it and re-run, for example: rm -r {display}",
+        display = path.display()
+    )
+}
+
+#[cfg(feature = "llm")]
+fn conversation_logs(conversations: &Path) -> Result<Vec<u32>, RecallError> {
+    let mut logs = Vec::new();
+    for entry in std::fs::read_dir(conversations)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(log) = log_from_archive_name(name) {
+            logs.push(log);
+        }
+    }
+    logs.sort_unstable();
+    logs.dedup();
+    Ok(logs)
+}
+
+#[cfg(feature = "llm")]
+fn log_from_archive_name(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(".md")?;
+    let rest = stem
+        .strip_prefix("conversation-")
+        .or_else(|| stem.strip_prefix("archive-log-"))?;
+    rest.parse().ok()
+}
+
+#[cfg(feature = "llm")]
+fn print_rebuild_dry_run(memory_dir: &Path, plan: &RebuildPlan) -> Result<(), RecallError> {
+    if plan.resume {
+        println!(
+            "Resuming rebuild from {} (stamped v2); continuing from unextracted logs.",
+            memory_dir.join(V2_BUILD_DIR).display()
+        );
+    }
+    println!("{BOLD}Dry run — {}{RESET} archives", plan.pending.len());
+    let mut total_calls = 0u32;
+    for log in &plan.pending {
+        let estimate = crate::graph::v2::estimate_session(memory_dir, *log)?;
+        let sidecar = if estimate.has_sidecar { "yes" } else { "no" };
+        println!(
+            "  {}  sidecar: {sidecar}  windows: {}  calls: {}",
+            archive_label(&plan.conversations, *log),
+            estimate.windows,
+            estimate.calls
+        );
+        total_calls = total_calls.saturating_add(estimate.calls);
+    }
+    println!(
+        "Estimated provider calls: {total_calls} (windows × 1 + resolver bound {})",
+        crate::graph::v2::RESOLVER_CALL_BOUND
+    );
+    Ok(())
+}
+
+#[cfg(feature = "llm")]
+fn archive_label(conversations: &Path, log: u32) -> String {
+    find_archive_file(conversations, log)
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| format!("log {log:03}"))
+}
+
+#[cfg(feature = "llm")]
+async fn stop_for_rebuild(memory_dir: &Path, stop: &impl RebuildStop) -> Result<(), RecallError> {
+    match stop.stop(memory_dir).await {
+        Ok(true) => {
+            println!("{GOOD}✓{RESET} Graph daemon stopped");
+            Ok(())
+        }
+        Ok(false) => {
+            println!("{WARN}No graph daemon running.{RESET}");
+            Ok(())
+        }
+        Err(err) => Err(RecallError::Daemon(format!(
+            "cannot stop the graph daemon: {err}"
+        ))),
+    }
+}
+
+#[cfg(feature = "llm")]
+async fn drive_rebuild(
+    memory_dir: &Path,
+    plan: &RebuildPlan,
+    llm: &dyn crate::graph::llm::LlmProvider,
+    max_tokens: u64,
+) -> Result<BuildTotals, RecallError> {
+    if plan.resume {
+        println!(
+            "Resuming rebuild from {} (stamped v2); continuing from unextracted logs.",
+            memory_dir.join(V2_BUILD_DIR).display()
+        );
+    }
+    let build = memory_dir.join(V2_BUILD_DIR);
+    let gm = crate::graph::GraphMemory::open_embedded(&build).await?;
+    crate::graph::v2::ensure_v2_store(&gm).await?;
+    let mut measured = 0u64;
+    let mut estimated = 0u64;
+    let mut facts = 0u32;
+    let total = plan.pending.len();
+    for (index, log) in plan.pending.iter().copied().enumerate() {
+        let spent = measured.saturating_add(estimated);
+        if max_tokens > 0 && spent >= max_tokens {
+            println!(
+                "\n{WARN}⚠ Token budget exhausted ({} of {}). Stopping.{RESET}",
+                format_token_bill(measured, estimated),
+                format_tokens(max_tokens),
+            );
+            println!(
+                "  Partial build left at {}. {} was not modified. Re-run to resume.",
+                build.display(),
+                memory_dir.join("graph").display()
+            );
+            return Ok(BuildTotals {
+                finished: false,
+                facts,
+            });
+        }
+        let report = match rebuild_archive(&gm, memory_dir, &plan.conversations, log, llm).await {
+            Ok(report) => report,
+            Err(err) => return Err(stopped(memory_dir, log, &err.to_string())),
+        };
+        measured = measured.saturating_add(report.measured_tokens);
+        estimated = estimated.saturating_add(report.estimated_tokens);
+        if report.leaves_pending() {
+            let detail = report
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "extraction left the archive pending".to_string());
+            return Err(stopped(memory_dir, log, &detail));
+        }
+        gm.mark_extracted(log).await?;
+        let written = report
+            .slots_written
+            .saturating_add(report.relationships_created);
+        facts = facts.saturating_add(written);
+        println!(
+            "  {GOOD}✓{RESET} [{}/{}] log {log:03}: {written} facts{}",
+            index + 1,
+            total,
+            v2_report_suffix(&report),
+        );
+    }
+    Ok(BuildTotals {
+        finished: true,
+        facts,
+    })
+}
+
+#[cfg(feature = "llm")]
+async fn rebuild_archive(
+    gm: &crate::graph::GraphMemory,
+    memory_dir: &Path,
+    conversations: &Path,
+    log: u32,
+    llm: &dyn crate::graph::llm::LlmProvider,
+) -> Result<IngestionReport, RecallError> {
+    let archive = find_archive_file(conversations, log)?;
+    let content = std::fs::read_to_string(&archive)?;
+    let (session_id, _) = extract_archive_metadata(&content, &archive);
+    let context = IngestContext::new(session_id, Some(log));
+    if gm.get_episode_by_log_number(log).await?.is_none() {
+        gm.ingest_archive(&content, &context, None).await?;
+    }
+    Ok(crate::graph::v2::extract_log(
+        gm,
+        memory_dir,
+        log,
+        &content,
+        &context,
+        llm,
+        PipelineVersion::V2,
+    )
+    .await?)
+}
+
+#[cfg(feature = "llm")]
+fn stopped(memory_dir: &Path, log: u32, detail: &str) -> RecallError {
+    RecallError::Other(format!(
+        "rebuild stopped on log {log:03}: {detail}; {} was not modified; partial build is at {}",
+        memory_dir.join("graph").display(),
+        memory_dir.join(V2_BUILD_DIR).display()
+    ))
+}
+
+#[cfg(feature = "llm")]
+fn swap_and_record(memory_dir: &Path, archives: u32, facts: u32) -> Result<(), RecallError> {
+    let backup = swap_store(memory_dir)?;
+    if let Err(err) = crate::config::set_graph_pipeline(memory_dir, "v2") {
+        return Err(RecallError::Config(format!(
+            "swapped the v2 store into place ({} holds the previous store) but did not set [graph] pipeline: {err}",
+            backup.display()
+        )));
+    }
+    print_swapped(memory_dir, &backup, archives, facts);
+    Ok(())
+}
+
+#[cfg(feature = "llm")]
+fn archive_count(plan: &RebuildPlan) -> u32 {
+    u32::try_from(plan.logs.len()).unwrap_or(u32::MAX)
+}
+
+#[cfg(feature = "llm")]
+fn swap_store(memory_dir: &Path) -> Result<PathBuf, RecallError> {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+    let backup = unique_backup(memory_dir, &stamp);
+    rename_swapping(
+        &memory_dir.join("graph"),
+        &memory_dir.join(V2_BUILD_DIR),
+        &backup,
+    )?;
+    Ok(backup)
+}
+
+#[cfg(feature = "llm")]
+fn unique_backup(memory_dir: &Path, stamp: &str) -> PathBuf {
+    let base = format!("graph.v1-backup-{stamp}");
+    let mut candidate = memory_dir.join(&base);
+    let mut n = 2u32;
+    while candidate.exists() {
+        candidate = memory_dir.join(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+#[cfg(feature = "llm")]
+fn rename_swapping(graph: &Path, build: &Path, backup: &Path) -> Result<(), RecallError> {
+    if let Err(err) = std::fs::rename(graph, backup) {
+        return Err(io_msg(format!(
+            "could not move {} to {}: {err}; {} was left in place",
+            graph.display(),
+            backup.display(),
+            graph.display()
+        )));
+    }
+    if let Err(err) = std::fs::rename(build, graph) {
+        return match std::fs::rename(backup, graph) {
+            Ok(()) => Err(io_msg(format!(
+                "could not move {} to {} ({err}); moved {} back so the original store is in place and the build is still at {}",
+                build.display(),
+                graph.display(),
+                backup.display(),
+                build.display()
+            ))),
+            Err(rollback) => Err(io_msg(format!(
+                "could not move {} to {} ({err}) and could not move {} back ({rollback}); the original store is at {} and the build is at {}",
+                build.display(),
+                graph.display(),
+                backup.display(),
+                backup.display(),
+                build.display()
+            ))),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(feature = "llm")]
+fn io_msg(message: String) -> RecallError {
+    RecallError::Io(std::io::Error::other(message))
+}
+
+#[cfg(feature = "llm")]
+fn print_swapped(memory_dir: &Path, backup: &Path, archives: u32, facts: u32) {
+    let graph = memory_dir.join("graph");
+    let build = memory_dir.join(V2_BUILD_DIR);
+    println!("\n{GOOD}✓{RESET} Rebuilt {archives} archives, {facts} facts written.");
+    println!("Rollback (stop the daemon first):");
+    println!("  mv {} {}", graph.display(), build.display());
+    println!("  mv {} {}", backup.display(), graph.display());
+}
+
 /// What `graph extract` does with an `Err` from one archive.
 #[cfg(feature = "llm")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,11 +1457,16 @@ pub struct ExtractOptions {
     pub max_tokens: u64,
     /// Flag value. `None` reads `[graph] pipeline`, which defaults to v1.
     pub pipeline: Option<PipelineVersion>,
+    /// Build a fresh v2 store and swap it into place. Ignores `--log` and `--all`.
+    pub rebuild: bool,
 }
 
 /// Extract entities from already-ingested archives using an LLM.
 #[cfg(feature = "llm")]
 pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), RecallError> {
+    if options.rebuild {
+        return rebuild(memory_dir, options, &LiveDaemonStop, None).await;
+    }
     let ExtractOptions {
         log,
         all,
@@ -995,6 +1476,7 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
         delay_ms,
         max_tokens,
         pipeline,
+        rebuild: _,
     } = options;
     let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, pipeline)?;
     let memory = memory_dir.to_path_buf();
@@ -2393,5 +2875,120 @@ mod tests {
         assert!(!text.contains("Inconsistent"), "{text}");
         assert!(text.contains("produced no entities"), "{text}");
         assert!(text.contains("quarantine"), "{text}");
+    }
+
+    #[test]
+    fn a_backup_name_gains_a_suffix_instead_of_overwriting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stamp = "20261025-1530";
+        let first = unique_backup(dir.path(), stamp);
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("graph.v1-backup-20261025-1530")
+        );
+        std::fs::create_dir(&first).expect("first");
+        std::fs::create_dir(dir.path().join(format!("graph.v1-backup-{stamp}-2"))).expect("second");
+        let third = unique_backup(dir.path(), stamp);
+        assert_eq!(
+            third.file_name().and_then(|name| name.to_str()),
+            Some("graph.v1-backup-20261025-1530-3")
+        );
+    }
+
+    #[test]
+    fn a_failed_second_rename_puts_the_original_store_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let graph = dir.path().join("graph");
+        let build = dir.path().join(V2_BUILD_DIR);
+        let backup = dir.path().join("graph.v1-backup-20261025-1530");
+        std::fs::create_dir(&graph).expect("graph");
+        std::fs::write(graph.join("KEEP"), b"old").expect("keep");
+
+        let err = rename_swapping(&graph, &build, &backup).expect_err("missing build");
+        assert!(
+            err.to_string().contains("original store is in place"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(graph.join("KEEP")).expect("kept"), b"old");
+        assert!(!backup.exists());
+        assert!(!build.exists());
+    }
+
+    #[test]
+    fn both_renames_land_on_the_memory_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let graph = dir.path().join("graph");
+        let build = dir.path().join(V2_BUILD_DIR);
+        let backup = dir.path().join("graph.v1-backup-20261025-1530");
+        std::fs::create_dir(&graph).expect("graph");
+        std::fs::write(graph.join("KEEP"), b"old").expect("keep");
+        std::fs::create_dir(&build).expect("build");
+        std::fs::write(build.join("NEW"), b"new").expect("new");
+
+        rename_swapping(&graph, &build, &backup).expect("swap");
+        assert_eq!(std::fs::read(graph.join("NEW")).expect("new store"), b"new");
+        assert_eq!(std::fs::read(backup.join("KEEP")).expect("backup"), b"old");
+        assert!(!build.exists());
+    }
+
+    #[test]
+    fn an_archive_listing_follows_log_number() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conversations = dir.path().join("conversations");
+        std::fs::create_dir(&conversations).expect("conversations");
+        for name in [
+            "notes.md",
+            "conversation-010.md",
+            "archive-log-003.md",
+            "conversation-002.md",
+        ] {
+            std::fs::write(conversations.join(name), "x").expect("archive");
+        }
+        assert_eq!(
+            conversation_logs(&conversations).expect("logs"),
+            vec![2, 3, 10]
+        );
+    }
+
+    #[test]
+    fn a_dry_run_estimate_is_one_call_per_window_plus_the_resolver_bound() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let memory = dir.path();
+        std::fs::create_dir(memory.join("conversations")).expect("conversations");
+        std::fs::write(
+            memory.join("conversations/conversation-001.md"),
+            "---\nlog: 1\ndate: \"2026-03-01T00:00:00Z\"\nsession_id: \"s1\"\n---\n\n\
+             ### User\n\nUse Rust for the shelf service.\n",
+        )
+        .expect("markdown");
+        let markdown = crate::graph::v2::estimate_session(memory, 1).expect("markdown estimate");
+        assert!(!markdown.has_sidecar);
+        assert_eq!(markdown.windows, 1);
+        assert_eq!(
+            markdown.calls,
+            markdown
+                .windows
+                .saturating_add(crate::graph::v2::RESOLVER_CALL_BOUND)
+        );
+
+        std::fs::create_dir(memory.join("turns")).expect("turns");
+        std::fs::write(
+            memory.join("turns/conversation-002.json"),
+            r#"{"version":1,"session_id":"s2","date":"2026-03-01T00:00:00Z","cwd":null,"project":{"name":"shelf","aliases":[]},"turns":[],"tools":[]}"#,
+        )
+        .expect("empty sidecar");
+        let empty = crate::graph::v2::estimate_session(memory, 2).expect("empty estimate");
+        assert!(empty.has_sidecar);
+        assert_eq!(empty.windows, 0);
+        assert_eq!(empty.calls, crate::graph::v2::RESOLVER_CALL_BOUND);
+    }
+
+    #[test]
+    fn a_non_v2_build_directory_says_how_to_remove_it() {
+        let path = PathBuf::from("/tmp/memory/graph.v2-build");
+        let hint = removal_hint(&path);
+        assert!(hint.contains(&path.display().to_string()), "{hint}");
+        assert!(hint.contains("rm -r"), "{hint}");
+        assert!(hint.contains("stamped v2"), "{hint}");
     }
 }

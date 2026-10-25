@@ -155,6 +155,7 @@ async fn collect_sessions(
                 report.resolve = extracted.resolve;
                 report.retirements = extracted.retirements;
                 report.retirements_skipped = extracted.retirements_skipped;
+                report.timing = extracted.timing;
                 report
             }
         };
@@ -175,6 +176,7 @@ async fn collect_sessions(
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
+            timing: report.timing,
         });
         before = after;
     }
@@ -1515,6 +1517,10 @@ mod tests {
         assert!(report.questions[1].graph_hit);
         assert!(report.questions[1].keyword_hit);
         assert!(report.patterns.is_none());
+        assert!(report
+            .sessions
+            .iter()
+            .all(|session| session.timing.is_none()));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2049,6 +2055,20 @@ mod tests {
         assert!(report.junk_edges.is_empty(), "{:?}", report.junk_edges);
         assert!(report.questions[0].graph_hit);
         assert!(!report.questions[1].graph_hit);
+        assert!(
+            report.sessions.iter().all(|session| {
+                let Some(timing) = session.timing else {
+                    return false;
+                };
+                timing.total_ms >= timing.pass1_ms
+            }),
+            "stage timing {:?}",
+            report
+                .sessions
+                .iter()
+                .map(|session| session.timing)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[cfg(feature = "embedded")]

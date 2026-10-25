@@ -1054,6 +1054,36 @@ pub fn load(base: &Path) -> Config {
     }
 }
 
+/// Set `[graph] pipeline` and write it through [`save`].
+///
+/// A missing file is created. A file that does not parse, or that [`load`]
+/// would replace with defaults, is left untouched: saving those defaults
+/// would wipe the caller's keys.
+pub(crate) fn set_graph_pipeline(
+    base: &Path,
+    pipeline: &str,
+) -> Result<(), crate::error::RecallError> {
+    let path = config_path(base);
+    if path.exists() {
+        let content = fs::read_to_string(&path)?;
+        let parsed: Config = toml::from_str(&content).map_err(|err| {
+            crate::error::RecallError::Config(format!(
+                "refusing to rewrite {}: {err}",
+                path.display()
+            ))
+        })?;
+        validate(parsed).map_err(|err| {
+            crate::error::RecallError::Config(format!(
+                "refusing to rewrite {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    let mut cfg = load(base);
+    cfg.set_key("graph.pipeline", pipeline)?;
+    save(base, &cfg)
+}
+
 /// Save config to .recall-echo.toml in the base dir.
 pub fn save(base: &Path, config: &Config) -> Result<(), crate::error::RecallError> {
     let path = config_path(base);
@@ -2033,6 +2063,51 @@ mod tests {
             Some("v2")
         );
         assert!(cfg.set_key("graph.pipeline", "v3").is_err());
+    }
+
+    #[test]
+    fn setting_graph_pipeline_keeps_other_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = config_path(dir.path());
+        fs::write(
+            &path,
+            "[llm]\nmodel = \"kept-model\"\nnum_ctx = 4096\n\n\
+             [capture]\nenabled = false\n\n\
+             [graph.provenance]\nweight_user = 0.5\n",
+        )
+        .expect("write config");
+
+        set_graph_pipeline(dir.path(), "v2").expect("set pipeline");
+
+        let cfg = load(dir.path());
+        assert_eq!(cfg.llm.model, "kept-model");
+        assert_eq!(cfg.llm.num_ctx, 4096);
+        assert!(!cfg.capture.enabled);
+        assert_eq!(
+            cfg.graph
+                .as_ref()
+                .and_then(|graph| graph.pipeline.as_deref()),
+            Some("v2")
+        );
+        let weight = cfg.graph.as_ref().expect("graph").provenance.weight_user;
+        assert!((weight - 0.5).abs() < f64::EPSILON, "{weight}");
+    }
+
+    #[test]
+    fn setting_graph_pipeline_does_not_rewrite_a_file_load_would_drop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = config_path(dir.path());
+        let broken = "this is not toml [[[";
+        fs::write(&path, broken).expect("write broken");
+        let err = set_graph_pipeline(dir.path(), "v2").expect_err("parse");
+        assert!(err.to_string().contains("refusing to rewrite"), "{err}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), broken);
+
+        let zero = "[llm]\nnum_ctx = 0\nmodel = \"kept\"\n";
+        fs::write(&path, zero).expect("write zero");
+        let err = set_graph_pipeline(dir.path(), "v2").expect_err("num_ctx");
+        assert!(err.to_string().contains("refusing to rewrite"), "{err}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), zero);
     }
 
     #[test]
