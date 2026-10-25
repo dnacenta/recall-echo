@@ -360,6 +360,55 @@ pub async fn contradict_relationship(
     record_observation(db, rel_id, evidence, Observation::Contradicting).await
 }
 
+/// Close a relationship at a caller-supplied time.
+///
+/// `valid_until` is an RFC3339 timestamp, normally midnight UTC of the
+/// session date. `ended_by` records who closed it and why
+/// (`<session_id>:<reason>`). A relationship that is already closed keeps
+/// the first `valid_until` and `ended_by`. A missing id is not an error:
+/// there was nothing to close.
+pub async fn retire_relationship(
+    db: &Surreal<Db>,
+    id: &str,
+    valid_until: &str,
+    ended_by: &str,
+) -> Result<(), GraphError> {
+    let mut response = db
+        .query("SELECT valid_until FROM type::record($id)")
+        .bind(("id", id.to_string()))
+        .await?;
+    let rows: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(());
+    };
+    if edge_already_closed(row.get("valid_until")) {
+        return Ok(());
+    }
+    db.query(RETIRE_EDGE)
+        .bind(("id", id.to_string()))
+        .bind(("valid_until", valid_until.to_string()))
+        .bind(("ended_by", ended_by.to_string()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// `true` when `valid_until` already holds a time.
+pub(crate) fn edge_already_closed(valid_until: Option<&serde_json::Value>) -> bool {
+    match valid_until {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(_) => true,
+    }
+}
+
+pub(crate) const RETIRE_EDGE: &str = r#"
+    UPDATE type::record($id) SET
+        valid_until = type::datetime($valid_until),
+        ended_by = $ended_by
+    WHERE valid_until = NONE
+"#;
+
 /// Supersede an existing relationship: set valid_until on the old one, create a new one.
 pub async fn supersede_relationship(
     db: &Surreal<Db>,
@@ -1045,5 +1094,99 @@ mod tests {
             { "operation": "Iterate Table", "detail": { "table": "episode" } }
         ]);
         assert!(!plan_uses_index(&table_scan, "episode_extracted"));
+    }
+
+    #[tokio::test]
+    async fn retire_relationship_stamps_given_date() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = store::open(dir.path()).await.expect("open store");
+        db.query(
+            "CREATE entity:app SET name = 'app', entity_type = 'project', abstract = 'host', overview = ''",
+        )
+        .await
+        .expect("subject")
+        .check()
+        .expect("subject check");
+        db.query(
+            "CREATE entity:redis SET name = 'redis', entity_type = 'tool', abstract = 'cache', overview = ''",
+        )
+        .await
+        .expect("object")
+        .check()
+        .expect("object check");
+        let mut created = db
+            .query(
+                r#"
+                RELATE entity:app -> relates_to -> entity:redis SET
+                    rel_type = 'uses',
+                    valid_from = time::now(),
+                    valid_until = NONE,
+                    confidence = 1.0
+                "#,
+            )
+            .await
+            .expect("relate");
+        #[derive(serde::Deserialize)]
+        struct Created {
+            id: serde_json::Value,
+        }
+        let edges: Vec<Created> = super::super::deserialize_take(&mut created, 0).expect("edge");
+        let id = match &edges[0].id {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+
+        retire_relationship(&db, &id, "2026-04-05T00:00:00Z", "s11:superseded")
+            .await
+            .expect("retire");
+        let first = read_closure(&db, &id).await;
+        assert_eq!(first.ended_by.as_deref(), Some("s11:superseded"));
+        assert!(
+            first.until.contains("2026-04-05T00:00:00"),
+            "stamp was {}",
+            first.until
+        );
+
+        retire_relationship(&db, &id, "2026-08-01T00:00:00Z", "s12:replaced")
+            .await
+            .expect("second retire");
+        let second = read_closure(&db, &id).await;
+        assert_eq!(second, first, "a closed edge keeps its first stamp");
+
+        retire_relationship(
+            &db,
+            "relates_to:missing",
+            "2026-04-05T00:00:00Z",
+            "s11:superseded",
+        )
+        .await
+        .expect("a missing edge is not a failure");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Closure {
+        until: String,
+        ended_by: Option<String>,
+    }
+
+    async fn read_closure(db: &Surreal<Db>, id: &str) -> Closure {
+        let mut response = db
+            .query("SELECT valid_until, ended_by FROM type::record($id)")
+            .bind(("id", id.to_string()))
+            .await
+            .expect("read");
+        let rows: Vec<serde_json::Value> =
+            super::super::deserialize_take(&mut response, 0).expect("row");
+        let row = rows.into_iter().next().expect("edge row");
+        Closure {
+            until: row
+                .get("valid_until")
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            ended_by: row
+                .get("ended_by")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        }
     }
 }

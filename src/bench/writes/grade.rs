@@ -82,6 +82,10 @@ pub struct SessionObservation {
     pub drops: HashMap<String, u32>,
     /// Entity resolution for a v2 session. Blank on v1.
     pub resolve: crate::graph::types::ResolveStats,
+    /// Facts this session closed. Empty on v1.
+    pub retirements: Vec<crate::graph::types::Retirement>,
+    /// Retirements that could not be applied.
+    pub retirements_skipped: u32,
 }
 
 /// Precision and recall for one operation.
@@ -167,6 +171,12 @@ pub struct SessionReport {
         skip_serializing_if = "crate::graph::types::ResolveStats::is_blank"
     )]
     pub resolve: crate::graph::types::ResolveStats,
+    /// Facts this session closed, beside the resolution stats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retirements: Vec<crate::graph::types::Retirement>,
+    /// Retirements that could not be applied.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub retirements_skipped: u32,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -469,6 +479,8 @@ pub fn grade(
                 kept: s.kept,
                 drops: s.drops.clone(),
                 resolve: s.resolve.clone(),
+                retirements: s.retirements.clone(),
+                retirements_skipped: s.retirements_skipped,
             })
             .collect(),
         steps,
@@ -1593,6 +1605,8 @@ mod tests {
             kept: 0,
             drops: HashMap::new(),
             resolve: crate::graph::types::ResolveStats::default(),
+            retirements: Vec::new(),
+            retirements_skipped: 0,
         }
     }
 

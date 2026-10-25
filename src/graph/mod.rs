@@ -320,6 +320,19 @@ impl GraphMemory {
         crud::supersede_relationship(&self.db, old_id, new).await
     }
 
+    /// Close a relationship at `valid_until` without writing a replacement.
+    ///
+    /// `valid_until` is an RFC3339 timestamp. A relationship that is already
+    /// closed keeps its first `valid_until` and `ended_by`.
+    pub async fn retire_relationship(
+        &self,
+        id: &str,
+        valid_until: &str,
+        ended_by: &str,
+    ) -> Result<(), GraphError> {
+        crud::retire_relationship(&self.db, id, valid_until, ended_by).await
+    }
+
     /// Overwrite a relationship's confidence, resetting its evidence to the
     /// prior around the new mean.
     pub async fn update_relationship_confidence(

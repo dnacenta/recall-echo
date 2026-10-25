@@ -760,6 +760,25 @@ pub struct RejectedMatch {
     pub match_id: String,
 }
 
+/// One live fact closed while a session was written.
+///
+/// `reason` is `superseded`, `rejected`, `replaced`, or `promoted`.
+/// `old_value` is the record that was closed. `new_value` is the fact that
+/// closed it, empty when a rejection names no replacement. `key` is the
+/// setting key that was closed, empty for an edge and for a slot that has
+/// none, so two retirements of one value stay distinguishable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retirement {
+    pub reason: String,
+    pub subject: String,
+    pub predicate: String,
+    /// Absent in reports written before this field existed.
+    #[serde(default)]
+    pub key: String,
+    pub old_value: String,
+    pub new_value: String,
+}
+
 /// Result of a full ingestion run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionReport {
@@ -822,6 +841,12 @@ pub struct IngestionReport {
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
+    /// Facts this session closed, in the order it closed them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retirements: Vec<Retirement>,
+    /// Retirements that could not be applied. The session still commits.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub retirements_skipped: u32,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
