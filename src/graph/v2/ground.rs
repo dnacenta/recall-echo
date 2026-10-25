@@ -41,8 +41,11 @@
 //!
 //! When the quote and its sentence do not bind a numbered key, a user turn
 //! can still bind it from the assistant turn immediately before or after it.
-//! The trimmed quote has to contain every number of the value. One sentence
-//! of that assistant turn has to name the key and those numbers, and no other
+//! The trimmed quote has to contain every number of the value. The sentence
+//! that contains the quote states those numbers and no other number, and the
+//! word immediately before one is not `not`, `no`, or another content word
+//! (`yes`, `sure`, `ok` and `okay` stay allowed). One sentence of that
+//! assistant turn has to name the key and those numbers, and no other
 //! number. The citation stays on the user turn.
 
 use super::input::{Turn, TurnRole};
@@ -212,7 +215,9 @@ impl SessionGround {
     /// fails. The number is still required to occur in the turn by
     /// [`SessionGround::supports_value`]. A `_version` key also needs every
     /// stem token, and an empty stem fails. When that check fails, a user
-    /// agreement can bind from one sentence of an adjacent assistant turn.
+    /// agreement can bind from one sentence of an adjacent assistant turn,
+    /// provided the user's own sentence states only the value's numbers and
+    /// does not put `not`, `no`, or another content word immediately before one.
     #[must_use]
     pub(crate) fn key_bound(&self, key: &str, value: &str, turn: usize, quote: &str) -> bool {
         if numbers_in(value).is_empty() {
@@ -235,14 +240,19 @@ impl SessionGround {
         }
     }
 
-    /// User agreement: the value's numbers are in the quote, and one adjacent
-    /// assistant sentence names the key and only those numbers.
+    /// User agreement: the cited sentence states only the value's numbers and
+    /// does not lead one with `not`, `no`, or another content word, and one
+    /// adjacent assistant sentence names the key and only those numbers.
     #[must_use]
     fn agreement_binds(&self, key: &str, value: &str, cited_pos: usize, quote: &str) -> bool {
         let Some(cited) = self.turns.get(cited_pos) else {
             return false;
         };
         if cited.role != TurnRole::User || !quote_states_numbers(value, quote) {
+            return false;
+        }
+        let sentence = sentence_containing(&cited.text, quote.trim());
+        if !user_states_agreement(value, sentence) {
             return false;
         }
         [cited_pos.checked_sub(1), cited_pos.checked_add(1)]
@@ -454,6 +464,58 @@ fn exclusive_numbers(value: &str, sentence: &str) -> bool {
             .all(|number| wanted.iter().any(|have| have == number))
 }
 
+/// The user's sentence states the value and does not negate or retarget it.
+///
+/// `not` and `no` negate the number they precede. Any other content word in
+/// that position names something else (`timeout`). An affirmation, a stop
+/// word, or no word at all leaves the number as the agreement.
+fn user_states_agreement(value: &str, sentence: &str) -> bool {
+    exclusive_numbers(value, sentence)
+        && number_spans(sentence)
+            .into_iter()
+            .all(|(_, start)| !preceding_word_blocks(sentence, start))
+}
+
+fn preceding_word_blocks(text: &str, number_start: usize) -> bool {
+    let Some(word) = word_before(text, number_start) else {
+        return false;
+    };
+    let word = word.to_ascii_lowercase();
+    match word.as_str() {
+        "not" | "no" => true,
+        "yes" | "sure" | "ok" | "okay" => false,
+        other => !is_stop(other),
+    }
+}
+
+/// Alphanumeric word immediately before `index`, skipping space and punctuation.
+///
+/// A run of digits is a number, not a word. The span start of a signed number
+/// is the hyphen, so the sign is skipped with the other punctuation.
+fn word_before(text: &str, index: usize) -> Option<&str> {
+    let mut end = index;
+    loop {
+        let ch = char_before(text, end)?;
+        if ch.is_alphanumeric() {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    let mut start = end;
+    while let Some(ch) = char_before(text, start) {
+        if !ch.is_alphanumeric() {
+            break;
+        }
+        start -= ch.len_utf8();
+    }
+    let word = &text[start..end];
+    if word.is_empty() || word.bytes().all(|byte| byte.is_ascii_digit()) {
+        None
+    } else {
+        Some(word)
+    }
+}
+
 fn agreement_tokens(key: &str, sentence: &str) -> bool {
     let specific = specific_key_tokens(key);
     if specific.is_empty() || !version_stem_ok(key, &[sentence]) {
@@ -540,6 +602,14 @@ fn is_generic_key(token: &str) -> bool {
 }
 
 pub(crate) fn numbers_in(text: &str) -> Vec<String> {
+    number_spans(text)
+        .into_iter()
+        .map(|(number, _start)| number)
+        .collect()
+}
+
+/// Each maximal number and the byte index where its span starts.
+fn number_spans(text: &str) -> Vec<(String, usize)> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut index = 0;
@@ -553,7 +623,7 @@ pub(crate) fn numbers_in(text: &str) -> Vec<String> {
         let signed = hyphen_is_sign(text, index);
         let start = if signed { index - 1 } else { index };
         index = end_of_number(bytes, index);
-        out.push(text[start..index].to_string());
+        out.push((text[start..index].to_string(), start));
     }
     out
 }
@@ -1155,6 +1225,41 @@ mod tests {
             "3.12",
             0,
             "3.12 then."
+        ));
+    }
+
+    #[test]
+    fn agreement_user_sentence_rejects_a_different_number_a_negation_and_another_setting() {
+        let question = "Should the port be 9123?";
+        let a = TurnRole::Assistant;
+        let u = TurnRole::User;
+        for user in [
+            "Not 9123, use 9124.",
+            "No, 9123 is taken.",
+            "Timeout 9123 ms is fine.",
+        ] {
+            assert!(
+                !bind(&[(question, a), (user, u)], "port", "9123", 1, user),
+                "{user}"
+            );
+        }
+        for user in ["Yes, 9123.", "Sure, 9123 works.", "OK, 9123."] {
+            assert!(
+                bind(&[(question, a), (user, u)], "port", "9123", 1, user),
+                "{user}"
+            );
+        }
+    }
+
+    #[test]
+    fn agreement_cited_to_an_assistant_beside_an_assistant_drops() {
+        let a = TurnRole::Assistant;
+        assert!(!bind(
+            &[("9123 works.", a), ("Default port is now 9123.", a),],
+            "port",
+            "9123",
+            0,
+            "9123 works."
         ));
     }
 
