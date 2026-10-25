@@ -442,7 +442,7 @@ fn is_generic_key(token: &str) -> bool {
     )
 }
 
-fn numbers_in(text: &str) -> Vec<String> {
+pub(crate) fn numbers_in(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut index = 0;
