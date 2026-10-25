@@ -420,6 +420,9 @@ pub async fn search(
 /// daemon, as before. `provenance` forces an authorship class on every
 /// episode of the run — how `--external` marks genuinely external material.
 /// `None` infers per chunk from conversation turn roles.
+///
+/// The pipeline choice consults a running daemon and does not open the store.
+/// The episode write that follows is what opens it.
 pub async fn ingest(
     memory_dir: &Path,
     archive_path: &Path,
@@ -999,14 +1002,13 @@ async fn prepare_rebuild(
     memory_dir: &Path,
     options: &ExtractOptions,
 ) -> Result<RebuildPlan, RecallError> {
-    // Explicit v1 is already refused. Reading the stamp to rephrase that
-    // refusal would open the store this check promises not to touch.
-    if options.pipeline == Some(PipelineVersion::V1) {
-        return Err(RecallError::Config(
-            "rebuild requires pipeline v2; pass --pipeline v2".into(),
-        ));
-    }
-    let pipeline = crate::graph::v2::chosen_pipeline(memory_dir, options.pipeline, None).await?;
+    // Flag and config only. A stamp read would open the store, and a refused
+    // rebuild must leave `graph/` byte-identical.
+    let configured = crate::config::load_from_dir(memory_dir)
+        .graph
+        .and_then(|section| section.pipeline);
+    let pipeline = PipelineVersion::resolve(options.pipeline, configured.as_deref())
+        .map_err(RecallError::Config)?;
     if pipeline != PipelineVersion::V2 {
         return Err(RecallError::Config(
             "rebuild requires pipeline v2; pass --pipeline v2".into(),
@@ -1718,7 +1720,7 @@ fn attempt_after_error(
 ) -> Attempt {
     // v1 into a v2 store is a refusal, not a flaky write. Retrying would
     // call the provider again and still write nothing.
-    if err.to_string().contains(crate::graph::v2::V1_REFUSAL) {
+    if matches!(err, crate::graph::error::GraphError::PipelineRefused(_)) {
         return Attempt::Stop;
     }
     if pipeline != PipelineVersion::V2 {
@@ -1733,10 +1735,9 @@ fn attempt_after_error(
 
 #[cfg(feature = "llm")]
 fn refusal_text(err: &crate::graph::error::GraphError) -> &'static str {
-    if err.to_string().contains(crate::graph::v2::V1_REFUSAL) {
-        crate::graph::v2::V1_REFUSAL
-    } else {
-        crate::graph::v2::V2_REFUSAL
+    match err {
+        crate::graph::error::GraphError::PipelineRefused(message) => message,
+        _ => crate::graph::v2::V2_REFUSAL,
     }
 }
 
@@ -3110,11 +3111,47 @@ mod tests {
             attempt_after_error(PipelineVersion::V1, &write),
             Attempt::Retry
         );
-        let v1_into_v2 = GraphError::Extraction(crate::graph::v2::V1_REFUSAL.to_string());
+        let v1_into_v2 = GraphError::PipelineRefused(crate::graph::v2::V1_REFUSAL);
         assert_eq!(
             attempt_after_error(PipelineVersion::V1, &v1_into_v2),
             Attempt::Stop
         );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn extract_pipeline_v1_on_a_v2_store_refuses_and_leaves_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        let conversations = memory.join("conversations");
+        std::fs::create_dir_all(&conversations).unwrap();
+        let archive = conversations.join("conversation-001.md");
+        let body = b"---\nlog: 1\n---\n\n### User\n\nhello\n";
+        std::fs::write(&archive, body).unwrap();
+        {
+            let gm = crate::graph::GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        }
+        let err = extract(
+            memory,
+            ExtractOptions {
+                log: Some(1),
+                all: false,
+                dry_run: false,
+                model: None,
+                provider: None,
+                delay_ms: 0,
+                max_tokens: 0,
+                pipeline: Some(PipelineVersion::V1),
+                rebuild: false,
+            },
+        )
+        .await
+        .expect_err("refused");
+        assert!(err.to_string().contains("stamped pipeline v2"), "{err}");
+        assert_eq!(std::fs::read(&archive).unwrap(), body);
     }
 
     #[test]

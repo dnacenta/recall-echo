@@ -49,7 +49,13 @@ pub(crate) const V2_REFUSAL: &str = "this graph was built by pipeline v1; re-ext
 /// Writing v1 rows into that store mixes the two schemas. The way back is the
 /// rebuild rollback: stop the daemon, move the backup into place, and set
 /// `[graph] pipeline = "v1"`.
-pub(crate) const V1_REFUSAL: &str = "this graph was built by pipeline v2; refusing pipeline v1. Roll back the rebuild (stop the daemon first) and set [graph] pipeline = \"v1\", or pass --pipeline v2";
+pub(crate) const V1_REFUSAL: &str = "\
+this store is stamped pipeline v2 and v1 writes are refused. \
+To keep using v2, leave the store as it is; where a command takes --pipeline, pass --pipeline v2. \
+To go back to v1 after a rebuild, stop the daemon first (`recall-echo graph daemon stop`), \
+move the backup directory `graph.v1-backup-*` (it sits next to `graph/` and exists only when this store was rebuilt; the name is `graph.v1-backup-<YYYYMMDD-HHMM>`, with `-<N>` if that name was taken) over `graph/`, \
+then set [graph] pipeline = \"v1\". \
+Setting [graph] pipeline = \"v1\" alone does not change the stamp.";
 
 const STAMP_V2: &str = "v2";
 
@@ -134,10 +140,39 @@ impl<'a> WriteCtx<'a> {
 /// before a provider is called.
 pub(crate) async fn ensure_v2_store(gm: &GraphMemory) -> Result<(), GraphError> {
     match read_stamp(gm.db()).await? {
-        Some(stamp) if stamp == STAMP_V2 => Ok(()),
-        None if entity_count(gm.db()).await? == 0 => write_stamp(gm.db(), STAMP_V2).await,
+        Some(stamp) if stamp == STAMP_V2 => {
+            gm.remember_pipeline_stamp(Some(stamp));
+            Ok(())
+        }
+        None if entity_count(gm.db()).await? == 0 => {
+            write_stamp(gm.db(), STAMP_V2).await?;
+            gm.remember_pipeline_stamp(Some(STAMP_V2.to_string()));
+            Ok(())
+        }
         _ => Err(GraphError::Extraction(V2_REFUSAL.to_string())),
     }
+}
+
+/// Refuse a v1-shaped write when this open connection's store is stamped v2.
+///
+/// The stamp is read once per connection and remembered. A v2-shaped entity
+/// (one that already carries `attributes.v2`) is the v2 writer's own row and
+/// is not checked here.
+pub(crate) async fn refuse_v1_write(gm: &GraphMemory) -> Result<(), GraphError> {
+    if gm.cached_pipeline_stamp().await?.as_deref() == Some(STAMP_V2) {
+        Err(GraphError::PipelineRefused(V1_REFUSAL))
+    } else {
+        Ok(())
+    }
+}
+
+/// `attributes.v2` is the closed record the v2 writer stores on an entity.
+#[must_use]
+pub(crate) fn carries_v2_record(attributes: &Option<serde_json::Value>) -> bool {
+    attributes
+        .as_ref()
+        .and_then(|value| value.get("v2"))
+        .is_some_and(serde_json::Value::is_object)
 }
 
 /// The pipeline stamp on `meta:pipeline`, if one was written.

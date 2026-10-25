@@ -349,6 +349,36 @@ fn error_code(err: &GraphError) -> &'static str {
         GraphError::Json(_) => "json",
         GraphError::ImmutableMerge(_) => "immutable_merge",
         GraphError::Migration(_) => "migration",
+        GraphError::PipelineRefused(_) => "pipeline_refused",
+    }
+}
+
+/// `meta:pipeline` as a daemon reports it.
+///
+/// [`PipelineStamp::Unknown`] is an old daemon, a failed read, or any case
+/// where the value was not observed. [`PipelineStamp::Unstamped`] means the
+/// row was read and is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStamp {
+    /// The stamp was not observed.
+    #[default]
+    Unknown,
+    /// `meta:pipeline` has no row.
+    Unstamped,
+    /// The stamp text, usually `v1` or `v2`.
+    Stamped(String),
+}
+
+impl PipelineStamp {
+    /// A stamp the pipeline choice can act on. Unknown and unstamped both
+    /// leave the choice to the flag and the config.
+    #[must_use]
+    pub fn as_choice(&self) -> Option<String> {
+        match self {
+            Self::Stamped(value) => Some(value.clone()),
+            Self::Unstamped | Self::Unknown => None,
+        }
     }
 }
 
@@ -365,10 +395,12 @@ pub struct DaemonInfo {
     pub uptime_secs: u64,
     #[serde(default)]
     pub extraction: ExtractionStatus,
-    /// `meta:pipeline` on the store this daemon has open. Absent on a daemon
-    /// that predates the field, and on a store that was never stamped.
+    /// `meta:pipeline` on the store this daemon has open.
+    ///
+    /// Absent on a daemon that predates the field, which deserializes as
+    /// [`PipelineStamp::Unknown`] rather than unstamped.
     #[serde(default)]
-    pub pipeline_stamp: Option<String>,
+    pub pipeline_stamp: PipelineStamp,
 }
 
 /// What this daemon's background extraction worker has done so far.
@@ -940,7 +972,7 @@ impl DaemonContext {
             socket_path: self.socket_path.display().to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
             extraction: self.extraction.snapshot(Instant::now()),
-            pipeline_stamp: None,
+            pipeline_stamp: PipelineStamp::Unknown,
         }
     }
 }
@@ -1268,8 +1300,12 @@ async fn handle_connection(
         let (response, stop) = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Hello) => {
                 let mut info = context.info();
-                match crate::graph::v2::read_stamp(graph.db()).await {
-                    Ok(stamp) => info.pipeline_stamp = stamp,
+                // Cached for the life of this open. A rebuild stops the daemon
+                // before the directory changes, and `ensure_v2_store` updates
+                // the cache when this process stamps the store.
+                match graph.cached_pipeline_stamp().await {
+                    Ok(None) => info.pipeline_stamp = PipelineStamp::Unstamped,
+                    Ok(Some(stamp)) => info.pipeline_stamp = PipelineStamp::Stamped(stamp),
                     Err(err) => log.log(&format!("pipeline stamp unreadable: {err}")),
                 }
                 (
@@ -1762,7 +1798,7 @@ mod tests {
         .expect("older daemon info");
         assert_eq!(info.extraction, ExtractionStatus::default());
         assert!(!info.extraction.enabled);
-        assert!(info.pipeline_stamp.is_none());
+        assert_eq!(info.pipeline_stamp, PipelineStamp::Unknown);
     }
 
     #[test]
@@ -1959,5 +1995,61 @@ mod tests {
                 .idle_timeout,
             None
         );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn daemon_add_entity_writes_nothing_on_a_v2_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(tmp.path()).await.unwrap();
+        crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        let response = dispatch_graph(
+            &gm,
+            &Request::AddEntity(AddEntityArgs {
+                name: "shelf".into(),
+                entity_type: "project".into(),
+                abstract_text: "a shelf".into(),
+                overview: None,
+                source: None,
+            }),
+        )
+        .await;
+        assert!(!response.ok, "{response:?}");
+        let message = response.error.expect("error").message;
+        assert!(message.contains("stamped pipeline v2"), "{message}");
+        assert_eq!(gm.stats().await.unwrap().entity_count, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn daemon_relate_writes_nothing_on_a_v2_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(tmp.path()).await.unwrap();
+        crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        for name in ["pine", "rust"] {
+            gm.db()
+                .query("CREATE entity SET name = $name, entity_type = 'project', abstract = 'host', overview = ''")
+                .bind(("name", name.to_string()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        let response = dispatch_graph(
+            &gm,
+            &Request::Relate(RelateArgs {
+                from: "pine".into(),
+                rel_type: "USES".into(),
+                to: "rust".into(),
+                description: None,
+                source: None,
+            }),
+        )
+        .await;
+        assert!(!response.ok, "{response:?}");
+        let message = response.error.expect("error").message;
+        assert!(message.contains("stamped pipeline v2"), "{message}");
+        assert_eq!(gm.stats().await.unwrap().relationship_count, 0);
+        assert_eq!(gm.stats().await.unwrap().entity_count, 2);
     }
 }

@@ -270,12 +270,10 @@ async fn process_extraction(
     report: &mut IngestionReport,
 ) -> Result<(), GraphError> {
     // Once per session, before any provider call or entity write. The archive
-    // file is the caller's: this error does not remove it.
-    if super::v2::read_stamp(gm.db()).await?.as_deref()
-        == Some(super::v2::PipelineVersion::V2.as_str())
-    {
-        return Err(GraphError::Extraction(super::v2::V1_REFUSAL.to_string()));
-    }
+    // file is the caller's: this error does not remove it. The same guard
+    // sits on the v1 entity and edge writes, so a path that skips this
+    // function still cannot land a v1 row.
+    super::v2::refuse_v1_write(gm).await?;
     let session_id = context.session_id.as_str();
     let log_number = context.log_number;
     report.chunks_total += u32::try_from(chunks.len()).unwrap_or(u32::MAX);

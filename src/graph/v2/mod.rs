@@ -28,7 +28,9 @@ use super::types::IngestionReport;
 use super::GraphMemory;
 use crate::error::RecallError;
 pub(crate) use resolve::RESOLVER_CALL_BOUND;
-pub(crate) use write::{ensure_v2_store, read_stamp, V1_REFUSAL, V2_REFUSAL};
+pub(crate) use write::{
+    carries_v2_record, ensure_v2_store, read_stamp, refuse_v1_write, V1_REFUSAL, V2_REFUSAL,
+};
 
 /// Which extraction pipeline a run uses.
 ///
@@ -89,12 +91,11 @@ struct PipelineChoice {
 
 /// Pipeline for a CLI command.
 ///
-/// A flag wins over the config, so a broken file is not read when the flag
-/// is set: `load` would drop it and print a warning for a value this call
-/// does not use. A v2 stamp then wins over the config. Explicit `--pipeline v1`
-/// on that stamp is refused. `db` is the already-open store; without it the
-/// stamp is read from `memory_dir/graph` and only when that directory is a
-/// SurrealKV store.
+/// A flag wins over the config. `--pipeline v2` does not read the file.
+/// A v2 stamp then wins over the config when it is already known: from `db`,
+/// or from a running daemon. This function does not open the store. Explicit
+/// `--pipeline v1` on a known v2 stamp is refused. With no daemon and no `db`
+/// the stamp is unknown and the flag or the config decides.
 ///
 /// # Errors
 ///
@@ -117,7 +118,7 @@ pub(crate) async fn chosen_pipeline(
             .and_then(|section| section.pipeline),
     };
     let stamp = if stamp_can_change(flag, configured.as_deref()) {
-        read_choice_stamp(memory_dir, flag, db).await?
+        read_choice_stamp(memory_dir, db).await?
     } else {
         None
     };
@@ -170,53 +171,36 @@ fn stamp_can_change(flag: Option<PipelineVersion>, configured: Option<&str>) -> 
 
 async fn read_choice_stamp(
     memory_dir: &Path,
-    flag: Option<PipelineVersion>,
     db: Option<&Surreal<Db>>,
 ) -> Result<Option<String>, RecallError> {
     if let Some(db) = db {
         return Ok(read_stamp(db).await?);
     }
-    // An explicit flag must not load config. Asking a running daemon for the
-    // stamp goes through `load`, so try the directory first and only then
-    // the daemon, when the directory open is the one the daemon holds.
-    if flag.is_some() {
-        read_stamp_off_daemon(memory_dir).await
-    } else {
-        read_embedded_stamp(memory_dir).await
+    // SurrealKV has no read-only open: `store::open` rewrites sstables. The
+    // stamp is taken from a daemon that already holds the store. With no
+    // daemon it stays unknown, and the flag plus the config decide. A later
+    // write still refuses on the open connection.
+    match crate::serve_client::daemon_info(memory_dir).await? {
+        Some(info) => Ok(info.pipeline_stamp.as_choice()),
+        None => Ok(None),
     }
 }
 
-/// The pipeline stamp on `memory_dir/graph`, if that directory is a store.
+/// Skip a v1 sync that would write entities or edges into a v2 store.
 ///
-/// A running daemon owns the file lock, so the stamp is read from the daemon
-/// when one is up. A directory with no SurrealKV manifest is not a store:
-/// this returns [`None`] and does not create one.
-pub(crate) async fn read_embedded_stamp(memory_dir: &Path) -> Result<Option<String>, RecallError> {
-    let graph = memory_dir.join("graph");
-    if !super::store::has_kv_manifest(&graph) {
-        return Ok(None);
-    }
-    if let Some(info) = crate::serve_client::daemon_info(memory_dir).await? {
-        return Ok(info.pipeline_stamp);
-    }
-    Ok(read_stamp(&super::store::open(&graph).await?).await?)
-}
-
-/// Like [`read_embedded_stamp`], without loading config unless the store is locked.
-async fn read_stamp_off_daemon(memory_dir: &Path) -> Result<Option<String>, RecallError> {
-    let graph = memory_dir.join("graph");
-    if !super::store::has_kv_manifest(&graph) {
-        return Ok(None);
-    }
-    match super::store::open(&graph).await {
-        Ok(db) => Ok(read_stamp(&db).await?),
-        Err(GraphError::Locked(message)) => {
-            match crate::serve_client::daemon_info(memory_dir).await? {
-                Some(info) => Ok(info.pipeline_stamp),
-                None => Err(GraphError::Locked(message).into()),
-            }
+/// `Ok(None)` means the sync may proceed. `Ok(Some(message))` means it was
+/// skipped: the message is logged, and the caller records it and writes nothing.
+pub(crate) async fn v1_sync_block(
+    gm: &GraphMemory,
+    what: &str,
+) -> Result<Option<String>, GraphError> {
+    match refuse_v1_write(gm).await {
+        Ok(()) => Ok(None),
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!("recall-echo: {what} skipped: {message}");
+            Ok(Some(message))
         }
-        Err(err) => Err(err.into()),
     }
 }
 
@@ -452,10 +436,14 @@ mod tests {
             assert_eq!(read_stamp(gm.db()).await.unwrap().as_deref(), Some("v2"));
         }
         assert_eq!(std::fs::read(&archive).unwrap(), body);
-        let err = chosen_pipeline(tmp.path(), Some(PipelineVersion::V1), None)
+        // No daemon and no open connection: the stamp is not read by opening
+        // the store, so the flag stands. The writer refuses once something opens it.
+        let files = list_files(&tmp.path().join("graph"));
+        let version = chosen_pipeline(tmp.path(), Some(PipelineVersion::V1), None)
             .await
-            .expect_err("refused from disk");
-        assert!(err.to_string().contains(V1_REFUSAL), "{err}");
+            .unwrap();
+        assert_eq!(version, PipelineVersion::V1);
+        assert_eq!(list_files(&tmp.path().join("graph")), files);
         assert_eq!(std::fs::read(&archive).unwrap(), body);
     }
 
@@ -523,8 +511,6 @@ mod tests {
         let before = list_files(&graph);
         let version = chosen_pipeline(tmp.path(), None, None).await.unwrap();
         assert_eq!(version, PipelineVersion::V1);
-        assert_eq!(list_files(&graph), before);
-        assert!(read_embedded_stamp(tmp.path()).await.unwrap().is_none());
         assert_eq!(list_files(&graph), before);
     }
 }

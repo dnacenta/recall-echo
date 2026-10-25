@@ -70,6 +70,18 @@ pub(crate) fn deserialize_take_opt<T: serde::de::DeserializeOwned>(
     Ok(values.into_iter().next())
 }
 
+/// `meta:pipeline` for this open connection.
+///
+/// Unread until the first guarded write or hello. [`v2::ensure_v2_store`]
+/// fills it when it stamps, so a later write sees v2 without another query.
+/// The stamp cannot change under a live daemon except through that helper:
+/// a rebuild stops the daemon before it swaps the directory.
+#[derive(Clone)]
+enum StampCache {
+    Unread,
+    Ready(Option<String>),
+}
+
 /// The main entry point for graph memory operations.
 pub struct GraphMemory {
     db: Surreal<Db>,
@@ -78,6 +90,7 @@ pub struct GraphMemory {
     scoring: crate::config::GraphScoringConfig,
     provenance: confidence::ProvenanceWeights,
     dedup: crate::config::GraphDedupConfig,
+    pipeline_stamp: std::sync::Mutex<StampCache>,
 }
 
 impl GraphMemory {
@@ -126,6 +139,7 @@ impl GraphMemory {
             scoring: graph_config.scoring,
             provenance: graph_config.provenance,
             dedup: graph_config.dedup,
+            pipeline_stamp: std::sync::Mutex::new(StampCache::Unread),
         })
     }
 
@@ -200,6 +214,7 @@ impl GraphMemory {
             scoring: crate::config::GraphScoringConfig::default(),
             provenance: confidence::ProvenanceWeights::default(),
             dedup: crate::config::GraphDedupConfig::default(),
+            pipeline_stamp: std::sync::Mutex::new(StampCache::Unread),
         })
     }
 
@@ -228,6 +243,32 @@ impl GraphMemory {
         &self.db
     }
 
+    /// The pipeline stamp, read once per open and then remembered.
+    pub(crate) async fn cached_pipeline_stamp(&self) -> Result<Option<String>, GraphError> {
+        if let StampCache::Ready(stamp) = self
+            .pipeline_stamp
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            return Ok(stamp);
+        }
+        let stamp = v2::read_stamp(&self.db).await?;
+        *self
+            .pipeline_stamp
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = StampCache::Ready(stamp.clone());
+        Ok(stamp)
+    }
+
+    /// Record a stamp this connection just wrote, so the next guard sees it.
+    pub(crate) fn remember_pipeline_stamp(&self, stamp: Option<String>) {
+        *self
+            .pipeline_stamp
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = StampCache::Ready(stamp);
+    }
+
     /// Re-run schema migrations against the open store.
     ///
     /// Opening already migrates, so on a healthy store this reports a no-op.
@@ -253,7 +294,13 @@ impl GraphMemory {
     // --- Entity CRUD ---
 
     /// Add a new entity to the graph.
+    ///
+    /// A v1-shaped entity (no `attributes.v2` record) is refused on a store
+    /// stamped v2. The v2 writer sets that record, so its own creates proceed.
     pub async fn add_entity(&self, entity: NewEntity) -> Result<Entity, GraphError> {
+        if !v2::carries_v2_record(&entity.attributes) {
+            v2::refuse_v1_write(self).await?;
+        }
         crud::add_entity(&self.db, self.embedder.get()?, entity).await
     }
 
@@ -279,6 +326,7 @@ impl GraphMemory {
         id: &str,
         updates: EntityUpdate,
     ) -> Result<Entity, GraphError> {
+        v2::refuse_v1_write(self).await?;
         crud::update_entity(&self.db, self.embedder.get()?, id, updates).await
     }
 
@@ -298,7 +346,10 @@ impl GraphMemory {
     // --- Relationships ---
 
     /// Create a relationship between two named entities.
+    ///
+    /// v2 edges are written by the v2 session writer, not this function.
     pub async fn add_relationship(&self, rel: NewRelationship) -> Result<Relationship, GraphError> {
+        v2::refuse_v1_write(self).await?;
         crud::add_relationship(&self.db, rel).await
     }
 
@@ -317,6 +368,7 @@ impl GraphMemory {
         old_id: &str,
         new: NewRelationship,
     ) -> Result<Relationship, GraphError> {
+        v2::refuse_v1_write(self).await?;
         crud::supersede_relationship(&self.db, old_id, new).await
     }
 
