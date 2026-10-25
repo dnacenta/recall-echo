@@ -197,10 +197,17 @@ pub(crate) async fn extract_session(
     let facts = dedupe_facts(facts);
 
     if !facts.is_empty() {
-        let stats = write::write_facts(gm, ctx.session_id(), &session.date, &facts).await?;
+        let write_ctx = write::WriteCtx {
+            llm,
+            project: &session.project,
+            session_id: ctx.session_id(),
+            date: &session.date,
+        };
+        let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         report.entities_created = stats.entities_created;
         report.relationships_created = stats.edges;
         report.slots_written = stats.slots;
+        report.llm_calls += stats.resolver_calls;
     }
     Ok(report)
 }
@@ -308,6 +315,7 @@ fn accept_item(
 fn accept_fact(object: &Map<String, Value>, session: &SessionInput) -> Result<Fact, &'static str> {
     let mention = mention_from(object, &session.turns)?;
     let mut fact = remap(mention)?;
+    fact.replaces = text(object, "replaces")?.trim().to_string();
     map_subject(&mut fact, &session.project);
     filter_fact(&fact)?;
     recite(&mut fact, &session.turns)?;
@@ -482,6 +490,7 @@ fn carrier(
         quote: text(object, "quote")?.to_string(),
         confidence,
         provenance: role_at(turn, turns),
+        replaces: String::new(),
     })
 }
 
@@ -499,6 +508,7 @@ fn slot_fact(subject: &str, kind: Kind, predicate: Predicate, value: &str, carri
         quote: carrier.quote.clone(),
         confidence: carrier.confidence,
         provenance: carrier.provenance,
+        replaces: String::new(),
     }
 }
 
@@ -523,6 +533,7 @@ fn edge_fact(
         quote: carrier.quote.clone(),
         confidence: carrier.confidence,
         provenance: carrier.provenance,
+        replaces: String::new(),
     }
 }
 

@@ -336,6 +336,12 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS timestamp      ON contributed_to TYPE datetime DEFAULT time::now();
 
         DEFINE INDEX IF NOT EXISTS ct_session ON contributed_to FIELDS session_id;
+
+        DEFINE TABLE IF NOT EXISTS alias SCHEMAFULL;
+        DEFINE FIELD IF NOT EXISTS name_folded ON alias TYPE string;
+        DEFINE FIELD IF NOT EXISTS entity ON alias TYPE record<entity>;
+        DEFINE FIELD IF NOT EXISTS created ON alias TYPE datetime DEFAULT time::now();
+        DEFINE INDEX IF NOT EXISTS alias_name ON alias FIELDS name_folded UNIQUE;
         "#,
     )
     .await?

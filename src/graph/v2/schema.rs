@@ -256,6 +256,9 @@ pub(crate) struct Fact {
     pub quote: String,
     pub confidence: f64,
     pub provenance: TurnRole,
+    /// The value this fact replaces, when the model named one. Empty when
+    /// it does not. A name that appears only here is not an entity.
+    pub replaces: String,
 }
 
 /// A model mention, before the remap table runs.
@@ -409,6 +412,7 @@ fn finish(mention: Mention) -> Fact {
         quote: mention.quote,
         confidence: mention.confidence,
         provenance: mention.provenance,
+        replaces: String::new(),
     }
 }
 
@@ -904,6 +908,7 @@ mod tests {
             quote: quote.into(),
             confidence: 0.9,
             provenance: role,
+            replaces: String::new(),
         }
     }
 
@@ -1006,6 +1011,7 @@ mod tests {
             quote: "quote".into(),
             confidence: 0.9,
             provenance: TurnRole::User,
+            replaces: String::new(),
         }
     }
 }
