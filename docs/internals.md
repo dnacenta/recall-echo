@@ -79,7 +79,9 @@ the human's words from the agent's; `graph ingest --external` marks genuinely ex
 material. Self-corroboration is also tallied separately on the edge, so coherence never
 passes for evidence.
 
-**Extraction.** An LLM pipeline chunks the text (~500 tokens), extracts entities and
+**Extraction.** Pipeline v2 checks every candidate through the grounding gates
+before it writes; the rules are in [grounding.md](grounding.md). The default
+pipeline chunks the text (~500 tokens), extracts entities and
 relationships in parallel (up to 10 at once), then deduplicates sequentially. Dedup asks
 the model only about what it cannot settle itself: an existing entity of the same name
 and type is the same entity, a nearest neighbour at or above `certain_similarity` is the

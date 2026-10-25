@@ -103,7 +103,8 @@ pub enum Provenance {
     /// The agent's own summaries, reflections and re-assertions — and the
     /// default for anything unlabelled, so unknown evidence never earns full
     /// weight. Pipeline v2 also uses this for a fact that is not quotable
-    /// from one turn.
+    /// from one turn, including a bug symptom the cited turn does not support
+    /// and an earlier turn of the same session does.
     #[default]
     #[serde(rename = "self")]
     SelfGenerated,
