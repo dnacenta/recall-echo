@@ -10,7 +10,8 @@
 
 pub(crate) mod input;
 pub(crate) mod pass1;
-mod schema;
+pub(crate) mod resolve;
+pub(crate) mod schema;
 mod write;
 
 use super::error::GraphError;

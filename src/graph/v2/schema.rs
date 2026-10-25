@@ -24,6 +24,7 @@ pub(crate) const DROP_VERSION: &str = "bad_version";
 pub(crate) const DROP_PARSE: &str = "parse";
 pub(crate) const DROP_TOO_LONG: &str = "too_long";
 pub(crate) const DROP_OVERFLOW: &str = "overflow";
+pub(crate) const DROP_UNRESOLVED: &str = "unresolved";
 
 /// Confidence below this is not a durable fact.
 const MIN_CONFIDENCE: f64 = 0.6;
@@ -256,6 +257,9 @@ pub(crate) struct Fact {
     pub quote: String,
     pub confidence: f64,
     pub provenance: TurnRole,
+    /// The value this fact replaces, when the model named one. Empty when
+    /// it does not. A name that appears only here is not an entity.
+    pub replaces: String,
 }
 
 /// A model mention, before the remap table runs.
@@ -409,6 +413,7 @@ fn finish(mention: Mention) -> Fact {
         quote: mention.quote,
         confidence: mention.confidence,
         provenance: mention.provenance,
+        replaces: String::new(),
     }
 }
 
@@ -904,6 +909,7 @@ mod tests {
             quote: quote.into(),
             confidence: 0.9,
             provenance: role,
+            replaces: String::new(),
         }
     }
 
@@ -1006,6 +1012,7 @@ mod tests {
             quote: "quote".into(),
             confidence: 0.9,
             provenance: TurnRole::User,
+            replaces: String::new(),
         }
     }
 }

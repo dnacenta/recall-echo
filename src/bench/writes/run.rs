@@ -168,6 +168,7 @@ async fn collect_sessions(
             candidates: report.candidates,
             kept: report.kept,
             drops: report.drops,
+            resolve: report.resolve,
         });
         before = after;
     }
@@ -793,6 +794,9 @@ impl LlmProvider for ScriptedExtractor {
         if system_prompt == crate::graph::v2::pass1::PASS1_SYSTEM {
             return self.v2_json(user_message);
         }
+        if system_prompt == crate::graph::v2::resolve::PASS2_SYSTEM {
+            return self.resolver_json(user_message);
+        }
         if system_prompt.contains(crate::graph::dedup::DEDUP_SYSTEM_PROMPT) {
             return Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string());
         }
@@ -1027,6 +1031,26 @@ impl ScriptedExtractor {
             "releases": releases,
         }))
         .map_err(crate::graph::error::GraphError::from)
+    }
+
+    /// The scripted resolver declines every mention. A real match is a tier
+    /// or a guard decision, never a fixture-tuned model answer.
+    fn resolver_json(&self, user_message: &str) -> Result<String, crate::graph::error::GraphError> {
+        let mut entities = Vec::new();
+        for line in user_message.lines() {
+            let Some(rest) = line.trim().strip_prefix("- \"") else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            entities.push(serde_json::json!({
+                "mention": &rest[..end],
+                "match_id": "",
+            }));
+        }
+        serde_json::to_string(&serde_json::json!({ "entities": entities }))
+            .map_err(crate::graph::error::GraphError::from)
     }
 }
 
@@ -1704,6 +1728,8 @@ mod tests {
         assert_eq!(report.calls, 14);
         assert_eq!(report.sessions.len(), 14);
         assert!(report.sessions.iter().all(|session| session.calls == 1));
+        // The resolver may add one call in a session that has a similar leftover.
+        assert!(report.sessions.iter().all(|session| session.calls <= 2));
         assert!(report.sessions.iter().all(|session| session.windows == 1));
         assert!(report
             .sessions
@@ -1761,6 +1787,14 @@ mod tests {
                 "linkshelf v0.3".to_string(),
                 "refresh rate limit".to_string(),
             ]
+        );
+        assert_eq!(
+            store
+                .names
+                .iter()
+                .filter(|name| name.as_str() == "linkshelf")
+                .count(),
+            1
         );
         assert_eq!(store.slots, 60, "slots {:?}", store.slot_predicates);
         let pred = |name: &str| {

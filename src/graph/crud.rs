@@ -705,6 +705,107 @@ pub async fn get_episode_by_log_number(
     deserialize_take_opt(&mut response, 0)
 }
 
+/// The entity a folded alias points at, if one was stored.
+///
+/// `name_folded` is the mention after v2 normalisation. The lookup is exact.
+pub async fn get_alias(db: &Surreal<Db>, name_folded: &str) -> Result<Option<String>, GraphError> {
+    let mut response = db
+        .query("SELECT entity FROM alias WHERE name_folded = $name LIMIT 1")
+        .bind(("name", name_folded.to_string()))
+        .await?;
+    let rows: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows.into_iter().find_map(|row| {
+        row.get("entity")
+            .and_then(alias_record_id)
+            .filter(|id| !id.is_empty())
+    }))
+}
+
+/// Every alias row, folded name then entity id.
+pub(crate) async fn list_aliases(db: &Surreal<Db>) -> Result<Vec<(String, String)>, GraphError> {
+    let mut response = db.query("SELECT name_folded, entity FROM alias").await?;
+    let rows: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    let mut aliases = Vec::new();
+    for row in rows {
+        let Some(name) = row.get("name_folded").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(entity) = row.get("entity").and_then(alias_record_id) else {
+            continue;
+        };
+        aliases.push((name.to_string(), entity));
+    }
+    aliases.sort();
+    Ok(aliases)
+}
+
+/// Remember that `name_folded` refers to `entity_id`.
+///
+/// A second write of the same pair does nothing, and a row that already
+/// exists is left in place. The unique `alias_name` index must not turn a
+/// retry of the session that wrote the alias into an error.
+pub async fn put_alias(
+    db: &Surreal<Db>,
+    name_folded: &str,
+    entity_id: &str,
+) -> Result<(), GraphError> {
+    if name_folded.is_empty() || entity_id.is_empty() {
+        return Ok(());
+    }
+    if get_alias(db, name_folded).await?.is_some() {
+        return Ok(());
+    }
+    let created = db
+        .query("CREATE alias SET name_folded = $name, entity = type::record($entity)")
+        .bind(("name", name_folded.to_string()))
+        .bind(("entity", entity_id.to_string()))
+        .await;
+    let response = match created {
+        Ok(response) => response,
+        Err(err) => return alias_write_error(db, name_folded, err).await,
+    };
+    if let Err(err) = response.check() {
+        return alias_write_error(db, name_folded, err).await;
+    }
+    Ok(())
+}
+
+async fn alias_write_error(
+    db: &Surreal<Db>,
+    name_folded: &str,
+    err: surrealdb::Error,
+) -> Result<(), GraphError> {
+    if get_alias(db, name_folded).await?.is_some() {
+        return Ok(());
+    }
+    Err(GraphError::Db(err))
+}
+
+fn alias_record_id(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(map) => {
+            let table = map.get("tb").and_then(serde_json::Value::as_str)?;
+            let id = map.get("id")?;
+            let id = match id {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Object(inner) => inner
+                    .get("String")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                other => other.to_string(),
+            };
+            if id.is_empty() {
+                None
+            } else {
+                Some(format!("{table}:{id}"))
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

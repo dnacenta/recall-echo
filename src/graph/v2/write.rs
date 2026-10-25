@@ -2,25 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Writes for the second pipeline: exact name-and-kind resolution, edges,
-//! slots, and reinforcement of an identical live fact.
+//! Writes for the second pipeline: resolved entities, edges, slots, and
+//! reinforcement of an identical live fact.
 //!
 //! Nothing here retires or contradicts an edge. A repeated fact from another
 //! sighting adds evidence and corroborates. The same session, turn and quote
 //! is already stored, so a retry does not corroborate it. That keeps the prior
 //! recovered from the edge's first β: the creating session never moves β.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
 use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Provenance};
-use super::super::crud;
 use super::super::error::GraphError;
+use super::super::llm::LlmProvider;
 use super::super::store::Db;
-use super::super::types::{Entity, EntityUpdate, NewEntity};
+use super::super::types::EntityUpdate;
 use super::super::{deserialize_take, GraphMemory};
-use super::input::TurnRole;
+use super::input::{ProjectIdentity, TurnRole};
+use super::resolve::{self, MentionDraft};
 use super::schema::{normalise, Fact, Kind};
 use surrealdb::Surreal;
 
@@ -30,7 +31,7 @@ pub(crate) const V2_REFUSAL: &str = "this graph was built by pipeline v1; re-ext
 const STAMP_V2: &str = "v2";
 
 /// What one batch of facts did to the store.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WriteStats {
     pub entities_created: u32,
     pub edges: u32,
@@ -38,6 +39,20 @@ pub(crate) struct WriteStats {
     pub reinforced: u32,
     /// The fact was already stored with this session, turn and quote.
     pub already_seen: u32,
+    /// Resolver calls made while binding mentions. Zero or one.
+    pub resolver_calls: u32,
+    /// Facts dropped because a mention had no binding. The session still writes.
+    pub unresolved: u32,
+    /// Tier hits and rejected resolver proposals for this batch.
+    pub resolve: resolve::ResolveReport,
+}
+
+/// What one session's write needs besides the facts.
+pub(crate) struct WriteCtx<'a> {
+    pub llm: &'a dyn LlmProvider,
+    pub project: &'a ProjectIdentity,
+    pub session_id: &'a str,
+    pub date: &'a str,
 }
 
 /// Refuse a store this pipeline must not write, otherwise stamp it `v2`.
@@ -98,16 +113,73 @@ fn json_u64(value: &Value) -> Option<u64> {
 /// Resolve every fact and write the edge or slot it asks for.
 pub(crate) async fn write_facts(
     gm: &GraphMemory,
-    session_id: &str,
-    date: &str,
+    ctx: &WriteCtx<'_>,
     facts: &[Fact],
 ) -> Result<WriteStats, GraphError> {
-    let mut stats = WriteStats::default();
-    let mut catalog = Catalog::load(gm).await?;
+    let resolution = resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?;
+    let mut stats = WriteStats {
+        entities_created: resolution.entities_created,
+        resolver_calls: resolution.report.resolver_called,
+        resolve: resolution.report.clone(),
+        ..WriteStats::default()
+    };
+    let mut catalog = Catalog::from_resolution(&resolution);
     for fact in facts {
-        write_one(gm, &mut catalog, session_id, date, fact, &mut stats).await?;
+        write_one(gm, &mut catalog, ctx.session_id, ctx.date, fact, &mut stats).await?;
     }
     Ok(stats)
+}
+
+fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
+    let mut drafts = Vec::new();
+    let mut creating = HashSet::new();
+    for fact in facts {
+        if push_endpoint(&mut drafts, &fact.subject_name, fact.subject_kind, fact) {
+            creating.insert(normalise(&fact.subject_name));
+        }
+        if fact.predicate.is_edge() {
+            let kind = fact.object_kind.unwrap_or(Kind::Technology);
+            if push_endpoint(&mut drafts, &fact.object_name, kind, fact) {
+                creating.insert(normalise(&fact.object_name));
+            }
+        } else if let Some(kind) = fact.object_kind {
+            if push_endpoint(&mut drafts, &fact.object_name, kind, fact) {
+                creating.insert(normalise(&fact.object_name));
+            }
+        }
+    }
+    for fact in facts {
+        let folded = normalise(&fact.replaces);
+        if folded.is_empty() || !creating.insert(folded) {
+            continue;
+        }
+        drafts.push(mention_draft(
+            fact.replaces.trim(),
+            Kind::Technology,
+            fact,
+            false,
+        ));
+    }
+    drafts
+}
+
+fn push_endpoint(drafts: &mut Vec<MentionDraft>, name: &str, kind: Kind, fact: &Fact) -> bool {
+    if normalise(name).is_empty() {
+        return false;
+    }
+    drafts.push(mention_draft(name.trim(), kind, fact, true));
+    true
+}
+
+fn mention_draft(name: &str, kind: Kind, fact: &Fact, creates: bool) -> MentionDraft {
+    MentionDraft {
+        name: name.to_string(),
+        kind,
+        subject: fact.subject_name.clone(),
+        predicate: fact.predicate.as_str().to_string(),
+        object: fact.object_name.clone(),
+        creates,
+    }
 }
 
 async fn write_one(
@@ -118,17 +190,34 @@ async fn write_one(
     fact: &Fact,
     stats: &mut WriteStats,
 ) -> Result<(), GraphError> {
-    let subject = catalog
-        .resolve(gm, &fact.subject_name, fact.subject_kind, stats)
-        .await?;
+    let Some(subject) = bound(catalog, &fact.subject_name, fact.subject_kind, stats)? else {
+        return Ok(());
+    };
     if fact.predicate.is_edge() {
         let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
-        let object = catalog
-            .resolve(gm, &fact.object_name, object_kind, stats)
-            .await?;
+        let Some(object) = bound(catalog, &fact.object_name, object_kind, stats)? else {
+            return Ok(());
+        };
         write_edge(gm, session_id, fact, &subject, &object, stats).await
     } else {
         write_slot(gm, catalog, session_id, date, fact, &subject, stats).await
+    }
+}
+
+/// A missing binding drops this fact. Any other error still fails the session.
+fn bound(
+    catalog: &Catalog,
+    name: &str,
+    kind: Kind,
+    stats: &mut WriteStats,
+) -> Result<Option<Stored>, GraphError> {
+    match catalog.get(name, kind) {
+        Ok(stored) => Ok(Some(stored)),
+        Err(GraphError::NotFound(_)) => {
+            stats.unresolved += 1;
+            Ok(None)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -498,168 +587,53 @@ struct StoredEdge {
 #[derive(Debug, Clone)]
 struct Stored {
     id: String,
-    name: String,
-    kind: Kind,
     attributes: Value,
 }
 
 struct Catalog {
-    by_name: HashMap<String, Vec<Stored>>,
+    by_id: HashMap<String, Stored>,
+    binding: HashMap<(String, Kind), String>,
 }
 
 impl Catalog {
-    async fn load(gm: &GraphMemory) -> Result<Self, GraphError> {
-        let entities = crud::list_entities(gm.db(), None).await?;
-        let mut by_name: HashMap<String, Vec<Stored>> = HashMap::new();
-        for entity in entities {
-            if let Some(stored) = stored_from(&entity) {
-                by_name
-                    .entry(normalise(&stored.name))
-                    .or_default()
-                    .push(stored);
-            }
+    fn from_resolution(resolution: &resolve::Resolution) -> Self {
+        let mut by_id = HashMap::new();
+        let mut binding = HashMap::new();
+        for item in &resolution.bindings {
+            binding.insert((item.norm.clone(), item.kind), item.entity.id.clone());
+            by_id.insert(
+                item.entity.id.clone(),
+                Stored {
+                    id: item.entity.id.clone(),
+                    attributes: item.entity.attributes.clone(),
+                },
+            );
         }
-        Ok(Self { by_name })
+        Self { by_id, binding }
     }
 
-    async fn resolve(
-        &mut self,
-        gm: &GraphMemory,
-        name: &str,
-        kind: Kind,
-        stats: &mut WriteStats,
-    ) -> Result<Stored, GraphError> {
-        let norm = normalise(name);
-        if let Some(existing) = self.same(&norm, kind) {
-            return Ok(existing);
-        }
-        if let Some(lower) = self.highest_lower(&norm, kind) {
-            return self.upgrade(gm, &norm, lower, kind).await;
-        }
-        self.create(gm, name.trim(), kind, stats).await
-    }
-
-    fn same(&self, norm: &str, kind: Kind) -> Option<Stored> {
-        self.by_name
-            .get(norm)
-            .and_then(|group| group.iter().find(|stored| stored.kind == kind))
+    fn get(&self, name: &str, kind: Kind) -> Result<Stored, GraphError> {
+        let id = self
+            .binding
+            .get(&(normalise(name), kind))
+            .ok_or_else(|| GraphError::NotFound(format!("no resolved entity for {name}")))?;
+        self.by_id
+            .get(id)
             .cloned()
-    }
-
-    fn highest_lower(&self, norm: &str, kind: Kind) -> Option<Kind> {
-        self.by_name.get(norm).and_then(|group| {
-            group
-                .iter()
-                .filter(|stored| stored.kind.priority() < kind.priority())
-                .max_by_key(|stored| stored.kind.priority())
-                .map(|stored| stored.kind)
-        })
-    }
-
-    async fn upgrade(
-        &mut self,
-        gm: &GraphMemory,
-        norm: &str,
-        from: Kind,
-        to: Kind,
-    ) -> Result<Stored, GraphError> {
-        let current = self
-            .same(norm, from)
-            .ok_or_else(|| GraphError::NotFound(format!("no {from:?} entity to upgrade")))?;
-        let mut attributes = current.attributes.clone();
-        if let Ok(v2) = v2_map(&mut attributes) {
-            v2.insert("kind".into(), json!(to.as_str()));
-        }
-        let mutable = to.entity_type().is_mutable();
-        gm.db()
-            .query(
-                "UPDATE type::record($id) SET entity_type = $entity_type, mutable = $mutable, attributes = $attributes, updated_at = time::now()",
-            )
-            .bind(("id", current.id.clone()))
-            .bind(("entity_type", to.entity_type().to_string()))
-            .bind(("mutable", mutable))
-            .bind(("attributes", attributes.clone()))
-            .await?
-            .check()?;
-        let upgraded = Stored {
-            id: current.id.clone(),
-            name: current.name.clone(),
-            kind: to,
-            attributes,
-        };
-        if let Some(group) = self.by_name.get_mut(norm) {
-            group.retain(|stored| stored.id != current.id);
-            group.push(upgraded.clone());
-        }
-        Ok(upgraded)
-    }
-
-    async fn create(
-        &mut self,
-        gm: &GraphMemory,
-        name: &str,
-        kind: Kind,
-        stats: &mut WriteStats,
-    ) -> Result<Stored, GraphError> {
-        let attributes = json!({
-            "v2": { "kind": kind.as_str(), "slots": [] }
-        });
-        let entity = gm
-            .add_entity(NewEntity {
-                name: name.to_string(),
-                entity_type: kind.entity_type(),
-                abstract_text: format!("{} {name}", kind.as_str()),
-                overview: None,
-                content: None,
-                attributes: Some(attributes.clone()),
-                source: None,
-            })
-            .await?;
-        stats.entities_created += 1;
-        let stored = Stored {
-            id: entity.id_string(),
-            name: entity.name.clone(),
-            kind,
-            attributes,
-        };
-        self.by_name
-            .entry(normalise(&stored.name))
-            .or_default()
-            .push(stored.clone());
-        Ok(stored)
+            .ok_or_else(|| GraphError::NotFound(id.clone()))
     }
 
     fn set_attributes(&mut self, id: &str, attributes: Value) {
-        for group in self.by_name.values_mut() {
-            for stored in group {
-                if stored.id == id {
-                    stored.attributes = attributes;
-                    return;
-                }
-            }
+        if let Some(stored) = self.by_id.get_mut(id) {
+            stored.attributes = attributes;
         }
     }
-}
-
-fn stored_from(entity: &Entity) -> Option<Stored> {
-    let kind = entity
-        .attributes
-        .as_ref()
-        .and_then(|attrs| attrs.get("v2"))
-        .and_then(|v2| v2.get("kind"))
-        .and_then(Value::as_str)
-        .and_then(Kind::parse)?;
-    Some(Stored {
-        id: entity.id_string(),
-        name: entity.name.clone(),
-        kind,
-        attributes: entity.attributes.clone().unwrap_or_else(|| json!({})),
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::crud;
     use crate::graph::v2::schema::{remap, Fact, Kind, Mention, Predicate, Role};
 
     fn setting(value: &str) -> Fact {
@@ -702,7 +676,9 @@ mod tests {
         let (_tmp, gm) = open_store().await;
         let fact = setting("9000");
         assert_eq!(fact.predicate, Predicate::Setting);
-        write_facts(&gm, "s1", "2026-01-02", &[fact]).await.unwrap();
+        write_session(&gm, "s1", "2026-01-02", &[fact])
+            .await
+            .unwrap();
 
         let entities = crud::list_entities(gm.db(), None).await.unwrap();
         assert!(
@@ -736,12 +712,12 @@ mod tests {
         let (_tmp, gm) = open_store().await;
         let slot = setting("redis");
         let edge = uses_edge();
-        write_facts(&gm, "s1", "2026-01-02", &[slot.clone(), edge.clone()])
+        write_session(&gm, "s1", "2026-01-02", &[slot.clone(), edge.clone()])
             .await
             .unwrap();
         // A later session is a new sighting. The same session is covered by
         // `retry_of_the_creating_session_does_not_corroborate`.
-        let again = write_facts(&gm, "s2", "2026-01-03", &[slot, edge])
+        let again = write_session(&gm, "s2", "2026-01-03", &[slot, edge])
             .await
             .unwrap();
         assert_eq!(again.reinforced, 2);
@@ -776,10 +752,14 @@ mod tests {
     async fn retry_of_the_creating_session_does_not_corroborate() {
         let (_tmp, gm) = open_store().await;
         let facts = [setting("redis"), uses_edge()];
-        write_facts(&gm, "s1", "2026-01-02", &facts).await.unwrap();
+        write_session(&gm, "s1", "2026-01-02", &facts)
+            .await
+            .unwrap();
         let before = stored_belief(&gm).await;
 
-        let retry = write_facts(&gm, "s1", "2026-01-02", &facts).await.unwrap();
+        let retry = write_session(&gm, "s1", "2026-01-02", &facts)
+            .await
+            .unwrap();
         assert_eq!(retry.already_seen, 2);
         assert_eq!(retry.reinforced, 0);
         assert_eq!(retry.slots, 0);
@@ -860,6 +840,41 @@ mod tests {
         super::super::schema::looks_literal(name)
     }
 
+    /// These writes hit a fresh store or an exact name, so the resolver is never asked.
+    struct Quiet;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Quiet {
+        async fn complete(
+            &self,
+            _system_prompt: &str,
+            _user_message: &str,
+            _max_tokens: u32,
+        ) -> Result<String, GraphError> {
+            panic!("resolver called");
+        }
+    }
+
+    async fn write_session(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        facts: &[Fact],
+    ) -> Result<WriteStats, GraphError> {
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let ctx = WriteCtx {
+            llm: &llm,
+            project: &project,
+            session_id,
+            date,
+        };
+        write_facts(gm, &ctx, facts).await
+    }
+
     #[cfg(feature = "embedded")]
     #[tokio::test]
     async fn v1_stamped_store_refused() {
@@ -895,5 +910,70 @@ mod tests {
         assert_eq!(read_stamp(gm.db()).await.unwrap().as_deref(), Some("v2"));
         // A second pass does not refuse a store this pipeline already stamped.
         ensure_v2_store(&gm).await.unwrap();
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn literal_object_edges_become_technology() {
+        let (_tmp, gm) = open_store().await;
+        let facts = [
+            raw_edge(Predicate::PartOf, "api", Kind::Component, "linkshelf"),
+            raw_edge(Predicate::DependsOn, "worker", Kind::Component, "queue"),
+            raw_edge(Predicate::WorksOn, "ada", Kind::Person, "release-bot"),
+        ];
+        let stats = write_session(&gm, "s1", "2026-01-02", &facts)
+            .await
+            .unwrap();
+        assert_eq!(stats.edges, 3);
+        assert_eq!(stats.unresolved, 0);
+        for name in ["linkshelf", "queue", "release-bot"] {
+            let entity = crud::list_entities(gm.db(), None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let kind = entity
+                .attributes
+                .as_ref()
+                .unwrap()
+                .pointer("/v2/kind")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(kind, Some("technology"), "{name}");
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_missing_binding_drops_one_fact() {
+        let (_tmp, gm) = open_store().await;
+        let mut blank = setting("9000");
+        blank.subject_name = "   ".into();
+        blank.quote = "blank subject".into();
+        let stats = write_session(&gm, "s1", "2026-01-02", &[blank, setting("redis")])
+            .await
+            .unwrap();
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(stats.slots, 1);
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert!(entities.iter().any(|entity| entity.name == "app"));
+    }
+
+    fn raw_edge(predicate: Predicate, subject: &str, subject_kind: Kind, object: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind,
+            predicate,
+            role: None,
+            key: String::new(),
+            object_name: object.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 1,
+            quote: format!("{subject} links {object}"),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+            replaces: String::new(),
+        }
     }
 }

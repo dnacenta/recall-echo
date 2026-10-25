@@ -25,7 +25,7 @@ use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
     affects_target, filter_fact, map_subject, over_long, recite, release_name, remap, Fact, Kind,
     Mention, Predicate, Role, DROP_CONFIDENCE, DROP_OVERFLOW, DROP_PARSE, DROP_TOO_LONG,
-    DROP_VERSION, MAX_ITEMS,
+    DROP_UNRESOLVED, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 
@@ -197,10 +197,21 @@ pub(crate) async fn extract_session(
     let facts = dedupe_facts(facts);
 
     if !facts.is_empty() {
-        let stats = write::write_facts(gm, ctx.session_id(), &session.date, &facts).await?;
+        let write_ctx = write::WriteCtx {
+            llm,
+            project: &session.project,
+            session_id: ctx.session_id(),
+            date: &session.date,
+        };
+        let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         report.entities_created = stats.entities_created;
         report.relationships_created = stats.edges;
         report.slots_written = stats.slots;
+        report.llm_calls += stats.resolver_calls;
+        report.resolve = stats.resolve;
+        if stats.unresolved > 0 {
+            *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
+        }
     }
     Ok(report)
 }
@@ -308,6 +319,12 @@ fn accept_item(
 fn accept_fact(object: &Map<String, Value>, session: &SessionInput) -> Result<Fact, &'static str> {
     let mention = mention_from(object, &session.turns)?;
     let mut fact = remap(mention)?;
+    fact.replaces = object
+        .get("replaces")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     map_subject(&mut fact, &session.project);
     filter_fact(&fact)?;
     recite(&mut fact, &session.turns)?;
@@ -482,6 +499,7 @@ fn carrier(
         quote: text(object, "quote")?.to_string(),
         confidence,
         provenance: role_at(turn, turns),
+        replaces: String::new(),
     })
 }
 
@@ -499,6 +517,7 @@ fn slot_fact(subject: &str, kind: Kind, predicate: Predicate, value: &str, carri
         quote: carrier.quote.clone(),
         confidence: carrier.confidence,
         provenance: carrier.provenance,
+        replaces: String::new(),
     }
 }
 
@@ -523,6 +542,7 @@ fn edge_fact(
         quote: carrier.quote.clone(),
         confidence: carrier.confidence,
         provenance: carrier.provenance,
+        replaces: String::new(),
     }
 }
 
@@ -663,10 +683,12 @@ fn object_matches(object: &Map<String, Value>, schema: &Value) -> bool {
         .and_then(Value::as_array)
         .map(|items| items.as_slice())
         .unwrap_or(&[]);
-    if required
-        .iter()
-        .any(|name| name.as_str().is_none_or(|name| !object.contains_key(name)))
-    {
+    if required.iter().any(|name| {
+        // `replaces` stays in the schema the provider is asked for. A reply
+        // that omits it is still the fact: the writer treats absence as "".
+        name.as_str()
+            .is_none_or(|name| name != "replaces" && !object.contains_key(name))
+    }) {
         return false;
     }
     object.iter().all(|(key, value)| {
@@ -826,6 +848,19 @@ mod tests {
         assert_eq!(facts[0].turn, 0);
         assert_eq!(facts[0].provenance, TurnRole::User);
         assert_eq!(facts[0].predicate, Predicate::Setting);
+
+        let mut bare = fact_json(0, "Ship the shelf.");
+        bare.as_object_mut().expect("object").remove("replaces");
+        let reply = serde_json::json!({
+            "facts": [bare],
+            "bugs": [],
+            "releases": []
+        });
+        let reply = reply.as_object().expect("object").clone();
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(&reply, &session(turns()), &mut report);
+        assert_eq!(facts.len(), 1, "a reply without replaces is kept");
+        assert!(facts[0].replaces.is_empty());
         assert_eq!(facts[0].key, "port");
         assert_eq!(facts[0].object_name, "9000");
 
