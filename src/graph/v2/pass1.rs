@@ -874,10 +874,11 @@ fn value_matches(value: &Value, schema: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::types::IngestionReport;
     use crate::graph::v2::input::{ProjectIdentity, Turn, TurnRole};
     use crate::graph::v2::schema::{
-        Kind, Predicate, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG, DROP_VALUE_SUPPORT,
-        DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
+        Fact, Kind, Predicate, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG,
+        DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
     };
     use crate::graph::Provenance;
     use serde_json::Value;
@@ -1844,6 +1845,74 @@ mod tests {
             Some(1)
         );
         assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn agreement_citation_survives_the_gates() {
+        let quote = "9123 is good.";
+        let kept_turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: quote.into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Default port is now 9123.".into(),
+            },
+        ];
+        let (facts, report) = grade_port(&kept_turns, 0, quote, "9123");
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        assert_eq!(facts[0].key, "port");
+        assert_eq!(facts[0].object_name, "9123");
+        assert_eq!(facts[0].turn, 0);
+        assert_eq!(facts[0].quote, quote);
+        assert_eq!(facts[0].provenance, Provenance::User);
+        assert_eq!(report.kept, 1);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+
+        let dropped_turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: quote.into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Port 9123 is taken, so I used 9124.".into(),
+            },
+        ];
+        let (facts, report) = grade_port(&dropped_turns, 0, quote, "9123");
+        assert!(facts.is_empty());
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    fn grade_port(
+        turns: &[Turn],
+        turn: usize,
+        quote: &str,
+        value: &str,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let mut item = fact_json(turn, quote);
+        let object = item.as_object_mut().expect("fact");
+        object.insert("key".into(), Value::String("port".into()));
+        object.insert("object".into(), Value::String(value.into()));
+        let reply = serde_json::json!({
+            "facts": [item],
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("reply"),
+            &session(turns.to_vec()),
+            &mut report,
+        );
+        (facts, report)
     }
 
     #[cfg(feature = "embedded")]
