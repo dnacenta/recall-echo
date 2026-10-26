@@ -222,6 +222,9 @@ pub(crate) async fn extract_session(
         report.resolve = stats.resolve;
         report.retirements = stats.retirements;
         report.retirements_skipped = stats.retirements_skipped;
+        if let Some(usage) = stats.usage {
+            record_sides(&mut report, usage);
+        }
         if stats.unresolved > 0 {
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }
@@ -272,7 +275,10 @@ async fn call_window(
 
 fn bill(report: &mut IngestionReport, usage: Option<TokenUsage>, message: &str, reply: &str) {
     match usage {
-        Some(usage) => report.measured_tokens += usage.total(),
+        Some(usage) => {
+            report.measured_tokens += usage.total();
+            record_sides(report, usage);
+        }
         None => {
             let chars = PASS1_SYSTEM.len()
                 + PASS1_EXAMPLE_USER.len()
@@ -282,6 +288,22 @@ fn bill(report: &mut IngestionReport, usage: Option<TokenUsage>, message: &str, 
             report.estimated_tokens += u64::try_from(chars / 4).unwrap_or(0);
         }
     }
+}
+
+/// Add one reported call. An unreported side arrives as zero, and that zero is summed.
+fn record_sides(report: &mut IngestionReport, usage: TokenUsage) {
+    report.input_tokens = Some(
+        report
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.input_tokens),
+    );
+    report.output_tokens = Some(
+        report
+            .output_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.output_tokens),
+    );
 }
 
 /// The first JSON object, salvaged when the reply was cut off, then checked
@@ -1403,6 +1425,47 @@ mod tests {
             report.estimated_tokens,
             u64::try_from(chars / 4).unwrap_or(0)
         );
+    }
+
+    #[test]
+    fn bill_adds_input_and_output_separately() {
+        let mut both = IngestionReport::default();
+        bill(
+            &mut both,
+            TokenUsage::from_counts(Some(3), Some(5)),
+            "m",
+            "r",
+        );
+        bill(
+            &mut both,
+            TokenUsage::from_counts(Some(2), Some(1)),
+            "m",
+            "r",
+        );
+        assert_eq!(
+            (
+                both.input_tokens,
+                both.output_tokens,
+                both.measured_tokens,
+                both.estimated_tokens
+            ),
+            (Some(5), Some(6), 11, 0)
+        );
+
+        let mut one = IngestionReport::default();
+        bill(&mut one, TokenUsage::from_counts(None, Some(4)), "m", "r");
+        assert_eq!(
+            (one.input_tokens, one.output_tokens, one.measured_tokens),
+            (Some(0), Some(4), 4)
+        );
+
+        let mut none = IngestionReport::default();
+        bill(&mut none, None, "m", "r");
+        assert_eq!(
+            (none.input_tokens, none.output_tokens, none.measured_tokens),
+            (None, None, 0)
+        );
+        assert!(none.estimated_tokens > 0);
     }
 
     #[test]

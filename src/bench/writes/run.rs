@@ -147,6 +147,8 @@ async fn collect_sessions(
                 report.slots_written += extracted.slots_written;
                 report.estimated_tokens += extracted.estimated_tokens;
                 report.measured_tokens += extracted.measured_tokens;
+                report.input_tokens = add_reported(report.input_tokens, extracted.input_tokens);
+                report.output_tokens = add_reported(report.output_tokens, extracted.output_tokens);
                 report.llm_calls += extracted.llm_calls;
                 report.windows = extracted.windows;
                 report.candidates = extracted.candidates;
@@ -168,6 +170,8 @@ async fn collect_sessions(
             after: after.clone(),
             calls,
             millis,
+            input_tokens: report.input_tokens,
+            output_tokens: report.output_tokens,
             warnings: report.errors,
             windows: report.windows,
             candidates: report.candidates,
@@ -181,6 +185,14 @@ async fn collect_sessions(
         before = after;
     }
     Ok(sessions)
+}
+
+fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
+    match (total, extra) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+    }
 }
 
 /// Grade `script` `repeat` times, each in a fresh `parent/run-<k>` directory.
@@ -1288,6 +1300,8 @@ mod tests {
     use super::*;
     use super::{map_relation, RelationMap};
     use crate::graph::extract::chunk_conversation;
+    #[cfg(feature = "embedded")]
+    use crate::graph::llm::TokenUsage;
     use crate::graph::{Provenance, ProvenancePolicy};
 
     fn history() -> FactScript {
@@ -1594,6 +1608,9 @@ mod tests {
             .sessions
             .iter()
             .all(|session| session.timing.is_none()));
+        let session = serde_json::to_value(&report.sessions[0]).unwrap();
+        assert!(session["input_tokens"].is_null() && session["output_tokens"].is_null());
+        assert!(report.input_tokens.is_none() && report.output_tokens.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2088,6 +2105,317 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
+    fn uses_fact(object: &str, quote: &str) -> serde_json::Value {
+        serde_json::json!({
+            "subject": "app",
+            "subject_type": "project",
+            "predicate": "uses",
+            "role": "database",
+            "key": "",
+            "object": object,
+            "object_type": "technology",
+            "status": "decided",
+            "replaces": "",
+            "turn": 0,
+            "quote": quote,
+            "confidence": 0.9
+        })
+    }
+
+    #[cfg(feature = "embedded")]
+    fn pass1(facts: Vec<serde_json::Value>) -> String {
+        serde_json::json!({"facts": facts, "bugs": [], "releases": []}).to_string()
+    }
+
+    #[cfg(feature = "embedded")]
+    fn counted_usage(input: u64, output: u64) -> Option<TokenUsage> {
+        TokenUsage::from_counts(Some(input), Some(output))
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn live_v2(script: &str, provider: &dyn LlmProvider) -> WriteReport {
+        let script = crate::bench::writes::parse_script(script).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        run(
+            &script,
+            tmp.path(),
+            Extractor::Live(provider),
+            PipelineVersion::V2,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reported_usage_sums_across_sessions() {
+        const INPUT: u64 = 17;
+        const OUTPUT: u64 = 4;
+        // First pass-1 reply for the Postgres window is not the root object.
+        struct Reporting(AtomicU64);
+
+        #[async_trait]
+        impl LlmProvider for Reporting {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Err(crate::graph::error::GraphError::Llm(
+                    "plain complete was called".into(),
+                ))
+            }
+
+            async fn complete_structured(
+                &self,
+                system_prompt: &str,
+                user_message: &str,
+                _: &serde_json::Value,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                if system_prompt == crate::graph::v2::resolve::PASS2_SYSTEM {
+                    let reply = r#"{"entities":[{"mention":"PostgreSQL","match_id":""}]}"#;
+                    return Ok(Completion::measured(reply, counted_usage(INPUT, OUTPUT)));
+                }
+                let text = if user_message.contains("PostgreSQL") {
+                    pass1(vec![uses_fact(
+                        "PostgreSQL",
+                        "The app uses PostgreSQL for storage.",
+                    )])
+                } else if user_message.contains("Postgres for storage") {
+                    let attempt = self.0.fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        "nope".to_string()
+                    } else {
+                        pass1(vec![uses_fact(
+                            "Postgres",
+                            "The app uses Postgres for storage.",
+                        )])
+                    }
+                } else {
+                    pass1(vec![])
+                };
+                let usage = if user_message.contains("Gamma note") {
+                    None
+                } else {
+                    counted_usage(INPUT, OUTPUT)
+                };
+                Ok(Completion::measured(text, usage))
+            }
+        }
+
+        let report = live_v2(
+            "name = \"tokens\"\nfacts = []\n\
+             [[sessions]]\nid = \"s1\"\ndate = \"2026-01-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"The app uses Postgres for storage.\"\n\
+             [[sessions]]\nid = \"s2\"\ndate = \"2026-01-02T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"The app uses PostgreSQL for storage.\"\n\
+             [[sessions]]\nid = \"s3\"\ndate = \"2026-01-03T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Gamma note.\"\n",
+            &Reporting(AtomicU64::new(0)),
+        )
+        .await;
+        assert!(
+            report
+                .sessions
+                .iter()
+                .all(|session| session.warnings.is_empty()),
+            "{:?}",
+            report.sessions
+        );
+        // s1 retries a bad reply, then stores Postgres. s2 asks the resolver
+        // about PostgreSQL. s3 reports nothing, so it stays out of the mean.
+        assert_eq!(report.sessions[0].calls, 2);
+        assert_eq!(report.sessions[0].resolve.resolver_called, 0);
+        assert_eq!(report.sessions[1].calls, 2);
+        assert_eq!(report.sessions[1].resolve.resolver_called, 1);
+        assert_eq!(
+            (
+                report.sessions[0].input_tokens,
+                report.sessions[0].output_tokens
+            ),
+            (Some(INPUT * 2), Some(OUTPUT * 2))
+        );
+        assert_eq!(
+            (
+                report.sessions[1].input_tokens,
+                report.sessions[1].output_tokens
+            ),
+            (Some(INPUT * 2), Some(OUTPUT * 2))
+        );
+        assert_eq!(
+            (
+                report.sessions[2].input_tokens,
+                report.sessions[2].output_tokens
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            (
+                report.input_tokens,
+                report.output_tokens,
+                report.input_tokens_per_session,
+                report.output_tokens_per_session,
+            ),
+            (
+                Some(INPUT * 4),
+                Some(OUTPUT * 4),
+                Some((INPUT * 2) as f64),
+                Some((OUTPUT * 2) as f64)
+            )
+        );
+        let json = serde_json::to_string(&report.sessions[0]).unwrap();
+        let at = |key: &str| json.find(&format!("\"{key}\"")).unwrap();
+        assert!(at("millis") < at("input_tokens") && at("input_tokens") < at("output_tokens"));
+    }
+
+    /// Two pass-1 calls, each reporting (3, 1). The retry is billed.
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parse_retry_sums_both_calls_on_the_session_report() {
+        struct Retry(AtomicU64);
+
+        #[async_trait]
+        impl LlmProvider for Retry {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Err(crate::graph::error::GraphError::Llm(
+                    "plain complete was called".into(),
+                ))
+            }
+
+            async fn complete_structured(
+                &self,
+                _: &str,
+                _: &str,
+                _: &serde_json::Value,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                let attempt = self.0.fetch_add(1, Ordering::Relaxed);
+                let text = if attempt == 0 {
+                    "nope"
+                } else {
+                    r#"{"facts":[],"bugs":[],"releases":[]}"#
+                };
+                Ok(Completion::measured(text, counted_usage(3, 1)))
+            }
+        }
+
+        let report = live_v2(
+            "name = \"retry\"\nfacts = []\n\
+             [[sessions]]\nid = \"s1\"\ndate = \"2026-01-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Alpha note.\"\n",
+            &Retry(AtomicU64::new(0)),
+        )
+        .await;
+        assert_eq!(report.sessions.len(), 1);
+        let session = &report.sessions[0];
+        assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+        assert_eq!(session.calls, 2);
+        assert_eq!(
+            (session.input_tokens, session.output_tokens),
+            (Some(6), Some(2))
+        );
+    }
+
+    /// Resolver usage is on the session for a parsed reply and for "nope".
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolver_usage_reaches_the_session_report() {
+        struct Resolver;
+
+        #[async_trait]
+        impl LlmProvider for Resolver {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Err(crate::graph::error::GraphError::Llm(
+                    "plain complete was called".into(),
+                ))
+            }
+
+            async fn complete_structured(
+                &self,
+                system_prompt: &str,
+                user_message: &str,
+                _: &serde_json::Value,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                if system_prompt == crate::graph::v2::resolve::PASS2_SYSTEM {
+                    let mentions = user_message
+                        .split_once("NEW MENTIONS:")
+                        .map(|(_, rest)| rest)
+                        .unwrap_or("");
+                    let text = if mentions.contains("PostgreSQL") {
+                        r#"{"entities":[{"mention":"PostgreSQL","match_id":""}]}"#
+                    } else {
+                        "nope"
+                    };
+                    return Ok(Completion::measured(text, counted_usage(7, 2)));
+                }
+                let text = if user_message.contains("uvicorn worker") {
+                    pass1(vec![
+                        uses_fact("Postgres", "The app uses Postgres for storage."),
+                        uses_fact("uvicorn worker", "The app uses uvicorn worker for jobs."),
+                    ])
+                } else if user_message.contains("PostgreSQL") {
+                    pass1(vec![uses_fact(
+                        "PostgreSQL",
+                        "The app uses PostgreSQL for storage.",
+                    )])
+                } else if user_message.contains("uvicorn for storage") {
+                    pass1(vec![uses_fact(
+                        "uvicorn",
+                        "The app uses uvicorn for storage.",
+                    )])
+                } else {
+                    pass1(vec![])
+                };
+                Ok(Completion::unmeasured(text))
+            }
+        }
+
+        let report = live_v2(
+            "name = \"resolver\"\nfacts = []\n\
+             [[sessions]]\nid = \"seed\"\ndate = \"2026-01-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\n\
+             text = \"The app uses Postgres for storage. The app uses uvicorn worker for jobs.\"\n\
+             [[sessions]]\nid = \"parse\"\ndate = \"2026-01-02T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\n\
+             text = \"The app uses PostgreSQL for storage.\"\n\
+             [[sessions]]\nid = \"nope\"\ndate = \"2026-01-03T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\n\
+             text = \"The app uses uvicorn for storage.\"\n",
+            &Resolver,
+        )
+        .await;
+        let session = |id: &str| {
+            report
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap()
+        };
+        let parse = session("parse");
+        let nope = session("nope");
+        assert_eq!(parse.resolve.resolver_called, 1, "{:?}", parse.warnings);
+        assert_eq!(nope.resolve.resolver_called, 1, "{:?}", nope.warnings);
+        assert_eq!(
+            (parse.input_tokens, parse.output_tokens),
+            (Some(7), Some(2))
+        );
+        assert_eq!((nope.input_tokens, nope.output_tokens), (Some(7), Some(2)));
+    }
+
+    #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     async fn history_scripted_v2() {
         let script = history();
@@ -2136,6 +2464,19 @@ mod tests {
         assert!(report.junk_edges.is_empty(), "{:?}", report.junk_edges);
         assert!(report.questions[0].graph_hit);
         assert!(!report.questions[1].graph_hit);
+        assert!(report
+            .sessions
+            .iter()
+            .all(|session| { session.input_tokens.is_none() && session.output_tokens.is_none() }));
+        assert_eq!(
+            (
+                report.input_tokens,
+                report.output_tokens,
+                report.input_tokens_per_session,
+                report.output_tokens_per_session,
+            ),
+            (None, None, None, None)
+        );
         assert!(
             report.sessions.iter().all(|session| {
                 let Some(timing) = session.timing else {

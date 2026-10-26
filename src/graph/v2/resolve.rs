@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::super::crud;
 use super::super::error::GraphError;
-use super::super::llm::LlmProvider;
+use super::super::llm::{LlmProvider, TokenUsage};
 use super::super::llm_json;
 use super::super::types::{NewEntity, RejectedMatch, ResolveStats};
 use super::super::GraphMemory;
@@ -61,6 +61,8 @@ pub(crate) struct Resolution {
     pub bindings: Vec<Binding>,
     pub report: ResolveReport,
     pub entities_created: u32,
+    /// Usage from the resolver call. `None` when it was not called or reported nothing.
+    pub usage: Option<TokenUsage>,
 }
 
 /// A mention bound to the entity it became.
@@ -215,7 +217,7 @@ pub(crate) async fn resolve_session(
         }
         pending.push(open);
     }
-    ask_resolver(gm, llm, &mut index, &mut bound, &mut report, &mut pending).await?;
+    let usage = ask_resolver(gm, llm, &mut index, &mut bound, &mut report, &mut pending).await?;
     pending.sort_by(|left, right| {
         right
             .kind
@@ -237,6 +239,7 @@ pub(crate) async fn resolve_session(
         bindings: snapshot(&index, &bound),
         report,
         entities_created: created,
+        usage,
     })
 }
 
@@ -292,10 +295,10 @@ async fn ask_resolver(
     bound: &mut HashMap<(String, Kind), String>,
     report: &mut ResolveReport,
     pending: &mut Vec<OpenMention>,
-) -> Result<(), GraphError> {
+) -> Result<Option<TokenUsage>, GraphError> {
     let plan = index.prompt_plan(pending);
     if plan.groups.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let prompted = cap_prompt(plan.groups, report);
     let mut row_idxs = Vec::new();
@@ -309,7 +312,7 @@ async fn ask_resolver(
     }
     row_idxs.sort_by(|&left, &right| index.rows[left].id.cmp(&index.rows[right].id));
     if row_idxs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let prompted: Vec<OpenMention> = prompted.into_iter().map(|group| group.mention).collect();
     report.resolver_called = 1;
@@ -324,11 +327,13 @@ async fn ask_resolver(
             report
                 .notes
                 .push("resolver unavailable; leftovers created as new entities".to_string());
-            return Ok(());
+            return Ok(None);
         }
     };
+    // The call was spent even when the reply is not a resolver object.
+    let usage = completion.usage;
     let Some(answers) = parse_answers(&completion.text) else {
-        return Ok(());
+        return Ok(usage);
     };
     let candidate_ids: HashSet<String> = row_idxs
         .iter()
@@ -344,7 +349,8 @@ async fn ask_resolver(
         &candidate_ids,
         &answers,
     )
-    .await
+    .await?;
+    Ok(usage)
 }
 
 #[allow(clippy::too_many_arguments)]
