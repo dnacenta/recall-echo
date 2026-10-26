@@ -743,7 +743,9 @@ fn tokens_required<'a>(key: &str, specific: &'a [&'a str]) -> &'a [&'a str] {
     }
 }
 
-fn content_tokens(value: &str) -> Vec<String> {
+/// Normalised content tokens: stop words removed, longer than one character or a digit.
+#[must_use]
+pub(crate) fn content_tokens(value: &str) -> Vec<String> {
     words_of(&normalise(value))
         .into_iter()
         .filter(|token| is_content(token))
