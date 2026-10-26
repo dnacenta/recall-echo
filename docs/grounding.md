@@ -8,6 +8,15 @@ The quote is checked first. The schema remap runs next, so a setting is bound on
 
 The trimmed quote must be at least three characters and contain an alphanumeric character. It must be an exact, case-sensitive substring of a turn. Tool lines are not turns and never match. A quote in the cited turn keeps that turn. A quote found only in another turn is re-cited to the first such turn in transcript order, and the fact takes that turn's role. Otherwise the candidate drops as `quote`. When that exact search misses, an underscore with an alphanumeric character on both sides may match that underscore or one ASCII space, and every other character must still match exactly. On such a match the stored quote is the turn's text.
 
+**Bug field fallback.** Bugs only, and only after that search has already failed:
+
+1. The reply quote has missed the exact check, re-cite and the separator pass, so the candidate would drop as `quote`.
+2. The bug's own fields are tried in order: symptom, then cause, then fix. No other turn is examined.
+3. A field is used only when, after trimming, it is at least three characters, has at least three content tokens, is within the length cap, and is an exact case-sensitive substring of the cited turn. A change of case, a hyphen, or an underscore standing for a space does not match.
+4. The cited turn and its role stay, and the stored quote is that field. If no field qualifies, the bug still drops as `quote`. Facts and releases never use this fallback.
+
+A bug cited to "Confirmed: the TTL was ignored by the reader, so expired rows were served. I changed the reader to check expires_at on read." with quote "the cache returned stale rows after the reader" stores the cause "the TTL was ignored by the reader, so expired rows were served".
+
 ## Gate 2 — value support
 
 The value is checked against the cited turn. Every number in the value has to occur there as a number, and the token rule has to hold. Failure drops the candidate as `value_support`.

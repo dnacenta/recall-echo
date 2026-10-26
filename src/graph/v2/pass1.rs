@@ -25,8 +25,9 @@ use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
     affects_target, filter_fact, map_subject, over_long, release_name, remap, Fact, Kind, Mention,
-    Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_TOO_LONG,
-    DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
+    Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE,
+    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
+    MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -434,7 +435,19 @@ fn expand_bug(
     ground: &SessionGround,
     report: &mut IngestionReport,
 ) -> Result<Vec<Fact>, &'static str> {
-    let cited = cite_object(object, ground)?;
+    // A merged quote drops the cause and the fix with it. A verbatim field of
+    // this bug can stand in, and only after the quote has already missed.
+    let cited = match cite_object(object, ground) {
+        Err(DROP_QUOTE) => {
+            let symptom = text(object, "symptom")?.trim();
+            let cause = text(object, "cause")?.trim();
+            let fix = text(object, "fix")?.trim();
+            ground
+                .cite_field(turn_of(object)?, &[symptom, cause, fix])
+                .ok_or(DROP_QUOTE)?
+        }
+        other => other?,
+    };
     let confidence = confidence_of(object)?;
     if confidence < 0.6 {
         return Err(DROP_CONFIDENCE);
@@ -876,8 +889,9 @@ mod tests {
     use crate::graph::types::IngestionReport;
     use crate::graph::v2::input::{ProjectIdentity, Turn, TurnRole};
     use crate::graph::v2::schema::{
-        Fact, Kind, Predicate, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_QUOTE, DROP_TOO_LONG,
-        DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
+        Fact, Kind, Predicate, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE,
+        DROP_QUOTE, DROP_TOO_LONG, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
+        MAX_ITEMS,
     };
     use crate::graph::Provenance;
     use serde_json::Value;
@@ -2296,6 +2310,467 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains(write::V2_REFUSAL), "{err}");
+    }
+
+    fn run_bug(
+        turns: &[Turn],
+        symptom: &str,
+        cause: &str,
+        fix: &str,
+        turn: usize,
+        quote: &str,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let reply = bug_reply(symptom, cause, fix, "", turn, quote);
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(&reply, &session(turns.to_vec()), &mut report);
+        (facts, report)
+    }
+
+    fn cache_turns() -> Vec<Turn> {
+        vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "The cache returned stale entries after deploy.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Confirmed: the TTL was ignored by the reader, so expired rows were served. I changed the reader to check expires_at on read.".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn merged_bug_quote_keeps_the_cause_from_the_cited_turn() {
+        let cause = "the TTL was ignored by the reader, so expired rows were served";
+        let fix = "I changed the reader to check expires_at on read";
+        let (facts, report) = run_bug(
+            &cache_turns(),
+            "cache returned stale entries",
+            cause,
+            fix,
+            1,
+            "the cache returned stale rows after the reader",
+        );
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert_candidate_balance(&report);
+        assert!(facts
+            .iter()
+            .all(|fact| fact.quote == cause && fact.turn == 1));
+        let symptom = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .unwrap();
+        assert_eq!(symptom.provenance, Provenance::SelfGenerated);
+        let cause_fact = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueCause)
+            .unwrap();
+        assert_eq!(
+            (cause_fact.object_name.as_str(), cause_fact.provenance),
+            (cause, Provenance::Assistant)
+        );
+        let fix_fact = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueFix)
+            .unwrap();
+        assert_eq!(
+            (fix_fact.object_name.as_str(), fix_fact.provenance),
+            (fix, Provenance::Assistant)
+        );
+        let status = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueStatus)
+            .unwrap();
+        assert_eq!(
+            (status.object_name.as_str(), status.provenance),
+            ("fixed", Provenance::SelfGenerated)
+        );
+    }
+
+    #[test]
+    fn a_verbatim_symptom_is_the_stored_quote() {
+        let symptom = "expired rows were served";
+        let (facts, report) = run_bug(
+            &cache_turns()[1..],
+            symptom,
+            "the TTL was ignored by the reader",
+            "I changed the reader to check expires_at on read",
+            1,
+            "the cache returned stale rows after the reader",
+        );
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert!(facts.iter().all(|fact| fact.quote == symptom));
+    }
+
+    #[test]
+    fn a_field_only_in_another_turn_still_drops_the_bug() {
+        let mut turns = cache_turns();
+        turns[1].text = "Noted and left the rest unchanged for now.".into();
+        let (facts, report) = run_bug(
+            &turns,
+            "cache returned stale entries",
+            "stale entries after deploy",
+            "returned stale entries after deploy",
+            1,
+            "the cache returned stale rows after the reader",
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn a_near_match_or_a_short_field_drops_the_bug() {
+        let turns = cache_turns();
+        for field in [
+            "Cache Returned Stale Entries",
+            "cache-returned stale entries",
+            "cache_returned stale entries",
+        ] {
+            let (facts, report) =
+                run_bug(&turns[..1], field, field, field, 0, "missing quote here");
+            assert!(facts.is_empty(), "{field}");
+            assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1), "{field}");
+        }
+        let (facts, report) = run_bug(
+            &[Turn {
+                index: 0,
+                role: TurnRole::Assistant,
+                text: "I changed the reader to check it on read.".into(),
+            }],
+            "not in this turn",
+            "also absent here",
+            "check it",
+            0,
+            "missing quote here",
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+    }
+
+    #[test]
+    fn an_accepted_quote_is_left_unchanged() {
+        let user = "The cache returned stale entries after deploy.";
+        let assistant =
+            "Confirmed: the TTL was ignored by the reader, so expired rows were served.";
+        let cases = [
+            (
+                user,
+                assistant,
+                "cache returned stale entries",
+                "the TTL was ignored by the reader",
+                "after deploy",
+                "after deploy",
+                0usize,
+            ),
+            (
+                user,
+                assistant,
+                "cache returned stale entries",
+                "the TTL was ignored by the reader",
+                "the TTL was ignored by the reader",
+                "the TTL was ignored by the reader",
+                1,
+            ),
+            (
+                "we keep rolling back to the last release",
+                assistant,
+                "keep rolling back",
+                "the TTL was ignored by the reader",
+                "rolling_back to the last release",
+                "rolling back to the last release",
+                0,
+            ),
+        ];
+        for (left, right, symptom, cause, quote, stored, turn) in cases {
+            let (facts, report) = run_bug(
+                &[
+                    Turn {
+                        index: 0,
+                        role: TurnRole::User,
+                        text: left.into(),
+                    },
+                    Turn {
+                        index: 1,
+                        role: TurnRole::Assistant,
+                        text: right.into(),
+                    },
+                ],
+                symptom,
+                cause,
+                "",
+                0,
+                quote,
+            );
+            assert_eq!(report.kept, 1, "{quote} {:?}", report.drops);
+            assert!(
+                facts
+                    .iter()
+                    .all(|fact| fact.quote == stored && fact.turn == turn),
+                "{quote}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verbatim_fact_object_does_not_save_a_missed_quote() {
+        let mut item = fact_json(0, "the cache returned stale rows after the reader");
+        item["object"] = Value::String("stale entries after".into());
+        let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().unwrap(),
+            &session(cache_turns()),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    fn grade_fallback(
+        turns: &[Turn],
+        symptom: &str,
+        cause: &str,
+        fix: &str,
+        cited: usize,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let miss = "the cache returned stale rows after the reader";
+        let chosen = SessionGround::prepare(turns).cite_field(cited, &[symptom, cause, fix]);
+        let (facts, report) = run_bug(turns, symptom, cause, fix, cited, miss);
+        let raw = turns
+            .iter()
+            .map(|turn| turn.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for fact in &facts {
+            for number in super::super::ground::numbers_in(&fact.object_name) {
+                assert!(
+                    super::super::ground::numbers_in(&raw)
+                        .iter()
+                        .any(|have| have == &number),
+                    "{number}"
+                );
+            }
+        }
+        let Some(chosen) = chosen else {
+            assert!(facts.is_empty(), "{symptom}/{cause}/{fix}");
+            assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+            assert_candidate_balance(&report);
+            return (facts, report);
+        };
+        if report.kept > 0 {
+            assert!(facts.iter().all(|fact| fact.quote == chosen.quote));
+        }
+        let direct = bug_reply(symptom, cause, fix, "", cited, &chosen.quote);
+        let mut other = IngestionReport::default();
+        let direct_facts = facts_from_reply(&direct, &session(turns.to_vec()), &mut other);
+        assert_eq!(facts, direct_facts, "{}", chosen.quote);
+        assert_eq!(report.kept, other.kept);
+        assert_eq!(report.candidates, other.candidates);
+        assert_eq!(report.drops, other.drops);
+        (facts, report)
+    }
+
+    fn shaped(span: &str, mode: usize) -> String {
+        match mode {
+            0 => span.to_string(),
+            1 => span.replacen(' ', "-", 1),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn fallback_kept_bug_matches_quoting_the_chosen_field() {
+        let rows = [
+            (
+                "The cache returned stale entries after deploy.",
+                [
+                    "cache returned stale entries",
+                    "stale entries after deploy",
+                    "returned stale entries after deploy",
+                ],
+            ),
+            (
+                "Confirmed: the TTL was ignored by the reader, so expired rows were served. I changed the reader to check expires_at on read.",
+                [
+                    "the TTL was ignored by the reader",
+                    "expired rows were served",
+                    "I changed the reader to check expires_at on read",
+                ],
+            ),
+            (
+                "The reader missed port 4242 after the deploy.",
+                [
+                    "missed port 4242 after the deploy",
+                    "reader missed port 4242",
+                    "port 4242 after the deploy",
+                ],
+            ),
+            (
+                "The timeout was raised and the reader now checks port 4242.",
+                [
+                    "timeout was raised and the reader",
+                    "reader now checks port 4242",
+                    "checks port 4242",
+                ],
+            ),
+        ];
+        for pair in [(0, 1), (2, 3)] {
+            for swap in [false, true] {
+                let (first, second) = if swap { (pair.1, pair.0) } else { pair };
+                for cited in [0usize, 1] {
+                    for mode in 0..27 {
+                        let spans = rows[if cited == 0 { first } else { second }].1;
+                        let symptom = shaped(spans[0], mode % 3);
+                        let cause = shaped(spans[1], (mode / 3) % 3);
+                        let fix = shaped(spans[2], mode / 9);
+                        let turns = [
+                            Turn {
+                                index: 0,
+                                role: if swap {
+                                    TurnRole::Assistant
+                                } else {
+                                    TurnRole::User
+                                },
+                                text: rows[first].0.into(),
+                            },
+                            Turn {
+                                index: 1,
+                                role: if swap {
+                                    TurnRole::User
+                                } else {
+                                    TurnRole::Assistant
+                                },
+                                text: rows[second].0.into(),
+                            },
+                        ];
+                        grade_fallback(&turns, &symptom, &cause, &fix, cited);
+                    }
+                }
+            }
+        }
+        let turns = [
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: rows[2].0.into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: rows[3].0.into(),
+            },
+        ];
+        let (facts, report) =
+            grade_fallback(&turns, "reader missed port 4242", "timeout hit 9090", "", 0);
+        assert_eq!(
+            report.drops.get(DROP_VALUE_SUPPORT_PARTIAL).copied(),
+            Some(1)
+        );
+        assert!(facts
+            .iter()
+            .all(|fact| fact.quote == "reader missed port 4242"
+                && !fact.object_name.contains("9090")));
+    }
+
+    #[test]
+    fn fallback_still_runs_the_later_bug_checks() {
+        let fix = "changed the reader to check expires_at on read";
+        let turns = [Turn {
+            index: 0,
+            role: TurnRole::Assistant,
+            text: "I changed the reader to check expires_at on read.".into(),
+        }];
+        let mut low = bug_reply("not in this turn", "", fix, "", 0, "missing quote here");
+        low["bugs"][0]["confidence"] = serde_json::json!(0.4);
+        let mut report = IngestionReport::default();
+        assert!(facts_from_reply(&low, &session(turns.to_vec()), &mut report).is_empty());
+        assert_eq!(report.drops.get(DROP_CONFIDENCE).copied(), Some(1));
+        let (facts, report) = run_bug(&turns, "", "", fix, 0, "missing quote here");
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_PARSE).copied(), Some(1));
+        let (facts, report) = run_bug(
+            &turns,
+            "not in this turn",
+            &"y".repeat(301),
+            fix,
+            0,
+            "missing quote here",
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_TOO_LONG).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn fallback_bug_write_is_idempotent() {
+        let cause = "the TTL was ignored by the reader, so expired rows were served";
+        let fix = "I changed the reader to check expires_at on read";
+        let turns = cache_turns();
+        let (facts, report) = run_bug(
+            &turns,
+            "cache returned stale entries",
+            cause,
+            fix,
+            1,
+            "the cache returned stale rows after the reader",
+        );
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        let llm = PanicProvider;
+        let input = session(turns.clone());
+        let ctx = write::WriteCtx::new(&llm, &input.project, "s1", "2026-01-02", &turns);
+        write::write_facts(&gm, &ctx, &facts).await.unwrap();
+        let before = stored_belief(&gm).await;
+        let again = write::write_facts(&gm, &ctx, &facts).await.unwrap();
+        assert_eq!(again.already_seen, u32::try_from(facts.len()).unwrap());
+        assert_eq!(again.reinforced, 0);
+        assert_eq!(again.slots, 0);
+        assert_eq!(again.edges, 0);
+        assert_eq!(stored_belief(&gm).await, before);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn stored_belief(gm: &GraphMemory) -> Vec<(String, f64, f64)> {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for entity in &entities {
+            let Some(slots) = entity
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs["v2"]["slots"].as_array())
+            else {
+                continue;
+            };
+            for slot in slots {
+                rows.push((
+                    format!("{}:{}:{}", entity.name, slot["predicate"], slot["value"]),
+                    slot["alpha"].as_f64().unwrap(),
+                    slot["beta"].as_f64().unwrap(),
+                ));
+            }
+        }
+        for edge in crate::graph::crud::list_all_relationships(gm.db())
+            .await
+            .unwrap()
+        {
+            rows.push((
+                format!("edge:{}:{}", edge.rel_type, edge.id_string()),
+                edge.alpha.unwrap(),
+                edge.beta.unwrap(),
+            ));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
     }
 
     struct Twice(&'static str);
