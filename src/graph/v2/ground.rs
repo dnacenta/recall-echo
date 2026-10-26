@@ -424,7 +424,7 @@ impl SessionGround {
     /// so a quote that only names a key term can keep the symptom.
     fn span_of_turn(&self, value: &str, turn: usize) -> bool {
         let value = value.trim();
-        if value.is_empty() || over_long(value) || content_tokens(value).len() < 3 {
+        if value.is_empty() || over_long(value) || !span_floor(value) {
             return false;
         }
         let Some(turn) = self.turn(turn) else {
@@ -440,6 +440,17 @@ impl SessionGround {
                 .windows(wanted.len())
                 .any(|window| window == wanted)
     }
+}
+
+/// Three content tokens, two of them with a letter. A version, a decimal or
+/// an address splits into digit tokens, and those are not symptom words.
+fn span_floor(value: &str) -> bool {
+    let tokens = content_tokens(value);
+    let lettered = tokens
+        .iter()
+        .filter(|token| token.chars().any(char::is_alphabetic))
+        .count();
+    tokens.len() >= 3 && lettered >= 2
 }
 
 fn with_quote(turn: &TurnGround, quote: &str) -> Cited {
@@ -1927,6 +1938,25 @@ mod tests {
         assert_eq!(
             widget().credit_symptom("froze badly", 0, "TimeoutError"),
             FieldCredit::Drop
+        );
+    }
+
+    #[test]
+    fn digit_tokens_do_not_make_a_symptom_span() {
+        let session = ground(&[(
+            "widget 1.4.0 on v2.5.1 stalled, steps 1 2 3, build 30 files, a 2.5 import: TimeoutError.",
+            TurnRole::User,
+        )]);
+        for symptom in ["1.4.0", "v2.5.1", "1 2 3", "a 2.5 import"] {
+            assert_eq!(
+                session.credit_symptom(symptom, 0, "TimeoutError"),
+                FieldCredit::Drop,
+                "{symptom}"
+            );
+        }
+        assert_eq!(
+            session.credit_symptom("build 30 files", 0, "TimeoutError"),
+            FieldCredit::Turn
         );
     }
 
