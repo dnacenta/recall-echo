@@ -406,6 +406,21 @@ fn accept_fact(
     } else {
         map_subject(&mut fact, &session.project);
     }
+    let shape = if fact.object_kind.is_some() {
+        ValueShape::Entity
+    } else {
+        ValueShape::Literal
+    };
+    // A punctuation literal has no content token. Only a keyed setting whose
+    // quote wraps it can pass gate 2 that way. Every other predicate, including
+    // a swapped component edge, stays on the ordinary check.
+    let punctuation_setting = fact.predicate == Predicate::Setting
+        && ground.punctuation_setting_supported(
+            &fact.key,
+            &fact.object_name,
+            fact.turn,
+            &fact.quote,
+        );
     let value_ok = if swapped {
         ground.supports_value(
             &fact.subject_name,
@@ -414,12 +429,8 @@ fn accept_fact(
             ValueShape::Entity,
         )
     } else {
-        let shape = if fact.object_kind.is_some() {
-            ValueShape::Entity
-        } else {
-            ValueShape::Literal
-        };
-        ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape)
+        punctuation_setting
+            || ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape)
     };
     if !value_ok {
         return Err(DROP_VALUE_SUPPORT);
@@ -2256,6 +2267,79 @@ mod tests {
             Some(1)
         );
         assert_candidate_balance(&report);
+
+        let quote = "Patched the reader; the mark is `|`.";
+        for value in ["|", ";", ",", "-->", "----", "|9", "a|"] {
+            let (facts, report) = one_fact("mark", value, "setting", quote);
+            assert_candidate_balance(&report);
+            assert!(facts.iter().all(|fact| {
+                super::super::ground::numbers_in(&fact.object_name)
+                    .iter()
+                    .all(|number| {
+                        super::super::ground::numbers_in(quote)
+                            .iter()
+                            .any(|have| have == number)
+                    })
+            }));
+            assert_eq!(facts.len() == 1, value == "|", "{value} {:?}", report.drops);
+            if value == "|" {
+                assert_eq!(facts[0].object_name, "|");
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_setting_passes_gate_two_only_when_wrapped() {
+        let keep = "The column separator is `|` in the export.";
+        let (facts, report) = one_fact("column_separator", "|", "setting", keep);
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        assert_eq!(facts[0].object_name, "|");
+        assert_eq!(facts[0].key, "column_separator");
+        assert_eq!(facts[0].predicate, Predicate::Setting);
+        assert_candidate_balance(&report);
+
+        let bare = "The column separator is | in the export.";
+        let (facts, report) = one_fact("column_separator", "|", "setting", bare);
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_candidate_balance(&report);
+
+        for predicate in ["rule", "uses"] {
+            let (facts, report) = one_fact("column_separator", "|", predicate, keep);
+            assert!(facts.is_empty(), "{predicate}: {:?}", report.drops);
+            assert_eq!(
+                report.drops.get(DROP_VALUE_SUPPORT).copied(),
+                Some(1),
+                "{predicate}"
+            );
+            assert_candidate_balance(&report);
+        }
+    }
+
+    fn one_fact(
+        key: &str,
+        object: &str,
+        predicate: &str,
+        quote: &str,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: quote.into(),
+        }];
+        let mut item = fact_json(0, quote);
+        let fields = item.as_object_mut().expect("fact");
+        fields.insert("key".into(), Value::String(key.into()));
+        fields.insert("object".into(), Value::String(object.into()));
+        fields.insert("predicate".into(), Value::String(predicate.into()));
+        let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        (facts, report)
     }
 
     #[test]

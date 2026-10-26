@@ -60,7 +60,7 @@
 //! and no other number. The citation stays on the user turn.
 
 use super::input::{Turn, TurnRole};
-use super::schema::{normalise, over_long, DROP_QUOTE};
+use super::schema::{key_is_empty, normalise, over_long, DROP_QUOTE};
 
 /// A quote shorter than this is not a verbatim span.
 const MIN_QUOTE_CHARS: usize = 3;
@@ -279,6 +279,34 @@ impl SessionGround {
             Some(cited_pos) => self.agreement_binds(key, value, cited_pos, quote),
             None => false,
         }
+    }
+
+    /// A keyed setting whose value is a short punctuation literal the quote wraps.
+    ///
+    /// Ordinary value support needs a content token, and a punctuation literal
+    /// has none. The key still has to bind by gate 3's direct whole-token rule
+    /// on the trimmed quote or the sentence that contains it.
+    #[must_use]
+    pub(crate) fn punctuation_setting_supported(
+        &self,
+        key: &str,
+        value: &str,
+        turn: usize,
+        quote: &str,
+    ) -> bool {
+        if !punctuation_literal(value) || key_is_empty(key) {
+            return false;
+        }
+        let Some(cited) = self.turn(turn) else {
+            return false;
+        };
+        let quote = quote.trim();
+        let value = value.trim();
+        if !wrapped_literal(quote, value) {
+            return false;
+        }
+        let sentence = sentence_containing(&cited.text, quote);
+        direct_key_bound(key, &[quote, sentence])
     }
 
     /// User agreement: the cited sentence states only the value's numbers, the
@@ -775,6 +803,28 @@ fn is_generic_key(token: &str) -> bool {
         token,
         "value" | "number" | "setting" | "default" | "current" | "new" | "min" | "max"
     )
+}
+
+/// Trimmed text of 1 to 3 characters, none alphanumeric and none whitespace.
+#[must_use]
+pub(crate) fn punctuation_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    let len = trimmed.chars().count();
+    (1..=3).contains(&len)
+        && !trimmed
+            .chars()
+            .any(|ch| ch.is_alphanumeric() || ch.is_whitespace())
+}
+
+/// `` `v` ``, `'v'` or `"v"`, with the marks directly around `value`.
+fn wrapped_literal(quote: &str, value: &str) -> bool {
+    [
+        format!("`{value}`"),
+        format!("'{value}'"),
+        format!("\"{value}\""),
+    ]
+    .iter()
+    .any(|wrapped| quote.contains(wrapped))
 }
 
 pub(crate) fn numbers_in(text: &str) -> Vec<String> {
@@ -1697,5 +1747,78 @@ mod tests {
             lines.swap(0, 1);
         }
         ground(&lines)
+    }
+
+    fn punctuation_bound(turn: &str, key: &str, value: &str) -> bool {
+        ground(&[(turn, TurnRole::User)]).punctuation_setting_supported(key, value, 0, turn)
+    }
+
+    #[test]
+    fn punctuation_setting_needs_a_wrapped_literal_and_a_key_token() {
+        assert!(punctuation_literal(" | "));
+        assert!(punctuation_literal("-->"));
+        assert!(!punctuation_literal("----"));
+        assert!(!punctuation_literal("a|"));
+        assert!(!punctuation_literal("| |"));
+        assert!(!punctuation_literal(""));
+
+        let keep = "The column separator is `|` in the export.";
+        assert!(punctuation_bound(keep, "column_separator", "|"));
+        assert!(punctuation_bound(
+            "The column separator is '|' in the export.",
+            "column_separator",
+            "|"
+        ));
+        assert!(punctuation_bound(
+            "The column separator is \"|\" in the export.",
+            "column_separator",
+            "|"
+        ));
+        assert!(!punctuation_bound(
+            "The column separator is | in the export.",
+            "column_separator",
+            "|"
+        ));
+        let incidental = "Export url, title and tags; the delimiter is configurable.";
+        assert!(!punctuation_bound(incidental, "delimiter", ","));
+        assert!(!punctuation_bound(incidental, "delimiter", ";"));
+        assert!(!punctuation_bound(keep, "row_terminator", "|"));
+        assert!(!punctuation_bound(keep, "value", "|"));
+        assert!(!punctuation_bound(keep, "", "|"));
+        // "Columns" and "joined" are not the tokens `column` and `separator`.
+        assert!(!punctuation_bound(
+            "Columns are joined with `|` in the export.",
+            "column_separator",
+            "|"
+        ));
+        assert!(!punctuation_bound(
+            "The column separator is `----` in the export.",
+            "column_separator",
+            "----"
+        ));
+        assert!(!punctuation_bound(
+            "The version marker is `|` in the export.",
+            "api_version",
+            "|"
+        ));
+
+        let words = ground(&[("Export the column now.", TurnRole::User)]);
+        assert!(words.supports_value("column", 0, "Export the column", ValueShape::Literal));
+        assert!(!words.punctuation_setting_supported("column", "column", 0, "Export the column"));
+        let session = ground(&[(keep, TurnRole::User)]);
+        assert!(!session.supports_value("|", 0, keep, ValueShape::Literal));
+        assert!(!session.punctuation_setting_supported("column_separator", "|", 3, keep));
+
+        let later = "Export uses `|` as the column separator.";
+        let session = ground(&[(later, TurnRole::User)]);
+        assert!(session.punctuation_setting_supported("column_separator", "|", 0, "uses `|` as"));
+        let split = "The column separator is fixed. Export uses `|` today.";
+        let session = ground(&[(split, TurnRole::User)]);
+        assert!(!session.punctuation_setting_supported(
+            "column_separator",
+            "|",
+            0,
+            "Export uses `|` today."
+        ));
     }
 }
