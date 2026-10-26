@@ -694,6 +694,9 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub known_facts_context: bool,
+    /// Match kept facts to stored rows after pass 1. Experimental, and off unless set.
+    #[serde(default = "default_known_match", skip_serializing_if = "is_false")]
+    pub known_match: bool,
 }
 
 impl Default for GraphSection {
@@ -710,6 +713,7 @@ impl Default for GraphSection {
             dedup: GraphDedupConfig::default(),
             pipeline: None,
             known_facts_context: default_known_facts_context(),
+            known_match: default_known_match(),
         }
     }
 }
@@ -1017,6 +1021,10 @@ fn default_known_facts_context() -> bool {
     false
 }
 
+fn default_known_match() -> bool {
+    false
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1304,6 +1312,12 @@ impl Config {
             }
             "graph.known_facts_context" => {
                 self.graph_section().known_facts_context = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.known_match" => {
+                self.graph_section().known_match = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2098,6 +2112,19 @@ mod tests {
         cfg.set_key("graph.known_facts_context", "true").unwrap();
         assert!(cfg.graph.as_ref().expect("graph").known_facts_context);
         assert!(cfg.set_key("graph.known_facts_context", "yes").is_err());
+    }
+
+    #[test]
+    fn known_match_defaults_off() {
+        assert!(!default_known_match());
+        assert!(!GraphSection::default().known_match);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().known_match);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.known_match", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").known_match);
+        assert!(cfg.set_key("graph.known_match", "yes").is_err());
+        assert!(!cfg.graph.as_ref().expect("graph").known_facts_context);
     }
 
     #[test]

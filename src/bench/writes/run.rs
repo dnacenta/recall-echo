@@ -77,6 +77,18 @@ pub enum KnownFactsContext {
     On,
 }
 
+/// Whether kept facts are matched to stored rows after pass 1.
+///
+/// Off does not read the store for matching and leaves writes unchanged.
+/// On is independent of [`KnownFactsContext`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownMatch {
+    /// No matcher and no retirement guards.
+    Off,
+    /// Lookup after pass 1, then the matcher and the guards.
+    On,
+}
+
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
 /// `work_dir` must be missing or empty. The function creates `memory/` under it.
@@ -90,11 +102,12 @@ pub async fn run(
     extractor: Extractor<'_>,
     pipeline: PipelineVersion,
     known_facts_context: KnownFactsContext,
+    known_match: KnownMatch,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
     let written = write_archives(&memory_dir, script)?;
-    apply_known_facts_context(&memory_dir, known_facts_context)?;
+    apply_graph_switches(&memory_dir, known_facts_context, known_match)?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
     let (label, provider) = provider_for(script, extractor)?;
@@ -173,6 +186,7 @@ async fn collect_sessions(
                 report.retirements = extracted.retirements;
                 report.retirements_skipped = extracted.retirements_skipped;
                 report.timing = extracted.timing;
+                report.known_match = extracted.known_match;
                 report
             }
         };
@@ -196,6 +210,7 @@ async fn collect_sessions(
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
             timing: report.timing,
+            known_match: report.known_match,
         });
         before = after;
     }
@@ -223,6 +238,7 @@ pub async fn run_repeat(
     extractor: Extractor<'_>,
     pipeline: PipelineVersion,
     known_facts_context: KnownFactsContext,
+    known_match: KnownMatch,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -235,23 +251,41 @@ pub async fn run_repeat(
     for k in 1..=repeat {
         let dir = parent.join(format!("run-{k}"));
         fs::create_dir(&dir)?;
-        runs.push(run(script, &dir, extractor, pipeline, known_facts_context).await?);
+        runs.push(
+            run(
+                script,
+                &dir,
+                extractor,
+                pipeline,
+                known_facts_context,
+                known_match,
+            )
+            .await?,
+        );
     }
     Ok(RepeatReport::from_runs(runs))
 }
 
-/// Opt in by writing `[graph] known_facts_context` into the fresh memory dir.
-fn apply_known_facts_context(
+/// Opt in by writing the graph switches into the fresh memory dir.
+fn apply_graph_switches(
     memory_dir: &Path,
     known: KnownFactsContext,
+    matched: KnownMatch,
 ) -> Result<(), RecallError> {
-    if known == KnownFactsContext::Off {
+    let mut body = String::from("[graph]\n");
+    let mut any = false;
+    if known == KnownFactsContext::On {
+        body.push_str("known_facts_context = true\n");
+        any = true;
+    }
+    if matched == KnownMatch::On {
+        body.push_str("known_match = true\n");
+        any = true;
+    }
+    if !any {
         return Ok(());
     }
-    fs::write(
-        crate::config::config_path(memory_dir),
-        "[graph]\nknown_facts_context = true\n",
-    )?;
+    fs::write(crate::config::config_path(memory_dir), body)?;
     Ok(())
 }
 
@@ -1403,6 +1437,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V1,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap_err();
@@ -1556,6 +1591,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V1,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap();
@@ -1658,6 +1694,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V1,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap_err();
@@ -1678,6 +1715,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V1,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap_err();
@@ -1750,6 +1788,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V1,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap();
@@ -2013,6 +2052,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V2,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap();
@@ -2222,6 +2262,7 @@ mod tests {
                 Extractor::Live(&seen),
                 PipelineVersion::V2,
                 known,
+                KnownMatch::Off,
             )
             .await
             .unwrap();
@@ -2255,6 +2296,7 @@ mod tests {
             Extractor::Live(provider),
             PipelineVersion::V2,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap()
@@ -2540,6 +2582,7 @@ mod tests {
             Extractor::Scripted,
             PipelineVersion::V2,
             KnownFactsContext::Off,
+            KnownMatch::Off,
         )
         .await
         .unwrap();
@@ -2597,7 +2640,7 @@ mod tests {
                 let Some(timing) = session.timing else {
                     return false;
                 };
-                timing.total_ms >= timing.pass1_ms
+                timing.match_ms.is_none() && timing.total_ms >= timing.pass1_ms
             }),
             "stage timing {:?}",
             report
@@ -2606,6 +2649,45 @@ mod tests {
                 .map(|session| session.timing)
                 .collect::<Vec<_>>()
         );
+        assert!(report.sessions.iter().all(|session| {
+            session.known_match.is_blank()
+                && serde_json::to_value(session)
+                    .unwrap()
+                    .get("known_match")
+                    .is_none()
+                && serde_json::to_value(session).unwrap()["timing"]
+                    .get("match_ms")
+                    .is_none()
+        }));
+    }
+
+    /// The switch adds match timing. Writes on this script stay the off-path
+    /// counts: each decided setting already names the stored key.
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_scripted_v2_known_match_reports_match_time() {
+        let script = history();
+        let tmp = tempfile::tempdir().unwrap();
+        let report = run(
+            &script,
+            tmp.path(),
+            Extractor::Scripted,
+            PipelineVersion::V2,
+            KnownFactsContext::Off,
+            KnownMatch::On,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.operations.supersede, counted(1, 0, 0));
+        assert_eq!(report.operations.create, counted(1, 0, 0));
+        assert!(report.wrong_facts.is_empty(), "{:?}", report.wrong_facts);
+        assert!(report.sessions.iter().all(|session| {
+            session
+                .timing
+                .is_some_and(|timing| timing.match_ms.is_some())
+        }));
+        let encoded = serde_json::to_value(&report.sessions[0]).unwrap();
+        assert!(encoded["timing"].get("match_ms").is_some());
     }
 
     #[cfg(feature = "embedded")]

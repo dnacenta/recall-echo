@@ -100,6 +100,8 @@ pub struct SessionObservation {
     pub retirements_skipped: u32,
     /// Pipeline v2 stage durations. Absent on v1.
     pub timing: Option<crate::graph::types::StageTiming>,
+    /// Known-row match counts. Blank when the switch is off.
+    pub known_match: crate::graph::types::MatchReport,
 }
 
 /// Precision and recall for one operation.
@@ -200,6 +202,12 @@ pub struct SessionReport {
     /// Pipeline v2 stage durations. Omitted on v1, where it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<crate::graph::types::StageTiming>,
+    /// Known-row match counts. Omitted when the switch is off or nothing matched.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::MatchReport::is_blank"
+    )]
+    pub known_match: crate::graph::types::MatchReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -560,6 +568,7 @@ pub fn grade_with_pipeline(
                 retirements: s.retirements.clone(),
                 retirements_skipped: s.retirements_skipped,
                 timing: s.timing,
+                known_match: s.known_match.clone(),
             })
             .collect(),
         steps,
@@ -1720,6 +1729,7 @@ mod tests {
             retirements: Vec::new(),
             retirements_skipped: 0,
             timing: None,
+            known_match: crate::graph::types::MatchReport::default(),
         }
     }
 
