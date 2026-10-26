@@ -4312,4 +4312,126 @@ mod tests {
         assert_eq!(live.len(), 1, "{slots:?}");
         assert_eq!(live[0]["value"], ";");
     }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn span_symptom_writes_one_bug_and_a_retry_is_idempotent() {
+        use crate::conversation::ConversationEntry;
+        use crate::graph::ingest::IngestContext;
+        use crate::graph::types::EntityType;
+
+        let user = "widget import froze on a large archive: TimeoutError.";
+        let assistant = "The importer stopped because the socket closed. I raised the wait.";
+        let reply = r#"{"facts":[],"bugs":[{"symptom":"froze on a large archive","cause":"the socket closed","fix":"raised the wait","status":"fixed","component":"","turn":0,"quote":"TimeoutError","confidence":0.9}],"releases":[]}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("widget");
+        std::fs::create_dir(&project).unwrap();
+        crate::graph::v2::input::write_turns_sidecar(
+            tmp.path(),
+            1,
+            "s-widget",
+            "2026-04-03",
+            Some(project.to_str().unwrap()),
+            &[
+                ConversationEntry::UserMessage(user.into()),
+                ConversationEntry::AssistantText(assistant.into()),
+            ],
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        let ctx = IngestContext::new("s-widget", Some(1));
+
+        struct Reply(&'static str);
+        #[async_trait::async_trait]
+        impl LlmProvider for Reply {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(self.0.to_string())
+            }
+        }
+
+        let report =
+            crate::graph::v2::pass1::extract_session(&gm, tmp.path(), 1, &ctx, &Reply(reply))
+                .await
+                .unwrap();
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.drops.contains_key("value_support"));
+        let bugs: Vec<_> = crud::list_entities(gm.db(), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.entity_type == EntityType::Case)
+            .collect();
+        assert_eq!(bugs.len(), 1, "{bugs:?}");
+        assert_eq!(bugs[0].name, "froze on a large archive");
+        let slots = bugs[0].attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap();
+        let symptom = slots
+            .iter()
+            .find(|slot| slot["predicate"] == "issue_symptom")
+            .expect("symptom slot");
+        assert_eq!(symptom["provenance"], "user");
+        let evidence = symptom["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["session"], "s-widget");
+        assert_eq!(evidence[0]["turn"], 0);
+        assert_eq!(evidence[0]["quote"], "TimeoutError");
+        let before = stored_rows(&gm).await;
+
+        let again =
+            crate::graph::v2::pass1::extract_session(&gm, tmp.path(), 1, &ctx, &Reply(reply))
+                .await
+                .unwrap();
+        assert_eq!(again.kept, 1);
+        assert_eq!(again.slots_written, 0);
+        assert_eq!(again.relationships_created, 0);
+        assert_eq!(stored_rows(&gm).await, before);
+        let bugs = crud::list_entities(gm.db(), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.entity_type == EntityType::Case)
+            .count();
+        assert_eq!(bugs, 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn stored_rows(gm: &GraphMemory) -> Vec<(String, f64, f64)> {
+        let mut rows = Vec::new();
+        for entity in crud::list_entities(gm.db(), None).await.unwrap() {
+            let Some(slots) = entity
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs["v2"]["slots"].as_array())
+            else {
+                continue;
+            };
+            for slot in slots {
+                let evidence = slot["evidence"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                rows.push((
+                    format!(
+                        "{}:{}:{}:{evidence}",
+                        entity.name, slot["predicate"], slot["value"]
+                    ),
+                    slot["alpha"].as_f64().unwrap(),
+                    slot["beta"].as_f64().unwrap(),
+                ));
+            }
+        }
+        for edge in crud::list_all_relationships(gm.db()).await.unwrap() {
+            rows.push((
+                format!("edge:{}:{}", edge.rel_type, edge.id_string()),
+                edge.alpha.unwrap(),
+                edge.beta.unwrap(),
+            ));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
 }
