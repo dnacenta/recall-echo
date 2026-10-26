@@ -823,6 +823,12 @@ pub struct IngestionReport {
     /// has to claim more precision than it has.
     #[serde(default)]
     pub measured_tokens: u64,
+    /// Prompt tokens providers reported. `None` when no call reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Completion tokens providers reported. `None` when no call reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
     /// Record IDs of the entities this run created or merged into — the
     /// entities the session touched, and so the ones a session outcome
     /// applies to. Empty when the run had no LLM to extract with.

@@ -25,7 +25,7 @@ use surrealdb::Surreal;
 use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Provenance};
 use super::super::crud;
 use super::super::error::GraphError;
-use super::super::llm::LlmProvider;
+use super::super::llm::{LlmProvider, TokenUsage};
 use super::super::store::Db;
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
@@ -83,6 +83,8 @@ pub(crate) struct WriteStats {
     pub resolve_ms: u64,
     /// Milliseconds spent committing edges, slots and retirements.
     pub write_ms: u64,
+    /// Usage from the resolver call. `None` when it was not called or reported nothing.
+    pub usage: Option<TokenUsage>,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -289,6 +291,7 @@ async fn write_attempt(
         entities_created: resolution.entities_created,
         resolver_calls: resolution.report.resolver_called,
         resolve: resolution.report.clone(),
+        usage: resolution.usage,
         ..WriteStats::default()
     };
     let mut catalog = Catalog::from_resolution(resolution);

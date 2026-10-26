@@ -147,6 +147,8 @@ async fn collect_sessions(
                 report.slots_written += extracted.slots_written;
                 report.estimated_tokens += extracted.estimated_tokens;
                 report.measured_tokens += extracted.measured_tokens;
+                report.input_tokens = add_reported(report.input_tokens, extracted.input_tokens);
+                report.output_tokens = add_reported(report.output_tokens, extracted.output_tokens);
                 report.llm_calls += extracted.llm_calls;
                 report.windows = extracted.windows;
                 report.candidates = extracted.candidates;
@@ -168,6 +170,8 @@ async fn collect_sessions(
             after: after.clone(),
             calls,
             millis,
+            input_tokens: report.input_tokens,
+            output_tokens: report.output_tokens,
             warnings: report.errors,
             windows: report.windows,
             candidates: report.candidates,
@@ -181,6 +185,14 @@ async fn collect_sessions(
         before = after;
     }
     Ok(sessions)
+}
+
+fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
+    match (total, extra) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(right)) => Some(left + right),
+    }
 }
 
 /// Grade `script` `repeat` times, each in a fresh `parent/run-<k>` directory.
@@ -1288,6 +1300,8 @@ mod tests {
     use super::*;
     use super::{map_relation, RelationMap};
     use crate::graph::extract::chunk_conversation;
+    #[cfg(feature = "embedded")]
+    use crate::graph::llm::TokenUsage;
     use crate::graph::{Provenance, ProvenancePolicy};
 
     fn history() -> FactScript {
@@ -1594,6 +1608,9 @@ mod tests {
             .sessions
             .iter()
             .all(|session| session.timing.is_none()));
+        let session = serde_json::to_value(&report.sessions[0]).unwrap();
+        assert!(session["input_tokens"].is_null() && session["output_tokens"].is_null());
+        assert!(report.input_tokens.is_none() && report.output_tokens.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2089,6 +2106,80 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    async fn reported_usage_sums_across_sessions() {
+        const INPUT: u64 = 17;
+        const OUTPUT: u64 = 4;
+        const EMPTY: &str = r#"{"facts":[],"bugs":[],"releases":[]}"#;
+        struct Fixed;
+
+        #[async_trait]
+        impl LlmProvider for Fixed {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Ok(EMPTY.to_string())
+            }
+
+            async fn complete_measured(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                Ok(Completion::measured(
+                    EMPTY,
+                    TokenUsage::from_counts(Some(INPUT), Some(OUTPUT)),
+                ))
+            }
+        }
+
+        let script = crate::bench::writes::parse_script(
+            "name = \"tokens\"\nfacts = []\n\
+             [[sessions]]\nid = \"s1\"\ndate = \"2026-01-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Alpha note.\"\n\
+             [[sessions]]\nid = \"s2\"\ndate = \"2026-01-02T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Beta note.\"\n",
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let report = run(
+            &script,
+            tmp.path(),
+            Extractor::Live(&Fixed),
+            PipelineVersion::V2,
+        )
+        .await
+        .unwrap();
+        assert!(report.sessions.iter().all(|session| {
+            session.calls == 1
+                && session.warnings.is_empty()
+                && session.input_tokens == Some(INPUT)
+                && session.output_tokens == Some(OUTPUT)
+        }));
+        assert_eq!(
+            (
+                report.input_tokens,
+                report.output_tokens,
+                report.input_tokens_per_session,
+                report.output_tokens_per_session,
+            ),
+            (
+                Some(INPUT * 2),
+                Some(OUTPUT * 2),
+                Some(INPUT as f64),
+                Some(OUTPUT as f64)
+            )
+        );
+        let json = serde_json::to_string(&report.sessions[0]).unwrap();
+        let at = |key: &str| json.find(&format!("\"{key}\"")).unwrap();
+        assert!(at("millis") < at("input_tokens") && at("input_tokens") < at("output_tokens"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
     async fn history_scripted_v2() {
         let script = history();
         let tmp = tempfile::tempdir().unwrap();
@@ -2136,6 +2227,19 @@ mod tests {
         assert!(report.junk_edges.is_empty(), "{:?}", report.junk_edges);
         assert!(report.questions[0].graph_hit);
         assert!(!report.questions[1].graph_hit);
+        assert!(report
+            .sessions
+            .iter()
+            .all(|session| { session.input_tokens.is_none() && session.output_tokens.is_none() }));
+        assert_eq!(
+            (
+                report.input_tokens,
+                report.output_tokens,
+                report.input_tokens_per_session,
+                report.output_tokens_per_session,
+            ),
+            (None, None, None, None)
+        );
         assert!(
             report.sessions.iter().all(|session| {
                 let Some(timing) = session.timing else {
