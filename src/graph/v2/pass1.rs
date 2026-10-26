@@ -1003,6 +1003,19 @@ mod tests {
     use crate::graph::Provenance;
     use serde_json::Value;
 
+    /// The pass-1 system prompt from before the known-facts block (631c5dc).
+    const SYSTEM_BEFORE_KNOWN_BLOCK: &str =
+        include_str!("../../../tests/fixtures/pass1/system-pre-known-block.txt");
+
+    #[test]
+    fn off_system_prompt_matches_the_golden_pre_block_prompt() {
+        assert_eq!(PASS1_SYSTEM_BARE, SYSTEM_BEFORE_KNOWN_BLOCK);
+        assert_eq!(
+            PASS1_SYSTEM,
+            format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}")
+        );
+    }
+
     fn session(turns: Vec<Turn>) -> SessionInput {
         SessionInput {
             session_id: "s".into(),
