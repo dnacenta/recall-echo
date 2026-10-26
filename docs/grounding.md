@@ -6,7 +6,7 @@ The quote is checked first. The schema remap runs next, so a setting is bound on
 
 ## Gate 1 — quote
 
-The trimmed quote must be at least three characters and contain an alphanumeric character. It must be an exact, case-sensitive substring of a turn. Tool lines are not turns and never match. A quote in the cited turn keeps that turn. A quote found only in another turn is re-cited to the first such turn in transcript order, and the fact takes that turn's role. Otherwise the candidate drops as `quote`.
+The trimmed quote must be at least three characters and contain an alphanumeric character. It must be an exact, case-sensitive substring of a turn. Tool lines are not turns and never match. A quote in the cited turn keeps that turn. A quote found only in another turn is re-cited to the first such turn in transcript order, and the fact takes that turn's role. Otherwise the candidate drops as `quote`. When that exact search misses, an underscore with an alphanumeric character on both sides may match that underscore or one ASCII space, and every other character must still match exactly. On such a match the stored quote is the turn's text.
 
 ## Gate 2 — value support
 
