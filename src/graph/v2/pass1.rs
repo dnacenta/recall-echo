@@ -63,6 +63,23 @@ confidence: 0.0-1.0 that this is a durable, correctly stated fact.
 
 Known facts lists what memory already holds. When a decided fact replaces one of them, copy that known value exactly into `replaces`, and reuse its key for the same setting."#;
 
+const KNOWN_SENTENCES: &str = "\n\nKnown facts lists what memory already holds. When a decided fact replaces one of them, copy that known value exactly into `replaces`, and reuse its key for the same setting.";
+
+const fn bare_end() -> usize {
+    let full = PASS1_SYSTEM.as_bytes();
+    let suffix = KNOWN_SENTENCES.as_bytes();
+    let start = full.len() - suffix.len();
+    let mut index = 0;
+    while index < suffix.len() {
+        assert!(full[start + index] == suffix[index]);
+        index += 1;
+    }
+    start
+}
+
+/// Pass-1 instructions with those sentences removed.
+pub(crate) const PASS1_SYSTEM_BARE: &str = PASS1_SYSTEM.split_at(bare_end()).0;
+
 /// Worked example, in the same shape as [`user_message`].
 pub(crate) const PASS1_EXAMPLE_USER: &str = r#"Project: tidepool
 Session date: 2026-01-02
@@ -195,15 +212,26 @@ pub(crate) async fn extract_session(
     report.chunks_total = report.windows;
 
     let pass1_started = std::time::Instant::now();
-    // Grounding stays on the turns. The known block is model input, not a turn,
-    // so a quote that exists only there still fails gate 1.
+    // The known block is opt-in model input, not a turn. Off does not read
+    // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
     let ground = SessionGround::prepare(&session.turns);
-    let session_text = super::known::turn_text(&session.turns);
-    let known_rows = super::known::known_rows(gm, &session.project, &session_text).await?;
-    let known_block = super::known::render_known(&known_rows);
+    let known_on = known_facts_context_enabled(memory_dir);
+    let system = if known_on {
+        PASS1_SYSTEM
+    } else {
+        PASS1_SYSTEM_BARE
+    };
+    let (known_rows, known_block) = if known_on {
+        let session_text = super::known::turn_text(&session.turns);
+        let rows = super::known::known_rows(gm, &session.project, &session_text).await?;
+        let block = super::known::render_known(&rows);
+        (rows, block)
+    } else {
+        (Vec::new(), String::new())
+    };
     let mut facts = Vec::new();
     for window in &windows {
-        match call_window(llm, &session, window, &known_block, &mut report).await {
+        match call_window(llm, &session, window, &known_block, system, &mut report).await {
             Ok(reply) => facts.extend(collect_facts(&reply, &session, &ground, &mut report)),
             Err(reason) => {
                 report.errors.push(reason);
@@ -258,11 +286,19 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn known_facts_context_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .known_facts_context
+}
+
 async fn call_window(
     llm: &dyn LlmProvider,
     session: &SessionInput,
     window: &str,
     known: &str,
+    system: &str,
     report: &mut IngestionReport,
 ) -> Result<Map<String, Value>, String> {
     let message = user_message(&session.project.name, &session.date, window, known);
@@ -275,13 +311,13 @@ async fn call_window(
     for _ in 0..2 {
         report.llm_calls += 1;
         let completion = match llm
-            .complete_structured_chat(PASS1_SYSTEM, &messages, pass1_schema(), MAX_TOKENS)
+            .complete_structured_chat(system, &messages, pass1_schema(), MAX_TOKENS)
             .await
         {
             Ok(completion) => completion,
             Err(err) => return Err(format!("parse failure: {err}")),
         };
-        bill(report, completion.usage, &message, &completion.text);
+        bill(report, completion.usage, system, &message, &completion.text);
         match parsed_root(&completion.text) {
             Ok(object) => return Ok(object),
             Err(reason) => last = reason,
@@ -290,14 +326,20 @@ async fn call_window(
     Err(last)
 }
 
-fn bill(report: &mut IngestionReport, usage: Option<TokenUsage>, message: &str, reply: &str) {
+fn bill(
+    report: &mut IngestionReport,
+    usage: Option<TokenUsage>,
+    system: &str,
+    message: &str,
+    reply: &str,
+) {
     match usage {
         Some(usage) => {
             report.measured_tokens += usage.total();
             record_sides(report, usage);
         }
         None => {
-            let chars = PASS1_SYSTEM.len()
+            let chars = system.len()
                 + PASS1_EXAMPLE_USER.len()
                 + PASS1_EXAMPLE_REPLY.len()
                 + message.len()
@@ -1024,9 +1066,16 @@ mod tests {
 
         let seen = Seen(std::sync::Mutex::new(None));
         let mut report = IngestionReport::default();
-        let object = call_window(&seen, &session(turns()), "[T0] USER: hi", "", &mut report)
-            .await
-            .expect("structured reply");
+        let object = call_window(
+            &seen,
+            &session(turns()),
+            "[T0] USER: hi",
+            "",
+            PASS1_SYSTEM,
+            &mut report,
+        )
+        .await
+        .expect("structured reply");
         assert!(object.get("facts").is_some());
         assert_eq!(seen.0.lock().expect("lock").as_ref(), Some(pass1_schema()));
         assert_eq!(report.llm_calls, 1);
@@ -1615,9 +1664,16 @@ mod tests {
 
         let window = "[T0] USER: hi";
         let mut report = IngestionReport::default();
-        call_window(&Bare, &session(turns()), window, "", &mut report)
-            .await
-            .expect("reply");
+        call_window(
+            &Bare,
+            &session(turns()),
+            window,
+            "",
+            PASS1_SYSTEM,
+            &mut report,
+        )
+        .await
+        .expect("reply");
         let message = user_message("tidepool", "2026-01-02", window, "");
         let reply = r#"{"facts":[],"bugs":[],"releases":[]}"#;
         let chars = PASS1_SYSTEM.len()
@@ -1638,12 +1694,14 @@ mod tests {
         bill(
             &mut both,
             TokenUsage::from_counts(Some(3), Some(5)),
+            PASS1_SYSTEM,
             "m",
             "r",
         );
         bill(
             &mut both,
             TokenUsage::from_counts(Some(2), Some(1)),
+            PASS1_SYSTEM,
             "m",
             "r",
         );
@@ -1658,14 +1716,20 @@ mod tests {
         );
 
         let mut one = IngestionReport::default();
-        bill(&mut one, TokenUsage::from_counts(None, Some(4)), "m", "r");
+        bill(
+            &mut one,
+            TokenUsage::from_counts(None, Some(4)),
+            PASS1_SYSTEM,
+            "m",
+            "r",
+        );
         assert_eq!(
             (one.input_tokens, one.output_tokens, one.measured_tokens),
             (Some(0), Some(4), 4)
         );
 
         let mut none = IngestionReport::default();
-        bill(&mut none, None, "m", "r");
+        bill(&mut none, None, PASS1_SYSTEM, "m", "r");
         assert_eq!(
             (none.input_tokens, none.output_tokens, none.measured_tokens),
             (None, None, 0)

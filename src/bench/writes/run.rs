@@ -65,21 +65,36 @@ pub fn require_scratch(path: &Path) -> Result<(), RecallError> {
     Ok(())
 }
 
+/// Whether pass 1 is shown facts already in the store.
+///
+/// Off does not read the store and leaves the pass-1 request unchanged.
+/// On is the experimental known-facts block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownFactsContext {
+    /// Do not read or send stored facts.
+    Off,
+    /// Read live rows and send them on pass 1.
+    On,
+}
+
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
 /// `work_dir` must be missing or empty. The function creates `memory/` under it.
 ///
 /// Session `millis` is ingest time. Model load is measured first and reported
 /// as `setup_millis`, so the first session is not charged for it.
+/// `known_facts_context` turns the experimental pass-1 block on or leaves it off.
 pub async fn run(
     script: &FactScript,
     work_dir: &Path,
     extractor: Extractor<'_>,
     pipeline: PipelineVersion,
+    known_facts_context: KnownFactsContext,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
     let written = write_archives(&memory_dir, script)?;
+    apply_known_facts_context(&memory_dir, known_facts_context)?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
     let (label, provider) = provider_for(script, extractor)?;
@@ -200,12 +215,14 @@ fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
 /// `parent` must be missing or empty. Nothing is created when it is not.
 /// `k` starts at 1. One run still uses `run-1`; the command prints a single
 /// report itself when repeat is 1.
+/// `known_facts_context` is passed to every run.
 pub async fn run_repeat(
     script: &FactScript,
     parent: &Path,
     repeat: usize,
     extractor: Extractor<'_>,
     pipeline: PipelineVersion,
+    known_facts_context: KnownFactsContext,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -218,9 +235,24 @@ pub async fn run_repeat(
     for k in 1..=repeat {
         let dir = parent.join(format!("run-{k}"));
         fs::create_dir(&dir)?;
-        runs.push(run(script, &dir, extractor, pipeline).await?);
+        runs.push(run(script, &dir, extractor, pipeline, known_facts_context).await?);
     }
     Ok(RepeatReport::from_runs(runs))
+}
+
+/// Opt in by writing `[graph] known_facts_context` into the fresh memory dir.
+fn apply_known_facts_context(
+    memory_dir: &Path,
+    known: KnownFactsContext,
+) -> Result<(), RecallError> {
+    if known == KnownFactsContext::Off {
+        return Ok(());
+    }
+    fs::write(
+        crate::config::config_path(memory_dir),
+        "[graph]\nknown_facts_context = true\n",
+    )?;
+    Ok(())
 }
 
 /// N fresh runs, plus the median and the min/max of each graded count.
@@ -992,7 +1024,7 @@ impl LlmProvider for ScriptedExtractor {
         user_message: &str,
         _max_tokens: u32,
     ) -> Result<String, crate::graph::error::GraphError> {
-        if system_prompt.starts_with(crate::graph::v2::pass1::PASS1_SYSTEM) {
+        if system_prompt.starts_with(crate::graph::v2::pass1::PASS1_SYSTEM_BARE) {
             return self.v2_json(user_message);
         }
         if system_prompt == crate::graph::v2::resolve::PASS2_SYSTEM {
@@ -1370,6 +1402,7 @@ mod tests {
             tmp.path(),
             Extractor::Scripted,
             PipelineVersion::V1,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap_err();
@@ -1522,6 +1555,7 @@ mod tests {
             tmp.path(),
             Extractor::Scripted,
             PipelineVersion::V1,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap();
@@ -1623,6 +1657,7 @@ mod tests {
             3,
             Extractor::Scripted,
             PipelineVersion::V1,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap_err();
@@ -1642,6 +1677,7 @@ mod tests {
             0,
             Extractor::Scripted,
             PipelineVersion::V1,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap_err();
@@ -1713,6 +1749,7 @@ mod tests {
             tmp.path(),
             Extractor::Scripted,
             PipelineVersion::V1,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap();
@@ -1975,6 +2012,7 @@ mod tests {
             tmp.path(),
             Extractor::Scripted,
             PipelineVersion::V2,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap();
@@ -2133,6 +2171,81 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_facts_context_flag_changes_the_pass1_prompt() {
+        use std::sync::Mutex;
+
+        const SCRIPT: &str = "name = \"cedar\"\nfacts = []\n\
+             [[sessions]]\nid = \"s1\"\ndate = \"2026-03-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Keep the shelf label as cedar.\"\n";
+
+        struct Seen(Mutex<Vec<(String, String)>>);
+
+        #[async_trait]
+        impl LlmProvider for Seen {
+            async fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> Result<String, crate::graph::error::GraphError> {
+                Err(crate::graph::error::GraphError::Llm(
+                    "plain complete was called".into(),
+                ))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                messages: &[Message],
+                _: &serde_json::Value,
+                _: u32,
+            ) -> Result<Completion, crate::graph::error::GraphError> {
+                let user = messages.last().map(|message| message.content.clone());
+                self.0
+                    .lock()
+                    .expect("lock")
+                    .push((system.to_string(), user.unwrap_or_default()));
+                Ok(Completion::unmeasured(
+                    r#"{"facts":[],"bugs":[],"releases":[]}"#,
+                ))
+            }
+        }
+
+        async fn once(known: KnownFactsContext) -> (String, String, bool) {
+            let script = crate::bench::writes::parse_script(SCRIPT).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let seen = Seen(Mutex::new(Vec::new()));
+            run(
+                &script,
+                tmp.path(),
+                Extractor::Live(&seen),
+                PipelineVersion::V2,
+                known,
+            )
+            .await
+            .unwrap();
+            let rows = seen.0.lock().expect("lock").clone();
+            let configured = std::fs::read_to_string(tmp.path().join("memory/.recall-echo.toml"))
+                .unwrap_or_default()
+                .contains("known_facts_context = true");
+            (rows[0].0.clone(), rows[0].1.clone(), configured)
+        }
+
+        let (off_system, off_user, off_configured) = once(KnownFactsContext::Off).await;
+        assert_eq!(off_system, crate::graph::v2::pass1::PASS1_SYSTEM_BARE);
+        assert!(!off_system.contains("Known facts lists what memory already holds."));
+        assert!(!off_user.contains("Known facts"));
+        assert!(!off_configured);
+
+        let (on_system, on_user, on_configured) = once(KnownFactsContext::On).await;
+        assert_eq!(on_system, crate::graph::v2::pass1::PASS1_SYSTEM);
+        assert!(on_system.contains("reuse its key for the same setting."));
+        assert!(!on_user.contains("Known facts"));
+        assert!(on_configured);
+    }
+
+    #[cfg(feature = "embedded")]
     async fn live_v2(script: &str, provider: &dyn LlmProvider) -> WriteReport {
         let script = crate::bench::writes::parse_script(script).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -2141,6 +2254,7 @@ mod tests {
             tmp.path(),
             Extractor::Live(provider),
             PipelineVersion::V2,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap()
@@ -2425,6 +2539,7 @@ mod tests {
             tmp.path(),
             Extractor::Scripted,
             PipelineVersion::V2,
+            KnownFactsContext::Off,
         )
         .await
         .unwrap();
