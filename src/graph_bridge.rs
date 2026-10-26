@@ -165,4 +165,37 @@ impl crate::graph::llm::LlmProvider for GraphLlmBridge<'_> {
 
         Ok(response.text())
     }
+
+    /// `invoke` already takes the turn list, so the worked example stays a
+    /// real user turn and a real assistant turn.
+    async fn complete_structured_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[crate::graph::llm::Message],
+        _schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<crate::graph::llm::Completion, crate::graph::error::GraphError> {
+        use pulse_system_types::llm::{Message, MessageContent, Role};
+
+        let messages: Vec<Message> = messages
+            .iter()
+            .map(|message| Message {
+                role: if message.role == "assistant" {
+                    Role::Assistant
+                } else {
+                    Role::User
+                },
+                content: MessageContent::Text(message.content.clone()),
+                source: None,
+            })
+            .collect();
+
+        let response = self
+            .provider
+            .invoke(system_prompt, &messages, max_tokens, None)
+            .await
+            .map_err(|e| crate::graph::error::GraphError::Llm(e.to_string()))?;
+
+        Ok(crate::graph::llm::Completion::unmeasured(response.text()))
+    }
 }
