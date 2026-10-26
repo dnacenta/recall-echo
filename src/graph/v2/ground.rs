@@ -817,14 +817,13 @@ pub(crate) fn punctuation_literal(value: &str) -> bool {
 }
 
 /// `` `v` ``, `'v'` or `"v"`, with the marks directly around `value`.
+///
+/// A mark that occurs in the value does not wrap it, so a fence such as
+/// `` ``` `` or `"""` is not read as a quoted mark.
 fn wrapped_literal(quote: &str, value: &str) -> bool {
-    [
-        format!("`{value}`"),
-        format!("'{value}'"),
-        format!("\"{value}\""),
-    ]
-    .iter()
-    .any(|wrapped| quote.contains(wrapped))
+    ['`', '\'', '"']
+        .into_iter()
+        .any(|mark| !value.contains(mark) && quote.contains(&format!("{mark}{value}{mark}")))
 }
 
 pub(crate) fn numbers_in(text: &str) -> Vec<String> {
@@ -1812,6 +1811,26 @@ mod tests {
         let later = "Export uses `|` as the column separator.";
         let session = ground(&[(later, TurnRole::User)]);
         assert!(session.punctuation_setting_supported("column_separator", "|", 0, "uses `|` as"));
+        for (turn, value) in [
+            ("Put column separator examples in ``` blocks.", "`"),
+            ("The column separator doc uses \"\"\" strings.", "\""),
+            ("The column separator doc uses ''' strings.", "'"),
+        ] {
+            assert!(
+                !punctuation_bound(turn, "column_separator", value),
+                "{turn}"
+            );
+        }
+        assert!(punctuation_bound(
+            "The column separator is '`' here.",
+            "column_separator",
+            "`"
+        ));
+        assert!(punctuation_bound(
+            "The column separator is `'|'` here.",
+            "column_separator",
+            "|"
+        ));
         let split = "The column separator is fixed. Export uses `|` today.";
         let session = ground(&[(split, TurnRole::User)]);
         assert!(!session.punctuation_setting_supported(
