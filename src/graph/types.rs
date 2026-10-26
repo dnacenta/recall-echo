@@ -821,12 +821,17 @@ pub struct IngestionReport {
     /// Tokens the providers actually reported, summed over the calls that
     /// reported them. Kept apart from the estimate so a displayed number never
     /// has to claim more precision than it has.
+    /// Pass 1 only, so input plus output can exceed it when the resolver ran.
     #[serde(default)]
     pub measured_tokens: u64,
     /// Prompt tokens providers reported. `None` when no call reported usage.
+    /// A provider reporting only one side records the other as 0, not null,
+    /// matching [`crate::graph::llm::TokenUsage::from_counts`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// Completion tokens providers reported. `None` when no call reported usage.
+    /// A provider reporting only one side records the other as 0, not null,
+    /// matching [`crate::graph::llm::TokenUsage::from_counts`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     /// Record IDs of the entities this run created or merged into — the

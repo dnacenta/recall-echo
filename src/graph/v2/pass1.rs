@@ -292,8 +292,18 @@ fn bill(report: &mut IngestionReport, usage: Option<TokenUsage>, message: &str, 
 
 /// Add one reported call. An unreported side arrives as zero, and that zero is summed.
 fn record_sides(report: &mut IngestionReport, usage: TokenUsage) {
-    report.input_tokens = Some(report.input_tokens.unwrap_or(0) + usage.input_tokens);
-    report.output_tokens = Some(report.output_tokens.unwrap_or(0) + usage.output_tokens);
+    report.input_tokens = Some(
+        report
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.input_tokens),
+    );
+    report.output_tokens = Some(
+        report
+            .output_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.output_tokens),
+    );
 }
 
 /// The first JSON object, salvaged when the reply was cut off, then checked

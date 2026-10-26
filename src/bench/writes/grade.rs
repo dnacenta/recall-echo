@@ -78,8 +78,10 @@ pub struct SessionObservation {
     pub calls: u64,
     pub millis: u64,
     /// Prompt tokens reported for this session. `None` when none were reported.
+    /// A provider reporting only one side records the other as 0, not null.
     pub input_tokens: Option<u64>,
     /// Completion tokens reported for this session. `None` when none were reported.
+    /// A provider reporting only one side records the other as 0, not null.
     pub output_tokens: Option<u64>,
     pub warnings: Vec<String>,
     /// Windows the second pipeline sent. Zero on v1.
@@ -165,8 +167,10 @@ pub struct SessionReport {
     pub calls: u64,
     pub millis: u64,
     /// Prompt tokens reported for this session. Null when none were reported.
+    /// A provider reporting only one side records the other as 0, not null.
     pub input_tokens: Option<u64>,
     /// Completion tokens reported for this session. Null when none were reported.
+    /// A provider reporting only one side records the other as 0, not null.
     pub output_tokens: Option<u64>,
     pub warnings: Vec<String>,
     /// Windows the second pipeline sent.
@@ -207,7 +211,7 @@ fn token_side(values: impl Iterator<Item = Option<u64>>) -> (Option<u64>, Option
     let mut total = 0u64;
     let mut counted = 0u64;
     for value in values.flatten() {
-        total += value;
+        total = total.saturating_add(value);
         counted += 1;
     }
     if counted == 0 {
@@ -240,8 +244,10 @@ pub struct WriteReport {
     /// Sum of per-session ingest time. Model load is [`WriteReport::setup_millis`].
     pub millis: u64,
     /// Sum of reported prompt tokens. Null when no session reported any.
+    /// A provider reporting only one side records the other as 0, not null.
     pub input_tokens: Option<u64>,
     /// Sum of reported completion tokens. Null when no session reported any.
+    /// A provider reporting only one side records the other as 0, not null.
     pub output_tokens: Option<u64>,
     /// Mean prompt tokens over sessions that reported them.
     pub input_tokens_per_session: Option<f64>,
@@ -2933,5 +2939,50 @@ mod tests {
             precision: Some(1.0),
             recall: Some(1.0),
         }
+    }
+
+    #[test]
+    fn null_session_is_left_out_of_the_token_mean() {
+        let script = FactScript {
+            name: "mean".to_string(),
+            project: None,
+            cwd: None,
+            sessions: vec![
+                session("s1", turn(Speaker::User, "a", vec![], false)),
+                session("s2", turn(Speaker::User, "b", vec![], false)),
+                session("s3", turn(Speaker::User, "c", vec![], false)),
+            ],
+            facts: vec![],
+            expect: vec![],
+            questions: vec![],
+            superseded_pairs: vec![],
+            noise: vec![],
+        };
+        let mut sessions = vec![
+            obs("s1", vec![], vec![]),
+            obs("s2", vec![], vec![]),
+            obs("s3", vec![], vec![]),
+        ];
+        sessions[0].input_tokens = Some(10);
+        sessions[0].output_tokens = Some(10);
+        sessions[2].input_tokens = Some(20);
+        sessions[2].output_tokens = Some(20);
+        let report = grade(
+            &script,
+            &sessions,
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.input_tokens,
+                report.input_tokens_per_session,
+                report.output_tokens,
+                report.output_tokens_per_session,
+            ),
+            (Some(30), Some(15.0), Some(30), Some(15.0))
+        );
     }
 }
