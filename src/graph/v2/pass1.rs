@@ -59,7 +59,9 @@ BUGS (section "bugs"): one entry per bug or problem: symptom = what went wrong (
 RELEASES (section "releases"): one entry per version that was released or is planned: version (e.g. 1.4.0), status = released or planned, contents = what it contains or will contain (short, comma separated).
 
 Evidence (every entry): turn = the N of the [TN] turn that states it; quote = an exact verbatim copy of 3-20 consecutive words from that turn that contains the value (copy characters exactly).
-confidence: 0.0-1.0 that this is a durable, correctly stated fact."#;
+confidence: 0.0-1.0 that this is a durable, correctly stated fact.
+
+Known facts lists what memory already holds. When a decided fact replaces one of them, copy that known value exactly into `replaces`, and reuse its key for the same setting."#;
 
 /// Worked example, in the same shape as [`user_message`].
 pub(crate) const PASS1_EXAMPLE_USER: &str = r#"Project: tidepool
@@ -150,10 +152,18 @@ const PASS1_JSON_SCHEMA: &str = r#"{
 }"#;
 
 /// The user message for one window.
+///
+/// `known` is the rendered known-facts block, or empty when there is nothing
+/// to show. An empty block leaves the message byte-for-byte unchanged.
 #[must_use]
-pub(crate) fn user_message(project: &str, date: &str, window: &str) -> String {
+pub(crate) fn user_message(project: &str, date: &str, window: &str, known: &str) -> String {
+    let known_line = if known.is_empty() {
+        String::new()
+    } else {
+        format!("{known}\n")
+    };
     format!(
-        "Project: {project}\nSession date: {date}\nTranscript:\n{window}\n\nExtract the durable facts, bugs and releases as JSON."
+        "Project: {project}\nSession date: {date}\n{known_line}Transcript:\n{window}\n\nExtract the durable facts, bugs and releases as JSON."
     )
 }
 
@@ -185,10 +195,15 @@ pub(crate) async fn extract_session(
     report.chunks_total = report.windows;
 
     let pass1_started = std::time::Instant::now();
+    // Grounding stays on the turns. The known block is model input, not a turn,
+    // so a quote that exists only there still fails gate 1.
     let ground = SessionGround::prepare(&session.turns);
+    let session_text = super::known::turn_text(&session.turns);
+    let known_rows = super::known::known_rows(gm, &session.project, &session_text).await?;
+    let known_block = super::known::render_known(&known_rows);
     let mut facts = Vec::new();
     for window in &windows {
-        match call_window(llm, &session, window, &mut report).await {
+        match call_window(llm, &session, window, &known_block, &mut report).await {
             Ok(reply) => facts.extend(collect_facts(&reply, &session, &ground, &mut report)),
             Err(reason) => {
                 report.errors.push(reason);
@@ -205,13 +220,14 @@ pub(crate) async fn extract_session(
     let mut resolve_ms = 0;
     let mut write_ms = 0;
     if !facts.is_empty() {
-        let write_ctx = write::WriteCtx::new(
+        let mut write_ctx = write::WriteCtx::new(
             llm,
             &session.project,
             ctx.session_id(),
             &session.date,
             &session.turns,
         );
+        write_ctx.known = known_rows;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         resolve_ms = stats.resolve_ms;
         write_ms = stats.write_ms;
@@ -246,9 +262,10 @@ async fn call_window(
     llm: &dyn LlmProvider,
     session: &SessionInput,
     window: &str,
+    known: &str,
     report: &mut IngestionReport,
 ) -> Result<Map<String, Value>, String> {
-    let message = user_message(&session.project.name, &session.date, window);
+    let message = user_message(&session.project.name, &session.date, window, known);
     let messages = [
         Message::user(PASS1_EXAMPLE_USER),
         Message::assistant(PASS1_EXAMPLE_REPLY),
@@ -996,7 +1013,7 @@ mod tests {
                 assert_eq!(messages[1], Message::assistant(PASS1_EXAMPLE_REPLY));
                 assert_eq!(
                     messages[2],
-                    Message::user(user_message("tidepool", "2026-01-02", "[T0] USER: hi"))
+                    Message::user(user_message("tidepool", "2026-01-02", "[T0] USER: hi", ""))
                 );
                 *self.0.lock().expect("lock") = Some(schema.clone());
                 Ok(crate::graph::llm::Completion::unmeasured(
@@ -1007,7 +1024,7 @@ mod tests {
 
         let seen = Seen(std::sync::Mutex::new(None));
         let mut report = IngestionReport::default();
-        let object = call_window(&seen, &session(turns()), "[T0] USER: hi", &mut report)
+        let object = call_window(&seen, &session(turns()), "[T0] USER: hi", "", &mut report)
             .await
             .expect("structured reply");
         assert!(object.get("facts").is_some());
@@ -1055,7 +1072,7 @@ mod tests {
             .expect("closing line");
         assert_eq!(
             PASS1_EXAMPLE_USER,
-            user_message("tidepool", "2026-01-02", transcript)
+            user_message("tidepool", "2026-01-02", transcript, "")
         );
         assert!(!PASS1_SYSTEM.contains("EXAMPLE"));
         let mut extra = example["facts"][0].clone();
@@ -1421,10 +1438,10 @@ mod tests {
 
         let window = "[T0] USER: hi";
         let mut report = IngestionReport::default();
-        call_window(&Bare, &session(turns()), window, &mut report)
+        call_window(&Bare, &session(turns()), window, "", &mut report)
             .await
             .expect("reply");
-        let message = user_message("tidepool", "2026-01-02", window);
+        let message = user_message("tidepool", "2026-01-02", window, "");
         let reply = r#"{"facts":[],"bugs":[],"releases":[]}"#;
         let chars = PASS1_SYSTEM.len()
             + PASS1_EXAMPLE_USER.len()

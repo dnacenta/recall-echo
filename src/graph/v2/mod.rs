@@ -11,6 +11,7 @@
 
 pub(crate) mod ground;
 pub(crate) mod input;
+pub(crate) mod known;
 pub(crate) mod pass1;
 pub(crate) mod resolve;
 pub(crate) mod schema;

@@ -114,6 +114,9 @@ pub(crate) struct WriteCtx<'a> {
     /// every retirement and still writes the facts.
     pub valid_until: Option<String>,
     pub on_conflict: Option<&'a dyn ConflictHook>,
+    /// Live rows pass 1 showed. The writer does not read them; the next
+    /// increment matches `replaces` against this list.
+    pub known: Vec<super::known::KnownRow>,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -133,6 +136,7 @@ impl<'a> WriteCtx<'a> {
             conflict_budget: &NO_CONFLICTS,
             valid_until: session_midnight(date),
             on_conflict: None,
+            known: Vec::new(),
         }
     }
 }
@@ -2275,6 +2279,17 @@ mod tests {
     /// These writes hit a fresh store or an exact name, so the resolver is never asked.
     struct Quiet;
 
+    #[test]
+    fn known_rows_start_empty() {
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let ctx = WriteCtx::new(&llm, &project, "s", "2026-01-02", &[]);
+        assert!(ctx.known.is_empty());
+    }
+
     #[async_trait::async_trait]
     impl LlmProvider for Quiet {
         async fn complete(
@@ -2516,6 +2531,7 @@ mod tests {
                 conflict_budget: budget,
                 valid_until: session_midnight(date),
                 on_conflict: None,
+                known: Vec::new(),
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -3776,6 +3792,7 @@ mod tests {
             conflict_budget: &budget,
             valid_until: session_midnight(date),
             on_conflict: Some(&hook),
+            known: Vec::new(),
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
