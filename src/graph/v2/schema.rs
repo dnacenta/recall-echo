@@ -617,19 +617,24 @@ fn is_project_name(norm: &str, project: &ProjectIdentity) -> bool {
 
 /// Point a swapped edge at the session project, or reject it.
 ///
-/// The object text is the model's subject. Empty project names, a subject that
-/// is not this project, and a component that is itself a project name are rejected.
+/// The object text is the model's subject. An empty project name, a subject
+/// that is not this project, a component that is itself a project name, and a
+/// generic, empty, or over-long component name are rejected. The swapped fact
+/// carries no `replaces`: that field names what the project used, not a value
+/// on the component.
 pub(crate) fn project_object(
     fact: &mut Fact,
     project: &ProjectIdentity,
 ) -> Result<(), &'static str> {
     if project.name.is_empty()
+        || generic_object(&fact.subject_name, "")
         || !is_project_name(&normalise(&fact.object_name), project)
         || is_project_name(&normalise(&fact.subject_name), project)
     {
         return Err(DROP_REJECTED);
     }
     fact.object_name = project.name.clone();
+    fact.replaces.clear();
     Ok(())
 }
 
@@ -1116,6 +1121,19 @@ mod tests {
             );
             assert_eq!(fact.object_name, object);
         }
+        let long = "x".repeat(301);
+        for subject in ["", "  ", "---", "file", long.as_str()] {
+            let mut fact = swapped(subject, "tidepool");
+            assert_eq!(
+                project_object(&mut fact, &project).unwrap_err(),
+                DROP_REJECTED,
+                "{subject}"
+            );
+        }
+        let mut fact = swapped("export command", "tidepool");
+        fact.replaces = "csv".into();
+        project_object(&mut fact, &project).unwrap();
+        assert!(fact.replaces.is_empty());
         let empty = ProjectIdentity {
             name: String::new(),
             aliases: Vec::new(),
