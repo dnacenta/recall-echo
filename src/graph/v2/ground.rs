@@ -19,6 +19,10 @@
 //! character still matches exactly. The stored quote is then the turn's own
 //! span, so the recorded text stays a verbatim substring.
 //!
+//! A bug whose quote still misses may keep one of its own fields as the quote.
+//! Only the cited turn is searched, and the field must be an exact span of that
+//! turn with at least three content tokens.
+//!
 //! A number is a maximal `\d+(\.\d+)*`. A `-` directly before the first digit
 //! is part of that number when the character before the hyphen is absent or
 //! is not alphanumeric. A hyphen after a letter or a digit is a range or an
@@ -56,7 +60,7 @@
 //! and no other number. The citation stays on the user turn.
 
 use super::input::{Turn, TurnRole};
-use super::schema::{normalise, DROP_QUOTE};
+use super::schema::{normalise, over_long, DROP_QUOTE};
 
 /// A quote shorter than this is not a verbatim span.
 const MIN_QUOTE_CHARS: usize = 3;
@@ -161,6 +165,32 @@ impl SessionGround {
             return Ok(with_quote(turn, quote));
         }
         self.cite_separators(cited, quote).ok_or(DROP_QUOTE)
+    }
+
+    /// First field that is an exact span of the cited turn, in the given order.
+    ///
+    /// A field that is short, has fewer than three content tokens, or is past
+    /// the length cap is skipped. Other turns are not searched, and a separator
+    /// underscore does not match a space.
+    #[must_use]
+    pub(crate) fn cite_field(&self, cited: usize, fields: &[&str]) -> Option<Cited> {
+        let turn = self.turn(cited)?;
+        for field in fields {
+            let field = field.trim();
+            if field.chars().count() < MIN_QUOTE_CHARS
+                || content_tokens(field).len() < 3
+                || over_long(field)
+                || !turn.text.contains(field)
+            {
+                continue;
+            }
+            return Some(Cited {
+                turn: cited,
+                role: turn.role,
+                quote: field.to_string(),
+            });
+        }
+        None
     }
 
     /// The raw text of a turn, after [`SessionGround::cite`] has resolved it.
@@ -985,6 +1015,88 @@ mod tests {
         // Beside punctuation the underscore is not between alphanumerics.
         let punct = ground(&[("end. start now", TurnRole::User)]);
         assert_eq!(punct.cite(0, "end._start now").unwrap_err(), DROP_QUOTE);
+    }
+
+    #[test]
+    fn cite_field_prefers_an_earlier_verbatim_field() {
+        let turn = "Confirmed: the TTL was ignored by the reader, so expired rows were served. I changed the reader to check expires_at on read.";
+        let session = ground(&[(turn, TurnRole::Assistant)]);
+        let symptom = "expired rows were served";
+        let cause = "the TTL was ignored by the reader";
+        let fix = "I changed the reader to check expires_at on read";
+        let cited = session.cite_field(0, &[symptom, cause, fix]).unwrap();
+        assert_eq!((cited.turn, cited.role), (0, TurnRole::Assistant));
+        assert_eq!(cited.quote, symptom);
+        let padded = format!("  {cause}  ");
+        let fields = ["nope", padded.as_str(), fix];
+        assert_eq!(session.cite_field(0, &fields).unwrap().quote, cause);
+    }
+
+    #[test]
+    fn cite_field_does_not_leave_the_cited_turn() {
+        let session = ground(&[
+            (
+                "The cache returned stale entries after deploy.",
+                TurnRole::User,
+            ),
+            (
+                "Noted and left the rest unchanged for now.",
+                TurnRole::Assistant,
+            ),
+        ]);
+        let fields = [
+            "cache returned stale entries",
+            "stale entries after deploy",
+            "returned stale entries after deploy",
+        ];
+        assert!(session.cite_field(1, &fields).is_none());
+        assert!(session.cite_field(3, &fields).is_none());
+        assert_eq!(
+            session.cite_field(0, &fields).unwrap().quote,
+            "cache returned stale entries"
+        );
+    }
+
+    #[test]
+    fn cite_field_rejects_case_hyphen_and_underscore() {
+        let session = ground(&[("cache returned stale entries after deploy.", TurnRole::User)]);
+        for field in [
+            "Cache Returned Stale Entries",
+            "cache-returned stale entries",
+            "cache_returned stale entries",
+        ] {
+            assert!(session.cite_field(0, &[field]).is_none(), "{field}");
+        }
+        assert!(session.cite(0, "cache_returned stale entries").is_ok());
+    }
+
+    #[test]
+    fn cite_field_rejects_a_short_or_over_long_field() {
+        let session = ground(&[(
+            "I changed the reader to check it on read.",
+            TurnRole::Assistant,
+        )]);
+        assert!(session
+            .cite_field(0, &["not here", "still missing", "check it"])
+            .is_none());
+        assert_eq!(
+            session
+                .cite_field(0, &["check it", "changed the reader to check"])
+                .unwrap()
+                .quote,
+            "changed the reader to check"
+        );
+        let long = format!("changed the reader to check {}", "n".repeat(280));
+        let session = SessionGround::prepare(&[Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: long.clone(),
+        }]);
+        let fields = [long.as_str(), "changed the reader to check"];
+        assert_eq!(
+            session.cite_field(0, &fields).unwrap().quote,
+            "changed the reader to check"
+        );
     }
 
     #[test]
