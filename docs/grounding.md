@@ -23,7 +23,7 @@ The value is checked against the cited turn. Every number in the value has to oc
 
 A number is a maximal run of digits with optional `.digits` groups. A `-` immediately before the first digit is part of the number when the character before the hyphen is absent or is not alphanumeric. A hyphen after a letter or a digit is a range or an identifier, so `3-5` yields 3 and 5. `8080` does not occur inside `18080`, `0.2` does not occur inside `0.2.0`, and `-1` does not occur as `1`.
 
-Content tokens are the normalised tokens longer than one character, or digits, minus the stop list: the, a, an, of, and, or, to, in, on, for, with, is, are, be, by, at, as, it, its, use, uses, using, used, from, that, this, now, all, any, not, no. A token longer than three characters may match as a case-insensitive substring of the normalised text. A shorter token has to equal a whole normalised token. A digit-only token also matches when that same number occurs in the raw text. A value with no content tokens fails.
+Content tokens are the normalised tokens longer than one character, or digits, minus the stop list: the, a, an, of, and, or, to, in, on, for, with, is, are, be, by, at, as, it, its, use, uses, using, used, from, that, this, now, all, any, not, no. A token longer than three characters may match as a case-insensitive substring of the normalised text. A shorter token has to equal a whole normalised token. A digit-only token also matches when that same number occurs in the raw text. A value with no content tokens fails. A setting whose trimmed value is one to three characters and contains no alphanumeric character and no whitespace is supported when the trimmed quote wraps that value in backticks or a matching single or double quote (a mark that occurs in the value does not count as its wrapper), the cited turn exists, and at least one specific key token occurs as a whole token in the trimmed quote or in the sentence that contains the quote.
 
 Three content tokens or fewer need at least half of them in the turn and at least one in the quote. A longer literal, and a longer entity name, need at least half of their content tokens in the turn.
 
@@ -43,7 +43,7 @@ A setting whose value contains a number has to name its key in the quote or in t
 
 ## Gate 5 — confidence and generic objects
 
-A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read.
+A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.
 
 ## Symptom on a later turn
 

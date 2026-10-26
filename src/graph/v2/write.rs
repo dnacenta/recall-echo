@@ -29,6 +29,7 @@ use super::super::llm::{LlmProvider, TokenUsage};
 use super::super::store::Db;
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
+use super::ground::punctuation_literal;
 use super::input::{ProjectIdentity, Turn};
 use super::resolve::{self, MentionDraft};
 use super::schema::{key_is_empty, normalise, Fact, Kind, Predicate};
@@ -1480,7 +1481,11 @@ fn status_is(edge: &StoredEdge, allowed: &[&str]) -> bool {
 }
 
 fn values_equal(left: &str, right: &str) -> bool {
-    fold_value(left) == fold_value(right)
+    if punctuation_literal(left) || punctuation_literal(right) {
+        left.trim() == right.trim()
+    } else {
+        fold_value(left) == fold_value(right)
+    }
 }
 
 /// Lower case, with whitespace collapsed. `-`, `+`, `#`, `.` and `/` stay,
@@ -4118,5 +4123,58 @@ mod tests {
         );
         let edges = crud::list_all_relationships(gm.db()).await.unwrap();
         assert_eq!(live(&edges), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn punctuation_values_supersede_then_reinforce() {
+        assert!(values_equal("|", " | "));
+        assert!(!values_equal("|", ";"));
+        assert!(!values_equal(";", ";;"));
+        assert!(!literal_matches("|", "|"));
+
+        let (_tmp, gm) = open_store().await;
+        write_session(
+            &gm,
+            "sA",
+            "2026-04-03",
+            &[decided_slot("column_separator", "|", 1)],
+        )
+        .await
+        .unwrap();
+        let changed = write_session(
+            &gm,
+            "sB",
+            "2026-04-11",
+            &[decided_slot("column_separator", ";", 1)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.reinforced, 0);
+        assert_eq!(changed.retirements.len(), 1, "{:?}", changed.retirements);
+        let slots = app_slots(&gm).await;
+        assert_eq!(
+            slot_named(&slots, "column_separator", "|")["ended_by"],
+            "sB:superseded"
+        );
+        assert!(slot_named(&slots, "column_separator", ";")["valid_until"].is_null());
+
+        let again = write_session(
+            &gm,
+            "sC",
+            "2026-05-01",
+            &[decided_slot("column_separator", ";", 1)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.reinforced, 1, "{:?}", again.retirements);
+        assert!(again.retirements.is_empty());
+        let slots = app_slots(&gm).await;
+        let live: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot["key"] == "column_separator" && slot["valid_until"].is_null())
+            .collect();
+        assert_eq!(live.len(), 1, "{slots:?}");
+        assert_eq!(live[0]["value"], ";");
     }
 }

@@ -14,7 +14,7 @@ use regex::Regex;
 
 use super::super::confidence::Provenance;
 use super::super::types::EntityType;
-use super::ground::numbers_in;
+use super::ground::{numbers_in, punctuation_literal};
 use super::input::{ProjectIdentity, TurnRole};
 
 /// Why a candidate was not written. Stable names, counted on the report.
@@ -708,12 +708,16 @@ const GENERIC_OBJECTS: &[&str] = &[
     "unknown",
 ];
 
-/// `Err` is the drop reason. Confidence and the generic-object rule.
+/// `Err` is the drop reason. Confidence always runs. A keyed setting whose
+/// value is a short punctuation literal skips the generic-object rule.
 pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
     if fact.confidence < MIN_CONFIDENCE {
         return Err(DROP_CONFIDENCE);
     }
-    if generic_object(&fact.object_name, &fact.subject_name) {
+    let keyed_punctuation = fact.predicate == Predicate::Setting
+        && !key_is_empty(&fact.key)
+        && punctuation_literal(&fact.object_name);
+    if !keyed_punctuation && generic_object(&fact.object_name, &fact.subject_name) {
         return Err(DROP_GENERIC);
     }
     Ok(())
@@ -1185,5 +1189,27 @@ mod tests {
             provenance: Provenance::User,
             replaces: String::new(),
         }
+    }
+
+    #[test]
+    fn keyed_punctuation_setting_skips_the_generic_object_check() {
+        let mut kept = fact(Predicate::Setting, Kind::Project, "app");
+        kept.key = "column_separator".into();
+        kept.object_name = "|".into();
+        kept.object_kind = None;
+        assert!(filter_fact(&kept).is_ok());
+
+        let mut low = kept.clone();
+        low.confidence = 0.59;
+        assert_eq!(filter_fact(&low).unwrap_err(), DROP_CONFIDENCE);
+
+        for key in ["", "value"] {
+            let mut empty = kept.clone();
+            empty.key = key.into();
+            assert_eq!(filter_fact(&empty).unwrap_err(), DROP_GENERIC, "{key}");
+        }
+        let mut rule = kept.clone();
+        rule.predicate = Predicate::Rule;
+        assert_eq!(filter_fact(&rule).unwrap_err(), DROP_GENERIC);
     }
 }
