@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -793,6 +793,36 @@ pub struct StageTiming {
     pub write_ms: u64,
     /// From the start of the v2 extraction through the write.
     pub total_ms: u64,
+    /// Known-row lookup plus reconcile. Absent when that switch is off, so a
+    /// report from before this field, and a run that did not match, still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_ms: Option<u64>,
+}
+
+/// Counts from the post-pass-1 known-row matcher and the retirement guards.
+///
+/// Older bench JSON has no object here. A blank report is left out of new JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchReport {
+    #[serde(default)]
+    pub key_filled: u32,
+    #[serde(default)]
+    pub key_canonical: u32,
+    #[serde(default)]
+    pub edge_targets: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped: BTreeMap<String, u32>,
+}
+
+impl MatchReport {
+    /// Nothing was filled, canonicalised, targeted or skipped.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.key_filled == 0
+            && self.key_canonical == 0
+            && self.edge_targets == 0
+            && self.skipped.is_empty()
+    }
 }
 
 /// Result of a full ingestion run.
@@ -877,6 +907,9 @@ pub struct IngestionReport {
     /// Stage durations for pipeline v2. Absent on v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<StageTiming>,
+    /// Known-row match counts. Blank, and omitted, when the switch is off.
+    #[serde(default, skip_serializing_if = "MatchReport::is_blank")]
+    pub known_match: MatchReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -962,6 +995,38 @@ mod tests {
     #[test]
     fn a_v1_report_carries_no_stage_timing() {
         assert!(IngestionReport::default().timing.is_none());
+    }
+
+    #[test]
+    fn older_json_loads_without_match_fields_and_a_zero_duration_is_kept() {
+        let timing: StageTiming =
+            serde_json::from_str(r#"{"pass1_ms":1,"resolve_ms":2,"write_ms":3,"total_ms":6}"#)
+                .unwrap();
+        assert_eq!(timing.match_ms, None);
+        let present = StageTiming {
+            match_ms: Some(0),
+            ..timing
+        };
+        let encoded = serde_json::to_value(present).unwrap();
+        assert_eq!(encoded["match_ms"], 0);
+
+        let value = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(value.get("known_match").is_none());
+
+        let mut filled = IngestionReport::default();
+        filled.known_match.key_filled = 2;
+        filled.known_match.skipped.insert("ambiguous".into(), 1);
+        filled.timing = Some(present);
+        let mut value = serde_json::to_value(&filled).unwrap();
+        assert_eq!(value["known_match"]["key_filled"], 2);
+        assert_eq!(value["known_match"]["skipped"]["ambiguous"], 1);
+        assert_eq!(value["timing"]["match_ms"], 0);
+        value.as_object_mut().unwrap().remove("known_match");
+        value["timing"].as_object_mut().unwrap().remove("match_ms");
+        let loaded: IngestionReport = serde_json::from_value(value).unwrap();
+        assert!(loaded.known_match.is_blank());
+        assert_eq!(loaded.timing.unwrap().match_ms, None);
+        assert_eq!(loaded.entities_created, 0);
     }
 
     #[test]

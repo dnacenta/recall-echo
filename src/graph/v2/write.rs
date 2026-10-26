@@ -14,7 +14,7 @@
 //! close the live record they succeed. The close is stamped with the session
 //! date and a reason. A record that is already closed keeps its first stamp.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -86,6 +86,8 @@ pub(crate) struct WriteStats {
     pub write_ms: u64,
     /// Usage from the resolver call. `None` when it was not called or reported nothing.
     pub usage: Option<TokenUsage>,
+    /// Guard and staleness skips while known-row match is on. Empty when it is off.
+    pub match_skips: BTreeMap<String, u32>,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -114,9 +116,14 @@ pub(crate) struct WriteCtx<'a> {
     /// every retirement and still writes the facts.
     pub valid_until: Option<String>,
     pub on_conflict: Option<&'a dyn ConflictHook>,
-    /// Live rows pass 1 showed. The writer does not read them; the next
-    /// increment matches `replaces` against this list.
+    /// Snapshot slot. Matching uses [`Self::targets`]; this list stays empty
+    /// unless a caller fills it. Empty when neither switch loaded the store.
+    #[allow(dead_code)]
     pub known: Vec<super::known::KnownRow>,
+    /// Retirement guards and [`Self::targets`] apply only when this is set.
+    pub match_on: bool,
+    /// Aligned with the fact slice. `Some` is an A1, A2 or A3 target.
+    pub targets: Vec<Option<super::known_match::MatchTarget>>,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -137,6 +144,8 @@ impl<'a> WriteCtx<'a> {
             valid_until: session_midnight(date),
             on_conflict: None,
             known: Vec::new(),
+            match_on: false,
+            targets: Vec::new(),
         }
     }
 }
@@ -336,8 +345,10 @@ async fn apply_all(
         names: HashMap::new(),
         edges: HashMap::new(),
         scope: HashMap::new(),
+        index: 0,
     };
     for index in ordered_indexes(facts) {
+        attempt.index = index;
         attempt.apply(&facts[index]).await?;
     }
     Ok(())
@@ -410,6 +421,8 @@ struct Attempt<'a> {
     edges: HashMap<String, Vec<StoredEdge>>,
     /// Component ids in a project's scope, for this attempt.
     scope: HashMap<String, Vec<String>>,
+    /// Index of the fact currently applied, into `ctx.targets`.
+    index: usize,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -487,6 +500,9 @@ impl<'a> Attempt<'a> {
             }
             if single_valued(fact.predicate) {
                 self.supersede_slot(&mut fact, &subject).await?;
+            }
+            if let Some(target) = self.edge_target().cloned() {
+                self.retire_matched(&fact, &subject, &target).await?;
             }
             self.promote(&fact, &subject).await?;
         }
@@ -694,6 +710,10 @@ impl<'a> Attempt<'a> {
         if fact.predicate == Predicate::Setting {
             fact.key = preferred_key(&fact.key, &slots);
         }
+        if self.setting_missing(fact, &slots) {
+            self.note_skip("stale");
+            return Ok(());
+        }
         let Some(until) = self.ctx.valid_until.clone() else {
             let session_id = self.ctx.session_id;
             self.skip_matches(&slots, |slot| {
@@ -714,6 +734,9 @@ impl<'a> Attempt<'a> {
                 || (opened_here(slot.get("evidence"), self.ctx.session_id)
                     && !same_session_status_close(slot, fact, self.ctx.session_id))
             {
+                continue;
+            }
+            if !self.supersede_allowed(slot, fact) {
                 continue;
             }
             let closed = closed_of(slot, fact);
@@ -885,6 +908,13 @@ impl<'a> Attempt<'a> {
             {
                 continue;
             }
+            let old_value = self
+                .label(&record_id(&edge.to_id), &record_id(&edge.to_id))
+                .await?;
+            if let Some(skip) = self.guard_reason(fact, &old_value) {
+                self.note_skip(skip);
+                continue;
+            }
             self.close_edge(id, &edge, REPLACED, &new_value).await?;
         }
         Ok(())
@@ -918,6 +948,12 @@ impl<'a> Attempt<'a> {
             }
             if !matches(slot) || opened_here(slot.get("evidence"), self.ctx.session_id) {
                 continue;
+            }
+            if reason == REPLACED {
+                if let Some(skip) = self.guard_reason(fact, slot_str(slot, "value").unwrap_or("")) {
+                    self.note_skip(skip);
+                    continue;
+                }
             }
             let closed = closed_of(slot, fact);
             if !stamp_slot(slot, &until, &ended_by) {
@@ -1208,6 +1244,112 @@ impl<'a> Attempt<'a> {
         self.edges.insert(subject_id.to_string(), edges.clone());
         Ok(edges)
     }
+
+    fn setting_target(&self) -> Option<&super::known_match::MatchTarget> {
+        self.target_if(|target| target.predicate == "setting")
+    }
+
+    fn edge_target(&self) -> Option<&super::known_match::MatchTarget> {
+        self.target_if(|target| target.predicate == "uses")
+    }
+
+    fn target_if(
+        &self,
+        pred: impl Fn(&super::known_match::MatchTarget) -> bool,
+    ) -> Option<&super::known_match::MatchTarget> {
+        if !self.ctx.match_on {
+            return None;
+        }
+        self.ctx
+            .targets
+            .get(self.index)
+            .and_then(Option::as_ref)
+            .filter(|target| pred(target))
+    }
+
+    /// An A1/A2 target whose subject, predicate, key and value are no longer live.
+    fn setting_missing(&self, fact: &Fact, slots: &[Value]) -> bool {
+        let Some(target) = self.setting_target() else {
+            return false;
+        };
+        normalise(&fact.subject_name) != normalise(&target.subject)
+            || !slots.iter().any(|slot| slot_matches_target(slot, target))
+    }
+
+    /// Keyed-match content filter and G1/G2. `false` means leave this slot live.
+    fn supersede_allowed(&mut self, slot: &Value, fact: &Fact) -> bool {
+        if !self.ctx.match_on || same_session_status_close(slot, fact, self.ctx.session_id) {
+            return true;
+        }
+        if let Some(target) = self.setting_target().cloned() {
+            if !slot_matches_target(slot, &target) {
+                return false;
+            }
+        }
+        if let Some(reason) = self.guard_reason(fact, slot_str(slot, "value").unwrap_or("")) {
+            self.note_skip(reason);
+            return false;
+        }
+        true
+    }
+
+    fn guard_reason(&self, fact: &Fact, old_value: &str) -> Option<&'static str> {
+        if !self.ctx.match_on {
+            return None;
+        }
+        let turn = self
+            .ctx
+            .turns
+            .iter()
+            .find(|turn| turn.index == fact.turn)
+            .map(|turn| turn.text.as_str())
+            .unwrap_or(fact.quote.as_str());
+        super::known_match::retirement_skip(fact, old_value, turn)
+    }
+
+    fn note_skip(&mut self, reason: &str) {
+        self.stats.retirements_skipped += 1;
+        *self
+            .stats
+            .match_skips
+            .entry(reason.to_string())
+            .or_insert(0) += 1;
+    }
+
+    async fn retire_matched(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        target: &super::known_match::MatchTarget,
+    ) -> Result<(), GraphError> {
+        if normalise(&fact.subject_name) != normalise(&target.subject) {
+            self.note_skip("stale");
+            return Ok(());
+        }
+        let edges = self.live_edges(&subject.id).await?;
+        let Some(edge) = edges
+            .iter()
+            .find(|edge| record_id(&edge.id) == target.row_id && edge.rel_type == target.predicate)
+            .cloned()
+        else {
+            self.note_skip("stale");
+            return Ok(());
+        };
+        let old_value = self.label(&record_id(&edge.to_id), &target.value).await?;
+        if normalise(&old_value) != normalise(&target.value) {
+            self.note_skip("stale");
+            return Ok(());
+        }
+        if opened_here(edge.evidence.as_ref(), self.ctx.session_id) {
+            return Ok(());
+        }
+        if let Some(reason) = self.guard_reason(fact, &old_value) {
+            self.note_skip(reason);
+            return Ok(());
+        }
+        self.close_edge(&subject.id, &edge, REPLACED, &fact.object_name)
+            .await
+    }
 }
 
 /// Outgoing live edges of one record. A graph-edge scan, not a table scan.
@@ -1227,7 +1369,7 @@ const CLOSE_EDGE: &str = r#"
 "#;
 
 /// Affixes `canon_key` peels one of. A family peels every copy.
-const KEY_AFFIXES: &[&str] = &[
+pub(crate) const KEY_AFFIXES: &[&str] = &[
     "default", "current", "new", "value", "number", "setting", "used",
 ];
 
@@ -1288,7 +1430,7 @@ fn content_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn alphanumeric_runs(text: &str) -> Vec<String> {
+pub(crate) fn alphanumeric_runs(text: &str) -> Vec<String> {
     let mut runs = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
@@ -1346,7 +1488,7 @@ fn is_calendar_day(year: i32, month: u32, day: u32) -> bool {
 /// another empty key: a shared empty slot is not a replacement. A new usable
 /// key is rewritten onto the live key it repeats, and a different value
 /// closes that live setting.
-fn keys_match(left: &str, right: &str) -> bool {
+pub(crate) fn keys_match(left: &str, right: &str) -> bool {
     if key_is_empty(left) || key_is_empty(right) {
         return false;
     }
@@ -1482,6 +1624,14 @@ fn status_is(edge: &StoredEdge, allowed: &[&str]) -> bool {
     edge.status
         .as_deref()
         .is_some_and(|status| allowed.contains(&status))
+}
+
+fn slot_matches_target(slot: &Value, target: &super::known_match::MatchTarget) -> bool {
+    slot_live(slot)
+        && slot_str(slot, "status") == Some("decided")
+        && slot_str(slot, "predicate") == Some(target.predicate.as_str())
+        && fold_key(slot_str(slot, "key").unwrap_or("")) == fold_key(&target.key)
+        && fold_value(slot_str(slot, "value").unwrap_or("")) == fold_value(&target.value)
 }
 
 fn values_equal(left: &str, right: &str) -> bool {
@@ -2532,6 +2682,8 @@ mod tests {
                 valid_until: session_midnight(date),
                 on_conflict: None,
                 known: Vec::new(),
+                match_on: false,
+                targets: Vec::new(),
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -3793,6 +3945,8 @@ mod tests {
             valid_until: session_midnight(date),
             on_conflict: Some(&hook),
             known: Vec::new(),
+            match_on: false,
+            targets: Vec::new(),
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -4433,5 +4587,567 @@ mod tests {
         }
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         rows
+    }
+
+    fn user_turn(text: &str) -> Turn {
+        Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: text.to_string(),
+        }
+    }
+
+    fn app_project() -> ProjectIdentity {
+        ProjectIdentity {
+            name: "app".into(),
+            aliases: Vec::new(),
+        }
+    }
+
+    async fn snapshot(gm: &GraphMemory, text: &str) -> Vec<super::super::known::KnownRow> {
+        super::super::known::live_rows(gm, &app_project(), text)
+            .await
+            .unwrap()
+    }
+
+    fn reconcile_one(
+        fact: &Fact,
+        rows: &[super::super::known::KnownRow],
+        turns: &[Turn],
+    ) -> super::super::known_match::Reconciled {
+        let ground = super::super::ground::SessionGround::prepare(turns);
+        super::super::known_match::reconcile(std::slice::from_ref(fact), rows, &ground)
+    }
+
+    async fn write_matched(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        match_on: bool,
+        targets: Vec<Option<super::super::known_match::MatchTarget>>,
+    ) -> Result<WriteStats, GraphError> {
+        let project = app_project();
+        let llm = Quiet;
+        let mut ctx = WriteCtx::new(&llm, &project, session_id, date, turns);
+        ctx.match_on = match_on;
+        ctx.targets = targets;
+        write_facts(gm, &ctx, facts).await
+    }
+
+    fn use_role(object: &str, role: Role, turn: usize, quote: &str) -> Fact {
+        let mut fact = uses_named("app", Kind::Project, object, "decided", "", turn);
+        fact.role = Some(role);
+        fact.quote = quote.to_string();
+        fact
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn use_states(gm: &GraphMemory) -> Vec<(String, String, bool, Option<String>)> {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT out, description, valid_until, ended_by FROM relates_to WHERE rel_type = 'uses'",
+            )
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let mut states = Vec::new();
+        for row in rows {
+            let id = super::record_id(row.get("out").unwrap_or(&Value::Null));
+            let name = entities
+                .iter()
+                .find(|entity| entity.id_string() == id)
+                .map(|entity| entity.name.clone())
+                .unwrap_or(id);
+            let role = row
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim_start_matches("role=")
+                .to_string();
+            let until = row
+                .get("valid_until")
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let live = until.is_empty() || until == "null";
+            let ended = row
+                .get("ended_by")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            states.push((name, role, live, ended));
+        }
+        states.sort();
+        states
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn equal_value_fills_the_key_and_reinforces_without_moving_the_prior() {
+        let (_tmp, gm) = open_store().await;
+        let weights = crate::graph::ProvenanceWeights::default();
+        assert!((weights.weight_user - 0.8).abs() < 1e-9);
+        assert!((weights.weight_assistant - 0.3).abs() < 1e-9);
+        assert!((weights.weight_self - 0.05).abs() < 1e-9);
+        let mut created = decided_slot("log_format", "plain", 0);
+        created.quote = "The log format was plain.".into();
+        write_session(&gm, "s1", "2026-04-03", &[created.clone()])
+            .await
+            .unwrap();
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        let first_slots = app_slots(&gm).await;
+        let first = slot_named(&first_slots, "log_format", "plain");
+        assert!((first["alpha"].as_f64().unwrap() - prior.alpha()).abs() < 1e-9);
+        assert!((first["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
+        assert_eq!(first["evidence"].as_array().unwrap().len(), 1);
+
+        let text = "The log format stays plain.";
+        let turns = [user_turn(text)];
+        let mut fact = decided_slot("", "plain", 0);
+        fact.quote = text.into();
+        let rows = snapshot(&gm, text).await;
+        let reconciled = reconcile_one(&fact, &rows, &turns);
+        assert_eq!(reconciled.facts[0].key, "log_format");
+        assert_eq!(reconciled.report.key_filled, 1);
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &reconciled.facts,
+            true,
+            reconciled.targets,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.reinforced, 1, "{stats:?}");
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+        let slot = slot_named(&app_slots(&gm).await, "log_format", "plain").clone();
+        assert_eq!(slot["evidence"].as_array().unwrap().len(), 2);
+        assert!(slot["valid_until"].is_null());
+        let alpha = slot["alpha"].as_f64().unwrap();
+        let beta = slot["beta"].as_f64().unwrap();
+        assert!((beta - prior.beta()).abs() < 1e-9, "beta moved: {beta}");
+        assert!(
+            (alpha - (prior.alpha() + weights.weight_user)).abs() < 1e-9,
+            "{alpha}"
+        );
+
+        let retry = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &reconciled.facts,
+            true,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.already_seen, 1, "{retry:?}");
+        assert_eq!(retry.reinforced, 0);
+        let again_slots = app_slots(&gm).await;
+        let again = slot_named(&again_slots, "log_format", "plain");
+        assert_eq!(again["evidence"].as_array().unwrap().len(), 2);
+        assert!((again["alpha"].as_f64().unwrap() - alpha).abs() < 1e-9);
+        assert!((again["beta"].as_f64().unwrap() - beta).abs() < 1e-9);
+
+        let creating = write_session(&gm, "s1", "2026-04-03", &[created])
+            .await
+            .unwrap();
+        assert_eq!(creating.already_seen, 1, "{creating:?}");
+        assert_eq!(creating.reinforced, 0);
+        let stored_slots = app_slots(&gm).await;
+        let stored = slot_named(&stored_slots, "log_format", "plain");
+        assert_eq!(stored["evidence"].as_array().unwrap().len(), 2);
+        assert!((stored["alpha"].as_f64().unwrap() - alpha).abs() < 1e-9);
+        assert!((stored["beta"].as_f64().unwrap() - beta).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn mention_guard_blocks_a_keyed_supersede_only_when_the_switch_is_on() {
+        let text = "Use the standard library HTML parser instead of a third-party one.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("export_format", "csv|html", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let mut fact = decided_slot("export_format", "html", 0);
+            fact.replaces = "csv".into();
+            fact.quote = text.into();
+            let (facts, targets) = if match_on {
+                let rows = snapshot(&gm, text).await;
+                let reconciled = reconcile_one(&fact, &rows, &turns);
+                assert_eq!(reconciled.facts[0].key, "export_format");
+                (reconciled.facts, reconciled.targets)
+            } else {
+                (vec![fact], Vec::new())
+            };
+            let stats = write_matched(&gm, "s2", "2026-04-11", &turns, &facts, match_on, targets)
+                .await
+                .unwrap();
+            let slots = app_slots(&gm).await;
+            let old = slot_named(&slots, "export_format", "csv|html");
+            if match_on {
+                assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+                assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+                assert!(old["valid_until"].is_null(), "{old}");
+            } else {
+                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+                assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+                assert_eq!(old["ended_by"], "s2:superseded");
+            }
+            assert!(slot_named(&slots, "export_format", "html")["valid_until"].is_null());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn coexistence_guard_keeps_a_listed_value_and_still_allows_a_replacement() {
+        let cases = [
+            ("Test on runtime 3.4 and 3.5.", false),
+            ("Upgrade the runtime from 3.4 to 3.5.", true),
+            ("Keep 3.4, also test 3.5.", false),
+        ];
+        for (text, retires) in cases {
+            for match_on in [false, true] {
+                let (_tmp, gm) = open_store().await;
+                write_session(
+                    &gm,
+                    "s1",
+                    "2026-04-03",
+                    &[decided_slot("runtime_version", "3.4", 0)],
+                )
+                .await
+                .unwrap();
+                let before = slot_named(&app_slots(&gm).await, "runtime_version", "3.4").clone();
+                let turns = [user_turn(text)];
+                let mut fact = decided_slot("runtime_version", "3.5", 0);
+                fact.quote = text.into();
+                let rows = snapshot(&gm, text).await;
+                let reconciled = if match_on {
+                    reconcile_one(&fact, &rows, &turns)
+                } else {
+                    super::super::known_match::Reconciled {
+                        facts: vec![fact],
+                        targets: Vec::new(),
+                        report: crate::graph::types::MatchReport::default(),
+                    }
+                };
+                let stats = write_matched(
+                    &gm,
+                    "s2",
+                    "2026-04-11",
+                    &turns,
+                    &reconciled.facts,
+                    match_on,
+                    reconciled.targets,
+                )
+                .await
+                .unwrap();
+                let slots = app_slots(&gm).await;
+                let old = slot_named(&slots, "runtime_version", "3.4");
+                let expect_close = !match_on || retires;
+                if expect_close {
+                    assert_eq!(old["ended_by"], "s2:superseded", "{text} on={match_on}");
+                    assert!(stats.match_skips.is_empty(), "{text} {stats:?}");
+                    let mut expected = before.clone();
+                    expected["valid_until"] = old["valid_until"].clone();
+                    expected["ended_by"] = old["ended_by"].clone();
+                    assert_eq!(old, &expected, "{text}");
+                    assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+                } else {
+                    assert!(old["valid_until"].is_null(), "{text}: {old}");
+                    assert_eq!(stats.match_skips.get("coexist").copied(), Some(1), "{text}");
+                    assert!(
+                        stats.retirements.is_empty(),
+                        "{text} {:?}",
+                        stats.retirements
+                    );
+                }
+                assert!(slot_named(&slots, "runtime_version", "3.5")["valid_until"].is_null());
+            }
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_edge_target_closes_only_that_edge_id() {
+        let (_tmp, gm) = open_store().await;
+        let text = "Use LibB instead of LibA for linting.";
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                use_role("LibA", Role::Linter, 0, "Use LibA for linting."),
+                use_role("LibA", Role::Formatter, 0, "Use LibA for formatting."),
+            ],
+        )
+        .await
+        .unwrap();
+        let rows = snapshot(&gm, text).await;
+        let linters: Vec<_> = rows
+            .iter()
+            .filter(|row| row.value == "LibA" && row.role == "linter")
+            .collect();
+        assert_eq!(linters.len(), 1, "{rows:?}");
+        let fact = use_role("LibB", Role::Linter, 0, text);
+        let turns = [user_turn(text)];
+        let reconciled = reconcile_one(&fact, &rows, &turns);
+        assert_eq!(reconciled.report.edge_targets, 1);
+        assert_eq!(
+            reconciled.targets[0]
+                .as_ref()
+                .map(|target| target.row_id.as_str()),
+            Some(linters[0].id.as_str())
+        );
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &reconciled.facts,
+            true,
+            reconciled.targets,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "replaced");
+        let states = use_states(&gm).await;
+        let ended = |role: &str| {
+            states
+                .iter()
+                .find(|state| state.0 == "LibA" && state.1 == role)
+                .unwrap_or_else(|| panic!("missing {role} in {states:?}"))
+        };
+        assert!(!ended("linter").2, "{states:?}");
+        assert_eq!(ended("linter").3.as_deref(), Some("s2:replaced"));
+        assert!(ended("formatter").2, "{states:?}");
+        assert!(ended("formatter").3.is_none(), "{states:?}");
+        assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_closed_target_is_stale_and_the_new_fact_is_still_written() {
+        let (_tmp, gm) = open_store().await;
+        let text = "Use LibB instead of LibA for linting.";
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[use_role("LibA", Role::Linter, 0, "Use LibA for linting.")],
+        )
+        .await
+        .unwrap();
+        let rows = snapshot(&gm, text).await;
+        let target = rows
+            .iter()
+            .find(|row| row.value == "LibA")
+            .unwrap_or_else(|| panic!("{rows:?}"))
+            .clone();
+        let fact = use_role("LibB", Role::Linter, 0, text);
+        let turns = [user_turn(text)];
+        let budget = AtomicU32::new(1);
+        let hook = CloseEdge(target.id.clone());
+        let project = app_project();
+        let llm = Quiet;
+        let ctx = WriteCtx {
+            llm: &llm,
+            project: &project,
+            session_id: "s2",
+            date: "2026-04-11",
+            turns: &turns,
+            conflict_budget: &budget,
+            valid_until: session_midnight("2026-04-11"),
+            on_conflict: Some(&hook),
+            known: Vec::new(),
+            match_on: true,
+            targets: vec![Some(super::super::known_match::MatchTarget {
+                row_id: target.id.clone(),
+                subject: target.subject,
+                predicate: target.predicate,
+                key: target.key,
+                value: target.value,
+            })],
+        };
+        let stats = write_facts(&gm, &ctx, &[fact]).await.unwrap();
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stats.match_skips.get("stale").copied(),
+            Some(1),
+            "{stats:?}"
+        );
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let states = use_states(&gm).await;
+        let lib_a = states
+            .iter()
+            .find(|state| state.0 == "LibA")
+            .unwrap_or_else(|| panic!("{states:?}"));
+        assert!(!lib_a.2, "{states:?}");
+        assert_eq!(lib_a.3.as_deref(), Some("other:replaced"));
+        assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
+    }
+
+    #[cfg(feature = "embedded")]
+    struct CloseEdge(String);
+
+    #[cfg(feature = "embedded")]
+    impl ConflictHook for CloseEdge {
+        fn between_attempts<'a>(
+            &'a self,
+            gm: &'a GraphMemory,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                gm.db()
+                    .query(
+                        "UPDATE type::record($id) SET valid_until = type::datetime($until), ended_by = $ended WHERE valid_until = NONE",
+                    )
+                    .bind(("id", self.0.clone()))
+                    .bind(("until", "2026-04-10T00:00:00Z"))
+                    .bind(("ended", "other:replaced"))
+                    .await?
+                    .check()?;
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_component_row_in_project_scope_does_not_match_a_project_fact() {
+        let (_tmp, gm) = open_store().await;
+        let mut part = raw_edge(Predicate::PartOf, "widget", Kind::Component, "app");
+        part.object_kind = Some(Kind::Project);
+        part.quote = "widget is part of app".into();
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                project_setting(
+                    "widget",
+                    Kind::Component,
+                    "log_format",
+                    "plain",
+                    "decided",
+                    0,
+                ),
+                decided_slot("log_format", "plain", 1),
+                part,
+            ],
+        )
+        .await
+        .unwrap();
+        let text = "Switch the log format to json lines.";
+        let rows = snapshot(&gm, text).await;
+        assert!(
+            rows.iter()
+                .any(|row| row.subject == "widget" && row.key == "log_format"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.subject == "app" && row.key == "log_format"),
+            "{rows:?}"
+        );
+        let turns = [user_turn(text)];
+        let mut project_fact = decided_slot("", "json lines", 0);
+        project_fact.quote = text.into();
+        let project_match = reconcile_one(&project_fact, &rows, &turns);
+        assert_eq!(project_match.facts[0].key, "log_format");
+        assert_eq!(
+            project_match.targets[0]
+                .as_ref()
+                .map(|target| target.subject.as_str()),
+            Some("app")
+        );
+        let mut component_fact = project_fact.clone();
+        component_fact.subject_name = "widget".into();
+        component_fact.subject_kind = Kind::Component;
+        let component_match = reconcile_one(&component_fact, &rows, &turns);
+        assert_eq!(
+            component_match.targets[0]
+                .as_ref()
+                .map(|target| target.subject.as_str()),
+            Some("widget")
+        );
+        write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &project_match.facts,
+            true,
+            project_match.targets,
+        )
+        .await
+        .unwrap();
+        let widget = slots_of(&gm, "widget").await;
+        assert!(slot_named(&widget, "log_format", "plain")["valid_until"].is_null());
+        let app = app_slots(&gm).await;
+        assert_eq!(
+            slot_named(&app, "log_format", "plain")["ended_by"],
+            "s2:superseded"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_row_opened_in_this_session_is_not_a_target_and_was_absent_before_the_write() {
+        let (_tmp, gm) = open_store().await;
+        let before = snapshot(&gm, "Use LibA for linting.").await;
+        assert!(before.iter().all(|row| row.value != "LibA"));
+        let opened = use_role("LibA", Role::Linter, 0, "Use LibA for linting.");
+        write_session(&gm, "s2", "2026-04-11", &[opened])
+            .await
+            .unwrap();
+        let text = "Use LibB instead of LibA for linting.";
+        let rows = snapshot(&gm, text).await;
+        let stored = rows
+            .iter()
+            .find(|row| row.value == "LibA")
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        let fact = use_role("LibB", Role::Linter, 0, text);
+        let turns = [user_turn(text)];
+        let reconciled = reconcile_one(&fact, &rows, &turns);
+        assert_eq!(
+            reconciled.targets[0]
+                .as_ref()
+                .map(|target| target.row_id.as_str()),
+            Some(stored.id.as_str())
+        );
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &reconciled.facts,
+            true,
+            reconciled.targets,
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+        let states = use_states(&gm).await;
+        assert!(
+            states.iter().any(|state| state.0 == "LibA" && state.2),
+            "{states:?}"
+        );
+        assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
     }
 }
