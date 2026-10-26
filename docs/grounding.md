@@ -51,7 +51,9 @@ A bug symptom is a literal. The cited turn is checked first. When that turn is l
 
 The quote still has to be in the cited turn (gate 1, including re-cite). Every number in the symptom has to occur in that supporting text. A number that occurs only inside a longer number does not. A symptom that appears nowhere there drops the whole bug as `value_support`.
 
-A symptom the cited turn does not support is inferred (`self`). One the cited turn does support keeps that turn's role.
+A symptom the token rule does not support on the cited turn still keeps that turn's role when its normalised words, stop words included, are one contiguous run of whole words in the cited turn and it has at least three content words. Normalisation is the same one the other gate-2 checks use: case-folded, with punctuation as separators, so "Froze on a LARGE archive" matches "froze on a large archive". There is no stemming and no skipped stop word inside the run. A span cut mid-word does not match. Words that sit in the cited turn but not as one run, a span of fewer than three content words, and a number the cited turn does not state still drop the bug as `value_support`. Other turns are not searched for this run. Cause, fix, release contents and settings do not use it.
+
+A symptom the cited turn does not support is inferred (`self`). One the cited turn does support, including one kept by that run, keeps that turn's role.
 
 Cause, fix and release contents already use the cited turn and, failing that, the joined session, on every turn. A fix that restates the symptom is kept when that text supports it. When it does not, the field drops as `value_support_partial` and the bug stays. A named component is still checked only against the cited turn.
 

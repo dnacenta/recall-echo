@@ -3414,4 +3414,213 @@ mod tests {
             panic!("provider called");
         }
     }
+
+    fn widget_turns() -> Vec<Turn> {
+        vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "widget import froze on a large archive: TimeoutError.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "The importer stopped because the socket closed. I raised the wait.".into(),
+            },
+        ]
+    }
+
+    fn widget_session(turns: Vec<Turn>) -> SessionInput {
+        let mut input = session(turns);
+        input.project.name = "widget".into();
+        input.project.aliases = vec!["widget".into()];
+        input
+    }
+
+    fn run_widget(
+        turns: &[Turn],
+        symptom: &str,
+        cause: &str,
+        fix: &str,
+        turn: usize,
+        quote: &str,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let reply = bug_reply(symptom, cause, fix, "", turn, quote);
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(&reply, &widget_session(turns.to_vec()), &mut report);
+        (facts, report)
+    }
+
+    fn symptom_of(facts: &[Fact]) -> &Fact {
+        facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueSymptom)
+            .expect("symptom")
+    }
+
+    #[test]
+    fn span_symptom_is_kept_with_the_cited_role() {
+        let (facts, report) = run_widget(
+            &widget_turns(),
+            "froze on a large archive",
+            "the socket closed",
+            "raised the wait",
+            0,
+            "TimeoutError",
+        );
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert!(!report.drops.contains_key(DROP_VALUE_SUPPORT));
+        assert_candidate_balance(&report);
+        let symptom = symptom_of(&facts);
+        assert_eq!(symptom.object_name, "froze on a large archive");
+        assert_eq!(symptom.provenance, Provenance::User);
+        assert_eq!(symptom.turn, 0);
+        assert_eq!(symptom.quote, "TimeoutError");
+        let cause = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueCause)
+            .expect("cause");
+        assert_eq!(
+            (cause.object_name.as_str(), cause.provenance),
+            ("the socket closed", Provenance::SelfGenerated)
+        );
+        let fix = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueFix)
+            .expect("fix");
+        assert_eq!(
+            (fix.object_name.as_str(), fix.provenance),
+            ("raised the wait", Provenance::SelfGenerated)
+        );
+        let status = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueStatus)
+            .expect("status");
+        assert_eq!(status.object_name, "fixed");
+        assert_eq!(status.provenance, Provenance::SelfGenerated);
+    }
+
+    #[test]
+    fn scattered_span_drops_the_bug() {
+        let (facts, report) = run_widget(
+            &widget_turns(),
+            "import froze archive",
+            "the socket closed",
+            "raised the wait",
+            0,
+            "TimeoutError",
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.kept, 0);
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn symptom_only_in_a_later_turn_drops() {
+        let mut turns = widget_turns();
+        turns[1].text = "the socket closed during upload".into();
+        let (facts, report) = run_widget(
+            &turns,
+            "socket closed during upload",
+            "",
+            "",
+            0,
+            "TimeoutError",
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn cause_span_and_setting_stay_on_their_own_rules() {
+        let (facts, report) = run_widget(
+            &widget_turns(),
+            "TimeoutError",
+            "froze on a large archive",
+            "",
+            0,
+            "TimeoutError",
+        );
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert_eq!(symptom_of(&facts).provenance, Provenance::User);
+        let cause = facts
+            .iter()
+            .find(|fact| fact.predicate == Predicate::IssueCause)
+            .expect("cause");
+        assert_eq!(cause.object_name, "froze on a large archive");
+        assert_eq!(cause.provenance, Provenance::SelfGenerated);
+        assert!(facts
+            .iter()
+            .all(|fact| fact.predicate != Predicate::IssueFix));
+
+        let reply = serde_json::json!({
+            "facts": [{
+                "subject": "widget",
+                "subject_type": "project",
+                "predicate": "setting",
+                "role": "none",
+                "key": "archive_limit",
+                "object": "froze on a large archive",
+                "object_type": "literal",
+                "status": "decided",
+                "replaces": "",
+                "turn": 0,
+                "quote": "TimeoutError",
+                "confidence": 0.9
+            }],
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("reply"),
+            &widget_session(widget_turns()),
+            &mut report,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn span_symptom_matches_quoting_the_symptom() {
+        let cause = "the socket closed";
+        let fix = "raised the wait";
+        let (span, span_report) = run_widget(
+            &widget_turns(),
+            "froze on a large archive",
+            cause,
+            fix,
+            0,
+            "TimeoutError",
+        );
+        let (quoted, quoted_report) = run_widget(
+            &widget_turns(),
+            "froze on a large archive",
+            cause,
+            fix,
+            0,
+            "froze on a large archive",
+        );
+        assert_eq!(span_report.kept, 1);
+        assert_eq!(quoted_report.kept, 1);
+        assert!(span_report.drops.is_empty(), "{:?}", span_report.drops);
+        assert!(quoted_report.drops.is_empty(), "{:?}", quoted_report.drops);
+        assert!(span.iter().all(|fact| fact.quote == "TimeoutError"));
+        assert!(quoted
+            .iter()
+            .all(|fact| fact.quote == "froze on a large archive"));
+        let blank = |facts: Vec<Fact>| {
+            facts
+                .into_iter()
+                .map(|mut fact| {
+                    fact.quote.clear();
+                    fact
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(blank(span), blank(quoted));
+    }
 }

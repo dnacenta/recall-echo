@@ -46,7 +46,10 @@
 //! than another turn of the same session, the cited turn and every earlier
 //! turn are checked together, so a fix turn can restate a symptom that was
 //! said earlier. A turn after the citation is not support. A number still has
-//! to occur in the text that is checked.
+//! to occur in the text that is checked. A symptom the token rule misses still
+//! keeps the cited turn when its normalised words are one contiguous run there
+//! and it has at least three content tokens. A later turn is not searched for
+//! that run.
 //!
 //! When the quote and its sentence do not bind a numbered key, a user turn
 //! can still bind it from the assistant turn immediately before or after it.
@@ -238,7 +241,9 @@ impl SessionGround {
 
     /// Symptom support. The cited turn wins. A later turn may also use the
     /// cited turn and every earlier turn. A turn after the citation does not
-    /// count, and the first turn cannot borrow from a later one.
+    /// count, and the first turn cannot borrow from a later one. A short
+    /// symptom the quote does not cover still keeps the cited turn when that
+    /// turn states it as one run of whole words.
     #[must_use]
     pub(crate) fn credit_symptom(&self, value: &str, turn: usize, quote: &str) -> FieldCredit {
         if self.supports_value(value, turn, quote, ValueShape::Literal) {
@@ -246,6 +251,9 @@ impl SessionGround {
         }
         if self.turn_is_later(turn) && self.prefix_supports(value, turn) {
             return FieldCredit::Session;
+        }
+        if self.span_of_turn(value, turn) {
+            return FieldCredit::Turn;
         }
         FieldCredit::Drop
     }
@@ -408,6 +416,41 @@ impl SessionGround {
             ValueShape::Literal,
         )
     }
+
+    /// The cited turn states `value` as one run of whole words.
+    ///
+    /// Gate 2's short-value rule still needs one token in the quote. A run of
+    /// three or more content words in the cited turn is that same evidence,
+    /// so a quote that only names a key term can keep the symptom.
+    fn span_of_turn(&self, value: &str, turn: usize) -> bool {
+        let value = value.trim();
+        if value.is_empty() || over_long(value) || !span_floor(value) {
+            return false;
+        }
+        let Some(turn) = self.turn(turn) else {
+            return false;
+        };
+        if !numbers_ok(value, &turn.numbers) {
+            return false;
+        }
+        let wanted = words_of(&normalise(value));
+        !wanted.is_empty()
+            && turn
+                .words
+                .windows(wanted.len())
+                .any(|window| window == wanted)
+    }
+}
+
+/// Three content tokens, two of them with a letter. A version, a decimal or
+/// an address splits into digit tokens, and those are not symptom words.
+fn span_floor(value: &str) -> bool {
+    let tokens = content_tokens(value);
+    let lettered = tokens
+        .iter()
+        .filter(|token| token.chars().any(char::is_alphabetic))
+        .count();
+    tokens.len() >= 3 && lettered >= 2
 }
 
 fn with_quote(turn: &TurnGround, quote: &str) -> Cited {
@@ -1841,5 +1884,158 @@ mod tests {
             0,
             "Export uses `|` today."
         ));
+    }
+
+    fn widget() -> SessionGround {
+        ground(&[
+            (
+                "widget import froze on a large archive: TimeoutError.",
+                TurnRole::User,
+            ),
+            (
+                "The importer stopped because the socket closed. I raised the wait.",
+                TurnRole::Assistant,
+            ),
+        ])
+    }
+
+    #[test]
+    fn cited_turn_span_keeps_a_normalised_symptom() {
+        let session = widget();
+        let quote = "TimeoutError";
+        assert_eq!(
+            session.credit_symptom("froze on a large archive", 0, quote),
+            FieldCredit::Turn
+        );
+        // Case and punctuation fold through `normalise`, the same way gate 2 does.
+        assert_eq!(
+            session.credit_symptom("Froze on a LARGE archive", 0, quote),
+            FieldCredit::Turn
+        );
+        assert_eq!(
+            session.credit_symptom("froze, on a large-archive", 0, quote),
+            FieldCredit::Turn
+        );
+        assert!(!session.span_of_turn("   ", 0));
+        assert!(!session.span_of_turn("froze on a large archive", 9));
+    }
+
+    #[test]
+    fn scattered_symptom_words_are_not_a_span() {
+        assert_eq!(
+            widget().credit_symptom("import froze archive", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+    }
+
+    #[test]
+    fn two_content_tokens_are_not_a_symptom_span() {
+        let stated = ground(&[("widget import froze badly: TimeoutError.", TurnRole::User)]);
+        assert_eq!(
+            stated.credit_symptom("froze badly", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+        assert_eq!(
+            widget().credit_symptom("froze badly", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+    }
+
+    #[test]
+    fn digit_tokens_do_not_make_a_symptom_span() {
+        let session = ground(&[(
+            "widget 1.4.0 on v2.5.1 stalled, steps 1 2 3, build 30 files, a 2.5 import: TimeoutError.",
+            TurnRole::User,
+        )]);
+        for symptom in ["1.4.0", "v2.5.1", "1 2 3", "a 2.5 import"] {
+            assert_eq!(
+                session.credit_symptom(symptom, 0, "TimeoutError"),
+                FieldCredit::Drop,
+                "{symptom}"
+            );
+        }
+        assert_eq!(
+            session.credit_symptom("build 30 files", 0, "TimeoutError"),
+            FieldCredit::Turn
+        );
+    }
+
+    #[test]
+    fn symptom_span_does_not_leave_the_cited_turn() {
+        let only_later = ground(&[
+            (
+                "widget import froze on a large archive: TimeoutError.",
+                TurnRole::User,
+            ),
+            ("the socket closed during upload", TurnRole::Assistant),
+        ]);
+        assert_eq!(
+            only_later.credit_symptom("socket closed during upload", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+        let split = ground(&[
+            (
+                "TimeoutError: widget import froze on a large archive",
+                TurnRole::User,
+            ),
+            ("during the retry the socket closed.", TurnRole::Assistant),
+        ]);
+        assert_eq!(
+            split.credit_symptom("large archive during", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+    }
+
+    #[test]
+    fn mid_word_symptom_span_is_not_support() {
+        assert_eq!(
+            widget().credit_symptom("roze on a large archiv", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+    }
+
+    #[test]
+    fn symptom_span_needs_the_cited_number() {
+        // `-4` is a different number from `4`, while the normalised words still
+        // contain the run. The number check is what rejects the symptom.
+        let session = ground(&[(
+            "widget import froze on a -4 GB archive: TimeoutError.",
+            TurnRole::User,
+        )]);
+        assert_eq!(
+            session.credit_symptom("froze on a 4 GB archive", 0, "TimeoutError"),
+            FieldCredit::Drop
+        );
+    }
+
+    #[test]
+    fn later_turn_rule_stays_ahead_of_a_cited_span() {
+        let session = ground(&[
+            ("Noted the import yesterday.", TurnRole::User),
+            (
+                "Retry after the import froze on a large archive. TimeoutError remains.",
+                TurnRole::Assistant,
+            ),
+        ]);
+        assert_eq!(
+            session.credit_symptom("froze on a large archive", 1, "TimeoutError"),
+            FieldCredit::Session
+        );
+        assert_eq!(
+            session.credit_symptom("froze on a large archive", 1, "froze on a large archive"),
+            FieldCredit::Turn
+        );
+        assert_eq!(
+            widget().credit_symptom("froze on a large archive", 1, "raised the wait"),
+            FieldCredit::Session
+        );
+    }
+
+    #[test]
+    fn cause_span_stays_on_credit_field() {
+        assert_eq!(
+            widget().credit_field("froze on a large archive", 0, "TimeoutError"),
+            FieldCredit::Session
+        );
     }
 }
