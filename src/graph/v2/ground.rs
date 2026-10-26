@@ -14,6 +14,11 @@
 //! re-cited to that turn, and the fact takes that turn's role. The first turn
 //! in transcript order wins when several others contain it.
 //!
+//! When that exact search misses, an underscore with an alphanumeric character
+//! on both sides may match that underscore or one ASCII space. Every other
+//! character still matches exactly. The stored quote is then the turn's own
+//! span, so the recorded text stays a verbatim substring.
+//!
 //! A number is a maximal `\d+(\.\d+)*`. A `-` directly before the first digit
 //! is part of that number when the character before the hyphen is absent or
 //! is not alphanumeric. A hyphen after a letter or a digit is a range or an
@@ -77,10 +82,14 @@ pub(crate) enum FieldCredit {
 }
 
 /// The turn a quote was verified against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `quote` is the text to store: the trimmed reply after an exact match, or
+/// the turn's span after a separator match.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Cited {
     pub turn: usize,
     pub role: TurnRole,
+    pub quote: String,
 }
 
 /// One session, normalised once.
@@ -136,22 +145,22 @@ impl SessionGround {
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
+    ///
+    /// An exact miss can still match when an underscore between two
+    /// alphanumeric characters stands for one ASCII space. The stored quote
+    /// is then that span of the turn.
     pub(crate) fn cite(&self, cited: usize, quote: &str) -> Result<Cited, &'static str> {
         let quote = quote.trim();
         if quote.chars().count() < MIN_QUOTE_CHARS || !quote.chars().any(char::is_alphanumeric) {
             return Err(DROP_QUOTE);
         }
         if let Some(turn) = self.found(cited, quote) {
-            return Ok(turn);
+            return Ok(with_quote(turn, quote));
         }
-        self.turns
-            .iter()
-            .find(|turn| turn.text.contains(quote))
-            .map(|turn| Cited {
-                turn: turn.index,
-                role: turn.role,
-            })
-            .ok_or(DROP_QUOTE)
+        if let Some(turn) = self.turns.iter().find(|turn| turn.text.contains(quote)) {
+            return Ok(with_quote(turn, quote));
+        }
+        self.cite_separators(cited, quote).ok_or(DROP_QUOTE)
     }
 
     /// The raw text of a turn, after [`SessionGround::cite`] has resolved it.
@@ -279,13 +288,20 @@ impl SessionGround {
             .any(|token| token_in(token, &turn.normalised, &turn.words, &turn.numbers))
     }
 
-    fn found(&self, index: usize, quote: &str) -> Option<Cited> {
+    fn found(&self, index: usize, quote: &str) -> Option<&TurnGround> {
         self.turns
             .iter()
             .find(|turn| turn.index == index && turn.text.contains(quote))
-            .map(|turn| Cited {
-                turn: turn.index,
-                role: turn.role,
+    }
+
+    /// Separator pass. The cited turn wins, then the first turn in transcript order.
+    fn cite_separators(&self, cited: usize, quote: &str) -> Option<Cited> {
+        self.turn(cited)
+            .and_then(|turn| separator_hit(turn, quote))
+            .or_else(|| {
+                self.turns
+                    .iter()
+                    .find_map(|turn| separator_hit(turn, quote))
             })
     }
 
@@ -334,6 +350,69 @@ impl SessionGround {
             ValueShape::Literal,
         )
     }
+}
+
+fn with_quote(turn: &TurnGround, quote: &str) -> Cited {
+    Cited {
+        turn: turn.index,
+        role: turn.role,
+        quote: quote.to_string(),
+    }
+}
+
+fn separator_hit(turn: &TurnGround, quote: &str) -> Option<Cited> {
+    let (start, end) = find_with_separators(&turn.text, quote)?;
+    Some(Cited {
+        turn: turn.index,
+        role: turn.role,
+        quote: turn.text[start..end].to_string(),
+    })
+}
+
+/// `_` between two alphanumeric characters. Any other `_` is literal.
+fn separator_at(pattern: &[char], at: usize) -> bool {
+    at > 0
+        && at + 1 < pattern.len()
+        && pattern[at] == '_'
+        && pattern[at - 1].is_alphanumeric()
+        && pattern[at + 1].is_alphanumeric()
+}
+
+/// Leftmost span where a separator underscore matches `_` or one ASCII space.
+fn find_with_separators(text: &str, quote: &str) -> Option<(usize, usize)> {
+    let pattern: Vec<char> = quote.chars().collect();
+    if !pattern
+        .iter()
+        .enumerate()
+        .any(|(at, _)| separator_at(&pattern, at))
+    {
+        return None;
+    }
+    let mut start = 0;
+    while start < text.len() {
+        if let Some(end) = match_separator_at(text, start, &pattern) {
+            return Some((start, end));
+        }
+        start += text[start..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn match_separator_at(text: &str, start: usize, pattern: &[char]) -> Option<usize> {
+    let mut index = start;
+    for (at, expected) in pattern.iter().enumerate() {
+        let next = text[index..].chars().next()?;
+        let matched = if separator_at(pattern, at) {
+            next == '_' || next == ' '
+        } else {
+            next == *expected
+        };
+        if !matched {
+            return None;
+        }
+        index += next.len_utf8();
+    }
+    Some(index)
 }
 
 fn supported(
@@ -815,6 +894,7 @@ mod tests {
         let cited = session.cite(0, "the shelf").unwrap();
         assert_eq!(cited.turn, 0);
         assert_eq!(cited.role, TurnRole::User);
+        assert_eq!(cited.quote, "the shelf");
     }
 
     #[test]
@@ -826,6 +906,7 @@ mod tests {
         let cited = session.cite(0, "Port 9000 is chosen.").unwrap();
         assert_eq!(cited.turn, 1);
         assert_eq!(cited.role, TurnRole::Assistant);
+        assert_eq!(cited.quote, "Port 9000 is chosen.");
     }
 
     #[test]
@@ -839,6 +920,71 @@ mod tests {
             session.cite(0, "port 9000 is chosen").unwrap_err(),
             DROP_QUOTE
         );
+    }
+
+    #[test]
+    fn separator_underscore_stores_the_turn_span() {
+        let turn = "if the deploy fails we keep rolling back to the last release";
+        let session = ground(&[(turn, TurnRole::User)]);
+        let cited = session.cite(0, "rolling_back to the last release").unwrap();
+        assert_eq!((cited.turn, cited.role), (0, TurnRole::User));
+        assert_eq!(cited.quote, "rolling back to the last release");
+        assert!(session.supports_value("last release", 0, &cited.quote, ValueShape::Literal));
+
+        let ident = ground(&[("retry_limit, rolling back to", TurnRole::User)]);
+        assert_eq!(
+            ident.cite(0, "retry_limit, rolling_back to").unwrap().quote,
+            "retry_limit, rolling back to"
+        );
+
+        let exact = ground(&[
+            ("rolling back to the last release", TurnRole::User),
+            ("keep rolling_back to the last release", TurnRole::Assistant),
+        ]);
+        let cited = exact.cite(0, "rolling_back to the last release").unwrap();
+        assert_eq!((cited.turn, cited.role), (1, TurnRole::Assistant));
+        assert_eq!(cited.quote, "rolling_back to the last release");
+        let both = ground(&[(
+            "see rolling back and rolling_back to the last release",
+            TurnRole::User,
+        )]);
+        assert_eq!(
+            both.cite(0, "rolling_back to the last release")
+                .unwrap()
+                .quote,
+            "rolling_back to the last release"
+        );
+
+        let order = ground(&[
+            ("we keep rolling back early", TurnRole::Assistant),
+            ("we keep rolling back later", TurnRole::User),
+        ]);
+        let cited = order.cite(1, "rolling_back").unwrap();
+        assert_eq!((cited.turn, cited.role), (1, TurnRole::User));
+        assert_eq!(cited.quote, "rolling back");
+        assert_eq!(order.cite(9, "rolling_back").unwrap().turn, 0);
+        assert_eq!(
+            ground(&[("a b_c then a_b c", TurnRole::User)])
+                .cite(0, "a_b_c")
+                .unwrap()
+                .quote,
+            "a b_c"
+        );
+
+        for quote in [
+            "rolling-back to",
+            "Rolling back To",
+            "rollingback to",
+            "rolling  back to",
+        ] {
+            assert_eq!(session.cite(0, quote).unwrap_err(), DROP_QUOTE, "{quote}");
+        }
+        let plain = ground(&[("rolling back", TurnRole::User)]);
+        assert_eq!(plain.cite(0, "_rolling back").unwrap_err(), DROP_QUOTE);
+        assert_eq!(plain.cite(0, "rolling back_").unwrap_err(), DROP_QUOTE);
+        // Beside punctuation the underscore is not between alphanumerics.
+        let punct = ground(&[("end. start now", TurnRole::User)]);
+        assert_eq!(punct.cite(0, "end._start now").unwrap_err(), DROP_QUOTE);
     }
 
     #[test]
@@ -936,7 +1082,7 @@ mod tests {
         assert_eq!(session.cite(0, "   ").unwrap_err(), DROP_QUOTE);
         assert_eq!(session.cite(0, "...").unwrap_err(), DROP_QUOTE);
         assert!(session.cite(0, "abc").is_ok());
-        assert!(session.cite(0, "  abc  ").is_ok());
+        assert_eq!(session.cite(0, "  abc  ").unwrap().quote, "abc");
     }
 
     #[test]

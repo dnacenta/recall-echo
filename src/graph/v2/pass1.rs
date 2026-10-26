@@ -369,6 +369,7 @@ fn accept_fact(
     let mut mention = mention_from(object, &session.turns)?;
     mention.turn = cited.turn;
     mention.provenance = cited.role;
+    mention.quote = cited.quote;
     let mut fact = remap(mention)?;
     fact.replaces = object
         .get("replaces")
@@ -447,7 +448,7 @@ fn expand_bug(
     if over_long(symptom) || over_long(cause) || over_long(fix) {
         return Err(DROP_TOO_LONG);
     }
-    let mut carrier = carrier(object, confidence, &cited)?;
+    let mut carrier = carrier(confidence, &cited);
     // The cited turn is checked first. A later turn may use that turn and
     // every earlier turn, so a fix turn can restate a symptom said earlier.
     // A turn after the citation is not support. Nowhere in that text drops
@@ -545,7 +546,7 @@ fn expand_release(
     if confidence < 0.6 {
         return Err(DROP_CONFIDENCE);
     }
-    let mut carrier = carrier(object, confidence, &cited)?;
+    let mut carrier = carrier(confidence, &cited);
     let turn_text = ground.turn_text(carrier.turn).unwrap_or("");
     let name = release_name(&session.project.name, text(object, "version")?, turn_text)
         .ok_or(DROP_VERSION)?;
@@ -624,12 +625,8 @@ fn inferred(mut fact: Fact) -> Fact {
     fact
 }
 
-fn carrier(
-    object: &Map<String, Value>,
-    confidence: f64,
-    cited: &super::ground::Cited,
-) -> Result<Fact, &'static str> {
-    Ok(Fact {
+fn carrier(confidence: f64, cited: &super::ground::Cited) -> Fact {
+    Fact {
         subject_name: String::new(),
         subject_kind: Kind::Issue,
         predicate: Predicate::IssueSymptom,
@@ -639,11 +636,11 @@ fn carrier(
         object_kind: None,
         status: "decided".to_string(),
         turn: cited.turn,
-        quote: text(object, "quote")?.trim().to_string(),
+        quote: cited.quote.clone(),
         confidence,
         provenance: from_role(cited.role),
         replaces: String::new(),
-    })
+    }
 }
 
 fn from_role(role: TurnRole) -> Provenance {
@@ -1899,6 +1896,144 @@ mod tests {
             Some(1)
         );
         assert_candidate_balance(&report);
+    }
+
+    #[test]
+    fn separator_quote_stores_the_turn_span_for_a_fact_and_a_bug() {
+        let text = "if the deploy fails we keep rolling back to the last release";
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: text.into(),
+        }];
+        let quote = "rolling_back to the last release";
+        let stored = "rolling back to the last release";
+        let mut item = fact_json(0, quote);
+        item["object"] = Value::String("last release".into());
+        let reply = serde_json::json!({
+            "facts": [item],
+            "bugs": [{
+                "symptom": "last release",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "",
+                "turn": 0,
+                "quote": quote,
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            reply.as_object().expect("object"),
+            &session(turns),
+            &mut report,
+        );
+        assert_eq!(report.kept, 2, "{:?}", report.drops);
+        assert_candidate_balance(&report);
+        assert!(facts.iter().all(|fact| fact.quote == stored));
+        assert!(facts.iter().any(|fact| {
+            fact.predicate == Predicate::Setting && fact.object_name == "last release"
+        }));
+        assert!(facts.iter().any(|fact| {
+            fact.predicate == Predicate::IssueSymptom && fact.object_name == "last release"
+        }));
+    }
+
+    #[test]
+    fn underscore_quote_never_keeps_an_unstated_number() {
+        let turns = reader_turns();
+        let raw = format!("{} {}", turns[0].text, turns[1].text);
+        let session = session(turns);
+        let quote = "Patched_the_reader";
+        for n in 0..200 {
+            for number in [n.to_string(), format!("{n}.5"), format!("-{n}")] {
+                if raw.contains(&number) {
+                    continue;
+                }
+                let mut report = IngestionReport::default();
+                let facts = facts_from_reply(
+                    &bug_reply(&format!("dropped rows {number}"), "", "", "", 1, quote),
+                    &session,
+                    &mut report,
+                );
+                assert!(facts.is_empty(), "{number}");
+                assert_eq!(
+                    report.drops.get(DROP_VALUE_SUPPORT).copied(),
+                    Some(1),
+                    "{number}"
+                );
+            }
+        }
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(
+            &bug_reply("dropped rows 4242", "", "", "", 1, quote),
+            &session,
+            &mut report,
+        );
+        assert!(facts
+            .iter()
+            .any(|fact| fact.object_name == "dropped rows 4242"));
+        assert!(facts.iter().all(|fact| {
+            fact.quote == "Patched the reader"
+                && super::super::ground::numbers_in(&fact.object_name)
+                    .iter()
+                    .all(|number| {
+                        super::super::ground::numbers_in(&raw)
+                            .iter()
+                            .any(|have| have == number)
+                    })
+        }));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn separator_and_space_quotes_are_one_evidence_item() {
+        let text = "if the deploy fails we keep rolling back to the last release";
+        let stored = "rolling back to the last release";
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: text.into(),
+        }];
+        let input = session(turns.clone());
+        let extract = |quote: &str| {
+            let mut item = fact_json(0, quote);
+            item["object"] = Value::String("last release".into());
+            let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(reply.as_object().expect("object"), &input, &mut report);
+            assert_eq!(facts.len(), 1, "{:?}", report.drops);
+            assert_eq!(facts[0].quote, stored);
+            facts
+        };
+        let first = extract("rolling_back to the last release");
+        let second = extract("rolling back to the last release");
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        let llm = PanicProvider;
+        let ctx = write::WriteCtx::new(&llm, &input.project, "s1", "2026-01-02", &turns);
+        write::write_facts(&gm, &ctx, &first).await.unwrap();
+        let again = write::write_facts(&gm, &ctx, &second).await.unwrap();
+        assert_eq!(again.already_seen, 1);
+        assert_eq!(again.reinforced, 0);
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let evidence = entities
+            .iter()
+            .find(|entity| entity.name == "tidepool")
+            .expect("project")
+            .attributes
+            .as_ref()
+            .unwrap()["v2"]["slots"][0]["evidence"]
+            .as_array()
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["quote"], stored);
     }
 
     #[test]
