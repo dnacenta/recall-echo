@@ -287,14 +287,32 @@ pub(crate) struct Mention {
 
 /// Apply the remap / reject table in the specified order.
 ///
-/// Row 3 sees the object kind the model sent. A literal object type is
-/// promoted to technology only at row 5, after that reject has run, so
-/// `technology uses "1.75"` is not a technology-to-technology edge.
+/// Row 0 records a project `uses` of a component as that component `part_of`
+/// the project. Row 3 sees the object kind the model sent. A literal object
+/// type is promoted to technology only at row 5, after that reject has run,
+/// so `technology uses "1.75"` is not a technology-to-technology edge.
 ///
 /// `Err(DROP_REJECTED)` is a counted drop. A `Fact` has already had its key
 /// canonicalised when it is a setting, and its role cleared when it is not a
 /// `uses` edge.
 pub(crate) fn remap(mention: Mention) -> Result<Fact, &'static str> {
+    // 0. project uses component => component part_of project
+    if component_of_project(&mention) {
+        return Ok(finish(Mention {
+            subject: mention.object,
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: Role::None,
+            key: String::new(),
+            object: mention.subject,
+            object_kind: Some(Kind::Project),
+            status: mention.status,
+            turn: mention.turn,
+            quote: mention.quote,
+            confidence: mention.confidence,
+            provenance: mention.provenance,
+        }));
+    }
     let mut mention = mention;
     // 1. uses + component object => depends_on
     if mention.predicate == Predicate::Uses && mention.object_kind == Some(Kind::Component) {
@@ -342,6 +360,14 @@ pub(crate) fn remap(mention: Mention) -> Result<Fact, &'static str> {
     // 11. a uses whose object looks literal becomes a setting
     literal_uses_becomes_setting(&mut mention);
     Ok(finish(mention))
+}
+
+/// A project `uses` mention of a component, on the kinds the model sent.
+#[must_use]
+pub(crate) fn component_of_project(mention: &Mention) -> bool {
+    mention.predicate == Predicate::Uses
+        && mention.subject_kind == Kind::Project
+        && mention.object_kind == Some(Kind::Component)
 }
 
 /// `uses`, `setting` and `rule` also accept project, component and technology.
@@ -587,6 +613,24 @@ fn is_project_name(norm: &str, project: &ProjectIdentity) -> bool {
         return true;
     }
     project.aliases.iter().any(|alias| normalise(alias) == norm)
+}
+
+/// Point a swapped edge at the session project, or reject it.
+///
+/// The object text is the model's subject. Empty project names, a subject that
+/// is not this project, and a component that is itself a project name are rejected.
+pub(crate) fn project_object(
+    fact: &mut Fact,
+    project: &ProjectIdentity,
+) -> Result<(), &'static str> {
+    if project.name.is_empty()
+        || !is_project_name(&normalise(&fact.object_name), project)
+        || is_project_name(&normalise(&fact.subject_name), project)
+    {
+        return Err(DROP_REJECTED);
+    }
+    fact.object_name = project.name.clone();
+    Ok(())
 }
 
 /// Lower case, non-alphanumerics collapsed to a single space.
@@ -1027,6 +1071,84 @@ mod tests {
             release_name("proj", "1.4.0-rc1", "cut 1.4.0-rc1b tonight"),
             None
         );
+    }
+
+    #[test]
+    fn project_uses_component_becomes_part_of() {
+        let mut row = mention(Predicate::Uses, Kind::Project, Some(Kind::Component));
+        row.subject = "tidepool".into();
+        row.object = "export command".into();
+        row.role = Role::Library;
+        row.key = "port".into();
+        row.quote = "Add an export command".into();
+        assert!(component_of_project(&row));
+        let mut expect = swapped("export command", "tidepool");
+        expect.quote = "Add an export command".into();
+        assert_eq!(remap(row).unwrap(), expect);
+        for status in ["considered", "rejected"] {
+            let mut row = mention(Predicate::Uses, Kind::Project, Some(Kind::Component));
+            row.object = "export command".into();
+            row.status = status.into();
+            assert_eq!(remap(row).unwrap().status, status);
+        }
+
+        let project = ProjectIdentity {
+            name: "tidepool".into(),
+            aliases: vec!["tide".into()],
+        };
+        for object in ["tidepool", "the project", "tide"] {
+            let mut fact = swapped("export command", object);
+            project_object(&mut fact, &project).unwrap();
+            assert_eq!(
+                (fact.subject_name.as_str(), fact.object_name.as_str()),
+                ("export command", "tidepool")
+            );
+        }
+        for (subject, object) in [
+            ("export command", "billing"),
+            ("tidepool", "tidepool"),
+            ("tide", "tidepool"),
+        ] {
+            let mut fact = swapped(subject, object);
+            assert_eq!(
+                project_object(&mut fact, &project).unwrap_err(),
+                DROP_REJECTED
+            );
+            assert_eq!(fact.object_name, object);
+        }
+        let empty = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        assert_eq!(
+            project_object(&mut swapped("export command", "the project"), &empty).unwrap_err(),
+            DROP_REJECTED
+        );
+
+        let mut depends = mention(Predicate::DependsOn, Kind::Project, Some(Kind::Component));
+        depends.object = "export command".into();
+        assert!(!component_of_project(&depends));
+        assert_eq!(remap(depends).unwrap_err(), DROP_REJECTED);
+        let mut tech = mention(Predicate::Uses, Kind::Project, Some(Kind::Technology));
+        tech.object = "chi".into();
+        tech.role = Role::Library;
+        assert!(!component_of_project(&tech));
+        let fact = remap(tech).unwrap();
+        assert_eq!(fact.predicate, Predicate::Uses);
+        assert_eq!(fact.subject_kind, Kind::Project);
+        assert_eq!(fact.object_name, "chi");
+        assert_eq!(fact.object_kind, Some(Kind::Technology));
+        assert_eq!(fact.role, Some(Role::Library));
+        let mut part = mention(Predicate::Uses, Kind::Component, Some(Kind::Component));
+        part.object = "cache".into();
+        assert_eq!(remap(part).unwrap().predicate, Predicate::DependsOn);
+    }
+
+    fn swapped(subject: &str, object: &str) -> Fact {
+        let mut fact = fact(Predicate::PartOf, Kind::Component, subject);
+        fact.object_name = object.into();
+        fact.object_kind = Some(Kind::Project);
+        fact
     }
 
     fn fact(predicate: Predicate, kind: Kind, subject: &str) -> Fact {

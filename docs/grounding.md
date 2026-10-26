@@ -2,7 +2,7 @@
 
 Pipeline v2 keeps a candidate only after the gates below. Each whole-candidate failure counts a reason on the report. A field failure does not drop the candidate.
 
-The quote is checked first. The schema remap runs next, so a setting is bound on its canonical key. Value support, key binding and replaces follow. Confidence and the generic-object rule are last. A reply that is not the schema, an over-long string, or more than 200 items in one section drops before these gates (`parse`, `too_long`, `overflow`).
+The quote is checked first. The schema remap runs next, so a setting is bound on its canonical key. A project `uses` whose object is a component becomes that component `part_of` the session project, and value support then checks the component name. Value support, key binding and replaces follow. Confidence and the generic-object rule are last. A reply that is not the schema, an over-long string, or more than 200 items in one section drops before these gates (`parse`, `too_long`, `overflow`).
 
 ## Gate 1 — quote
 

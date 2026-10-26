@@ -24,10 +24,10 @@ use super::super::GraphMemory;
 use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
-    affects_target, filter_fact, map_subject, over_long, release_name, remap, Fact, Kind, Mention,
-    Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE,
-    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
-    MAX_ITEMS,
+    affects_target, component_of_project, filter_fact, map_subject, over_long, project_object,
+    release_name, remap, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING,
+    DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT,
+    DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -371,6 +371,7 @@ fn accept_fact(
     mention.turn = cited.turn;
     mention.provenance = cited.role;
     mention.quote = cited.quote;
+    let swapped = component_of_project(&mention);
     let mut fact = remap(mention)?;
     fact.replaces = object
         .get("replaces")
@@ -378,13 +379,27 @@ fn accept_fact(
         .unwrap_or("")
         .trim()
         .to_string();
-    map_subject(&mut fact, &session.project);
-    let shape = if fact.object_kind.is_some() {
-        ValueShape::Entity
+    if swapped {
+        project_object(&mut fact, &session.project)?;
     } else {
-        ValueShape::Literal
+        map_subject(&mut fact, &session.project);
+    }
+    let value_ok = if swapped {
+        ground.supports_value(
+            &fact.subject_name,
+            fact.turn,
+            &fact.quote,
+            ValueShape::Entity,
+        )
+    } else {
+        let shape = if fact.object_kind.is_some() {
+            ValueShape::Entity
+        } else {
+            ValueShape::Literal
+        };
+        ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape)
     };
-    if !ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape) {
+    if !value_ok {
         return Err(DROP_VALUE_SUPPORT);
     }
     if fact.predicate == Predicate::Setting
@@ -1090,6 +1105,113 @@ mod tests {
         );
         assert!(facts.is_empty());
         assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+    }
+
+    #[test]
+    fn project_uses_component_is_part_of_the_session() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "Add an export command with CSV output.".into(),
+        }];
+        let cases = [
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "decided",
+                true,
+            ),
+            (
+                "the project",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "decided",
+                true,
+            ),
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "considered",
+                true,
+            ),
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "rejected",
+                true,
+            ),
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "import wizard",
+                "component",
+                "decided",
+                false,
+            ),
+            (
+                "export command",
+                "component",
+                "part_of",
+                "tidepool",
+                "project",
+                "decided",
+                false,
+            ),
+        ];
+        for (subject, subject_type, predicate, object, object_type, status, kept) in cases {
+            let mut item = fact_json(0, "Add an export command");
+            let fields = item.as_object_mut().expect("fact");
+            for (key, value) in [
+                ("subject", subject),
+                ("subject_type", subject_type),
+                ("predicate", predicate),
+                ("object", object),
+                ("object_type", object_type),
+                ("status", status),
+                ("key", ""),
+            ] {
+                fields.insert(key.into(), Value::String(value.into()));
+            }
+            let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                reply.as_object().expect("reply"),
+                &session(turns.clone()),
+                &mut report,
+            );
+            assert_candidate_balance(&report);
+            if kept {
+                assert_eq!(facts.len(), 1, "{subject} {status}");
+                assert!(report.drops.is_empty(), "{:?}", report.drops);
+                let fact = &facts[0];
+                assert_eq!(fact.subject_name, "export command");
+                assert_eq!(fact.subject_kind, Kind::Component);
+                assert_eq!(fact.predicate, Predicate::PartOf);
+                assert_eq!(fact.object_name, "tidepool");
+                assert_eq!(fact.object_kind, Some(Kind::Project));
+                assert_eq!(fact.status, status);
+                assert_eq!(fact.provenance, Provenance::User);
+                assert_eq!(fact.role, None);
+                assert_eq!(fact.key, "");
+                assert!(fact.replaces.is_empty());
+                assert_eq!(fact.quote, "Add an export command");
+            } else {
+                assert!(facts.is_empty(), "{predicate} {object}");
+                assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+            }
+        }
     }
 
     #[tokio::test]

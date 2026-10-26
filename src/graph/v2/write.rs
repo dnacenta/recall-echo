@@ -4037,4 +4037,83 @@ mod tests {
         beliefs.sort();
         beliefs
     }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn project_component_part_of_is_in_retirement_scope() {
+        let (_tmp, gm) = open_store().await;
+        let mut part = raw_edge(
+            Predicate::PartOf,
+            "export command",
+            Kind::Component,
+            "tidepool",
+        );
+        part.object_kind = Some(Kind::Project);
+        part.quote = "Add an export command".into();
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                project_setting(
+                    "export command",
+                    Kind::Component,
+                    "format",
+                    "csv",
+                    "decided",
+                    1,
+                ),
+                part,
+            ],
+        )
+        .await
+        .unwrap();
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let id_of = |name: &str| {
+            entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .id
+                .clone()
+        };
+        let live = |edges: &[crate::graph::types::Relationship]| {
+            edges
+                .iter()
+                .filter(|edge| edge.rel_type == "part_of" && edge.valid_until.is_none())
+                .count()
+        };
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        assert_eq!(live(&edges), 1, "{edges:?}");
+        assert_eq!(edges[0].from_id, id_of("export command"));
+        assert_eq!(edges[0].to_id, id_of("tidepool"));
+        let stats = write_session(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[project_setting(
+                "tidepool",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "rejected");
+        assert_eq!(stats.retirements[0].subject, "export command");
+        assert_eq!(stats.retirements[0].predicate, "setting");
+        assert_eq!(stats.retirements[0].key, "format");
+        assert_eq!(stats.retirements[0].old_value, "csv");
+        let slots = slots_of(&gm, "export command").await;
+        assert_eq!(
+            slot_named(&slots, "format", "csv")["ended_by"],
+            "s2:rejected"
+        );
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        assert_eq!(live(&edges), 1);
+    }
 }
