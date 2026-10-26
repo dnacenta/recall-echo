@@ -24,10 +24,10 @@ use super::super::GraphMemory;
 use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
-    affects_target, filter_fact, map_subject, over_long, release_name, remap, Fact, Kind, Mention,
-    Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE,
-    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
-    MAX_ITEMS,
+    affects_target, component_of_project, filter_fact, map_subject, over_long, project_object,
+    release_name, remap, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING,
+    DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT,
+    DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -371,6 +371,7 @@ fn accept_fact(
     mention.turn = cited.turn;
     mention.provenance = cited.role;
     mention.quote = cited.quote;
+    let swapped = component_of_project(&mention);
     let mut fact = remap(mention)?;
     fact.replaces = object
         .get("replaces")
@@ -378,13 +379,27 @@ fn accept_fact(
         .unwrap_or("")
         .trim()
         .to_string();
-    map_subject(&mut fact, &session.project);
-    let shape = if fact.object_kind.is_some() {
-        ValueShape::Entity
+    if swapped {
+        project_object(&mut fact, &session.project)?;
     } else {
-        ValueShape::Literal
+        map_subject(&mut fact, &session.project);
+    }
+    let value_ok = if swapped {
+        ground.supports_value(
+            &fact.subject_name,
+            fact.turn,
+            &fact.quote,
+            ValueShape::Entity,
+        )
+    } else {
+        let shape = if fact.object_kind.is_some() {
+            ValueShape::Entity
+        } else {
+            ValueShape::Literal
+        };
+        ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape)
     };
-    if !ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape) {
+    if !value_ok {
         return Err(DROP_VALUE_SUPPORT);
     }
     if fact.predicate == Predicate::Setting
@@ -890,8 +905,8 @@ mod tests {
     use crate::graph::v2::input::{ProjectIdentity, Turn, TurnRole};
     use crate::graph::v2::schema::{
         Fact, Kind, Predicate, DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE,
-        DROP_QUOTE, DROP_TOO_LONG, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
-        MAX_ITEMS,
+        DROP_QUOTE, DROP_REJECTED, DROP_TOO_LONG, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL,
+        DROP_VERSION, MAX_ITEMS,
     };
     use crate::graph::Provenance;
     use serde_json::Value;
@@ -1090,6 +1105,274 @@ mod tests {
         );
         assert!(facts.is_empty());
         assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
+    }
+
+    #[test]
+    fn project_uses_component_is_part_of_the_session() {
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "Add an export command with CSV output.".into(),
+        }];
+        let cases = [
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "decided",
+                true,
+            ),
+            (
+                "the project",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "decided",
+                true,
+            ),
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "considered",
+                true,
+            ),
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "export command",
+                "component",
+                "rejected",
+                true,
+            ),
+            (
+                "tidepool",
+                "project",
+                "uses",
+                "import wizard",
+                "component",
+                "decided",
+                false,
+            ),
+            (
+                "export command",
+                "component",
+                "part_of",
+                "tidepool",
+                "project",
+                "decided",
+                false,
+            ),
+        ];
+        for (subject, subject_type, predicate, object, object_type, status, kept) in cases {
+            let mut item = fact_json(0, "Add an export command");
+            let fields = item.as_object_mut().expect("fact");
+            for (key, value) in [
+                ("subject", subject),
+                ("subject_type", subject_type),
+                ("predicate", predicate),
+                ("object", object),
+                ("object_type", object_type),
+                ("status", status),
+                ("key", ""),
+            ] {
+                fields.insert(key.into(), Value::String(value.into()));
+            }
+            let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                reply.as_object().expect("reply"),
+                &session(turns.clone()),
+                &mut report,
+            );
+            assert_candidate_balance(&report);
+            if kept {
+                assert_eq!(facts.len(), 1, "{subject} {status}");
+                assert!(report.drops.is_empty(), "{:?}", report.drops);
+                let fact = &facts[0];
+                assert_eq!(fact.subject_name, "export command");
+                assert_eq!(fact.subject_kind, Kind::Component);
+                assert_eq!(fact.predicate, Predicate::PartOf);
+                assert_eq!(fact.object_name, "tidepool");
+                assert_eq!(fact.object_kind, Some(Kind::Project));
+                assert_eq!(fact.status, status);
+                assert_eq!(fact.provenance, Provenance::User);
+                assert_eq!(fact.role, None);
+                assert_eq!(fact.key, "");
+                assert!(fact.replaces.is_empty());
+                assert_eq!(fact.quote, "Add an export command");
+            } else {
+                assert!(facts.is_empty(), "{predicate} {object}");
+                assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn swapped_component_rejects_generic_empty_and_over_long_names() {
+        let long = "x".repeat(301);
+        let turn = "Add an export command with CSV output.";
+        let quote = "Add an export command";
+        let cases = [
+            ("", turn, quote),
+            ("---", turn, quote),
+            ("file", "Keep the file export.", "Keep the file export."),
+            (long.as_str(), long.as_str(), long.as_str()),
+        ];
+        for (object, turn, quote) in cases {
+            let turns = vec![Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: turn.into(),
+            }];
+            let mut item = fact_json(0, quote);
+            let fields = item.as_object_mut().expect("fact");
+            for (key, value) in [
+                ("subject", "tidepool"),
+                ("subject_type", "project"),
+                ("predicate", "uses"),
+                ("object", object),
+                ("object_type", "component"),
+                ("status", "decided"),
+                ("key", ""),
+            ] {
+                fields.insert(key.into(), Value::String(value.into()));
+            }
+            let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                reply.as_object().expect("reply"),
+                &session(turns),
+                &mut report,
+            );
+            assert!(facts.is_empty(), "{object}");
+            assert_eq!(
+                report.drops.get(DROP_REJECTED).copied(),
+                Some(1),
+                "{object} {:?}",
+                report.drops
+            );
+            assert_candidate_balance(&report);
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn swapped_replaces_is_cleared_and_retires_nothing() {
+        let turn = "We use the export command instead of csv";
+        let turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: turn.into(),
+        }];
+        let mut item = fact_json(0, turn);
+        let fields = item.as_object_mut().expect("fact");
+        for (key, value) in [
+            ("subject", "tidepool"),
+            ("subject_type", "project"),
+            ("predicate", "uses"),
+            ("object", "export command"),
+            ("object_type", "component"),
+            ("status", "decided"),
+            ("key", ""),
+            ("replaces", "csv"),
+        ] {
+            fields.insert(key.into(), Value::String(value.into()));
+        }
+        let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+        let input = session(turns.clone());
+        let mut report = IngestionReport::default();
+        let facts = facts_from_reply(reply.as_object().expect("reply"), &input, &mut report);
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        let fact = &facts[0];
+        assert!(fact.replaces.is_empty(), "{}", fact.replaces);
+        assert_eq!(fact.predicate, Predicate::PartOf);
+        assert_eq!(fact.subject_name, "export command");
+        assert_eq!(fact.subject_kind, Kind::Component);
+        assert_eq!(fact.object_name, "tidepool");
+        assert_eq!(fact.status, "decided");
+
+        let prior = [
+            Fact {
+                subject_name: "export command".into(),
+                subject_kind: Kind::Component,
+                predicate: Predicate::Setting,
+                role: None,
+                key: "format".into(),
+                object_name: "csv".into(),
+                object_kind: None,
+                status: "decided".into(),
+                turn: 0,
+                quote: "format is csv".into(),
+                confidence: 0.9,
+                provenance: Provenance::User,
+                replaces: String::new(),
+            },
+            Fact {
+                subject_name: "export command".into(),
+                subject_kind: Kind::Component,
+                predicate: Predicate::PartOf,
+                role: None,
+                key: String::new(),
+                object_name: "cli".into(),
+                object_kind: Some(Kind::Component),
+                status: "decided".into(),
+                turn: 0,
+                quote: "export command is part of cli".into(),
+                confidence: 0.9,
+                provenance: Provenance::User,
+                replaces: String::new(),
+            },
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        let llm = PanicProvider;
+        let ctx = write::WriteCtx::new(&llm, &input.project, "s1", "2026-04-03", &[]);
+        write::write_facts(&gm, &ctx, &prior).await.unwrap();
+        let ctx = write::WriteCtx::new(&llm, &input.project, "s2", "2026-04-11", &turns);
+        let stats = write::write_facts(&gm, &ctx, &facts).await.unwrap();
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let component = entities
+            .iter()
+            .find(|entity| entity.name == "export command")
+            .expect("component");
+        let slots = component.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap();
+        let slot = slots
+            .iter()
+            .find(|slot| slot["key"] == "format" && slot["value"] == "csv")
+            .expect("format=csv");
+        assert!(slot["valid_until"].is_null(), "{slot}");
+        let cli = entities
+            .iter()
+            .find(|entity| entity.name == "cli")
+            .expect("cli");
+        let edges = crate::graph::crud::list_all_relationships(gm.db())
+            .await
+            .unwrap();
+        let live = edges
+            .iter()
+            .filter(|edge| {
+                edge.rel_type == "part_of"
+                    && edge.valid_until.is_none()
+                    && edge.from_id == component.id
+                    && edge.to_id == cli.id
+            })
+            .count();
+        assert_eq!(live, 1, "{edges:?}");
     }
 
     #[tokio::test]
