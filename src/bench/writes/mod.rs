@@ -25,7 +25,8 @@ pub use grade::{
     WrongReason,
 };
 pub use run::{
-    require_scratch, run, run_repeat, Extractor, MetricRange, MetricSet, MetricSpan, RepeatReport,
+    require_scratch, run, run_repeat, Extractor, KnownFactsContext, MetricRange, MetricSet,
+    MetricSpan, RepeatReport,
 };
 pub use script::{
     load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState,

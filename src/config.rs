@@ -688,6 +688,12 @@ pub struct GraphSection {
     /// wipe the rest of the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// Show live stored facts to pass 1. Experimental, and off unless set.
+    #[serde(
+        default = "default_known_facts_context",
+        skip_serializing_if = "is_false"
+    )]
+    pub known_facts_context: bool,
 }
 
 impl Default for GraphSection {
@@ -703,6 +709,7 @@ impl Default for GraphSection {
             provenance: ProvenanceWeights::default(),
             dedup: GraphDedupConfig::default(),
             pipeline: None,
+            known_facts_context: default_known_facts_context(),
         }
     }
 }
@@ -1006,6 +1013,14 @@ fn default_graph_namespace() -> String {
     "nullarc".to_string()
 }
 
+fn default_known_facts_context() -> bool {
+    false
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_provider() -> Provider {
     Provider::Anthropic
 }
@@ -1285,6 +1300,12 @@ impl Config {
                     ));
                 }
                 self.graph_section().pipeline = Some(value.to_string());
+                Ok(())
+            }
+            "graph.known_facts_context" => {
+                self.graph_section().known_facts_context = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
             }
             "graph.dedup.max_candidates" => {
@@ -2062,6 +2083,21 @@ mod tests {
             .set_key("graph.dedup.review_similarity", "-0.1")
             .is_err());
         assert!(cfg.set_key("graph.dedup.max_candidates", "0").is_err());
+    }
+
+    #[test]
+    fn known_facts_context_defaults_off() {
+        assert!(!default_known_facts_context());
+        assert!(!GraphSection::default().known_facts_context);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().known_facts_context);
+        let section: Config =
+            toml::from_str("[graph]\nmode = \"embedded\"\n").expect("graph section");
+        assert!(!section.graph.expect("graph").known_facts_context);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.known_facts_context", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").known_facts_context);
+        assert!(cfg.set_key("graph.known_facts_context", "yes").is_err());
     }
 
     #[test]

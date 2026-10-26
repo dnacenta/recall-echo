@@ -244,6 +244,9 @@ enum BenchCommands {
         /// unless the memory directory's config says otherwise.
         #[arg(long, value_parser = parse_pipeline)]
         pipeline: Option<recall_echo::graph::PipelineVersion>,
+        /// Show stored facts to pass 1. Experimental, and off unless set.
+        #[arg(long)]
+        known_facts_context: bool,
     },
 }
 
@@ -1060,7 +1063,20 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             model,
             repeat,
             pipeline,
-        } => run_writes(script, work_dir, provider, model, repeat, pipeline),
+            known_facts_context,
+        } => run_writes(
+            script,
+            work_dir,
+            provider,
+            model,
+            repeat,
+            pipeline,
+            if known_facts_context {
+                recall_echo::bench::writes::KnownFactsContext::On
+            } else {
+                recall_echo::bench::writes::KnownFactsContext::Off
+            },
+        ),
     }
 }
 
@@ -1072,6 +1088,7 @@ fn run_writes(
     model: Option<String>,
     repeat: usize,
     pipeline: Option<recall_echo::graph::PipelineVersion>,
+    known_facts_context: recall_echo::bench::writes::KnownFactsContext,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1102,6 +1119,7 @@ fn run_writes(
             provider,
             model.as_deref(),
             pipeline,
+            known_facts_context,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1112,6 +1130,7 @@ fn run_writes(
             provider,
             model.as_deref(),
             pipeline,
+            known_facts_context,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1126,6 +1145,7 @@ async fn grade_once(
     provider: Option<String>,
     model: Option<&str>,
     pipeline: recall_echo::graph::PipelineVersion,
+    known_facts_context: recall_echo::bench::writes::KnownFactsContext,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1134,9 +1154,25 @@ async fn grade_once(
             let memory_dir = root.join("memory");
             let (llm, _) =
                 recall_echo::llm_provider::create_provider(&memory_dir, Some(&name), model)?;
-            writes::run(script, root, Extractor::Live(llm.as_ref()), pipeline).await
+            writes::run(
+                script,
+                root,
+                Extractor::Live(llm.as_ref()),
+                pipeline,
+                known_facts_context,
+            )
+            .await
         }
-        None => writes::run(script, root, Extractor::Scripted, pipeline).await,
+        None => {
+            writes::run(
+                script,
+                root,
+                Extractor::Scripted,
+                pipeline,
+                known_facts_context,
+            )
+            .await
+        }
     }
 }
 
@@ -1148,6 +1184,7 @@ async fn grade_repeat(
     provider: Option<String>,
     model: Option<&str>,
     pipeline: recall_echo::graph::PipelineVersion,
+    known_facts_context: recall_echo::bench::writes::KnownFactsContext,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1162,10 +1199,21 @@ async fn grade_repeat(
                 repeat,
                 Extractor::Live(llm.as_ref()),
                 pipeline,
+                known_facts_context,
             )
             .await
         }
-        None => writes::run_repeat(script, root, repeat, Extractor::Scripted, pipeline).await,
+        None => {
+            writes::run_repeat(
+                script,
+                root,
+                repeat,
+                Extractor::Scripted,
+                pipeline,
+                known_facts_context,
+            )
+            .await
+        }
     }
 }
 

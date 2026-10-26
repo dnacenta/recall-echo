@@ -32,6 +32,7 @@ timeout_secs = 300            # per call; 0 waits forever
 [graph]
 mode = "embedded"             # embedded (single-process SurrealKV) | server (shared SurrealDB)
 url = "ws://localhost:8787"   # server mode only
+# known_facts_context = false # experimental: show stored facts to pass 1; off by default
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

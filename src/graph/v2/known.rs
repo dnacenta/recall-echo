@@ -1446,6 +1446,16 @@ mod tests {
             .unwrap();
         }
 
+        fn enable_known_facts(memory: &std::path::Path) {
+            std::fs::write(
+                memory.join(".recall-echo.toml"),
+                "[graph]\nknown_facts_context = true\n",
+            )
+            .unwrap();
+        }
+
+        const PRE_BLOCK_USER: &str = "Project: tidepool\nSession date: 2026-01-02\nTranscript:\n[T0] USER: Ship the shelf today.\n\nExtract the durable facts, bugs and releases as JSON.";
+
         #[tokio::test]
         async fn empty_store_user_message_matches_the_unblocked_request() {
             let tmp = tempfile::tempdir().unwrap();
@@ -1454,6 +1464,7 @@ mod tests {
             let gm = GraphMemory::open_embedded(&memory.join("graph"))
                 .await
                 .unwrap();
+            enable_known_facts(memory);
             let provider = Capture {
                 seen: Mutex::new(Vec::new()),
                 reply: r#"{"facts":[],"bugs":[],"releases":[]}"#.into(),
@@ -1508,6 +1519,7 @@ mod tests {
             let reply = format!(
                 r#"{{"facts":[{{"subject":"tidepool","subject_type":"project","predicate":"rule","role":"none","key":"","object":"{quote}","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"{quote}","confidence":0.9}}],"bugs":[],"releases":[]}}"#
             );
+            enable_known_facts(memory);
             let provider = Capture {
                 seen: Mutex::new(Vec::new()),
                 reply,
@@ -1522,6 +1534,7 @@ mod tests {
             .await
             .unwrap();
             let seen = provider.seen.lock().expect("lock");
+            assert_eq!(seen[0].0, PASS1_SYSTEM);
             assert!(seen[0].1[2].content.contains(quote));
             assert!(seen[0].1[2].content.contains("Known facts"));
             assert_eq!(report.drops.get(DROP_QUOTE).copied(), Some(1));
@@ -1583,6 +1596,7 @@ mod tests {
                 assert_eq!(notes.as_slice(), [super::super::KNOWN_UNREAD.to_string()]);
                 assert!(notes.iter().all(|line| !line.contains(SECRET)));
             });
+            enable_known_facts(memory);
             let provider = Capture {
                 seen: Mutex::new(Vec::new()),
                 reply: r#"{"facts":[],"bugs":[],"releases":[]}"#.into(),
@@ -1598,8 +1612,7 @@ mod tests {
             .unwrap();
             assert_eq!(report.llm_calls, 1);
             let seen = provider.seen.lock().expect("lock");
-            let expected = "Project: tidepool\nSession date: 2026-01-02\nTranscript:\n[T0] USER: Ship the shelf today.\n\nExtract the durable facts, bugs and releases as JSON.";
-            assert_eq!(seen[0].1[2], Message::user(expected));
+            assert_eq!(seen[0].1[2], Message::user(PRE_BLOCK_USER));
             assert!(!seen[0].1[2].content.contains("Known facts"));
             assert!(!seen[0].1[2].content.contains(SECRET));
             super::super::KNOWN_NOTES.with(|notes| {
@@ -1607,6 +1620,111 @@ mod tests {
                 assert!(notes.len() >= 2);
                 assert!(notes.iter().all(|line| line == super::super::KNOWN_UNREAD));
                 assert!(notes.iter().all(|line| !line.contains(SECRET)));
+            });
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn off_request_matches_the_pre_block_prompt_and_skips_stored_rows() {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = tmp.path();
+            let turn = "Ship the shelf today.";
+            sidecar(memory, turn);
+            let gm = GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            super::super::super::write::ensure_v2_store(&gm)
+                .await
+                .unwrap();
+            let stored = "quartz linen stays";
+            assert!(!turn.contains(stored));
+            let _tidepool = make(
+                &gm,
+                "tidepool",
+                Kind::Project,
+                vec![slot("setting", "label", stored, "decided", false)],
+            )
+            .await;
+            let provider = Capture {
+                seen: Mutex::new(Vec::new()),
+                reply: r#"{"facts":[],"bugs":[],"releases":[]}"#.into(),
+            };
+            let report = pass1::extract_session(
+                &gm,
+                memory,
+                1,
+                &IngestContext::new("s", Some(1)),
+                &provider,
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.llm_calls, 1);
+            let seen = provider.seen.lock().expect("lock");
+            let (system, messages) = &seen[0];
+            assert_eq!(system, pass1::PASS1_SYSTEM_BARE);
+            assert!(!system.contains("Known facts lists what memory already holds."));
+            assert!(!system.contains("reuse its key for the same setting."));
+            assert_eq!(messages[0], Message::user(PASS1_EXAMPLE_USER));
+            assert_eq!(messages[1], Message::assistant(PASS1_EXAMPLE_REPLY));
+            assert_eq!(messages[2], Message::user(PRE_BLOCK_USER));
+            assert!(!messages[2].content.contains("Known facts"));
+            assert!(!messages[2].content.contains(stored));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn off_does_not_read_a_failing_store() {
+            const SECRET: &str = "zephyr-quartz-991";
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = tmp.path();
+            sidecar(memory, "Ship the shelf today.");
+            let gm = GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            super::super::super::write::ensure_v2_store(&gm)
+                .await
+                .unwrap();
+            gm.db()
+                .query(
+                    "CREATE entity SET
+                        name = $name,
+                        entity_type = $entity_type,
+                        abstract = $name,
+                        overview = '',
+                        mutable = true,
+                        access_count = 0,
+                        utility_score = 0.5,
+                        utility_updates = 0,
+                        created_at = time::now(),
+                        updated_at = time::now()",
+                )
+                .bind(("name", SECRET.to_string()))
+                .bind(("entity_type", SECRET.to_string()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            super::super::KNOWN_NOTES.with(|notes| notes.borrow_mut().clear());
+            let provider = Capture {
+                seen: Mutex::new(Vec::new()),
+                reply: r#"{"facts":[],"bugs":[],"releases":[]}"#.into(),
+            };
+            let report = pass1::extract_session(
+                &gm,
+                memory,
+                1,
+                &IngestContext::new("s", Some(1)),
+                &provider,
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.llm_calls, 1);
+            let seen = provider.seen.lock().expect("lock");
+            assert_eq!(seen[0].0, pass1::PASS1_SYSTEM_BARE);
+            assert_eq!(seen[0].1[2], Message::user(PRE_BLOCK_USER));
+            assert!(!seen[0].1[2].content.contains(SECRET));
+            // A read goes through `known_rows`, which logs when this row fails
+            // to deserialise. No log means the store was not read.
+            super::super::KNOWN_NOTES.with(|notes| {
+                assert!(notes.borrow().is_empty());
             });
         }
     }

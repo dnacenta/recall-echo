@@ -62,3 +62,7 @@ A fact stored in the current session stays live for the rest of that session, so
 ## Reports
 
 `kept` plus the whole-candidate drop counts equals `candidates`. Cause, fix, release contents, and a named `affects` edge that fail value support count as `value_support_partial`. They are listed separately and are not part of that sum. An empty optional field is not a drop. `unresolved` is counted at write time on a candidate that was already kept, so it sits outside the pass-1 sum.
+
+## Known facts
+
+The known-facts block is experimental and off by default. Pass 1 is not shown stored rows, and its request does not mention them, unless `[graph] known_facts_context` is true or `bench writes` is run with `--known-facts-context`. With the switch on, live rows from earlier sessions are listed after the session date as data. A quote still has to come from a turn; text that appears only in the block is not evidence.

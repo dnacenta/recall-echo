@@ -1,0 +1,27 @@
+You extract durable project memory from a coding-session transcript between a USER and a coding ASSISTANT.
+Extract EVERY fact worth remembering in a future session, one fact per distinct value: decisions, chosen technologies and tools, settings and their values (ports, versions, paths, commands, limits, thresholds, formats), project rules and conventions, plans, and people's durable preferences. Bugs and releases go in their own sections (below).
+
+Do NOT extract: greetings, small talk, moods, weather, holidays or personal chatter; one-off actions (ran tests, created a file, committed); tool names, file listings, test counts or command output; vague ideas the user says are not a plan.
+
+FACTS (section "facts")
+Entity types: project (the software being built), component (a part of the project: module, command, subsystem, file format, script, API), technology (an external language, library, framework, tool, service or database), person.
+Predicates (subject -> object):
+- uses: project|component -> technology. role = what it is used for: language, runtime, package_manager (uv, pip, npm, cargo), framework, cli_framework, web_framework, database, test_framework, linter, formatter, type_checker, build_tool, ci, hosting, library, other.
+- part_of: component -> project|component.
+- depends_on: component -> component.
+- works_on: person -> project.
+- setting: project|component|technology -> literal. key = short snake_case name (port, version, license, storage_path, test_command, line_length, timeout_seconds, max_concurrency, coverage_min, release_process ...). One current value per key.
+- rule: project|component -> literal. A convention or constraint that must be followed, as a short imperative sentence.
+- prefers: person -> literal. A durable working preference.
+Use role "none" and key "" when they do not apply.
+Numbers, versions, ports, paths, commands and thresholds are literals (setting values), never technologies.
+The subject of project-wide facts is the PROJECT NAME given above the transcript. Use full proper names, never pronouns or "project".
+status: decided = adopted, agreed or currently true; considered = proposed or discussed but not adopted; rejected = turned down, removed or abandoned.
+replaces: when a decided fact REPLACES an earlier choice (switch from X to Y, X removed in favour of Y), put the old value X here and ALSO output X as a separate rejected fact. Otherwise "".
+
+BUGS (section "bugs"): one entry per bug or problem: symptom = what went wrong (short), cause = why, fix = what was changed, status = open, fixed or wont_fix, component = the affected part or the project name. Leave cause or fix "" if not stated.
+
+RELEASES (section "releases"): one entry per version that was released or is planned: version (e.g. 1.4.0), status = released or planned, contents = what it contains or will contain (short, comma separated).
+
+Evidence (every entry): turn = the N of the [TN] turn that states it; quote = an exact verbatim copy of 3-20 consecutive words from that turn that contains the value (copy characters exactly).
+confidence: 0.0-1.0 that this is a durable, correctly stated fact.
