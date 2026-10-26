@@ -1935,7 +1935,7 @@ mod tests {
     use super::*;
     use crate::graph::crud;
     use crate::graph::v2::input::TurnRole;
-    use crate::graph::v2::schema::{remap, Fact, Kind, Mention, Predicate, Role};
+    use crate::graph::v2::schema::{project_object, remap, Fact, Kind, Mention, Predicate, Role};
 
     fn setting(value: &str) -> Fact {
         let mut mention = Mention {
@@ -4140,6 +4140,124 @@ mod tests {
         );
         let edges = crud::list_all_relationships(gm.db()).await.unwrap();
         assert_eq!(live(&edges), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn inverted_part_of_and_uses_swap_are_one_edge() {
+        let inverted = kept_component(Predicate::PartOf);
+        let uses = kept_component(Predicate::Uses);
+        assert_eq!(inverted, uses);
+        assert_eq!(inverted.subject_name, "cache layer");
+        assert_eq!(inverted.object_name, "widget");
+        assert!(inverted.replaces.is_empty());
+
+        let (_tmp, gm) = open_store().await;
+        let first = write_session(&gm, "s1", "2026-04-03", &[inverted.clone(), uses])
+            .await
+            .unwrap();
+        assert_eq!(
+            (first.edges, first.already_seen, first.reinforced),
+            (1, 1, 0),
+            "{first:?}"
+        );
+        assert_part_of(&gm, &["s1"], 1).await;
+
+        let again = write_session(&gm, "s2", "2026-04-11", std::slice::from_ref(&inverted))
+            .await
+            .unwrap();
+        assert_eq!(
+            (again.edges, again.already_seen, again.reinforced),
+            (0, 0, 1)
+        );
+        let reinforced = assert_part_of(&gm, &["s1", "s2"], 2).await;
+        let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+        assert!(reinforced.0 > prior.alpha(), "{}", reinforced.0);
+        assert_close(reinforced.1, prior.beta());
+
+        let retry = write_session(&gm, "s1", "2026-04-03", &[inverted])
+            .await
+            .unwrap();
+        assert_eq!(
+            (retry.edges, retry.already_seen, retry.reinforced),
+            (0, 1, 0)
+        );
+        let stored = assert_part_of(&gm, &["s1", "s2"], 2).await;
+        assert_close(stored.0, reinforced.0);
+        assert_close(stored.1, reinforced.1);
+    }
+
+    fn kept_component(predicate: Predicate) -> Fact {
+        let mention = Mention {
+            subject: "widget".into(),
+            subject_kind: Kind::Project,
+            predicate,
+            role: Role::Library,
+            key: "port".into(),
+            object: "cache layer".into(),
+            object_kind: Some(Kind::Component),
+            status: "decided".into(),
+            turn: 0,
+            quote: "cache layer".into(),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+        };
+        let mut fact = remap(mention).expect("swap");
+        let project = ProjectIdentity {
+            name: "widget".into(),
+            aliases: vec!["wdg".into()],
+        };
+        project_object(&mut fact, &project).expect("session project");
+        fact
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn assert_part_of(gm: &GraphMemory, sessions: &[&str], evidence: usize) -> (f64, f64) {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let id_of = |name: &str| {
+            entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .id
+                .clone()
+        };
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        let live: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.rel_type == "part_of" && edge.valid_until.is_none())
+            .collect();
+        assert_eq!(live.len(), 1, "{edges:?}");
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(live[0].from_id, id_of("cache layer"));
+        assert_eq!(live[0].to_id, id_of("widget"));
+
+        let mut response = gm
+            .db()
+            .query("SELECT alpha, beta, evidence FROM relates_to WHERE rel_type = 'part_of'")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let items = rows[0]["evidence"].as_array().expect("evidence");
+        assert_eq!(items.len(), evidence);
+        let seen: Vec<&str> = items
+            .iter()
+            .map(|item| item["session"].as_str().expect("session"))
+            .collect();
+        assert_eq!(seen, sessions);
+        for item in items {
+            assert_eq!(item["quote"], "cache layer");
+            assert_eq!(item["turn"].as_u64(), Some(0));
+        }
+        let alpha = rows[0]["alpha"].as_f64().expect("alpha");
+        let beta = rows[0]["beta"].as_f64().expect("beta");
+        if evidence == 1 {
+            let prior = Evidence::from_prior(ExtractionContext::Explicit.prior());
+            assert_close(alpha, prior.alpha());
+            assert_close(beta, prior.beta());
+        }
+        (alpha, beta)
     }
 
     #[cfg(feature = "embedded")]

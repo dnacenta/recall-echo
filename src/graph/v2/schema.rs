@@ -287,8 +287,9 @@ pub(crate) struct Mention {
 
 /// Apply the remap / reject table in the specified order.
 ///
-/// Row 0 records a project `uses` of a component as that component `part_of`
-/// the project. Row 3 sees the object kind the model sent. A literal object
+/// Row 0 records a project `uses` of a component, or a decided project
+/// `part_of` of a component, as that component `part_of` the project. Row 3
+/// sees the object kind the model sent. A literal object
 /// type is promoted to technology only at row 5, after that reject has run,
 /// so `technology uses "1.75"` is not a technology-to-technology edge.
 ///
@@ -296,7 +297,7 @@ pub(crate) struct Mention {
 /// canonicalised when it is a setting, and its role cleared when it is not a
 /// `uses` edge.
 pub(crate) fn remap(mention: Mention) -> Result<Fact, &'static str> {
-    // 0. project uses component => component part_of project
+    // 0. project uses or decided part_of component => component part_of project
     if component_of_project(&mention) {
         return Ok(finish(Mention {
             subject: mention.object,
@@ -362,12 +363,22 @@ pub(crate) fn remap(mention: Mention) -> Result<Fact, &'static str> {
     Ok(finish(mention))
 }
 
-/// A project `uses` mention of a component, on the kinds the model sent.
+/// A project `uses` of a component, or a decided project `part_of` of one.
+///
+/// Kinds and status are the ones the model sent. A `part_of` that is not
+/// decided, or whose object is not a component, stays on row 6.
 #[must_use]
 pub(crate) fn component_of_project(mention: &Mention) -> bool {
-    mention.predicate == Predicate::Uses
-        && mention.subject_kind == Kind::Project
-        && mention.object_kind == Some(Kind::Component)
+    if mention.subject_kind != Kind::Project {
+        return false;
+    }
+    match mention.predicate {
+        Predicate::Uses => mention.object_kind == Some(Kind::Component),
+        Predicate::PartOf => {
+            mention.status == "decided" && mention.object_kind == Some(Kind::Component)
+        }
+        _ => false,
+    }
 }
 
 /// `uses`, `setting` and `rule` also accept project, component and technology.
@@ -1164,6 +1175,34 @@ mod tests {
         let mut part = mention(Predicate::Uses, Kind::Component, Some(Kind::Component));
         part.object = "cache".into();
         assert_eq!(remap(part).unwrap().predicate, Predicate::DependsOn);
+    }
+
+    #[test]
+    fn decided_project_part_of_component_uses_the_same_swap() {
+        let mut row = mention(Predicate::PartOf, Kind::Project, Some(Kind::Component));
+        row.subject = "widget".into();
+        row.object = "cache layer".into();
+        row.quote = "cache layer".into();
+        assert!(component_of_project(&row));
+        let mut expect = swapped("cache layer", "widget");
+        expect.quote = "cache layer".into();
+        assert_eq!(remap(row.clone()).unwrap(), expect);
+        let mut uses = row.clone();
+        uses.predicate = Predicate::Uses;
+        assert_eq!(remap(uses).unwrap(), expect);
+
+        for status in ["considered", "rejected"] {
+            let mut held = row.clone();
+            held.status = status.into();
+            assert!(!component_of_project(&held), "{status}");
+            assert_eq!(remap(held).unwrap_err(), DROP_REJECTED);
+        }
+        for kind in [Some(Kind::Project), Some(Kind::Technology), None] {
+            let mut other = row.clone();
+            other.object_kind = kind;
+            assert!(!component_of_project(&other));
+            assert_eq!(remap(other).unwrap_err(), DROP_REJECTED);
+        }
     }
 
     fn swapped(subject: &str, object: &str) -> Fact {

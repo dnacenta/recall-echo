@@ -1265,6 +1265,183 @@ mod tests {
     }
 
     #[test]
+    fn inverted_project_part_of_component_is_part_of_the_session() {
+        let turn = "Add a cache layer module to widget inside the platform suite \
+            beside the queue broker using the buffer pool instead of the buffer";
+        let session = SessionInput {
+            session_id: "s".into(),
+            date: "2026-01-02".into(),
+            project: ProjectIdentity {
+                name: "widget".into(),
+                aliases: vec!["wdg".into()],
+            },
+            turns: vec![Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: turn.into(),
+            }],
+            tool_lines: Vec::new(),
+        };
+        let accept = |subject: &str,
+                      predicate: &str,
+                      object: &str,
+                      object_type: &str,
+                      status: &str,
+                      quote: &str,
+                      replaces: &str| {
+            let mut item = fact_json(0, quote);
+            let fields = item.as_object_mut().expect("fact");
+            for (key, value) in [
+                ("subject", subject),
+                ("subject_type", "project"),
+                ("predicate", predicate),
+                ("object", object),
+                ("object_type", object_type),
+                ("status", status),
+                ("key", ""),
+                ("role", "none"),
+                ("replaces", replaces),
+            ] {
+                fields.insert(key.into(), Value::String(value.into()));
+            }
+            let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(reply.as_object().expect("reply"), &session, &mut report);
+            assert_candidate_balance(&report);
+            (facts, report)
+        };
+
+        let (missing, report) = accept(
+            "widget",
+            "part_of",
+            "queue worker",
+            "component",
+            "decided",
+            "widget",
+            "",
+        );
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+
+        let (facts, report) = accept(
+            "widget",
+            "part_of",
+            "cache layer",
+            "component",
+            "decided",
+            "cache layer",
+            "",
+        );
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        let fact = &facts[0];
+        assert_eq!(fact.subject_name, "cache layer");
+        assert_eq!(fact.subject_kind, Kind::Component);
+        assert_eq!(fact.predicate, Predicate::PartOf);
+        assert_eq!(fact.object_name, "widget");
+        assert_eq!(fact.object_kind, Some(Kind::Project));
+        assert_eq!(fact.status, "decided");
+        assert_eq!(fact.provenance, Provenance::User);
+        assert_eq!(fact.quote, "cache layer");
+        assert_eq!(fact.turn, 0);
+        assert_eq!(fact.confidence, 0.9);
+        assert!(fact.replaces.is_empty());
+        let (uses, uses_report) = accept(
+            "widget",
+            "uses",
+            "cache layer",
+            "component",
+            "decided",
+            "cache layer",
+            "",
+        );
+        assert!(uses_report.drops.is_empty(), "{:?}", uses_report.drops);
+        assert_eq!(facts, uses);
+
+        for (subject, object, object_type, status, quote) in [
+            (
+                "widget",
+                "platform suite",
+                "project",
+                "decided",
+                "platform suite",
+            ),
+            (
+                "widget",
+                "queue broker",
+                "technology",
+                "decided",
+                "queue broker",
+            ),
+            ("widget", "buffer pool", "literal", "decided", "buffer pool"),
+            (
+                "widget",
+                "cache layer",
+                "component",
+                "considered",
+                "cache layer",
+            ),
+            (
+                "widget",
+                "cache layer",
+                "component",
+                "rejected",
+                "cache layer",
+            ),
+            (
+                "gizmo",
+                "cache layer",
+                "component",
+                "decided",
+                "cache layer",
+            ),
+            ("widget", "wdg", "component", "decided", "widget"),
+            ("widget", "widget", "component", "decided", "widget"),
+        ] {
+            let (facts, report) =
+                accept(subject, "part_of", object, object_type, status, quote, "");
+            assert!(
+                facts.is_empty(),
+                "{subject} {object} {object_type} {status}"
+            );
+            assert_eq!(
+                report.drops.get(DROP_REJECTED).copied(),
+                Some(1),
+                "{subject} {object} {object_type} {status} {:?}",
+                report.drops
+            );
+        }
+
+        for subject in ["wdg", "the project"] {
+            let (kept, report) = accept(
+                subject,
+                "part_of",
+                "cache layer",
+                "component",
+                "decided",
+                "cache layer",
+                "",
+            );
+            assert_eq!(kept.len(), 1, "{subject} {:?}", report.drops);
+            assert_eq!(
+                (kept[0].subject_name.as_str(), kept[0].object_name.as_str()),
+                ("cache layer", "widget")
+            );
+        }
+
+        let (cleared, report) = accept(
+            "widget",
+            "part_of",
+            "cache layer",
+            "component",
+            "decided",
+            "cache layer",
+            "buffer",
+        );
+        assert_eq!(cleared.len(), 1, "{:?}", report.drops);
+        assert!(cleared[0].replaces.is_empty(), "{}", cleared[0].replaces);
+    }
+
+    #[test]
     fn swapped_component_rejects_generic_empty_and_over_long_names() {
         let long = "x".repeat(301);
         let turn = "Add an export command with CSV output.";
