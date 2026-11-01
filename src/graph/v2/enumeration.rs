@@ -198,17 +198,15 @@ fn gap_at(runs: &[Run], sentence: &str, index: usize) -> Option<usize> {
 
 #[rustfmt::skip]
 fn additive(sentence: &str, span: (usize, usize)) -> bool {
-    // A departure, or `to`, already names a change. The cue is not a list.
-    if cue_words(sentence).iter().any(|(word, _, end)| {
-        *end <= span.0 && (word == "to" || DEPARTURE.contains(&word.as_str()))
-    }) {
-        return false;
-    }
     let words = cue_words(sentence);
     let before: Vec<&str> = words.iter().filter(|(_, _, end)| *end <= span.0).map(|(w, _, _)| w.as_str()).collect();
     let after: Vec<&str> = words.iter().filter(|(_, start, _)| *start >= span.1).map(|(w, _, _)| w.as_str()).take(3).collect();
-    let from = before.len().saturating_sub(3);
-    window(&before[from..]) || window(&after)
+    let near = &before[before.len().saturating_sub(3)..];
+    // A departure, or `to`, beside the value already names a change. The cue is not a list.
+    if near.iter().any(|word| *word == "to" || DEPARTURE.contains(word)) {
+        return false;
+    }
+    window(near) || window(&after)
 }
 
 #[rustfmt::skip]
@@ -341,6 +339,11 @@ mod tests {
         assert!(!enumerated("4.3", "We also moved to 4.3."));
         assert!(!enumerated("4.3", "Upgrade to 4.3 too."));
         assert!(!enumerated("LibB", "We also switched to LibB."));
+        assert!(enumerated("4.3", "To be safe, keep 4.2 and also test 4.3."));
+        assert!(enumerated(
+            "4.3",
+            "We moved CI last week; keep 4.2 and also test 4.3."
+        ));
     }
 
     #[test]
