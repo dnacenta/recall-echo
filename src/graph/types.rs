@@ -904,6 +904,10 @@ pub struct IngestionReport {
     /// Retirements that could not be applied. The session still commits.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub retirements_skipped: u32,
+    /// Why a row that would have closed was left live. Empty, and omitted,
+    /// when nothing was skipped this way. Older bench JSON has no field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub retirement_skips: BTreeMap<String, u32>,
     /// Stage durations for pipeline v2. Absent on v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<StageTiming>,
@@ -1027,6 +1031,24 @@ mod tests {
         assert!(loaded.known_match.is_blank());
         assert_eq!(loaded.timing.unwrap().match_ms, None);
         assert_eq!(loaded.entities_created, 0);
+        assert!(loaded.retirement_skips.is_empty());
+    }
+
+    #[test]
+    fn retirement_skips_round_trip_and_older_json_still_loads() {
+        let mut report = IngestionReport::default();
+        report.retirement_skips.insert("enumeration".into(), 2);
+        report.drops.insert("enumeration".into(), 1);
+        let mut value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["retirement_skips"]["enumeration"], 2);
+        assert_eq!(value["drops"]["enumeration"], 1);
+        value.as_object_mut().unwrap().remove("retirement_skips");
+        value.as_object_mut().unwrap().remove("drops");
+        let loaded: IngestionReport = serde_json::from_value(value).unwrap();
+        assert!(loaded.retirement_skips.is_empty());
+        assert!(loaded.drops.is_empty());
+        let encoded = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(encoded.get("retirement_skips").is_none());
     }
 
     #[test]
