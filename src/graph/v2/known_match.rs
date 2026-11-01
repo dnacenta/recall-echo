@@ -53,7 +53,6 @@ const DEPARTURE: &[&str] = &[
     "dropped",
     "remove",
     "removed",
-    "not",
 ];
 
 /// Apply A1–A3. A fact that does not match is returned unchanged.
@@ -174,7 +173,7 @@ fn edge_target(
         .iter()
         .any(|row| normalise(&row.value) == normalise(&fact.object_name))
     {
-        skip(report, "already_live");
+        // The new object is already stored. That is not a retirement skip.
         return (fact.clone(), None);
     }
     let hits: Vec<&KnownRow> = same
@@ -355,14 +354,17 @@ pub(crate) fn coexist(old: &str, new: &str, sentence: &str) -> bool {
         return false;
     }
     connectors_only(nearest_between(&old_spans, &new_spans, sentence))
-        || near_cue(&old_spans, sentence, false)
+        || near_cue(&old_spans, sentence)
 }
 
-/// A closed departure cue within three word tokens of `old`.
+/// A departure cue within three word tokens of `old`.
+///
+/// A cue is ignored when a negator sits within two tokens before it.
+/// `not` counts only where the old value follows it after a comma.
 #[must_use]
 pub(crate) fn departure_near(old: &str, sentence: &str) -> bool {
     let spans = value_spans(sentence, old);
-    !spans.is_empty() && near_cue(&spans, sentence, true)
+    !spans.is_empty() && spans.iter().any(|&span| departure_beside(span, sentence))
 }
 
 fn value_spans(text: &str, value: &str) -> Vec<(usize, usize)> {
@@ -458,7 +460,7 @@ fn take_connector(word: &mut String) -> bool {
     ok
 }
 
-fn near_cue(spans: &[(usize, usize)], sentence: &str, departure: bool) -> bool {
+fn near_cue(spans: &[(usize, usize)], sentence: &str) -> bool {
     let tokens = run_spans(sentence);
     for &(start, end) in spans {
         let before: Vec<&str> = tokens
@@ -473,23 +475,144 @@ fn near_cue(spans: &[(usize, usize)], sentence: &str, departure: bool) -> bool {
             .map(|(word, _, _)| word.as_str())
             .take(3)
             .collect();
-        if has_cue(&before[from..], departure) || has_cue(&after, departure) {
+        if has_keep(&before[from..]) || has_keep(&after) {
             return true;
         }
     }
     false
 }
 
-fn has_cue(tokens: &[&str], departure: bool) -> bool {
-    if departure {
-        tokens.iter().any(|token| DEPARTURE.contains(token))
-            || tokens.windows(2).any(|pair| *pair == ["no", "longer"])
-    } else {
-        tokens
-            .iter()
-            .any(|token| matches!(*token, "keep" | "also" | "too" | "alongside"))
-            || tokens.windows(2).any(|pair| *pair == ["as", "well"])
+/// Words, keeping an apostrophe so `don't` stays one token.
+fn cue_words(text: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut current = String::new();
+    for (index, ch) in text.char_indices() {
+        if ch.is_alphanumeric() || ch == '\'' {
+            if start.is_none() {
+                start = Some(index);
+            }
+            current.extend(ch.to_lowercase());
+        } else if let Some(from) = start.take() {
+            push_cue(&mut out, &mut current, from, index);
+        }
     }
+    if let Some(from) = start {
+        push_cue(&mut out, &mut current, from, text.len());
+    }
+    out
+}
+
+fn push_cue(out: &mut Vec<(String, usize, usize)>, current: &mut String, from: usize, to: usize) {
+    let word = current.trim_matches('\'').to_string();
+    current.clear();
+    if !word.is_empty() {
+        out.push((word, from, to));
+    }
+}
+
+fn departure_beside(span: (usize, usize), sentence: &str) -> bool {
+    let (start, end) = span;
+    let tokens = cue_words(sentence);
+    let before: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, stop))| *stop <= start)
+        .map(|(index, _)| index)
+        .collect();
+    let from = before.len().saturating_sub(3);
+    let after: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, begin, _))| *begin >= end)
+        .map(|(index, _)| index)
+        .take(3)
+        .collect();
+    before[from..]
+        .iter()
+        .chain(after.iter())
+        .any(|&index| departure_token(index, &tokens, sentence, start))
+}
+
+fn departure_token(
+    index: usize,
+    tokens: &[(String, usize, usize)],
+    sentence: &str,
+    value_start: usize,
+) -> bool {
+    let word = tokens[index].0.as_str();
+    if word == "not" {
+        return not_replaces_value(index, tokens, sentence, value_start);
+    }
+    if word == "no" && next_word(tokens, index) == Some("longer") {
+        return !cue_negated(index, tokens);
+    }
+    DEPARTURE.contains(&word) && !cue_negated(index, tokens)
+}
+
+/// `, not <old>`. `not` elsewhere is a negator, not a departure.
+fn not_replaces_value(
+    index: usize,
+    tokens: &[(String, usize, usize)],
+    sentence: &str,
+    value_start: usize,
+) -> bool {
+    let not_end = tokens[index].2;
+    if value_start < not_end {
+        return false;
+    }
+    if tokens
+        .iter()
+        .any(|(_, begin, _)| *begin >= not_end && *begin < value_start)
+    {
+        return false;
+    }
+    let from = if index == 0 { 0 } else { tokens[index - 1].2 };
+    sentence[from..tokens[index].1].contains(',')
+}
+
+fn next_word(tokens: &[(String, usize, usize)], index: usize) -> Option<&str> {
+    tokens.get(index + 1).map(|(word, _, _)| word.as_str())
+}
+
+/// A negator in the two tokens before a cue cancels that cue.
+fn cue_negated(index: usize, tokens: &[(String, usize, usize)]) -> bool {
+    let from = index.saturating_sub(2);
+    tokens[from..index]
+        .iter()
+        .any(|(word, _, _)| is_negator(word))
+}
+
+fn is_negator(token: &str) -> bool {
+    let folded: String = token.chars().filter(|ch| *ch != '\'').collect();
+    matches!(
+        folded.as_str(),
+        "not"
+            | "never"
+            | "no"
+            | "without"
+            | "dont"
+            | "wont"
+            | "cant"
+            | "cannot"
+            | "isnt"
+            | "arent"
+            | "wasnt"
+            | "werent"
+            | "didnt"
+            | "doesnt"
+            | "havent"
+            | "hasnt"
+            | "hadnt"
+            | "neither"
+    )
+}
+
+fn has_keep(tokens: &[&str]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(*token, "keep" | "also" | "too" | "alongside"))
+        || tokens.windows(2).any(|pair| *pair == ["as", "well"])
 }
 
 #[cfg(test)]
@@ -722,6 +845,56 @@ mod tests {
             assert!(got.targets[0].is_none(), "{role:?}");
             assert_eq!(got.report.edge_targets, 0);
         }
+    }
+
+    #[test]
+    fn a3_ignores_a_negated_departure_cue() {
+        for text in [
+            "Do not drop LibA, add LibB for linting.",
+            "We are not removing LibA; LibB joins as a second linter.",
+        ] {
+            let got = one(
+                uses("LibB", Role::Linter, text),
+                vec![row("uses", "", "LibA", "linter")],
+                text,
+            );
+            assert!(got.targets[0].is_none(), "{text}");
+            assert_eq!(got.report.edge_targets, 0, "{text}");
+            assert!(got.report.skipped.is_empty(), "{text} {:?}", got.report);
+        }
+    }
+
+    #[test]
+    fn a3_keeps_a_comma_not_and_an_unnegated_cue() {
+        for text in [
+            "Switched from LibA to LibB, not LibA anymore.",
+            "Now using LibB instead of LibA.",
+        ] {
+            let got = one(
+                uses("LibB", Role::Linter, text),
+                vec![row("uses", "", "LibA", "linter")],
+                text,
+            );
+            assert_eq!(got.report.edge_targets, 1, "{text}");
+            assert_eq!(
+                got.targets[0].as_ref().map(|target| target.value.as_str()),
+                Some("LibA"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a3_already_live_is_not_counted_as_a_skip() {
+        let text = "Use LibA for linting.";
+        let got = one(
+            uses("LibA", Role::Linter, text),
+            vec![row("uses", "", "LibA", "linter")],
+            text,
+        );
+        assert!(got.targets[0].is_none());
+        assert!(got.report.skipped.is_empty(), "{:?}", got.report);
+        assert_eq!(got.report.edge_targets, 0);
     }
 
     #[test]

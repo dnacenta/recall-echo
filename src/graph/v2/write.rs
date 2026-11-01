@@ -5150,4 +5150,255 @@ mod tests {
         );
         assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
     }
+
+    fn named_setting(value: &str, replaces: &str, quote: &str) -> Fact {
+        let mut fact = decided_slot("", value, 0);
+        fact.replaces = replaces.to_string();
+        fact.quote = quote.to_string();
+        fact
+    }
+
+    fn named_link(object: &str, replaces: &str, quote: &str) -> Fact {
+        let mut fact = use_role(object, Role::Linter, 0, quote);
+        fact.replaces = replaces.to_string();
+        fact
+    }
+
+    /// The model named `replaces`. The guard on that close is what must fire:
+    /// the new setting has an empty key, so the keyed supersede does not.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_named_setting_replacement_is_blocked_by_mention_when_the_switch_is_on() {
+        let text = "Prefer the alpha style today.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("note", "alpha beta gamma", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[named_setting("delta", "alpha beta", text)],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let slots = app_slots(&gm).await;
+            let old = slot_named(&slots, "note", "alpha beta gamma");
+            if match_on {
+                assert!(old["valid_until"].is_null(), "{old}");
+                assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+                assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+            } else {
+                assert_eq!(old["ended_by"], "s2:replaced", "{old}");
+                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+            }
+            assert!(slot_named(&slots, "", "delta")["valid_until"].is_null());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_named_setting_replacement_is_blocked_by_coexistence_when_the_switch_is_on() {
+        let text = "Test plain and vivid together.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(&gm, "s1", "2026-04-03", &[decided_slot("note", "plain", 0)])
+                .await
+                .unwrap();
+            let turns = [user_turn(text)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[named_setting("vivid", "plain", text)],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let slots = app_slots(&gm).await;
+            let old = slot_named(&slots, "note", "plain");
+            if match_on {
+                assert!(old["valid_until"].is_null(), "{old}");
+                assert_eq!(stats.match_skips.get("coexist").copied(), Some(1));
+                assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+            } else {
+                assert_eq!(old["ended_by"], "s2:replaced", "{old}");
+                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+            }
+            assert!(slot_named(&slots, "", "vivid")["valid_until"].is_null());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_named_link_replacement_is_blocked_by_mention_when_the_switch_is_on() {
+        let text = "Prefer the alpha style today.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[use_role(
+                    "alpha beta",
+                    Role::Linter,
+                    0,
+                    "Use alpha beta for linting.",
+                )],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[named_link("LibB", "alpha beta", text)],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let states = use_states(&gm).await;
+            let old = states
+                .iter()
+                .find(|state| state.0 == "alpha beta")
+                .unwrap_or_else(|| panic!("{states:?}"));
+            if match_on {
+                assert!(old.2, "{states:?}");
+                assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+                assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+            } else {
+                assert!(!old.2, "{states:?}");
+                assert_eq!(old.3.as_deref(), Some("s2:replaced"));
+                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+            }
+            assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_named_link_replacement_is_blocked_by_coexistence_when_the_switch_is_on() {
+        let text = "Run LibB with LibA.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[use_role("LibA", Role::Linter, 0, "Use LibA for linting.")],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[named_link("LibB", "LibA", text)],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let states = use_states(&gm).await;
+            let old = states
+                .iter()
+                .find(|state| state.0 == "LibA")
+                .unwrap_or_else(|| panic!("{states:?}"));
+            if match_on {
+                assert!(old.2, "{states:?}");
+                assert_eq!(stats.match_skips.get("coexist").copied(), Some(1));
+                assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+            } else {
+                assert!(!old.2, "{states:?}");
+                assert_eq!(old.3.as_deref(), Some("s2:replaced"));
+                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+            }
+            assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_named_replacement_still_retires_when_the_turn_supports_it() {
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            let setting_turn = "Switch the note from plain to vivid.";
+            write_session(&gm, "s1", "2026-04-03", &[decided_slot("note", "plain", 0)])
+                .await
+                .unwrap();
+            let turns = [user_turn(setting_turn)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[named_setting("vivid", "plain", setting_turn)],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stats.retirements.len(), 1, "on={match_on} {stats:?}");
+            assert_eq!(stats.retirements[0].reason, "replaced");
+            assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+            let slots = app_slots(&gm).await;
+            assert_eq!(
+                slot_named(&slots, "note", "plain")["ended_by"],
+                "s2:replaced"
+            );
+            assert!(slot_named(&slots, "", "vivid")["valid_until"].is_null());
+        }
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            let link_turn = "Use LibB instead of LibA for linting.";
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[use_role("LibA", Role::Linter, 0, "Use LibA for linting.")],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(link_turn)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[named_link("LibB", "LibA", link_turn)],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stats.retirements.len(), 1, "on={match_on} {stats:?}");
+            assert_eq!(stats.retirements[0].reason, "replaced");
+            assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+            let states = use_states(&gm).await;
+            let old = states
+                .iter()
+                .find(|state| state.0 == "LibA")
+                .unwrap_or_else(|| panic!("{states:?}"));
+            assert!(!old.2, "{states:?}");
+            assert_eq!(old.3.as_deref(), Some("s2:replaced"));
+            assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
+        }
+    }
 }
