@@ -303,6 +303,10 @@ pub(crate) async fn extract_session(
         report.resolve = stats.resolve;
         report.retirements = stats.retirements;
         report.retirements_skipped = stats.retirements_skipped;
+        report.retirement_skips = stats.retirement_skips;
+        if stats.drops_enumeration > 0 {
+            *report.drops.entry("enumeration".to_string()).or_insert(0) += stats.drops_enumeration;
+        }
         if let Some(usage) = stats.usage {
             record_sides(&mut report, usage);
         }

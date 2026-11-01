@@ -80,6 +80,8 @@ pub(crate) struct WriteStats {
     pub retirements: Vec<Retirement>,
     /// A retirement whose target was missing or whose slot was not an object.
     pub retirements_skipped: u32,
+    pub retirement_skips: BTreeMap<String, u32>,
+    pub drops_enumeration: u32,
     /// Milliseconds spent resolving mentions, measured around that call.
     pub resolve_ms: u64,
     /// Milliseconds spent committing edges, slots and retirements.
@@ -346,6 +348,9 @@ async fn apply_all(
         edges: HashMap::new(),
         scope: HashMap::new(),
         index: 0,
+        block: None,
+        held_slots: HashSet::new(),
+        held_edges: HashSet::new(),
     };
     for index in ordered_indexes(facts) {
         attempt.index = index;
@@ -423,6 +428,9 @@ struct Attempt<'a> {
     scope: HashMap<String, Vec<String>>,
     /// Index of the fact currently applied, into `ctx.targets`.
     index: usize,
+    block: Option<&'static str>,
+    held_slots: HashSet<(String, usize)>,
+    held_edges: HashSet<String>,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -495,14 +503,24 @@ impl<'a> Attempt<'a> {
         if fact.status == "rejected" {
             self.retire_rejected(&fact, &subject).await?;
         } else if fact.status == "decided" {
+            let turn = self.cited_turn(&fact).to_string();
+            self.block = super::enumeration::enumeration_skip(&fact, &turn);
+            self.held_slots.clear();
+            self.held_edges.clear();
             if replaces_supported(&fact, self.ctx.turns) {
                 self.retire_replaced(&fact, &subject).await?;
             }
+            let mut listed_conflict = false;
             if single_valued(fact.predicate) {
-                self.supersede_slot(&mut fact, &subject).await?;
+                listed_conflict = self.supersede_slot(&mut fact, &subject).await?;
             }
             if let Some(target) = self.edge_target().cloned() {
                 self.retire_matched(&fact, &subject, &target).await?;
+            }
+            self.block = None;
+            if listed_conflict && fact.predicate == Predicate::Setting {
+                self.stats.drops_enumeration += 1;
+                return Ok(());
             }
             self.promote(&fact, &subject).await?;
         }
@@ -703,29 +721,33 @@ impl<'a> Attempt<'a> {
         &mut self,
         fact: &mut Fact,
         subject: &Stored,
-    ) -> Result<(), GraphError> {
+    ) -> Result<bool, GraphError> {
         let Some((stored, mut slots)) = self.load_slots(&subject.id).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if fact.predicate == Predicate::Setting {
             fact.key = preferred_key(&fact.key, &slots);
         }
+        let conflict =
+            self.block.is_some() && slots.iter().any(|slot| supersede_target(slot, fact));
         if self.setting_missing(fact, &slots) {
             self.note_skip("stale");
-            return Ok(());
+            return Ok(conflict);
         }
         let Some(until) = self.ctx.valid_until.clone() else {
-            let session_id = self.ctx.session_id;
-            self.skip_matches(&slots, |slot| {
-                supersede_target(slot, fact)
-                    && (!opened_here(slot.get("evidence"), session_id)
-                        || same_session_status_close(slot, fact, session_id))
-            });
-            return Ok(());
+            if self.block.is_none() {
+                let session_id = self.ctx.session_id;
+                self.skip_matches(&slots, |slot| {
+                    supersede_target(slot, fact)
+                        && (!opened_here(slot.get("evidence"), session_id)
+                            || same_session_status_close(slot, fact, session_id))
+                });
+            }
+            return Ok(conflict);
         };
         let ended_by = format!("{}:{SUPERSEDED}", self.ctx.session_id);
         let mut changed = false;
-        for slot in &mut slots {
+        for (index, slot) in slots.iter_mut().enumerate() {
             if !slot.is_object() {
                 self.stats.retirements_skipped += 1;
                 continue;
@@ -734,6 +756,12 @@ impl<'a> Attempt<'a> {
                 || (opened_here(slot.get("evidence"), self.ctx.session_id)
                     && !same_session_status_close(slot, fact, self.ctx.session_id))
             {
+                continue;
+            }
+            if self.block.is_some() {
+                if self.held_slots.insert((stored.id.clone(), index)) {
+                    self.note_enumeration();
+                }
                 continue;
             }
             if !self.supersede_allowed(slot, fact) {
@@ -751,7 +779,7 @@ impl<'a> Attempt<'a> {
             self.store_slots(&stored.id, &stored.attributes, slots)
                 .await?;
         }
-        Ok(())
+        Ok(conflict)
     }
 
     async fn promote(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
@@ -908,6 +936,9 @@ impl<'a> Attempt<'a> {
             {
                 continue;
             }
+            if self.hold_enumerated_edge(&record_id(&edge.id)) {
+                continue;
+            }
             let old_value = self
                 .label(&record_id(&edge.to_id), &record_id(&edge.to_id))
                 .await?;
@@ -941,12 +972,18 @@ impl<'a> Attempt<'a> {
         let ended_by = format!("{}:{reason}", self.ctx.session_id);
         let mut changed = false;
         let mut notes = Vec::new();
-        for slot in &mut slots {
+        for (index, slot) in slots.iter_mut().enumerate() {
             if !slot.is_object() {
                 self.stats.retirements_skipped += 1;
                 continue;
             }
             if !matches(slot) || opened_here(slot.get("evidence"), self.ctx.session_id) {
+                continue;
+            }
+            if reason == REPLACED && self.block.is_some() {
+                if self.held_slots.insert((id.to_string(), index)) {
+                    self.note_enumeration();
+                }
                 continue;
             }
             if reason == REPLACED {
@@ -1329,6 +1366,25 @@ impl<'a> Attempt<'a> {
             .or_insert(0) += 1;
     }
 
+    fn note_enumeration(&mut self) {
+        self.stats.retirements_skipped += 1;
+        *self
+            .stats
+            .retirement_skips
+            .entry("enumeration".to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn hold_enumerated_edge(&mut self, id: &str) -> bool {
+        if self.block.is_none() {
+            return false;
+        }
+        if self.held_edges.insert(id.to_string()) {
+            self.note_enumeration();
+        }
+        true
+    }
+
     async fn retire_matched(
         &mut self,
         fact: &Fact,
@@ -1354,6 +1410,9 @@ impl<'a> Attempt<'a> {
             return Ok(());
         }
         if opened_here(edge.evidence.as_ref(), self.ctx.session_id) {
+            return Ok(());
+        }
+        if self.hold_enumerated_edge(&record_id(&edge.id)) {
             return Ok(());
         }
         if let Some(reason) = self.guard_reason(fact, &old_value) {
@@ -4870,25 +4929,31 @@ mod tests {
                 .unwrap();
                 let slots = app_slots(&gm).await;
                 let old = slot_named(&slots, "runtime_version", "3.4");
-                let expect_close = !match_on || retires;
-                if expect_close {
+                if retires {
                     assert_eq!(old["ended_by"], "s2:superseded", "{text} on={match_on}");
                     assert!(stats.match_skips.is_empty(), "{text} {stats:?}");
+                    assert!(stats.retirement_skips.is_empty(), "{text} {stats:?}");
                     let mut expected = before.clone();
                     expected["valid_until"] = old["valid_until"].clone();
                     expected["ended_by"] = old["ended_by"].clone();
                     assert_eq!(old, &expected, "{text}");
                     assert_eq!(old["valid_until"], "2026-04-11T00:00:00Z");
+                    assert!(slot_named(&slots, "runtime_version", "3.5")["valid_until"].is_null());
                 } else {
+                    // A listed member does not retire, on either switch, and it
+                    // is not stored beside the live value.
                     assert!(old["valid_until"].is_null(), "{text}: {old}");
-                    assert_eq!(stats.match_skips.get("coexist").copied(), Some(1), "{text}");
-                    assert!(
-                        stats.retirements.is_empty(),
-                        "{text} {:?}",
-                        stats.retirements
+                    assert_eq!(old, &before, "{text}");
+                    assert!(stats.retirements.is_empty(), "{text} {stats:?}");
+                    assert!(stats.match_skips.is_empty(), "{text} {stats:?}");
+                    assert_eq!(stats.drops_enumeration, 1, "{text} {stats:?}");
+                    assert_eq!(
+                        stats.retirement_skips.get("enumeration").copied(),
+                        Some(1),
+                        "{text} {stats:?}"
                     );
+                    assert!(slots.iter().all(|slot| slot["value"] != "3.5"), "{text}");
                 }
-                assert!(slot_named(&slots, "runtime_version", "3.5")["valid_until"].is_null());
             }
         }
     }
@@ -5221,7 +5286,7 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
-    async fn a_named_setting_replacement_is_blocked_by_coexistence_when_the_switch_is_on() {
+    async fn a_listed_pair_does_not_retire_on_either_switch() {
         let text = "Test plain and vivid together.";
         for match_on in [false, true] {
             let (_tmp, gm) = open_store().await;
@@ -5242,14 +5307,17 @@ mod tests {
             .unwrap();
             let slots = app_slots(&gm).await;
             let old = slot_named(&slots, "note", "plain");
-            if match_on {
-                assert!(old["valid_until"].is_null(), "{old}");
-                assert_eq!(stats.match_skips.get("coexist").copied(), Some(1));
-                assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
-            } else {
-                assert_eq!(old["ended_by"], "s2:replaced", "{old}");
-                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
-            }
+            // "Test plain and vivid" is a list, so neither switch retires.
+            // The new key is empty, so the listed value is still stored.
+            assert!(old["valid_until"].is_null(), "on={match_on} {old}");
+            assert!(stats.retirements.is_empty(), "{stats:?}");
+            assert!(stats.match_skips.is_empty(), "{stats:?}");
+            assert_eq!(stats.drops_enumeration, 0, "{stats:?}");
+            assert_eq!(
+                stats.retirement_skips.get("enumeration").copied(),
+                Some(1),
+                "{stats:?}"
+            );
             assert!(slot_named(&slots, "", "vivid")["valid_until"].is_null());
         }
     }
@@ -5596,16 +5664,307 @@ mod tests {
             .await
             .unwrap();
             assert!(stats.retirements.is_empty(), "{text} {stats:?}");
-            assert_eq!(
-                stats.match_skips.get("fill_no_evidence").copied(),
-                Some(1),
-                "{text}"
-            );
             let slots = app_slots(&gm).await;
+            if text.contains(" and ") {
+                assert!(stats.match_skips.is_empty(), "{text} {stats:?}");
+                assert_eq!(stats.drops_enumeration, 1, "{text} {stats:?}");
+                assert_eq!(
+                    stats.retirement_skips.get("enumeration").copied(),
+                    Some(1),
+                    "{text}"
+                );
+                assert!(
+                    slots.iter().all(|slot| slot["value"] != "clock.instant()"),
+                    "{text}"
+                );
+            } else {
+                assert_eq!(
+                    stats.match_skips.get("fill_no_evidence").copied(),
+                    Some(1),
+                    "{text}"
+                );
+                assert!(
+                    slot_named(&slots, "output_renders", "clock.instant()")["valid_until"]
+                        .is_null(),
+                    "{text}"
+                );
+            }
             assert!(
                 slot_named(&slots, "output_renders", "alpha, beta")["valid_until"].is_null(),
                 "{text}"
             );
         }
+    }
+
+    fn cited(key: &str, value: &str, quote: &str, replaces: &str) -> Fact {
+        let mut fact = decided_slot(key, value, 0);
+        fact.quote = quote.into();
+        fact.replaces = replaces.into();
+        fact
+    }
+
+    async fn listed_against(
+        match_on: bool,
+        prior_value: Option<&str>,
+        turn: &str,
+        value: &str,
+        replaces: &str,
+    ) -> (WriteStats, Vec<Value>) {
+        let (_tmp, gm) = open_store().await;
+        if let Some(prior) = prior_value {
+            let mut stored = decided_slot("runtime_version", prior, 0);
+            stored.quote = format!("runtime {prior}");
+            write_session(&gm, "s1", "2026-04-03", &[stored])
+                .await
+                .unwrap();
+        }
+        let turns = [user_turn(turn)];
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[cited("runtime_version", value, turn, replaces)],
+            match_on,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        (stats, app_slots(&gm).await)
+    }
+
+    fn assert_listed_drop(stats: &WriteStats, slots: &[Value], old: &str, new_value: &str) {
+        assert!(
+            slot_named(slots, "runtime_version", old)["valid_until"].is_null(),
+            "{slots:?}"
+        );
+        assert!(
+            slots.iter().all(|slot| slot["value"] != new_value),
+            "{slots:?}"
+        );
+        assert!(stats.retirements.is_empty(), "{stats:?}");
+        assert!(stats.match_skips.is_empty(), "{stats:?}");
+        assert_eq!(stats.drops_enumeration, 1, "{stats:?}");
+        assert_eq!(stats.retirement_skips.get("enumeration").copied(), Some(1));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_listed_setting_does_not_supersede_on_either_switch() {
+        let turn = "Test on runtime 4.2 and 4.3.";
+        for match_on in [false, true] {
+            let (stats, slots) = listed_against(match_on, Some("4.2"), turn, "4.3", "").await;
+            assert_listed_drop(&stats, &slots, "4.2", "4.3");
+            let absent = "CI runs runtime 4.3 and 4.4.";
+            let (stats, slots) = listed_against(match_on, Some("4.2"), absent, "4.3", "").await;
+            assert_listed_drop(&stats, &slots, "4.2", "4.3");
+            let matrix = "runtime: [4.1, 4.2, 4.3]";
+            let (stats, slots) = listed_against(match_on, Some("4.2"), matrix, "4.3", "").await;
+            assert_listed_drop(&stats, &slots, "4.2", "4.3");
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_listed_replaces_closes_nothing() {
+        let turn = "Test on runtime 4.2 and 4.3.";
+        for match_on in [false, true] {
+            let (stats, slots) = listed_against(match_on, Some("4.2"), turn, "4.3", "4.2").await;
+            assert_listed_drop(&stats, &slots, "4.2", "4.3");
+            assert!(stats
+                .retirements
+                .iter()
+                .all(|item| item.reason != "replaced"));
+        }
+        let turn = "Builds run on LibA, LibB and LibC.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("build_os", "LibA", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(turn)];
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &[cited("build_os", "LibB", turn, "LibA")],
+                match_on,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let slots = app_slots(&gm).await;
+            assert!(slot_named(&slots, "build_os", "LibA")["valid_until"].is_null());
+            assert!(slots.iter().all(|slot| slot["value"] != "LibB"));
+            assert!(stats.retirements.is_empty(), "{stats:?}");
+            assert_eq!(stats.retirement_skips.get("enumeration").copied(), Some(1));
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_listed_edge_is_written_and_closes_nothing() {
+        for (text, closes) in [
+            ("Lint with LibA, LibB and LibC.", false),
+            ("Use LibB instead of LibA.", true),
+        ] {
+            for match_on in [false, true] {
+                let (_tmp, gm) = open_store().await;
+                write_session(
+                    &gm,
+                    "s1",
+                    "2026-04-03",
+                    &[use_role("LibA", Role::Linter, 0, "Lint with LibA.")],
+                )
+                .await
+                .unwrap();
+                let mut fact = use_role("LibB", Role::Linter, 0, text);
+                fact.replaces = "LibA".into();
+                let turns = [user_turn(text)];
+                let stats = write_matched(
+                    &gm,
+                    "s2",
+                    "2026-04-11",
+                    &turns,
+                    &[fact],
+                    match_on,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+                let states = use_states(&gm).await;
+                let old = states
+                    .iter()
+                    .find(|state| state.0 == "LibA")
+                    .unwrap_or_else(|| panic!("{states:?}"));
+                assert!(
+                    states.iter().any(|state| state.0 == "LibB" && state.2),
+                    "{states:?}"
+                );
+                if closes {
+                    assert!(!old.2, "{text} on={match_on} {states:?}");
+                    assert_eq!(old.3.as_deref(), Some("s2:replaced"));
+                    assert!(stats.retirement_skips.is_empty(), "{stats:?}");
+                } else {
+                    assert!(old.2, "{text} on={match_on} {states:?}");
+                    assert!(stats.retirements.is_empty(), "{stats:?}");
+                    assert_eq!(stats.drops_enumeration, 0);
+                    assert_eq!(stats.retirement_skips.get("enumeration").copied(), Some(1));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_first_listed_setting_is_written() {
+        for match_on in [false, true] {
+            let turn = "Test on runtime 4.2 and 4.3.";
+            let (stats, slots) = listed_against(match_on, None, turn, "4.3", "").await;
+            assert_eq!(stats.slots, 1, "{stats:?}");
+            assert_eq!(stats.drops_enumeration, 0);
+            assert!(stats.retirement_skips.is_empty(), "{stats:?}");
+            assert!(slot_named(&slots, "runtime_version", "4.3")["valid_until"].is_null());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_list_does_not_close_a_row_opened_in_this_session() {
+        let (_tmp, gm) = open_store().await;
+        let mut opened = decided_slot("runtime_version", "4.2", 0);
+        opened.quote = "runtime 4.2".into();
+        let mut listed = decided_slot("runtime_version", "4.3", 1);
+        listed.quote = "Test on runtime 4.2 and 4.3.".into();
+        let turns = [
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "runtime 4.2".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: listed.quote.clone(),
+            },
+        ];
+        let stats = write_turns(&gm, "s1", "2026-04-03", &turns, &[opened, listed], None)
+            .await
+            .unwrap();
+        let slots = app_slots(&gm).await;
+        let live = slot_named(&slots, "runtime_version", "4.2");
+        assert!(live["valid_until"].is_null(), "{live}");
+        assert!(live["ended_by"].is_null(), "{live}");
+        assert!(slots.iter().all(|slot| slot["value"] != "4.3"));
+        assert!(stats.retirements.is_empty(), "{stats:?}");
+        let again = write_turns(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &turns,
+            &[cited("runtime_version", "4.2", "runtime 4.2", "")],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.already_seen, 1, "{again:?}");
+        assert_eq!(again.reinforced, 0);
+        let again_slots = app_slots(&gm).await;
+        let stored = slot_named(&again_slots, "runtime_version", "4.2");
+        assert_eq!(stored["evidence"].as_array().unwrap().len(), 1);
+        assert!((stored["alpha"].as_f64().unwrap() - live["alpha"].as_f64().unwrap()).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_dropped_list_member_does_not_promote_its_considered_row() {
+        let (_tmp, gm) = open_store().await;
+        let mut live = decided_slot("runtime_version", "4.2", 0);
+        live.quote = "runtime 4.2".into();
+        let mut considered = decided_slot("runtime_version", "4.3", 1);
+        considered.status = "considered".into();
+        considered.quote = "runtime 4.3 maybe".into();
+        write_session(&gm, "s1", "2026-04-03", &[live, considered])
+            .await
+            .unwrap();
+        let turn = "Test on runtime 4.2 and 4.3.";
+        let turns = [user_turn(turn)];
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[cited("runtime_version", "4.3", turn, "")],
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.drops_enumeration, 1, "{stats:?}");
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = app_slots(&gm).await;
+        assert!(slot_named(&slots, "runtime_version", "4.2")["valid_until"].is_null());
+        let held = slot_named(&slots, "runtime_version", "4.3");
+        assert_eq!(held["status"], "considered");
+        assert!(held["valid_until"].is_null(), "{held}");
+        assert!(held["ended_by"].is_null(), "{held}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_additive_cue_beside_a_change_still_retires() {
+        let (stats, slots) =
+            listed_against(false, Some("4.2"), "Also upgrade to 4.3.", "4.3", "").await;
+        assert_eq!(stats.drops_enumeration, 0, "{stats:?}");
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].old_value, "4.2");
+        assert!(!slot_named(&slots, "runtime_version", "4.2")["valid_until"].is_null());
+        assert!(slot_named(&slots, "runtime_version", "4.3")["valid_until"].is_null());
     }
 }

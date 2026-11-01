@@ -41,6 +41,20 @@ A setting whose value contains a number has to name its key in the quote or in t
 
 `replaces` stays only on a decided fact, and only when one of its content tokens occurs in the cited turn. Otherwise the field is cleared and the fact stays.
 
+## Lists are not replacements
+
+A decided fact whose value is one member of a list does not retire a live row. `issue_status` is never treated as a list member. When the sentence that contains the quote mentions the new value, only that sentence is judged. Otherwise any sentence of the cited turn that mentions the value can list it. A value mentioned nowhere is not a list, and today's retirement applies.
+
+The value is listed when one mention of it meets any of these:
+
+- **Bracket list.** The mention sits in the innermost `[...]`, `(...)` or `{...}`, and inside that pair, at depth 1, there is a comma, pipe, semicolon, or the word `and` or `or`, plus another alphanumeric run. `runtime: [4.1, 4.2, 4.3]` qualifies. `(was 4.2)` does not.
+- **Sibling across a list gap.** The gap may hold whitespace, `,` `|` `&` `+`, the words `and` `or` `nor` `plus`, or a `/` with whitespace or digits on both sides, and it must contain one of those. Pure whitespace is not a gap. `to`, `->`, `=>`, `from`, `with`, `instead` and `-` are never gaps. A numbered neighbour qualifies when its first run has a digit, or when that run repeats the label just before the value and the next run has a digit. A numberless chain qualifies at three items, or at two items plus a list cue (`matrix`, `versions`, `variants`, `targets`, `tested`, `test`, `tests`, `across`, `each`, `every`, `all`, `supported`, `supports`, `both`, `either`). A path such as `src/bin/main.rs` is not a list.
+- **Additive cue.** `also`, `too`, `as well`, `additionally` or `in addition` within three words of the mention, unless `to` or a departure word is one of the three words immediately before the value.
+
+The fact then retires nothing: not through `replaces`, not through a single-valued supersession, and not through a matched edge. Each row that would have closed counts as `retirement_skips.enumeration`. A setting that already has a different live value is not written; the drop reason is `enumeration`. An edge is still written. Promotion, rejection, a same-session issue-status close, and a row opened in this session are unchanged.
+
+`Test on runtime 4.2 and 4.3.` leaves `4.2` live and does not store `4.3`. `Bump the runtime from 4.2 to 4.3.` still retires `4.2`. `Keep 4.2 and also test 4.3.` does not. `Builds run on Alpha, Beta and Gamma.` does not retire a live `Beta`.
+
 ## Known-row match (opt-in)
 
 `known_match` is off by default, in config, on the bench command, and in the writer. Pass 1 is not shown stored rows and its request does not change. With the switch on, after pass 1, kept facts are matched to the scoped live rows. The cap used for the known-facts block does not apply. The matcher never changes a value, a quote, a turn, a status or a provenance, and it never creates a fact.

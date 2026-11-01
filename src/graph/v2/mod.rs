@@ -9,6 +9,7 @@
 //! v2 stamps `meta:pipeline` and refuses a store it did not build, and a
 //! v2 stamp refuses a v1 write the other way.
 
+mod enumeration;
 pub(crate) mod ground;
 pub(crate) mod input;
 pub(crate) mod known;

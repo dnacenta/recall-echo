@@ -39,7 +39,7 @@ pub(crate) struct Reconciled {
 /// the live value and never put a departure cue in the key's sentence.
 const FILL_NO_EVIDENCE: &str = "fill_no_evidence";
 
-const DEPARTURE: &[&str] = &[
+pub(crate) const DEPARTURE: &[&str] = &[
     "instead",
     "rather",
     "replace",
@@ -409,7 +409,7 @@ pub(crate) fn departure_near(old: &str, sentence: &str) -> bool {
     !spans.is_empty() && spans.iter().any(|&span| departure_beside(span, sentence))
 }
 
-fn value_spans(text: &str, value: &str) -> Vec<(usize, usize)> {
+pub(crate) fn value_spans(text: &str, value: &str) -> Vec<(usize, usize)> {
     let want = alphanumeric_runs(value);
     if want.is_empty() {
         return Vec::new();
@@ -432,7 +432,7 @@ fn value_spans(text: &str, value: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-fn run_spans(text: &str) -> Vec<(String, usize, usize)> {
+pub(crate) fn run_spans(text: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     let mut start = None;
     let mut current = String::new();
@@ -525,7 +525,7 @@ fn near_cue(spans: &[(usize, usize)], sentence: &str) -> bool {
 }
 
 /// Words, keeping an apostrophe so `don't` stays one token.
-fn cue_words(text: &str) -> Vec<(String, usize, usize)> {
+pub(crate) fn cue_words(text: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     let mut start = None;
     let mut current = String::new();
@@ -625,7 +625,7 @@ fn cue_negated(index: usize, tokens: &[(String, usize, usize)]) -> bool {
         .any(|(word, _, _)| is_negator(word))
 }
 
-fn is_negator(token: &str) -> bool {
+pub(crate) fn is_negator(token: &str) -> bool {
     let folded: String = token.chars().filter(|ch| *ch != '\'').collect();
     matches!(
         folded.as_str(),
