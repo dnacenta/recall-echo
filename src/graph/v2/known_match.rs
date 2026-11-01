@@ -35,6 +35,10 @@ pub(crate) struct Reconciled {
     pub report: MatchReport,
 }
 
+/// A filled or canonicalised key closed nothing: the cited turn never named
+/// the live value and never put a departure cue in the key's sentence.
+const FILL_NO_EVIDENCE: &str = "fill_no_evidence";
+
 const DEPARTURE: &[&str] = &[
     "instead",
     "rather",
@@ -337,6 +341,43 @@ pub(crate) fn retirement_skip(fact: &Fact, old_value: &str, turn: &str) -> Optio
         return Some("coexist");
     }
     None
+}
+
+/// Why a filled or canonicalised key must not retire `old_value`.
+///
+/// Binding the key is not evidence. A verb can carry every token of the key,
+/// so the close needs the live value somewhere in the cited turn, or a
+/// departure cue in the sentence that mentions the key. The key's own token
+/// is not that cue, and a negator within two tokens cancels one.
+#[must_use]
+pub(crate) fn fill_retirement_skip(key: &str, old_value: &str, turn: &str) -> Option<&'static str> {
+    if mention(old_value, turn) || key_departure(key, turn) {
+        return None;
+    }
+    Some(FILL_NO_EVIDENCE)
+}
+
+fn key_departure(key: &str, turn: &str) -> bool {
+    sentences(turn)
+        .any(|sentence| every_required_token(key, sentence) && sentence_departs(key, sentence))
+}
+
+fn sentence_departs(key: &str, sentence: &str) -> bool {
+    let own = required_words(key);
+    let tokens = cue_words(sentence);
+    tokens.iter().enumerate().any(|(index, (word, _, _))| {
+        // `0` keeps `, not <value>` from counting here. That form names the
+        // old value, which `mention` already accepts.
+        !own.iter().any(|token| token == word) && departure_token(index, &tokens, sentence, 0)
+    })
+}
+
+fn required_words(key: &str) -> Vec<String> {
+    let specific = specific_key_tokens(key);
+    tokens_required(key, &specific)
+        .iter()
+        .map(|token| normalise(token))
+        .collect()
 }
 
 /// `old`'s alphanumeric runs occur as one contiguous run of whole tokens in `text`.
@@ -951,6 +992,69 @@ mod tests {
             "Use LibB instead of LibA for linting."
         ));
         assert!(!departure_near("LibA", "Run LibB with LibA."));
+    }
+
+    #[test]
+    fn a_verb_only_key_hit_fills_and_is_not_retirement_evidence() {
+        let text = "The writer output renders it as a wall clock stamp.";
+        let got = one(
+            setting("", "clock.instant()", text),
+            vec![row("setting", "output_renders", "csv, html", "")],
+            text,
+        );
+        assert_eq!(got.facts[0].key, "output_renders");
+        assert_eq!(got.facts[0].object_name, "clock.instant()");
+        assert_eq!(got.report.key_filled, 1);
+        assert!(got.targets[0].is_some());
+        assert_eq!(
+            fill_retirement_skip("output_renders", "csv, html", text),
+            Some("fill_no_evidence")
+        );
+    }
+
+    #[test]
+    fn fill_evidence_is_the_old_value_or_a_cue_in_the_key_sentence() {
+        assert!(fill_retirement_skip(
+            "output_renders",
+            "csv, html",
+            "The stored list is csv, html. The writer output renders it as a wall clock stamp.",
+        )
+        .is_none());
+        assert!(fill_retirement_skip(
+            "output_renders",
+            "csv, html",
+            "After a long note about the plan we switch, and the writer output renders it as a wall clock stamp.",
+        )
+        .is_none());
+        assert_eq!(
+            fill_retirement_skip(
+                "output_renders",
+                "csv, html",
+                "We switch the theme. The writer output renders it as a wall clock stamp.",
+            ),
+            Some("fill_no_evidence")
+        );
+        assert_eq!(
+            fill_retirement_skip(
+                "output_renders",
+                "csv, html",
+                "Do not switch the output renders to a wall clock call.",
+            ),
+            Some("fill_no_evidence")
+        );
+    }
+
+    #[test]
+    fn a_key_token_that_is_also_a_departure_word_is_not_a_cue() {
+        let text = "The drop policy stays weekly.";
+        assert_eq!(
+            fill_retirement_skip("drop_policy", "daily", text),
+            Some("fill_no_evidence")
+        );
+        assert!(
+            fill_retirement_skip("drop_policy", "daily", "Switch the drop policy to weekly.",)
+                .is_none()
+        );
     }
 
     #[test]
