@@ -1276,17 +1276,28 @@ impl<'a> Attempt<'a> {
             || !slots.iter().any(|slot| slot_matches_target(slot, target))
     }
 
-    /// Keyed-match content filter and G1/G2. `false` means leave this slot live.
+    /// Keyed-match content filter, filled-key evidence, and G1/G2.
+    /// `false` means leave this slot live.
     fn supersede_allowed(&mut self, slot: &Value, fact: &Fact) -> bool {
         if !self.ctx.match_on || same_session_status_close(slot, fact, self.ctx.session_id) {
             return true;
         }
-        if let Some(target) = self.setting_target().cloned() {
-            if !slot_matches_target(slot, &target) {
+        let old = slot_str(slot, "value").unwrap_or("");
+        let bound = self
+            .setting_target()
+            .map(|target| (slot_matches_target(slot, target), target.key.clone()));
+        if let Some((is_target, key)) = bound {
+            if !is_target {
+                return false;
+            }
+            if let Some(reason) =
+                super::known_match::fill_retirement_skip(&key, old, self.cited_turn(fact))
+            {
+                self.note_skip(reason);
                 return false;
             }
         }
-        if let Some(reason) = self.guard_reason(fact, slot_str(slot, "value").unwrap_or("")) {
+        if let Some(reason) = self.guard_reason(fact, old) {
             self.note_skip(reason);
             return false;
         }
@@ -1297,14 +1308,16 @@ impl<'a> Attempt<'a> {
         if !self.ctx.match_on {
             return None;
         }
-        let turn = self
-            .ctx
+        super::known_match::retirement_skip(fact, old_value, self.cited_turn(fact))
+    }
+
+    fn cited_turn<'b>(&'b self, fact: &'b Fact) -> &'b str {
+        self.ctx
             .turns
             .iter()
             .find(|turn| turn.index == fact.turn)
             .map(|turn| turn.text.as_str())
-            .unwrap_or(fact.quote.as_str());
-        super::known_match::retirement_skip(fact, old_value, turn)
+            .unwrap_or(fact.quote.as_str())
     }
 
     fn note_skip(&mut self, reason: &str) {
@@ -5399,6 +5412,200 @@ mod tests {
             assert!(!old.2, "{states:?}");
             assert_eq!(old.3.as_deref(), Some("s2:replaced"));
             assert!(states.iter().any(|state| state.0 == "LibB" && state.2));
+        }
+    }
+
+    /// The key word is only a verb. The live value stays, and the new value
+    /// is stored beside it. With the switch off the new row stays unkeyed.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filled_verb_key_does_not_retire_the_live_row() {
+        let text = "The writer output renders it as a wall clock stamp.";
+        for match_on in [false, true] {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("output_renders", "alpha, beta", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let mut fact = decided_slot("", "clock.instant()", 0);
+            fact.quote = text.into();
+            let (facts, targets) = if match_on {
+                let rows = snapshot(&gm, text).await;
+                let reconciled = reconcile_one(&fact, &rows, &turns);
+                assert_eq!(reconciled.facts[0].key, "output_renders");
+                assert_eq!(reconciled.report.key_filled, 1);
+                assert!(reconciled.targets[0].is_some());
+                (reconciled.facts, reconciled.targets)
+            } else {
+                (vec![fact], Vec::new())
+            };
+            let stats = write_matched(&gm, "s2", "2026-04-11", &turns, &facts, match_on, targets)
+                .await
+                .unwrap();
+            assert!(stats.retirements.is_empty(), "on={match_on} {stats:?}");
+            let slots = app_slots(&gm).await;
+            assert!(
+                slot_named(&slots, "output_renders", "alpha, beta")["valid_until"].is_null(),
+                "on={match_on}"
+            );
+            if match_on {
+                assert_eq!(stats.match_skips.get("fill_no_evidence").copied(), Some(1));
+                assert!(
+                    slot_named(&slots, "output_renders", "clock.instant()")["valid_until"]
+                        .is_null()
+                );
+            } else {
+                assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+                assert!(slot_named(&slots, "", "clock.instant()")["valid_until"].is_null());
+            }
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filled_key_still_retires_when_the_turn_has_evidence() {
+        let cases = [
+            "Replace output renders alpha, beta with a wall clock call.",
+            "Switch the output renders to a wall clock call.",
+        ];
+        for text in cases {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("output_renders", "alpha, beta", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let mut fact = decided_slot("", "clock.instant()", 0);
+            fact.quote = text.into();
+            let rows = snapshot(&gm, text).await;
+            let reconciled = reconcile_one(&fact, &rows, &turns);
+            assert_eq!(reconciled.facts[0].key, "output_renders", "{text}");
+            assert_eq!(reconciled.report.key_filled, 1, "{text}");
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &reconciled.facts,
+                true,
+                reconciled.targets,
+            )
+            .await
+            .unwrap();
+            assert!(stats.match_skips.is_empty(), "{text} {stats:?}");
+            assert_eq!(stats.retirements.len(), 1, "{text} {stats:?}");
+            assert_eq!(stats.retirements[0].reason, "superseded");
+            let slots = app_slots(&gm).await;
+            assert_eq!(
+                slot_named(&slots, "output_renders", "alpha, beta")["ended_by"],
+                "s2:superseded",
+                "{text}"
+            );
+            assert!(
+                slot_named(&slots, "output_renders", "clock.instant()")["valid_until"].is_null()
+            );
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_canonicalised_key_does_not_retire_without_evidence() {
+        let text = "The test command is now just check.";
+        let (_tmp, gm) = open_store().await;
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[decided_slot("test_command", "make check", 0)],
+        )
+        .await
+        .unwrap();
+        let turns = [user_turn(text)];
+        let mut fact = decided_slot("testCommand", "just check", 0);
+        fact.quote = text.into();
+        let rows = snapshot(&gm, text).await;
+        let reconciled = reconcile_one(&fact, &rows, &turns);
+        assert_eq!(reconciled.facts[0].key, "test_command");
+        assert_eq!(reconciled.report.key_canonical, 1);
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &reconciled.facts,
+            true,
+            reconciled.targets,
+        )
+        .await
+        .unwrap();
+        assert!(stats.retirements.is_empty(), "{stats:?}");
+        assert_eq!(stats.match_skips.get("fill_no_evidence").copied(), Some(1));
+        let slots = app_slots(&gm).await;
+        assert!(slot_named(&slots, "test_command", "make check")["valid_until"].is_null());
+        assert!(slot_named(&slots, "test_command", "just check")["valid_until"].is_null());
+    }
+
+    /// A recap or a list names the live value and still leaves that row live.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filled_key_needs_a_cue_not_a_bare_old_value_mention() {
+        let cases = [
+            (
+                "The writer output renders alpha, beta today. The writer output renders it as a wall clock stamp.",
+                "The writer output renders it as a wall clock stamp.",
+            ),
+            (
+                "The writer output renders alpha, beta and clock.instant() both.",
+                "The writer output renders alpha, beta and clock.instant() both.",
+            ),
+        ];
+        for (text, quote) in cases {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("output_renders", "alpha, beta", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let mut fact = decided_slot("", "clock.instant()", 0);
+            fact.quote = quote.into();
+            let rows = snapshot(&gm, text).await;
+            let reconciled = reconcile_one(&fact, &rows, &turns);
+            assert_eq!(reconciled.facts[0].key, "output_renders", "{text}");
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &reconciled.facts,
+                true,
+                reconciled.targets,
+            )
+            .await
+            .unwrap();
+            assert!(stats.retirements.is_empty(), "{text} {stats:?}");
+            assert_eq!(
+                stats.match_skips.get("fill_no_evidence").copied(),
+                Some(1),
+                "{text}"
+            );
+            let slots = app_slots(&gm).await;
+            assert!(
+                slot_named(&slots, "output_renders", "alpha, beta")["valid_until"].is_null(),
+                "{text}"
+            );
         }
     }
 }
