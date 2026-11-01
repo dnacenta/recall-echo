@@ -80,9 +80,7 @@ pub(crate) struct WriteStats {
     pub retirements: Vec<Retirement>,
     /// A retirement whose target was missing or whose slot was not an object.
     pub retirements_skipped: u32,
-    /// Rows left live because the new value is a list member. Always recorded.
     pub retirement_skips: BTreeMap<String, u32>,
-    /// Decided settings dropped because a different live value already holds the key.
     pub drops_enumeration: u32,
     /// Milliseconds spent resolving mentions, measured around that call.
     pub resolve_ms: u64,
@@ -430,11 +428,8 @@ struct Attempt<'a> {
     scope: HashMap<String, Vec<String>>,
     /// Index of the fact currently applied, into `ctx.targets`.
     index: usize,
-    /// Set while a decided fact's value is a list member. Closes count a skip.
     block: Option<&'static str>,
-    /// Slots already counted for this fact, so a later path does not count them again.
     held_slots: HashSet<(String, usize)>,
-    /// Edges already counted for this fact.
     held_edges: HashSet<String>,
 }
 
@@ -523,11 +518,11 @@ impl<'a> Attempt<'a> {
                 self.retire_matched(&fact, &subject, &target).await?;
             }
             self.block = None;
-            self.promote(&fact, &subject).await?;
             if listed_conflict && fact.predicate == Predicate::Setting {
                 self.stats.drops_enumeration += 1;
                 return Ok(());
             }
+            self.promote(&fact, &subject).await?;
         }
         let Some(subject) = self.catalog.by_id.get(&subject.id).cloned() else {
             return Ok(());
@@ -722,7 +717,6 @@ impl<'a> Attempt<'a> {
         Ok(())
     }
 
-    /// `true` when a listed setting meets a different live value on its key.
     async fn supersede_slot(
         &mut self,
         fact: &mut Fact,
@@ -765,9 +759,7 @@ impl<'a> Attempt<'a> {
                 continue;
             }
             if self.block.is_some() {
-                if self.enumeration_considers(slot, fact)
-                    && self.held_slots.insert((stored.id.clone(), index))
-                {
+                if self.held_slots.insert((stored.id.clone(), index)) {
                     self.note_enumeration();
                 }
                 continue;
@@ -944,11 +936,7 @@ impl<'a> Attempt<'a> {
             {
                 continue;
             }
-            if self.block.is_some() {
-                let edge_id = record_id(&edge.id);
-                if self.held_edges.insert(edge_id) {
-                    self.note_enumeration();
-                }
+            if self.hold_enumerated_edge(&record_id(&edge.id)) {
                 continue;
             }
             let old_value = self
@@ -1387,17 +1375,14 @@ impl<'a> Attempt<'a> {
             .or_insert(0) += 1;
     }
 
-    /// A row the unguarded close would stamp, or a guard would skip.
-    ///
-    /// A slot that is not the filled target is left out: it would not close.
-    fn enumeration_considers(&self, slot: &Value, fact: &Fact) -> bool {
-        if !self.ctx.match_on || same_session_status_close(slot, fact, self.ctx.session_id) {
-            return true;
+    fn hold_enumerated_edge(&mut self, id: &str) -> bool {
+        if self.block.is_none() {
+            return false;
         }
-        match self.setting_target() {
-            Some(target) => slot_matches_target(slot, target),
-            None => true,
+        if self.held_edges.insert(id.to_string()) {
+            self.note_enumeration();
         }
+        true
     }
 
     async fn retire_matched(
@@ -1427,11 +1412,7 @@ impl<'a> Attempt<'a> {
         if opened_here(edge.evidence.as_ref(), self.ctx.session_id) {
             return Ok(());
         }
-        if self.block.is_some() {
-            let edge_id = record_id(&edge.id);
-            if self.held_edges.insert(edge_id) {
-                self.note_enumeration();
-            }
+        if self.hold_enumerated_edge(&record_id(&edge.id)) {
             return Ok(());
         }
         if let Some(reason) = self.guard_reason(fact, &old_value) {
@@ -5305,7 +5286,7 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
-    async fn a_named_setting_replacement_is_blocked_by_coexistence_when_the_switch_is_on() {
+    async fn a_listed_pair_does_not_retire_on_either_switch() {
         let text = "Test plain and vivid together.";
         for match_on in [false, true] {
             let (_tmp, gm) = open_store().await;
@@ -5938,5 +5919,52 @@ mod tests {
         let stored = slot_named(&again_slots, "runtime_version", "4.2");
         assert_eq!(stored["evidence"].as_array().unwrap().len(), 1);
         assert!((stored["alpha"].as_f64().unwrap() - live["alpha"].as_f64().unwrap()).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_dropped_list_member_does_not_promote_its_considered_row() {
+        let (_tmp, gm) = open_store().await;
+        let mut live = decided_slot("runtime_version", "4.2", 0);
+        live.quote = "runtime 4.2".into();
+        let mut considered = decided_slot("runtime_version", "4.3", 1);
+        considered.status = "considered".into();
+        considered.quote = "runtime 4.3 maybe".into();
+        write_session(&gm, "s1", "2026-04-03", &[live, considered])
+            .await
+            .unwrap();
+        let turn = "Test on runtime 4.2 and 4.3.";
+        let turns = [user_turn(turn)];
+        let stats = write_matched(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[cited("runtime_version", "4.3", turn, "")],
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.drops_enumeration, 1, "{stats:?}");
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = app_slots(&gm).await;
+        assert!(slot_named(&slots, "runtime_version", "4.2")["valid_until"].is_null());
+        let held = slot_named(&slots, "runtime_version", "4.3");
+        assert_eq!(held["status"], "considered");
+        assert!(held["valid_until"].is_null(), "{held}");
+        assert!(held["ended_by"].is_null(), "{held}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_additive_cue_beside_a_change_still_retires() {
+        let (stats, slots) =
+            listed_against(false, Some("4.2"), "Also upgrade to 4.3.", "4.3", "").await;
+        assert_eq!(stats.drops_enumeration, 0, "{stats:?}");
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].old_value, "4.2");
+        assert!(!slot_named(&slots, "runtime_version", "4.2")["valid_until"].is_null());
+        assert!(slot_named(&slots, "runtime_version", "4.3")["valid_until"].is_null());
     }
 }

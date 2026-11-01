@@ -58,7 +58,7 @@ fn bracketed(sentence: &str, span: (usize, usize)) -> bool {
             continue;
         }
         if let Some(from) = run.take() {
-            if to_outside(from, index, span) { other = true; }
+            if index <= span.0 || from >= span.1 { other = true; }
             let word = sentence[from..index].to_lowercase();
             if word == "and" || word == "or" { separator = true; }
         }
@@ -71,16 +71,11 @@ fn bracketed(sentence: &str, span: (usize, usize)) -> bool {
         index += len;
     }
     if let Some(from) = run.take() {
-        if to_outside(from, close, span) { other = true; }
+        if close <= span.0 || from >= span.1 { other = true; }
         let word = sentence[from..close].to_lowercase();
         if word == "and" || word == "or" { separator = true; }
     }
     separator && other
-}
-
-#[rustfmt::skip]
-fn to_outside(from: usize, to: usize, span: (usize, usize)) -> bool {
-    to <= span.0 || from >= span.1
 }
 
 #[rustfmt::skip]
@@ -108,24 +103,32 @@ fn innermost(sentence: &str, span: (usize, usize)) -> Option<(usize, usize)> {
 fn sibling(sentence: &str, value: &str, span: (usize, usize)) -> bool {
     let runs = run_spans(sentence);
     let items = split_items(&runs, sentence);
-    let Some(at) = items.iter().position(|item| overlaps(&runs, item, span)) else {
+    let Some(at) = items.iter().position(|item| {
+        item.iter().any(|&i| runs[i].1 < span.1 && runs[i].2 > span.0)
+    }) else {
         return false;
     };
     if numbers_in(value).is_empty() {
         return numberless(&runs, &items, at, span, sentence);
     }
+    // The gap must touch the span: only a repeated label may sit between them.
+    let own = &items[at];
+    let first = own.iter().position(|&i| runs[i].2 > span.0).unwrap_or(0);
+    let last = own.iter().rposition(|&i| runs[i].1 < span.1).unwrap_or(0);
+    let label = |item: &[usize]| {
+        first >= 1
+            && item.len() >= 2
+            && runs[item[0]].0 == runs[own[first - 1]].0
+            && digit(&runs[item[1]].0)
+    };
     [-1i8, 1].into_iter().any(|dir| {
         let Some(next) = step(at, dir, items.len()) else { return false };
         let item = &items[next];
-        let near = if dir < 0 { item[item.len() - 1] } else { item[0] };
-        digit(&runs[near].0) || (dir < 0 && item.len() >= 2 && repeated(&runs, item, span))
-    })
-}
-
-#[rustfmt::skip]
-fn repeated(runs: &[Run], item: &[usize], span: (usize, usize)) -> bool {
-    runs.iter().rposition(|run| run.2 <= span.0).is_some_and(|before| {
-        runs[item[0]].0 == runs[before].0 && digit(&runs[item[1]].0)
+        if dir < 0 {
+            (first == 0 && digit(&runs[item[item.len() - 1]].0)) || (first == 1 && label(item))
+        } else {
+            last + 1 == own.len() && (digit(&runs[item[0]].0) || label(item))
+        }
     })
 }
 
@@ -186,15 +189,21 @@ fn gap_at(runs: &[Run], sentence: &str, index: usize) -> Option<usize> {
     if !gap_word(&runs[index].0) { return marks(text).then_some(index); }
     let mut cursor = index;
     while cursor < runs.len() && gap_word(&runs[cursor].0) {
-        if cursor > index && !join_ok(sentence, runs, cursor - 1, cursor) { return None; }
+        if cursor > index && !between_ok(&sentence[runs[cursor - 1].2..runs[cursor].1], endch(&runs[cursor - 1].0), startch(&runs[cursor].0)) { return None; }
         cursor += 1;
     }
-    if cursor < runs.len() && !join_ok(sentence, runs, cursor - 1, cursor) { return None; }
+    if cursor < runs.len() && !between_ok(&sentence[runs[cursor - 1].2..runs[cursor].1], endch(&runs[cursor - 1].0), startch(&runs[cursor].0)) { return None; }
     Some(cursor)
 }
 
 #[rustfmt::skip]
 fn additive(sentence: &str, span: (usize, usize)) -> bool {
+    // A departure, or `to`, already names a change. The cue is not a list.
+    if cue_words(sentence).iter().any(|(word, _, end)| {
+        *end <= span.0 && (word == "to" || DEPARTURE.contains(&word.as_str()))
+    }) {
+        return false;
+    }
     let words = cue_words(sentence);
     let before: Vec<&str> = words.iter().filter(|(_, _, end)| *end <= span.0).map(|(w, _, _)| w.as_str()).collect();
     let after: Vec<&str> = words.iter().filter(|(_, start, _)| *start >= span.1).map(|(w, _, _)| w.as_str()).take(3).collect();
@@ -206,11 +215,6 @@ fn additive(sentence: &str, span: (usize, usize)) -> bool {
 fn window(tokens: &[&str]) -> bool {
     tokens.iter().any(|token| matches!(*token, "also" | "too" | "additionally"))
         || tokens.windows(2).any(|pair| pair == ["as", "well"] || pair == ["in", "addition"])
-}
-
-#[rustfmt::skip]
-fn overlaps(runs: &[Run], item: &[usize], span: (usize, usize)) -> bool {
-    item.iter().any(|&index| runs[index].1 < span.1 && runs[index].2 > span.0)
 }
 
 #[rustfmt::skip]
@@ -226,11 +230,6 @@ fn step(pos: usize, dir: i8, len: usize) -> Option<usize> {
         1 if pos + 1 < len => Some(pos + 1),
         _ => None,
     }
-}
-
-#[rustfmt::skip]
-fn join_ok(sentence: &str, runs: &[Run], left: usize, right: usize) -> bool {
-    between_ok(&sentence[runs[left].2..runs[right].1], endch(&runs[left].0), startch(&runs[right].0))
 }
 
 #[rustfmt::skip]
@@ -321,13 +320,27 @@ mod tests {
         assert!(!enumerated("8100", "Port 8000 -> 8100."));
         assert!(!enumerated("4.3", "Bump to 4.3, and drop 4.2."));
         assert!(!enumerated("4.3", "Also, we now bump the runtime to 4.3."));
+        assert!(!enumerated("4.3", "Runtime is 4.2, bump it to 4.3."));
+        assert!(!enumerated("4.3", "Switched from 4.1, 4.2 to 4.3."));
+        assert!(!enumerated("30", "Set retries to 3, timeout to 30."));
+        assert!(enumerated("4.3", "CI runs runtime 4.3 and runtime 4.4."));
+        assert!(!enumerated("4.3", "We were on 4.2, now upgrading to 4.3."));
+        assert!(!enumerated("4.3", "Runtime was 4.2, now 4.3."));
+        assert!(!enumerated("8100", "Port was 8000, use 8100 now."));
+        assert!(!enumerated("4.3", "Date 10/11, bump to 4.3."));
     }
 
     #[test]
     fn additive_cues_are_local_to_the_value() {
         assert!(enumerated("4.3", "Keep 4.2 and also test 4.3."));
         assert!(enumerated("4.3", "Keep 4.2, also test 4.3."));
+        assert!(enumerated("4.3", "Test on runtime 4.2, also 4.3."));
+        assert!(enumerated("4.3", "Also test on 4.3 as well as 4.2."));
         assert!(!enumerated("4.3", "Also, we now bump the runtime to 4.3."));
+        assert!(!enumerated("4.3", "Also upgrade to 4.3."));
+        assert!(!enumerated("4.3", "We also moved to 4.3."));
+        assert!(!enumerated("4.3", "Upgrade to 4.3 too."));
+        assert!(!enumerated("LibB", "We also switched to LibB."));
     }
 
     #[test]
