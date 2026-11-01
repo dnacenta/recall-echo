@@ -30,6 +30,8 @@ pub(crate) struct KnownRow {
     pub value: String,
     pub role: String,
     pub id: String,
+    /// `decided` or `considered`. The matcher retires decided settings only.
+    pub status: String,
 }
 
 const HEADER: &str =
@@ -58,6 +60,19 @@ const KNOWN_UNREAD: &str = "recall-echo: known facts could not be read; pass 1 w
 #[cfg(test)]
 thread_local! {
     static KNOWN_NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Store reads performed by [`live_rows`] on this thread.
+#[cfg(test)]
+pub(crate) fn lookup_count() -> u32 {
+    LOOKUPS.with(std::cell::Cell::get)
+}
+
+/// Zero the [`lookup_count`] for the next assertion.
+#[cfg(test)]
+pub(crate) fn reset_lookups() {
+    LOOKUPS.with(|count| count.set(0));
 }
 
 /// Live rows for this project, highest rank first, already capped.
@@ -74,11 +89,24 @@ pub(crate) async fn known_rows(
     project: &ProjectIdentity,
     session_text: &str,
 ) -> Result<Vec<KnownRow>, GraphError> {
-    match load_known_rows(gm, project, session_text).await {
-        Ok(rows) => Ok(rows),
+    Ok(rank_known(
+        read_live(gm, project, session_text).await,
+        session_text,
+    ))
+}
+
+/// Scoped live rows, unranked and uncapped. A failed read is an empty list
+/// and [`KNOWN_UNREAD`], same as [`known_rows`].
+pub(crate) async fn read_live(
+    gm: &GraphMemory,
+    project: &ProjectIdentity,
+    session_text: &str,
+) -> Vec<KnownRow> {
+    match live_rows(gm, project, session_text).await {
+        Ok(rows) => rows,
         Err(err) => {
             warn_known_unread(&err);
-            Ok(Vec::new())
+            Vec::new()
         }
     }
 }
@@ -91,7 +119,7 @@ fn warn_known_unread(err: &GraphError) {
     KNOWN_NOTES.with(|notes| notes.borrow_mut().push(KNOWN_UNREAD.to_string()));
 }
 
-async fn load_known_rows(
+pub(crate) async fn live_rows(
     gm: &GraphMemory,
     project: &ProjectIdentity,
     session_text: &str,
@@ -99,6 +127,8 @@ async fn load_known_rows(
     if project_labels(project).is_empty() {
         return Ok(Vec::new());
     }
+    #[cfg(test)]
+    LOOKUPS.with(|count| count.set(count.get().saturating_add(1)));
     let entities = load_entities(gm).await?;
     let Some(project_entity) = find_project(&entities, project) else {
         return Ok(Vec::new());
@@ -122,7 +152,7 @@ async fn load_known_rows(
             rows.extend(rows_of(entity, outgoing, &index));
         }
     }
-    Ok(rank_known(rows, session_text))
+    Ok(rows)
 }
 
 /// The block placed after the session date, or empty when `rows` is empty.
@@ -671,6 +701,11 @@ fn slot_row(entity: &Entity, index: usize, slot: &Value) -> Option<KnownRow> {
         value: slot.get("value").and_then(Value::as_str)?.to_string(),
         role: String::new(),
         id: format!("{}#{index}", entity.id_string()),
+        status: slot
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -687,6 +722,7 @@ fn edge_row(
         value: object.name.clone(),
         role: role_label(&edge.description),
         id: record_id(&edge.id),
+        status: edge.status.as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -749,6 +785,7 @@ mod tests {
             value: value.into(),
             role: String::new(),
             id: id.into(),
+            status: "decided".into(),
         }
     }
 
@@ -1404,6 +1441,28 @@ mod tests {
             assert!(alpha < host && host < port && port < zulu, "{once}");
         }
 
+        #[tokio::test]
+        async fn live_rows_keep_a_row_the_prompt_cap_drops() {
+            let (_tmp, gm) = open().await;
+            let slots: Vec<Value> = (0..45)
+                .map(|index| {
+                    slot(
+                        "setting",
+                        &format!("key_{index:02}"),
+                        "stored",
+                        "decided",
+                        false,
+                    )
+                })
+                .collect();
+            make(&gm, "acme", Kind::Project, slots).await;
+            let session = "none of these keys are named";
+            let live = live_rows(&gm, &project("acme"), session).await.unwrap();
+            let ranked = rank_known(live.clone(), session);
+            assert_eq!(live.len(), 45, "{live:?}");
+            assert!(ranked.len() < live.len(), "{}", ranked.len());
+        }
+
         struct Capture {
             seen: Mutex<Vec<(String, Vec<Message>)>>,
             reply: String,
@@ -1581,10 +1640,9 @@ mod tests {
                 .unwrap()
                 .check()
                 .unwrap();
-            let err =
-                super::super::load_known_rows(&gm, &project("tidepool"), "Ship the shelf today.")
-                    .await
-                    .expect_err("a row whose type does not deserialise");
+            let err = super::super::live_rows(&gm, &project("tidepool"), "Ship the shelf today.")
+                .await
+                .expect_err("a row whose type does not deserialise");
             assert!(err.to_string().contains(SECRET), "{err}");
             super::super::KNOWN_NOTES.with(|notes| notes.borrow_mut().clear());
             let rows = known_rows(&gm, &project("tidepool"), "Ship the shelf today.")

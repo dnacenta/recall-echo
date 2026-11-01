@@ -41,6 +41,18 @@ A setting whose value contains a number has to name its key in the quote or in t
 
 `replaces` stays only on a decided fact, and only when one of its content tokens occurs in the cited turn. Otherwise the field is cleared and the fact stays.
 
+## Known-row match (opt-in)
+
+`known_match` is off by default, in config, on the bench command, and in the writer. Pass 1 is not shown stored rows and its request does not change. With the switch on, after pass 1, kept facts are matched to the scoped live rows. The cap used for the known-facts block does not apply. The matcher never changes a value, a quote, a turn, a status or a provenance, and it never creates a fact.
+
+A decided setting with an empty key takes the key of the one stored decided setting of the same normalised subject whose required key tokens all occur as whole tokens in the cited sentence, and whose value contains a number only when the new value does. Zero matches do nothing. Two or more are skipped as ambiguous. A shape mismatch is skipped and counted.
+
+A decided setting whose key is not already the same family as a live key is rewritten onto the one stored key that has the same token list after splitting separators and camel case and dropping generic affixes. The lists must be equal. A shorter list is not a match. Two equal lists are skipped as ambiguous.
+
+A decided `uses` with an empty `replaces` and a role other than `other`, `none` or `library` can name one stored live `uses` of the same subject and role. The old value has to be mentioned in the cited turn, and a departure cue has to sit within three words of that mention. The new object must not already be a live `uses` of that subject and role. The close is that edge id only. A second row with the same value stays.
+
+While the switch is on, every superseded or replaced close a decided fact would make also has to pass two guards. The cited turn has to contain a specific key token as a whole token, or mention the old value. When both values sit in one sentence and the text between them is only a list connector, or a keep cue sits within three words of the old value, the old row stays. Rejected closes, promoted closes, and a same-session issue-status close are unchanged. An ambiguous match, a missing target, or a row that changed after the snapshot skips that retirement and still writes the new fact. A row opened in the current session is not closed. A retirement stamps only `valid_until` and `ended_by`.
+
 ## Gate 5 — confidence and generic objects
 
 A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.

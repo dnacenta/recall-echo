@@ -609,7 +609,7 @@ fn version_stem_ok(key: &str, texts: &[&str]) -> bool {
     !stem_tokens.is_empty() && stem_tokens.iter().all(|token| token_occurs(token, texts))
 }
 
-fn specific_key_tokens(key: &str) -> Vec<&str> {
+pub(crate) fn specific_key_tokens(key: &str) -> Vec<&str> {
     key.split('_')
         .filter(|token| !token.is_empty() && !is_generic_key(token))
         .collect()
@@ -776,7 +776,7 @@ fn agreement_tokens(key: &str, sentence: &str) -> bool {
         .all(|token| token_occurs(token, &[sentence]))
 }
 
-fn tokens_required<'a>(key: &str, specific: &'a [&'a str]) -> &'a [&'a str] {
+pub(crate) fn tokens_required<'a>(key: &str, specific: &'a [&'a str]) -> &'a [&'a str] {
     if version_stem(key).is_none() {
         return specific;
     }
@@ -937,7 +937,7 @@ fn end_of_number(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
-fn sentence_containing<'a>(text: &'a str, quote: &str) -> &'a str {
+pub(crate) fn sentence_containing<'a>(text: &'a str, quote: &str) -> &'a str {
     let Some(start) = text.find(quote) else {
         return text;
     };
@@ -967,7 +967,7 @@ fn is_boundary(bytes: &[u8], index: usize) -> bool {
     }
 }
 
-fn sentences(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn sentences(text: &str) -> impl Iterator<Item = &str> {
     let mut start = 0usize;
     let mut index = 0usize;
     std::iter::from_fn(move || {

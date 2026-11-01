@@ -247,6 +247,9 @@ enum BenchCommands {
         /// Show stored facts to pass 1. Experimental, and off unless set.
         #[arg(long)]
         known_facts_context: bool,
+        /// Match kept facts to stored rows after pass 1. Off unless set.
+        #[arg(long)]
+        known_match: bool,
     },
 }
 
@@ -1064,6 +1067,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             repeat,
             pipeline,
             known_facts_context,
+            known_match,
         } => run_writes(
             script,
             work_dir,
@@ -1076,11 +1080,17 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::KnownFactsContext::Off
             },
+            if known_match {
+                recall_echo::bench::writes::KnownMatch::On
+            } else {
+                recall_echo::bench::writes::KnownMatch::Off
+            },
         ),
     }
 }
 
 #[cfg(feature = "bench")]
+#[allow(clippy::too_many_arguments)]
 fn run_writes(
     script: PathBuf,
     work_dir: Option<PathBuf>,
@@ -1089,6 +1099,7 @@ fn run_writes(
     repeat: usize,
     pipeline: Option<recall_echo::graph::PipelineVersion>,
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
+    known_match: recall_echo::bench::writes::KnownMatch,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1120,6 +1131,7 @@ fn run_writes(
             model.as_deref(),
             pipeline,
             known_facts_context,
+            known_match,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1131,6 +1143,7 @@ fn run_writes(
             model.as_deref(),
             pipeline,
             known_facts_context,
+            known_match,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1146,6 +1159,7 @@ async fn grade_once(
     model: Option<&str>,
     pipeline: recall_echo::graph::PipelineVersion,
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
+    known_match: recall_echo::bench::writes::KnownMatch,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1160,6 +1174,7 @@ async fn grade_once(
                 Extractor::Live(llm.as_ref()),
                 pipeline,
                 known_facts_context,
+                known_match,
             )
             .await
         }
@@ -1170,6 +1185,7 @@ async fn grade_once(
                 Extractor::Scripted,
                 pipeline,
                 known_facts_context,
+                known_match,
             )
             .await
         }
@@ -1177,6 +1193,7 @@ async fn grade_once(
 }
 
 #[cfg(feature = "bench")]
+#[allow(clippy::too_many_arguments)]
 async fn grade_repeat(
     script: &recall_echo::bench::writes::FactScript,
     root: &std::path::Path,
@@ -1185,6 +1202,7 @@ async fn grade_repeat(
     model: Option<&str>,
     pipeline: recall_echo::graph::PipelineVersion,
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
+    known_match: recall_echo::bench::writes::KnownMatch,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1200,6 +1218,7 @@ async fn grade_repeat(
                 Extractor::Live(llm.as_ref()),
                 pipeline,
                 known_facts_context,
+                known_match,
             )
             .await
         }
@@ -1211,6 +1230,7 @@ async fn grade_repeat(
                 Extractor::Scripted,
                 pipeline,
                 known_facts_context,
+                known_match,
             )
             .await
         }

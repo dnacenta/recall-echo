@@ -19,7 +19,7 @@ use super::super::error::GraphError;
 use super::super::ingest::IngestContext;
 use super::super::llm::{LlmProvider, Message, TokenUsage};
 use super::super::llm_json::{self, JsonFailure};
-use super::super::types::{IngestionReport, StageTiming};
+use super::super::types::{IngestionReport, MatchReport, StageTiming};
 use super::super::GraphMemory;
 use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
@@ -216,18 +216,28 @@ pub(crate) async fn extract_session(
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
     let ground = SessionGround::prepare(&session.turns);
     let known_on = known_facts_context_enabled(memory_dir);
+    let match_on = known_match_enabled(memory_dir);
     let system = if known_on {
         PASS1_SYSTEM
     } else {
         PASS1_SYSTEM_BARE
     };
-    let (known_rows, known_block) = if known_on {
-        let session_text = super::known::turn_text(&session.turns);
+    // The block is the only pre-pass lookup. Matching, when the block is off,
+    // waits until the kept facts are known so a session with nothing to match
+    // does not read the store.
+    let session_text = super::known::turn_text(&session.turns);
+    // One load when either switch is on. The block ranks that load. Matching
+    // reuses the unranked rows, so a second read is not needed.
+    let (stored, known_block) = if known_on && match_on {
+        let rows = super::known::read_live(gm, &session.project, &session_text).await;
+        let block =
+            super::known::render_known(&super::known::rank_known(rows.clone(), &session_text));
+        (Some(rows), block)
+    } else if known_on {
         let rows = super::known::known_rows(gm, &session.project, &session_text).await?;
-        let block = super::known::render_known(&rows);
-        (rows, block)
+        (None, super::known::render_known(&rows))
     } else {
-        (Vec::new(), String::new())
+        (None, String::new())
     };
     let mut facts = Vec::new();
     for window in &windows {
@@ -245,6 +255,27 @@ pub(crate) async fn extract_session(
     let facts = dedupe_facts(facts);
     let pass1_ms = elapsed_ms(pass1_started);
 
+    let match_started = std::time::Instant::now();
+    let (facts, targets, mut match_report, match_ms) = if match_on {
+        let rows = if let Some(rows) = stored {
+            rows
+        } else if facts.iter().any(wants_match) {
+            super::known::read_live(gm, &session.project, &session_text).await
+        } else {
+            Vec::new()
+        };
+        let reconciled = super::known_match::reconcile(&facts, &rows, &ground);
+        (
+            reconciled.facts,
+            reconciled.targets,
+            reconciled.report,
+            Some(elapsed_ms(match_started)),
+        )
+    } else {
+        let _ = stored;
+        (facts, Vec::new(), MatchReport::default(), None)
+    };
+
     let mut resolve_ms = 0;
     let mut write_ms = 0;
     if !facts.is_empty() {
@@ -255,8 +286,14 @@ pub(crate) async fn extract_session(
             &session.date,
             &session.turns,
         );
-        write_ctx.known = known_rows;
+        write_ctx.match_on = match_on;
+        write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
+        if match_on {
+            for (reason, count) in stats.match_skips {
+                *match_report.skipped.entry(reason).or_insert(0) += count;
+            }
+        }
         resolve_ms = stats.resolve_ms;
         write_ms = stats.write_ms;
         report.entities_created = stats.entities_created;
@@ -273,11 +310,13 @@ pub(crate) async fn extract_session(
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }
     }
+    report.known_match = match_report;
     report.timing = Some(StageTiming {
         pass1_ms,
         resolve_ms,
         write_ms,
         total_ms: elapsed_ms(total_started),
+        match_ms,
     });
     Ok(report)
 }
@@ -291,6 +330,27 @@ fn known_facts_context_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .known_facts_context
+}
+
+fn known_match_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .known_match
+}
+
+/// A decided setting, or a decided `uses` whose role can retire a stored edge.
+fn wants_match(fact: &Fact) -> bool {
+    if fact.status != "decided" {
+        return false;
+    }
+    match fact.predicate {
+        Predicate::Setting => true,
+        Predicate::Uses => fact
+            .role
+            .is_some_and(|role| !matches!(role, Role::Other | Role::None | Role::Library)),
+        _ => false,
+    }
 }
 
 async fn call_window(
@@ -3699,5 +3759,115 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(blank(span), blank(quoted));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_match_does_not_change_the_request_or_read_before_the_provider() {
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        const PRE_BLOCK_USER: &str = "Project: tidepool\nSession date: 2026-01-02\nTranscript:\n[T0] USER: Ship the shelf today.\n\nExtract the durable facts, bugs and releases as JSON.";
+        let reply = r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"","object":"shelf","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Ship the shelf today.","confidence":0.9}],"bugs":[],"releases":[]}"#;
+
+        struct Seen {
+            during: Mutex<u32>,
+            reply: &'static str,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Seen {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Err(GraphError::Llm("plain complete was called".into()))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                messages: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                assert_eq!(
+                    super::super::known::lookup_count(),
+                    0,
+                    "the store was read before the provider returned"
+                );
+                assert_eq!(system, PASS1_SYSTEM_BARE);
+                assert_eq!(messages[2], Message::user(PRE_BLOCK_USER));
+                assert!(!messages[2].content.contains("Known facts"));
+                *self.during.lock().expect("lock") = super::super::known::lookup_count();
+                Ok(Completion::unmeasured(self.reply))
+            }
+        }
+
+        fn plant(memory: &std::path::Path) {
+            let cwd = memory.join("tidepool");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                memory,
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    "Ship the shelf today.".into(),
+                )],
+            )
+            .unwrap();
+        }
+
+        let matched = tempfile::tempdir().unwrap();
+        plant(matched.path());
+        std::fs::write(
+            matched.path().join(".recall-echo.toml"),
+            "[graph]\nknown_match = true\n",
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&matched.path().join("graph"))
+            .await
+            .unwrap();
+        super::super::known::reset_lookups();
+        let provider = Seen {
+            during: Mutex::new(1),
+            reply,
+        };
+        let report = extract_session(
+            &gm,
+            matched.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*provider.during.lock().expect("lock"), 0);
+        assert_eq!(super::super::known::lookup_count(), 1);
+        assert_eq!(report.kept, 1, "{:?}", report.drops);
+        assert!(report.timing.unwrap().match_ms.is_some());
+
+        let off = tempfile::tempdir().unwrap();
+        plant(off.path());
+        let gm = GraphMemory::open_embedded(&off.path().join("graph"))
+            .await
+            .unwrap();
+        super::super::known::reset_lookups();
+        let provider = Seen {
+            during: Mutex::new(1),
+            reply,
+        };
+        let report = extract_session(
+            &gm,
+            off.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(super::super::known::lookup_count(), 0);
+        assert!(report.timing.unwrap().match_ms.is_none());
+        assert!(report.known_match.is_blank());
     }
 }
