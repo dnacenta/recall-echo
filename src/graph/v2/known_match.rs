@@ -346,12 +346,13 @@ pub(crate) fn retirement_skip(fact: &Fact, old_value: &str, turn: &str) -> Optio
 /// Why a filled or canonicalised key must not retire `old_value`.
 ///
 /// Binding the key is not evidence. A verb can carry every token of the key,
-/// so the close needs the live value somewhere in the cited turn, or a
-/// departure cue in the sentence that mentions the key. The key's own token
-/// is not that cue, and a negator within two tokens cancels one.
+/// so the close needs the live value beside a departure cue in the cited turn,
+/// or a departure cue in the sentence that mentions the key. A bare mention of
+/// the live value is not enough (it may be a recap or a list). The key's own
+/// token is not a cue, and a negator within two tokens cancels one.
 #[must_use]
 pub(crate) fn fill_retirement_skip(key: &str, old_value: &str, turn: &str) -> Option<&'static str> {
-    if mention(old_value, turn) || key_departure(key, turn) {
+    if mentioned_with_cue(old_value, turn) || key_departure(key, turn) {
         return None;
     }
     Some(FILL_NO_EVIDENCE)
@@ -999,7 +1000,7 @@ mod tests {
         let text = "The writer output renders it as a wall clock stamp.";
         let got = one(
             setting("", "clock.instant()", text),
-            vec![row("setting", "output_renders", "csv, html", "")],
+            vec![row("setting", "output_renders", "alpha, beta", "")],
             text,
         );
         assert_eq!(got.facts[0].key, "output_renders");
@@ -1007,29 +1008,37 @@ mod tests {
         assert_eq!(got.report.key_filled, 1);
         assert!(got.targets[0].is_some());
         assert_eq!(
-            fill_retirement_skip("output_renders", "csv, html", text),
+            fill_retirement_skip("output_renders", "alpha, beta", text),
             Some("fill_no_evidence")
         );
     }
 
     #[test]
     fn fill_evidence_is_the_old_value_or_a_cue_in_the_key_sentence() {
+        assert_eq!(
+            fill_retirement_skip(
+                "output_renders",
+                "alpha, beta",
+                "The stored list is alpha, beta. The writer output renders it as a wall clock stamp.",
+            ),
+            Some("fill_no_evidence")
+        );
         assert!(fill_retirement_skip(
             "output_renders",
-            "csv, html",
-            "The stored list is csv, html. The writer output renders it as a wall clock stamp.",
+            "alpha, beta",
+            "We drop alpha, beta. The writer output renders it as a wall clock stamp.",
         )
         .is_none());
         assert!(fill_retirement_skip(
             "output_renders",
-            "csv, html",
+            "alpha, beta",
             "After a long note about the plan we switch, and the writer output renders it as a wall clock stamp.",
         )
         .is_none());
         assert_eq!(
             fill_retirement_skip(
                 "output_renders",
-                "csv, html",
+                "alpha, beta",
                 "We switch the theme. The writer output renders it as a wall clock stamp.",
             ),
             Some("fill_no_evidence")
@@ -1037,7 +1046,7 @@ mod tests {
         assert_eq!(
             fill_retirement_skip(
                 "output_renders",
-                "csv, html",
+                "alpha, beta",
                 "Do not switch the output renders to a wall clock call.",
             ),
             Some("fill_no_evidence")

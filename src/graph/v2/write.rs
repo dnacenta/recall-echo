@@ -5427,7 +5427,7 @@ mod tests {
                 &gm,
                 "s1",
                 "2026-04-03",
-                &[decided_slot("output_renders", "csv, html", 0)],
+                &[decided_slot("output_renders", "alpha, beta", 0)],
             )
             .await
             .unwrap();
@@ -5450,7 +5450,7 @@ mod tests {
             assert!(stats.retirements.is_empty(), "on={match_on} {stats:?}");
             let slots = app_slots(&gm).await;
             assert!(
-                slot_named(&slots, "output_renders", "csv, html")["valid_until"].is_null(),
+                slot_named(&slots, "output_renders", "alpha, beta")["valid_until"].is_null(),
                 "on={match_on}"
             );
             if match_on {
@@ -5470,7 +5470,7 @@ mod tests {
     #[tokio::test]
     async fn a_filled_key_still_retires_when_the_turn_has_evidence() {
         let cases = [
-            "Replace output renders csv, html with a wall clock call.",
+            "Replace output renders alpha, beta with a wall clock call.",
             "Switch the output renders to a wall clock call.",
         ];
         for text in cases {
@@ -5479,7 +5479,7 @@ mod tests {
                 &gm,
                 "s1",
                 "2026-04-03",
-                &[decided_slot("output_renders", "csv, html", 0)],
+                &[decided_slot("output_renders", "alpha, beta", 0)],
             )
             .await
             .unwrap();
@@ -5506,7 +5506,7 @@ mod tests {
             assert_eq!(stats.retirements[0].reason, "superseded");
             let slots = app_slots(&gm).await;
             assert_eq!(
-                slot_named(&slots, "output_renders", "csv, html")["ended_by"],
+                slot_named(&slots, "output_renders", "alpha, beta")["ended_by"],
                 "s2:superseded",
                 "{text}"
             );
@@ -5552,5 +5552,60 @@ mod tests {
         let slots = app_slots(&gm).await;
         assert!(slot_named(&slots, "test_command", "make check")["valid_until"].is_null());
         assert!(slot_named(&slots, "test_command", "just check")["valid_until"].is_null());
+    }
+
+    /// A recap or a list names the live value and still leaves that row live.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filled_key_needs_a_cue_not_a_bare_old_value_mention() {
+        let cases = [
+            (
+                "The writer output renders alpha, beta today. The writer output renders it as a wall clock stamp.",
+                "The writer output renders it as a wall clock stamp.",
+            ),
+            (
+                "The writer output renders alpha, beta and clock.instant() both.",
+                "The writer output renders alpha, beta and clock.instant() both.",
+            ),
+        ];
+        for (text, quote) in cases {
+            let (_tmp, gm) = open_store().await;
+            write_session(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[decided_slot("output_renders", "alpha, beta", 0)],
+            )
+            .await
+            .unwrap();
+            let turns = [user_turn(text)];
+            let mut fact = decided_slot("", "clock.instant()", 0);
+            fact.quote = quote.into();
+            let rows = snapshot(&gm, text).await;
+            let reconciled = reconcile_one(&fact, &rows, &turns);
+            assert_eq!(reconciled.facts[0].key, "output_renders", "{text}");
+            let stats = write_matched(
+                &gm,
+                "s2",
+                "2026-04-11",
+                &turns,
+                &reconciled.facts,
+                true,
+                reconciled.targets,
+            )
+            .await
+            .unwrap();
+            assert!(stats.retirements.is_empty(), "{text} {stats:?}");
+            assert_eq!(
+                stats.match_skips.get("fill_no_evidence").copied(),
+                Some(1),
+                "{text}"
+            );
+            let slots = app_slots(&gm).await;
+            assert!(
+                slot_named(&slots, "output_renders", "alpha, beta")["valid_until"].is_null(),
+                "{text}"
+            );
+        }
     }
 }
