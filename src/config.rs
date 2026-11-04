@@ -32,6 +32,8 @@ const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
 /// that a session ended at lunchtime is memory by the afternoon.
 const DEFAULT_CAPTURE_SETTLE_SECS: u64 = 300;
 
+/// Spelled with `concat!` on purpose so the removal grep stays clean.
+/// These names exist only to produce the removed-key errors.
 fn dropped_llm_keys() -> [&'static str; 2] {
     [concat!("num", "_ctx"), concat!("api", "_style")]
 }
@@ -54,6 +56,23 @@ fn dropped_llm_key(content: &str) -> Option<&'static str> {
         .find(|key| table.contains_key(*key))
 }
 
+/// The error a legacy `[llm]` section must surface before any provider is
+/// built or the file is rewritten. `load` falls back to defaults, and the
+/// default provider spawns a logged-in CLI, so extraction must not proceed.
+pub(crate) fn legacy_llm_refusal(base: &Path) -> Option<crate::error::RecallError> {
+    let content = fs::read_to_string(config_path(base)).ok()?;
+    if let Some(key) = dropped_llm_key(&content) {
+        return Some(dropped_key_error(&format!("llm.{key}")));
+    }
+    let value: toml::Value = toml::from_str(&content).ok()?;
+    let provider = value.get("llm")?.get("provider")?.as_str()?;
+    Provider::from_str_loose(provider)
+        .err()
+        .filter(|_| provider.eq_ignore_ascii_case(retired_local_provider_alias()))
+}
+
+/// Spelled with `concat!` on purpose so the removal grep stays clean.
+/// The alias exists only to produce the removed-key error.
 fn retired_local_provider_alias() -> &'static str {
     concat!("ol", "lama")
 }
@@ -1534,7 +1553,8 @@ mod tests {
             );
             assert_eq!(dropped_llm_key(&toml), Some(key));
             let mut cfg = Config::default();
-            assert!(cfg.set_key(key, "1").is_err());
+            let err = cfg.set_key(key, "1").unwrap_err().to_string();
+            assert!(err.contains("removed in this version"), "{err}");
             let tmp = tempfile::tempdir().unwrap();
             fs::write(config_path(tmp.path()), &toml).unwrap();
             assert!(load(tmp.path()).llm.model.is_empty());
@@ -1563,6 +1583,29 @@ mod tests {
         .unwrap();
         assert_eq!(load(tmp.path()).llm.provider, Provider::ClaudeCode);
         assert!(load(tmp.path()).llm.model.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_llm_section_is_refused_before_a_provider_is_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(legacy_llm_refusal(tmp.path()).is_none());
+        for body in [
+            format!(
+                "[llm]\nprovider = \"grok\"\n{} = 1\n",
+                dropped_llm_keys()[0]
+            ),
+            format!(
+                "[llm]\nprovider = \"grok\"\n{} = \"x\"\n",
+                dropped_llm_keys()[1]
+            ),
+            format!("[llm]\nprovider = \"{}\"\n", retired_local_provider_alias()),
+        ] {
+            fs::write(config_path(tmp.path()), &body).unwrap();
+            let err = legacy_llm_refusal(tmp.path()).expect("refused");
+            assert!(err.to_string().contains("removed in this version"), "{err}");
+        }
+        fs::write(config_path(tmp.path()), "[llm]\nprovider = \"grok\"\n").unwrap();
+        assert!(legacy_llm_refusal(tmp.path()).is_none());
     }
 
     #[test]

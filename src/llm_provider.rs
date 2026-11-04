@@ -57,6 +57,9 @@ pub fn create_provider_with_binary(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<ProviderHandle, crate::error::RecallError> {
+    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
+        return Err(err);
+    }
     let mut cfg = config::load(memory_dir).llm;
 
     if let Some(p) = provider_override {
@@ -81,6 +84,9 @@ pub fn create_provider_with_overrides(
     memory_dir: &Path,
     overrides: &CliOverrides,
 ) -> Result<ProviderHandle, crate::error::RecallError> {
+    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
+        return Err(err);
+    }
     let mut cfg = config::load(memory_dir).llm;
     if let Some(command) = &overrides.command {
         let command = command.to_str().ok_or_else(|| {
@@ -216,6 +222,11 @@ impl HttpConfig {
         if llm.provider == Provider::Openai && api_base.is_empty() {
             return Err(crate::error::RecallError::Config(
                 "llm.api_base is required for the openai provider".into(),
+            ));
+        }
+        if llm.provider == Provider::Openai && model.is_empty() {
+            return Err(crate::error::RecallError::Config(
+                "llm.model is required for the openai provider".into(),
             ));
         }
         let api_key = api_key_for(&llm.provider)?;
@@ -1096,8 +1107,40 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
+    /// Restores the keys this test clears. Dropped while the env lock is held.
+    struct KeyRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for KeyRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn openai_section(api_base: &str, model: &str) -> config::LlmSection {
+        config::LlmSection {
+            provider: Provider::Openai,
+            api_base: api_base.into(),
+            model: model.into(),
+            ..config::LlmSection::default()
+        }
+    }
+
+    #[test]
+    fn openai_without_a_model_is_refused() {
+        let err = HttpConfig::from_config_section(&openai_section("https://example.test/v1", ""))
+            .unwrap_err();
+        assert!(err.to_string().contains("llm.model"), "{err}");
+        assert!(Provider::Openai.default_model().is_empty());
+    }
+
     #[test]
     fn openai_requires_an_endpoint_and_an_api_key() {
+        let _lock = crate::test_env::lock();
         let saved: Vec<_> = ["OPENAI_API_KEY", "RECALL_LLM_API_KEY"]
             .into_iter()
             .map(|key| (key, std::env::var_os(key)))
@@ -1105,32 +1148,25 @@ mod tests {
         for (key, _) in &saved {
             std::env::remove_var(key);
         }
-        let section = |api_base: &str| config::LlmSection {
-            provider: Provider::Openai,
-            api_base: api_base.into(),
-            ..config::LlmSection::default()
-        };
-        let missing_base = HttpConfig::from_config_section(&section("")).unwrap_err();
+        let _restore = KeyRestore(saved);
+        let missing_base = HttpConfig::from_config_section(&openai_section("", "m")).unwrap_err();
         assert!(
             missing_base.to_string().contains("api_base"),
             "{missing_base}"
         );
         assert!(Provider::Openai.default_api_base().is_empty());
-        assert!(Provider::Openai.default_model().is_empty());
         let missing_key =
-            HttpConfig::from_config_section(&section("https://example.test/v1")).unwrap_err();
+            HttpConfig::from_config_section(&openai_section("https://example.test/v1", "m"))
+                .unwrap_err();
         assert!(
             missing_key.to_string().contains("OPENAI_API_KEY"),
             "{missing_key}"
         );
         std::env::set_var("OPENAI_API_KEY", "sk-test");
-        let built = HttpConfig::from_config_section(&section("https://example.test/v1")).unwrap();
+        let built =
+            HttpConfig::from_config_section(&openai_section("https://example.test/v1", "m"))
+                .unwrap();
         assert_eq!(built.api_key, "sk-test");
-        for (key, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
+        assert_eq!(built.model, "m");
     }
 }

@@ -178,6 +178,10 @@ fn show_cli_section(llm: &config::LlmSection) {
 
 /// Set a config key and save.
 pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError> {
+    // `load` would hand back defaults, and the save below would erase the file.
+    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
+        return Err(err);
+    }
     let mut cfg = config::load(memory_dir);
     cfg.set_key(key, value)?;
     config::save(memory_dir, &cfg)?;

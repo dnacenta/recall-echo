@@ -1235,6 +1235,7 @@ mod tests {
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let absent = dir.path().join("x");
+        let _lock = crate::test_env::lock();
         let _env = cli_env(
             bin.to_str().unwrap(),
             binary.to_str().unwrap(),
@@ -1257,6 +1258,7 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         let absent = dir.path().join("x");
         let absent = absent.to_str().unwrap();
+        let _lock = crate::test_env::lock();
         let _env = cli_env(bin.to_str().unwrap(), absent, absent);
         assert!(agent_cli::installed().is_empty());
         let memory = dir.path().join("memory");
