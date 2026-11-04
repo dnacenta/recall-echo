@@ -929,18 +929,30 @@ impl ScratchDir {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "recall-echo-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|err| {
-                GraphError::Llm(format!("could not create a working directory: {err}"))
-            })?;
-        Ok(Self(path))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let mut last = None;
+        // A leftover from a killed run with a reused pid must not fail every call.
+        for _ in 0..8 {
+            let path = std::env::temp_dir().join(format!(
+                "recall-echo-{}-{nanos}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+                Err(err) => last = Some(err),
+            }
+            if !matches!(&last, Some(e) if e.kind() == std::io::ErrorKind::AlreadyExists) {
+                break;
+            }
+        }
+        Err(GraphError::Llm(format!(
+            "could not create a working directory: {}",
+            last.map_or_else(|| "unknown".to_string(), |e| e.to_string())
+        )))
     }
 }
 
