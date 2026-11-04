@@ -135,15 +135,18 @@ pub(crate) async fn run(
     let (selected, overflow) = select(&anchors, &loaded, ctx);
     report.consolidate.pairs = count(selected.len());
     report.consolidate.overflow = overflow;
+    // Rows closed so far this pass. A kept copy must still be live.
+    let mut gone: BTreeSet<usize> = BTreeSet::new();
     let mut waiting = Vec::new();
     for pair in &selected {
         match classify(pair, &anchors, &loaded.rows, &selected, ctx) {
             Step::Dup => {
                 report.consolidate.prefilter.dup += 1;
-                close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, report).await;
+                close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, &mut gone, report).await;
             }
             Step::Sup => {
                 report.consolidate.prefilter.sup += 1;
+                let before = report.consolidate.closes_sup;
                 close_partner(
                     gm,
                     ctx,
@@ -154,6 +157,9 @@ pub(crate) async fn run(
                     report,
                 )
                 .await;
+                if report.consolidate.closes_sup > before {
+                    gone.insert(pair.partner);
+                }
             }
             Step::Drop => report.consolidate.prefilter.drop += 1,
             Step::Judge => waiting.push(pair.clone()),
@@ -255,6 +261,7 @@ pub(crate) async fn run(
             continue;
         }
         if verdict == "supersedes" {
+            let before = report.consolidate.closes_sup;
             close_partner(
                 gm,
                 ctx,
@@ -265,8 +272,11 @@ pub(crate) async fn run(
                 report,
             )
             .await;
+            if report.consolidate.closes_sup > before {
+                gone.insert(pair.partner);
+            }
         } else if verdict == "duplicate" {
-            close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, report).await;
+            close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, &mut gone, report).await;
         }
     }
 }
@@ -604,11 +614,11 @@ fn quote_span(quote: &str) -> bool {
     folded.chars().count() >= 12 && alphanumeric_runs(&folded).len() >= 2
 }
 
-/// Another loaded live row still carries `value`.
-fn kept_copy(rows: &[Row], closing: usize, value: &str) -> bool {
-    rows.iter()
-        .enumerate()
-        .any(|(index, row)| index != closing && values_equal(&row.value, value))
+/// Another loaded row still carries `value` and has not been closed in this pass.
+fn kept_copy(rows: &[Row], gone: &BTreeSet<usize>, closing: usize, value: &str) -> bool {
+    rows.iter().enumerate().any(|(index, row)| {
+        index != closing && !gone.contains(&index) && values_equal(&row.value, value)
+    })
 }
 
 fn wanted_names(anchors: &[Anchor], ctx: &WriteCtx<'_>) -> Vec<String> {
@@ -685,14 +695,22 @@ async fn close_duplicate(
     anchors: &[Anchor],
     rows: &[Row],
     pair: &Pair,
+    gone: &mut BTreeSet<usize>,
     report: &mut IngestionReport,
 ) {
     let partner = &rows[pair.partner];
+    if gone.contains(&pair.partner) {
+        return;
+    }
     let Some(live) = anchors[pair.anchor].live else {
         // No kept copy of this value. A duplicate close would drop the only
         // live row. That needs the supersede path, which checks quote and cue.
-        if kept_copy(rows, pair.partner, &partner.value) && !partner.here {
+        if kept_copy(rows, gone, pair.partner, &partner.value) && !partner.here {
+            let before = report.consolidate.closes_dup;
             close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+            if report.consolidate.closes_dup > before {
+                gone.insert(pair.partner);
+            }
         } else {
             *report
                 .consolidate
@@ -703,7 +721,7 @@ async fn close_duplicate(
         return;
     };
     let mine = &rows[live];
-    if !values_equal(&mine.value, &partner.value) {
+    if gone.contains(&live) || !values_equal(&mine.value, &partner.value) {
         *report
             .consolidate
             .skips
@@ -714,7 +732,11 @@ async fn close_duplicate(
     let close_partner_row =
         partner.from > mine.from || (partner.from == mine.from && !partner.here);
     if close_partner_row {
+        let before = report.consolidate.closes_dup;
         close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+        if report.consolidate.closes_dup > before {
+            gone.insert(pair.partner);
+        }
         return;
     }
     if mine.here {
@@ -726,6 +748,7 @@ async fn close_duplicate(
     let ended = format!("{}:duplicate", ctx.session_id);
     if matches!(close_row(gm, mine, &until, &ended).await, Ok(true)) {
         report.consolidate.closes_dup += 1;
+        gone.insert(live);
         report.retirements.push(Retirement {
             reason: "duplicate".into(),
             subject: mine.subject.clone(),
@@ -812,7 +835,7 @@ async fn load_rows(
         let mut response = gm
             .db()
             .query(
-                "SELECT in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE) LIMIT 16",
+                "SELECT id, in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE) ORDER BY id LIMIT 16",
             )
             .bind(("id", id.clone()))
             .await?;
@@ -840,7 +863,7 @@ async fn load_rows(
         let mut response = gm
             .db()
             .query(
-                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence FROM type::record($id)->(relates_to WHERE valid_until = NONE) LIMIT 32",
+                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
             )
             .bind(("id", entity.id_string()))
             .await?;
@@ -954,7 +977,7 @@ async fn load_named(gm: &GraphMemory, names: &[String]) -> Result<Vec<Entity>, G
     }
     let mut response = gm
         .db()
-        .query("SELECT * OMIT embedding FROM entity WHERE name INSIDE $names LIMIT 48")
+        .query("SELECT * OMIT embedding FROM entity WHERE name INSIDE $names ORDER BY id LIMIT 48")
         .bind(("names", names))
         .await?;
     deserialize_take(&mut response, 0)
@@ -1248,6 +1271,7 @@ fn count(len: usize) -> u32 {
 
 #[cfg(all(test, feature = "embedded"))]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
@@ -2193,5 +2217,116 @@ mod tests {
         let report = pass(&gm, "s3", "2026-03-04", &turns, &[again], &stats, &stub).await;
         assert_eq!(stub.calls(), 1, "{}", stub.message.lock().unwrap());
         assert_eq!(report.consolidate.closes_sup, 0);
+    }
+
+    /// Two live copies, each judged a duplicate in one pass: one stays live.
+    #[tokio::test]
+    async fn two_duplicate_copies_keep_one_live() {
+        let (_tmp, gm) = open().await;
+        let layout = setting(
+            "acme",
+            Kind::Project,
+            "layout",
+            "plain grid",
+            "layout is plain grid",
+        );
+        let grid = setting(
+            "acme",
+            Kind::Project,
+            "grid",
+            "plain grid",
+            "grid is plain grid",
+        );
+        let text = setting(
+            "acme",
+            Kind::Project,
+            "format",
+            "plain text",
+            "format is plain text",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn(
+                "layout is plain grid. grid is plain grid. format is plain text",
+            )],
+            &[layout, grid, text],
+        )
+        .await;
+        let spoken = "Leave the plain grid layout in place.";
+        let mut rejected = setting("acme", Kind::Project, "format", "plain text", spoken);
+        rejected.status = "rejected".into();
+        let turns = [turn(spoken)];
+        let stats = commit(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            std::slice::from_ref(&rejected),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "duplicate", "plain grid layout"),
+            (2, "duplicate", "plain grid layout"),
+        ])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[rejected], &stats, &stub).await;
+        assert_eq!(report.consolidate.pairs, 2);
+        assert!(report.consolidate.closes_dup <= 1);
+        let live = slots(&gm, "acme")
+            .await
+            .iter()
+            .filter(|slot| slot["value"] == "plain grid" && ended(slot).is_none())
+            .count();
+        assert_eq!(live, 1);
+    }
+
+    /// The part_of cap keeps the lowest edge ids, not an arbitrary 16.
+    #[tokio::test]
+    async fn neighbourhood_cap_keeps_the_lowest_edge_ids() {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![setting("acme", Kind::Project, "note", "acme note", "note")];
+        for index in 0..17 {
+            let name = format!("piece{index:02}");
+            facts.push(edge(
+                Predicate::PartOf,
+                &name,
+                Kind::Component,
+                "acme",
+                Kind::Project,
+            ));
+        }
+        commit(&gm, "s1", "2026-03-01", &[turn("pieces")], &facts).await;
+        let loaded = super::load_rows(&gm, "s9", &["acme".into()]).await.unwrap();
+        let project = loaded
+            .owners
+            .iter()
+            .find(|(_, name)| name == "acme")
+            .expect("acme")
+            .0
+            .clone();
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE) ORDER BY id",
+            )
+            .bind(("id", project))
+            .await
+            .unwrap();
+        let edges: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        assert!(edges.len() >= 17, "{}", edges.len());
+        let first: BTreeSet<String> = edges
+            .iter()
+            .take(16)
+            .map(|edge| super::id_text(edge.get("in")))
+            .collect();
+        let loaded_ids: BTreeSet<String> = loaded
+            .owners
+            .iter()
+            .filter(|(_, name)| name != "acme")
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(loaded_ids.len(), 16);
+        assert_eq!(loaded_ids, first);
     }
 }
