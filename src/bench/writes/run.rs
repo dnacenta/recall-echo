@@ -2744,6 +2744,8 @@ mod tests {
                     .get("consolidate_ms")
                     .is_none()
         }));
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(encoded.get("consolidate_drops").is_none());
         let gm = GraphMemory::open(&tmp.path().join("memory/graph"))
             .await
             .unwrap();

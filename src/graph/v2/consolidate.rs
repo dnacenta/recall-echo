@@ -32,6 +32,13 @@ const ROW_CAP: usize = 256;
 const CAP: usize = 6;
 const PER_ANCHOR: usize = 2;
 const MAX_TOKENS: u32 = 400;
+const DROP_QUOTE_SHORT: &str = "quote too short";
+const DROP_QUOTE_MISSING: &str = "quote not verbatim in the evidence";
+const DROP_NO_CUE: &str = "no departure cue";
+const DROP_SECOND: &str = "second supersede on the same anchor";
+const DROP_NO_COPY: &str = "no kept live copy (duplicate)";
+const DROP_OPENED_HERE: &str = "row opened this session";
+const DROP_GONE: &str = "anchor or pair no longer present";
 const SYSTEM: &str = "\
 You compare stored project facts. For each numbered pair, OLD is a stored fact and NEW is the newer evidence. Answer one verdict:
 - supersedes: the evidence shows OLD no longer holds because NEW replaced it.
@@ -143,12 +150,23 @@ pub(crate) async fn run(
         match classify(pair, &anchors, &loaded.rows, &selected, ctx) {
             Step::Dup => {
                 report.consolidate.prefilter.dup += 1;
-                close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, &mut gone, report).await;
+                if let Some(reason) =
+                    close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, &mut gone, report).await
+                {
+                    note_drop(
+                        report,
+                        reason,
+                        &anchors,
+                        &loaded.rows,
+                        pair,
+                        &anchors[pair.anchor].quote,
+                    );
+                }
             }
             Step::Sup => {
                 report.consolidate.prefilter.sup += 1;
                 let before = report.consolidate.closes_sup;
-                close_partner(
+                let reason = close_partner(
                     gm,
                     ctx,
                     &anchors,
@@ -160,6 +178,15 @@ pub(crate) async fn run(
                 .await;
                 if report.consolidate.closes_sup > before {
                     gone.insert(pair.partner);
+                } else if let Some(reason) = reason {
+                    note_drop(
+                        report,
+                        reason,
+                        &anchors,
+                        &loaded.rows,
+                        pair,
+                        &anchors[pair.anchor].quote,
+                    );
                 }
             }
             Step::Drop => report.consolidate.prefilter.drop += 1,
@@ -226,7 +253,7 @@ pub(crate) async fn run(
         let anchor = &anchors[pair.anchor];
         let partner = &loaded.rows[pair.partner];
         let turn = cited(ctx, anchor);
-        let verdict = accept(
+        match accept(
             &verdict,
             &quote,
             &pair.evidence,
@@ -234,12 +261,14 @@ pub(crate) async fn run(
             &anchor.new_value,
             turn,
             &anchor.replaces,
-        );
-        accepted.push((pair, verdict));
+        ) {
+            Ok(verdict) => accepted.push((pair, verdict.to_string(), quote)),
+            Err(reason) => note_drop(report, reason, &anchors, &loaded.rows, &pair, &quote),
+        }
     }
     let mut blocked = BTreeSet::new();
     let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (index, (pair, verdict)) in accepted.iter().enumerate() {
+    for (index, (pair, verdict, _)) in accepted.iter().enumerate() {
         if verdict == "supersedes" {
             grouped.entry(pair.anchor).or_default().push(index);
         }
@@ -254,16 +283,18 @@ pub(crate) async fn run(
                     .skips
                     .entry("consolidate_ambiguous".into())
                     .or_insert(0) += 1;
+                let (pair, _, quote) = &accepted[*index];
+                note_drop(report, DROP_SECOND, &anchors, &loaded.rows, pair, quote);
             }
         }
     }
-    for (index, (pair, verdict)) in accepted.iter().enumerate() {
+    for (index, (pair, verdict, quote)) in accepted.iter().enumerate() {
         if blocked.contains(&index) {
             continue;
         }
         if verdict == "supersedes" {
             let before = report.consolidate.closes_sup;
-            close_partner(
+            let reason = close_partner(
                 gm,
                 ctx,
                 &anchors,
@@ -275,9 +306,15 @@ pub(crate) async fn run(
             .await;
             if report.consolidate.closes_sup > before {
                 gone.insert(pair.partner);
+            } else if let Some(reason) = reason {
+                note_drop(report, reason, &anchors, &loaded.rows, pair, quote);
             }
         } else if verdict == "duplicate" {
-            close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, &mut gone, report).await;
+            if let Some(reason) =
+                close_duplicate(gm, ctx, &anchors, &loaded.rows, pair, &mut gone, report).await
+            {
+                note_drop(report, reason, &anchors, &loaded.rows, pair, quote);
+            }
         }
     }
 }
@@ -589,24 +626,76 @@ fn accept(
     new_value: &str,
     turn: &str,
     replaces: &str,
-) -> String {
+) -> Result<&'static str, &'static str> {
     let duplicate = verdict == "duplicate";
     if verdict != "supersedes" && !duplicate {
-        return if verdict == "unrelated" {
-            "unrelated".into()
+        return Ok(if verdict == "unrelated" {
+            "unrelated"
         } else {
-            "unsure".into()
-        };
+            "unsure"
+        });
+    }
+    if !quote_span(quote) {
+        return Err(DROP_QUOTE_SHORT);
     }
     let in_evidence = contains_folded(evidence, quote);
     let in_value = duplicate && (contains_folded(old, quote) || contains_folded(new_value, quote));
-    if !quote_span(quote)
-        || !(in_evidence || in_value)
-        || (verdict == "supersedes" && !departs(turn, old, replaces))
-    {
-        return "unsure".into();
+    if !(in_evidence || in_value) {
+        return Err(DROP_QUOTE_MISSING);
     }
-    verdict.to_string()
+    if verdict == "supersedes" && !departs(turn, old, replaces) {
+        return Err(DROP_NO_CUE);
+    }
+    Ok(if duplicate { "duplicate" } else { "supersedes" })
+}
+
+/// Count one dropped verdict and print the drop line on stderr.
+///
+/// The line is the reason, the stored row's subject and key, the anchor's
+/// subject and key, and the first 80 characters of the quote. It does not
+/// carry the evidence or the old and new values.
+fn note_drop(
+    report: &mut IngestionReport,
+    reason: &'static str,
+    anchors: &[Anchor],
+    rows: &[Row],
+    pair: &Pair,
+    quote: &str,
+) {
+    *report
+        .consolidate
+        .dropped
+        .entry(reason.to_string())
+        .or_insert(0) += 1;
+    let partner = &rows[pair.partner];
+    let anchor = &anchors[pair.anchor];
+    eprintln!(
+        "{}",
+        drop_line(
+            reason,
+            &format!("{}:{}", partner.subject, partner.key),
+            &format!("{}:{}", anchor.subject, anchor.key),
+            quote
+        )
+    );
+}
+
+/// Stderr line for one drop. `old_key` is the stored row, `new_key` the anchor.
+fn drop_line(reason: &str, old_key: &str, new_key: &str, quote: &str) -> String {
+    format!(
+        "consolidate drop: {reason} | {old_key} | {new_key} | {}",
+        quote_head(quote)
+    )
+}
+
+/// First 80 characters of `quote`, with any control character (line break,
+/// escape) turned into a space so a quote cannot forge or recolour log lines.
+fn quote_head(quote: &str) -> String {
+    quote
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(80)
+        .collect()
 }
 
 /// A quote has to be a real span of stored text, not one letter of it.
@@ -655,24 +744,22 @@ async fn close_partner(
     pair: &Pair,
     reason: &str,
     report: &mut IngestionReport,
-) {
+) -> Option<&'static str> {
     let partner = &rows[pair.partner];
     if partner.here {
-        return;
+        return Some(DROP_OPENED_HERE);
     }
-    let Some(until) = session_midnight(ctx.date) else {
-        return;
-    };
+    let until = session_midnight(ctx.date)?;
     let ended = format!("{}:{reason}", ctx.session_id);
     let closed = match close_row(gm, partner, &until, &ended).await {
         Ok(closed) => closed,
         Err(_) => {
             report.consolidate.errors += 1;
-            return;
+            return None;
         }
     };
     if !closed {
-        return;
+        return Some(DROP_GONE);
     }
     if reason == "consolidated" {
         report.consolidate.closes_sup += 1;
@@ -688,6 +775,7 @@ async fn close_partner(
         old_value: partner.value.clone(),
         new_value: anchor.new_value.clone(),
     });
+    None
 }
 
 async fn close_duplicate(
@@ -698,28 +786,32 @@ async fn close_duplicate(
     pair: &Pair,
     gone: &mut BTreeSet<usize>,
     report: &mut IngestionReport,
-) {
+) -> Option<&'static str> {
     let partner = &rows[pair.partner];
     if gone.contains(&pair.partner) {
-        return;
+        return Some(DROP_GONE);
     }
     let Some(live) = anchors[pair.anchor].live else {
         // No kept copy of this value. A duplicate close would drop the only
         // live row. That needs the supersede path, which checks quote and cue.
-        if kept_copy(rows, gone, pair.partner, &partner.value) && !partner.here {
+        if partner.here {
+            return Some(DROP_OPENED_HERE);
+        }
+        if kept_copy(rows, gone, pair.partner, &partner.value) {
             let before = report.consolidate.closes_dup;
-            close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+            let reason = close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
             if report.consolidate.closes_dup > before {
                 gone.insert(pair.partner);
+                return None;
             }
-        } else {
-            *report
-                .consolidate
-                .skips
-                .entry("consolidate_dup_no_copy".into())
-                .or_insert(0) += 1;
+            return reason;
         }
-        return;
+        *report
+            .consolidate
+            .skips
+            .entry("consolidate_dup_no_copy".into())
+            .or_insert(0) += 1;
+        return Some(DROP_NO_COPY);
     };
     let mine = &rows[live];
     if gone.contains(&live) || !values_equal(&mine.value, &partner.value) {
@@ -728,36 +820,43 @@ async fn close_duplicate(
             .skips
             .entry("consolidate_dup_no_copy".into())
             .or_insert(0) += 1;
-        return;
+        return Some(DROP_NO_COPY);
     }
     let close_partner_row =
         partner.from > mine.from || (partner.from == mine.from && !partner.here);
     if close_partner_row {
         let before = report.consolidate.closes_dup;
-        close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+        let reason = close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
         if report.consolidate.closes_dup > before {
             gone.insert(pair.partner);
+            return None;
         }
-        return;
+        return reason;
     }
     if mine.here {
-        return;
+        return Some(DROP_OPENED_HERE);
     }
-    let Some(until) = session_midnight(ctx.date) else {
-        return;
-    };
+    let until = session_midnight(ctx.date)?;
     let ended = format!("{}:duplicate", ctx.session_id);
-    if matches!(close_row(gm, mine, &until, &ended).await, Ok(true)) {
-        report.consolidate.closes_dup += 1;
-        gone.insert(live);
-        report.retirements.push(Retirement {
-            reason: "duplicate".into(),
-            subject: mine.subject.clone(),
-            predicate: mine.pred.clone(),
-            key: mine.key.clone(),
-            old_value: mine.value.clone(),
-            new_value: anchors[pair.anchor].new_value.clone(),
-        });
+    match close_row(gm, mine, &until, &ended).await {
+        Ok(true) => {
+            report.consolidate.closes_dup += 1;
+            gone.insert(live);
+            report.retirements.push(Retirement {
+                reason: "duplicate".into(),
+                subject: mine.subject.clone(),
+                predicate: mine.pred.clone(),
+                key: mine.key.clone(),
+                old_value: mine.value.clone(),
+                new_value: anchors[pair.anchor].new_value.clone(),
+            });
+            None
+        }
+        Ok(false) => Some(DROP_GONE),
+        Err(_) => {
+            report.consolidate.errors += 1;
+            None
+        }
     }
 }
 
@@ -2181,6 +2280,190 @@ mod tests {
         assert!(ended(&slot).is_none());
     }
 
+    fn dropped(report: &IngestionReport, reason: &str) -> u32 {
+        report.consolidate.dropped.get(reason).copied().unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn quote_too_short_is_counted() {
+        let (report, slot) =
+            judge_layout("plain text", "Switch to rich text instead of plain text.").await;
+        assert_eq!(dropped(&report, "quote too short"), 1);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn quote_not_verbatim_is_counted() {
+        let (report, slot) = judge_layout(
+            "instead of plain text is not what was said",
+            "Switch to rich text instead of plain text.",
+        )
+        .await;
+        assert_eq!(dropped(&report, "quote not verbatim in the evidence"), 1);
+        assert_eq!(dropped(&report, "quote too short"), 0);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_departure_cue_is_counted() {
+        let (report, slot) = judge_layout(
+            "plain text is still stored",
+            "The layout is rich text while plain text is still stored.",
+        )
+        .await;
+        assert_eq!(dropped(&report, "no departure cue"), 1);
+        assert_eq!(dropped(&report, "quote too short"), 0);
+        assert_eq!(dropped(&report, "quote not verbatim in the evidence"), 0);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn second_supersede_on_one_anchor_is_counted() {
+        let (_tmp, gm) = open().await;
+        let plank = setting(
+            "acme",
+            Kind::Project,
+            "plank",
+            "cedar plank",
+            "plank is cedar plank",
+        );
+        let board = setting(
+            "acme",
+            Kind::Project,
+            "board",
+            "cedar board",
+            "board is cedar board",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("cedar plank and cedar board")],
+            &[plank, board],
+        )
+        .await;
+        let quote =
+            "Use cedar beam instead of cedar plank. Prefer cedar beam instead of cedar board.";
+        let next = setting("acme", Kind::Project, "beam", "cedar beam", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", "instead of cedar plank"),
+            (2, "supersedes", "instead of cedar board"),
+        ])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
+        assert_eq!(dropped(&report, "second supersede on the same anchor"), 2);
+        assert_eq!(report.consolidate.closes_sup, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_without_a_kept_copy_is_counted() {
+        let (_tmp, gm) = open().await;
+        let grid = setting(
+            "acme",
+            Kind::Project,
+            "layout",
+            "plain grid",
+            "layout is plain grid",
+        );
+        let text = setting(
+            "acme",
+            Kind::Project,
+            "format",
+            "plain text",
+            "format is plain text",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("layout is plain grid. format is plain text")],
+            &[grid, text],
+        )
+        .await;
+        let spoken = "Leave the plain grid layout in place.";
+        let mut rejected = setting("acme", Kind::Project, "format", "plain text", spoken);
+        rejected.status = "rejected".into();
+        let turns = [turn(spoken)];
+        let stats = commit(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            std::slice::from_ref(&rejected),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(judged(&[(
+            1,
+            "duplicate",
+            "plain grid layout",
+        )])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[rejected], &stats, &stub).await;
+        assert_eq!(dropped(&report, "no kept live copy (duplicate)"), 1);
+        assert_eq!(report.consolidate.closes_dup, 0);
+        assert_eq!(report.consolidate.closes_sup, 0);
+    }
+
+    #[tokio::test]
+    async fn a_row_opened_this_session_is_counted() {
+        let (_tmp, gm) = open().await;
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "layout",
+            "plain grid",
+            "layout is plain grid",
+        );
+        commit(&gm, "s1", "2026-03-01", &[turn(&old.quote)], &[old]).await;
+        let next = setting(
+            "acme",
+            Kind::Project,
+            "grid",
+            "plain grid",
+            "grid is plain grid",
+        );
+        let turns = [turn(&next.quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Panic);
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
+        assert_eq!(stub.calls(), 0);
+        assert_eq!(dropped(&report, "row opened this session"), 1);
+        assert_eq!(report.consolidate.closes_dup, 0);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(live_any(&rows, "layout", "plain grid")).is_none());
+        assert!(ended(live_any(&rows, "grid", "plain grid")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_row_already_closed_is_counted() {
+        let (_tmp, gm) = open().await;
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "plank",
+            "cedar plank",
+            "plank is cedar plank",
+        );
+        commit(&gm, "s1", "2026-03-01", &[turn(&old.quote)], &[old]).await;
+        let quote = "Use cedar beam instead of cedar plank. Use cedar post instead of cedar plank.";
+        let beam = setting("acme", Kind::Project, "beam", "cedar beam", quote);
+        let post = setting("acme", Kind::Project, "post", "cedar post", quote);
+        let turns = [turn(quote)];
+        let facts = [beam, post];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, &facts).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", "instead of cedar plank"),
+            (2, "supersedes", "instead of cedar plank"),
+        ])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &facts, &stats, &stub).await;
+        assert_eq!(dropped(&report, "anchor or pair no longer present"), 1);
+        assert_eq!(report.consolidate.closes_sup, 1);
+        assert!(ended(live_any(&slots(&gm, "acme").await, "plank", "cedar plank")).is_some());
+    }
+
     #[tokio::test]
     async fn two_supersedes_with_different_quotes_close_none() {
         let (_tmp, gm) = open().await;
@@ -2474,5 +2757,33 @@ mod tests {
             .unwrap();
         assert!(cache_get(&gm, &current).await.unwrap().is_none());
         assert_eq!(cache_get(&gm, &v1).await.unwrap().unwrap().0, "supersedes");
+    }
+}
+
+#[cfg(test)]
+mod drop_line_tests {
+    use super::{drop_line, quote_head};
+
+    #[test]
+    fn the_line_is_the_reason_the_keys_and_eighty_chars() {
+        let quote = format!("Agreed\n{}", "q".repeat(90));
+        let line = drop_line("quote too short", "acme:layout", "acme:format", &quote);
+        let head = quote_head(&quote);
+        assert_eq!(head.chars().count(), 80);
+        assert!(!head.contains('\n'));
+        assert_eq!(
+            line,
+            format!("consolidate drop: quote too short | acme:layout | acme:format | {head}")
+        );
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.contains("plain text"));
+        let mut raw = String::from("a");
+        raw.push(char::from(0x1b));
+        raw.push_str("[31mred\tb");
+        raw.push('\u{0}');
+        raw.push('c');
+        let head = quote_head(&raw);
+        assert!(!head.chars().any(char::is_control), "{head:?}");
+        assert_eq!(head, "a [31mred b c");
     }
 }

@@ -867,6 +867,11 @@ pub struct ConsolidateReport {
     pub closes_dup: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skips: BTreeMap<String, u32>,
+    /// Judge verdicts a guard did not apply, keyed by reason. Empty, and
+    /// omitted, when nothing was dropped. Absent on a report from before
+    /// this field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dropped: BTreeMap<String, u32>,
     #[serde(default)]
     pub calls: u32,
     #[serde(default)]
@@ -886,6 +891,7 @@ impl ConsolidateReport {
             && self.closes_sup == 0
             && self.closes_dup == 0
             && self.skips.is_empty()
+            && self.dropped.is_empty()
             && self.calls == 0
             && self.errors == 0
     }
@@ -1103,6 +1109,21 @@ mod tests {
         assert_eq!(loaded.timing.unwrap().match_ms, None);
         assert_eq!(loaded.entities_created, 0);
         assert!(loaded.retirement_skips.is_empty());
+    }
+
+    #[test]
+    fn consolidate_drop_counters_are_omitted_when_empty() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("dropped").is_none());
+        assert!(encoded.get("skips").is_none());
+        let mut report = ConsolidateReport::default();
+        report.dropped.insert("quote too short".into(), 1);
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["dropped"]["quote too short"], 1);
+        assert!(!report.is_blank());
+        assert!(ConsolidateReport::default().is_blank());
+        let blank = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(blank.get("consolidate").is_none());
     }
 
     #[test]
