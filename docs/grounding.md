@@ -67,6 +67,12 @@ A decided `uses` with an empty `replaces` and a role other than `other`, `none` 
 
 While the switch is on, every superseded or replaced close a decided fact would make also has to pass two guards. The cited turn has to contain a specific key token as a whole token, or mention the old value. When both values sit in one sentence and the text between them is only a list connector, or a keep cue sits within three words of the old value, the old row stays. Rejected closes, promoted closes, and a same-session issue-status close are unchanged. An ambiguous match, a missing target, or a row that changed after the snapshot skips that retirement and still writes the new fact. A row opened in the current session is not closed. A retirement stamps only `valid_until` and `ended_by`.
 
+## Consolidation pass (opt-in, prototype)
+
+`consolidate` is off by default, in config and on `bench writes`. Off does not define `consolidation_cache`, does not read the store for this pass, and does not call the provider. The pass-1 prompt, schema and request stay as they are.
+
+With `[graph] consolidate = true` or `--consolidate`, after the session's writes the pass looks at rows this session closed, at a grounded `replaces` that closed nothing, and at a decided setting or rule created this session that closed nothing. Partners are live decided rows in the project neighbourhood that this session did not open. A fixed pre-filter can mark a duplicate, a supersede, or a drop. The pairs that remain go to one structured call (`CONSOLIDATE_V1`, `max_tokens` 400). A supersede or a duplicate is kept only when `quote` is a verbatim span of the evidence that was sent, and a duplicate may instead quote either stored value. A supersede also needs a departure cue in the cited turn. Two supersedes for one anchor that share a quote close nothing. A close writes `valid_until` and `ended_by` only. The row opened in the creating session is not closed. A provider or parse error is counted and the ingest still succeeds.
+
 ## Gate 5 — confidence and generic objects
 
 A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.

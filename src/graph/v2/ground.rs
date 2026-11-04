@@ -806,6 +806,11 @@ fn is_content(token: &str) -> bool {
     token.chars().count() > 1 || token.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[must_use]
+pub(crate) fn is_stop_word(token: &str) -> bool {
+    is_stop(token)
+}
+
 fn is_stop(token: &str) -> bool {
     matches!(
         token,

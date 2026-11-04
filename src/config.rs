@@ -701,6 +701,9 @@ pub struct GraphSection {
     /// Match kept facts to stored rows after pass 1. Experimental, and off unless set.
     #[serde(default = "default_known_match", skip_serializing_if = "is_false")]
     pub known_match: bool,
+    /// Look across subjects and keys after a session's writes. Off unless set.
+    #[serde(default = "default_consolidate", skip_serializing_if = "is_false")]
+    pub consolidate: bool,
 }
 
 impl Default for GraphSection {
@@ -718,6 +721,7 @@ impl Default for GraphSection {
             pipeline: None,
             known_facts_context: default_known_facts_context(),
             known_match: default_known_match(),
+            consolidate: default_consolidate(),
         }
     }
 }
@@ -1029,6 +1033,10 @@ fn default_known_match() -> bool {
     false
 }
 
+fn default_consolidate() -> bool {
+    false
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1324,6 +1332,12 @@ impl Config {
             }
             "graph.known_match" => {
                 self.graph_section().known_match = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate" => {
+                self.graph_section().consolidate = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2143,6 +2157,18 @@ mod tests {
         assert!(cfg.graph.as_ref().expect("graph").known_match);
         assert!(cfg.set_key("graph.known_match", "yes").is_err());
         assert!(!cfg.graph.as_ref().expect("graph").known_facts_context);
+    }
+
+    #[test]
+    fn consolidate_defaults_off() {
+        assert!(!default_consolidate());
+        assert!(!GraphSection::default().consolidate);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().consolidate);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").consolidate);
+        assert!(cfg.set_key("graph.consolidate", "yes").is_err());
     }
 
     #[test]

@@ -5,6 +5,10 @@ changes a user has to know about before upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in consolidation pass after a session write (`[graph] consolidate`, `--consolidate`), off by default (#182).
+
 ### Breaking
 
 - Default provider is the CLI login (`claude-code`). `num_ctx`, `api_style`, and `provider = "ollama"` are refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.

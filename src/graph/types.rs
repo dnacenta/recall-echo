@@ -797,6 +797,9 @@ pub struct StageTiming {
     /// report from before this field, and a run that did not match, still load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_ms: Option<u64>,
+    /// Consolidation after the write. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidate_ms: Option<u64>,
 }
 
 /// Counts from the post-pass-1 known-row matcher and the retirement guards.
@@ -822,6 +825,69 @@ impl MatchReport {
             && self.key_canonical == 0
             && self.edge_targets == 0
             && self.skipped.is_empty()
+    }
+}
+
+/// How many candidate pairs the deterministic pre-filter settled.
+///
+/// Older bench JSON has no object here. A blank report is left out of new JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsolidatePrefilter {
+    /// Same live value, same subject, same predicate: the later copy may close.
+    #[serde(default)]
+    pub dup: u32,
+    /// A grounded replacement with one token partner and a departure cue.
+    #[serde(default)]
+    pub sup: u32,
+    /// Left for the ordinary supersede path, or equal values that must not close.
+    #[serde(default)]
+    pub drop: u32,
+}
+
+/// Counts from the opt-in consolidation pass.
+///
+/// Older bench JSON has no object here. A blank report is left out of new JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsolidateReport {
+    #[serde(default)]
+    pub anchors: u32,
+    #[serde(default)]
+    pub pairs: u32,
+    #[serde(default)]
+    pub overflow: u32,
+    #[serde(default)]
+    pub prefilter: ConsolidatePrefilter,
+    #[serde(default)]
+    pub judged: u32,
+    #[serde(default)]
+    pub cache_hits: u32,
+    #[serde(default)]
+    pub closes_sup: u32,
+    #[serde(default)]
+    pub closes_dup: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skips: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub calls: u32,
+    #[serde(default)]
+    pub errors: u32,
+}
+
+impl ConsolidateReport {
+    /// The pass did not run, or it found nothing to count.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.anchors == 0
+            && self.pairs == 0
+            && self.overflow == 0
+            && self.prefilter == ConsolidatePrefilter::default()
+            && self.judged == 0
+            && self.cache_hits == 0
+            && self.closes_sup == 0
+            && self.closes_dup == 0
+            && self.skips.is_empty()
+            && self.calls == 0
+            && self.errors == 0
     }
 }
 
@@ -914,6 +980,9 @@ pub struct IngestionReport {
     /// Known-row match counts. Blank, and omitted, when the switch is off.
     #[serde(default, skip_serializing_if = "MatchReport::is_blank")]
     pub known_match: MatchReport,
+    /// Consolidation counts. Blank, and omitted, when the switch is off.
+    #[serde(default, skip_serializing_if = "ConsolidateReport::is_blank")]
+    pub consolidate: ConsolidateReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -1016,6 +1085,8 @@ mod tests {
 
         let value = serde_json::to_value(IngestionReport::default()).unwrap();
         assert!(value.get("known_match").is_none());
+        assert!(value.get("consolidate").is_none());
+        assert!(value["timing"].get("consolidate_ms").is_none());
 
         let mut filled = IngestionReport::default();
         filled.known_match.key_filled = 2;

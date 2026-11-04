@@ -258,7 +258,7 @@ fn whole_token(token: &str, text: &str) -> bool {
 
 /// Separator and camel tokens, lowercased, with [`KEY_AFFIXES`] removed.
 /// Equality is the whole list. A shorter list is not a stem and not a subset.
-fn key_tokens(key: &str) -> Vec<String> {
+pub(crate) fn key_tokens(key: &str) -> Vec<String> {
     let chars: Vec<char> = key.chars().collect();
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -307,7 +307,7 @@ fn generic_role(role: &str) -> bool {
     matches!(role, "other" | "none" | "library")
 }
 
-fn mentioned_with_cue(old: &str, turn: &str) -> bool {
+pub(crate) fn mentioned_with_cue(old: &str, turn: &str) -> bool {
     mention(old, turn)
         && sentences(turn).any(|sentence| mention(old, sentence) && departure_near(old, sentence))
 }

@@ -90,6 +90,8 @@ pub(crate) struct WriteStats {
     pub usage: Option<TokenUsage>,
     /// Guard and staleness skips while known-row match is on. Empty when it is off.
     pub match_skips: BTreeMap<String, u32>,
+    /// Decided facts whose grounded `replaces` closed no row. Indexes into the fact slice.
+    pub replaces_unconsumed: Vec<usize>,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -508,7 +510,11 @@ impl<'a> Attempt<'a> {
             self.held_slots.clear();
             self.held_edges.clear();
             if replaces_supported(&fact, self.ctx.turns) {
+                let before = self.stats.retirements.len();
                 self.retire_replaced(&fact, &subject).await?;
+                if self.stats.retirements.len() == before {
+                    self.stats.replaces_unconsumed.push(self.index);
+                }
             }
             let mut listed_conflict = false;
             if single_valued(fact.predicate) {
@@ -1432,7 +1438,7 @@ const LIVE_EDGES_OF: &str =
 const SCOPE_PART_OF: &str = "SELECT in FROM type::record($id)<-(relates_to \
      WHERE rel_type = 'part_of' AND valid_until = NONE)";
 
-const CLOSE_EDGE: &str = r#"
+pub(crate) const CLOSE_EDGE: &str = r#"
     UPDATE type::record($id) SET
         valid_until = type::datetime($valid_until),
         ended_by = $ended_by
@@ -1523,7 +1529,7 @@ pub(crate) fn alphanumeric_runs(text: &str) -> Vec<String> {
 /// `YYYY-MM-DD` and a `T` timestamp of that day both stamp the day. A blank
 /// date or a time written with a space is not a day, and a retirement that
 /// needed one is skipped rather than failing the session.
-fn session_midnight(date: &str) -> Option<String> {
+pub(crate) fn session_midnight(date: &str) -> Option<String> {
     let day = match date.split_once('T') {
         Some((day, _)) => day,
         None => date,
@@ -1706,7 +1712,7 @@ fn slot_matches_target(slot: &Value, target: &super::known_match::MatchTarget) -
         && fold_value(slot_str(slot, "value").unwrap_or("")) == fold_value(&target.value)
 }
 
-fn values_equal(left: &str, right: &str) -> bool {
+pub(crate) fn values_equal(left: &str, right: &str) -> bool {
     if punctuation_literal(left) || punctuation_literal(right) {
         left.trim() == right.trim()
     } else {
@@ -1782,7 +1788,7 @@ fn edge_closed(valid_until: Option<&Value>) -> bool {
 /// does not see the decided fact beside it. A later turn does not close an
 /// earlier fact of this session either, except the synthetic status close in
 /// [`same_session_status_close`].
-fn opened_here(evidence: Option<&Value>, session_id: &str) -> bool {
+pub(crate) fn opened_here(evidence: Option<&Value>, session_id: &str) -> bool {
     let Some(items) = evidence.and_then(Value::as_array) else {
         return false;
     };
@@ -1823,7 +1829,7 @@ fn evidence_already_stored(slot: &Value, fact: &Fact, session_id: &str) -> bool 
     same_fact(slot, fact) && evidence_seen(slot.get("evidence"), session_id, fact)
 }
 
-fn stamp_slot(slot: &mut Value, until: &str, ended_by: &str) -> bool {
+pub(crate) fn stamp_slot(slot: &mut Value, until: &str, ended_by: &str) -> bool {
     if !slot_live(slot) {
         return false;
     }
