@@ -43,7 +43,7 @@ Produce a reproducible LoCoMo run that:
 | `graph::query::hybrid_query` | `src/graph/query.rs` | Public, semantic + expansion + episodes |
 | `search::ranked_search` | `src/search.rs` | Public, archive line search |
 | `recall_echo::config::Config` | `src/config.rs` | Loads `.recall-echo.toml` |
-| LLM provider abstraction | `src/llm_provider.rs` | Anthropic + OpenAI + Ollama + claude-code |
+| LLM provider abstraction | `src/llm_provider.rs` | CLI presets (claude-code default) + Anthropic + OpenAI-compatible HTTP |
 | LoCoMo dataset | external | CC BY-NC 4.0, `data/locomo10.json` upstream |
 | LoCoMo eval harness | external | `task_eval/evaluate_qa.py` (F1) — Python |
 | mem0 J-metric harness | external | `mem0/evaluation/metrics/llm_judge.py` — Python |

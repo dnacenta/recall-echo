@@ -4,9 +4,9 @@
 
 //! recall-echo — Persistent memory system with knowledge graph.
 //!
-//! A general-purpose persistent memory system for any LLM tool — Claude Code,
-//! Ollama, or any provider. Features a four-layer memory architecture with
-//! a knowledge graph (SurrealDB + fastembed) as Layer 0.
+//! A general-purpose persistent memory system for any LLM tool — the CLI you
+//! already log in to, or an HTTP provider you configure. Features a four-layer
+//! memory architecture with a knowledge graph (SurrealDB + fastembed) as Layer 0.
 //!
 //! # Architecture
 //!

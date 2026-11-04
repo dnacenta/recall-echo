@@ -257,7 +257,7 @@ enum BenchCommands {
 enum ConfigCommands {
     /// Show current configuration
     Show,
-    /// Set a config value (e.g., `config set provider ollama`)
+    /// Set a config value (e.g., `config set provider claude-code`)
     Set {
         /// Config key (provider, model, api_base, llm.cli.*, ephemeral.max_entries)
         key: String,

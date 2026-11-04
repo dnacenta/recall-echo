@@ -30,19 +30,21 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
 
     // LLM
     eprintln!("\n{BOLD}[llm]{RESET}");
-    let provider_label = match &cfg.llm.provider {
-        Provider::Openai => "openai (ollama)".to_string(),
-        other => other.to_string(),
+    eprintln!("  provider = {}", cfg.llm.provider);
+    let note = |empty: bool, required: bool| {
+        if !empty {
+            "custom"
+        } else if required {
+            "required"
+        } else {
+            "default"
+        }
     };
-    eprintln!("  provider = {provider_label}");
+    let openai = cfg.llm.provider == Provider::Openai;
     eprintln!(
         "  model    = {} {DIM}({}){RESET}",
         cfg.llm.resolved_model(),
-        if cfg.llm.model.is_empty() {
-            "default"
-        } else {
-            "custom"
-        }
+        note(cfg.llm.model.is_empty(), openai)
     );
     if cfg.llm.provider.is_cli() {
         show_cli_section(&cfg.llm);
@@ -50,24 +52,7 @@ pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
         eprintln!(
             "  api_base = {} {DIM}({}){RESET}",
             cfg.llm.resolved_api_base(),
-            if cfg.llm.api_base.is_empty() {
-                "default"
-            } else {
-                "custom"
-            }
-        );
-        eprintln!(
-            "  num_ctx  = {} {DIM}({}){RESET}",
-            cfg.llm.num_ctx,
-            if cfg.llm.num_ctx == config::default_num_ctx() {
-                "default"
-            } else {
-                "custom"
-            }
-        );
-        eprintln!(
-            "  api_style = {}",
-            cfg.llm.api_style.as_deref().unwrap_or("(default)")
+            note(cfg.llm.api_base.is_empty(), openai)
         );
     }
 

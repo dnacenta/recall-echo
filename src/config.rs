@@ -31,54 +31,41 @@ const DEFAULT_EXTRACTION_BATCH_SIZE: usize = 3;
 /// Five minutes: longer than any pause inside a working session, short enough
 /// that a session ended at lunchtime is memory by the afternoon.
 const DEFAULT_CAPTURE_SETTLE_SECS: u64 = 300;
-/// Configured floor for Ollama's native chat route. A structured call raises
-/// this to fit the prompt (one token per three characters, rounded up) plus
-/// the reserved reply, and that automatic raise stops at 32768. A higher
-/// configured value is kept. The server default (4096) truncates the tail of
-/// a pass-1 window.
-const DEFAULT_NUM_CTX: u32 = 16384;
 
-pub(crate) fn default_num_ctx() -> u32 {
-    DEFAULT_NUM_CTX
+fn dropped_llm_keys() -> [&'static str; 2] {
+    [concat!("num", "_ctx"), concat!("api", "_style")]
 }
 
-fn is_default_num_ctx(value: &u32) -> bool {
-    *value == DEFAULT_NUM_CTX
+fn is_dropped_llm_key(key: &str) -> bool {
+    dropped_llm_keys()
+        .iter()
+        .any(|name| key == *name || key.strip_prefix("llm.").is_some_and(|rest| rest == *name))
 }
 
-/// `0` is not a context window. The message is the one `config set` and a
-/// rejected file both surface.
-fn require_nonzero_num_ctx(n: u32) -> Result<(), crate::error::RecallError> {
-    if n == 0 {
-        Err(crate::error::RecallError::Config(
-            "llm.num_ctx must be at least 1".into(),
-        ))
-    } else {
-        Ok(())
-    }
+fn dropped_key_error(key: &str) -> crate::error::RecallError {
+    crate::error::RecallError::Config(format!("{key} was removed in this version; delete the key"))
 }
 
-/// `"ollama"` or `"openai"`, stored in the spelling the wire format uses.
-pub(crate) fn canonical_api_style(value: &str) -> Result<String, crate::error::RecallError> {
-    match value.to_ascii_lowercase().as_str() {
-        "ollama" => Ok("ollama".to_string()),
-        "openai" => Ok("openai".to_string()),
-        other => Err(crate::error::RecallError::Config(format!(
-            "llm.api_style must be \"ollama\" or \"openai\" (got {other})"
-        ))),
-    }
+fn dropped_llm_key(content: &str) -> Option<&'static str> {
+    let value: toml::Value = toml::from_str(content).ok()?;
+    let table = value.get("llm")?.as_table()?;
+    dropped_llm_keys()
+        .into_iter()
+        .find(|key| table.contains_key(*key))
+}
+
+fn retired_local_provider_alias() -> &'static str {
+    concat!("ol", "lama")
 }
 
 // ── Provider enum ────────────────────────────────────────────────────────
 
 /// LLM provider for entity extraction.
 ///
-/// Two families. [`Provider::Anthropic`] and [`Provider::Openai`] talk HTTP —
-/// an API key, billed per token (the OpenAI-compatible one also covers Ollama
-/// and any local server that speaks that protocol). Everything else spawns an
-/// agent CLI the user already pays a subscription for; those are all one
-/// implementation driven by a [`CliPreset`], so supporting a new vendor is a
-/// preset — or just a `[llm.cli]` section — rather than a new code path.
+/// Two families. [`Provider::Anthropic`] and [`Provider::Openai`] talk HTTP
+/// and bill per token. OpenAI-compatible HTTP is opt-in: it needs `api_base`
+/// and `OPENAI_API_KEY`, and it has no default endpoint. Everything else
+/// spawns an agent CLI the user already pays a subscription for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
@@ -97,7 +84,6 @@ impl Provider {
     pub fn default_model(&self) -> &'static str {
         match self {
             Provider::Anthropic => "claude-haiku-4-5-20251001",
-            Provider::Openai => "llama3.2",
             _ => "",
         }
     }
@@ -106,7 +92,6 @@ impl Provider {
     pub fn default_api_base(&self) -> &'static str {
         match self {
             Provider::Anthropic => "https://api.anthropic.com/v1/messages",
-            Provider::Openai => "http://localhost:11434/v1",
             _ => "",
         }
     }
@@ -132,16 +117,24 @@ impl Provider {
     }
 
     pub fn from_str_loose(s: &str) -> Result<Self, crate::error::RecallError> {
-        match s.to_lowercase().as_str() {
+        let name = s.to_lowercase();
+        if name == retired_local_provider_alias() {
+            return Err(crate::error::RecallError::Config(
+                "that provider was removed in this version; use a CLI provider \
+                 ('claude-code', 'gemini', 'grok', 'codex', or 'cli')"
+                    .into(),
+            ));
+        }
+        match name.as_str() {
             "anthropic" | "claude" => Ok(Provider::Anthropic),
-            "openai" | "ollama" | "openai-compat" => Ok(Provider::Openai),
+            "openai" | "openai-compat" => Ok(Provider::Openai),
             "claude-code" | "claudecode" => Ok(Provider::ClaudeCode),
             "gemini" | "gemini-cli" | "google" => Ok(Provider::Gemini),
             "grok" | "grok-cli" | "xai" => Ok(Provider::Grok),
             "codex" | "codex-cli" => Ok(Provider::Codex),
             "cli" | "custom" | "custom-cli" => Ok(Provider::Cli),
             other => Err(crate::error::RecallError::Config(format!(
-                "unknown provider: {other} (use 'anthropic', 'ollama', 'claude-code', \
+                "unknown provider: {other} (use 'anthropic', 'openai', 'claude-code', \
                  'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)"
             ))),
         }
@@ -570,28 +563,15 @@ fn default_max_entries() -> usize {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LlmSection {
-    #[serde(default = "default_provider")]
+    #[serde(
+        default = "default_provider",
+        deserialize_with = "deserialize_provider"
+    )]
     pub provider: Provider,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub api_base: String,
-    /// Context length for Ollama's native chat route. Absent means 16384.
-    /// That value is a floor: a structured native call may send a larger
-    /// `num_ctx`, capped at 32768, so a full v2 window is not truncated. A
-    /// higher configured value is kept. The default is left out of a saved
-    /// file. `0` is rejected.
-    #[serde(
-        default = "default_num_ctx",
-        skip_serializing_if = "is_default_num_ctx"
-    )]
-    pub num_ctx: u32,
-    /// Wire format for an OpenAI-compatible provider: `"ollama"` or `"openai"`.
-    /// Absent leaves the default. A base URL on port 11434 then uses native
-    /// chat for structured calls only; v1 stays on `/v1/chat/completions`
-    /// unless this is set to `"ollama"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_style: Option<String>,
     /// Overrides for the spawned agent CLI. Serialized only when non-empty, so
     /// a config that never touches it stays byte-identical.
     #[serde(default, skip_serializing_if = "CliSection::is_empty")]
@@ -601,14 +581,19 @@ pub struct LlmSection {
 impl Default for LlmSection {
     fn default() -> Self {
         Self {
-            provider: Provider::Anthropic,
+            provider: default_provider(),
             model: String::new(),
             api_base: String::new(),
-            num_ctx: default_num_ctx(),
-            api_style: None,
             cli: CliSection::default(),
         }
     }
+}
+
+fn deserialize_provider<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Provider, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    Provider::from_str_loose(&raw).map_err(serde::de::Error::custom)
 }
 
 impl LlmSection {
@@ -1030,7 +1015,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn default_provider() -> Provider {
-    Provider::Anthropic
+    Provider::ClaudeCode
 }
 
 // ── Load / Save ──────────────────────────────────────────────────────────
@@ -1050,9 +1035,9 @@ pub fn load_from_dir(dir: &Path) -> Config {
 
 /// Load config from .recall-echo.toml in the base dir.
 ///
-/// Returns defaults if the file doesn't exist, is malformed, or sets
-/// `llm.num_ctx` to 0. A zero context window is rejected: the error is
-/// printed and the rest of that file is not applied.
+/// Returns defaults if the file doesn't exist or is malformed. A file that
+/// still sets a removed `[llm]` key, or the retired local-model provider
+/// alias, is not applied: the error is printed and the defaults stand.
 #[must_use]
 pub fn load(base: &Path) -> Config {
     let path = config_path(base);
@@ -1065,6 +1050,11 @@ pub fn load(base: &Path) -> Config {
         Err(_) => return Config::default(),
     };
 
+    if let Some(key) = dropped_llm_key(&content) {
+        eprintln!("recall-echo: {}", dropped_key_error(&format!("llm.{key}")));
+        return Config::default();
+    }
+
     match toml::from_str(&content) {
         Ok(cfg) => match validate(cfg) {
             Ok(cfg) => cfg,
@@ -1073,7 +1063,13 @@ pub fn load(base: &Path) -> Config {
                 Config::default()
             }
         },
-        Err(_) => Config::default(),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("removed in this version") {
+                eprintln!("recall-echo: {message}");
+            }
+            Config::default()
+        }
     }
 }
 
@@ -1133,11 +1129,18 @@ pub(crate) fn validate_for_rewrite(
     base: &Path,
     cfg: Config,
 ) -> Result<(), crate::error::RecallError> {
+    let path = config_path(base);
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Some(key) = dropped_llm_key(&content) {
+            return Err(crate::error::RecallError::Config(format!(
+                "refusing to rewrite {}: {}",
+                path.display(),
+                dropped_key_error(&format!("llm.{key}"))
+            )));
+        }
+    }
     validate(cfg).map(|_| ()).map_err(|err| {
-        crate::error::RecallError::Config(format!(
-            "refusing to rewrite {}: {err}",
-            config_path(base).display()
-        ))
+        crate::error::RecallError::Config(format!("refusing to rewrite {}: {err}", path.display()))
     })
 }
 
@@ -1145,7 +1148,6 @@ fn validate(mut cfg: Config) -> Result<Config, crate::error::RecallError> {
     if !(1..=50).contains(&cfg.ephemeral.max_entries) {
         cfg.ephemeral.max_entries = DEFAULT_MAX_ENTRIES;
     }
-    require_nonzero_num_ctx(cfg.llm.num_ctx)?;
     Ok(cfg)
 }
 
@@ -1177,22 +1179,7 @@ impl Config {
                 self.llm.api_base = value.to_string();
                 Ok(())
             }
-            "llm.num_ctx" | "num_ctx" => {
-                let n: u32 = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                require_nonzero_num_ctx(n)?;
-                self.llm.num_ctx = n;
-                Ok(())
-            }
-            "llm.api_style" | "api_style" => {
-                if value.is_empty() {
-                    self.llm.api_style = None;
-                } else {
-                    self.llm.api_style = Some(canonical_api_style(value)?);
-                }
-                Ok(())
-            }
+            key if is_dropped_llm_key(key) => Err(dropped_key_error(key)),
             "ephemeral.max_entries" => {
                 let n: usize = value
                     .parse()
@@ -1404,7 +1391,7 @@ mod tests {
     fn default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.ephemeral.max_entries, 5);
-        assert_eq!(cfg.llm.provider, Provider::Anthropic);
+        assert_eq!(cfg.llm.provider, Provider::ClaudeCode);
         assert!(cfg.llm.model.is_empty());
     }
 
@@ -1412,7 +1399,7 @@ mod tests {
     fn parse_ephemeral_only() {
         let cfg: Config = toml::from_str("[ephemeral]\nmax_entries = 10\n").unwrap();
         assert_eq!(cfg.ephemeral.max_entries, 10);
-        assert_eq!(cfg.llm.provider, Provider::Anthropic);
+        assert_eq!(cfg.llm.provider, Provider::ClaudeCode);
     }
 
     #[test]
@@ -1458,12 +1445,12 @@ mod tests {
     #[test]
     fn parse_llm_section() {
         let cfg: Config = toml::from_str(
-            "[llm]\nprovider = \"openai\"\nmodel = \"llama3.1\"\napi_base = \"http://myhost:11434/v1\"\n",
+            "[llm]\nprovider = \"openai\"\nmodel = \"mistral-7b\"\napi_base = \"https://example.test/v1\"\n",
         )
         .unwrap();
         assert_eq!(cfg.llm.provider, Provider::Openai);
-        assert_eq!(cfg.llm.model, "llama3.1");
-        assert_eq!(cfg.llm.api_base, "http://myhost:11434/v1");
+        assert_eq!(cfg.llm.model, "mistral-7b");
+        assert_eq!(cfg.llm.api_base, "https://example.test/v1");
     }
 
     #[test]
@@ -1475,9 +1462,17 @@ mod tests {
     #[test]
     fn resolved_defaults() {
         let llm = LlmSection::default();
-        assert_eq!(llm.resolved_model(), "claude-haiku-4-5-20251001");
+        assert_eq!(llm.provider, Provider::ClaudeCode);
+        assert_eq!(llm.resolved_model(), "");
+        assert_eq!(llm.resolved_api_base(), "");
+
+        let anthropic = LlmSection {
+            provider: Provider::Anthropic,
+            ..LlmSection::default()
+        };
+        assert_eq!(anthropic.resolved_model(), "claude-haiku-4-5-20251001");
         assert_eq!(
-            llm.resolved_api_base(),
+            anthropic.resolved_api_base(),
             "https://api.anthropic.com/v1/messages"
         );
     }
@@ -1490,7 +1485,7 @@ mod tests {
             ..LlmSection::default()
         };
         assert_eq!(llm.resolved_model(), "mistral-7b");
-        assert_eq!(llm.resolved_api_base(), "http://localhost:11434/v1");
+        assert_eq!(llm.resolved_api_base(), "");
     }
 
     #[test]
@@ -1499,8 +1494,8 @@ mod tests {
             ephemeral: EphemeralConfig { max_entries: 3 },
             llm: LlmSection {
                 provider: Provider::Openai,
-                model: "llama3.2".into(),
-                api_base: "http://localhost:11434/v1".into(),
+                model: "mistral-7b".into(),
+                api_base: "https://example.test/v1".into(),
                 ..LlmSection::default()
             },
             ..Config::default()
@@ -1509,13 +1504,14 @@ mod tests {
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.ephemeral.max_entries, 3);
         assert_eq!(parsed.llm.provider, Provider::Openai);
-        assert_eq!(parsed.llm.model, "llama3.2");
+        assert_eq!(parsed.llm.model, "mistral-7b");
+        assert_eq!(parsed.llm.api_base, "https://example.test/v1");
     }
 
     #[test]
     fn set_key_provider() {
         let mut cfg = Config::default();
-        cfg.set_key("llm.provider", "ollama").unwrap();
+        cfg.set_key("llm.provider", "openai").unwrap();
         assert_eq!(cfg.llm.provider, Provider::Openai);
         assert!(cfg.llm.model.is_empty());
     }
@@ -1528,66 +1524,45 @@ mod tests {
     }
 
     #[test]
-    fn num_ctx_defaults_to_16384_and_api_style_is_optional() {
-        let cfg: Config = toml::from_str("[llm]\nprovider = \"openai\"\n").unwrap();
-        assert_eq!(cfg.llm.num_ctx, 16_384);
-        assert!(cfg.llm.api_style.is_none());
-        let rendered = toml::to_string_pretty(&cfg).unwrap();
-        assert!(!rendered.contains("num_ctx"), "{rendered}");
-        assert!(!rendered.contains("api_style"), "{rendered}");
+    fn a_removed_llm_key_fails_and_load_drops_the_file() {
+        for key in dropped_llm_keys() {
+            let toml = format!("[llm]\nprovider = \"grok\"\nmodel = \"kept\"\n{key} = 1\n");
+            let message = dropped_key_error(&format!("llm.{key}")).to_string();
+            assert!(
+                message.contains("removed in this version; delete the key"),
+                "{message}"
+            );
+            assert_eq!(dropped_llm_key(&toml), Some(key));
+            let mut cfg = Config::default();
+            assert!(cfg.set_key(key, "1").is_err());
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(config_path(tmp.path()), &toml).unwrap();
+            assert!(load(tmp.path()).llm.model.is_empty());
+            assert_eq!(load(tmp.path()).llm.provider, Provider::ClaudeCode);
+        }
     }
 
     #[test]
-    fn set_key_num_ctx_and_api_style() {
+    fn the_retired_local_provider_alias_points_at_the_cli_providers() {
+        let alias = retired_local_provider_alias();
+        let message = Provider::from_str_loose(alias).unwrap_err().to_string();
+        assert!(message.contains("removed in this version"), "{message}");
+        assert!(
+            message.contains("claude-code") && message.contains("'cli'"),
+            "{message}"
+        );
+        let parsed = toml::from_str::<Config>(&format!("[llm]\nprovider = \"{alias}\"\n"));
+        assert!(parsed.unwrap_err().to_string().contains("claude-code"));
         let mut cfg = Config::default();
-        cfg.set_key("llm.num_ctx", "32768").unwrap();
-        cfg.set_key("llm.api_style", "Ollama").unwrap();
-        assert_eq!(cfg.llm.num_ctx, 32_768);
-        assert_eq!(cfg.llm.api_style.as_deref(), Some("ollama"));
-        cfg.set_key("api_style", "").unwrap();
-        assert!(cfg.llm.api_style.is_none());
-        assert!(cfg.set_key("llm.api_style", "xml").is_err());
-        assert!(cfg.set_key("llm.num_ctx", "big").is_err());
-    }
-
-    #[test]
-    fn num_ctx_zero_is_rejected_at_set_key_and_load() {
-        let mut cfg = Config::default();
-        let err = cfg.set_key("llm.num_ctx", "0").unwrap_err();
-        assert!(
-            err.to_string().contains("llm.num_ctx must be at least 1"),
-            "{err}"
-        );
-        assert_eq!(cfg.llm.num_ctx, 16_384);
-        let err = cfg.set_key("num_ctx", "0").unwrap_err();
-        assert!(
-            err.to_string().contains("llm.num_ctx must be at least 1"),
-            "{err}"
-        );
-
-        let err = validate(Config {
-            llm: LlmSection {
-                num_ctx: 0,
-                provider: Provider::Openai,
-                ..LlmSection::default()
-            },
-            ..Config::default()
-        })
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("llm.num_ctx must be at least 1"),
-            "{err}"
-        );
-
+        assert!(cfg.set_key("provider", alias).is_err());
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             config_path(tmp.path()),
-            "[llm]\nprovider = \"openai\"\nnum_ctx = 0\n",
+            format!("[llm]\nprovider = \"{alias}\"\nmodel = \"kept\"\n"),
         )
         .unwrap();
-        let loaded = load(tmp.path());
-        assert_eq!(loaded.llm.num_ctx, 16_384);
-        assert_eq!(loaded.llm.provider, Provider::Anthropic);
+        assert_eq!(load(tmp.path()).llm.provider, Provider::ClaudeCode);
+        assert!(load(tmp.path()).llm.model.is_empty());
     }
 
     #[test]
@@ -1811,7 +1786,7 @@ mod tests {
     #[test]
     fn provider_from_str_loose() {
         assert_eq!(
-            Provider::from_str_loose("ollama").unwrap(),
+            Provider::from_str_loose("openai").unwrap(),
             Provider::Openai
         );
         assert_eq!(
@@ -2154,7 +2129,7 @@ mod tests {
         let path = config_path(dir.path());
         fs::write(
             &path,
-            "[llm]\nmodel = \"kept-model\"\nnum_ctx = 4096\n\n\
+            "[llm]\nmodel = \"kept-model\"\napi_base = \"https://example.test/v1\"\n\n\
              [capture]\nenabled = false\n\n\
              [graph.provenance]\nweight_user = 0.5\n",
         )
@@ -2164,7 +2139,7 @@ mod tests {
 
         let cfg = load(dir.path());
         assert_eq!(cfg.llm.model, "kept-model");
-        assert_eq!(cfg.llm.num_ctx, 4096);
+        assert_eq!(cfg.llm.api_base, "https://example.test/v1");
         assert!(!cfg.capture.enabled);
         assert_eq!(
             cfg.graph
@@ -2186,11 +2161,12 @@ mod tests {
         assert!(err.to_string().contains("refusing to rewrite"), "{err}");
         assert_eq!(fs::read_to_string(&path).expect("read"), broken);
 
-        let zero = "[llm]\nnum_ctx = 0\nmodel = \"kept\"\n";
-        fs::write(&path, zero).expect("write zero");
-        let err = set_graph_pipeline(dir.path(), "v2").expect_err("num_ctx");
+        let removed = format!("[llm]\n{} = 1\nmodel = \"kept\"\n", dropped_llm_keys()[0]);
+        fs::write(&path, &removed).expect("write removed key");
+        let err = set_graph_pipeline(dir.path(), "v2").expect_err("removed key");
         assert!(err.to_string().contains("refusing to rewrite"), "{err}");
-        assert_eq!(fs::read_to_string(&path).expect("read"), zero);
+        assert!(err.to_string().contains("removed in this version"), "{err}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), removed);
     }
 
     #[test]

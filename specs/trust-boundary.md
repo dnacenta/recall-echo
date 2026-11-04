@@ -28,9 +28,9 @@ Audit 2026-09-02, verified in code:
 - Only `archive-session`, `checkpoint`, `consume` use the root persisted by RE-46;
   `status`, `graph *`, `serve`, `mcp`, `what-do-you-know` use cwd. Memory "vanishes"
   depending on where the command runs.
-- `config.rs:983` turns any TOML parse error into `Config::default()` whose provider is the
-  Anthropic cloud API (`config.rs:551`). A typo in an Ollama config ships transcripts to a
-  vendor silently.
+- `config.rs` turns a TOML parse error into `Config::default()`, whose provider is the
+  user's CLI login. A typo in an HTTP provider config can still ship transcripts to a
+  vendor if the error is swallowed.
 - `llm_provider.rs:189` has no timeouts and runs under the admin lock that stops the daemon.
 - The memory tree is created at umask default while the socket is 0700.
 - MCP read side pastes up to 1,200 chars of recalled text into tool results with no envelope
@@ -129,7 +129,7 @@ One helper, `fence::Fence::new()` (per-process 64-bit random nonce, hex):
 - AC4: `init` writes hook commands without `--entity-root`; an existing hook with a baked root is rewritten flagless; an operator-carrying hook keeps its operator.
 - AC5: A root whose config is group-writable is refused with the path and mode in the message.
 - AC6: A config file with a TOML syntax error fails every command with the file path and line; nothing runs with defaults.
-- AC7: `api_base = "http://example.com"` fails at load; `http://127.0.0.1:11434` and `ws://localhost:8787` load.
+- AC7: `api_base = "http://example.com"` fails at load; `http://127.0.0.1:8080` and `ws://localhost:8787` load.
 - AC8: `password_file = "/etc/hostname"` fails at load; a path under the root loads.
 - AC9: A mock HTTP server that accepts and never responds makes `graph extract` fail within `timeout_secs + connect` seconds and the admin lock is released (existing lock tests extended).
 - AC10: A 503 then 200 sequence from a mock server yields one retry; a 400 yields none.

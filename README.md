@@ -17,8 +17,8 @@
 recall-echo captures your agent's sessions as they end, turns them into a knowledge graph
 while the machine is idle, and gives every claim a confidence that rises with corroboration
 and falls with contradiction. Your agent asks it questions over MCP. The database and the
-embeddings run locally; only extraction calls a model, and that can be the CLI subscription
-you already pay for.
+embeddings run locally; only extraction calls a model. The default is your own CLI
+login. Extraction sends session text to the provider you configure.
 
 ## Install
 

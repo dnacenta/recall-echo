@@ -18,7 +18,8 @@
 //! - one agent CLI installed — no question at all, that is the provider;
 //! - several — one short menu, defaulted to the CLI the session is running
 //!   under, because that is the subscription the user just proved they have;
-//! - none — the full provider menu, since now the choice really is open.
+//! - none — say to install a CLI and log in, or choose an API key. A scripted
+//!   install does not pick an API provider.
 //!
 //! And one yes/no, only when Claude Code's built-in auto-memory is on: turn it
 //! off, so MEMORY.md here is the one curated store? Enter means yes, end of
@@ -182,13 +183,7 @@ fn select_provider(
             );
             Some(only.provider())
         }
-        [] => {
-            eprintln!(
-                "\n  {WARN}~{RESET} No agent CLI found. Extraction needs a model provider — \
-                 {BOLD}ollama{RESET} is the free, local option."
-            );
-            prompt_any_provider(reader, interactive)
-        }
+        [] => prompt_when_no_cli(reader, interactive),
         several => prompt_installed_cli(reader, several, interactive),
     }
 }
@@ -244,7 +239,7 @@ fn prompt_installed_cli(
             cli.label()
         );
     }
-    eprintln!("  {BOLD}o{RESET}) other       {DIM}— Claude API, Ollama, or decide later{RESET}");
+    eprintln!("  {BOLD}a{RESET}) advanced    {DIM}— API key, billed per token{RESET}");
     eprint!("\n  Choice [{default_index}]: ");
     io::stderr().flush().ok();
 
@@ -257,8 +252,8 @@ fn prompt_installed_cli(
     if answer.is_empty() {
         return Some(default.provider());
     }
-    if answer == "o" || answer == "other" {
-        return prompt_any_provider(reader, interactive);
+    if answer == "a" || answer == "advanced" {
+        return prompt_api_key_provider(reader);
     }
     if let Some(cli) = answer
         .parse::<usize>()
@@ -274,30 +269,27 @@ fn prompt_installed_cli(
     Some(default.provider())
 }
 
-/// The full provider menu — every provider recall-echo speaks, installed or
-/// not. Reached when nothing was detected, or when the user asks for it.
-///
-/// Returns `None` if the user chose to configure it later.
-fn prompt_any_provider(reader: &mut dyn BufRead, interactive: bool) -> Option<Provider> {
+/// Nothing installed. Say so, and do not pick an API provider on the user's
+/// behalf. Interactive runs may still choose one.
+fn prompt_when_no_cli(reader: &mut dyn BufRead, interactive: bool) -> Option<Provider> {
+    eprintln!(
+        "\n  {WARN}~{RESET} No agent CLI found. Install one and log in, or choose an API key."
+    );
     if !interactive {
-        return Some(Provider::Anthropic);
+        return None;
     }
+    prompt_api_key_provider(reader)
+}
 
-    eprintln!("\n{BOLD}LLM provider for entity extraction:{RESET}");
-    eprintln!("  {BOLD}1{RESET}) anthropic   {DIM}— Claude API (default){RESET}");
-    eprintln!("  {BOLD}2{RESET}) ollama      {DIM}— Local models via Ollama, free{RESET}");
+/// API-key providers, offered only when the user asks. Enter skips them.
+fn prompt_api_key_provider(reader: &mut dyn BufRead) -> Option<Provider> {
+    eprintln!("\n{BOLD}Advanced (API key, billed per token){RESET}");
+    eprintln!("  {BOLD}1{RESET}) anthropic   {DIM}— set ANTHROPIC_API_KEY{RESET}");
+    eprintln!("  {BOLD}2{RESET}) openai      {DIM}— set OPENAI_API_KEY and api_base{RESET}");
     eprintln!(
-        "  {BOLD}3{RESET}) claude-code {DIM}— Spawns your `claude` CLI (subscription){RESET}"
+        "  {BOLD}3{RESET}) skip        {DIM}— Configure later with `recall-echo config`{RESET}"
     );
-    eprintln!(
-        "  {BOLD}4{RESET}) gemini      {DIM}— Spawns your `gemini` CLI (subscription){RESET}"
-    );
-    eprintln!("  {BOLD}5{RESET}) grok        {DIM}— Spawns your `grok` CLI (subscription){RESET}");
-    eprintln!("  {BOLD}6{RESET}) codex       {DIM}— Spawns your `codex` CLI (subscription){RESET}");
-    eprintln!(
-        "  {BOLD}7{RESET}) skip        {DIM}— Configure later with `recall-echo config`{RESET}"
-    );
-    eprint!("\n  Choice [1]: ");
+    eprint!("\n  Choice [3]: ");
     io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -306,16 +298,12 @@ fn prompt_any_provider(reader: &mut dyn BufRead, interactive: bool) -> Option<Pr
     }
 
     match input.trim() {
-        "" | "1" | "anthropic" => Some(Provider::Anthropic),
-        "2" | "ollama" => Some(Provider::Openai),
-        "3" | "claude-code" => Some(Provider::ClaudeCode),
-        "4" | "gemini" => Some(Provider::Gemini),
-        "5" | "grok" => Some(Provider::Grok),
-        "6" | "codex" => Some(Provider::Codex),
-        "7" | "skip" => None,
+        "" | "3" | "skip" => None,
+        "1" | "anthropic" => Some(Provider::Anthropic),
+        "2" | "openai" => Some(Provider::Openai),
         _ => {
-            eprintln!("  {WARN}~{RESET} Unknown choice, defaulting to anthropic");
-            Some(Provider::Anthropic)
+            eprintln!("  {WARN}~{RESET} Unknown choice, skipping the API provider");
+            None
         }
     }
 }
@@ -355,10 +343,7 @@ fn configure_llm(
         Ok(()) => {
             print_status(
                 Status::Created,
-                &format!(
-                    "Created .recall-echo.toml (provider: {})",
-                    label_of(&provider)
-                ),
+                &format!("Created .recall-echo.toml (provider: {})", provider),
             );
             Some(provider)
         }
@@ -369,19 +354,15 @@ fn configure_llm(
     }
 }
 
-/// The provider's name as a user knows it.
-fn label_of(provider: &Provider) -> String {
-    match provider {
-        Provider::Openai => "ollama (openai-compat)".to_string(),
-        other => other.to_string(),
-    }
-}
-
 /// The provider's name plus what it will cost.
 fn extraction_line(provider: &Provider) -> String {
     match provider {
-        Provider::Anthropic => "anthropic (Claude API — set ANTHROPIC_API_KEY)".into(),
-        Provider::Openai => "ollama (local models — free)".into(),
+        Provider::Anthropic => {
+            "anthropic (API key, billed per token — set ANTHROPIC_API_KEY)".into()
+        }
+        Provider::Openai => {
+            "openai (API key, billed per token — set OPENAI_API_KEY and api_base)".into()
+        }
         Provider::Cli => "custom CLI (from `[llm.cli]`)".into(),
         cli => format!("{cli} (your subscription — no API billing)"),
     }
@@ -1210,20 +1191,88 @@ mod tests {
         assert_eq!(default_cli(&[]), AgentCli::ClaudeCode);
     }
 
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn cli_env(path: &str, claude: &str, absent: &str) -> EnvRestore {
+        let pairs = [
+            ("PATH", path),
+            ("CLAUDE_BIN", claude),
+            ("GEMINI_BIN", absent),
+            ("GROK_BIN", absent),
+            ("CODEX_BIN", absent),
+        ];
+        let saved = pairs
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
+        for (key, value) in pairs {
+            std::env::set_var(key, value);
+        }
+        EnvRestore(saved)
+    }
+
     #[test]
-    fn no_installed_cli_falls_back_to_the_full_menu() {
-        let mut reader = Cursor::new(b"" as &[u8]);
-        assert_eq!(
-            select_provider(&mut reader, &[], false),
-            Some(Provider::Anthropic)
+    fn init_with_a_fake_cli_on_path_selects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let binary = bin.join("claude");
+        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let absent = dir.path().join("x");
+        let _env = cli_env(
+            bin.to_str().unwrap(),
+            binary.to_str().unwrap(),
+            absent.to_str().unwrap(),
         );
+        let found = agent_cli::installed();
+        assert_eq!(found, vec![AgentCli::ClaudeCode]);
+        let memory = dir.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        assert_eq!(
+            configure_llm(&mut Cursor::new(b"" as &[u8]), &memory, &found, false),
+            Some(Provider::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn init_with_no_cli_on_path_does_not_pick_an_api_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let absent = dir.path().join("x");
+        let absent = absent.to_str().unwrap();
+        let _env = cli_env(bin.to_str().unwrap(), absent, absent);
+        assert!(agent_cli::installed().is_empty());
+        let memory = dir.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        assert_eq!(
+            configure_llm(&mut Cursor::new(b"" as &[u8]), &memory, &[], false),
+            None
+        );
+        assert!(!config::exists(&memory));
     }
 
     #[test]
     fn the_summary_names_the_cost_of_each_provider() {
         assert!(extraction_line(&Provider::Grok).contains("no API billing"));
         assert!(extraction_line(&Provider::Anthropic).contains("ANTHROPIC_API_KEY"));
-        assert!(extraction_line(&Provider::Openai).contains("free"));
+        assert!(extraction_line(&Provider::Openai).contains("OPENAI_API_KEY"));
     }
 
     #[test]
@@ -1685,7 +1734,7 @@ mod tests {
         }
         fs::write(
             memory.join(".recall-echo.toml"),
-            "[llm]\nprovider = \"ollama\"\n",
+            "[llm]\nprovider = \"claude-code\"\n",
         )
         .unwrap();
         sandbox
