@@ -663,6 +663,8 @@ mod tests {
     /// detection and the later calls identically.
     #[test]
     fn the_command_is_the_presets_command() {
+        // Reads the same process environment the init tests rewrite.
+        let _lock = crate::test_env::lock();
         assert_eq!(AgentCli::ClaudeCode.command(), "claude");
         assert_eq!(AgentCli::Gemini.command(), "gemini");
         assert_eq!(AgentCli::Grok.command(), "grok");

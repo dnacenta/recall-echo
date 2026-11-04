@@ -8,9 +8,9 @@ optional; a missing file or an invalid value falls back to the default, silently
 max_entries = 5               # rolling window of session summaries, 1-50
 
 [llm]
-provider = "anthropic"        # default when unset; `init` writes the CLI it found
-model = ""                    # empty = the provider's default
-api_base = ""                 # HTTP providers only
+provider = "claude-code"      # default when unset; `init` writes the CLI it found
+model = ""                    # empty = the provider's default, except openai (no default)
+api_base = ""                 # HTTP only; required for openai, no default endpoint
 
 [llm.cli]                     # CLI providers; each key defaults to the preset
 # command = "mycli"           # binary name or path
@@ -77,14 +77,15 @@ provider will run. `recall-echo config set KEY VALUE` changes one (`provider`, `
 
 | `provider` | How it runs | What it costs |
 |---|---|---|
-| `claude-code` | spawns `claude` | Claude subscription |
+| `claude-code` | spawns `claude` | the user's own CLI login (the default) |
 | `gemini` | spawns `gemini` | Gemini subscription or free tier |
 | `grok` | spawns `grok` | Grok subscription |
 | `codex` | spawns `codex exec` | ChatGPT/Codex subscription |
 | `cli` | spawns whatever `[llm.cli]` describes | whatever that CLI costs |
-| `ollama` | HTTP to `localhost:11434/v1` | free, fully local |
-| `openai` | HTTP to any OpenAI-compatible endpoint | per token |
-| `anthropic` | HTTP to the Anthropic API | per token |
+| `openai` | HTTP to the OpenAI-compatible endpoint in `api_base` | per token; `api_base` and `OPENAI_API_KEY` are both required |
+| `anthropic` | HTTP to the Anthropic API | per token; set `ANTHROPIC_API_KEY` |
+
+`init` offers installed CLIs first. API keys are "advanced (API key, billed per token)". With no CLI installed it does not pick an API provider. A removed local-model key fails with `removed in this version; delete the key`.
 
 Embeddings are always local (fastembed/ONNX, no network after the model downloads once),
 so semantic search, HNSW indexing and traversal cost nothing whatever this is set to.

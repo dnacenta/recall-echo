@@ -5,13 +5,13 @@
 //! LLM providers implementing crate::graph::LlmProvider.
 //!
 //! Two families:
-//! - **HTTP** — Anthropic (x-api-key), any OpenAI-compatible endpoint, or
-//!   Ollama's native chat when the call carries a JSON schema. Billed per
-//!   token, or free when the endpoint is local.
+//! - **HTTP** — Anthropic (`x-api-key`) or any OpenAI-compatible endpoint.
+//!   Billed per token. The OpenAI-compatible one is opt-in: `api_base` and
+//!   `OPENAI_API_KEY` are both required, and there is no default endpoint.
 //! - **Agent CLI** — spawns the tool the user already subscribes to
 //!   (`claude`, `gemini`, `grok`, `codex`, or anything described in
 //!   `[llm.cli]`). No API key, no per-token billing. See
-//!   [`crate::cli_provider`].
+//!   [`crate::cli_provider`]. The default provider is one of these.
 //!
 //! Provider/model/api_base loaded from `.recall-echo.toml` config.
 //! API keys read from environment variables (never stored in config).
@@ -57,6 +57,9 @@ pub fn create_provider_with_binary(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<ProviderHandle, crate::error::RecallError> {
+    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
+        return Err(err);
+    }
     let mut cfg = config::load(memory_dir).llm;
 
     if let Some(p) = provider_override {
@@ -81,6 +84,9 @@ pub fn create_provider_with_overrides(
     memory_dir: &Path,
     overrides: &CliOverrides,
 ) -> Result<ProviderHandle, crate::error::RecallError> {
+    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
+        return Err(err);
+    }
     let mut cfg = config::load(memory_dir).llm;
     if let Some(command) = &overrides.command {
         let command = command.to_str().ok_or_else(|| {
@@ -188,35 +194,16 @@ impl LlmProvider for ClaudeCodeProvider {
 
 // ── HTTP providers (Anthropic + OpenAI-compat) ───────────────────────────
 
-/// API protocol style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiStyle {
-    Anthropic,
-    OpenAiCompat,
-    /// Ollama's native `/api/chat`, which can carry a JSON schema and `num_ctx`.
-    OllamaNative,
-}
-
 /// Resolved configuration for an HTTP LLM provider.
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     pub api_key: String,
     pub model: String,
     pub api_base: String,
-    /// Style for [`LlmProvider::complete`] and [`LlmProvider::complete_measured`].
-    /// Native chat is used here only when `[llm] api_style = "ollama"`.
-    pub api_style: ApiStyle,
+    /// [`Provider::Anthropic`] or [`Provider::Openai`]. Anything else is a CLI.
+    pub provider: Provider,
     pub max_retries: u32,
     pub retry_delay_ms: u64,
-    /// Configured floor for `options.num_ctx` on the native chat route.
-    /// A structured call may raise it to cover the prompt plus the reserved
-    /// reply, up to 32768. A higher configured value is kept.
-    pub num_ctx: u32,
-    /// Style for [`LlmProvider::complete_structured`]. Equal to `api_style`
-    /// except when `[llm] api_style` is unset and the base URL's port is
-    /// 11434: structured calls then use native chat, and plain calls stay on
-    /// `/v1/chat/completions`.
-    pub structured_style: ApiStyle,
 }
 
 impl HttpConfig {
@@ -224,24 +211,25 @@ impl HttpConfig {
     pub fn from_config_section(
         llm: &config::LlmSection,
     ) -> Result<Self, crate::error::RecallError> {
+        if !matches!(llm.provider, Provider::Anthropic | Provider::Openai) {
+            return Err(crate::error::RecallError::Config(format!(
+                "provider {} spawns a CLI — use create_provider()",
+                llm.provider
+            )));
+        }
         let model = llm.resolved_model().to_string();
         let api_base = llm.resolved_api_base().to_string();
-        let (api_style, structured_style) =
-            http_styles(&llm.provider, llm.api_style.as_deref(), &api_base)?;
-
-        let api_key = env::var("RECALL_LLM_API_KEY")
-            .or_else(|_| match api_style {
-                ApiStyle::Anthropic => env::var("ANTHROPIC_API_KEY"),
-                ApiStyle::OpenAiCompat | ApiStyle::OllamaNative => {
-                    env::var("OPENAI_API_KEY").or_else(|_| Ok("ollama".into()))
-                }
-            })
-            .map_err(|_| {
-                crate::error::RecallError::Config(
-                    "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your environment."
-                        .into(),
-                )
-            })?;
+        if llm.provider == Provider::Openai && api_base.is_empty() {
+            return Err(crate::error::RecallError::Config(
+                "llm.api_base is required for the openai provider".into(),
+            ));
+        }
+        if llm.provider == Provider::Openai && model.is_empty() {
+            return Err(crate::error::RecallError::Config(
+                "llm.model is required for the openai provider".into(),
+            ));
+        }
+        let api_key = api_key_for(&llm.provider)?;
 
         let max_retries = env::var("RECALL_LLM_MAX_RETRIES")
             .ok()
@@ -257,13 +245,37 @@ impl HttpConfig {
             api_key,
             model,
             api_base,
-            api_style,
+            provider: llm.provider.clone(),
             max_retries,
             retry_delay_ms,
-            num_ctx: llm.num_ctx,
-            structured_style,
         })
     }
+}
+
+/// `RECALL_LLM_API_KEY` overrides the provider key when it is non-empty.
+/// OpenAI-compatible HTTP does not invent a key when `OPENAI_API_KEY` is absent.
+fn api_key_for(provider: &Provider) -> Result<String, crate::error::RecallError> {
+    if let Some(key) = non_empty_env("RECALL_LLM_API_KEY") {
+        return Ok(key);
+    }
+    let (name, key) = match provider {
+        Provider::Anthropic => ("ANTHROPIC_API_KEY", non_empty_env("ANTHROPIC_API_KEY")),
+        Provider::Openai => ("OPENAI_API_KEY", non_empty_env("OPENAI_API_KEY")),
+        other => {
+            return Err(crate::error::RecallError::Config(format!(
+                "provider {other} spawns a CLI — use create_provider()"
+            )))
+        }
+    };
+    key.ok_or_else(|| {
+        crate::error::RecallError::Config(format!(
+            "No API key found. Set {name} in your environment."
+        ))
+    })
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// HTTP-based LLM provider.
@@ -317,23 +329,23 @@ impl HttpLlmProvider {
         max_tokens: u32,
         requested: Requested<'_>,
     ) -> Result<Completion, GraphError> {
-        let (style, schema) = match requested {
-            Requested::Text => (self.config.api_style, None),
-            Requested::Structured(schema) => (self.config.structured_style, Some(schema)),
+        let schema = match requested {
+            Requested::Text => None,
+            Requested::Structured(schema) => Some(schema),
         };
-        match style {
-            ApiStyle::Anthropic => {
+        match self.config.provider {
+            Provider::Anthropic => {
                 self.complete_anthropic(system_prompt, messages, max_tokens, schema)
                     .await
             }
-            ApiStyle::OpenAiCompat => {
+            Provider::Openai => {
                 self.complete_openai(system_prompt, messages, max_tokens, schema)
                     .await
             }
-            ApiStyle::OllamaNative => {
-                self.complete_ollama(system_prompt, messages, max_tokens, schema)
-                    .await
-            }
+            _ => Err(GraphError::Llm(format!(
+                "provider {} is not an HTTP provider",
+                self.config.provider
+            ))),
         }
     }
 
@@ -457,38 +469,6 @@ impl HttpLlmProvider {
         ))
     }
 
-    async fn complete_ollama(
-        &self,
-        system_prompt: &str,
-        messages: &[Message],
-        max_tokens: u32,
-        schema: Option<&serde_json::Value>,
-    ) -> Result<Completion, GraphError> {
-        let num_ctx = match schema {
-            Some(_) => effective_num_ctx(
-                self.config.num_ctx,
-                prompt_chars(system_prompt, messages),
-                max_tokens,
-            ),
-            None => self.config.num_ctx,
-        };
-        let body = ollama_body(
-            &self.config.model,
-            system_prompt,
-            messages,
-            max_tokens,
-            num_ctx,
-            schema,
-        );
-        let url = ollama_chat_url(&self.config.api_base);
-        let (status, text) = self.post_json(&url, Auth::Bearer, &body).await?;
-        let completion = ollama_completion(status, &text)?;
-        if schema.is_some() {
-            warn_if_prompt_truncated(&completion, num_ctx, max_tokens);
-        }
-        Ok(completion)
-    }
-
     fn is_retryable(err: &GraphError) -> bool {
         if let GraphError::Llm(msg) = err {
             msg.contains("API 429") || msg.contains("API 5")
@@ -563,75 +543,6 @@ impl LlmProvider for HttpLlmProvider {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Plain style and structured style for one HTTP provider.
-///
-/// `api_style = "ollama"` selects native chat for every call. Unset, on an
-/// OpenAI provider whose base URL uses port 11434, selects native chat for
-/// structured calls only. `api_style = "openai"` keeps `/v1/chat/completions`
-/// for both, even on that port.
-fn http_styles(
-    provider: &Provider,
-    api_style: Option<&str>,
-    api_base: &str,
-) -> Result<(ApiStyle, ApiStyle), crate::error::RecallError> {
-    let pin = match api_style {
-        None => None,
-        Some(value) => Some(config::canonical_api_style(value)?),
-    };
-    let plain = match provider {
-        Provider::Anthropic => ApiStyle::Anthropic,
-        Provider::Openai => match pin.as_deref() {
-            Some("ollama") => ApiStyle::OllamaNative,
-            Some("openai") | None => ApiStyle::OpenAiCompat,
-            Some(other) => {
-                return Err(crate::error::RecallError::Config(format!(
-                    "llm.api_style must be \"ollama\" or \"openai\" (got {other})"
-                )))
-            }
-        },
-        other => {
-            return Err(crate::error::RecallError::Config(format!(
-                "provider {other} spawns a CLI — use create_provider()"
-            )))
-        }
-    };
-    let structured = match (provider, pin.as_deref()) {
-        (Provider::Openai, None) if url_port(api_base) == Some(11434) => ApiStyle::OllamaNative,
-        (Provider::Openai, Some("ollama")) => ApiStyle::OllamaNative,
-        _ => plain,
-    };
-    Ok((plain, structured))
-}
-
-fn url_port(url: &str) -> Option<u16> {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let port = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once("]:")?.1
-    } else {
-        authority.rsplit_once(':')?.1
-    };
-    port.parse().ok()
-}
-
-/// Configured base with a trailing `/v1` removed, so `http://host:11434/v1`
-/// becomes the native origin `http://host:11434`.
-fn ollama_native_base(api_base: &str) -> String {
-    let trimmed = api_base.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/v1")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn ollama_chat_url(api_base: &str) -> String {
-    format!("{}/api/chat", ollama_native_base(api_base))
-}
-
 fn openai_chat_url(api_base: &str) -> String {
     format!("{}/chat/completions", api_base.trim_end_matches('/'))
 }
@@ -662,12 +573,6 @@ fn turn_values(messages: &[Message]) -> Vec<serde_json::Value> {
         .iter()
         .map(|message| turn_json(&message.role, &message.content))
         .collect()
-}
-
-fn prompt_chars(system_prompt: &str, messages: &[Message]) -> usize {
-    messages.iter().fold(system_prompt.len(), |total, message| {
-        total.saturating_add(message.content.len())
-    })
 }
 
 fn openai_body(
@@ -718,37 +623,6 @@ fn anthropic_body(
     body
 }
 
-fn ollama_body(
-    model: &str,
-    system_prompt: &str,
-    messages: &[Message],
-    max_tokens: u32,
-    num_ctx: u32,
-    schema: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let messages = messages_with_system(system_prompt, messages);
-    let options = serde_json::json!({
-        "num_ctx": num_ctx,
-        "temperature": 0,
-        "num_predict": max_tokens,
-    });
-    match schema {
-        Some(schema) => serde_json::json!({
-            "model": model,
-            "stream": false,
-            "format": schema,
-            "messages": messages,
-            "options": options,
-        }),
-        None => serde_json::json!({
-            "model": model,
-            "stream": false,
-            "messages": messages,
-            "options": options,
-        }),
-    }
-}
-
 fn api_failure(status: reqwest::StatusCode, text: &str) -> GraphError {
     GraphError::Llm(format!("API {status}: {}", truncate_str(text, 300)))
 }
@@ -777,18 +651,6 @@ fn openai_completion(status: reqwest::StatusCode, text: &str) -> Result<Completi
     Ok(Completion::measured(reply, openai_usage(&json)))
 }
 
-fn ollama_completion(status: reqwest::StatusCode, text: &str) -> Result<Completion, GraphError> {
-    if !status.is_success() {
-        return Err(api_failure(status, text));
-    }
-    let json: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| GraphError::Llm(format!("parse: {e}")))?;
-    let reply = json["message"]["content"]
-        .as_str()
-        .ok_or_else(|| GraphError::Llm("no text in ollama response".into()))?;
-    Ok(Completion::measured(reply, ollama_usage(&json)))
-}
-
 /// Anthropic's counts: `usage.input_tokens` / `usage.output_tokens`.
 fn anthropic_usage(json: &serde_json::Value) -> Option<TokenUsage> {
     TokenUsage::from_counts(
@@ -797,21 +659,11 @@ fn anthropic_usage(json: &serde_json::Value) -> Option<TokenUsage> {
     )
 }
 
-/// The OpenAI-compatible counts. Ollama and the other compatible servers use
-/// the same two keys; one that omits them is simply estimated.
+/// The OpenAI-compatible counts. A server that omits them is estimated.
 fn openai_usage(json: &serde_json::Value) -> Option<TokenUsage> {
     TokenUsage::from_counts(
         json["usage"]["prompt_tokens"].as_u64(),
         json["usage"]["completion_tokens"].as_u64(),
-    )
-}
-
-/// Ollama native chat reports `prompt_eval_count` and `eval_count` on the
-/// top-level object, not under `usage`.
-fn ollama_usage(json: &serde_json::Value) -> Option<TokenUsage> {
-    TokenUsage::from_counts(
-        json["prompt_eval_count"].as_u64(),
-        json["eval_count"].as_u64(),
     )
 }
 
@@ -822,41 +674,6 @@ fn truncate_str(text: &str, max: usize) -> &str {
         i -= 1;
     }
     &text[..i]
-}
-
-/// Automatic raise of a structured native `num_ctx` stops here.
-/// The configured value is a floor and may sit above this.
-const NUM_CTX_CAP: u32 = 32_768;
-
-/// Tokens to budget for a prompt: one per three characters, rounded up.
-fn estimated_prompt_tokens(prompt_chars: usize) -> u32 {
-    u32::try_from(prompt_chars.div_ceil(3)).unwrap_or(u32::MAX)
-}
-
-/// `num_ctx` for one structured native call.
-///
-/// `configured` is a floor. The window is at least the estimated prompt plus
-/// the reserved reply, and the automatic raise never exceeds [`NUM_CTX_CAP`].
-fn effective_num_ctx(configured: u32, prompt_chars: usize, max_tokens: u32) -> u32 {
-    let needed = estimated_prompt_tokens(prompt_chars).saturating_add(max_tokens);
-    configured.max(needed.min(NUM_CTX_CAP))
-}
-
-/// The prompt filled the window left after reserving the reply.
-fn prompt_may_be_truncated(prompt_eval_count: u64, num_ctx: u32, max_tokens: u32) -> bool {
-    prompt_eval_count >= u64::from(num_ctx.saturating_sub(max_tokens))
-}
-
-fn warn_if_prompt_truncated(completion: &Completion, num_ctx: u32, max_tokens: u32) {
-    let Some(usage) = completion.usage else {
-        return;
-    };
-    if prompt_may_be_truncated(usage.input_tokens, num_ctx, max_tokens) {
-        eprintln!(
-            "recall-echo: prompt may have been truncated (prompt_eval_count {count} >= num_ctx {num_ctx} - max_tokens {max_tokens})",
-            count = usage.input_tokens,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -900,62 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn ollama_native_body_has_format_and_num_ctx() {
-        let user = [Message::user("user")];
-        let body = ollama_body("qwen", "sys", &user, 4096, 24_576, Some(&schema()));
-        assert_eq!(body["stream"], false);
-        assert_eq!(body["format"], schema());
-        assert_eq!(body["options"]["num_ctx"], 24_576);
-        assert_eq!(body["options"]["temperature"], 0);
-        assert_eq!(body["options"]["num_predict"], 4096);
-        assert_eq!(body["messages"][0]["role"], "system");
-        assert_eq!(body["messages"][0]["content"], "sys");
-        assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(body["messages"][1]["content"], "user");
-
-        let plain = ollama_body("qwen", "sys", &user, 4096, 24_576, None);
-        assert!(plain.get("format").is_none(), "{plain}");
-    }
-
-    #[test]
-    fn ollama_base_strips_v1() {
-        assert_eq!(
-            ollama_native_base("http://localhost:11434/v1"),
-            "http://localhost:11434"
-        );
-        assert_eq!(
-            ollama_native_base("http://localhost:11434/v1/"),
-            "http://localhost:11434"
-        );
-        assert_eq!(
-            ollama_native_base("http://localhost:11434"),
-            "http://localhost:11434"
-        );
-        assert_eq!(
-            ollama_chat_url("http://localhost:11434/v1"),
-            "http://localhost:11434/api/chat"
-        );
-    }
-
-    #[test]
-    fn port_11434_selects_native_for_structured() {
-        let base = Provider::Openai.default_api_base();
-        assert_eq!(base, "http://localhost:11434/v1");
-        let (plain, structured) = http_styles(&Provider::Openai, None, base).unwrap();
-        assert_eq!(plain, ApiStyle::OpenAiCompat);
-        assert_eq!(structured, ApiStyle::OllamaNative);
-
-        let (plain, structured) =
-            http_styles(&Provider::Openai, Some("ollama"), "http://example:8080/v1").unwrap();
-        assert_eq!(plain, ApiStyle::OllamaNative);
-        assert_eq!(structured, ApiStyle::OllamaNative);
-
-        let (plain, structured) = http_styles(&Provider::Openai, Some("openai"), base).unwrap();
-        assert_eq!(plain, ApiStyle::OpenAiCompat);
-        assert_eq!(structured, ApiStyle::OpenAiCompat);
-    }
-
-    #[test]
     fn anthropic_body_has_output_config() {
         let user = [Message::user("user")];
         let body = anthropic_body("claude", "sys", &user, 100, Some(&schema()));
@@ -971,7 +732,7 @@ mod tests {
     #[test]
     fn openai_body_has_response_format() {
         let user = [Message::user("user")];
-        let body = openai_body("llama3.2", "sys", &user, 800, Some(&schema()));
+        let body = openai_body("m", "sys", &user, 800, Some(&schema()));
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["name"], "extraction");
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema());
@@ -987,11 +748,11 @@ mod tests {
     #[test]
     fn plain_openai_body_matches_the_pre_schema_shape() {
         let user = [Message::user("user")];
-        let body = openai_body("llama3.2", "sys", &user, 800, None);
+        let body = openai_body("m", "sys", &user, 800, None);
         assert_eq!(
             body,
             serde_json::json!({
-                "model": "llama3.2",
+                "model": "m",
                 "max_tokens": 800,
                 "messages": [
                     {"role": "system", "content": "sys"},
@@ -1001,8 +762,7 @@ mod tests {
         );
     }
 
-    /// The worked example is a real turn on every HTTP style. Ollama's options
-    /// and schema field stay where a single-turn call puts them.
+    /// The worked example is a real turn on both HTTP styles.
     #[test]
     fn chat_bodies_emit_the_turns_in_order() {
         let messages = [
@@ -1016,18 +776,7 @@ mod tests {
             ("user", "real-user"),
         ];
 
-        let ollama = ollama_body("qwen", "sys", &messages, 4096, 24_576, Some(&schema()));
-        assert_eq!(ollama["format"], schema());
-        assert_eq!(ollama["stream"], false);
-        assert_eq!(ollama["options"]["num_ctx"], 24_576);
-        assert_eq!(ollama["options"]["temperature"], 0);
-        assert_eq!(ollama["options"]["num_predict"], 4096);
-        assert_eq!(ollama["messages"].as_array().map(Vec::len), Some(4));
-        assert_eq!(ollama["messages"][0]["role"], "system");
-        assert_eq!(ollama["messages"][0]["content"], "sys");
-        assert_roles(&ollama["messages"], 1, &expected);
-
-        let openai = openai_body("llama3.2", "sys", &messages, 800, Some(&schema()));
+        let openai = openai_body("m", "sys", &messages, 800, Some(&schema()));
         assert_eq!(openai["messages"].as_array().map(Vec::len), Some(4));
         assert_eq!(openai["messages"][0]["role"], "system");
         assert_eq!(openai["messages"][0]["content"], "sys");
@@ -1046,27 +795,6 @@ mod tests {
             assert_eq!(messages[start + offset]["role"], *role);
             assert_eq!(messages[start + offset]["content"], *content);
         }
-    }
-
-    #[test]
-    fn ollama_usage_is_measured() {
-        let json = serde_json::json!({
-            "message": {"role": "assistant", "content": "{}"},
-            "prompt_eval_count": 5000,
-            "eval_count": 12,
-            "done_reason": "stop",
-        });
-        assert_eq!(
-            ollama_usage(&json),
-            Some(TokenUsage {
-                input_tokens: 5000,
-                output_tokens: 12,
-            })
-        );
-        assert_eq!(
-            ollama_usage(&serde_json::json!({"message": {"content": "{}"}})),
-            None
-        );
     }
 
     struct ScriptedReply {
@@ -1183,20 +911,14 @@ mod tests {
         (format!("http://{addr}"), requests)
     }
 
-    fn http_provider(
-        api_base: &str,
-        api_style: ApiStyle,
-        structured_style: ApiStyle,
-    ) -> HttpLlmProvider {
+    fn http_provider(api_base: &str, provider: Provider) -> HttpLlmProvider {
         HttpLlmProvider::for_tests(HttpConfig {
             api_key: "test".into(),
             model: "m".into(),
             api_base: api_base.to_string(),
-            api_style,
+            provider,
             max_retries: 0,
             retry_delay_ms: 0,
-            num_ctx: 16_384,
-            structured_style,
         })
     }
 
@@ -1218,7 +940,7 @@ mod tests {
             },
         ])
         .await;
-        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OpenAiCompat);
+        let provider = http_provider(&base, Provider::Openai);
         let completion = provider
             .complete_structured("sys", "user", &schema(), 128)
             .await
@@ -1256,7 +978,7 @@ mod tests {
             body: r#"{"error":"model not found"}"#.into(),
         }])
         .await;
-        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OpenAiCompat);
+        let provider = http_provider(&base, Provider::Openai);
         let err = provider
             .complete_structured("sys", "user", &schema(), 32)
             .await
@@ -1266,123 +988,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_call_on_the_port_split_stays_on_chat_completions() {
+    async fn a_plain_openai_call_posts_chat_completions() {
         let (base, requests) = scripted_server(vec![ScriptedReply {
             status: 200,
             body: r#"{"choices":[{"message":{"content":"OK"}}]}"#.into(),
         }])
         .await;
-        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OllamaNative);
+        let provider = http_provider(&base, Provider::Openai);
         let text = provider.complete("sys", "user", 32).await.unwrap();
         assert_eq!(text, "OK");
         let recorded = requests.lock().unwrap();
         assert_eq!(recorded[0].path, "/chat/completions");
         assert!(recorded[0].body.get("response_format").is_none());
-        assert!(recorded[0].body.get("format").is_none());
         assert_eq!(recorded[0].body["max_tokens"], 32);
-    }
-
-    #[test]
-    fn short_prompt_keeps_the_configured_num_ctx() {
-        assert_eq!(estimated_prompt_tokens(0), 0);
-        assert_eq!(estimated_prompt_tokens(1), 1);
-        assert_eq!(estimated_prompt_tokens(3), 1);
-        assert_eq!(estimated_prompt_tokens(4), 2);
-        assert_eq!(effective_num_ctx(16_384, 20, 128), 16_384);
-        assert_eq!(effective_num_ctx(8_192, 20, 128), 8_192);
-    }
-
-    /// Structured native `num_ctx` is sized from [`prompt_chars`], which counts
-    /// every turn, including the worked example.
-    #[test]
-    fn prompt_chars_counts_the_example_turns_in_num_ctx() {
-        let system = "sys";
-        let example_user = "example-user";
-        let example_reply = "example-reply-0123456789abcdef";
-        let real_user = "real";
-        let messages = [
-            Message::user(example_user),
-            Message::assistant(example_reply),
-            Message::user(real_user),
-        ];
-        let chars = prompt_chars(system, &messages);
-        assert_eq!(
-            chars,
-            system.len() + example_user.len() + example_reply.len() + real_user.len()
-        );
-        let without_example = prompt_chars(system, &[Message::user(real_user)]);
-        let floor = 8;
-        let max_tokens = 1;
-        assert_eq!(effective_num_ctx(floor, without_example, max_tokens), floor);
-        let raised = effective_num_ctx(floor, chars, max_tokens);
-        assert!(raised > floor, "{raised}");
-        assert_eq!(
-            raised,
-            estimated_prompt_tokens(chars).saturating_add(max_tokens)
-        );
-    }
-
-    #[test]
-    fn a_full_v2_window_raises_num_ctx_within_the_cap() {
-        let chars = 48_000 + crate::graph::v2::pass1::PASS1_SYSTEM.len();
-        let effective = effective_num_ctx(16_384, chars, 4_096);
-        let estimated = u32::try_from(chars.div_ceil(3)).unwrap();
-        let expected = 16_384u32.max(estimated.saturating_add(4_096).min(32_768));
-        assert_eq!(effective, expected);
-        assert!(effective > 16_384, "{effective}");
-        assert!(effective <= 32_768, "{effective}");
-    }
-
-    #[test]
-    fn an_absurd_prompt_is_capped_and_a_higher_floor_is_kept() {
-        let chars = 10_000_000;
-        assert_eq!(effective_num_ctx(16_384, chars, 4_096), 32_768);
-        assert_eq!(effective_num_ctx(40_000, chars, 4_096), 40_000);
-    }
-
-    #[test]
-    fn prompt_truncation_warning_fires_at_the_reserved_boundary() {
-        let num_ctx = 16_384;
-        let max_tokens = 4_096;
-        let limit = u64::from(num_ctx - max_tokens);
-        assert!(!prompt_may_be_truncated(limit - 1, num_ctx, max_tokens));
-        assert!(prompt_may_be_truncated(limit, num_ctx, max_tokens));
-        assert!(prompt_may_be_truncated(limit + 50, num_ctx, max_tokens));
-        assert!(prompt_may_be_truncated(0, 100, 4_096));
-    }
-
-    #[tokio::test]
-    async fn ollama_native_structured_round_trip() {
-        let (base, requests) = scripted_server(vec![ScriptedReply {
-            status: 200,
-            body: r#"{"message":{"role":"assistant","content":"{\"facts\":[]}"},"prompt_eval_count":120,"eval_count":4}"#.into(),
-        }])
-        .await;
-        let provider = http_provider(
-            &format!("{base}/v1"),
-            ApiStyle::OpenAiCompat,
-            ApiStyle::OllamaNative,
-        );
-        let completion = provider
-            .complete_structured("sys", "user", &schema(), 64)
-            .await
-            .unwrap();
-        assert_eq!(completion.text, r#"{"facts":[]}"#);
-        assert_eq!(
-            completion.usage,
-            Some(TokenUsage {
-                input_tokens: 120,
-                output_tokens: 4,
-            })
-        );
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded[0].path, "/api/chat");
-        assert_eq!(recorded[0].body["format"], schema());
-        assert_eq!(recorded[0].body["options"]["num_ctx"], 16_384);
-        assert_eq!(recorded[0].body["messages"][0]["role"], "system");
-        assert_eq!(recorded[0].body["messages"][0]["content"], "sys");
-        assert_eq!(recorded[0].body["messages"][1]["role"], "user");
-        assert_eq!(recorded[0].body["messages"][1]["content"], "user");
     }
 
     /// The posted body, not the body builder, carries the four turns in order.
@@ -1390,14 +1008,10 @@ mod tests {
     async fn posted_chat_body_has_four_messages_in_order() {
         let (base, requests) = scripted_server(vec![ScriptedReply {
             status: 200,
-            body: r#"{"message":{"role":"assistant","content":"{}"}}"#.into(),
+            body: r#"{"choices":[{"message":{"content":"{}"}}]}"#.into(),
         }])
         .await;
-        let provider = http_provider(
-            &format!("{base}/v1"),
-            ApiStyle::OpenAiCompat,
-            ApiStyle::OllamaNative,
-        );
+        let provider = http_provider(&base, Provider::Openai);
         let messages = [
             Message::user("example-user"),
             Message::assistant("example-reply"),
@@ -1409,7 +1023,7 @@ mod tests {
             .unwrap();
         let recorded = requests.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].path, "/api/chat");
+        assert_eq!(recorded[0].path, "/chat/completions");
         let posted = &recorded[0].body["messages"];
         assert_eq!(posted.as_array().map(Vec::len), Some(4));
         assert_eq!(posted[0]["role"], "system");
@@ -1420,7 +1034,10 @@ mod tests {
         assert_eq!(posted[2]["content"], "example-reply");
         assert_eq!(posted[3]["role"], "user");
         assert_eq!(posted[3]["content"], "real-user");
-        assert_eq!(recorded[0].body["format"], schema());
+        assert_eq!(
+            recorded[0].body["response_format"]["json_schema"]["schema"],
+            schema()
+        );
     }
 
     #[tokio::test]
@@ -1430,7 +1047,7 @@ mod tests {
             body: r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"usage":{"input_tokens":3,"output_tokens":2}}"#.into(),
         }])
         .await;
-        let provider = http_provider(&base, ApiStyle::Anthropic, ApiStyle::Anthropic);
+        let provider = http_provider(&base, Provider::Anthropic);
         let completion = provider
             .complete_structured("sys", "hi", &schema(), 32)
             .await
@@ -1462,7 +1079,7 @@ mod tests {
             },
         ])
         .await;
-        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OpenAiCompat);
+        let provider = http_provider(&base, Provider::Openai);
         let completion = provider
             .complete_structured("sys", "user", &schema(), 128)
             .await
@@ -1481,12 +1098,75 @@ mod tests {
             body: r#"{"error":"model not found"}"#.into(),
         }])
         .await;
-        let provider = http_provider(&base, ApiStyle::OpenAiCompat, ApiStyle::OpenAiCompat);
+        let provider = http_provider(&base, Provider::Openai);
         let err = provider
             .complete_structured("sys", "user", &schema(), 32)
             .await
             .expect_err("422");
         assert!(err.to_string().contains("API 422"), "{err}");
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    /// Restores the keys this test clears. Dropped while the env lock is held.
+    struct KeyRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for KeyRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn openai_section(api_base: &str, model: &str) -> config::LlmSection {
+        config::LlmSection {
+            provider: Provider::Openai,
+            api_base: api_base.into(),
+            model: model.into(),
+            ..config::LlmSection::default()
+        }
+    }
+
+    #[test]
+    fn openai_without_a_model_is_refused() {
+        let err = HttpConfig::from_config_section(&openai_section("https://example.test/v1", ""))
+            .unwrap_err();
+        assert!(err.to_string().contains("llm.model"), "{err}");
+        assert!(Provider::Openai.default_model().is_empty());
+    }
+
+    #[test]
+    fn openai_requires_an_endpoint_and_an_api_key() {
+        let _lock = crate::test_env::lock();
+        let saved: Vec<_> = ["OPENAI_API_KEY", "RECALL_LLM_API_KEY"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        let _restore = KeyRestore(saved);
+        let missing_base = HttpConfig::from_config_section(&openai_section("", "m")).unwrap_err();
+        assert!(
+            missing_base.to_string().contains("api_base"),
+            "{missing_base}"
+        );
+        assert!(Provider::Openai.default_api_base().is_empty());
+        let missing_key =
+            HttpConfig::from_config_section(&openai_section("https://example.test/v1", "m"))
+                .unwrap_err();
+        assert!(
+            missing_key.to_string().contains("OPENAI_API_KEY"),
+            "{missing_key}"
+        );
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        let built =
+            HttpConfig::from_config_section(&openai_section("https://example.test/v1", "m"))
+                .unwrap();
+        assert_eq!(built.api_key, "sk-test");
+        assert_eq!(built.model, "m");
     }
 }

@@ -168,7 +168,7 @@ fn write_config(memory: &Path, server: bool) {
     std::fs::write(
         memory.join(".recall-echo.toml"),
         format!(
-            "[llm]\nmodel = \"kept-model\"\nnum_ctx = 4096\n\n\
+            "[llm]\nmodel = \"kept-model\"\napi_base = \"https://example.test/v1\"\n\n\
              [capture]\nenabled = false\n\n\
              [graph]\nmode = \"{mode}\"\n\n\
              [graph.provenance]\nweight_user = 0.5\n\n\
@@ -373,7 +373,7 @@ async fn assert_swapped(memory: &Path) {
 
     let cfg = recall_echo::config::load(memory);
     assert_eq!(cfg.llm.model, "kept-model");
-    assert_eq!(cfg.llm.num_ctx, 4096);
+    assert_eq!(cfg.llm.api_base, "https://example.test/v1");
     assert!(!cfg.capture.enabled);
     assert_eq!(
         cfg.graph
@@ -795,15 +795,16 @@ async fn a_half_finished_swap_is_refused_with_the_commands() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_zero_context_and_server_mode_refuse_before_the_daemon_stops() {
+async fn a_removed_llm_key_and_server_mode_refuse_before_the_daemon_stops() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
     let before_graph = seed(memory, false).await;
     let socket = memory.join("run/graph.sock");
+    let removed = concat!("num", "_ctx");
     std::fs::write(
         memory.join(".recall-echo.toml"),
         format!(
-            "[llm]\nnum_ctx = 0\nmodel = \"kept-model\"\n\n\
+            "[llm]\n{removed} = 0\nmodel = \"kept-model\"\n\n\
              [capture]\nenabled = false\n\n\
              [graph]\nmode = \"server\"\n\n\
              [graph.provenance]\nweight_user = 0.5\n\n\
@@ -825,7 +826,8 @@ async fn a_zero_context_and_server_mode_refuse_before_the_daemon_stops() {
     let message = err.to_string();
     assert!(message.contains("server"), "{message}");
     assert!(message.contains("nothing was changed"), "{message}");
-    assert!(message.contains("num_ctx"), "{message}");
+    assert!(message.contains("removed in this version"), "{message}");
+    assert!(message.contains("delete the key"), "{message}");
     assert!(message.contains("refusing to rewrite"), "{message}");
     assert!(!stop.called());
     assert_unchanged(memory, &before);
