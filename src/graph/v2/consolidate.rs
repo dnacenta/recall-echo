@@ -26,7 +26,7 @@ use super::write::{
     WriteCtx, WriteStats, CLOSE_EDGE,
 };
 
-const PROMPT: &str = "CONSOLIDATE_V1";
+const PROMPT: &str = "CONSOLIDATE_V2";
 const NEIGHBOUR_CAP: usize = 48;
 const ROW_CAP: usize = 256;
 const CAP: usize = 6;
@@ -38,7 +38,8 @@ You compare stored project facts. For each numbered pair, OLD is a stored fact a
 - duplicate: same fact, same meaning.
 - unrelated: both can be true.
 - unsure.
-Copy quote verbatim from the EVIDENCE text that shows the change; if you cannot, answer unrelated or unsure. Do not use outside knowledge. Two values that can both hold (different settings, different components, a list) are unrelated.";
+Copy quote verbatim from the EVIDENCE text that shows the change; if you cannot, answer unrelated or unsure. Do not use outside knowledge. Two values that can both hold (different settings, different components, a list) are unrelated.
+Reply with one JSON object and nothing else (no prose, no markdown fence): {\"pairs\":[{\"i\":1,\"verdict\":\"supersedes\",\"quote\":\"old line\"},{\"i\":2,\"verdict\":\"duplicate\",\"quote\":\"same line\"},{\"i\":3,\"verdict\":\"unrelated\",\"quote\":\"\"},{\"i\":4,\"verdict\":\"unsure\",\"quote\":\"\"}]}";
 
 const DEFINE_CACHE: &str = "\
 DEFINE TABLE IF NOT EXISTS consolidation_cache SCHEMAFULL;
@@ -1050,12 +1051,19 @@ async fn cache_put(
 }
 
 fn cache_key(anchor: &Anchor, partner: &Row, evidence: &str) -> String {
+    digest_key(
+        [&anchor.value, &anchor.new_value, &partner.value, evidence],
+        PROMPT,
+    )
+}
+
+fn digest_key(parts: [&str; 4], prompt: &str) -> String {
     let raw = format!(
-        "{}\n{}\n{}\n{}\n{PROMPT}",
-        normalise(&anchor.value),
-        normalise(&anchor.new_value),
-        normalise(&partner.value),
-        normalise(evidence)
+        "{}\n{}\n{}\n{}\n{prompt}",
+        normalise(parts[0]),
+        normalise(parts[1]),
+        normalise(parts[2]),
+        normalise(parts[3]),
     );
     format!("{:x}", Sha256::digest(raw.as_bytes()))
 }
@@ -1080,7 +1088,9 @@ fn schema() -> Value {
 }
 
 fn parse_reply(text: &str) -> Result<Vec<(usize, String, String)>, ()> {
-    let value: Value = serde_json::from_str(text).map_err(|_| ())?;
+    // A later object is not a verdict when this one is not the schema.
+    let slice = first_object(text).ok_or(())?;
+    let value: Value = serde_json::from_str(slice).map_err(|_| ())?;
     let pairs = value.get("pairs").and_then(Value::as_array).ok_or(())?;
     let mut out = Vec::new();
     for item in pairs {
@@ -1100,6 +1110,46 @@ fn parse_reply(text: &str) -> Result<Vec<(usize, String, String)>, ()> {
         ));
     }
     Ok(out)
+}
+
+/// First balanced `{...}`. Braces inside a JSON string do not count.
+fn first_object(text: &str) -> Option<&str> {
+    let mut opened = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (index, ch) in text.char_indices() {
+        let Some(from) = opened else {
+            if ch == '{' {
+                opened = Some(index);
+                depth = 1;
+            }
+            continue;
+        };
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = index + ch.len_utf8();
+                    return Some(&text[from..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn cited<'a>(ctx: &'a WriteCtx<'_>, anchor: &'a Anchor) -> &'a str {
@@ -1715,6 +1765,10 @@ mod tests {
     }
 
     async fn judge_layout(quote: &str, turn_text: &str) -> (IngestionReport, Value) {
+        judge_turn(turn_text, &judged(&[(1, "supersedes", quote)])).await
+    }
+
+    async fn judge_turn(turn_text: &str, body: &str) -> (IngestionReport, Value) {
         let (_tmp, gm) = open().await;
         let old = setting(
             "acme",
@@ -1727,7 +1781,7 @@ mod tests {
         let next = setting("acme", Kind::Project, "layout", "rich text", turn_text);
         let turns = [turn(turn_text)];
         let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
-        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let stub = Stub::new(Answer::Reply(body.to_string()));
         let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
         let slot = live_any(&slots(&gm, "acme").await, "format", "plain text").clone();
         (report, slot)
@@ -2328,5 +2382,94 @@ mod tests {
             .collect();
         assert_eq!(loaded_ids.len(), 16);
         assert_eq!(loaded_ids, first);
+    }
+
+    fn one(text: &str) -> (String, String) {
+        let rows = parse_reply(text).expect("reply");
+        assert_eq!(rows.len(), 1);
+        (rows[0].1.clone(), rows[0].2.clone())
+    }
+
+    #[test]
+    fn fenced_wrapped_and_first_object_only() {
+        assert_ne!(PROMPT, "CONSOLIDATE_V1");
+        assert_eq!(MAX_TOKENS, 400);
+        let tail = SYSTEM.lines().last().expect("system");
+        assert!(tail.contains("one JSON object and nothing else"));
+        assert!(tail.contains("no prose") && tail.contains("no markdown fence"));
+        assert!(["supersedes", "duplicate", "unrelated", "unsure"]
+            .iter()
+            .all(|verdict| tail.contains(&format!("\"verdict\":\"{verdict}\""))));
+        let kept = judged(&[(1, "unrelated", "a { b }")]);
+        assert_eq!(one(&kept), ("unrelated".into(), "a { b }".into()));
+        let fenced = format!("```json\n{}\n```", judged(&[(1, "duplicate", "same fact")]));
+        assert_eq!(one(&fenced).0, "duplicate");
+        let wrapped = format!("note\n{}\nend", judged(&[(1, "unsure", "")]));
+        assert_eq!(one(&wrapped).0, "unsure");
+        let later = judged(&[(1, "supersedes", "later")]);
+        assert_eq!(one(&format!("{kept} {later}")).0, "unrelated");
+        assert!(parse_reply(&format!("{{}} {later}")).is_err());
+        assert!(parse_reply("1. unrelated {\"verdict\":\"supersedes\"}\n2. unrelated").is_err());
+        assert!(parse_reply("1. unrelated\n2. unrelated\n\nboth can hold").is_err());
+    }
+
+    #[tokio::test]
+    async fn fenced_wrapped_and_prose_follow_the_count() {
+        let turn_text = "Switch to rich text instead of plain text.";
+        let fenced = format!(
+            "```json\n{}\n```",
+            judged(&[(1, "supersedes", "instead of plain text")])
+        );
+        let (report, slot) = judge_turn(turn_text, &fenced).await;
+        assert_eq!(
+            (report.consolidate.errors, report.consolidate.closes_sup),
+            (0, 1)
+        );
+        assert_eq!(ended(&slot), Some("s2:consolidated"));
+        let wrapped = format!(
+            "note\n{}\nthanks",
+            judged(&[(1, "supersedes", "not in the evidence at all")])
+        );
+        let (report, slot) = judge_turn(turn_text, &wrapped).await;
+        assert_eq!(
+            (report.consolidate.errors, report.consolidate.closes_sup),
+            (0, 0)
+        );
+        assert!(ended(&slot).is_none());
+        let (report, slot) =
+            judge_turn(turn_text, "1. unrelated\n2. unrelated\n\nboth can hold").await;
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(
+            (
+                report.consolidate.errors,
+                report.consolidate.closes_sup,
+                report.consolidate.closes_dup
+            ),
+            (1, 0, 0)
+        );
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_v1_cache_row_is_not_returned() {
+        let (_tmp, gm) = open().await;
+        define_cache(&gm).await.unwrap();
+        let parts = [
+            "quartz beacon",
+            "quartz beacon",
+            "quartz marker",
+            "Keep the quartz beacon for now.",
+        ];
+        let v1 = digest_key(parts, "CONSOLIDATE_V1");
+        let current = digest_key(parts, PROMPT);
+        assert_ne!(v1, current);
+        gm.db()
+            .query(format!("CREATE consolidation_cache SET key = '{v1}', verdict = 'supersedes', quote = 'instead of quartz marker', prompt = 'CONSOLIDATE_V1', at = time::now()"))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(cache_get(&gm, &current).await.unwrap().is_none());
+        assert_eq!(cache_get(&gm, &v1).await.unwrap().unwrap().0, "supersedes");
     }
 }
