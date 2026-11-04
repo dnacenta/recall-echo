@@ -7,7 +7,7 @@ changes a user has to know about before upgrading.
 
 ### Added
 
-- Opt-in consolidation pass after a session write (`[graph] consolidate`, `--consolidate`), off by default (#182).
+- Opt-in consolidation pass after a session write (`[graph] consolidate`, `--consolidate`), off by default. The judge reply is one JSON object; a fenced or wrapped object is read and prose is not (#182, #184).
 
 ### Breaking
 
