@@ -2402,6 +2402,9 @@ mod tests {
             .all(|verdict| tail.contains(&format!("\"verdict\":\"{verdict}\""))));
         let kept = judged(&[(1, "unrelated", "a { b }")]);
         assert_eq!(one(&kept), ("unrelated".into(), "a { b }".into()));
+        // A lone brace and an escaped quote inside a string do not end the object.
+        let lone = judged(&[(1, "unsure", "a } b \" c")]);
+        assert_eq!(one(&format!("note {lone} end")).1, "a } b \" c");
         let fenced = format!("```json\n{}\n```", judged(&[(1, "duplicate", "same fact")]));
         assert_eq!(one(&fenced).0, "duplicate");
         let wrapped = format!("note\n{}\nend", judged(&[(1, "unsure", "")]));
