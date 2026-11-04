@@ -6,7 +6,9 @@
 //! could not see. It does not write evidence or edit a value.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -25,6 +27,8 @@ use super::write::{
 };
 
 const PROMPT: &str = "CONSOLIDATE_V1";
+const NEIGHBOUR_CAP: usize = 48;
+const ROW_CAP: usize = 256;
 const CAP: usize = 6;
 const PER_ANCHOR: usize = 2;
 const MAX_TOKENS: u32 = 400;
@@ -118,7 +122,8 @@ pub(crate) async fn run(
         report.consolidate.errors += 1;
         return;
     }
-    let Ok(loaded) = load_rows(gm, ctx.session_id).await else {
+    let names = wanted_names(&rough, ctx);
+    let Ok(loaded) = load_rows(gm, ctx.session_id, &names).await else {
         report.consolidate.errors += 1;
         return;
     };
@@ -223,22 +228,18 @@ pub(crate) async fn run(
             turn,
             &anchor.replaces,
         );
-        accepted.push((pair, verdict, fold_ws(&quote)));
+        accepted.push((pair, verdict));
     }
     let mut blocked = BTreeSet::new();
     let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (index, (pair, verdict, quote)) in accepted.iter().enumerate() {
+    for (index, (pair, verdict)) in accepted.iter().enumerate() {
         if verdict == "supersedes" {
             grouped.entry(pair.anchor).or_default().push(index);
-            let _ = quote;
         }
     }
     for indexes in grouped.values() {
-        let mut quotes: BTreeMap<&str, u32> = BTreeMap::new();
-        for index in indexes {
-            *quotes.entry(accepted[*index].2.as_str()).or_insert(0) += 1;
-        }
-        if quotes.values().any(|count| *count >= 2) {
+        // Two supersedes for one anchor close nothing, whatever the quotes.
+        if indexes.len() >= 2 {
             for index in indexes {
                 blocked.insert(*index);
                 *report
@@ -249,7 +250,7 @@ pub(crate) async fn run(
             }
         }
     }
-    for (index, (pair, verdict, _)) in accepted.iter().enumerate() {
+    for (index, (pair, verdict)) in accepted.iter().enumerate() {
         if blocked.contains(&index) {
             continue;
         }
@@ -588,10 +589,44 @@ fn accept(
     }
     let in_evidence = contains_folded(evidence, quote);
     let in_value = duplicate && (contains_folded(old, quote) || contains_folded(new_value, quote));
-    if !(in_evidence || in_value) || (verdict == "supersedes" && !departs(turn, old, replaces)) {
+    if !quote_span(quote)
+        || !(in_evidence || in_value)
+        || (verdict == "supersedes" && !departs(turn, old, replaces))
+    {
         return "unsure".into();
     }
     verdict.to_string()
+}
+
+/// A quote has to be a real span of stored text, not one letter of it.
+fn quote_span(quote: &str) -> bool {
+    let folded = fold_ws(quote);
+    folded.chars().count() >= 12 && alphanumeric_runs(&folded).len() >= 2
+}
+
+/// Another loaded live row still carries `value`.
+fn kept_copy(rows: &[Row], closing: usize, value: &str) -> bool {
+    rows.iter()
+        .enumerate()
+        .any(|(index, row)| index != closing && values_equal(&row.value, value))
+}
+
+fn wanted_names(anchors: &[Anchor], ctx: &WriteCtx<'_>) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    if !ctx.project.name.is_empty() {
+        names.insert(ctx.project.name.clone());
+    }
+    for alias in &ctx.project.aliases {
+        if !alias.is_empty() {
+            names.insert(alias.clone());
+        }
+    }
+    for anchor in anchors {
+        if !anchor.subject.is_empty() {
+            names.insert(anchor.subject.clone());
+        }
+    }
+    names.into_iter().take(NEIGHBOUR_CAP).collect()
 }
 
 fn departs(turn: &str, old: &str, replaces: &str) -> bool {
@@ -654,12 +689,28 @@ async fn close_duplicate(
 ) {
     let partner = &rows[pair.partner];
     let Some(live) = anchors[pair.anchor].live else {
-        if !partner.here {
+        // No kept copy of this value. A duplicate close would drop the only
+        // live row. That needs the supersede path, which checks quote and cue.
+        if kept_copy(rows, pair.partner, &partner.value) && !partner.here {
             close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+        } else {
+            *report
+                .consolidate
+                .skips
+                .entry("consolidate_dup_no_copy".into())
+                .or_insert(0) += 1;
         }
         return;
     };
     let mine = &rows[live];
+    if !values_equal(&mine.value, &partner.value) {
+        *report
+            .consolidate
+            .skips
+            .entry("consolidate_dup_no_copy".into())
+            .or_insert(0) += 1;
+        return;
+    }
     let close_partner_row =
         partner.from > mine.from || (partner.from == mine.from && !partner.here);
     if close_partner_row {
@@ -745,14 +796,58 @@ async fn close_row(
     Ok(true)
 }
 
-async fn load_rows(gm: &GraphMemory, session: &str) -> Result<Loaded, GraphError> {
-    let mut response = gm.db().query("SELECT * OMIT embedding FROM entity").await?;
-    let entities: Vec<Entity> = deserialize_take(&mut response, 0)?;
-    let mut response = gm
-        .db()
-        .query("SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence FROM relates_to")
-        .await?;
-    let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
+async fn load_rows(
+    gm: &GraphMemory,
+    session: &str,
+    names: &[String],
+) -> Result<Loaded, GraphError> {
+    let mut entities = load_named(gm, names).await?;
+    let mut seen: BTreeSet<String> = entities.iter().map(Entity::id_string).collect();
+    let seeds: Vec<String> = seen.iter().cloned().collect();
+    let mut part_links = Vec::new();
+    for id in &seeds {
+        if part_links.len() >= NEIGHBOUR_CAP {
+            break;
+        }
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE) LIMIT 16",
+            )
+            .bind(("id", id.clone()))
+            .await?;
+        let incoming: Vec<Value> = deserialize_take(&mut response, 0)?;
+        for row in incoming {
+            let from = id_text(row.get("in"));
+            if from.is_empty() {
+                continue;
+            }
+            part_links.push((from.clone(), id.clone()));
+            if seen.contains(&from) || seen.len() >= NEIGHBOUR_CAP {
+                continue;
+            }
+            seen.insert(from.clone());
+            if let Some(entity) = load_entity(gm, &from).await? {
+                entities.push(entity);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for entity in entities.iter().take(NEIGHBOUR_CAP) {
+        if edges.len() >= ROW_CAP {
+            break;
+        }
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence FROM type::record($id)->(relates_to WHERE valid_until = NONE) LIMIT 32",
+            )
+            .bind(("id", entity.id_string()))
+            .await?;
+        let batch: Vec<Value> = deserialize_take(&mut response, 0)?;
+        edges.extend(batch);
+    }
+    let mut part_of = part_links;
     let mut names = BTreeMap::new();
     let mut owners = Vec::new();
     let mut rows = Vec::new();
@@ -778,6 +873,9 @@ async fn load_rows(gm: &GraphMemory, session: &str) -> Result<Loaded, GraphError
             continue;
         };
         for (index, slot) in slots.iter().enumerate() {
+            if rows.len() >= ROW_CAP {
+                break;
+            }
             if crud::edge_already_closed(slot.get("valid_until")) {
                 continue;
             }
@@ -811,8 +909,7 @@ async fn load_rows(gm: &GraphMemory, session: &str) -> Result<Loaded, GraphError
             });
         }
     }
-    let mut part_of = Vec::new();
-    for edge in &edges {
+    for edge in edges.iter().take(ROW_CAP) {
         if crud::edge_already_closed(edge.get("valid_until")) {
             continue;
         }
@@ -848,6 +945,29 @@ async fn load_rows(gm: &GraphMemory, session: &str) -> Result<Loaded, GraphError
         owners,
         part_of,
     })
+}
+
+async fn load_named(gm: &GraphMemory, names: &[String]) -> Result<Vec<Entity>, GraphError> {
+    let names: Vec<String> = names.iter().take(NEIGHBOUR_CAP).cloned().collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut response = gm
+        .db()
+        .query("SELECT * OMIT embedding FROM entity WHERE name INSIDE $names LIMIT 48")
+        .bind(("names", names))
+        .await?;
+    deserialize_take(&mut response, 0)
+}
+
+async fn load_entity(gm: &GraphMemory, id: &str) -> Result<Option<Entity>, GraphError> {
+    let mut response = gm
+        .db()
+        .query("SELECT * OMIT embedding FROM type::record($id)")
+        .bind(("id", id.to_string()))
+        .await?;
+    let rows: Vec<Entity> = deserialize_take(&mut response, 0)?;
+    Ok(rows.into_iter().next())
 }
 
 fn id_text(id: Option<&Value>) -> String {
@@ -908,8 +1028,9 @@ async fn cache_put(
 
 fn cache_key(anchor: &Anchor, partner: &Row, evidence: &str) -> String {
     let raw = format!(
-        "{}\n{}\n{}\n{PROMPT}",
-        normalise(&anchor.text),
+        "{}\n{}\n{}\n{}\n{PROMPT}",
+        normalise(&anchor.value),
+        normalise(&anchor.new_value),
         normalise(&partner.value),
         normalise(evidence)
     );
@@ -1028,34 +1149,61 @@ fn key_overlap(left: &str, right: &str, names: &[String]) -> bool {
         .any(|token| left.contains(&token))
 }
 
+struct ValueClasses {
+    duration: Option<Regex>,
+    version: Option<Regex>,
+    number: Option<Regex>,
+    path: Option<Regex>,
+    command: Option<Regex>,
+    ident: Option<Regex>,
+}
+
+fn value_classes() -> &'static ValueClasses {
+    static CLASSES: OnceLock<ValueClasses> = OnceLock::new();
+    CLASSES.get_or_init(|| ValueClasses {
+        duration: Regex::new(r"(?i)^\d+(?:\.\d+)?\s*(?:ms|sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days|[smhd])$").ok(),
+        version: Regex::new(r"(?i)^v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.]+)?$").ok(),
+        number: Regex::new(r"^[+-]?\d+(?:\.\d+)?$").ok(),
+        path: Regex::new(r"(?i)(?:/|\\|\{\{|\{[A-Za-z0-9_]+\}|YYYY)").ok(),
+        command: Regex::new(r"(?i)(?:^|\s)--?[A-Za-z]|&&|\|\||`[^`]+`").ok(),
+        ident: Regex::new(r"^[A-Za-z_][A-Za-z0-9_-]*$").ok(),
+    })
+}
+
 fn value_class(value: &str) -> &'static str {
     let value = value.trim();
-    if regex_is(
-        r"(?i)^\d+(?:\.\d+)?\s*(?:ms|sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days|[smhd])$",
-        value,
-    ) {
+    let classes = value_classes();
+    if classes
+        .duration
+        .as_ref()
+        .is_some_and(|re| re.is_match(value))
+    {
         return "duration";
     }
-    if regex_is(r"(?i)^v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.]+)?$", value) {
+    if classes
+        .version
+        .as_ref()
+        .is_some_and(|re| re.is_match(value))
+    {
         return "version";
     }
-    if regex_is(r"^[+-]?\d+(?:\.\d+)?$", value) {
+    if classes.number.as_ref().is_some_and(|re| re.is_match(value)) {
         return "number";
     }
-    if regex_is(r"(?i)(?:/|\\|\{\{|\{[A-Za-z0-9_]+\}|YYYY)", value) {
+    if classes.path.as_ref().is_some_and(|re| re.is_match(value)) {
         return "path";
     }
-    if regex_is(r"(?i)(?:^|\s)--?[A-Za-z]|&&|\|\||`[^`]+`", value) {
+    if classes
+        .command
+        .as_ref()
+        .is_some_and(|re| re.is_match(value))
+    {
         return "command";
     }
-    if regex_is(r"^[A-Za-z_][A-Za-z0-9_-]*$", value) {
+    if classes.ident.as_ref().is_some_and(|re| re.is_match(value)) {
         return "identifier";
     }
     "prose"
-}
-
-fn regex_is(pattern: &str, value: &str) -> bool {
-    regex::Regex::new(pattern).is_ok_and(|pattern| pattern.is_match(value))
 }
 
 fn contains_folded(haystack: &str, needle: &str) -> bool {
@@ -1199,7 +1347,7 @@ mod tests {
             _: u32,
         ) -> Result<Completion, GraphError> {
             Ok(Completion::unmeasured(
-                r#"{"facts":[{"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"cover","object":"linen cover","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Ship the shelf with a linen cover.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+                r#"{"facts":[{"subject":"harbor","subject_type":"project","predicate":"setting","role":"none","key":"cover","object":"woven wrap","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Pack the harbor with a woven wrap.","confidence":0.9}],"bugs":[],"releases":[]}"#,
             ))
         }
 
@@ -1328,6 +1476,28 @@ mod tests {
 
     fn ended(slot: &Value) -> Option<&str> {
         slot.get("ended_by").and_then(Value::as_str)
+    }
+
+    async fn rewrite_slot(gm: &GraphMemory, name: &str, key: &str, from: &str, to: &str) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let slot = slots
+            .iter_mut()
+            .find(|slot| slot["key"] == key && slot["value"] == from)
+            .unwrap();
+        slot["value"] = json!(to);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
     }
 
     async fn cache_defined(gm: &GraphMemory) -> bool {
@@ -1825,7 +1995,7 @@ mod tests {
             std::fs::create_dir_all(memory.join("conversations")).unwrap();
             std::fs::write(
                 memory.join("conversations/conversation-002.md"),
-                "---\nlog: 2\ndate: \"2026-04-02T00:00:00Z\"\nsession_id: \"s2\"\n---\n\n### User\n\nShip the shelf with a linen cover.\n",
+                "---\nlog: 2\ndate: \"2026-04-02T00:00:00Z\"\nsession_id: \"s2\"\n---\n\n### User\n\nPack the harbor with a woven wrap.\n",
             )
             .unwrap();
             let gm = GraphMemory::open_embedded(&memory.join("graph"))
@@ -1833,18 +2003,18 @@ mod tests {
                 .unwrap();
             ensure_v2_store(&gm).await.unwrap();
             let old = setting(
-                "shelf",
+                "harbor",
                 Kind::Project,
-                "wrap",
-                "linen wrap",
-                "wrap is linen wrap",
+                "cloth",
+                "woven cloth",
+                "cloth is woven cloth",
             );
-            let shelf = ProjectIdentity {
-                name: "shelf".into(),
+            let harbor = ProjectIdentity {
+                name: "harbor".into(),
                 aliases: Vec::new(),
             };
             let spoken = [turn(&old.quote)];
-            let ctx = WriteCtx::new(&Quiet, &shelf, "s1", "2026-04-01", &spoken);
+            let ctx = WriteCtx::new(&Quiet, &harbor, "s1", "2026-04-01", &spoken);
             write_facts(&gm, &ctx, &[old]).await.unwrap();
             let provider = Split {
                 answer,
@@ -1864,7 +2034,164 @@ mod tests {
             assert_eq!(report.consolidate.errors, 1);
             assert_eq!(report.consolidate.closes_sup, 0);
             assert!(report.errors.is_empty(), "{:?}", report.errors);
-            assert!(ended(live_any(&slots(&gm, "shelf").await, "wrap", "linen wrap")).is_none());
+            assert!(ended(live_any(
+                &slots(&gm, "harbor").await,
+                "cloth",
+                "woven cloth"
+            ))
+            .is_none());
         }
+    }
+
+    /// The probe: a one-letter duplicate quote, and a longer one, against the
+    /// only live copy. Neither closes it.
+    #[tokio::test]
+    async fn a_duplicate_quote_does_not_close_the_only_live_copy() {
+        for quote in ["p", "plain grid layout"] {
+            let (_tmp, gm) = open().await;
+            let grid = setting(
+                "acme",
+                Kind::Project,
+                "layout",
+                "plain grid",
+                "layout is plain grid",
+            );
+            let text = setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "plain text",
+                "format is plain text",
+            );
+            commit(
+                &gm,
+                "s1",
+                "2026-03-01",
+                &[turn("layout is plain grid. format is plain text")],
+                &[grid, text],
+            )
+            .await;
+            let spoken = "Leave the plain grid layout in place.";
+            let mut rejected = setting("acme", Kind::Project, "format", "plain text", spoken);
+            rejected.status = "rejected".into();
+            let turns = [turn(spoken)];
+            let stats = commit(
+                &gm,
+                "s2",
+                "2026-03-02",
+                &turns,
+                std::slice::from_ref(&rejected),
+            )
+            .await;
+            let stub = Stub::new(Answer::Reply(judged(&[(1, "duplicate", quote)])));
+            let report = pass(&gm, "s2", "2026-03-02", &turns, &[rejected], &stats, &stub).await;
+            assert_eq!(stub.calls(), 1, "{quote}");
+            assert_eq!(report.consolidate.closes_dup, 0, "{quote}");
+            assert_eq!(report.consolidate.closes_sup, 0, "{quote}");
+            assert!(
+                ended(live_any(&slots(&gm, "acme").await, "layout", "plain grid")).is_none(),
+                "{quote}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_one_character_quote_closes_nothing() {
+        let (report, slot) = judge_layout("t", "Switch to rich text instead of plain text.").await;
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn two_supersedes_with_different_quotes_close_none() {
+        let (_tmp, gm) = open().await;
+        let plank = setting(
+            "acme",
+            Kind::Project,
+            "plank",
+            "cedar plank",
+            "plank is cedar plank",
+        );
+        let board = setting(
+            "acme",
+            Kind::Project,
+            "board",
+            "cedar board",
+            "board is cedar board",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("cedar plank and cedar board")],
+            &[plank, board],
+        )
+        .await;
+        let quote =
+            "Use cedar beam instead of cedar plank. Prefer cedar beam instead of cedar board.";
+        let next = setting("acme", Kind::Project, "beam", "cedar beam", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", "instead of cedar plank"),
+            (2, "supersedes", "instead of cedar board"),
+        ])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message.lock().unwrap());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(
+            report
+                .consolidate
+                .skips
+                .get("consolidate_ambiguous")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(live_any(&rows, "plank", "cedar plank")).is_none());
+        assert!(ended(live_any(&rows, "board", "cedar board")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_changed_partner_value_is_judged_again() {
+        let (_tmp, gm) = open().await;
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "old",
+            "quartz marker",
+            "old is quartz marker",
+        );
+        commit(&gm, "s1", "2026-03-01", &[turn(&old.quote)], &[old]).await;
+        let quote = "Keep the quartz beacon for now.";
+        let first = setting("acme", Kind::Project, "new", "quartz beacon", quote);
+        let turns = [turn(quote)];
+        let stats = commit(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            std::slice::from_ref(&first),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "unrelated", "quartz beacon")])));
+        pass(&gm, "s2", "2026-03-02", &turns, &[first], &stats, &stub).await;
+        assert_eq!(stub.calls(), 1);
+        rewrite_slot(&gm, "acme", "old", "quartz marker", "quartz signal").await;
+        let again = setting("acme", Kind::Project, "newer", "quartz beacon", quote);
+        let stats = commit(
+            &gm,
+            "s3",
+            "2026-03-04",
+            &turns,
+            std::slice::from_ref(&again),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "unrelated", "quartz beacon")])));
+        let report = pass(&gm, "s3", "2026-03-04", &turns, &[again], &stats, &stub).await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message.lock().unwrap());
+        assert_eq!(report.consolidate.closes_sup, 0);
     }
 }
