@@ -9,7 +9,7 @@
 //! moved the way that operation moves it, including the provenance weight on
 //! a corroboration or a contradiction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -275,6 +275,11 @@ pub struct WriteReport {
     /// script's report keeps its previous shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patterns: Option<PatternScore>,
+    /// Dropped consolidation verdicts, summed across sessions. Omitted when
+    /// the switch is off or nothing was dropped, so an off run stays the
+    /// same shape.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consolidate_drops: BTreeMap<String, u32>,
 }
 
 /// How many facts, pairs and noise items landed in each pattern bucket.
@@ -590,7 +595,19 @@ pub fn grade_with_pipeline(
         output_tokens_per_session,
         setup_millis: 0,
         patterns: score_patterns(script, sessions)?,
+        consolidate_drops: sum_consolidate_drops(sessions),
     })
+}
+
+/// Reasons a consolidation guard dropped a verdict, summed over the run.
+fn sum_consolidate_drops(sessions: &[SessionObservation]) -> BTreeMap<String, u32> {
+    let mut dropped = BTreeMap::new();
+    for session in sessions {
+        for (reason, count) in &session.consolidate.dropped {
+            *dropped.entry(reason.clone()).or_insert(0) += *count;
+        }
+    }
+    dropped
 }
 
 /// Everything one session's claims are scored against.
@@ -1741,6 +1758,35 @@ mod tests {
             known_match: crate::graph::types::MatchReport::default(),
             consolidate: crate::graph::types::ConsolidateReport::default(),
         }
+    }
+
+    #[test]
+    fn consolidate_drops_sum_across_sessions() {
+        let mut first = obs("s1", Vec::new(), Vec::new());
+        first
+            .consolidate
+            .dropped
+            .insert("quote too short".into(), 2);
+        let mut second = obs("s2", Vec::new(), Vec::new());
+        second
+            .consolidate
+            .dropped
+            .insert("quote too short".into(), 1);
+        second
+            .consolidate
+            .dropped
+            .insert("no departure cue".into(), 4);
+        let sum = super::sum_consolidate_drops(&[first, second]);
+        assert_eq!(sum.get("quote too short").copied(), Some(3));
+        assert_eq!(sum.get("no departure cue").copied(), Some(4));
+        let encoded = serde_json::to_value(&sum).unwrap();
+        assert_eq!(encoded["quote too short"], 3);
+        let empty = super::sum_consolidate_drops(&[]);
+        assert!(serde_json::to_value(empty)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .is_empty());
     }
 
     fn history() -> FactScript {
