@@ -10,6 +10,10 @@ changes a user has to know about before upgrading.
 - Default provider is the CLI login (`claude-code`). `num_ctx`, `api_style`, and `provider = "ollama"` are refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.
 - Rust API: `ApiStyle` is removed. `LlmSection` and `HttpConfig` lost `num_ctx`, `api_style`, and the local-model fields.
 
+### Fixed
+
+- The grok preset passes `--reasoning-effort low --no-subagents --disable-web-search --max-turns 1` and runs in an empty directory, because the default reasoning effort is too slow for extraction (#180).
+
 ## [4.8.0] — 2026-10-17
 
 ### Fixed

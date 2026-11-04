@@ -89,6 +89,9 @@ pub struct CliSpec {
     /// means there is no verified path. The value is serialised back to a
     /// JSON string for the caller.
     pub structured_json_path: String,
+    /// When true, and the caller set no working directory, the child runs in
+    /// an empty temporary directory so it cannot read the caller's tree.
+    pub empty_workdir: bool,
 }
 
 /// One resolved call: the exact argv, and what to write to stdin.
@@ -140,6 +143,7 @@ impl CliSpec {
                 structured_json_path: "structured_output".into(),
                 timeout: default_timeout(),
                 env_remove: vec!["CLAUDECODE".into()],
+                empty_workdir: false,
             },
             // `gemini -m M -o json -p <prompt>`. The envelope's success field
             // is not documented; `response` then `result` are tried and raw
@@ -177,15 +181,29 @@ impl CliSpec {
                 structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
+                empty_workdir: false,
             },
-            // `grok -m M --output-format json -p <prompt>`. The envelope was
-            // read off a live call: the answer is `text`, and `thought` holds
-            // reasoning — which is why the path is pinned rather than "first
-            // string field".
+            // `grok --reasoning-effort low --no-subagents --disable-web-search
+            //  --max-turns 1 -m M --output-format json -p <prompt>`.
+            // The default reasoning effort is too slow for extraction: a
+            // pass-1 prompt spends minutes and exceeds the per-call timeout.
+            // These flags force one plain turn, with no tools and no web
+            // access. Replace `[llm.cli] args` to raise the effort; that key
+            // replaces this list rather than appending to it. The envelope
+            // was read off a live call: the answer is `text`, and `thought`
+            // holds reasoning — which is why the path is pinned rather than
+            // "first string field".
             CliPreset::Grok => Self {
                 command: "grok".into(),
                 command_env: Some("GROK_BIN".into()),
-                args: Vec::new(),
+                args: vec![
+                    "--reasoning-effort".into(),
+                    "low".into(),
+                    "--no-subagents".into(),
+                    "--disable-web-search".into(),
+                    "--max-turns".into(),
+                    "1".into(),
+                ],
                 prompt_delivery: PromptDelivery::Flag,
                 prompt_flag: "-p".into(),
                 model_flag: "-m".into(),
@@ -213,6 +231,7 @@ impl CliSpec {
                 structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
+                empty_workdir: true,
             },
             // `codex exec -m M --json --skip-git-repo-check`, prompt on stdin.
             // Three traps, all encoded here rather than left to the user:
@@ -248,6 +267,7 @@ impl CliSpec {
                 structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
+                empty_workdir: false,
             },
             // Nothing assumed: a binary, the prompt on stdin, prose out.
             CliPreset::Custom => Self {
@@ -271,6 +291,7 @@ impl CliSpec {
                 structured_json_path: String::new(),
                 timeout: default_timeout(),
                 env_remove: Vec::new(),
+                empty_workdir: false,
             },
         }
     }
@@ -838,8 +859,12 @@ impl CliProvider {
         if let Some(env) = &self.env {
             command.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
         }
+        // Held until the child exits, including on a timeout or a spawn error.
+        let scratch = self.scratch_dir()?;
         if let Some(dir) = &self.current_dir {
             command.current_dir(dir);
+        } else if let Some(dir) = &scratch {
+            command.current_dir(&dir.0);
         }
         for key in &self.spec.env_remove {
             command.env_remove(key);
@@ -883,6 +908,57 @@ impl CliProvider {
             return Err(GraphError::Llm(format!("{binary} returned empty output")));
         }
         Ok(stdout)
+    }
+
+    /// An empty directory for a preset that must not see the caller's tree.
+    /// A directory the caller already chose wins.
+    fn scratch_dir(&self) -> Result<Option<ScratchDir>, GraphError> {
+        if self.current_dir.is_some() || !self.spec.empty_workdir {
+            return Ok(None);
+        }
+        ScratchDir::create().map(Some)
+    }
+}
+
+/// One call's working directory. Dropped, and removed, when the call ends.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create() -> Result<Self, GraphError> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let mut last = None;
+        // A leftover from a killed run with a reused pid must not fail every call.
+        for _ in 0..8 {
+            let path = std::env::temp_dir().join(format!(
+                "recall-echo-{}-{nanos}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+                Err(err) => last = Some(err),
+            }
+            if !matches!(&last, Some(e) if e.kind() == std::io::ErrorKind::AlreadyExists) {
+                break;
+            }
+        }
+        Err(GraphError::Llm(format!(
+            "could not create a working directory: {}",
+            last.map_or_else(|| "unknown".to_string(), |e| e.to_string())
+        )))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1474,6 +1550,12 @@ mod tests {
             invocation.argv,
             vec![
                 "grok",
+                "--reasoning-effort",
+                "low",
+                "--no-subagents",
+                "--disable-web-search",
+                "--max-turns",
+                "1",
                 "-m",
                 "grok-4",
                 "--output-format",
@@ -1484,6 +1566,44 @@ mod tests {
         );
         assert!(invocation.stdin.is_none());
         assert_eq!(spec.result_json_paths.paths(), ["text"]);
+        assert!(spec.empty_workdir);
+    }
+
+    /// `[llm.cli] args` replaces the preset list. Appending would leave the
+    /// low-effort flag in place beside the user's own.
+    #[test]
+    fn a_grok_args_override_replaces_the_preset_flags() {
+        let section = CliSection {
+            args: Some(vec!["--reasoning-effort".into(), "high".into()]),
+            ..CliSection::default()
+        };
+        let spec = CliSpec::resolve(&Provider::Grok, &section).expect("resolves");
+        let argv = spec.invocation("grok-4", SYSTEM, USER).argv;
+
+        assert_eq!(
+            argv,
+            vec![
+                "grok",
+                "--reasoning-effort",
+                "high",
+                "-m",
+                "grok-4",
+                "--output-format",
+                "json",
+                "-p",
+                &format!("{SYSTEM}\n\n{USER}"),
+            ]
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| *arg == "--reasoning-effort")
+                .count(),
+            1
+        );
+        assert!(!argv.iter().any(|arg| {
+            arg == "--no-subagents" || arg == "--disable-web-search" || arg == "--max-turns"
+        }));
+        assert!(spec.empty_workdir);
     }
 
     /// grok's envelope carries reasoning in `thought` beside the answer in
@@ -2185,6 +2305,61 @@ mod tests {
 
         let expected_cwd = cwd.path().canonicalize().unwrap();
         assert_eq!(answer, format!("t0ken|absent|{}", expected_cwd.display()),);
+    }
+
+    /// The grok preset must not inherit the caller's tree. The stand-in is a
+    /// shell script, not the real CLI.
+    #[tokio::test]
+    async fn grok_runs_in_an_empty_directory_when_none_was_set() {
+        let mock = MockCli::new(
+            "dir=$(pwd); set -- *; \
+             if [ \"$1\" = '*' ] && [ ! -e \"$1\" ]; then state=empty; else state=files; fi; \
+             printf '%s|%s' \"$dir\" \"$state\"",
+        );
+        let provider = mock.provider(
+            CliSection {
+                preset: Some(CliPreset::Grok),
+                ..CliSection::default()
+            },
+            "grok-4",
+        );
+
+        let answer = provider.complete(SYSTEM, USER, 1024).await.unwrap();
+        let (dir, state) = answer.split_once('|').expect("pwd and state");
+        let caller = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_ne!(Path::new(dir), caller.as_path());
+        assert!(
+            dir.starts_with(std::env::temp_dir().to_string_lossy().as_ref()),
+            "{dir}"
+        );
+        assert_eq!(state, "empty");
+        assert!(
+            !Path::new(dir).exists(),
+            "scratch directory outlived the call"
+        );
+    }
+
+    /// A host that already picked a directory keeps it.
+    #[tokio::test]
+    async fn a_host_directory_wins_over_groks_empty_default() {
+        let cwd = tempfile::tempdir().unwrap();
+        fs::write(cwd.path().join("marker"), b"x").unwrap();
+        let mock = MockCli::new("printf '%s' \"$(pwd)\"");
+        let provider = mock
+            .provider(
+                CliSection {
+                    preset: Some(CliPreset::Grok),
+                    ..CliSection::default()
+                },
+                "grok-4",
+            )
+            .with_current_dir(Some(cwd.path().to_path_buf()));
+
+        let answer = provider.complete(SYSTEM, USER, 1024).await.unwrap();
+        assert_eq!(
+            Path::new(&answer).canonicalize().unwrap(),
+            cwd.path().canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]

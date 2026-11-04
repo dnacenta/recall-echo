@@ -99,7 +99,8 @@ called (`<prompt>` is the message, `<system>` the system prompt, `<` means stdin
 claude-code  claude -p --model <M> --output-format text --system-prompt <system> \
                     --no-session-persistence  < <prompt>
 gemini       gemini -m <M> -o json -p "<system>\n\n<prompt>"
-grok         grok -m <M> --output-format json -p "<system>\n\n<prompt>"
+grok         grok --reasoning-effort low --no-subagents --disable-web-search \
+                    --max-turns 1 -m <M> --output-format json -p "<system>\n\n<prompt>"
 codex        codex exec -m <M> --json --skip-git-repo-check  < "<system>\n\n<prompt>"
 ```
 
@@ -129,6 +130,14 @@ CLI's stderr, and so is a JSON envelope that reports its own failure while exiti
 - **codex**: `--skip-git-repo-check` is required, because codex refuses to run outside a
   trusted git directory and a memory directory usually is not one. Its `-p` is
   `--profile`, not the prompt, so the prompt goes in on stdin.
+- **grok**: the preset's `args` are `--reasoning-effort low --no-subagents
+  --disable-web-search --max-turns 1`. The default reasoning effort is too slow for
+  extraction: a pass-1 prompt spends minutes and exceeds the per-call timeout. The flags
+  keep one plain turn, with no tools and no web access. With no working directory set,
+  the process runs in an empty temporary directory, so it does not read the directory it
+  was started from. Set `[llm.cli] args` to replace that list — a higher effort means
+  repeating the flags you still want, because the replacement is not appended.
+  `extra_args` is appended after the model and format flags and does not remove `args`.
 - **gemini's result field is unverified.** The flags were checked against `gemini` 0.27.3,
   but no authenticated call was made, so the preset tries `response`, then `result`, then
   raw stdout. If yours wraps the answer elsewhere, set `result_json_path`, or clear
