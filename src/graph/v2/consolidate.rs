@@ -649,7 +649,7 @@ fn accept(
     Ok(if duplicate { "duplicate" } else { "supersedes" })
 }
 
-/// Count one dropped verdict and print the bench-log line.
+/// Count one dropped verdict and print the drop line on stderr.
 ///
 /// The line is the reason, the stored row's subject and key, the anchor's
 /// subject and key, and the first 80 characters of the quote. It does not
@@ -680,7 +680,7 @@ fn note_drop(
     );
 }
 
-/// Bench-log line for one drop. `old_key` is the stored row, `new_key` the anchor.
+/// Stderr line for one drop. `old_key` is the stored row, `new_key` the anchor.
 fn drop_line(reason: &str, old_key: &str, new_key: &str, quote: &str) -> String {
     format!(
         "consolidate drop: {reason} | {old_key} | {new_key} | {}",
@@ -688,11 +688,12 @@ fn drop_line(reason: &str, old_key: &str, new_key: &str, quote: &str) -> String 
     )
 }
 
-/// First 80 characters of `quote`, with a line break turned into a space.
+/// First 80 characters of `quote`, with any control character (line break,
+/// escape) turned into a space so a quote cannot forge or recolour log lines.
 fn quote_head(quote: &str) -> String {
     quote
         .chars()
-        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
         .take(80)
         .collect()
 }
@@ -2776,5 +2777,13 @@ mod drop_line_tests {
         );
         assert_eq!(line.lines().count(), 1);
         assert!(!line.contains("plain text"));
+        let mut raw = String::from("a");
+        raw.push(char::from(0x1b));
+        raw.push_str("[31mred\tb");
+        raw.push('\u{0}');
+        raw.push('c');
+        let head = quote_head(&raw);
+        assert!(!head.chars().any(char::is_control), "{head:?}");
+        assert_eq!(head, "a [31mred b c");
     }
 }
