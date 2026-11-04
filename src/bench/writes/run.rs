@@ -89,6 +89,19 @@ pub enum KnownMatch {
     On,
 }
 
+/// Whether the post-write consolidation pass runs.
+///
+/// Off does not define a cache table, read the store for pairs, or call the
+/// provider. On is independent of [`KnownMatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consolidate {
+    /// No consolidation pass.
+    Off,
+    /// Candidate pairs, a pre-filter, and at most one judge call per session.
+    On,
+}
+
+#[allow(clippy::too_many_arguments)]
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
 /// `work_dir` must be missing or empty. The function creates `memory/` under it.
@@ -103,11 +116,12 @@ pub async fn run(
     pipeline: PipelineVersion,
     known_facts_context: KnownFactsContext,
     known_match: KnownMatch,
+    consolidate: Consolidate,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
     let written = write_archives(&memory_dir, script)?;
-    apply_graph_switches(&memory_dir, known_facts_context, known_match)?;
+    apply_graph_switches(&memory_dir, known_facts_context, known_match, consolidate)?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
     let (label, provider) = provider_for(script, extractor)?;
@@ -187,6 +201,7 @@ async fn collect_sessions(
                 report.retirements_skipped = extracted.retirements_skipped;
                 report.timing = extracted.timing;
                 report.known_match = extracted.known_match;
+                report.consolidate = extracted.consolidate;
                 report
             }
         };
@@ -211,6 +226,7 @@ async fn collect_sessions(
             retirements_skipped: report.retirements_skipped,
             timing: report.timing,
             known_match: report.known_match,
+            consolidate: report.consolidate,
         });
         before = after;
     }
@@ -225,6 +241,7 @@ fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Grade `script` `repeat` times, each in a fresh `parent/run-<k>` directory.
 ///
 /// `parent` must be missing or empty. Nothing is created when it is not.
@@ -239,6 +256,7 @@ pub async fn run_repeat(
     pipeline: PipelineVersion,
     known_facts_context: KnownFactsContext,
     known_match: KnownMatch,
+    consolidate: Consolidate,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -259,6 +277,7 @@ pub async fn run_repeat(
                 pipeline,
                 known_facts_context,
                 known_match,
+                consolidate,
             )
             .await?,
         );
@@ -271,6 +290,7 @@ fn apply_graph_switches(
     memory_dir: &Path,
     known: KnownFactsContext,
     matched: KnownMatch,
+    consolidate: Consolidate,
 ) -> Result<(), RecallError> {
     let mut body = String::from("[graph]\n");
     let mut any = false;
@@ -280,6 +300,10 @@ fn apply_graph_switches(
     }
     if matched == KnownMatch::On {
         body.push_str("known_match = true\n");
+        any = true;
+    }
+    if consolidate == Consolidate::On {
+        body.push_str("consolidate = true\n");
         any = true;
     }
     if !any {
@@ -1421,6 +1445,31 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_switch_is_written_only_when_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+    }
+
+    #[test]
     fn a_missing_or_empty_directory_is_a_scratch() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(require_scratch(tmp.path()).is_ok());
@@ -1438,6 +1487,7 @@ mod tests {
             PipelineVersion::V1,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap_err();
@@ -1592,6 +1642,7 @@ mod tests {
             PipelineVersion::V1,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap();
@@ -1695,6 +1746,7 @@ mod tests {
             PipelineVersion::V1,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap_err();
@@ -1716,6 +1768,7 @@ mod tests {
             PipelineVersion::V1,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap_err();
@@ -1789,6 +1842,7 @@ mod tests {
             PipelineVersion::V1,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap();
@@ -1868,6 +1922,23 @@ mod tests {
         assert_eq!(patterns.premature.count, 0);
         assert_eq!(patterns.noise_hits.count, 0);
         assert_eq!(patterns.unmatched.count, 0);
+        assert!(report.sessions.iter().all(|session| {
+            session.consolidate.is_blank()
+                && serde_json::to_value(session)
+                    .unwrap()
+                    .get("consolidate")
+                    .is_none()
+        }));
+        let gm = GraphMemory::open(&tmp.path().join("memory/graph"))
+            .await
+            .unwrap();
+        let mut info = gm.db().query("INFO FOR DB").await.unwrap();
+        let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut info, 0).unwrap();
+        let text = serde_json::to_string(&rows).unwrap_or_default();
+        assert!(
+            !text.contains("consolidation_cache"),
+            "off run defined the cache table"
+        );
     }
 
     #[cfg(feature = "embedded")]
@@ -2053,6 +2124,7 @@ mod tests {
             PipelineVersion::V2,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap();
@@ -2263,6 +2335,7 @@ mod tests {
                 PipelineVersion::V2,
                 known,
                 KnownMatch::Off,
+                Consolidate::Off,
             )
             .await
             .unwrap();
@@ -2297,6 +2370,7 @@ mod tests {
             PipelineVersion::V2,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap()
@@ -2583,6 +2657,7 @@ mod tests {
             PipelineVersion::V2,
             KnownFactsContext::Off,
             KnownMatch::Off,
+            Consolidate::Off,
         )
         .await
         .unwrap();
@@ -2640,7 +2715,9 @@ mod tests {
                 let Some(timing) = session.timing else {
                     return false;
                 };
-                timing.match_ms.is_none() && timing.total_ms >= timing.pass1_ms
+                timing.match_ms.is_none()
+                    && timing.consolidate_ms.is_none()
+                    && timing.total_ms >= timing.pass1_ms
             }),
             "stage timing {:?}",
             report
@@ -2651,14 +2728,30 @@ mod tests {
         );
         assert!(report.sessions.iter().all(|session| {
             session.known_match.is_blank()
+                && session.consolidate.is_blank()
                 && serde_json::to_value(session)
                     .unwrap()
                     .get("known_match")
                     .is_none()
+                && serde_json::to_value(session)
+                    .unwrap()
+                    .get("consolidate")
+                    .is_none()
                 && serde_json::to_value(session).unwrap()["timing"]
                     .get("match_ms")
                     .is_none()
+                && serde_json::to_value(session).unwrap()["timing"]
+                    .get("consolidate_ms")
+                    .is_none()
         }));
+        let gm = GraphMemory::open(&tmp.path().join("memory/graph"))
+            .await
+            .unwrap();
+        let mut info = gm.db().query("INFO FOR DB").await.unwrap();
+        let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut info, 0).unwrap();
+        assert!(!serde_json::to_string(&rows)
+            .unwrap_or_default()
+            .contains("consolidation_cache"));
     }
 
     /// The switch adds match timing. Writes on this script stay the off-path
@@ -2675,6 +2768,7 @@ mod tests {
             PipelineVersion::V2,
             KnownFactsContext::Off,
             KnownMatch::On,
+            Consolidate::Off,
         )
         .await
         .unwrap();

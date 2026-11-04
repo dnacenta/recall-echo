@@ -102,6 +102,8 @@ pub struct SessionObservation {
     pub timing: Option<crate::graph::types::StageTiming>,
     /// Known-row match counts. Blank when the switch is off.
     pub known_match: crate::graph::types::MatchReport,
+    /// Consolidation counts. Blank when the switch is off.
+    pub consolidate: crate::graph::types::ConsolidateReport,
 }
 
 /// Precision and recall for one operation.
@@ -208,6 +210,12 @@ pub struct SessionReport {
         skip_serializing_if = "crate::graph::types::MatchReport::is_blank"
     )]
     pub known_match: crate::graph::types::MatchReport,
+    /// Consolidation counts. Omitted when the switch is off or nothing was counted.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::ConsolidateReport::is_blank"
+    )]
+    pub consolidate: crate::graph::types::ConsolidateReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -569,6 +577,7 @@ pub fn grade_with_pipeline(
                 retirements_skipped: s.retirements_skipped,
                 timing: s.timing,
                 known_match: s.known_match.clone(),
+                consolidate: s.consolidate.clone(),
             })
             .collect(),
         steps,
@@ -1730,6 +1739,7 @@ mod tests {
             retirements_skipped: 0,
             timing: None,
             known_match: crate::graph::types::MatchReport::default(),
+            consolidate: crate::graph::types::ConsolidateReport::default(),
         }
     }
 

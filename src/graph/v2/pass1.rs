@@ -278,6 +278,8 @@ pub(crate) async fn extract_session(
 
     let mut resolve_ms = 0;
     let mut write_ms = 0;
+    let consolidate_on = consolidate_enabled(memory_dir);
+    let mut consolidate_ms = None;
     if !facts.is_empty() {
         let mut write_ctx = write::WriteCtx::new(
             llm,
@@ -290,8 +292,8 @@ pub(crate) async fn extract_session(
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
-            for (reason, count) in stats.match_skips {
-                *match_report.skipped.entry(reason).or_insert(0) += count;
+            for (reason, count) in &stats.match_skips {
+                *match_report.skipped.entry(reason.clone()).or_insert(0) += *count;
             }
         }
         resolve_ms = stats.resolve_ms;
@@ -300,10 +302,10 @@ pub(crate) async fn extract_session(
         report.relationships_created = stats.edges;
         report.slots_written = stats.slots;
         report.llm_calls += stats.resolver_calls;
-        report.resolve = stats.resolve;
-        report.retirements = stats.retirements;
+        report.resolve = stats.resolve.clone();
+        report.retirements = stats.retirements.clone();
         report.retirements_skipped = stats.retirements_skipped;
-        report.retirement_skips = stats.retirement_skips;
+        report.retirement_skips = stats.retirement_skips.clone();
         if stats.drops_enumeration > 0 {
             *report.drops.entry("enumeration".to_string()).or_insert(0) += stats.drops_enumeration;
         }
@@ -313,6 +315,13 @@ pub(crate) async fn extract_session(
         if stats.unresolved > 0 {
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }
+        if consolidate_on {
+            let started = std::time::Instant::now();
+            super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
+            consolidate_ms = Some(elapsed_ms(started));
+        }
+    } else if consolidate_on {
+        consolidate_ms = Some(0);
     }
     report.known_match = match_report;
     report.timing = Some(StageTiming {
@@ -321,6 +330,7 @@ pub(crate) async fn extract_session(
         write_ms,
         total_ms: elapsed_ms(total_started),
         match_ms,
+        consolidate_ms,
     });
     Ok(report)
 }
@@ -341,6 +351,13 @@ fn known_match_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .known_match
+}
+
+fn consolidate_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .consolidate
 }
 
 /// A decided setting, or a decided `uses` whose role can retire a stored edge.

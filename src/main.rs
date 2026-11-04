@@ -250,6 +250,9 @@ enum BenchCommands {
         /// Match kept facts to stored rows after pass 1. Off unless set.
         #[arg(long)]
         known_match: bool,
+        /// Close drifted copies after the session write. Off unless set.
+        #[arg(long)]
+        consolidate: bool,
     },
 }
 
@@ -1068,6 +1071,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             pipeline,
             known_facts_context,
             known_match,
+            consolidate,
         } => run_writes(
             script,
             work_dir,
@@ -1085,6 +1089,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::KnownMatch::Off
             },
+            if consolidate {
+                recall_echo::bench::writes::Consolidate::On
+            } else {
+                recall_echo::bench::writes::Consolidate::Off
+            },
         ),
     }
 }
@@ -1100,6 +1109,7 @@ fn run_writes(
     pipeline: Option<recall_echo::graph::PipelineVersion>,
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
     known_match: recall_echo::bench::writes::KnownMatch,
+    consolidate: recall_echo::bench::writes::Consolidate,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1132,6 +1142,7 @@ fn run_writes(
             pipeline,
             known_facts_context,
             known_match,
+            consolidate,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1144,6 +1155,7 @@ fn run_writes(
             pipeline,
             known_facts_context,
             known_match,
+            consolidate,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1152,6 +1164,7 @@ fn run_writes(
 }
 
 #[cfg(feature = "bench")]
+#[allow(clippy::too_many_arguments)]
 async fn grade_once(
     script: &recall_echo::bench::writes::FactScript,
     root: &std::path::Path,
@@ -1160,6 +1173,7 @@ async fn grade_once(
     pipeline: recall_echo::graph::PipelineVersion,
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
     known_match: recall_echo::bench::writes::KnownMatch,
+    consolidate: recall_echo::bench::writes::Consolidate,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1175,6 +1189,7 @@ async fn grade_once(
                 pipeline,
                 known_facts_context,
                 known_match,
+                consolidate,
             )
             .await
         }
@@ -1186,6 +1201,7 @@ async fn grade_once(
                 pipeline,
                 known_facts_context,
                 known_match,
+                consolidate,
             )
             .await
         }
@@ -1203,6 +1219,7 @@ async fn grade_repeat(
     pipeline: recall_echo::graph::PipelineVersion,
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
     known_match: recall_echo::bench::writes::KnownMatch,
+    consolidate: recall_echo::bench::writes::Consolidate,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1219,6 +1236,7 @@ async fn grade_repeat(
                 pipeline,
                 known_facts_context,
                 known_match,
+                consolidate,
             )
             .await
         }
@@ -1231,6 +1249,7 @@ async fn grade_repeat(
                 pipeline,
                 known_facts_context,
                 known_match,
+                consolidate,
             )
             .await
         }
