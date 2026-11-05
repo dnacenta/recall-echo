@@ -257,7 +257,7 @@ pub(crate) async fn run(
         let turn = cited(ctx, anchor);
         let cue = departs(turn, &partner.value, &anchor.replaces)
             || (shares_pair(anchor, partner, &loaded.part_of, &loaded.owners)
-                && replacement_quote(&quote, &partner.value, &anchor.new_value));
+                && replacement_quote(&quote, &partner.value, &anchor.new_value, &anchor.key));
         match accept(
             &verdict,
             &quote,
@@ -743,22 +743,72 @@ fn departs(turn: &str, old: &str, replaces: &str) -> bool {
 ///
 /// `instead` is already a departure word, so it is not repeated here. A list
 /// item is not a replacement. The phrase has to be in the quote itself.
-fn replacement_quote(quote: &str, old: &str, new_value: &str) -> bool {
+fn replacement_quote(quote: &str, old: &str, new_value: &str, key: &str) -> bool {
+    let words = cue_words(quote);
     !names_value(old, quote)
         && names_value(new_value, quote)
         && !listed_new(new_value, quote)
+        && !hedged(quote, &words)
+        && names_key(key, &words)
         && quote_replaces(quote)
 }
 
-/// A listed new value is one item among others, not a replacement.
+/// A question, a negation, a condition, a hedge, or an addition is not a
+/// decided replacement, wherever it sits in the quote.
+fn hedged(quote: &str, words: &[(String, usize, usize)]) -> bool {
+    quote.contains('?')
+        || words.iter().any(|(word, _, _)| {
+            word.ends_with("n't")
+                || matches!(
+                    word.as_str(),
+                    "not"
+                        | "no"
+                        | "never"
+                        | "nor"
+                        | "neither"
+                        | "if"
+                        | "unless"
+                        | "whether"
+                        | "maybe"
+                        | "perhaps"
+                        | "might"
+                        | "could"
+                        | "would"
+                        | "should"
+                        | "may"
+                        | "suppose"
+                        | "suggest"
+                        | "propose"
+                        | "proposal"
+                        | "idea"
+                        | "consider"
+                        | "also"
+                        | "too"
+                        | "well"
+                        | "additionally"
+                        | "available"
+                        | "plus"
+                )
+        })
+}
+
+/// The quote names the setting being replaced: a token of the anchor's key.
+fn names_key(key: &str, words: &[(String, usize, usize)]) -> bool {
+    let tokens = key_tokens(key);
+    !tokens.is_empty() && words.iter().any(|(word, _, _)| tokens.contains(word))
+}
+
+/// A quote with any list mark is not a sole replacement.
 ///
-/// Additive wording such as `also` is not a list mark. Those quotes stay
-/// dropped because they are not replacement phrases.
+/// A comma, or `and`, `or`, `nor`, or `plus`, is enough. The new value does
+/// not have to be one of the listed items. Addition words such as `also` are
+/// rejected by [`hedged`], not here.
 fn listed_new(value: &str, quote: &str) -> bool {
-    enumerated(value, quote) && list_mark(quote)
+    !value.is_empty() && list_mark(quote)
 }
 
 fn list_mark(quote: &str) -> bool {
+    // Any list mark counts, whether or not the value itself is enumerated.
     quote.contains(',')
         || quote.split_whitespace().any(|word| {
             let word = word
@@ -2448,10 +2498,10 @@ mod tests {
         for quote in [
             "The layout is now sqlite for the index rows.",
             "The layout IS NOW sqlite for the index rows.",
-            "The pools are now sqlite for the index rows.",
-            "The store now uses sqlite for the index rows.",
+            "The layout pools are now sqlite for the index rows.",
+            "The layout store now uses sqlite for the index rows.",
             "New layout: sqlite for the index rows.",
-            "Agreed today. New default: sqlite for the index rows.",
+            "Agreed today. New layout: sqlite for the index rows.",
         ] {
             assert!(quote_replaces(quote), "{quote}");
         }
@@ -2472,10 +2522,10 @@ mod tests {
         for quote in [
             "The layout is now sqlite for the index rows.",
             "The layout IS NOW sqlite for the index rows.",
-            "The pools are now sqlite for the index rows.",
-            "The store now uses sqlite for the index rows.",
+            "The layout pools are now sqlite for the index rows.",
+            "The layout store now uses sqlite for the index rows.",
             "New layout: sqlite for the index rows.",
-            "Agreed today. New default: sqlite for the index rows.",
+            "Agreed today. New layout: sqlite for the index rows.",
         ] {
             let (report, slot) =
                 judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
@@ -2608,18 +2658,31 @@ mod tests {
             &[walnut, cherry],
         )
         .await;
-        let quote = "The layout is now sqlite for the index rows.";
-        let next = setting("acme", Kind::Project, "layout", "sqlite", quote);
-        let turns = [turn(quote)];
+        // Each quote would close on its own. Two supersedes on this anchor close none.
+        let turn_text =
+            "The layout is now sqlite for the index rows. New layout: sqlite for the index rows.";
+        let first = "The layout is now sqlite for the index rows.";
+        let second = "New layout: sqlite for the index rows.";
+        let next = setting("acme", Kind::Project, "layout", "sqlite", turn_text);
+        let turns = [turn(turn_text)];
         let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
         let stub = Stub::new(Answer::Reply(judged(&[
-            (1, "supersedes", quote),
-            (2, "supersedes", quote),
+            (1, "supersedes", first),
+            (2, "supersedes", second),
         ])));
         let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
         assert_eq!(stub.calls(), 1, "{}", stub.message.lock().unwrap());
         assert_eq!(report.consolidate.closes_sup, 0);
         assert_eq!(dropped(&report, "second supersede on the same anchor"), 2);
+        assert!(
+            report
+                .consolidate
+                .skips
+                .get("consolidate_ambiguous")
+                .copied()
+                .unwrap_or(0)
+                >= 2
+        );
         let rows = slots(&gm, "acme").await;
         assert!(ended(live_any(&rows, "layout_name", "walnut")).is_none());
         assert!(ended(live_any(&rows, "layout_mode", "cherry")).is_none());
@@ -2666,6 +2729,69 @@ mod tests {
             )),
             Some("s2:consolidated")
         );
+    }
+
+    /// Negated, additive, questioned, hedged, listed or off-key phrasing
+    /// never closes, even when the judge says supersedes.
+    #[tokio::test]
+    async fn hedged_or_off_key_phrasing_stays_dropped() {
+        for quote in [
+            "The layout is now not sqlite for the rows.",
+            "No, the layout is now never sqlite here.",
+            "The layout isn't now sqlite for the rows.",
+            "The layout is now also sqlite for the rows.",
+            "The layout now uses sqlite as well for rows.",
+            "The layout sqlite is now available for rows.",
+            "So the layout is now sqlite for the rows?",
+            "If the layout is now sqlite, tests would break.",
+            "Maybe the layout is now sqlite for the rows.",
+            "I could suggest the layout is now sqlite here.",
+            "New idea: sqlite for the index rows maybe.",
+            "New file: sqlite.rs holds the index rows.",
+            "The cache is now sqlite for the index rows.",
+            "The layout is now sqlite plus redis for rows.",
+        ] {
+            let (report, slot) =
+                judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
+            assert_eq!(report.consolidate.closes_sup, 0, "{quote}");
+            assert!(ended(&slot).is_none(), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_replacements_still_close() {
+        for (quote, new_key, new_value, old_key, old_value) in [
+            (
+                "Storage is now SQLite at ~/.local/share/app.db.",
+                "storage",
+                "sqlite",
+                "storage_name",
+                "walnut",
+            ),
+            (
+                "New layout: per-project folders under data.",
+                "layout",
+                "per-project folders",
+                "layout_name",
+                "flat folders",
+            ),
+            (
+                "Default --jobs is now 4 instead of the CPU count.",
+                "jobs",
+                "4",
+                "jobs_count",
+                "8",
+            ),
+        ] {
+            let (report, slot) =
+                judge_keyed(quote, quote, new_key, new_value, old_key, old_value).await;
+            assert_eq!(
+                report.consolidate.closes_sup, 1,
+                "{quote} {:?}",
+                report.consolidate
+            );
+            assert_eq!(ended(&slot), Some("s2:consolidated"), "{quote}");
+        }
     }
 
     async fn judge_keyed(
