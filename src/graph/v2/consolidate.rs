@@ -750,6 +750,8 @@ fn replacement_quote(quote: &str, old: &str, new_value: &str, key: &str) -> bool
         && !listed_new(new_value, quote)
         && !hedged(quote, &words)
         && names_key(key, &words)
+        && !tentative(&words)
+        && plain_shape(quote, key, &words)
         && quote_replaces(quote)
 }
 
@@ -790,6 +792,98 @@ fn hedged(quote: &str, words: &[(String, usize, usize)]) -> bool {
                         | "plus"
                 )
         })
+}
+
+/// Reported speech, a trial, a revert, or a time limit is not a decision.
+fn tentative(words: &[(String, usize, usize)]) -> bool {
+    words
+        .windows(2)
+        .any(|pair| pair[0].0 == "for" && pair[1].0 == "now")
+        || words.iter().any(|(word, _, _)| {
+            matches!(
+                word.as_str(),
+                "said"
+                    | "says"
+                    | "say"
+                    | "told"
+                    | "thinks"
+                    | "think"
+                    | "thought"
+                    | "proposes"
+                    | "proposed"
+                    | "suggests"
+                    | "suggested"
+                    | "tried"
+                    | "trying"
+                    | "try"
+                    | "testing"
+                    | "trial"
+                    | "temporarily"
+                    | "temporary"
+                    | "briefly"
+                    | "only"
+                    | "until"
+                    | "but"
+                    | "reverted"
+                    | "revert"
+                    | "later"
+            )
+        })
+}
+
+/// Each cue is the head of its sentence: before `is now`, `are now` or
+/// `now uses` sit only articles, `default`, the key's own tokens, and at most
+/// one other word right after a key token (`the layout store`). `new <word>:`
+/// needs `<word>` to be a key token. Another subject, a speaker or a time
+/// phrase in front of the cue rejects the quote.
+fn plain_shape(quote: &str, key: &str, words: &[(String, usize, usize)]) -> bool {
+    let tokens = key_tokens(key);
+    let mut any = false;
+    for (index, pair) in words.windows(2).enumerate() {
+        let cue = matches!(
+            (pair[0].0.as_str(), pair[1].0.as_str()),
+            ("is" | "are", "now") | ("now", "uses")
+        );
+        let label =
+            pair[0].0 == "new" && sentence_start(quote, pair[0].1) && colon_after(quote, pair[1].2);
+        if label {
+            if !tokens.contains(&pair[1].0) {
+                return false;
+            }
+            any = true;
+            continue;
+        }
+        if !cue {
+            continue;
+        }
+        let mut from = index;
+        while from > 0 && !sentence_start(quote, words[from].1) {
+            from -= 1;
+        }
+        let mut seen_key = false;
+        let mut extra = 0;
+        for (word, _, _) in &words[from..index] {
+            if tokens.contains(word) {
+                seen_key = true;
+            } else if matches!(
+                word.as_str(),
+                "the" | "a" | "an" | "our" | "its" | "default"
+            ) {
+                if seen_key && extra == 0 && word != "default" {
+                    return false;
+                }
+            } else if seen_key && extra == 0 {
+                extra += 1;
+            } else {
+                return false;
+            }
+        }
+        if !seen_key {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// The quote names the setting being replaced: a token of the anchor's key.
@@ -2750,6 +2844,15 @@ mod tests {
             "New file: sqlite.rs holds the index rows.",
             "The cache is now sqlite for the index rows.",
             "The layout is now sqlite plus redis for rows.",
+            "They said the layout is now sqlite for rows.",
+            "The layout is now sqlite for now.",
+            "The layout is now sqlite for testing only.",
+            "Until Friday the layout is now sqlite.",
+            "The assistant proposes the layout is now sqlite.",
+            "We tried it: the layout is now sqlite but reverted.",
+            "The picker layout is now sqlite for the rows.",
+            "The layout is now sqlite temporarily for rows.",
+            "The layout is now sqlite, redis for the rows.",
         ] {
             let (report, slot) =
                 judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
@@ -2790,6 +2893,19 @@ mod tests {
                 "{quote} {:?}",
                 report.consolidate
             );
+            assert_eq!(ended(&slot), Some("s2:consolidated"), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_longer_before_the_new_value_still_closes() {
+        for quote in [
+            "The layout is no longer walnut; it is now sqlite.",
+            "No longer walnut, the layout is now sqlite.",
+        ] {
+            let (report, slot) =
+                judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
+            assert_eq!(report.consolidate.closes_sup, 1, "{quote}");
             assert_eq!(ended(&slot), Some("s2:consolidated"), "{quote}");
         }
     }
