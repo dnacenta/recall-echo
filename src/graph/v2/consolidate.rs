@@ -19,7 +19,9 @@ use super::super::types::{Entity, IngestionReport, Retirement};
 use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
 use super::ground::{is_stop_word, sentences};
-use super::known_match::{coexist, departure_near, key_tokens, mentioned_with_cue, value_spans};
+use super::known_match::{
+    coexist, cue_words, departure_near, key_tokens, mentioned_with_cue, value_spans,
+};
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
@@ -253,14 +255,16 @@ pub(crate) async fn run(
         let anchor = &anchors[pair.anchor];
         let partner = &loaded.rows[pair.partner];
         let turn = cited(ctx, anchor);
+        let cue = departs(turn, &partner.value, &anchor.replaces)
+            || (shares_pair(anchor, partner, &loaded.part_of, &loaded.owners)
+                && replacement_quote(&quote, &partner.value, &anchor.new_value));
         match accept(
             &verdict,
             &quote,
             &pair.evidence,
             &partner.value,
             &anchor.new_value,
-            turn,
-            &anchor.replaces,
+            cue,
         ) {
             Ok(verdict) => accepted.push((pair, verdict.to_string(), quote)),
             Err(reason) => note_drop(report, reason, &anchors, &loaded.rows, &pair, &quote),
@@ -624,8 +628,7 @@ fn accept(
     evidence: &str,
     old: &str,
     new_value: &str,
-    turn: &str,
-    replaces: &str,
+    cue: bool,
 ) -> Result<&'static str, &'static str> {
     let duplicate = verdict == "duplicate";
     if verdict != "supersedes" && !duplicate {
@@ -643,7 +646,7 @@ fn accept(
     if !(in_evidence || in_value) {
         return Err(DROP_QUOTE_MISSING);
     }
-    if verdict == "supersedes" && !departs(turn, old, replaces) {
+    if verdict == "supersedes" && !cue {
         return Err(DROP_NO_CUE);
     }
     Ok(if duplicate { "duplicate" } else { "supersedes" })
@@ -734,6 +737,126 @@ fn departs(turn: &str, old: &str, replaces: &str) -> bool {
         !value.is_empty() && (mentioned_with_cue(value, turn) || departure_near(value, turn))
     };
     hit(old) || hit(replaces)
+}
+
+/// Replacement phrasing in the quote, when the old value is not in that quote.
+///
+/// `instead` is already a departure word, so it is not repeated here. A list
+/// item is not a replacement. The phrase has to be in the quote itself.
+fn replacement_quote(quote: &str, old: &str, new_value: &str) -> bool {
+    !names_value(old, quote)
+        && names_value(new_value, quote)
+        && !listed_new(new_value, quote)
+        && quote_replaces(quote)
+}
+
+/// A listed new value is one item among others, not a replacement.
+///
+/// Additive wording such as `also` is not a list mark. Those quotes stay
+/// dropped because they are not replacement phrases.
+fn listed_new(value: &str, quote: &str) -> bool {
+    enumerated(value, quote) && list_mark(quote)
+}
+
+fn list_mark(quote: &str) -> bool {
+    quote.contains(',')
+        || quote.split_whitespace().any(|word| {
+            let word = word
+                .trim_matches(|ch: char| !ch.is_alphanumeric())
+                .to_lowercase();
+            matches!(word.as_str(), "and" | "or" | "nor" | "plus")
+        })
+}
+
+fn names_value(value: &str, text: &str) -> bool {
+    !value.is_empty() && !value_spans(text, value).is_empty()
+}
+
+/// Whole-phrase replacement wording, case-insensitive.
+///
+/// `now`, `new`, and `also` alone are not cues. `new <word>:` counts only at
+/// the start of the quote or of a sentence.
+fn quote_replaces(quote: &str) -> bool {
+    let words = cue_words(quote);
+    phrase_pair(&words, "is", "now")
+        || phrase_pair(&words, "are", "now")
+        || phrase_pair(&words, "now", "uses")
+        || new_label(quote, &words)
+}
+
+fn phrase_pair(words: &[(String, usize, usize)], first: &str, second: &str) -> bool {
+    words
+        .windows(2)
+        .any(|pair| pair[0].0 == first && pair[1].0 == second)
+}
+
+fn new_label(quote: &str, words: &[(String, usize, usize)]) -> bool {
+    words.iter().enumerate().any(|(index, (word, start, _))| {
+        word == "new"
+            && sentence_start(quote, *start)
+            && words
+                .get(index + 1)
+                .is_some_and(|(_, _, end)| colon_after(quote, *end))
+    })
+}
+
+fn sentence_start(quote: &str, start: usize) -> bool {
+    let before = quote[..start].trim_end();
+    before.is_empty()
+        || matches!(
+            before.as_bytes().last().copied(),
+            Some(b'.' | b'!' | b'?' | b'\n')
+        )
+}
+
+fn colon_after(quote: &str, end: usize) -> bool {
+    quote[end..].trim_start().starts_with(':')
+}
+
+/// Same subject and key, or a `part_of` component and that same key pairing.
+fn shares_pair(
+    anchor: &Anchor,
+    partner: &Row,
+    part_of: &[(String, String)],
+    owners: &[(String, String)],
+) -> bool {
+    let names = tokens(&partner.subject);
+    let key =
+        keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names);
+    key && (same_name(&anchor.subject, &partner.subject)
+        || component_link(anchor, partner, part_of, owners))
+}
+
+fn same_name(left: &str, right: &str) -> bool {
+    let left = normalise(left);
+    !left.is_empty() && left == normalise(right)
+}
+
+fn component_link(
+    anchor: &Anchor,
+    partner: &Row,
+    part_of: &[(String, String)],
+    owners: &[(String, String)],
+) -> bool {
+    let Some(anchor_id) = owner_id(&anchor.subject, owners) else {
+        return false;
+    };
+    let Some(partner_id) = owner_id(&partner.subject, owners) else {
+        return false;
+    };
+    part_of.iter().any(|(from, to)| {
+        let from = from.as_str();
+        let to = to.as_str();
+        (from == partner_id && to == anchor_id) || (from == anchor_id && to == partner_id)
+    })
+}
+
+fn owner_id<'a>(name: &str, owners: &'a [(String, String)]) -> Option<&'a str> {
+    let name = normalise(name);
+    owners
+        .iter()
+        .find(|(_, owned)| normalise(owned) == name)
+        .map(|(id, _)| id.as_str())
 }
 
 async fn close_partner(
@@ -2318,6 +2441,257 @@ mod tests {
         assert_eq!(dropped(&report, "quote not verbatim in the evidence"), 0);
         assert_eq!(report.consolidate.closes_sup, 0);
         assert!(ended(&slot).is_none());
+    }
+
+    #[test]
+    fn replacement_phrases_are_whole_phrases_only() {
+        for quote in [
+            "The layout is now sqlite for the index rows.",
+            "The layout IS NOW sqlite for the index rows.",
+            "The pools are now sqlite for the index rows.",
+            "The store now uses sqlite for the index rows.",
+            "New layout: sqlite for the index rows.",
+            "Agreed today. New default: sqlite for the index rows.",
+        ] {
+            assert!(quote_replaces(quote), "{quote}");
+        }
+        for quote in [
+            "also now supports sqlite in production",
+            "now available in addition to sqlite",
+            "the layout now sqlite for the index rows",
+            "We picked a new layout: sqlite for the index rows.",
+            "Use sqlite instead of walnut today.",
+            "dry run by default with --apply",
+        ] {
+            assert!(!quote_replaces(quote), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_phrase_closes_when_the_quote_names_the_new_value() {
+        for quote in [
+            "The layout is now sqlite for the index rows.",
+            "The layout IS NOW sqlite for the index rows.",
+            "The pools are now sqlite for the index rows.",
+            "The store now uses sqlite for the index rows.",
+            "New layout: sqlite for the index rows.",
+            "Agreed today. New default: sqlite for the index rows.",
+        ] {
+            let (report, slot) =
+                judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
+            assert_eq!(report.consolidate.closes_sup, 1, "{quote}");
+            assert_eq!(dropped(&report, "no departure cue"), 0, "{quote}");
+            assert_eq!(ended(&slot), Some("s2:consolidated"), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_phrase_without_the_new_value_stays_dropped() {
+        for quote in [
+            "The layout is now ready for the index rows.",
+            "The pools are now ready for the index rows.",
+            "The store now uses rocks for the index rows.",
+            "New layout: rocks for the index rows.",
+            "Agreed today. New default: rocks for the index rows.",
+        ] {
+            let turn_text = format!("{quote} sqlite stays noted here.");
+            let (report, slot) = judge_keyed(
+                quote,
+                &turn_text,
+                "layout",
+                "sqlite",
+                "layout_name",
+                "walnut",
+            )
+            .await;
+            assert_eq!(report.consolidate.calls, 1, "{quote}");
+            assert_eq!(dropped(&report, "no departure cue"), 1, "{quote}");
+            assert_eq!(report.consolidate.closes_sup, 0, "{quote}");
+            assert!(ended(&slot).is_none(), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_wording_stays_dropped() {
+        let quote = "dry run by default with --apply";
+        let (report, slot) =
+            judge_keyed(quote, quote, "layout", "dry run", "layout_name", "live run").await;
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(dropped(&report, "no departure cue"), 1);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn additive_wording_stays_dropped() {
+        for quote in [
+            "also now supports sqlite in production",
+            "now available in addition to sqlite today",
+        ] {
+            let (report, slot) =
+                judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
+            assert_eq!(report.consolidate.calls, 1, "{quote}");
+            assert_eq!(dropped(&report, "no departure cue"), 1, "{quote}");
+            assert_eq!(report.consolidate.closes_sup, 0, "{quote}");
+            assert!(ended(&slot).is_none(), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_item_or_a_second_setting_stays_dropped() {
+        let listed = "New layout: cedar, oak and pine for the rows.";
+        let (report, slot) =
+            judge_keyed(listed, listed, "layout", "cedar", "layout_name", "walnut").await;
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(dropped(&report, "no departure cue"), 1);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+
+        let second = "The layout is now rich grid for the index rows.";
+        let (report, slot) = judge_keyed(
+            second,
+            second,
+            "layout",
+            "rich grid",
+            "format",
+            "plain grid",
+        )
+        .await;
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(dropped(&report, "no departure cue"), 1);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_phrase_outside_the_quote_does_not_count() {
+        let quote = "Keep sqlite for the index rows.";
+        let turn_text = "The layout is now ready today. Keep sqlite for the index rows.";
+        let (report, slot) = judge_keyed(
+            quote,
+            turn_text,
+            "layout",
+            "sqlite",
+            "layout_name",
+            "walnut",
+        )
+        .await;
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(dropped(&report, "no departure cue"), 1);
+        assert_eq!(dropped(&report, "quote not verbatim in the evidence"), 0);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(&slot).is_none());
+    }
+
+    #[tokio::test]
+    async fn two_replacement_supersedes_on_one_anchor_close_none() {
+        let (_tmp, gm) = open().await;
+        let walnut = setting(
+            "acme",
+            Kind::Project,
+            "layout_name",
+            "walnut",
+            "layout_name is walnut",
+        );
+        let cherry = setting(
+            "acme",
+            Kind::Project,
+            "layout_mode",
+            "cherry",
+            "layout_mode is cherry",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("layout_name is walnut. layout_mode is cherry")],
+            &[walnut, cherry],
+        )
+        .await;
+        let quote = "The layout is now sqlite for the index rows.";
+        let next = setting("acme", Kind::Project, "layout", "sqlite", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", quote),
+            (2, "supersedes", quote),
+        ])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message.lock().unwrap());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(dropped(&report, "second supersede on the same anchor"), 2);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(live_any(&rows, "layout_name", "walnut")).is_none());
+        assert!(ended(live_any(&rows, "layout_mode", "cherry")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_component_with_the_same_key_accepts_the_phrase() {
+        let (_tmp, gm) = open().await;
+        let link = edge(
+            Predicate::PartOf,
+            "picker",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old = setting(
+            "picker",
+            Kind::Component,
+            "layout_name",
+            "walnut",
+            "layout_name is walnut",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("picker is part of acme. layout_name is walnut")],
+            &[link, old],
+        )
+        .await;
+        let quote = "The layout is now sqlite for the index rows.";
+        let next = setting("acme", Kind::Project, "layout", "sqlite", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message.lock().unwrap());
+        assert_eq!(report.consolidate.closes_sup, 1);
+        assert_eq!(
+            ended(live_any(
+                &slots(&gm, "picker").await,
+                "layout_name",
+                "walnut"
+            )),
+            Some("s2:consolidated")
+        );
+    }
+
+    async fn judge_keyed(
+        quote: &str,
+        turn_text: &str,
+        new_key: &str,
+        new_value: &str,
+        old_key: &str,
+        old_value: &str,
+    ) -> (IngestionReport, Value) {
+        let (_tmp, gm) = open().await;
+        let old = setting(
+            "acme",
+            Kind::Project,
+            old_key,
+            old_value,
+            &format!("{old_key} is {old_value}"),
+        );
+        commit(&gm, "s1", "2026-03-01", &[turn(&old.quote)], &[old]).await;
+        let next = setting("acme", Kind::Project, new_key, new_value, turn_text);
+        let turns = [turn(turn_text)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass(&gm, "s2", "2026-03-02", &turns, &[next], &stats, &stub).await;
+        let slot = live_any(&slots(&gm, "acme").await, old_key, old_value).clone();
+        (report, slot)
     }
 
     #[tokio::test]
