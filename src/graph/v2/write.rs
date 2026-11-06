@@ -749,10 +749,18 @@ impl<'a> Attempt<'a> {
                 self.hold_conflicts = None;
                 true
             } else {
-                // The value is already waiting. A second copy would move weights.
-                self.stats.already_seen += 1;
+                // Still pending. Attach this session's evidence; do not promote.
                 self.hold_conflicts = None;
-                false
+                match reinforce_slot(&mut slots[index], self.gm, fact, self.ctx.session_id)? {
+                    Sight::Recorded => {
+                        self.stats.reinforced += 1;
+                        true
+                    }
+                    Sight::AlreadySeen => {
+                        self.stats.already_seen += 1;
+                        false
+                    }
+                }
             }
         } else if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
             match reinforce_slot(slot, self.gm, fact, self.ctx.session_id)? {

@@ -3684,6 +3684,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restatement_keeps_the_pending_value_and_records_evidence() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let quote = "Keep using linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        assert_eq!(stats.holds_confirmed, 0);
+        assert_eq!(stats.holds_opened, 0);
+        assert_eq!(stats.already_seen, 0);
+        assert_eq!(stats.reinforced, 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(linen.get("pending").is_some());
+        assert!(ended(linen).is_none());
+        let evidence = linen["evidence"].as_array().unwrap();
+        assert!(evidence.iter().any(|item| {
+            item["session"] == "s3" && item["quote"] == quote && item["turn"] == 0
+        }));
+    }
+
+    #[tokio::test]
     async fn a_later_departure_confirms_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
