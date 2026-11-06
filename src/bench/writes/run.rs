@@ -7,7 +7,7 @@
 //! Archives go through the same renderer ingestion already reads, so turn
 //! headings survive and provenance is classified the way a real session is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -628,6 +628,22 @@ fn to_conversation(session: &ScriptSession) -> Conversation {
     }
 }
 
+async fn pending_edge_ids(gm: &GraphMemory) -> Result<HashSet<String>, RecallError> {
+    let mut response = gm
+        .db()
+        .query("SELECT id FROM relates_to WHERE pending != NONE")
+        .await
+        .map_err(crate::graph::error::GraphError::from)?;
+    let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            crate::graph::edge_view::record_id(row.get("id").unwrap_or(&serde_json::Value::Null))
+        })
+        .filter(|id| !id.is_empty())
+        .collect())
+}
+
 async fn snapshot(
     gm: &GraphMemory,
     first_beta: &mut HashMap<String, f64>,
@@ -635,6 +651,7 @@ async fn snapshot(
     // Names live on the entity records, not on the edge. The same lookup the
     // inspect path uses keeps a dangling id visible instead of dropping it.
     let relationships = crate::graph::crud::list_all_relationships(gm.db()).await?;
+    let pending_edge_ids = pending_edge_ids(gm).await?;
     let edge_evidence = edge_evidence(gm).await?;
     let mut names = crate::graph::edge_view::NameCache::new();
     let mut edges = Vec::with_capacity(relationships.len());
@@ -646,12 +663,13 @@ async fn snapshot(
         let beta = evidence.beta();
         let prior_alpha = starting_alpha(&id, beta, first_beta);
         let (assistant_steps, self_steps) = corroboration_steps(edge_evidence.get(&id));
+        let live = relationship.valid_until.is_none() && !pending_edge_ids.contains(&id);
         edges.push(ObservedEdge {
             id,
             subject: names.name_of(gm.db(), &from_id).await?,
             relation: relationship.rel_type.clone(),
             object: names.name_of(gm.db(), &to_id).await?,
-            live: relationship.valid_until.is_none(),
+            live,
             alpha: evidence.alpha(),
             beta,
             self_reinforcements: relationship.self_reinforcements.unwrap_or(0).max(0),

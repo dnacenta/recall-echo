@@ -275,10 +275,18 @@ async fn confidence_summary(db: &Surreal<Db>) -> Result<ConfidenceSummary, Graph
 }
 
 /// The live relationships the graph believes least.
+#[cfg(test)]
+pub(crate) async fn least_certain_for_test(
+    db: &Surreal<Db>,
+) -> Result<Vec<super::types::Relationship>, GraphError> {
+    least_certain(db).await
+}
+
+/// The live relationships the graph believes least.
 async fn least_certain(db: &Surreal<Db>) -> Result<Vec<super::types::Relationship>, GraphError> {
     let query = format!(
         r#"SELECT * FROM relates_to
-           WHERE valid_until IS NONE AND confidence < {STRONG_CONFIDENCE}
+           WHERE valid_until IS NONE AND pending IS NONE AND confidence < {STRONG_CONFIDENCE}
            ORDER BY confidence ASC
            LIMIT {HIGHLIGHT_EDGES}"#
     );
