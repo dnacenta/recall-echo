@@ -137,20 +137,11 @@ async fn consider(
             return;
         };
         let ended = format!("{}:superseded", ctx.session_id);
-        let stamped = stamp_ref(gm, old_ref, &until, &ended, old_value)
+        // Decide before writing. Clear the pending row first so a failed
+        // stamp cannot leave the slot with no live value.
+        let already = ref_already_closed(gm, old_ref, old_value)
             .await
             .unwrap_or(false);
-        // The write may already have closed the old row. Clear pending only
-        // when this pair is the one that should become live. Another live
-        // value for the same slot can reach this branch; drop the rival then.
-        let already = !stamped
-            && ref_already_closed(gm, old_ref, old_value)
-                .await
-                .unwrap_or(false);
-        if !stamped && !already {
-            report.hold.errors += 1;
-            return;
-        }
         let occupied = if already {
             match other_live(gm, new_ref, pred, key, new_value).await {
                 Ok(occupied) => occupied,
@@ -175,6 +166,17 @@ async fn consider(
             return;
         }
         if !clear_ref(gm, new_ref).await.unwrap_or(false) {
+            report.hold.errors += 1;
+            return;
+        }
+        let stamped = if already {
+            false
+        } else {
+            stamp_ref(gm, old_ref, &until, &ended, old_value)
+                .await
+                .unwrap_or(false)
+        };
+        if !already && !stamped {
             report.hold.errors += 1;
             return;
         }

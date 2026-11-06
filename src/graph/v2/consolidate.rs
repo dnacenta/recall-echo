@@ -322,6 +322,14 @@ pub(crate) async fn run(
             continue;
         }
         if verdict == "supersedes" {
+            let cleared = if pair.hold {
+                confirm_held(gm, &anchors, &loaded, pair, report).await
+            } else {
+                true
+            };
+            if pair.hold && !cleared {
+                continue;
+            }
             let before = report.consolidate.closes_sup;
             let reason = close_partner(
                 gm,
@@ -336,8 +344,11 @@ pub(crate) async fn run(
             if report.consolidate.closes_sup > before {
                 gone.insert(pair.partner);
                 if pair.hold {
-                    confirm_held(gm, &anchors, &loaded, pair, report).await;
+                    report.hold.holds_confirmed += 1;
+                    report.hold.holds_ambiguous = report.hold.holds_ambiguous.saturating_sub(1);
                 }
+            } else if pair.hold {
+                report.hold.errors += 1;
             } else if let Some(reason) = reason {
                 note_drop(report, reason, &anchors, &loaded.rows, pair, quote);
             }
@@ -1786,18 +1797,18 @@ async fn confirm_held(
     loaded: &Loaded,
     pair: &Pair,
     report: &mut IngestionReport,
-) {
+) -> bool {
     let Some(index) = anchors[pair.anchor].live else {
         report.hold.errors += 1;
-        return;
+        return false;
     };
     let reference = ref_of(&loaded.rows[index]);
     match super::hold::clear_ref(gm, &reference).await {
-        Ok(true) => {
-            report.hold.holds_confirmed += 1;
-            report.hold.holds_ambiguous = report.hold.holds_ambiguous.saturating_sub(1);
+        Ok(true) => true,
+        _ => {
+            report.hold.errors += 1;
+            false
         }
-        _ => report.hold.errors += 1,
     }
 }
 
