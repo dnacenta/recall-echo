@@ -143,6 +143,7 @@ pub(crate) async fn run(
     }
     if define_cache(gm).await.is_err() {
         report.consolidate.errors += 1;
+        report.hold.errors += count(ambiguous.len());
         return;
     }
     let mut names = wanted_names(&rough, ctx);
@@ -156,10 +157,11 @@ pub(crate) async fn run(
     }
     let Ok(loaded) = load_rows(gm, ctx.session_id, &names).await else {
         report.consolidate.errors += 1;
+        report.hold.errors += count(ambiguous.len());
         return;
     };
     let mut anchors = finish_anchors(rough, &loaded.rows);
-    if anchors.is_empty() {
+    if anchors.is_empty() && ambiguous.is_empty() {
         return;
     }
     report.consolidate.anchors = count(anchors.len());
@@ -3854,6 +3856,43 @@ mod tests {
             linen.get("pending").is_some(),
             "linen was promoted beside silk"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_repro_ambiguous_hold_without_session_anchors() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("The harbor bell rang twice today.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert!(llm.calls() >= 1, "hold pair never reached the judge");
+        assert!(report.consolidate.pairs >= 1 || llm.calls() >= 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_some());
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
     }
 
     #[tokio::test]

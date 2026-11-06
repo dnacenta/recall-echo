@@ -322,6 +322,20 @@ pub(crate) async fn extract_session(
             consolidate_ms = Some(elapsed_ms(started));
         }
         report.hold.holds_opened = stats.holds_opened;
+    } else if hold_enabled(memory_dir) {
+        // No facts to write. A text-only session can still confirm or judge a hold.
+        let mut write_ctx = write::WriteCtx::new(
+            llm,
+            &session.project,
+            ctx.session_id(),
+            &session.date,
+            &session.turns,
+        );
+        write_ctx.hold_on = true;
+        let started = std::time::Instant::now();
+        let stats = write::WriteStats::default();
+        super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
+        consolidate_ms = Some(elapsed_ms(started));
     } else if consolidate_on {
         consolidate_ms = Some(0);
     }
