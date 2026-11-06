@@ -234,12 +234,13 @@ pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool,
         })
         .await;
     }
-    gm.db()
-        .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE")
+    let mut response = gm
+        .db()
+        .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE RETURN BEFORE")
         .bind(("id", reference.to_string()))
-        .await?
-        .check()?;
-    Ok(true)
+        .await?;
+    let cleared: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(!cleared.is_empty())
 }
 
 /// Another live, non-pending value already holds this slot.

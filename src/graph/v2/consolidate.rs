@@ -4304,6 +4304,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clearing_an_edge_without_pending_is_not_success() {
+        let (_tmp, gm) = open().await;
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[turn("acme links canvas")],
+            &[edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "canvas",
+                Kind::Technology,
+            )],
+            false,
+            false,
+        )
+        .await;
+        let edges = uses_edges(&gm).await;
+        let id = id_text(edge_named(&edges, "canvas").get("id"));
+        assert!(!super::super::hold::clear_ref(&gm, &id).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn an_empty_hold_does_not_load_every_entity() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
