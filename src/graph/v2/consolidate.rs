@@ -20,7 +20,7 @@ use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
 use super::ground::{is_stop_word, sentences};
 use super::known_match::{
-    coexist, cue_words, departure_near, key_tokens, mentioned_with_cue, value_spans,
+    coexist, cue_words, departure_near, key_tokens, mention, mentioned_with_cue, value_spans,
 };
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
@@ -1724,6 +1724,20 @@ fn stored_session(evidence: &Value) -> String {
         .to_string()
 }
 
+/// The turn the cue check should read. Prefer one that names both values,
+/// then the old value, then the new value. Turn 0 is only the fallback when
+/// none of the session's turns name either value.
+fn hold_turn(ctx: &WriteCtx<'_>, old: &str, new_value: &str) -> usize {
+    let hit = |text: &str, value: &str| !value.is_empty() && mention(value, text);
+    ctx.turns
+        .iter()
+        .find(|turn| hit(&turn.text, old) && hit(&turn.text, new_value))
+        .or_else(|| ctx.turns.iter().find(|turn| hit(&turn.text, old)))
+        .or_else(|| ctx.turns.iter().find(|turn| hit(&turn.text, new_value)))
+        .map(|turn| turn.index)
+        .unwrap_or(0)
+}
+
 fn attach_holds(
     ctx: &WriteCtx<'_>,
     open: &[super::hold::OpenHold],
@@ -1760,7 +1774,7 @@ fn attach_holds(
             replaces: String::new(),
             entity: hold.subject.clone(),
             reason: "hold",
-            turn: 0,
+            turn: hold_turn(ctx, &hold.old_value, &hold.new_value),
             quote: String::new(),
             live: Some(new_index),
             a2: false,
@@ -3777,6 +3791,52 @@ mod tests {
         assert_eq!(report.hold.holds_confirmed, 0);
         let rows = slots(&gm, "acme").await;
         assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_turn_cue_confirms_the_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let quote = "Moved off canvas yesterday.";
+        let turns = [
+            turn("The label is north."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: quote.into(),
+            },
+        ];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert_eq!(report.hold.errors, 0, "{:?}", report.consolidate.dropped);
+        assert_eq!(report.hold.holds_confirmed, 1);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "canvas")),
+            Some("s3:consolidated")
+        );
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_none());
     }
 
     #[tokio::test]
