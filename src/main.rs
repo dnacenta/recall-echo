@@ -254,7 +254,8 @@ enum BenchCommands {
         #[arg(long)]
         consolidate: bool,
         /// Hold a conflicting write the retirement guard would skip.
-        /// Implies `--consolidate`. Off unless set.
+        /// Implies `--consolidate`. Off unless set. Pending rows stay out of
+        /// live reads if this is later turned off; see docs/grounding.md.
         #[arg(long)]
         consolidate_hold: bool,
     },

@@ -706,6 +706,7 @@ pub struct GraphSection {
     pub consolidate: bool,
     /// Hold a conflicting write that the retirement guard would skip.
     /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// A pending row stays out of live reads if this is later turned off.
     #[serde(default = "default_consolidate_hold", skip_serializing_if = "is_false")]
     pub consolidate_hold: bool,
 }

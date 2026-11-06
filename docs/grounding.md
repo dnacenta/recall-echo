@@ -83,6 +83,8 @@ With both on, a decided write that conflicts with a live row and would be left i
 
 The next session resolves a pending pair before the consolidation judge. Departure or replace evidence for that pair closes the old row (`valid_until` and `ended_by`) and clears `pending`, so the new row becomes the live value. A decided re-assertion of the old value closes the pending row with `ended_by` `<session>:hold_dropped`. Otherwise the pair stays pending and is added to the consolidation batch. That is still one call. A provider or parse error leaves the pending row unchanged and the ingest still succeeds. The report's `hold` object counts `holds_opened`, `holds_confirmed`, `holds_dropped`, and `holds_ambiguous`.
 
+Turning the hold off does not put a pending row into live reads, and it does not confirm or drop it. The row stays excluded until the hold is turned back on, when a later session can settle it.
+
 `--consolidate-hold` turns consolidation and the hold on for that bench run. The bench JSON includes `consolidate_hold` when the hold was on.
 
 ## Gate 5 — confidence and generic objects
