@@ -3982,7 +3982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_repro_restated_replace_confirms_hold() {
+    async fn a_restated_replace_confirms_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
         let open_turns = [turn("Store the pages in linen.")];
@@ -4664,7 +4664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_repro_ambiguous_hold_without_session_anchors() {
+    async fn an_ambiguous_hold_reaches_the_judge_without_session_anchors() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
         let open_turns = [turn("Store the pages in linen.")];
