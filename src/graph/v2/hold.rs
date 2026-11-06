@@ -237,8 +237,9 @@ pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool,
 
 /// Another live, non-pending value already holds this slot.
 ///
-/// Slots match subject, predicate, and key. An edge matches subject and
-/// relationship type: one other live edge of that type occupies the slot.
+/// Slots match subject, predicate, and key. An edge occupies the slot only
+/// when another live edge has the same type and the same role. A pending
+/// edge with no role does not treat other edges of that type as occupants.
 async fn other_live(
     gm: &GraphMemory,
     new_ref: &str,
@@ -288,11 +289,15 @@ async fn other_slot(
 async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool, GraphError> {
     let mut response = gm
         .db()
-        .query("SELECT in FROM type::record($id)")
+        .query("SELECT in, description FROM type::record($id)")
         .bind(("id", edge_id.to_string()))
         .await?;
     let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-    let Some(from) = rows.into_iter().next().map(|row| id_text(row.get("in"))) else {
+    let Some(mine) = rows.into_iter().next() else {
+        return Ok(false);
+    };
+    let from = id_text(mine.get("in"));
+    let Some(role) = edge_role(mine.get("description")) else {
         return Ok(false);
     };
     if from.is_empty() {
@@ -301,15 +306,32 @@ async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool,
     let mut response = gm
         .db()
         .query(
-            "SELECT id, pending, valid_until FROM type::record($id)->(relates_to WHERE valid_until = NONE AND rel_type = $rel)",
+            "SELECT id, pending, valid_until, description FROM type::record($id)->(relates_to WHERE valid_until = NONE AND rel_type = $rel)",
         )
         .bind(("id", from))
         .bind(("rel", pred.to_string()))
         .await?;
     let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
     Ok(edges.iter().any(|edge| {
-        id_text(edge.get("id")) != edge_id && !is_pending(edge) && !closed(edge.get("valid_until"))
+        id_text(edge.get("id")) != edge_id
+            && !is_pending(edge)
+            && !closed(edge.get("valid_until"))
+            && edge_role(edge.get("description")).as_deref() == Some(role.as_str())
     }))
+}
+
+/// Role stored on an edge, or nothing when the edge names none.
+fn edge_role(description: Option<&Value>) -> Option<String> {
+    let text = description.and_then(Value::as_str).map(str::trim)?;
+    if text.is_empty() {
+        return None;
+    }
+    let role = text.strip_prefix("role=").unwrap_or(text).trim();
+    if role.is_empty() {
+        None
+    } else {
+        Some(role.to_string())
+    }
 }
 
 fn same_key(left: &str, right: &str) -> bool {

@@ -3858,6 +3858,24 @@ mod tests {
         );
     }
 
+    async fn uses_edges(gm: &GraphMemory) -> Vec<Value> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, pending, valid_until, ended_by, description, out.name AS object FROM relates_to WHERE rel_type = 'uses'",
+            )
+            .await
+            .unwrap();
+        deserialize_take(&mut response, 0).unwrap()
+    }
+
+    fn edge_named<'a>(edges: &'a [Value], object: &str) -> &'a Value {
+        edges
+            .iter()
+            .find(|edge| edge.get("object").and_then(Value::as_str) == Some(object))
+            .unwrap_or_else(|| panic!("missing uses {object}"))
+    }
+
     fn live_values(rows: &[Value]) -> Vec<String> {
         rows.iter()
             .filter(|slot| {
@@ -3869,6 +3887,78 @@ mod tests {
                     .map(str::to_string)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_uses_edge_does_not_drop_a_roleless_hold() {
+        let (_tmp, gm) = open().await;
+        let turns = [turn("acme links canvas and rust")];
+        let facts = [
+            edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "canvas",
+                Kind::Technology,
+            ),
+            edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "rust",
+                Kind::Technology,
+            ),
+        ];
+        commit_flags(&gm, "s1", "2026-04-01", &turns, &facts, false, false).await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        let before = uses_edges(&gm).await;
+        assert!(
+            !field_absent(edge_named(&before, "linen").get("pending")),
+            "linen was not stored pending: {}",
+            edge_named(&before, "linen")
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let later = [turn("We moved off canvas. Linen is in.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &later, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &later, &[], &stats, &llm, true).await;
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        let rust_edge = edge_named(&edges, "rust");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(rust_edge.get("valid_until")), "{rust_edge}");
+        assert!(ended_edge(rust_edge).is_none(), "{rust_edge}");
+        assert_eq!(report.hold.holds_dropped, 0);
+        assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
+    }
+
+    fn ended_edge(edge: &Value) -> Option<&str> {
+        edge.get("ended_by").and_then(Value::as_str)
+    }
+
+    fn field_absent(value: Option<&Value>) -> bool {
+        value.is_none_or(Value::is_null)
     }
 
     #[tokio::test]
