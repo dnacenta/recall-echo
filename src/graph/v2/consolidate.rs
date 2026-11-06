@@ -3756,6 +3756,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_repro_restated_replace_confirms_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for linen.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Switched canvas for linen.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        assert_eq!(report.hold.errors, 0);
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(canvas).is_some(), "canvas stayed live");
+        assert!(linen.get("pending").is_none(), "linen still pending");
+        assert!(ended(linen).is_none());
+        let live: Vec<_> = rows
+            .iter()
+            .filter(|slot| {
+                slot.get("valid_until").is_none_or(Value::is_null) && slot.get("pending").is_none()
+            })
+            .filter_map(|slot| slot.get("value").and_then(Value::as_str))
+            .collect();
+        assert_eq!(live, vec!["linen"]);
+    }
+
+    #[tokio::test]
+    async fn a_third_value_does_not_promote_the_pending_rival() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let _report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        let silk = slot_named(&rows, "binder", "silk");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_some());
+        assert!(silk.get("pending").is_none());
+        assert!(ended(silk).is_none());
+        assert!(
+            linen.get("pending").is_some(),
+            "linen was promoted beside silk"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_consolidation_batch_leaves_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;

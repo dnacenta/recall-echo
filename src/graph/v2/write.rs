@@ -359,6 +359,7 @@ async fn apply_all(
         held_slots: HashSet::new(),
         held_edges: HashSet::new(),
         hold_conflicts: None,
+        closed_rows: HashSet::new(),
     };
     for index in ordered_indexes(facts) {
         attempt.index = index;
@@ -441,6 +442,8 @@ struct Attempt<'a> {
     held_edges: HashSet<String>,
     /// Old row id when this fact is stored pending instead of retiring that row.
     hold_conflicts: Option<String>,
+    /// Row ids this fact closed. A restated pending value can clear against them.
+    closed_rows: HashSet<String>,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -505,6 +508,7 @@ enum Close {
 impl<'a> Attempt<'a> {
     async fn apply(&mut self, source: &Fact) -> Result<(), GraphError> {
         self.hold_conflicts = None;
+        self.closed_rows.clear();
         let Some(subject) = bound(
             self.catalog,
             &source.subject_name,
@@ -574,6 +578,12 @@ impl<'a> Attempt<'a> {
             .find_edge(subject, object, fact, description.as_deref())
             .await?
         {
+            if let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) {
+                let old = (!fact.replaces.is_empty()).then_some(fact.replaces.as_str());
+                if self.releases_pending(conflicts, fact, old) {
+                    self.clear_edge_pending(&record_id(&existing.id)).await?;
+                }
+            }
             match self.reinforce_edge(&subject.id, &existing, fact).await? {
                 Sight::Recorded => self.stats.reinforced += 1,
                 Sight::AlreadySeen => self.stats.already_seen += 1,
@@ -718,11 +728,30 @@ impl<'a> Attempt<'a> {
             // Reinforce would otherwise attach it to a later live value.
             self.stats.already_seen += 1;
             false
-        } else if slots.iter().any(|slot| pending_same(slot, fact)) {
-            // The value is already waiting. A second copy would move weights.
-            self.stats.already_seen += 1;
-            self.hold_conflicts = None;
-            false
+        } else if let Some(index) = slots.iter().position(|slot| pending_same(slot, fact)) {
+            let conflicts = pending_conflicts(slots[index].get("pending")).map(str::to_string);
+            let old = conflicts
+                .as_deref()
+                .and_then(|id| slot_value_at(&subject.id, slots, id));
+            if conflicts
+                .as_deref()
+                .is_some_and(|id| self.releases_pending(id, fact, old.as_deref()))
+            {
+                if let Some(object) = slots[index].as_object_mut() {
+                    object.remove("pending");
+                }
+                match reinforce_slot(&mut slots[index], self.gm, fact, self.ctx.session_id)? {
+                    Sight::Recorded => self.stats.reinforced += 1,
+                    Sight::AlreadySeen => self.stats.already_seen += 1,
+                }
+                self.hold_conflicts = None;
+                true
+            } else {
+                // The value is already waiting. A second copy would move weights.
+                self.stats.already_seen += 1;
+                self.hold_conflicts = None;
+                false
+            }
         } else if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
             match reinforce_slot(slot, self.gm, fact, self.ctx.session_id)? {
                 Sight::Recorded => {
@@ -827,6 +856,7 @@ impl<'a> Attempt<'a> {
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
+            self.closed_rows.insert(format!("{}#{}", stored.id, index));
             changed = true;
             let subject_name = self.label(&stored.id, &fact.subject_name).await?;
             self.record(SUPERSEDED, &subject_name, closed, &fact.object_name);
@@ -1060,6 +1090,7 @@ impl<'a> Attempt<'a> {
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
+            self.closed_rows.insert(format!("{id}#{index}"));
             changed = true;
             notes.push(closed);
         }
@@ -1110,7 +1141,7 @@ impl<'a> Attempt<'a> {
         let mut response = self
             .tx
             .query(CLOSE_EDGE)
-            .bind(("id", id))
+            .bind(("id", id.clone()))
             .bind(("valid_until", until))
             .bind(("ended_by", ended_by))
             .await?;
@@ -1118,6 +1149,7 @@ impl<'a> Attempt<'a> {
         if closed.is_empty() {
             return Ok(());
         }
+        self.closed_rows.insert(id);
         let object_id = record_id(&edge.to_id);
         let old_value = self.label(&object_id, &object_id).await?;
         let subject_name = self.label(subject_id, subject_id).await?;
@@ -1413,6 +1445,29 @@ impl<'a> Attempt<'a> {
         if self.hold_conflicts.is_none() {
             self.hold_conflicts = Some(conflicts);
         }
+    }
+
+    /// The pending row names a conflict this fact closed, or the cited turn
+    /// has a departure cue beside that old value.
+    fn releases_pending(&self, conflicts: &str, fact: &Fact, old_value: Option<&str>) -> bool {
+        if self.closed_rows.contains(conflicts) {
+            return true;
+        }
+        let Some(old) = old_value.filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let turn = self.cited_turn(fact);
+        super::known_match::mentioned_with_cue(old, turn)
+            || super::known_match::departure_near(old, turn)
+    }
+
+    async fn clear_edge_pending(&mut self, id: &str) -> Result<(), GraphError> {
+        self.tx
+            .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE")
+            .bind(("id", id.to_string()))
+            .await?
+            .check()?;
+        Ok(())
     }
 
     fn guard_reason(&self, fact: &Fact, old_value: &str) -> Option<&'static str> {
@@ -1944,6 +1999,26 @@ fn pending_same(slot: &Value, fact: &Fact) -> bool {
     is_pending(slot) && slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
 }
 
+fn pending_conflicts(pending: Option<&Value>) -> Option<&str> {
+    pending
+        .and_then(|pending| pending.get("conflicts"))
+        .and_then(Value::as_str)
+}
+
+/// Value of `entity#index` when that slot is on this entity.
+fn slot_value_at(entity: &str, slots: &[Value], conflicts: &str) -> Option<String> {
+    let (id, index) = conflicts.rsplit_once('#')?;
+    if id != entity {
+        return None;
+    }
+    let index: usize = index.parse().ok()?;
+    slots
+        .get(index)
+        .and_then(|slot| slot.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// A row waiting on a later session. Live reads leave it out.
 #[must_use]
 pub(crate) fn is_pending(value: &Value) -> bool {
@@ -2193,6 +2268,8 @@ struct StoredEdge {
     self_reinforcements: Option<i64>,
     #[serde(default)]
     evidence: Option<Value>,
+    #[serde(default)]
+    pending: Option<Value>,
 }
 
 #[derive(Debug, Clone)]

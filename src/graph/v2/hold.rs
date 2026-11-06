@@ -140,20 +140,32 @@ async fn consider(
         let stamped = stamp_ref(gm, old_ref, &until, &ended, old_value)
             .await
             .unwrap_or(false);
-        let cleared = stamped && clear_ref(gm, new_ref).await.unwrap_or(false);
-        if !cleared {
+        // The write path may already have closed the old row. Still clear
+        // pending for this confirmed pair. A different value that closed the
+        // old row does not reach this branch.
+        let already = !stamped
+            && ref_already_closed(gm, old_ref, old_value)
+                .await
+                .unwrap_or(false);
+        if !stamped && !already {
+            report.hold.errors += 1;
+            return;
+        }
+        if !clear_ref(gm, new_ref).await.unwrap_or(false) {
             report.hold.errors += 1;
             return;
         }
         report.hold.holds_confirmed += 1;
-        report.retirements.push(Retirement {
-            reason: "superseded".into(),
-            subject: subject.to_string(),
-            predicate: pred.to_string(),
-            key: key.to_string(),
-            old_value: old_value.to_string(),
-            new_value: new_value.to_string(),
-        });
+        if stamped {
+            report.retirements.push(Retirement {
+                reason: "superseded".into(),
+                subject: subject.to_string(),
+                predicate: pred.to_string(),
+                key: key.to_string(),
+                old_value: old_value.to_string(),
+                new_value: new_value.to_string(),
+            });
+        }
         return;
     }
     if reasserts(facts, subject, pred, key, old_value) {
@@ -198,6 +210,43 @@ pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool,
         .await?
         .check()?;
     Ok(true)
+}
+
+async fn ref_already_closed(
+    gm: &GraphMemory,
+    reference: &str,
+    expect: &str,
+) -> Result<bool, GraphError> {
+    if let Some((entity, index)) = split_slot(reference) {
+        let mut response = gm
+            .db()
+            .query("SELECT attributes FROM type::record($id)")
+            .bind(("id", entity.to_string()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let Some(slot) = rows.into_iter().next().and_then(|row| {
+            row.get("attributes")
+                .and_then(|attrs| attrs.get("v2"))
+                .and_then(|v2| v2.get("slots"))
+                .and_then(Value::as_array)
+                .and_then(|slots| slots.get(index))
+                .cloned()
+        }) else {
+            return Ok(false);
+        };
+        let same = slot.get("value").and_then(Value::as_str) == Some(expect);
+        return Ok(same && crud::edge_already_closed(slot.get("valid_until")));
+    }
+    let mut response = gm
+        .db()
+        .query("SELECT valid_until FROM type::record($id)")
+        .bind(("id", reference.to_string()))
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .is_some_and(|row| crud::edge_already_closed(row.get("valid_until"))))
 }
 
 async fn stamp_ref(
