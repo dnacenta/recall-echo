@@ -4920,6 +4920,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_old_stamp_recovers_through_settle() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let quote = "Store the pages in linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        let rows = slots(&gm, "acme").await;
+        let index = rows
+            .iter()
+            .position(|slot| slot["value"] == "linen")
+            .unwrap();
+        let pending = slot_named(&rows, "binder", "linen")["pending"].clone();
+        let old_ref = pending["conflicts"].as_str().unwrap().to_string();
+        let entity = old_ref.rsplit_once('#').unwrap().0;
+        let new_ref = format!("{entity}#{index}");
+        // Loaded value was canvas. The stored value no longer matches, so the
+        // old-row stamp refuses while that row is still live.
+        rewrite_slot(&gm, "acme", "binder", "canvas", "jute").await;
+        let project = project();
+        let confirm = [turn("Switched canvas for linen.")];
+        let ctx = WriteCtx::new(&Quiet, &project, "s3", "2026-04-03", &confirm);
+        let mut report = IngestionReport::default();
+        let mut open = Vec::new();
+        super::super::hold::consider(
+            &gm,
+            &ctx,
+            &[],
+            &mut report,
+            &mut open,
+            &super::super::hold::OpenHold {
+                subject: "acme".into(),
+                pred: "setting".into(),
+                key: "binder".into(),
+                new_value: "linen".into(),
+                old_value: "canvas".into(),
+                new_ref,
+                old_ref,
+            },
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["jute".to_string()]);
+        assert!(ended(slot_named(&rows, "binder", "jute")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert_eq!(linen["pending"], pending);
+        assert!(ended(linen).is_none());
+        assert!(report.hold.errors >= 1, "{:?}", report.hold);
+        assert!(open.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_partner_close_recovers_through_the_judge() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let quote = "Store the pages in linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        let pending = slot_named(&slots(&gm, "acme").await, "binder", "linen")["pending"].clone();
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap()
+            .id_string();
+        struct RewriteOnJudge {
+            db: surrealdb::Surreal<crate::graph::store::Db>,
+            entity: String,
+        }
+        #[async_trait]
+        impl LlmProvider for RewriteOnJudge {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                panic!("plain complete was called");
+            }
+
+            async fn complete_structured(
+                &self,
+                _: &str,
+                _: &str,
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                let mut response = self
+                    .db
+                    .query("SELECT attributes FROM type::record($id)")
+                    .bind(("id", self.entity.clone()))
+                    .await
+                    .unwrap();
+                let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+                let mut attributes = rows[0]["attributes"].clone();
+                let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+                let canvas = slots
+                    .iter_mut()
+                    .find(|slot| slot["key"] == "binder" && slot["value"] == "canvas")
+                    .unwrap();
+                canvas["value"] = json!("jute");
+                self.db
+                    .query("UPDATE type::record($id) SET attributes = $attributes")
+                    .bind(("id", self.entity.clone()))
+                    .bind(("attributes", attributes))
+                    .await
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                Ok(Completion::unmeasured(
+                    r#"{"pairs":[{"i":1,"verdict":"supersedes","quote":"We moved off canvas."}]}"#,
+                ))
+            }
+        }
+        let judge = RewriteOnJudge {
+            db: gm.db().clone(),
+            entity,
+        };
+        let later = [turn("We moved off canvas.")];
+        let project = project();
+        let mut ctx = WriteCtx::new(&judge, &project, "s3", "2026-04-03", &later);
+        ctx.hold_on = true;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &[], &WriteStats::default(), &judge, &mut report).await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["jute".to_string()]);
+        assert!(ended(slot_named(&rows, "binder", "jute")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert_eq!(linen["pending"], pending, "linen was left live: {linen}");
+        assert!(ended(linen).is_none());
+        assert!(report.hold.errors >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
     async fn a_failed_pending_restore_does_not_leave_two_live_values() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;

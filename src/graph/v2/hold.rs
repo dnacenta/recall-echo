@@ -177,7 +177,7 @@ pub(crate) async fn settle(
     Ok(open)
 }
 
-async fn consider(
+pub(crate) async fn consider(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     facts: &[Fact],
