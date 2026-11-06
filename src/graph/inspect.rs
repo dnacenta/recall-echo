@@ -263,7 +263,9 @@ async fn strongest_of_type(
 /// Band every live relationship by how firmly it is believed.
 async fn confidence_summary(db: &Surreal<Db>) -> Result<ConfidenceSummary, GraphError> {
     let mut response = db
-        .query("SELECT VALUE confidence FROM relates_to WHERE valid_until IS NONE")
+        .query(
+            "SELECT VALUE confidence FROM relates_to WHERE valid_until IS NONE AND pending IS NONE",
+        )
         .await?;
     let confidences: Vec<f64> = super::deserialize_take(&mut response, 0)?;
 
@@ -328,5 +330,46 @@ mod tests {
     fn an_empty_graph_has_nothing_to_be_sure_of() {
         let summary = ConfidenceSummary::default();
         assert_eq!(summary.total(), 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_pending_edge_is_absent_from_overview_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        for (id, name) in [("one", "acme"), ("two", "linen"), ("three", "rust")] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = '{name}', entity_type = 'project', abstract = '', overview = ''"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:three SET rel_type = 'uses', confidence = 0.9",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:two SET rel_type = 'uses', confidence = 0.2, pending = { since: 's2', conflicts: 'relates_to:old' }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let report = overview(gm.db(), super::GraphStats::default(), 1)
+            .await
+            .unwrap();
+        assert_eq!(report.confidence.strong, 1);
+        assert_eq!(report.confidence.doubtful, 0);
+        assert_eq!(report.confidence.total(), 1);
     }
 }
