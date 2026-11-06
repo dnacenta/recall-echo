@@ -583,8 +583,9 @@ impl<'a> Attempt<'a> {
         {
             if let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) {
                 let pending_id = record_id(&existing.id);
-                if self.releases_edge(conflicts, &pending_id).await? {
-                    self.clear_edge_pending(&pending_id).await?;
+                if self.releases_edge(conflicts, &pending_id).await?
+                    && self.clear_edge_pending(&pending_id).await?
+                {
                     self.stats.holds_confirmed += 1;
                 }
             }
@@ -1496,6 +1497,10 @@ impl<'a> Attempt<'a> {
         conflicts: &str,
         pending_id: &str,
     ) -> Result<bool, GraphError> {
+        if !conflicts.starts_with("relates_to:") || !pending_id.starts_with("relates_to:") {
+            self.stats.retirements_skipped += 1;
+            return Ok(false);
+        }
         if self.closed_rows.contains(conflicts) {
             return Ok(true);
         }
@@ -1549,13 +1554,17 @@ impl<'a> Attempt<'a> {
         Ok(!occupied)
     }
 
-    async fn clear_edge_pending(&mut self, id: &str) -> Result<(), GraphError> {
+    async fn clear_edge_pending(&mut self, id: &str) -> Result<bool, GraphError> {
+        if !id.starts_with("relates_to:") {
+            self.stats.retirements_skipped += 1;
+            return Ok(false);
+        }
         self.tx
             .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE")
             .bind(("id", id.to_string()))
             .await?
             .check()?;
-        Ok(())
+        Ok(true)
     }
 
     fn guard_reason(&self, fact: &Fact, old_value: &str) -> Option<&'static str> {

@@ -3725,6 +3725,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mismatched_hold_reference_is_not_written() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let linen = attributes["v2"]["slots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot["value"] == "linen")
+            .unwrap();
+        linen["pending"]["conflicts"] = json!("user:other");
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("Switched canvas for linen.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert!(report.hold.errors >= 1);
+        assert_eq!(report.hold.holds_confirmed, 0);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+    }
+
+    #[tokio::test]
     async fn a_later_departure_confirms_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;

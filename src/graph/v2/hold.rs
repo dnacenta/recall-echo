@@ -223,12 +223,14 @@ async fn consider(
 /// Remove `pending` so the row is live. The value and the weights stay.
 pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
+        entity_slot(entity)?;
         return edit_slot(gm, entity, index, |slot| {
             slot.as_object_mut()
                 .is_some_and(|object| object.remove("pending").is_some())
         })
         .await;
     }
+    edge_record(reference)?;
     let mut response = gm
         .db()
         .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE RETURN BEFORE")
@@ -389,12 +391,14 @@ async fn stamp_ref(
     expect: &str,
 ) -> Result<bool, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
+        entity_slot(entity)?;
         return edit_slot(gm, entity, index, |slot| {
             slot.get("value").and_then(Value::as_str) == Some(expect)
                 && stamp_slot(slot, until, ended)
         })
         .await;
     }
+    edge_record(reference)?;
     let mut response = gm
         .db()
         .query(CLOSE_EDGE)
@@ -433,6 +437,7 @@ async fn edit_slot_once(
     index: usize,
     edit: &mut impl FnMut(&mut Value) -> bool,
 ) -> Result<bool, GraphError> {
+    entity_slot(entity)?;
     let tx = gm.db().clone().begin().await?;
     let changed = apply_slot_edit(&tx, entity, index, edit).await;
     match changed {
@@ -664,6 +669,26 @@ async fn name_of(gm: &GraphMemory, id: &str) -> Result<String, GraphError> {
 fn split_slot(reference: &str) -> Option<(&str, usize)> {
     let (entity, index) = reference.rsplit_once('#')?;
     Some((entity, index.parse().ok()?))
+}
+
+fn entity_slot(entity: &str) -> Result<(), GraphError> {
+    if entity.starts_with("entity:") {
+        Ok(())
+    } else {
+        Err(GraphError::Parse(
+            "hold slot reference is not an entity record".into(),
+        ))
+    }
+}
+
+fn edge_record(reference: &str) -> Result<(), GraphError> {
+    if reference.starts_with("relates_to:") {
+        Ok(())
+    } else {
+        Err(GraphError::Parse(
+            "hold edge reference is not a relates_to record".into(),
+        ))
+    }
 }
 
 fn conflicts(value: &Value) -> Option<&str> {
