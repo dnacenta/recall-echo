@@ -40,7 +40,12 @@ pub(crate) async fn settle(
     facts: &[Fact],
     report: &mut IngestionReport,
 ) -> Result<Vec<OpenHold>, ()> {
-    let entities = crud::list_entities(gm.db(), None).await.map_err(|_| ())?;
+    if !any_pending(gm).await? {
+        return Ok(Vec::new());
+    }
+    #[cfg(test)]
+    FULL_LOADS.with(|loads| loads.set(loads.get().saturating_add(1)));
+    let entities = load_entities(gm).await?;
     let mut open = Vec::new();
     for entity in &entities {
         let Some(slots) = slots_of(entity) else {
@@ -487,6 +492,53 @@ fn cited<'a>(ctx: &'a WriteCtx<'a>, fact: &'a Fact) -> &'a str {
         .find(|turn| turn.index == fact.turn)
         .map(|turn| turn.text.as_str())
         .unwrap_or(fact.quote.as_str())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times settle loaded entity rows on this thread.
+#[cfg(test)]
+pub(crate) fn full_loads() -> u32 {
+    FULL_LOADS.with(std::cell::Cell::get)
+}
+
+/// Zero [`full_loads`] before the next assertion.
+#[cfg(test)]
+pub(crate) fn reset_full_loads() {
+    FULL_LOADS.with(|loads| loads.set(0));
+}
+
+async fn any_pending(gm: &GraphMemory) -> Result<bool, ()> {
+    let mut response = gm
+        .db()
+        .query("SELECT id FROM relates_to WHERE pending != NONE LIMIT 1")
+        .await
+        .map_err(|_| ())?;
+    let edges: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+    if !edges.is_empty() {
+        return Ok(true);
+    }
+    let mut response = gm
+        .db()
+        .query(
+            "SELECT id FROM entity WHERE count(attributes.v2.slots[WHERE pending != NONE]) > 0 LIMIT 1",
+        )
+        .await
+        .map_err(|_| ())?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+    Ok(!rows.is_empty())
+}
+
+async fn load_entities(gm: &GraphMemory) -> Result<Vec<super::super::types::Entity>, ()> {
+    let mut response = gm
+        .db()
+        .query("SELECT * OMIT embedding FROM entity")
+        .await
+        .map_err(|_| ())?;
+    deserialize_take(&mut response, 0).map_err(|_| ())
 }
 
 fn slots_of(entity: &super::super::types::Entity) -> Option<Vec<Value>> {

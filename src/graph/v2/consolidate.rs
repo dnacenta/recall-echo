@@ -4304,6 +4304,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_hold_does_not_load_every_entity() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        super::super::hold::reset_full_loads();
+        let turns = [turn("The harbor bell rang twice today.")];
+        let stats = WriteStats::default();
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s2", "2026-04-02", &turns, &[], &stats, &llm, true).await;
+        assert_eq!(super::super::hold::full_loads(), 0);
+        assert_eq!(report.hold.errors, 0);
+    }
+
+    #[tokio::test]
     async fn a_split_turn_does_not_confirm_a_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
