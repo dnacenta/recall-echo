@@ -195,16 +195,29 @@ async fn consider(
             }
             return;
         }
-        if !noted(clear_ref(gm, new_ref).await) {
-            report.hold.errors += 1;
-            return;
-        }
+        let removed = match take_pending(gm, new_ref).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                report.hold.errors += 1;
+                return;
+            }
+            Err(err) => {
+                eprintln!("hold error: {err}");
+                report.hold.errors += 1;
+                return;
+            }
+        };
         let stamped = if already {
             false
         } else {
             noted(stamp_ref(gm, old_ref, &until, &ended, old_value).await)
         };
         if !already && !stamped {
+            // The old row is still live. Put the hold back so both values
+            // are not live with nothing left to settle.
+            if let Err(err) = restore_pending(gm, new_ref, &removed).await {
+                eprintln!("hold error: {err}");
+            }
             report.hold.errors += 1;
             return;
         }
@@ -237,15 +250,23 @@ async fn consider(
     open.push(hold.clone());
 }
 
-/// Remove `pending` so the row is live. The value and the weights stay.
-pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool, GraphError> {
+/// Remove `pending` and return the object that was stored there.
+pub(crate) async fn take_pending(
+    gm: &GraphMemory,
+    reference: &str,
+) -> Result<Option<Value>, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
         entity_slot(entity)?;
-        return edit_slot(gm, entity, index, |slot| {
-            slot.as_object_mut()
-                .is_some_and(|object| object.remove("pending").is_some())
+        let mut removed = None;
+        let changed = edit_slot(gm, entity, index, |slot| {
+            let Some(object) = slot.as_object_mut() else {
+                return false;
+            };
+            removed = object.remove("pending");
+            removed.is_some()
         })
-        .await;
+        .await?;
+        return Ok(changed.then_some(removed).flatten());
     }
     edge_record(reference)?;
     let mut response = gm
@@ -254,7 +275,49 @@ pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool,
         .bind(("id", reference.to_string()))
         .await?;
     let cleared: Vec<Value> = deserialize_take(&mut response, 0)?;
-    Ok(!cleared.is_empty())
+    Ok(cleared.into_iter().next().and_then(|row| {
+        let pending = row.get("pending").cloned()?;
+        pending.is_object().then_some(pending)
+    }))
+}
+
+/// Put a removed `pending` object back on a row that is still live.
+pub(crate) async fn restore_pending(
+    gm: &GraphMemory,
+    reference: &str,
+    pending: &Value,
+) -> Result<bool, GraphError> {
+    if !pending.is_object() {
+        return Ok(false);
+    }
+    if let Some((entity, index)) = split_slot(reference) {
+        entity_slot(entity)?;
+        return edit_slot(gm, entity, index, |slot| {
+            let Some(object) = slot.as_object_mut() else {
+                return false;
+            };
+            if object.get("pending").is_some_and(Value::is_object) {
+                return false;
+            }
+            if crud::edge_already_closed(object.get("valid_until")) {
+                return false;
+            }
+            object.insert("pending".to_string(), pending.clone());
+            true
+        })
+        .await;
+    }
+    edge_record(reference)?;
+    let mut response = gm
+        .db()
+        .query(
+            "UPDATE type::record($id) SET pending = $pending WHERE pending = NONE AND valid_until = NONE RETURN AFTER",
+        )
+        .bind(("id", reference.to_string()))
+        .bind(("pending", pending.clone()))
+        .await?;
+    let restored: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(!restored.is_empty())
 }
 
 /// Another live, non-pending value already holds this slot.

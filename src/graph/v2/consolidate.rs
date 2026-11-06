@@ -321,12 +321,18 @@ pub(crate) async fn run(
             continue;
         }
         if verdict == "supersedes" {
-            let cleared = if pair.hold {
+            // A partner closed earlier in this batch already has one live
+            // successor. Clearing another hold against it would make a second.
+            if pair.hold && gone.contains(&pair.partner) {
+                note_drop(report, DROP_GONE, &anchors, &loaded.rows, pair, quote);
+                continue;
+            }
+            let taken = if pair.hold {
                 confirm_held(gm, &anchors, &loaded, pair, report).await
             } else {
-                true
+                None
             };
-            if pair.hold && !cleared {
+            if pair.hold && taken.is_none() {
                 continue;
             }
             let before = report.consolidate.closes_sup;
@@ -347,6 +353,16 @@ pub(crate) async fn run(
                     report.hold.holds_ambiguous = report.hold.holds_ambiguous.saturating_sub(1);
                 }
             } else if pair.hold {
+                if let Some(pending) = taken {
+                    if let Some(index) = anchors[pair.anchor].live {
+                        let reference = ref_of(&loaded.rows[index]);
+                        if let Err(err) =
+                            super::hold::restore_pending(gm, &reference, &pending).await
+                        {
+                            eprintln!("hold error: {err}");
+                        }
+                    }
+                }
                 report.hold.errors += 1;
             } else if let Some(reason) = reason {
                 note_drop(report, reason, &anchors, &loaded.rows, pair, quote);
@@ -1817,17 +1833,17 @@ async fn confirm_held(
     loaded: &Loaded,
     pair: &Pair,
     report: &mut IngestionReport,
-) -> bool {
+) -> Option<Value> {
     let Some(index) = anchors[pair.anchor].live else {
         report.hold.errors += 1;
-        return false;
+        return None;
     };
     let reference = ref_of(&loaded.rows[index]);
-    match super::hold::clear_ref(gm, &reference).await {
-        Ok(true) => true,
+    match super::hold::take_pending(gm, &reference).await {
+        Ok(Some(pending)) => Some(pending),
         _ => {
             report.hold.errors += 1;
-            false
+            None
         }
     }
 }
@@ -4635,7 +4651,10 @@ mod tests {
         .await;
         let edges = uses_edges(&gm).await;
         let id = id_text(edge_named(&edges, "canvas").get("id"));
-        assert!(!super::super::hold::clear_ref(&gm, &id).await.unwrap());
+        assert!(super::super::hold::take_pending(&gm, &id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -4855,6 +4874,44 @@ mod tests {
             let rows = slots(&gm, "acme").await;
             assert_eq!(slot_named(&rows, "binder", "linen")["pending"], pending);
             assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn two_supersedes_on_one_old_row_promote_one_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        for (session, date, value) in [("s2", "2026-04-02", "linen"), ("s3", "2026-04-03", "silk")]
+        {
+            let quote = format!("Store the pages in {value}.");
+            let turns = [turn(&quote)];
+            let facts = [setting("acme", Kind::Project, "binder", value, &quote)];
+            commit_flags(&gm, session, date, &turns, &facts, true, true).await;
+        }
+        let turns = [turn("We moved off canvas.")];
+        let stats = commit_flags(&gm, "s4", "2026-04-04", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"supersedes","quote":"We moved off canvas."},{"i":2,"verdict":"supersedes","quote":"We moved off canvas."}]}"#.into(),
+        ));
+        let report = pass_hold(&gm, "s4", "2026-04-04", &turns, &[], &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        let live = live_values(&rows);
+        assert!(live.len() <= 1, "two live binder values: {live:?}");
+        let promoted = ["linen", "silk"]
+            .into_iter()
+            .filter(|value| live.iter().any(|row| row == value))
+            .count();
+        assert_eq!(promoted, 1, "live {live:?} hold {:?}", report.hold);
+        for value in ["linen", "silk"] {
+            let slot = slot_named(&rows, "binder", value);
+            let is_live = slot.get("pending").is_none() && ended(slot).is_none();
+            if !is_live {
+                assert!(
+                    slot.get("pending").is_some()
+                        || ended(slot).is_some_and(|reason| reason.ends_with("hold_dropped")),
+                    "{value} became a second live value: {slot}"
+                );
+            }
         }
     }
 }
