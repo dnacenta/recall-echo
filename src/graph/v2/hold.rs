@@ -259,7 +259,7 @@ async fn other_slot(
     index: usize,
     pred: &str,
     key: &str,
-    new_value: &str,
+    _new_value: &str,
 ) -> Result<bool, GraphError> {
     let mut response = gm
         .db()
@@ -282,7 +282,6 @@ async fn other_slot(
             && !is_pending(slot)
             && text_at(slot, "predicate") == pred
             && same_key(&text_at(slot, "key"), key)
-            && !values_equal(&text_at(slot, "value"), new_value)
     }))
 }
 

@@ -3890,6 +3890,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_copy_drops_the_pending_duplicate() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let stored = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let mut live = stored
+            .iter()
+            .find(|slot| slot.get("value").and_then(Value::as_str) == Some("linen"))
+            .unwrap()
+            .clone();
+        live.as_object_mut().unwrap().remove("pending");
+        stored.push(live);
+        stored
+            .iter_mut()
+            .find(|slot| slot.get("value").and_then(Value::as_str) == Some("canvas"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .extend([
+                ("valid_until".into(), json!("2026-04-02T00:00:00Z")),
+                ("ended_by".into(), json!("s2:consolidated")),
+            ]);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("Switched canvas for linen.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["linen".to_string()]);
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert!(report.hold.holds_dropped >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
     async fn an_unrelated_uses_edge_does_not_drop_a_roleless_hold() {
         let (_tmp, gm) = open().await;
         let turns = [turn("acme links canvas and rust")];
