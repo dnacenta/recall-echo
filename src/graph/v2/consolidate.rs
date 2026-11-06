@@ -3858,6 +3858,124 @@ mod tests {
         );
     }
 
+    fn live_values(rows: &[Value]) -> Vec<String> {
+        rows.iter()
+            .filter(|slot| {
+                slot.get("valid_until").is_none_or(Value::is_null) && slot.get("pending").is_none()
+            })
+            .filter_map(|slot| {
+                slot.get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_mentioned_rival_is_dropped_beside_the_new_value() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk. The linen samples go back.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["silk".to_string()]);
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_some());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(linen).is_some_and(|reason| reason.ends_with("hold_dropped")));
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert!(report.hold.holds_dropped >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_later_mention_drops_the_rival_beside_the_live_value() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let _ = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let later = [turn(
+            "We moved off canvas last month. The linen swatches arrived today.",
+        )];
+        let later_stats = commit_flags(&gm, "s4", "2026-04-04", &later, &[], true, true).await;
+        let later_llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(
+            &gm,
+            "s4",
+            "2026-04-04",
+            &later,
+            &[],
+            &later_stats,
+            &later_llm,
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["silk".to_string()]);
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(linen).is_some_and(|reason| reason.ends_with("hold_dropped")));
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert!(report.hold.holds_dropped >= 1);
+    }
+
     #[tokio::test]
     async fn audit_repro_ambiguous_hold_without_session_anchors() {
         let (_tmp, gm) = open().await;

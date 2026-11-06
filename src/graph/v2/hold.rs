@@ -140,15 +140,38 @@ async fn consider(
         let stamped = stamp_ref(gm, old_ref, &until, &ended, old_value)
             .await
             .unwrap_or(false);
-        // The write path may already have closed the old row. Still clear
-        // pending for this confirmed pair. A different value that closed the
-        // old row does not reach this branch.
+        // The write may already have closed the old row. Clear pending only
+        // when this pair is the one that should become live. Another live
+        // value for the same slot can reach this branch; drop the rival then.
         let already = !stamped
             && ref_already_closed(gm, old_ref, old_value)
                 .await
                 .unwrap_or(false);
         if !stamped && !already {
             report.hold.errors += 1;
+            return;
+        }
+        let occupied = if already {
+            match other_live(gm, new_ref, pred, key, new_value).await {
+                Ok(occupied) => occupied,
+                Err(_) => {
+                    report.hold.errors += 1;
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+        if occupied {
+            let dropped = format!("{}:hold_dropped", ctx.session_id);
+            if stamp_ref(gm, new_ref, &until, &dropped, new_value)
+                .await
+                .unwrap_or(false)
+            {
+                report.hold.holds_dropped += 1;
+            } else {
+                report.hold.errors += 1;
+            }
             return;
         }
         if !clear_ref(gm, new_ref).await.unwrap_or(false) {
@@ -210,6 +233,91 @@ pub(crate) async fn clear_ref(gm: &GraphMemory, reference: &str) -> Result<bool,
         .await?
         .check()?;
     Ok(true)
+}
+
+/// Another live, non-pending value already holds this slot.
+///
+/// Slots match subject, predicate, and key. An edge matches subject and
+/// relationship type: one other live edge of that type occupies the slot.
+async fn other_live(
+    gm: &GraphMemory,
+    new_ref: &str,
+    pred: &str,
+    key: &str,
+    new_value: &str,
+) -> Result<bool, GraphError> {
+    if let Some((entity, index)) = split_slot(new_ref) {
+        return other_slot(gm, entity, index, pred, key, new_value).await;
+    }
+    other_edge(gm, new_ref, pred).await
+}
+
+async fn other_slot(
+    gm: &GraphMemory,
+    entity: &str,
+    index: usize,
+    pred: &str,
+    key: &str,
+    new_value: &str,
+) -> Result<bool, GraphError> {
+    let mut response = gm
+        .db()
+        .query("SELECT attributes FROM type::record($id)")
+        .bind(("id", entity.to_string()))
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    let Some(slots) = rows.into_iter().next().and_then(|row| {
+        row.get("attributes")
+            .and_then(|attrs| attrs.get("v2"))
+            .and_then(|v2| v2.get("slots"))
+            .and_then(Value::as_array)
+            .cloned()
+    }) else {
+        return Ok(false);
+    };
+    Ok(slots.iter().enumerate().any(|(at, slot)| {
+        at != index
+            && !closed(slot.get("valid_until"))
+            && !is_pending(slot)
+            && text_at(slot, "predicate") == pred
+            && same_key(&text_at(slot, "key"), key)
+            && !values_equal(&text_at(slot, "value"), new_value)
+    }))
+}
+
+async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool, GraphError> {
+    let mut response = gm
+        .db()
+        .query("SELECT in FROM type::record($id)")
+        .bind(("id", edge_id.to_string()))
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    let Some(from) = rows.into_iter().next().map(|row| id_text(row.get("in"))) else {
+        return Ok(false);
+    };
+    if from.is_empty() {
+        return Ok(false);
+    }
+    let mut response = gm
+        .db()
+        .query(
+            "SELECT id, pending, valid_until FROM type::record($id)->(relates_to WHERE valid_until = NONE AND rel_type = $rel)",
+        )
+        .bind(("id", from))
+        .bind(("rel", pred.to_string()))
+        .await?;
+    let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(edges.iter().any(|edge| {
+        id_text(edge.get("id")) != edge_id && !is_pending(edge) && !closed(edge.get("valid_until"))
+    }))
+}
+
+fn same_key(left: &str, right: &str) -> bool {
+    if left.is_empty() && right.is_empty() {
+        true
+    } else {
+        keys_match(left, right)
+    }
 }
 
 async fn ref_already_closed(
