@@ -3890,6 +3890,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cue_without_a_close_leaves_the_row_pending() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for linen.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Switched canvas for linen.",
+        );
+        fact.replaces = "canvas".into();
+        commit_flags(&gm, "s3", "not-a-day", &turns, &[fact], true, true).await;
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert!(!field_absent(
+            slot_named(&rows, "binder", "linen").get("pending")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_replaces_name_does_not_release_an_edge_hold() {
+        let (_tmp, gm) = open().await;
+        let turns = [turn("acme links canvas")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &turns,
+            &[edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "canvas",
+                Kind::Technology,
+            )],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Keep canvas and linen.")],
+            &[linen],
+            true,
+            true,
+        )
+        .await;
+        let mut again = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        again.replaces = "jute".into();
+        again.quote = "Replaced jute with linen.".into();
+        commit_flags(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[turn("Replaced jute with linen.")],
+            &[again],
+            true,
+            true,
+        )
+        .await;
+        let edges = uses_edges(&gm).await;
+        assert!(ended_edge(edge_named(&edges, "canvas")).is_none());
+        assert!(!field_absent(edge_named(&edges, "linen").get("pending")));
+    }
+
+    #[tokio::test]
     async fn a_live_copy_drops_the_pending_duplicate() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;

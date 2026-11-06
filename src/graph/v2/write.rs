@@ -579,9 +579,9 @@ impl<'a> Attempt<'a> {
             .await?
         {
             if let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) {
-                let old = (!fact.replaces.is_empty()).then_some(fact.replaces.as_str());
-                if self.releases_pending(conflicts, fact, old) {
-                    self.clear_edge_pending(&record_id(&existing.id)).await?;
+                let pending_id = record_id(&existing.id);
+                if self.releases_edge(conflicts, &pending_id).await? {
+                    self.clear_edge_pending(&pending_id).await?;
                 }
             }
             match self.reinforce_edge(&subject.id, &existing, fact).await? {
@@ -730,12 +730,9 @@ impl<'a> Attempt<'a> {
             false
         } else if let Some(index) = slots.iter().position(|slot| pending_same(slot, fact)) {
             let conflicts = pending_conflicts(slots[index].get("pending")).map(str::to_string);
-            let old = conflicts
-                .as_deref()
-                .and_then(|id| slot_value_at(&subject.id, slots, id));
             if conflicts
                 .as_deref()
-                .is_some_and(|id| self.releases_pending(id, fact, old.as_deref()))
+                .is_some_and(|id| self.releases_slot(id, &subject.id, slots))
             {
                 if let Some(object) = slots[index].as_object_mut() {
                     object.remove("pending");
@@ -1447,18 +1444,94 @@ impl<'a> Attempt<'a> {
         }
     }
 
-    /// The pending row names a conflict this fact closed, or the cited turn
-    /// has a departure cue beside that old value.
-    fn releases_pending(&self, conflicts: &str, fact: &Fact, old_value: Option<&str>) -> bool {
+    /// Release a pending row when this fact closed its conflict, or that
+    /// conflict is already closed and no other live value holds the slot.
+    fn releases_slot(&self, conflicts: &str, entity: &str, slots: &[Value]) -> bool {
         if self.closed_rows.contains(conflicts) {
             return true;
         }
-        let Some(old) = old_value.filter(|value| !value.is_empty()) else {
+        let Some((id, index)) = conflicts.rsplit_once('#') else {
             return false;
         };
-        let turn = self.cited_turn(fact);
-        super::known_match::mentioned_with_cue(old, turn)
-            || super::known_match::departure_near(old, turn)
+        if id != entity {
+            return false;
+        }
+        let Ok(index) = index.parse::<usize>() else {
+            return false;
+        };
+        let Some(old) = slots.get(index) else {
+            return false;
+        };
+        if !edge_closed(old.get("valid_until")) {
+            return false;
+        }
+        let pred = slot_str(old, "predicate");
+        let key = slot_str(old, "key").unwrap_or("");
+        !slots.iter().enumerate().any(|(at, slot)| {
+            at != index
+                && slot_live(slot)
+                && !is_pending(slot)
+                && slot_str(slot, "predicate") == pred
+                && keys_agree(key, slot_str(slot, "key").unwrap_or(""))
+        })
+    }
+
+    async fn releases_edge(
+        &mut self,
+        conflicts: &str,
+        pending_id: &str,
+    ) -> Result<bool, GraphError> {
+        if self.closed_rows.contains(conflicts) {
+            return Ok(true);
+        }
+        let mut response = self
+            .tx
+            .query("SELECT valid_until FROM type::record($id)")
+            .bind(("id", conflicts.to_string()))
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(false);
+        };
+        if !edge_closed(row.get("valid_until")) {
+            return Ok(false);
+        }
+        let mut response = self
+            .tx
+            .query("SELECT in, description, rel_type FROM type::record($id)")
+            .bind(("id", pending_id.to_string()))
+            .await?;
+        let pending_rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let Some(pending) = pending_rows.into_iter().next() else {
+            return Ok(false);
+        };
+        let Some(role) = stored_role(pending.get("description")) else {
+            return Ok(true);
+        };
+        let from = record_id_field(pending.get("in"));
+        let rel = pending
+            .get("rel_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if from.is_empty() || rel.is_empty() {
+            return Ok(false);
+        }
+        let mut response = self
+            .tx
+            .query(
+                "SELECT id, pending, description FROM type::record($id)->(relates_to WHERE valid_until = NONE AND rel_type = $rel)",
+            )
+            .bind(("id", from))
+            .bind(("rel", rel))
+            .await?;
+        let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let occupied = edges.iter().any(|edge| {
+            record_id_field(edge.get("id")) != pending_id
+                && !is_pending(edge)
+                && stored_role(edge.get("description")).as_deref() == Some(role.as_str())
+        });
+        Ok(!occupied)
     }
 
     async fn clear_edge_pending(&mut self, id: &str) -> Result<(), GraphError> {
@@ -1999,6 +2072,31 @@ fn pending_same(slot: &Value, fact: &Fact) -> bool {
     is_pending(slot) && slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
 }
 
+fn keys_agree(left: &str, right: &str) -> bool {
+    if left.is_empty() && right.is_empty() {
+        true
+    } else {
+        keys_match(left, right)
+    }
+}
+
+fn stored_role(description: Option<&Value>) -> Option<String> {
+    let text = description.and_then(Value::as_str).map(str::trim)?;
+    if text.is_empty() {
+        return None;
+    }
+    let role = text.strip_prefix("role=").unwrap_or(text).trim();
+    if role.is_empty() {
+        None
+    } else {
+        Some(role.to_string())
+    }
+}
+
+fn record_id_field(id: Option<&Value>) -> String {
+    id.map(record_id).unwrap_or_default()
+}
+
 fn pending_conflicts(pending: Option<&Value>) -> Option<&str> {
     pending
         .and_then(|pending| pending.get("conflicts"))
@@ -2006,19 +2104,6 @@ fn pending_conflicts(pending: Option<&Value>) -> Option<&str> {
 }
 
 /// Value of `entity#index` when that slot is on this entity.
-fn slot_value_at(entity: &str, slots: &[Value], conflicts: &str) -> Option<String> {
-    let (id, index) = conflicts.rsplit_once('#')?;
-    if id != entity {
-        return None;
-    }
-    let index: usize = index.parse().ok()?;
-    slots
-        .get(index)
-        .and_then(|slot| slot.get("value"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
 /// A row waiting on a later session. Live reads leave it out.
 #[must_use]
 pub(crate) fn is_pending(value: &Value) -> bool {
