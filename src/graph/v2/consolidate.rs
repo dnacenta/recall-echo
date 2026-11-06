@@ -1739,11 +1739,11 @@ fn attach_holds(
         .join("\n");
     let mut added = 0u32;
     for hold in open {
-        let Some(new_index) = find_ref(&loaded.rows, &hold.new_ref, &hold.new_value) else {
+        let Some(new_index) = find_ref(&loaded.rows, &hold.new_ref, hold, &hold.new_value) else {
             report.hold.errors += 1;
             continue;
         };
-        let Some(old_index) = find_ref(&loaded.rows, &hold.old_ref, &hold.old_value) else {
+        let Some(old_index) = find_ref(&loaded.rows, &hold.old_ref, hold, &hold.old_value) else {
             report.hold.errors += 1;
             continue;
         };
@@ -1778,10 +1778,24 @@ fn attach_holds(
     added
 }
 
-fn find_ref(rows: &[Row], reference: &str, value: &str) -> Option<usize> {
+fn find_ref(
+    rows: &[Row],
+    reference: &str,
+    hold: &super::hold::OpenHold,
+    value: &str,
+) -> Option<usize> {
     rows.iter()
         .position(|row| ref_of(row) == reference)
-        .or_else(|| rows.iter().position(|row| values_equal(&row.value, value)))
+        .or_else(|| {
+            rows.iter().position(|row| {
+                values_equal(&row.value, value)
+                    && normalise(&row.subject) == normalise(&hold.subject)
+                    && row.pred == hold.pred
+                    && (row.edge.is_some()
+                        || keys_match(&row.key, &hold.key)
+                        || row.key == hold.key)
+            })
+        })
 }
 
 fn ref_of(row: &Row) -> String {
@@ -3904,6 +3918,105 @@ mod tests {
                     .map(str::to_string)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_shared_short_value_does_not_bind_another_subject() {
+        let (_tmp, gm) = open().await;
+        let on = [turn("The flag is on.")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &on,
+            &[setting(
+                "acme",
+                Kind::Project,
+                "flag",
+                "on",
+                "The flag is on.",
+            )],
+            false,
+            false,
+        )
+        .await;
+        commit_flags(
+            &gm,
+            "s1b",
+            "2026-04-01",
+            &on,
+            &[setting(
+                "bravo",
+                Kind::Project,
+                "flag",
+                "on",
+                "The flag is on.",
+            )],
+            false,
+            false,
+        )
+        .await;
+        let off = [turn("Store the pages in off.")];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &off,
+            &[setting(
+                "acme",
+                Kind::Project,
+                "flag",
+                "off",
+                "Store the pages in off.",
+            )],
+            true,
+            true,
+        )
+        .await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        attributes["v2"]["slots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot.get("value").and_then(Value::as_str) == Some("on"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .extend([
+                ("valid_until".into(), json!("2026-04-02T00:00:00Z")),
+                ("ended_by".into(), json!("s2:consolidated")),
+            ]);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("The harbor bell rang twice today.")];
+        let project = ProjectIdentity {
+            name: "acme".into(),
+            aliases: vec!["bravo".into()],
+        };
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let mut ctx = WriteCtx::new(&llm, &project, "s3", "2026-04-03", &turns);
+        ctx.hold_on = true;
+        let stats = WriteStats::default();
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &[], &stats, &llm, &mut report).await;
+        let bravo = slots(&gm, "bravo").await;
+        assert!(ended(slot_named(&bravo, "flag", "on")).is_none());
+        assert!(report.hold.errors >= 1, "{:?}", report.hold);
     }
 
     #[tokio::test]
