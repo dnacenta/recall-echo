@@ -504,7 +504,8 @@ fn mention_draft(name: &str, kind: Kind, fact: &Fact, creates: bool) -> MentionD
 enum Close {
     Allow,
     Skip,
-    Hold,
+    /// Hold the first conflict. `reason` is the skip counted for each later one.
+    Hold(&'static str),
 }
 
 impl<'a> Attempt<'a> {
@@ -847,8 +848,8 @@ impl<'a> Attempt<'a> {
             }
             match self.supersede_allowed(slot, fact) {
                 Close::Skip => continue,
-                Close::Hold => {
-                    self.arm_hold(format!("{}#{}", stored.id, index));
+                Close::Hold(reason) => {
+                    self.arm_hold(format!("{}#{}", stored.id, index), reason);
                     continue;
                 }
                 Close::Allow => {}
@@ -1031,7 +1032,7 @@ impl<'a> Attempt<'a> {
                 .await?;
             if let Some(skip) = self.guard_reason(fact, &old_value) {
                 if self.ctx.hold_on {
-                    self.arm_hold(record_id(&edge.id));
+                    self.arm_hold(record_id(&edge.id), skip);
                 } else {
                     self.note_skip(skip);
                 }
@@ -1080,7 +1081,7 @@ impl<'a> Attempt<'a> {
             if reason == REPLACED {
                 if let Some(skip) = self.guard_reason(fact, slot_str(slot, "value").unwrap_or("")) {
                     if self.ctx.hold_on {
-                        self.arm_hold(format!("{id}#{index}"));
+                        self.arm_hold(format!("{id}#{index}"), skip);
                     } else {
                         self.note_skip(skip);
                     }
@@ -1434,7 +1435,7 @@ impl<'a> Attempt<'a> {
         }
         if let Some(reason) = self.guard_reason(fact, old) {
             if self.ctx.hold_on {
-                return Close::Hold;
+                return Close::Hold(reason);
             }
             self.note_skip(reason);
             return Close::Skip;
@@ -1442,9 +1443,11 @@ impl<'a> Attempt<'a> {
         Close::Allow
     }
 
-    fn arm_hold(&mut self, conflicts: String) {
+    fn arm_hold(&mut self, conflicts: String, reason: &str) {
         if self.hold_conflicts.is_none() {
             self.hold_conflicts = Some(conflicts);
+        } else {
+            self.note_skip(reason);
         }
     }
 
@@ -1623,7 +1626,7 @@ impl<'a> Attempt<'a> {
         }
         if let Some(reason) = self.guard_reason(fact, &old_value) {
             if self.ctx.hold_on {
-                self.arm_hold(record_id(&edge.id));
+                self.arm_hold(record_id(&edge.id), reason);
             } else {
                 self.note_skip(reason);
             }

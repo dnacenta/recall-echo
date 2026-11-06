@@ -3642,6 +3642,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_conflict_is_counted_as_a_skip() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let stored = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let mut silk = stored[0].clone();
+        silk["value"] = json!("silk");
+        stored.push(silk);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("Store the pages in linen.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        assert_eq!(stats.holds_opened, 1);
+        assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert!(ended(slot_named(&rows, "binder", "silk")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(linen.get("pending").is_some());
+    }
+
+    #[tokio::test]
     async fn a_later_departure_confirms_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
