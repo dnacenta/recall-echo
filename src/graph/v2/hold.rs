@@ -241,10 +241,24 @@ async fn consider(
             noted(stamp_ref(gm, old_ref, &until, &ended, old_value).await)
         };
         if !already && !stamped {
-            // The old row is still live. Put the hold back so both values
-            // are not live with nothing left to settle.
-            if let Err(err) = restore_pending(gm, new_ref, &removed).await {
-                eprintln!("hold error: {err}");
+            // The old row is still live. Put the hold back, or drop the new
+            // row when another live value already occupies the slot.
+            let dropped_by = format!("{}:hold_dropped", ctx.session_id);
+            if let Ok(PendingRecover::Dropped) = recover_pending(
+                gm,
+                &PendingTarget {
+                    new_ref,
+                    pred,
+                    key,
+                    new_value,
+                },
+                &removed,
+                &until,
+                &dropped_by,
+            )
+            .await
+            {
+                report.hold.holds_dropped += 1;
             }
             report.hold.errors += 1;
             return;
@@ -290,8 +304,11 @@ pub(crate) async fn take_pending(
             let Some(object) = slot.as_object_mut() else {
                 return false;
             };
+            if !object.get("pending").is_some_and(Value::is_object) {
+                return false;
+            }
             removed = object.remove("pending");
-            removed.is_some()
+            removed.as_ref().is_some_and(Value::is_object)
         })
         .await?;
         return Ok(changed.then_some(removed).flatten());
@@ -346,6 +363,107 @@ pub(crate) async fn restore_pending(
         .await?;
     let restored: Vec<Value> = deserialize_take(&mut response, 0)?;
     Ok(!restored.is_empty())
+}
+
+/// What a failed confirm did with the pending object it had already removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingRecover {
+    /// `pending` is back on the new row.
+    Restored,
+    /// Another live value occupies the slot, so the new row was closed.
+    Dropped,
+    /// The object is still off the row and the row is still live.
+    Failed,
+}
+
+/// The new row a failed confirm has to put back or drop.
+pub(crate) struct PendingTarget<'a> {
+    pub new_ref: &'a str,
+    pub pred: &'a str,
+    pub key: &'a str,
+    pub new_value: &'a str,
+}
+
+/// Put `pending` back after a confirm failed to close the old row.
+///
+/// `Ok(false)` from [`restore_pending`] is a failure, same as `Err`. When
+/// another live value already occupies the slot, the new row is stamped
+/// `hold_dropped`. Otherwise the restore is tried once more.
+pub(crate) async fn recover_pending(
+    gm: &GraphMemory,
+    target: &PendingTarget<'_>,
+    pending: &Value,
+    until: &str,
+    dropped_by: &str,
+) -> Result<PendingRecover, GraphError> {
+    if let Ok(true) = restore_attempt(gm, target.new_ref, pending).await {
+        return Ok(PendingRecover::Restored);
+    }
+    let occupied = match other_live(
+        gm,
+        target.new_ref,
+        target.pred,
+        target.key,
+        target.new_value,
+    )
+    .await
+    {
+        Ok(occupied) => occupied,
+        Err(err) => {
+            eprintln!("hold error: {err}");
+            return retry_restore(gm, target.new_ref, pending).await;
+        }
+    };
+    if occupied && !until.is_empty() {
+        return match stamp_ref(gm, target.new_ref, until, dropped_by, target.new_value).await {
+            Ok(true) => Ok(PendingRecover::Dropped),
+            Ok(false) => {
+                eprintln!("hold error: pending was not restored");
+                Ok(PendingRecover::Failed)
+            }
+            Err(err) => {
+                eprintln!("hold error: {err}");
+                Err(err)
+            }
+        };
+    }
+    retry_restore(gm, target.new_ref, pending).await
+}
+
+async fn restore_attempt(
+    gm: &GraphMemory,
+    reference: &str,
+    pending: &Value,
+) -> Result<bool, GraphError> {
+    match restore_pending(gm, reference, pending).await {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            eprintln!("hold error: pending was not restored");
+            Ok(false)
+        }
+        Err(err) => {
+            eprintln!("hold error: {err}");
+            Err(err)
+        }
+    }
+}
+
+async fn retry_restore(
+    gm: &GraphMemory,
+    reference: &str,
+    pending: &Value,
+) -> Result<PendingRecover, GraphError> {
+    match restore_pending(gm, reference, pending).await {
+        Ok(true) => Ok(PendingRecover::Restored),
+        Ok(false) => {
+            eprintln!("hold error: pending was not restored");
+            Ok(PendingRecover::Failed)
+        }
+        Err(err) => {
+            eprintln!("hold error: {err}");
+            Err(err)
+        }
+    }
 }
 
 /// Another live, non-pending value already holds this slot.

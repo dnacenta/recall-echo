@@ -356,10 +356,25 @@ pub(crate) async fn run(
                 if let Some(pending) = taken {
                     if let Some(index) = anchors[pair.anchor].live {
                         let reference = ref_of(&loaded.rows[index]);
-                        if let Err(err) =
-                            super::hold::restore_pending(gm, &reference, &pending).await
+                        let anchor = &anchors[pair.anchor];
+                        let until = session_midnight(ctx.date).unwrap_or_default();
+                        let dropped_by = format!("{}:hold_dropped", ctx.session_id);
+                        if let Ok(super::hold::PendingRecover::Dropped) =
+                            super::hold::recover_pending(
+                                gm,
+                                &super::hold::PendingTarget {
+                                    new_ref: &reference,
+                                    pred: &anchor.pred,
+                                    key: &anchor.key,
+                                    new_value: &anchor.new_value,
+                                },
+                                &pending,
+                                &until,
+                                &dropped_by,
+                            )
+                            .await
                         {
-                            eprintln!("hold error: {err}");
+                            report.hold.holds_dropped += 1;
                         }
                     }
                 }
@@ -4902,6 +4917,59 @@ mod tests {
             assert_eq!(slot_named(&rows, "binder", "linen")["pending"], pending);
             assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_pending_restore_does_not_leave_two_live_values() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let quote = "Store the pages in linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        let rows = slots(&gm, "acme").await;
+        let index = rows
+            .iter()
+            .position(|slot| slot["value"] == "linen")
+            .unwrap();
+        let conflicts = slot_named(&rows, "binder", "linen")["pending"]["conflicts"]
+            .as_str()
+            .unwrap();
+        let entity = conflicts.rsplit_once('#').unwrap().0;
+        let new_ref = format!("{entity}#{index}");
+        let taken = super::super::hold::take_pending(&gm, &new_ref)
+            .await
+            .unwrap()
+            .expect("pending object");
+        assert!(taken.is_object());
+        let taken_live = live_values(&slots(&gm, "acme").await);
+        assert!(
+            taken_live.iter().any(|value| value == "canvas")
+                && taken_live.iter().any(|value| value == "linen"),
+            "take left one value: {taken_live:?}"
+        );
+        // A non-object is not a pending payload, so the restore returns Ok(false).
+        let outcome = super::super::hold::recover_pending(
+            &gm,
+            &super::super::hold::PendingTarget {
+                new_ref: &new_ref,
+                pred: "setting",
+                key: "binder",
+                new_value: "linen",
+            },
+            &json!("not-an-object"),
+            "2026-04-03T00:00:00Z",
+            "s3:hold_dropped",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, super::super::hold::PendingRecover::Dropped);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["canvas".to_string()]);
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "linen")),
+            Some("s3:hold_dropped")
+        );
     }
 
     #[tokio::test]
