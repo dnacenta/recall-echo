@@ -322,6 +322,10 @@ pub(crate) async fn extract_session(
             consolidate_ms = Some(elapsed_ms(started));
         }
         report.hold.holds_opened = stats.holds_opened;
+        report.hold.holds_confirmed = report
+            .hold
+            .holds_confirmed
+            .saturating_add(stats.holds_confirmed);
     } else if hold_enabled(memory_dir) {
         // No facts to write. A text-only session can still confirm or judge a hold.
         let mut write_ctx = write::WriteCtx::new(

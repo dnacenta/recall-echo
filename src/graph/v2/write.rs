@@ -94,6 +94,8 @@ pub(crate) struct WriteStats {
     pub replaces_unconsumed: Vec<usize>,
     /// Conflicting rows stored pending instead of skipped. Zero when the hold is off.
     pub holds_opened: u32,
+    /// Pending rows this batch released after the old row was closed.
+    pub holds_confirmed: u32,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -582,6 +584,7 @@ impl<'a> Attempt<'a> {
                 let pending_id = record_id(&existing.id);
                 if self.releases_edge(conflicts, &pending_id).await? {
                     self.clear_edge_pending(&pending_id).await?;
+                    self.stats.holds_confirmed += 1;
                 }
             }
             match self.reinforce_edge(&subject.id, &existing, fact).await? {
@@ -741,6 +744,7 @@ impl<'a> Attempt<'a> {
                     Sight::Recorded => self.stats.reinforced += 1,
                     Sight::AlreadySeen => self.stats.already_seen += 1,
                 }
+                self.stats.holds_confirmed += 1;
                 self.hold_conflicts = None;
                 true
             } else {

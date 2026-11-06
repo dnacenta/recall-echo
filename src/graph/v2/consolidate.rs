@@ -3791,7 +3791,13 @@ mod tests {
         let facts = [fact];
         let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
         let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
-        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let mut report =
+            pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        report.hold.holds_confirmed = report
+            .hold
+            .holds_confirmed
+            .saturating_add(stats.holds_confirmed);
+        assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
         assert_eq!(report.hold.errors, 0);
         let rows = slots(&gm, "acme").await;
         let canvas = slot_named(&rows, "binder", "canvas");
