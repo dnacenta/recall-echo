@@ -3918,4 +3918,123 @@ mod tests {
         assert!(report.timing.unwrap().match_ms.is_none());
         assert!(report.known_match.is_blank());
     }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_empty_extraction_still_settles_a_pending_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::create_dir_all(memory.join("conversations")).unwrap();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nconsolidate = true\nconsolidate_hold = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            memory.join("conversations/conversation-001.md"),
+            "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
+             ### User\n\nSwitched canvas for linen.\n",
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        let project = ProjectIdentity {
+            name: "acme".into(),
+            aliases: Vec::new(),
+        };
+        struct Quiet;
+        #[async_trait::async_trait]
+        impl LlmProvider for Quiet {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                panic!("resolver called");
+            }
+        }
+        let quiet = Quiet;
+        let canvas_turns = [Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The binder is canvas.".into(),
+        }];
+        let canvas = Fact {
+            subject_name: "acme".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: "binder".into(),
+            object_name: "canvas".into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 0,
+            quote: "The binder is canvas.".into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        };
+        let ctx = super::write::WriteCtx::new(&quiet, &project, "s1", "2026-04-01", &canvas_turns);
+        super::write::write_facts(&gm, &ctx, &[canvas])
+            .await
+            .unwrap();
+        let linen_turns = [Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "Store the pages in linen.".into(),
+        }];
+        let linen = Fact {
+            subject_name: "acme".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: "binder".into(),
+            object_name: "linen".into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 0,
+            quote: "Store the pages in linen.".into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        };
+        let mut ctx =
+            super::write::WriteCtx::new(&quiet, &project, "s2", "2026-04-02", &linen_turns);
+        ctx.match_on = true;
+        ctx.hold_on = true;
+        let opened = super::write::write_facts(&gm, &ctx, &[linen])
+            .await
+            .unwrap();
+        assert_eq!(opened.holds_opened, 1);
+
+        struct Empty;
+        #[async_trait::async_trait]
+        impl LlmProvider for Empty {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string())
+            }
+        }
+        let report = extract_session(&gm, memory, 1, &IngestContext::new("s3", Some(1)), &Empty)
+            .await
+            .unwrap();
+        assert_eq!(report.slots_written, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report.hold.holds_confirmed >= 1,
+            "empty facts left the hold: {:?}",
+            report.hold
+        );
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let acme = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let slots = acme.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap();
+        let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert_eq!(canvas["ended_by"], "s3:superseded");
+        assert!(linen.get("pending").is_none());
+    }
 }
