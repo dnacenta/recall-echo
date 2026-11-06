@@ -4076,7 +4076,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restated_replace_confirms_the_hold() {
-        let (_tmp, gm) = open().await;
+        let (tmp, gm) = open().await;
         seed_binder(&gm).await;
         let open_turns = [turn("Store the pages in linen.")];
         let open_facts = [setting(
@@ -4096,24 +4096,46 @@ mod tests {
             true,
         )
         .await;
-        let turns = [turn("Switched canvas for linen.")];
-        let mut fact = setting(
-            "acme",
-            Kind::Project,
-            "binder",
-            "linen",
-            "Switched canvas for linen.",
-        );
-        fact.replaces = "canvas".into();
-        let facts = [fact];
-        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
-        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
-        let mut report =
-            pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
-        report.hold.holds_confirmed = report
-            .hold
-            .holds_confirmed
-            .saturating_add(stats.holds_confirmed);
+        std::fs::write(
+            tmp.path().join(".recall-echo.toml"),
+            "[graph]\nknown_match = true\nconsolidate = true\nconsolidate_hold = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        std::fs::write(
+            tmp.path().join("conversations/conversation-001.md"),
+            "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
+             ### User\n\nSwitched canvas for linen.\n",
+        )
+        .unwrap();
+        struct Confirm;
+        #[async_trait]
+        impl LlmProvider for Confirm {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"pairs":[]}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                _: &str,
+                _: &[crate::graph::llm::Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                Ok(Completion::unmeasured(
+                    r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"binder","object":"linen","object_type":"literal","status":"decided","replaces":"canvas","turn":0,"quote":"Switched canvas for linen.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+                ))
+            }
+        }
+        let report = super::super::pass1::extract_session(
+            &gm,
+            tmp.path(),
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &Confirm,
+        )
+        .await
+        .unwrap();
         assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
         assert_eq!(report.hold.errors, 0);
         let rows = slots(&gm, "acme").await;

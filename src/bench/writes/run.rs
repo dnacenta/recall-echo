@@ -2932,6 +2932,62 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_pending_edge_is_not_live_in_the_bench_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        for (id, name) in [("one", "acme"), ("two", "linen"), ("three", "rust")] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = '{name}', entity_type = 'project', abstract = '', overview = ''"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:two SET rel_type = 'uses', confidence = 0.4, valid_from = time::now(), pending = { since: 's2', conflicts: 'relates_to:old' }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:three SET rel_type = 'uses', confidence = 0.4, valid_from = time::now()",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut first_beta = std::collections::HashMap::new();
+        let edges = snapshot(&gm, &mut first_beta).await.unwrap();
+        let pending = edges
+            .iter()
+            .find(|edge| edge.object == "linen")
+            .expect("pending edge");
+        let live = edges
+            .iter()
+            .find(|edge| edge.object == "rust")
+            .expect("live edge");
+        let mut response = gm
+            .db()
+            .query("SELECT id FROM relates_to WHERE pending != NONE")
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> =
+            crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let stored = crate::graph::edge_view::record_id(rows[0].get("id").unwrap());
+        assert_eq!(pending.id, stored);
+        assert!(!pending.live);
+        assert!(live.live);
+    }
+
+    #[cfg(feature = "embedded")]
     fn counted(tp: u32, fp: u32, missed: u32) -> grade::OpScore {
         grade::OpScore {
             tp,

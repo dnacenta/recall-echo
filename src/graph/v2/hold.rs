@@ -377,13 +377,7 @@ async fn other_slot(
     let Some(slots) = attribute_row(gm, entity).await?.as_ref().and_then(slots_in) else {
         return Ok(false);
     };
-    Ok(slots.iter().enumerate().any(|(at, slot)| {
-        at != index
-            && !closed(slot.get("valid_until"))
-            && !is_pending(slot)
-            && text_at(slot, "predicate") == pred
-            && keys_agree(&text_at(slot, "key"), key)
-    }))
+    Ok(slot_occupied(&slots, index, pred, key))
 }
 
 async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool, GraphError> {
@@ -412,12 +406,29 @@ async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool,
         .bind(("rel", pred.to_string()))
         .await?;
     let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
-    Ok(edges.iter().any(|edge| {
-        id_text(edge.get("id")) != edge_id
+    Ok(edge_occupied(&edges, edge_id, &role))
+}
+
+/// Another live, non-pending slot with this predicate and key.
+pub(crate) fn slot_occupied(slots: &[Value], index: usize, pred: &str, key: &str) -> bool {
+    slots.iter().enumerate().any(|(at, slot)| {
+        at != index
+            && !closed(slot.get("valid_until"))
+            && !is_pending(slot)
+            && text_at(slot, "predicate") == pred
+            && keys_agree(&text_at(slot, "key"), key)
+    })
+}
+
+/// Another live, non-pending edge of this role. The caller has already
+/// decided that a role-less edge is not occupied.
+pub(crate) fn edge_occupied(edges: &[Value], pending_id: &str, role: &str) -> bool {
+    edges.iter().any(|edge| {
+        id_text(edge.get("id")) != pending_id
             && !is_pending(edge)
             && !closed(edge.get("valid_until"))
-            && stored_role(edge.get("description")).as_deref() == Some(role.as_str())
-    }))
+            && stored_role(edge.get("description")).as_deref() == Some(role)
+    })
 }
 
 async fn ref_already_closed(
@@ -794,11 +805,8 @@ fn closed(valid_until: Option<&Value>) -> bool {
 }
 
 pub(crate) fn id_text(id: Option<&Value>) -> String {
-    match id {
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    }
+    id.map(super::super::edge_view::record_id)
+        .unwrap_or_default()
 }
 
 /// The object stored on a new row that conflicts with `old`.

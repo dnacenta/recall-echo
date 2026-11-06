@@ -1481,15 +1481,9 @@ impl<'a> Attempt<'a> {
         if !edge_closed(old.get("valid_until")) {
             return false;
         }
-        let pred = slot_str(old, "predicate");
+        let pred = slot_str(old, "predicate").unwrap_or("");
         let key = slot_str(old, "key").unwrap_or("");
-        !slots.iter().enumerate().any(|(at, slot)| {
-            at != index
-                && slot_live(slot)
-                && !is_pending(slot)
-                && slot_str(slot, "predicate") == pred
-                && keys_agree(key, slot_str(slot, "key").unwrap_or(""))
-        })
+        !super::hold::slot_occupied(slots, index, pred, key)
     }
 
     async fn releases_edge(
@@ -1546,12 +1540,7 @@ impl<'a> Attempt<'a> {
             .bind(("rel", rel))
             .await?;
         let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
-        let occupied = edges.iter().any(|edge| {
-            record_id_field(edge.get("id")) != pending_id
-                && !is_pending(edge)
-                && stored_role(edge.get("description")).as_deref() == Some(role.as_str())
-        });
-        Ok(!occupied)
+        Ok(!super::hold::edge_occupied(&edges, pending_id, &role))
     }
 
     async fn clear_edge_pending(&mut self, id: &str) -> Result<bool, GraphError> {
@@ -2118,7 +2107,7 @@ pub(crate) fn stored_role(description: Option<&Value>) -> Option<String> {
 }
 
 fn record_id_field(id: Option<&Value>) -> String {
-    id.map(record_id).unwrap_or_default()
+    super::hold::id_text(id)
 }
 
 fn pending_conflicts(pending: Option<&Value>) -> Option<&str> {
@@ -2127,7 +2116,6 @@ fn pending_conflicts(pending: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// Value of `entity#index` when that slot is on this entity.
 /// A row waiting on a later session. Live reads leave it out.
 #[must_use]
 pub(crate) fn is_pending(value: &Value) -> bool {
@@ -2349,10 +2337,7 @@ fn slots_mut(v2: &mut serde_json::Map<String, Value>) -> Result<&mut Vec<Value>,
 }
 
 fn record_id(id: &Value) -> String {
-    match id {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
+    crate::graph::edge_view::record_id(id)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
