@@ -8,6 +8,9 @@
 //! batch. This pass does not call the provider.
 
 use serde_json::{json, Value};
+use surrealdb::method::Transaction;
+
+use super::super::store::Db;
 
 use super::super::crud;
 use super::super::error::GraphError;
@@ -407,10 +410,54 @@ async fn edit_slot(
     gm: &GraphMemory,
     entity: &str,
     index: usize,
-    edit: impl FnOnce(&mut Value) -> bool,
+    mut edit: impl FnMut(&mut Value) -> bool,
 ) -> Result<bool, GraphError> {
-    let mut response = gm
-        .db()
+    let mut attempt = 0u8;
+    loop {
+        match edit_slot_once(gm, entity, index, &mut edit).await {
+            Ok(changed) => return Ok(changed),
+            Err(err) if attempt == 0 && hold_conflict(&err) => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Read and write one entity's attributes in a single transaction.
+/// A concurrent ingest that commits the same record conflicts, and the
+/// caller reads again instead of overwriting that commit.
+async fn edit_slot_once(
+    gm: &GraphMemory,
+    entity: &str,
+    index: usize,
+    edit: &mut impl FnMut(&mut Value) -> bool,
+) -> Result<bool, GraphError> {
+    let tx = gm.db().clone().begin().await?;
+    let changed = apply_slot_edit(&tx, entity, index, edit).await;
+    match changed {
+        Ok(true) => {
+            tx.commit().await?;
+            Ok(true)
+        }
+        Ok(false) => {
+            let _ = tx.cancel().await;
+            Ok(false)
+        }
+        Err(err) => {
+            let _ = tx.cancel().await;
+            Err(err)
+        }
+    }
+}
+
+async fn apply_slot_edit(
+    tx: &Transaction<Db>,
+    entity: &str,
+    index: usize,
+    edit: &mut impl FnMut(&mut Value) -> bool,
+) -> Result<bool, GraphError> {
+    let mut response = tx
         .query("SELECT attributes FROM type::record($id)")
         .bind(("id", entity.to_string()))
         .await?;
@@ -434,13 +481,22 @@ async fn edit_slot(
     if !edit(slot) {
         return Ok(false);
     }
-    gm.db()
-        .query("UPDATE type::record($id) SET attributes = $attributes")
+    tx.query("UPDATE type::record($id) SET attributes = $attributes")
         .bind(("id", entity.to_string()))
         .bind(("attributes", attributes))
         .await?
         .check()?;
     Ok(true)
+}
+
+fn hold_conflict(err: &GraphError) -> bool {
+    match err {
+        GraphError::Db(inner) => {
+            let message = inner.to_string().to_lowercase();
+            message.contains("conflict") || message.contains("please retry")
+        }
+        _ => false,
+    }
 }
 
 fn confirms(ctx: &WriteCtx<'_>, facts: &[Fact], old: &str, new_value: &str) -> bool {
