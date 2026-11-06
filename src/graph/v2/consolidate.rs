@@ -4304,6 +4304,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_split_turn_does_not_confirm_a_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Store the pages in linen.")],
+            &[setting(
+                "acme",
+                Kind::Project,
+                "binder",
+                "linen",
+                "Store the pages in linen.",
+            )],
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[fact], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let _ = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        let later = [
+            turn("We moved off canvas last month."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: "The linen swatches arrived today.".into(),
+            },
+        ];
+        let later_stats = commit_flags(&gm, "s4", "2026-04-04", &later, &[], true, true).await;
+        let later_llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_hold(
+            &gm,
+            "s4",
+            "2026-04-04",
+            &later,
+            &[],
+            &later_stats,
+            &later_llm,
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        assert!(!field_absent(
+            slot_named(&rows, "binder", "linen").get("pending")
+        ));
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert_eq!(report.hold.holds_dropped, 0);
+    }
+
+    #[tokio::test]
     async fn a_later_mention_drops_the_rival_beside_the_live_value() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;

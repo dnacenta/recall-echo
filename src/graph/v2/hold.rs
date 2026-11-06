@@ -446,8 +446,13 @@ async fn edit_slot(
 }
 
 fn confirms(ctx: &WriteCtx<'_>, facts: &[Fact], old: &str, new_value: &str) -> bool {
-    let text = session_text(ctx);
-    if !new_value.is_empty() && mention(new_value, &text) && departs(&text, old, "") {
+    // The new value, the old value, and the departure cue have to share a turn.
+    if !new_value.is_empty()
+        && ctx
+            .turns
+            .iter()
+            .any(|turn| mention(new_value, &turn.text) && departs(&turn.text, old, ""))
+    {
         return true;
     }
     facts.iter().any(|fact| {
@@ -482,17 +487,6 @@ fn cited<'a>(ctx: &'a WriteCtx<'a>, fact: &'a Fact) -> &'a str {
         .find(|turn| turn.index == fact.turn)
         .map(|turn| turn.text.as_str())
         .unwrap_or(fact.quote.as_str())
-}
-
-fn session_text(ctx: &WriteCtx<'_>) -> String {
-    let mut text = String::new();
-    for turn in ctx.turns {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&turn.text);
-    }
-    text
 }
 
 fn slots_of(entity: &super::super::types::Entity) -> Option<Vec<Value>> {
