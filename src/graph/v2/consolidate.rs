@@ -72,6 +72,7 @@ struct Row {
     evidence: Value,
     from: String,
     here: bool,
+    pending: bool,
 }
 
 #[derive(Clone)]
@@ -99,6 +100,7 @@ struct Pair {
     score: i32,
     evidence: String,
     stored: String,
+    hold: bool,
 }
 
 struct Loaded {
@@ -125,19 +127,38 @@ pub(crate) async fn run(
     report: &mut IngestionReport,
 ) {
     let rough = rough_anchors(facts, stats);
-    if rough.is_empty() {
+    let ambiguous = if ctx.hold_on {
+        match super::hold::settle(gm, ctx, facts, report).await {
+            Ok(open) => open,
+            Err(()) => {
+                report.hold.errors += 1;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if rough.is_empty() && ambiguous.is_empty() {
         return;
     }
     if define_cache(gm).await.is_err() {
         report.consolidate.errors += 1;
         return;
     }
-    let names = wanted_names(&rough, ctx);
+    let mut names = wanted_names(&rough, ctx);
+    for hold in &ambiguous {
+        if names.len() >= NEIGHBOUR_CAP {
+            break;
+        }
+        if !names.iter().any(|name| name == &hold.subject) {
+            names.push(hold.subject.clone());
+        }
+    }
     let Ok(loaded) = load_rows(gm, ctx.session_id, &names).await else {
         report.consolidate.errors += 1;
         return;
     };
-    let anchors = finish_anchors(rough, &loaded.rows);
+    let mut anchors = finish_anchors(rough, &loaded.rows);
     if anchors.is_empty() {
         return;
     }
@@ -195,6 +216,8 @@ pub(crate) async fn run(
             Step::Judge => waiting.push(pair.clone()),
         }
     }
+    let added = attach_holds(ctx, &ambiguous, &mut anchors, &loaded, &mut waiting, report);
+    report.consolidate.pairs = report.consolidate.pairs.saturating_add(added);
     let mut batch = Vec::new();
     let mut verdicts = Vec::new();
     for pair in waiting {
@@ -310,6 +333,9 @@ pub(crate) async fn run(
             .await;
             if report.consolidate.closes_sup > before {
                 gone.insert(pair.partner);
+                if pair.hold {
+                    confirm_held(gm, &anchors, &loaded, pair, report).await;
+                }
             } else if let Some(reason) = reason {
                 note_drop(report, reason, &anchors, &loaded.rows, pair, quote);
             }
@@ -467,7 +493,7 @@ fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>
     for (anchor_index, anchor) in anchors.iter().enumerate() {
         let turn = cited(ctx, anchor);
         for (partner_index, partner) in rows.iter().enumerate() {
-            if partner.here || !neighbourhood.contains(&partner.entity) {
+            if partner.pending || partner.here || !neighbourhood.contains(&partner.entity) {
                 continue;
             }
             if anchor.live == Some(partner_index) {
@@ -494,6 +520,7 @@ fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>
                 score,
                 evidence: cut_evidence(turn, &[&anchor.value, &anchor.replaces, &anchor.quote]),
                 stored: stored_session(&partner.evidence),
+                hold: false,
             });
         }
     }
@@ -1230,7 +1257,7 @@ async fn load_rows(
         let mut response = gm
             .db()
             .query(
-                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
+                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence, pending FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
             )
             .bind(("id", entity.id_string()))
             .await?;
@@ -1296,6 +1323,7 @@ async fn load_rows(
                     .unwrap_or("")
                     .into(),
                 here: opened_here(slot.get("evidence"), session),
+                pending: super::write::is_pending(slot),
             });
         }
     }
@@ -1327,6 +1355,7 @@ async fn load_rows(
             value: names.get(&to).cloned().unwrap_or_default(),
             from: json_text(edge.get("valid_from")),
             here: opened_here(Some(&evidence), session),
+            pending: edge.get("pending").is_some_and(Value::is_object),
             evidence,
         });
     }
@@ -1681,6 +1710,95 @@ fn stored_session(evidence: &Value) -> String {
         .to_string()
 }
 
+fn attach_holds(
+    ctx: &WriteCtx<'_>,
+    open: &[super::hold::OpenHold],
+    anchors: &mut Vec<Anchor>,
+    loaded: &Loaded,
+    waiting: &mut Vec<Pair>,
+    report: &mut IngestionReport,
+) -> u32 {
+    let text = ctx
+        .turns
+        .iter()
+        .map(|turn| turn.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut added = 0u32;
+    for hold in open {
+        let Some(new_index) = find_ref(&loaded.rows, &hold.new_ref, &hold.new_value) else {
+            report.hold.errors += 1;
+            continue;
+        };
+        let Some(old_index) = find_ref(&loaded.rows, &hold.old_ref, &hold.old_value) else {
+            report.hold.errors += 1;
+            continue;
+        };
+        let anchor = anchors.len();
+        anchors.push(Anchor {
+            id: format!("h:{anchor}"),
+            subject: hold.subject.clone(),
+            pred: hold.pred.clone(),
+            key: hold.key.clone(),
+            value: hold.old_value.clone(),
+            text: format!("{} {}", hold.old_value, hold.new_value),
+            new_value: hold.new_value.clone(),
+            replaces: String::new(),
+            entity: hold.subject.clone(),
+            reason: "hold",
+            turn: 0,
+            quote: String::new(),
+            live: Some(new_index),
+            a2: false,
+        });
+        waiting.push(Pair {
+            anchor,
+            partner: old_index,
+            score: 0,
+            evidence: cut_evidence(&text, &[&hold.old_value, &hold.new_value]),
+            stored: stored_session(&loaded.rows[old_index].evidence),
+            hold: true,
+        });
+        report.hold.holds_ambiguous += 1;
+        added += 1;
+    }
+    added
+}
+
+fn find_ref(rows: &[Row], reference: &str, value: &str) -> Option<usize> {
+    rows.iter()
+        .position(|row| ref_of(row) == reference)
+        .or_else(|| rows.iter().position(|row| values_equal(&row.value, value)))
+}
+
+fn ref_of(row: &Row) -> String {
+    if let Some(edge) = &row.edge {
+        return edge.clone();
+    }
+    format!("{}#{}", row.entity, row.slot.unwrap_or(0))
+}
+
+async fn confirm_held(
+    gm: &GraphMemory,
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    pair: &Pair,
+    report: &mut IngestionReport,
+) {
+    let Some(index) = anchors[pair.anchor].live else {
+        report.hold.errors += 1;
+        return;
+    };
+    let reference = ref_of(&loaded.rows[index]);
+    match super::hold::clear_ref(gm, &reference).await {
+        Ok(true) => {
+            report.hold.holds_confirmed += 1;
+            report.hold.holds_ambiguous = report.hold.holds_ambiguous.saturating_sub(1);
+        }
+        _ => report.hold.errors += 1,
+    }
+}
+
 fn count(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
@@ -1739,6 +1857,10 @@ mod tests {
 
         fn calls(&self) -> u32 {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn message(&self) -> String {
+            self.message.lock().expect("message").clone()
         }
     }
 
@@ -3373,6 +3495,307 @@ mod tests {
             .unwrap();
         assert!(cache_get(&gm, &current).await.unwrap().is_none());
         assert_eq!(cache_get(&gm, &v1).await.unwrap().unwrap().0, "supersedes");
+    }
+
+    async fn commit_flags(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        match_on: bool,
+        hold_on: bool,
+    ) -> WriteStats {
+        let project = project();
+        let mut ctx = WriteCtx::new(&Quiet, &project, session, date, turns);
+        ctx.match_on = match_on;
+        ctx.hold_on = hold_on;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pass_hold(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        stats: &WriteStats,
+        llm: &Stub,
+        hold_on: bool,
+    ) -> IngestionReport {
+        let project = project();
+        let mut ctx = WriteCtx::new(llm, &project, session, date, turns);
+        ctx.hold_on = hold_on;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, facts, stats, llm, &mut report).await;
+        report
+    }
+
+    fn slot_named<'a>(slots: &'a [Value], key: &str, value: &str) -> &'a Value {
+        slots
+            .iter()
+            .find(|slot| {
+                slot.get("key").and_then(Value::as_str) == Some(key)
+                    && slot.get("value").and_then(Value::as_str) == Some(value)
+            })
+            .unwrap()
+    }
+
+    async fn seed_binder(gm: &GraphMemory) {
+        let turns = [turn("The binder is canvas.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "canvas",
+            "The binder is canvas.",
+        )];
+        commit_flags(gm, "s1", "2026-04-01", &turns, &facts, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn hold_off_writes_no_pending_field() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let turns = [turn("Store the pages in linen.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, false).await;
+        assert_eq!(stats.holds_opened, 0);
+        assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(canvas.get("pending").is_none());
+        assert!(linen.get("pending").is_none());
+        assert!(ended(canvas).is_none());
+        assert!(ended(linen).is_none());
+    }
+
+    #[tokio::test]
+    async fn hold_stores_the_new_value_pending_and_keeps_the_old_live() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let before = slots(&gm, "acme").await;
+        let alpha = slot_named(&before, "binder", "canvas")["alpha"].clone();
+        let turns = [turn("Store the pages in linen.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        assert_eq!(stats.holds_opened, 1);
+        assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+        assert!(stats.retirements.is_empty());
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(canvas).is_none());
+        assert_eq!(canvas["alpha"], alpha);
+        let pending = linen.get("pending").expect("pending");
+        assert_eq!(pending["since"], "s2");
+        assert!(pending["conflicts"].as_str().unwrap().ends_with("#0"));
+        let project = project();
+        let live = super::super::known::read_live(&gm, &project, "binder canvas linen").await;
+        assert!(live.iter().any(|row| row.value == "canvas"));
+        assert!(live.iter().all(|row| row.value != "linen"));
+        let block = super::super::known::render_known(&live);
+        assert!(block.contains("canvas"));
+        assert!(!block.contains("linen"));
+    }
+
+    #[tokio::test]
+    async fn a_later_departure_confirms_the_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [
+            turn("Switched canvas for linen."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: "The label is north.".into(),
+            },
+        ];
+        let mut label = setting(
+            "acme",
+            Kind::Project,
+            "label",
+            "north",
+            "The label is north.",
+        );
+        label.turn = 1;
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[label], true, true).await;
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert_eq!(llm.calls(), 0);
+        assert_eq!(report.hold.holds_confirmed, 1);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "canvas")),
+            Some("s3:superseded")
+        );
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(linen.get("pending").is_none());
+        assert!(ended(linen).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_reassertion_drops_the_pending_row() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("The binder stays canvas.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "canvas",
+            "The binder stays canvas.",
+        )];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        assert_eq!(report.hold.holds_dropped, 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "linen")),
+            Some("s3:hold_dropped")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_evidence_keeps_the_hold_in_the_consolidation_batch() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("The harbor bell is brass.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "bell",
+            "brass",
+            "The harbor bell is brass.",
+        )];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        assert_eq!(llm.calls(), 1);
+        let message = llm.message();
+        assert!(message.contains("canvas"), "{message}");
+        assert!(message.contains("linen"), "{message}");
+        assert_eq!(report.hold.holds_ambiguous, 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_consolidation_batch_leaves_the_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let before = slots(&gm, "acme").await;
+        let pending = slot_named(&before, "binder", "linen")["pending"].clone();
+        let turns = [turn("The harbor bell is brass.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "bell",
+            "brass",
+            "The harbor bell is brass.",
+        )];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Err);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        assert!(report.consolidate.errors >= 1);
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert_eq!(report.hold.holds_dropped, 0);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(slot_named(&rows, "binder", "linen")["pending"], pending);
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
     }
 }
 

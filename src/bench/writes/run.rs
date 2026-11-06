@@ -99,6 +99,18 @@ pub enum Consolidate {
     Off,
     /// Candidate pairs, a pre-filter, and at most one judge call per session.
     On,
+    /// Consolidation, and a hold for a conflict the retirement guard would skip.
+    Hold,
+}
+
+impl Consolidate {
+    fn writes_pass(self) -> bool {
+        matches!(self, Self::On | Self::Hold)
+    }
+
+    fn writes_hold(self) -> bool {
+        matches!(self, Self::Hold)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +152,7 @@ pub async fn run(
         .collect::<Result<Vec<_>, _>>()?;
     let mut report =
         grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
+    report.consolidate_hold = consolidate.writes_hold();
     report.setup_millis = setup_millis;
     Ok(report)
 }
@@ -202,6 +215,7 @@ async fn collect_sessions(
                 report.timing = extracted.timing;
                 report.known_match = extracted.known_match;
                 report.consolidate = extracted.consolidate;
+                report.hold = extracted.hold;
                 report
             }
         };
@@ -227,6 +241,7 @@ async fn collect_sessions(
             timing: report.timing,
             known_match: report.known_match,
             consolidate: report.consolidate,
+            hold: report.hold,
         });
         before = after;
     }
@@ -302,8 +317,12 @@ fn apply_graph_switches(
         body.push_str("known_match = true\n");
         any = true;
     }
-    if consolidate == Consolidate::On {
+    if consolidate.writes_pass() {
         body.push_str("consolidate = true\n");
+        any = true;
+    }
+    if consolidate.writes_hold() {
+        body.push_str("consolidate_hold = true\n");
         any = true;
     }
     if !any {
@@ -692,8 +711,13 @@ async fn snapshot(
             let beta = json_number(slot.get("beta"));
             let prior_alpha = starting_alpha(&id, beta, first_beta);
             let until = slot.get("valid_until");
-            let live = until
-                .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty));
+            let pending = slot
+                .get("pending")
+                .is_some_and(serde_json::Value::is_object);
+            let live = !pending
+                && until.is_none_or(|value| {
+                    value.is_null() || value.as_str().is_some_and(str::is_empty)
+                });
             let (assistant_steps, self_steps) = corroboration_steps(slot.get("evidence"));
             edges.push(ObservedEdge {
                 id,
@@ -1467,6 +1491,17 @@ mod tests {
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
         assert!(text.contains("consolidate = true\n"), "{text}");
         assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Hold,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_hold = true\n"), "{text}");
     }
 
     #[test]
@@ -2729,10 +2764,12 @@ mod tests {
         assert!(report.sessions.iter().all(|session| {
             session.known_match.is_blank()
                 && session.consolidate.is_blank()
+                && session.hold.is_blank()
                 && serde_json::to_value(session)
                     .unwrap()
                     .get("known_match")
                     .is_none()
+                && serde_json::to_value(session).unwrap().get("hold").is_none()
                 && serde_json::to_value(session)
                     .unwrap()
                     .get("consolidate")
@@ -2746,9 +2783,19 @@ mod tests {
         }));
         let encoded = serde_json::to_value(&report).unwrap();
         assert!(encoded.get("consolidate_drops").is_none());
+        assert!(encoded.get("consolidate_hold").is_none());
         let gm = GraphMemory::open(&tmp.path().join("memory/graph"))
             .await
             .unwrap();
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&entities)
+                .unwrap_or_default()
+                .contains("\"pending\""),
+            "hold off wrote a pending field"
+        );
         let mut info = gm.db().query("INFO FOR DB").await.unwrap();
         let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut info, 0).unwrap();
         assert!(!serde_json::to_string(&rows)

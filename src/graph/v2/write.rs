@@ -92,6 +92,8 @@ pub(crate) struct WriteStats {
     pub match_skips: BTreeMap<String, u32>,
     /// Decided facts whose grounded `replaces` closed no row. Indexes into the fact slice.
     pub replaces_unconsumed: Vec<usize>,
+    /// Conflicting rows stored pending instead of skipped. Zero when the hold is off.
+    pub holds_opened: u32,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -128,6 +130,8 @@ pub(crate) struct WriteCtx<'a> {
     pub match_on: bool,
     /// Aligned with the fact slice. `Some` is an A1, A2 or A3 target.
     pub targets: Vec<Option<super::known_match::MatchTarget>>,
+    /// Store a guard-skipped conflict as pending. Off leaves the skip path unchanged.
+    pub hold_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -150,6 +154,7 @@ impl<'a> WriteCtx<'a> {
             known: Vec::new(),
             match_on: false,
             targets: Vec::new(),
+            hold_on: false,
         }
     }
 }
@@ -353,6 +358,7 @@ async fn apply_all(
         block: None,
         held_slots: HashSet::new(),
         held_edges: HashSet::new(),
+        hold_conflicts: None,
     };
     for index in ordered_indexes(facts) {
         attempt.index = index;
@@ -433,6 +439,8 @@ struct Attempt<'a> {
     block: Option<&'static str>,
     held_slots: HashSet<(String, usize)>,
     held_edges: HashSet<String>,
+    /// Old row id when this fact is stored pending instead of retiring that row.
+    hold_conflicts: Option<String>,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -487,8 +495,16 @@ fn mention_draft(name: &str, kind: Kind, fact: &Fact, creates: bool) -> MentionD
     }
 }
 
+/// Whether a conflicting slot may be closed.
+enum Close {
+    Allow,
+    Skip,
+    Hold,
+}
+
 impl<'a> Attempt<'a> {
     async fn apply(&mut self, source: &Fact) -> Result<(), GraphError> {
+        self.hold_conflicts = None;
         let Some(subject) = bound(
             self.catalog,
             &source.subject_name,
@@ -596,9 +612,17 @@ impl<'a> Attempt<'a> {
         let (provenance, label) = provenance_of(fact.provenance);
         let evidence = prior_evidence(provenance);
         let item = evidence_item(self.ctx.session_id, fact, label);
-        self.tx
-            .query(
-                r#"
+        let pending = self.hold_conflicts.take().map(|conflicts| {
+            self.stats.holds_opened += 1;
+            super::hold::pending_value(self.ctx.session_id, &conflicts)
+        });
+        let pending_line = if pending.is_some() {
+            "pending = $pending,"
+        } else {
+            ""
+        };
+        let statement = format!(
+            r#"
             LET $from = type::record($from_id);
             LET $to = type::record($to_id);
             RELATE $from -> relates_to -> $to SET
@@ -615,9 +639,13 @@ impl<'a> Attempt<'a> {
                 status = $status,
                 provenance = $provenance,
                 ended_by = NONE,
+                {pending_line}
                 evidence = $evidence
-            "#,
-            )
+            "#
+        );
+        let mut request = self
+            .tx
+            .query(&statement)
             .bind(("from_id", subject.id.clone()))
             .bind(("to_id", object.id.clone()))
             .bind(("rel_type", fact.predicate.as_str().to_string()))
@@ -627,9 +655,11 @@ impl<'a> Attempt<'a> {
             .bind(("beta", evidence.beta()))
             .bind(("status", fact.status.clone()))
             .bind(("provenance", label.to_string()))
-            .bind(("evidence", json!([item])))
-            .await?
-            .check()?;
+            .bind(("evidence", json!([item])));
+        if let Some(pending) = pending {
+            request = request.bind(("pending", pending));
+        }
+        request.await?.check()?;
         self.forget_edges(&subject.id, &object.id);
         Ok(())
     }
@@ -688,6 +718,11 @@ impl<'a> Attempt<'a> {
             // Reinforce would otherwise attach it to a later live value.
             self.stats.already_seen += 1;
             false
+        } else if slots.iter().any(|slot| pending_same(slot, fact)) {
+            // The value is already waiting. A second copy would move weights.
+            self.stats.already_seen += 1;
+            self.hold_conflicts = None;
+            false
         } else if let Some(slot) = slots.iter_mut().find(|slot| same_slot(slot, fact)) {
             match reinforce_slot(slot, self.gm, fact, self.ctx.session_id)? {
                 Sight::Recorded => {
@@ -700,7 +735,17 @@ impl<'a> Attempt<'a> {
                 }
             }
         } else {
-            slots.push(new_slot(self.ctx.session_id, self.ctx.date, fact));
+            let mut slot = new_slot(self.ctx.session_id, self.ctx.date, fact);
+            if let Some(conflicts) = self.hold_conflicts.take() {
+                if let Some(object) = slot.as_object_mut() {
+                    object.insert(
+                        "pending".to_string(),
+                        super::hold::pending_value(self.ctx.session_id, &conflicts),
+                    );
+                }
+                self.stats.holds_opened += 1;
+            }
+            slots.push(slot);
             self.stats.slots += 1;
             true
         };
@@ -770,8 +815,13 @@ impl<'a> Attempt<'a> {
                 }
                 continue;
             }
-            if !self.supersede_allowed(slot, fact) {
-                continue;
+            match self.supersede_allowed(slot, fact) {
+                Close::Skip => continue,
+                Close::Hold => {
+                    self.arm_hold(format!("{}#{}", stored.id, index));
+                    continue;
+                }
+                Close::Allow => {}
             }
             let closed = closed_of(slot, fact);
             if !stamp_slot(slot, &until, &ended_by) {
@@ -949,7 +999,11 @@ impl<'a> Attempt<'a> {
                 .label(&record_id(&edge.to_id), &record_id(&edge.to_id))
                 .await?;
             if let Some(skip) = self.guard_reason(fact, &old_value) {
-                self.note_skip(skip);
+                if self.ctx.hold_on {
+                    self.arm_hold(record_id(&edge.id));
+                } else {
+                    self.note_skip(skip);
+                }
                 continue;
             }
             self.close_edge(id, &edge, REPLACED, &new_value).await?;
@@ -994,7 +1048,11 @@ impl<'a> Attempt<'a> {
             }
             if reason == REPLACED {
                 if let Some(skip) = self.guard_reason(fact, slot_str(slot, "value").unwrap_or("")) {
-                    self.note_skip(skip);
+                    if self.ctx.hold_on {
+                        self.arm_hold(format!("{id}#{index}"));
+                    } else {
+                        self.note_skip(skip);
+                    }
                     continue;
                 }
             }
@@ -1320,10 +1378,11 @@ impl<'a> Attempt<'a> {
     }
 
     /// Keyed-match content filter, filled-key evidence, and G1/G2.
-    /// `false` means leave this slot live.
-    fn supersede_allowed(&mut self, slot: &Value, fact: &Fact) -> bool {
+    /// [`Close::Skip`] leaves the slot live. [`Close::Hold`] does too, and
+    /// the new value is stored pending against it.
+    fn supersede_allowed(&mut self, slot: &Value, fact: &Fact) -> Close {
         if !self.ctx.match_on || same_session_status_close(slot, fact, self.ctx.session_id) {
-            return true;
+            return Close::Allow;
         }
         let old = slot_str(slot, "value").unwrap_or("");
         let bound = self
@@ -1331,20 +1390,29 @@ impl<'a> Attempt<'a> {
             .map(|target| (slot_matches_target(slot, target), target.key.clone()));
         if let Some((is_target, key)) = bound {
             if !is_target {
-                return false;
+                return Close::Skip;
             }
             if let Some(reason) =
                 super::known_match::fill_retirement_skip(&key, old, self.cited_turn(fact))
             {
                 self.note_skip(reason);
-                return false;
+                return Close::Skip;
             }
         }
         if let Some(reason) = self.guard_reason(fact, old) {
+            if self.ctx.hold_on {
+                return Close::Hold;
+            }
             self.note_skip(reason);
-            return false;
+            return Close::Skip;
         }
-        true
+        Close::Allow
+    }
+
+    fn arm_hold(&mut self, conflicts: String) {
+        if self.hold_conflicts.is_none() {
+            self.hold_conflicts = Some(conflicts);
+        }
     }
 
     fn guard_reason(&self, fact: &Fact, old_value: &str) -> Option<&'static str> {
@@ -1422,7 +1490,11 @@ impl<'a> Attempt<'a> {
             return Ok(());
         }
         if let Some(reason) = self.guard_reason(fact, &old_value) {
-            self.note_skip(reason);
+            if self.ctx.hold_on {
+                self.arm_hold(record_id(&edge.id));
+            } else {
+                self.note_skip(reason);
+            }
             return Ok(());
         }
         self.close_edge(&subject.id, &edge, REPLACED, &fact.object_name)
@@ -1598,6 +1670,7 @@ fn preferred_key(incoming: &str, slots: &[Value]) -> String {
         .iter()
         .filter_map(|slot| {
             if !slot_live(slot)
+                || is_pending(slot)
                 || slot_str(slot, "predicate") != Some("setting")
                 || slot_str(slot, "status") != Some("decided")
             {
@@ -1620,7 +1693,7 @@ fn preferred_key(incoming: &str, slots: &[Value]) -> String {
 }
 
 fn supersede_target(slot: &Value, fact: &Fact) -> bool {
-    if !slot_live(slot) || slot_str(slot, "status") != Some("decided") {
+    if !slot_live(slot) || is_pending(slot) || slot_str(slot, "status") != Some("decided") {
         return false;
     }
     if slot_str(slot, "predicate") != Some(fact.predicate.as_str()) {
@@ -1864,7 +1937,17 @@ fn stored_kind(attributes: &Value) -> Option<Kind> {
 }
 
 fn same_slot(slot: &Value, fact: &Fact) -> bool {
-    slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
+    !is_pending(slot) && slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
+}
+
+fn pending_same(slot: &Value, fact: &Fact) -> bool {
+    is_pending(slot) && slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
+}
+
+/// A row waiting on a later session. Live reads leave it out.
+#[must_use]
+pub(crate) fn is_pending(value: &Value) -> bool {
+    value.get("pending").is_some_and(Value::is_object)
 }
 
 fn same_fact(slot: &Value, fact: &Fact) -> bool {
@@ -2762,6 +2845,7 @@ mod tests {
                 known: Vec::new(),
                 match_on: false,
                 targets: Vec::new(),
+                hold_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4025,6 +4109,7 @@ mod tests {
             known: Vec::new(),
             match_on: false,
             targets: Vec::new(),
+            hold_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -5059,6 +5144,7 @@ mod tests {
             on_conflict: Some(&hook),
             known: Vec::new(),
             match_on: true,
+            hold_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,

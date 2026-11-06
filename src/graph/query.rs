@@ -297,7 +297,7 @@ async fn get_neighbor_details(
             r#"
             SELECT rel_type, confidence, last_reinforced, valid_from, out AS target_id
             FROM relates_to
-            WHERE in = type::record($id) AND valid_until IS NONE
+            WHERE in = type::record($id) AND valid_until IS NONE AND pending IS NONE
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -311,7 +311,7 @@ async fn get_neighbor_details(
             r#"
             SELECT rel_type, confidence, last_reinforced, valid_from, in AS target_id
             FROM relates_to
-            WHERE out = type::record($id) AND valid_until IS NONE
+            WHERE out = type::record($id) AND valid_until IS NONE AND pending IS NONE
             "#,
         )
         .bind(("id", entity_id.to_string()))

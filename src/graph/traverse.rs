@@ -91,6 +91,7 @@ fn traverse_from<'a>(
             FROM relates_to
             WHERE in = type::record($id)
               AND valid_until IS NONE
+              AND pending IS NONE
             "#,
             )
             .bind(("id", entity.id_string()))
@@ -124,6 +125,7 @@ fn traverse_from<'a>(
             FROM relates_to
             WHERE out = type::record($id)
               AND valid_until IS NONE
+              AND pending IS NONE
             "#,
             )
             .bind(("id", entity.id_string()))

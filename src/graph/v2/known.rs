@@ -19,6 +19,7 @@ use super::super::{deserialize_take, GraphMemory};
 use super::ground;
 use super::input::{ProjectIdentity, Turn};
 use super::schema::{normalise, Kind};
+use super::write::is_pending;
 
 /// One live fact that may be shown. The value is the stored text, not the
 /// shortened line pass 1 sees, so a later match can copy it exactly.
@@ -433,6 +434,8 @@ struct EdgeRow {
     status: Value,
     #[serde(default)]
     valid_until: Value,
+    #[serde(default)]
+    pending: Value,
 }
 
 /// Embeddings are never read here, and they are most of each record.
@@ -448,7 +451,9 @@ async fn load_entities(gm: &GraphMemory) -> Result<Vec<Entity>, GraphError> {
 async fn load_edges(gm: &GraphMemory) -> Result<Vec<EdgeRow>, GraphError> {
     let mut response = gm
         .db()
-        .query("SELECT id, in, out, rel_type, description, status, valid_until FROM relates_to")
+        .query(
+            "SELECT id, in, out, rel_type, description, status, valid_until, pending FROM relates_to",
+        )
         .await?;
     deserialize_take(&mut response, 0)
 }
@@ -684,7 +689,10 @@ fn slot_list(entity: &Entity) -> Option<&Vec<Value>> {
 }
 
 fn slot_row(entity: &Entity, index: usize, slot: &Value) -> Option<KnownRow> {
-    if !slot.is_object() || !is_live(slot.get("valid_until").unwrap_or(&Value::Null)) {
+    if !slot.is_object()
+        || is_pending(slot)
+        || !is_live(slot.get("valid_until").unwrap_or(&Value::Null))
+    {
         return None;
     }
     if !shown_status(slot.get("status").and_then(Value::as_str)) {
@@ -714,6 +722,9 @@ fn edge_row(
     edge: &EdgeRow,
     entities: &HashMap<String, &Entity>,
 ) -> Option<KnownRow> {
+    if edge.pending.is_object() {
+        return None;
+    }
     let object = entities.get(&record_id(&edge.to_id))?;
     Some(KnownRow {
         subject: entity.name.clone(),

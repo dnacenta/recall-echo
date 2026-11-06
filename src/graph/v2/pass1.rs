@@ -289,6 +289,7 @@ pub(crate) async fn extract_session(
             &session.turns,
         );
         write_ctx.match_on = match_on;
+        write_ctx.hold_on = hold_enabled(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -320,6 +321,7 @@ pub(crate) async fn extract_session(
             super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
             consolidate_ms = Some(elapsed_ms(started));
         }
+        report.hold.holds_opened = stats.holds_opened;
     } else if consolidate_on {
         consolidate_ms = Some(0);
     }
@@ -358,6 +360,13 @@ fn consolidate_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .consolidate
+}
+
+fn hold_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .hold_applies()
 }
 
 /// A decided setting, or a decided `uses` whose role can retire a stored edge.
