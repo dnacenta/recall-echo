@@ -130,7 +130,8 @@ pub(crate) async fn run(
     let ambiguous = if ctx.hold_on {
         match super::hold::settle(gm, ctx, facts, report).await {
             Ok(open) => open,
-            Err(()) => {
+            Err(err) => {
+                eprintln!("hold error: {err}");
                 report.hold.errors += 1;
                 Vec::new()
             }

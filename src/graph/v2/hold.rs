@@ -33,13 +33,13 @@ pub(crate) struct OpenHold {
 
 /// Confirm, drop, or return the pairs that stay pending.
 ///
-/// A store error is `Err(())`. The caller counts it. The session still commits.
+/// A store error is returned. The caller counts it and the session still commits.
 pub(crate) async fn settle(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     facts: &[Fact],
     report: &mut IngestionReport,
-) -> Result<Vec<OpenHold>, ()> {
+) -> Result<Vec<OpenHold>, GraphError> {
     if !any_pending(gm).await? {
         return Ok(Vec::new());
     }
@@ -70,7 +70,8 @@ pub(crate) async fn settle(
                     report.hold.errors += 1;
                     continue;
                 }
-                Err(()) => {
+                Err(err) => {
+                    eprintln!("hold error: {err}");
                     report.hold.errors += 1;
                     continue;
                 }
@@ -144,13 +145,12 @@ async fn consider(
         let ended = format!("{}:superseded", ctx.session_id);
         // Decide before writing. Clear the pending row first so a failed
         // stamp cannot leave the slot with no live value.
-        let already = ref_already_closed(gm, old_ref, old_value)
-            .await
-            .unwrap_or(false);
+        let already = noted(ref_already_closed(gm, old_ref, old_value).await);
         let occupied = if already {
             match other_live(gm, new_ref, pred, key, new_value).await {
                 Ok(occupied) => occupied,
-                Err(_) => {
+                Err(err) => {
+                    eprintln!("hold error: {err}");
                     report.hold.errors += 1;
                     return;
                 }
@@ -160,26 +160,21 @@ async fn consider(
         };
         if occupied {
             let dropped = format!("{}:hold_dropped", ctx.session_id);
-            if stamp_ref(gm, new_ref, &until, &dropped, new_value)
-                .await
-                .unwrap_or(false)
-            {
+            if noted(stamp_ref(gm, new_ref, &until, &dropped, new_value).await) {
                 report.hold.holds_dropped += 1;
             } else {
                 report.hold.errors += 1;
             }
             return;
         }
-        if !clear_ref(gm, new_ref).await.unwrap_or(false) {
+        if !noted(clear_ref(gm, new_ref).await) {
             report.hold.errors += 1;
             return;
         }
         let stamped = if already {
             false
         } else {
-            stamp_ref(gm, old_ref, &until, &ended, old_value)
-                .await
-                .unwrap_or(false)
+            noted(stamp_ref(gm, old_ref, &until, &ended, old_value).await)
         };
         if !already && !stamped {
             report.hold.errors += 1;
@@ -204,10 +199,7 @@ async fn consider(
             return;
         };
         let ended = format!("{}:hold_dropped", ctx.session_id);
-        if stamp_ref(gm, new_ref, &until, &ended, new_value)
-            .await
-            .unwrap_or(false)
-        {
+        if noted(stamp_ref(gm, new_ref, &until, &ended, new_value).await) {
             report.hold.holds_dropped += 1;
         } else {
             report.hold.errors += 1;
@@ -495,6 +487,14 @@ fn cited<'a>(ctx: &'a WriteCtx<'a>, fact: &'a Fact) -> &'a str {
         .unwrap_or(fact.quote.as_str())
 }
 
+/// A store failure counts as the boolean `false` after the cause is printed.
+fn noted(result: Result<bool, GraphError>) -> bool {
+    result.unwrap_or_else(|err| {
+        eprintln!("hold error: {err}");
+        false
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     static FULL_LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -512,13 +512,12 @@ pub(crate) fn reset_full_loads() {
     FULL_LOADS.with(|loads| loads.set(0));
 }
 
-async fn any_pending(gm: &GraphMemory) -> Result<bool, ()> {
+async fn any_pending(gm: &GraphMemory) -> Result<bool, GraphError> {
     let mut response = gm
         .db()
         .query("SELECT id FROM relates_to WHERE pending != NONE LIMIT 1")
-        .await
-        .map_err(|_| ())?;
-    let edges: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+        .await?;
+    let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
     if !edges.is_empty() {
         return Ok(true);
     }
@@ -528,18 +527,14 @@ async fn any_pending(gm: &GraphMemory) -> Result<bool, ()> {
             "SELECT id FROM entity WHERE count(attributes.v2.slots[WHERE pending != NONE]) > 0 LIMIT 1",
         )
         .await
-        .map_err(|_| ())?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+        ?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
     Ok(!rows.is_empty())
 }
 
-async fn load_entities(gm: &GraphMemory) -> Result<Vec<super::super::types::Entity>, ()> {
-    let mut response = gm
-        .db()
-        .query("SELECT * OMIT embedding FROM entity")
-        .await
-        .map_err(|_| ())?;
-    deserialize_take(&mut response, 0).map_err(|_| ())
+async fn load_entities(gm: &GraphMemory) -> Result<Vec<super::super::types::Entity>, GraphError> {
+    let mut response = gm.db().query("SELECT * OMIT embedding FROM entity").await?;
+    deserialize_take(&mut response, 0)
 }
 
 fn slots_of(entity: &super::super::types::Entity) -> Option<Vec<Value>> {
@@ -552,26 +547,25 @@ fn slots_of(entity: &super::super::types::Entity) -> Option<Vec<Value>> {
         .cloned()
 }
 
-async fn pending_edges(gm: &GraphMemory) -> Result<Vec<Value>, ()> {
+async fn pending_edges(gm: &GraphMemory) -> Result<Vec<Value>, GraphError> {
     let mut response = gm
         .db()
         .query(
             "SELECT id, in, out, rel_type, pending, status, valid_until FROM relates_to WHERE pending != NONE AND valid_until = NONE",
         )
         .await
-        .map_err(|_| ())?;
-    deserialize_take(&mut response, 0).map_err(|_| ())
+        ?;
+    deserialize_take(&mut response, 0)
 }
 
-async fn value_at(gm: &GraphMemory, reference: &str) -> Result<Option<String>, ()> {
+async fn value_at(gm: &GraphMemory, reference: &str) -> Result<Option<String>, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
         let mut response = gm
             .db()
             .query("SELECT attributes FROM type::record($id)")
             .bind(("id", entity.to_string()))
-            .await
-            .map_err(|_| ())?;
-        let rows: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+            .await?;
+        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
         return Ok(rows.into_iter().next().and_then(|row| {
             row.get("attributes")
                 .and_then(|attrs| attrs.get("v2"))
@@ -587,16 +581,15 @@ async fn value_at(gm: &GraphMemory, reference: &str) -> Result<Option<String>, (
         .db()
         .query("SELECT out FROM type::record($id)")
         .bind(("id", reference.to_string()))
-        .await
-        .map_err(|_| ())?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
     let Some(out) = rows.into_iter().next().map(|row| id_text(row.get("out"))) else {
         return Ok(None);
     };
     name_of(gm, &out).await.map(Some)
 }
 
-async fn name_of(gm: &GraphMemory, id: &str) -> Result<String, ()> {
+async fn name_of(gm: &GraphMemory, id: &str) -> Result<String, GraphError> {
     if id.is_empty() {
         return Ok(String::new());
     }
@@ -604,9 +597,8 @@ async fn name_of(gm: &GraphMemory, id: &str) -> Result<String, ()> {
         .db()
         .query("SELECT name FROM type::record($id)")
         .bind(("id", id.to_string()))
-        .await
-        .map_err(|_| ())?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0).map_err(|_| ())?;
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
     Ok(rows
         .into_iter()
         .find_map(|row| row.get("name").and_then(Value::as_str).map(str::to_string))
