@@ -102,49 +102,77 @@ pub(crate) async fn settle(
             .await;
         }
     }
-    if let Ok(edges) = pending_edges(gm).await {
-        for edge in edges {
-            if since(&edge) == Some(ctx.session_id) || closed(edge.get("valid_until")) {
-                continue;
-            }
-            let Some(old_ref) = conflicts(&edge) else {
-                report.hold.errors += 1;
-                continue;
-            };
-            let new_ref = id_text(edge.get("id"));
-            if new_ref.is_empty() {
-                report.hold.errors += 1;
-                continue;
-            }
-            let (Ok(Some(new_value)), Ok(Some(old_value)), Ok(subject)) = (
-                value_at(gm, &new_ref).await,
-                value_at(gm, old_ref).await,
-                name_of(gm, &id_text(edge.get("in"))).await,
-            ) else {
-                report.hold.errors += 1;
-                continue;
-            };
-            let pred = text_at(&edge, "rel_type");
-            consider(
-                gm,
-                ctx,
-                facts,
-                report,
-                &mut open,
-                &OpenHold {
-                    subject,
-                    pred,
-                    key: String::new(),
-                    new_value,
-                    old_value,
-                    new_ref,
-                    old_ref: old_ref.to_string(),
-                },
-            )
-            .await;
+    let edges = match pending_edges(gm).await {
+        Ok(edges) => edges,
+        Err(err) => {
+            eprintln!("hold error: {err}");
+            report.hold.errors += 1;
+            return Ok(open);
         }
-    } else {
-        report.hold.errors += 1;
+    };
+    for edge in edges {
+        if since(&edge) == Some(ctx.session_id) || closed(edge.get("valid_until")) {
+            continue;
+        }
+        let Some(old_ref) = conflicts(&edge) else {
+            report.hold.errors += 1;
+            continue;
+        };
+        let new_ref = id_text(edge.get("id"));
+        if new_ref.is_empty() {
+            report.hold.errors += 1;
+            continue;
+        }
+        let new_value = match value_at(gm, &new_ref).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                report.hold.errors += 1;
+                continue;
+            }
+            Err(err) => {
+                eprintln!("hold error: {err}");
+                report.hold.errors += 1;
+                continue;
+            }
+        };
+        let old_value = match value_at(gm, old_ref).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                report.hold.errors += 1;
+                continue;
+            }
+            Err(err) => {
+                eprintln!("hold error: {err}");
+                report.hold.errors += 1;
+                continue;
+            }
+        };
+        let subject = match name_of(gm, &id_text(edge.get("in"))).await {
+            Ok(subject) => subject,
+            Err(err) => {
+                eprintln!("hold error: {err}");
+                report.hold.errors += 1;
+                continue;
+            }
+        };
+        let pred = text_at(&edge, "rel_type");
+        consider(
+            gm,
+            ctx,
+            facts,
+            report,
+            &mut open,
+            &OpenHold {
+                subject,
+                pred,
+                key: String::new(),
+                new_value,
+                old_value,
+                new_ref,
+                old_ref: old_ref.to_string(),
+            },
+        )
+        .await;
     }
     Ok(open)
 }

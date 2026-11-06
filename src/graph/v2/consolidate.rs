@@ -1841,7 +1841,12 @@ async fn confirm_held(
     let reference = ref_of(&loaded.rows[index]);
     match super::hold::take_pending(gm, &reference).await {
         Ok(Some(pending)) => Some(pending),
-        _ => {
+        Ok(None) => {
+            report.hold.errors += 1;
+            None
+        }
+        Err(err) => {
+            eprintln!("hold error: {err}");
             report.hold.errors += 1;
             None
         }
