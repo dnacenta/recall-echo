@@ -19,9 +19,7 @@ use super::super::types::{Entity, IngestionReport, Retirement};
 use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
 use super::ground::{is_stop_word, sentences};
-use super::known_match::{
-    coexist, cue_words, departure_near, key_tokens, mention, mentioned_with_cue, value_spans,
-};
+use super::known_match::{coexist, cue_words, key_tokens, mention, value_spans};
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
@@ -774,10 +772,7 @@ fn wanted_names(anchors: &[Anchor], ctx: &WriteCtx<'_>) -> Vec<String> {
 }
 
 fn departs(turn: &str, old: &str, replaces: &str) -> bool {
-    let hit = |value: &str| {
-        !value.is_empty() && (mentioned_with_cue(value, turn) || departure_near(value, turn))
-    };
-    hit(old) || hit(replaces)
+    super::hold::departs(turn, old, replaces)
 }
 
 /// Replacement phrasing in the quote, when the old value is not in that quote.
@@ -1404,11 +1399,7 @@ async fn load_entity(gm: &GraphMemory, id: &str) -> Result<Option<Entity>, Graph
 }
 
 fn id_text(id: Option<&Value>) -> String {
-    match id {
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    }
+    super::hold::id_text(id)
 }
 
 fn json_text(value: Option<&Value>) -> String {

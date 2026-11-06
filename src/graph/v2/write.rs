@@ -2096,7 +2096,7 @@ fn pending_same(slot: &Value, fact: &Fact) -> bool {
     is_pending(slot) && slot.get("valid_until").is_none_or(Value::is_null) && same_fact(slot, fact)
 }
 
-fn keys_agree(left: &str, right: &str) -> bool {
+pub(crate) fn keys_agree(left: &str, right: &str) -> bool {
     if left.is_empty() && right.is_empty() {
         true
     } else {
@@ -2104,7 +2104,7 @@ fn keys_agree(left: &str, right: &str) -> bool {
     }
 }
 
-fn stored_role(description: Option<&Value>) -> Option<String> {
+pub(crate) fn stored_role(description: Option<&Value>) -> Option<String> {
     let text = description.and_then(Value::as_str).map(str::trim)?;
     if text.is_empty() {
         return None;

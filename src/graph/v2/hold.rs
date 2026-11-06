@@ -19,7 +19,8 @@ use super::super::{deserialize_take, GraphMemory};
 use super::known_match::{departure_near, mention, mentioned_with_cue};
 use super::schema::{normalise, Fact};
 use super::write::{
-    is_pending, keys_match, session_midnight, stamp_slot, values_equal, WriteCtx, CLOSE_EDGE,
+    is_pending, keys_agree, keys_match, session_midnight, stamp_slot, stored_role, values_equal,
+    WriteCtx, CLOSE_EDGE,
 };
 
 /// A pending pair the judge still has to see.
@@ -83,8 +84,20 @@ pub(crate) async fn settle(
             let pred = text_at(slot, "predicate");
             let key = text_at(slot, "key");
             consider(
-                gm, ctx, facts, report, &mut open, &subject, &pred, &key, &new_value, &old_value,
-                &new_ref, old_ref,
+                gm,
+                ctx,
+                facts,
+                report,
+                &mut open,
+                &OpenHold {
+                    subject,
+                    pred,
+                    key,
+                    new_value,
+                    old_value,
+                    new_ref,
+                    old_ref: old_ref.to_string(),
+                },
             )
             .await;
         }
@@ -113,8 +126,20 @@ pub(crate) async fn settle(
             };
             let pred = text_at(&edge, "rel_type");
             consider(
-                gm, ctx, facts, report, &mut open, &subject, &pred, "", &new_value, &old_value,
-                &new_ref, old_ref,
+                gm,
+                ctx,
+                facts,
+                report,
+                &mut open,
+                &OpenHold {
+                    subject,
+                    pred,
+                    key: String::new(),
+                    new_value,
+                    old_value,
+                    new_ref,
+                    old_ref: old_ref.to_string(),
+                },
             )
             .await;
         }
@@ -124,21 +149,21 @@ pub(crate) async fn settle(
     Ok(open)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn consider(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     facts: &[Fact],
     report: &mut IngestionReport,
     open: &mut Vec<OpenHold>,
-    subject: &str,
-    pred: &str,
-    key: &str,
-    new_value: &str,
-    old_value: &str,
-    new_ref: &str,
-    old_ref: &str,
+    hold: &OpenHold,
 ) {
+    let subject = hold.subject.as_str();
+    let pred = hold.pred.as_str();
+    let key = hold.key.as_str();
+    let new_value = hold.new_value.as_str();
+    let old_value = hold.old_value.as_str();
+    let new_ref = hold.new_ref.as_str();
+    let old_ref = hold.old_ref.as_str();
     let until = session_midnight(ctx.date);
     if confirms(ctx, facts, old_value, new_value) {
         let Some(until) = until else {
@@ -209,15 +234,7 @@ async fn consider(
         }
         return;
     }
-    open.push(OpenHold {
-        subject: subject.to_string(),
-        pred: pred.to_string(),
-        key: key.to_string(),
-        new_value: new_value.to_string(),
-        old_value: old_value.to_string(),
-        new_ref: new_ref.to_string(),
-        old_ref: old_ref.to_string(),
-    });
+    open.push(hold.clone());
 }
 
 /// Remove `pending` so the row is live. The value and the weights stay.
@@ -266,19 +283,7 @@ async fn other_slot(
     key: &str,
     _new_value: &str,
 ) -> Result<bool, GraphError> {
-    let mut response = gm
-        .db()
-        .query("SELECT attributes FROM type::record($id)")
-        .bind(("id", entity.to_string()))
-        .await?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-    let Some(slots) = rows.into_iter().next().and_then(|row| {
-        row.get("attributes")
-            .and_then(|attrs| attrs.get("v2"))
-            .and_then(|v2| v2.get("slots"))
-            .and_then(Value::as_array)
-            .cloned()
-    }) else {
+    let Some(slots) = attribute_row(gm, entity).await?.as_ref().and_then(slots_in) else {
         return Ok(false);
     };
     Ok(slots.iter().enumerate().any(|(at, slot)| {
@@ -286,7 +291,7 @@ async fn other_slot(
             && !closed(slot.get("valid_until"))
             && !is_pending(slot)
             && text_at(slot, "predicate") == pred
-            && same_key(&text_at(slot, "key"), key)
+            && keys_agree(&text_at(slot, "key"), key)
     }))
 }
 
@@ -301,7 +306,7 @@ async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool,
         return Ok(false);
     };
     let from = id_text(mine.get("in"));
-    let Some(role) = edge_role(mine.get("description")) else {
+    let Some(role) = stored_role(mine.get("description")) else {
         return Ok(false);
     };
     if from.is_empty() {
@@ -320,30 +325,8 @@ async fn other_edge(gm: &GraphMemory, edge_id: &str, pred: &str) -> Result<bool,
         id_text(edge.get("id")) != edge_id
             && !is_pending(edge)
             && !closed(edge.get("valid_until"))
-            && edge_role(edge.get("description")).as_deref() == Some(role.as_str())
+            && stored_role(edge.get("description")).as_deref() == Some(role.as_str())
     }))
-}
-
-/// Role stored on an edge, or nothing when the edge names none.
-fn edge_role(description: Option<&Value>) -> Option<String> {
-    let text = description.and_then(Value::as_str).map(str::trim)?;
-    if text.is_empty() {
-        return None;
-    }
-    let role = text.strip_prefix("role=").unwrap_or(text).trim();
-    if role.is_empty() {
-        None
-    } else {
-        Some(role.to_string())
-    }
-}
-
-fn same_key(left: &str, right: &str) -> bool {
-    if left.is_empty() && right.is_empty() {
-        true
-    } else {
-        keys_match(left, right)
-    }
 }
 
 async fn ref_already_closed(
@@ -352,20 +335,12 @@ async fn ref_already_closed(
     expect: &str,
 ) -> Result<bool, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
-        let mut response = gm
-            .db()
-            .query("SELECT attributes FROM type::record($id)")
-            .bind(("id", entity.to_string()))
-            .await?;
-        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-        let Some(slot) = rows.into_iter().next().and_then(|row| {
-            row.get("attributes")
-                .and_then(|attrs| attrs.get("v2"))
-                .and_then(|v2| v2.get("slots"))
-                .and_then(Value::as_array)
-                .and_then(|slots| slots.get(index))
-                .cloned()
-        }) else {
+        let Some(slot) = attribute_row(gm, entity)
+            .await?
+            .as_ref()
+            .and_then(slots_in)
+            .and_then(|slots| slots.get(index).cloned())
+        else {
             return Ok(false);
         };
         let same = slot.get("value").and_then(Value::as_str) == Some(expect);
@@ -533,7 +508,7 @@ fn reasserts(facts: &[Fact], subject: &str, pred: &str, key: &str, old: &str) ->
     })
 }
 
-fn departs(turn: &str, old: &str, replaces: &str) -> bool {
+pub(crate) fn departs(turn: &str, old: &str, replaces: &str) -> bool {
     let hit = |value: &str| {
         !value.is_empty() && (mentioned_with_cue(value, turn) || departure_near(value, turn))
     };
@@ -598,11 +573,27 @@ async fn load_entities(gm: &GraphMemory) -> Result<Vec<super::super::types::Enti
     deserialize_take(&mut response, 0)
 }
 
+async fn attribute_row(gm: &GraphMemory, entity: &str) -> Result<Option<Value>, GraphError> {
+    let mut response = gm
+        .db()
+        .query("SELECT attributes FROM type::record($id)")
+        .bind(("id", entity.to_string()))
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(rows.into_iter().next())
+}
+
+fn slots_in(row: &Value) -> Option<Vec<Value>> {
+    row.get("attributes").and_then(slot_list)
+}
+
 fn slots_of(entity: &super::super::types::Entity) -> Option<Vec<Value>> {
-    entity
-        .attributes
-        .as_ref()
-        .and_then(|attrs| attrs.get("v2"))
+    entity.attributes.as_ref().and_then(slot_list)
+}
+
+fn slot_list(attributes: &Value) -> Option<Vec<Value>> {
+    attributes
+        .get("v2")
         .and_then(|v2| v2.get("slots"))
         .and_then(Value::as_array)
         .cloned()
@@ -621,22 +612,16 @@ async fn pending_edges(gm: &GraphMemory) -> Result<Vec<Value>, GraphError> {
 
 async fn value_at(gm: &GraphMemory, reference: &str) -> Result<Option<String>, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
-        let mut response = gm
-            .db()
-            .query("SELECT attributes FROM type::record($id)")
-            .bind(("id", entity.to_string()))
-            .await?;
-        let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-        return Ok(rows.into_iter().next().and_then(|row| {
-            row.get("attributes")
-                .and_then(|attrs| attrs.get("v2"))
-                .and_then(|v2| v2.get("slots"))
-                .and_then(Value::as_array)
-                .and_then(|slots| slots.get(index))
-                .and_then(|slot| slot.get("value"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        }));
+        return Ok(attribute_row(gm, entity)
+            .await?
+            .as_ref()
+            .and_then(slots_in)
+            .and_then(|slots| slots.get(index).cloned())
+            .and_then(|slot| {
+                slot.get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }));
     }
     let mut response = gm
         .db()
@@ -717,7 +702,7 @@ fn closed(valid_until: Option<&Value>) -> bool {
     crud::edge_already_closed(valid_until)
 }
 
-fn id_text(id: Option<&Value>) -> String {
+pub(crate) fn id_text(id: Option<&Value>) -> String {
     match id {
         Some(Value::String(text)) => text.clone(),
         Some(other) => other.to_string(),
