@@ -258,6 +258,10 @@ enum BenchCommands {
         /// live reads if this is later turned off; see docs/grounding.md.
         #[arg(long)]
         consolidate_hold: bool,
+        /// Drop a decided rule that only restates a same-session setting.
+        /// Off unless set.
+        #[arg(long)]
+        drop_restatements: bool,
     },
 }
 
@@ -1078,6 +1082,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             known_match,
             consolidate,
             consolidate_hold,
+            drop_restatements,
         } => run_writes(
             script,
             work_dir,
@@ -1102,6 +1107,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::Consolidate::Off
             },
+            if drop_restatements {
+                recall_echo::bench::writes::DropRestatements::On
+            } else {
+                recall_echo::bench::writes::DropRestatements::Off
+            },
         ),
     }
 }
@@ -1118,6 +1128,7 @@ fn run_writes(
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
     known_match: recall_echo::bench::writes::KnownMatch,
     consolidate: recall_echo::bench::writes::Consolidate,
+    drop_restatements: recall_echo::bench::writes::DropRestatements,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1151,6 +1162,7 @@ fn run_writes(
             known_facts_context,
             known_match,
             consolidate,
+            drop_restatements,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1164,6 +1176,7 @@ fn run_writes(
             known_facts_context,
             known_match,
             consolidate,
+            drop_restatements,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1182,6 +1195,7 @@ async fn grade_once(
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
     known_match: recall_echo::bench::writes::KnownMatch,
     consolidate: recall_echo::bench::writes::Consolidate,
+    drop_restatements: recall_echo::bench::writes::DropRestatements,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1198,6 +1212,7 @@ async fn grade_once(
                 known_facts_context,
                 known_match,
                 consolidate,
+                drop_restatements,
             )
             .await
         }
@@ -1210,6 +1225,7 @@ async fn grade_once(
                 known_facts_context,
                 known_match,
                 consolidate,
+                drop_restatements,
             )
             .await
         }
@@ -1228,6 +1244,7 @@ async fn grade_repeat(
     known_facts_context: recall_echo::bench::writes::KnownFactsContext,
     known_match: recall_echo::bench::writes::KnownMatch,
     consolidate: recall_echo::bench::writes::Consolidate,
+    drop_restatements: recall_echo::bench::writes::DropRestatements,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1245,6 +1262,7 @@ async fn grade_repeat(
                 known_facts_context,
                 known_match,
                 consolidate,
+                drop_restatements,
             )
             .await
         }
@@ -1258,6 +1276,7 @@ async fn grade_repeat(
                 known_facts_context,
                 known_match,
                 consolidate,
+                drop_restatements,
             )
             .await
         }

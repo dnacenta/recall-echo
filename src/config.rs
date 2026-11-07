@@ -709,6 +709,13 @@ pub struct GraphSection {
     /// A pending row stays out of live reads if this is later turned off.
     #[serde(default = "default_consolidate_hold", skip_serializing_if = "is_false")]
     pub consolidate_hold: bool,
+    /// Drop a decided rule that only restates a same-session setting.
+    /// Off unless set.
+    #[serde(
+        default = "default_drop_restatements",
+        skip_serializing_if = "is_false"
+    )]
+    pub drop_restatements: bool,
 }
 
 impl Default for GraphSection {
@@ -728,6 +735,7 @@ impl Default for GraphSection {
             known_match: default_known_match(),
             consolidate: default_consolidate(),
             consolidate_hold: default_consolidate_hold(),
+            drop_restatements: default_drop_restatements(),
         }
     }
 }
@@ -1055,6 +1063,10 @@ fn default_consolidate_hold() -> bool {
     false
 }
 
+fn default_drop_restatements() -> bool {
+    false
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1362,6 +1374,12 @@ impl Config {
             }
             "graph.consolidate_hold" => {
                 self.graph_section().consolidate_hold = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.drop_restatements" => {
+                self.graph_section().drop_restatements = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2209,6 +2227,82 @@ mod tests {
         cfg.set_key("graph.consolidate", "true").unwrap();
         assert!(cfg.graph.as_ref().expect("graph").hold_applies());
         assert!(cfg.set_key("graph.consolidate_hold", "yes").is_err());
+    }
+
+    #[test]
+    fn drop_restatements_defaults_off_round_trips_and_stays_independent() {
+        assert!(!default_drop_restatements());
+        assert!(!GraphSection::default().drop_restatements);
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().drop_restatements);
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\ndrop_restatements = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.drop_restatements);
+        assert!(!false_graph.known_facts_context);
+        assert!(!false_graph.known_match);
+        assert!(!false_graph.consolidate);
+        assert!(!false_graph.consolidate_hold);
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\ndrop_restatements = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.drop_restatements);
+        assert!(!true_graph.known_facts_context);
+        assert!(!true_graph.known_match);
+        assert!(!true_graph.consolidate);
+        assert!(!true_graph.consolidate_hold);
+
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("drop_restatements"));
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("drop_restatements"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.drop_restatements", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.drop_restatements);
+        assert!(!graph.known_facts_context);
+        assert!(!graph.known_match);
+        assert!(!graph.consolidate);
+        assert!(!graph.consolidate_hold);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("drop_restatements = true"));
+        assert!(!rendered.contains("known_facts_context"));
+        assert!(!rendered.contains("known_match"));
+        assert!(!rendered.contains("consolidate"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.drop_restatements);
+        assert!(!parsed_graph.known_facts_context);
+        assert!(!parsed_graph.known_match);
+        assert!(!parsed_graph.consolidate);
+        assert!(!parsed_graph.consolidate_hold);
+
+        cfg.set_key("graph.drop_restatements", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").drop_restatements);
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("drop_restatements"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse cleared");
+        assert!(!parsed.graph.unwrap_or_default().drop_restatements);
+
+        cfg.set_key("graph.known_facts_context", "true").unwrap();
+        cfg.set_key("graph.known_match", "true").unwrap();
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        cfg.set_key("graph.consolidate_hold", "true").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").drop_restatements);
+        cfg.set_key("graph.drop_restatements", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.drop_restatements);
+        assert!(graph.known_facts_context);
+        assert!(graph.known_match);
+        assert!(graph.consolidate);
+        assert!(graph.consolidate_hold);
+
+        assert!(cfg.set_key("graph.drop_restatements", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").drop_restatements);
     }
 
     #[test]
