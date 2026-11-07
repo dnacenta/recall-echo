@@ -140,6 +140,7 @@ pub async fn live_edges_of(
             r#"SELECT * FROM relates_to
                WHERE (in = type::record($id) OR out = type::record($id))
                  AND valid_until IS NONE
+                 AND pending IS NONE
                ORDER BY confidence DESC"#,
         )
         .bind(("id", entity_id.to_string()))
@@ -178,6 +179,7 @@ pub async fn live_edges_between(
         .query(
             r#"SELECT * FROM relates_to
                WHERE valid_until IS NONE
+                 AND pending IS NONE
                  AND ((in = type::record($one) AND out = type::record($other))
                    OR (in = type::record($other) AND out = type::record($one)))
                ORDER BY confidence DESC"#,
@@ -239,6 +241,72 @@ mod tests {
         relationship.valid_until = Some(json!("2026-02-01T00:00:00Z"));
         let view = EdgeView::of(&relationship, "Rust".into(), "Cargo".into());
         assert!(view.superseded);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_pending_edge_is_not_a_live_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        for (id, name) in [("one", "acme"), ("two", "linen"), ("three", "rust")] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = '{name}', entity_type = 'project', abstract = '', overview = ''"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:two SET rel_type = 'uses', confidence = 0.4, pending = { since: 's2', conflicts: 'relates_to:old' }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:three SET rel_type = 'uses', confidence = 0.4",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let live = live_edges_of(gm.db(), "entity:one").await.unwrap();
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert!(live_edges_between(gm.db(), "entity:one", "entity:two")
+            .await
+            .unwrap()
+            .is_empty());
+        let tree = crate::graph::traverse::traverse(gm.db(), "acme", 1)
+            .await
+            .unwrap();
+        assert!(tree
+            .edges
+            .iter()
+            .all(|edge| edge.target.entity.name != "linen"));
+        let uncertain = crate::graph::inspect::least_certain_for_test(gm.db())
+            .await
+            .unwrap();
+        assert!(uncertain
+            .iter()
+            .all(|edge| { crate::graph::edge_view::record_id(&edge.to_id) != "entity:two" }));
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:two SET rel_type = 'EVOLVED_FROM', confidence = 0.4, pending = { since: 's2', conflicts: 'relates_to:old' }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let flow = crate::graph::query::pipeline_flow(gm.db(), "acme")
+            .await
+            .unwrap();
+        assert!(flow.is_empty(), "{flow:?}");
     }
 
     #[test]

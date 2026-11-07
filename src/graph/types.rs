@@ -878,6 +878,36 @@ pub struct ConsolidateReport {
     pub errors: u32,
 }
 
+/// Counts from the opt-in contradiction hold.
+///
+/// Older bench JSON has no object here. A blank report is left out of new JSON.
+/// The hold runs only when consolidation is also on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldReport {
+    #[serde(default)]
+    pub holds_opened: u32,
+    #[serde(default)]
+    pub holds_confirmed: u32,
+    #[serde(default)]
+    pub holds_dropped: u32,
+    #[serde(default)]
+    pub holds_ambiguous: u32,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub errors: u32,
+}
+
+impl HoldReport {
+    /// Nothing was opened, resolved, left pending, or failed.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.holds_opened == 0
+            && self.holds_confirmed == 0
+            && self.holds_dropped == 0
+            && self.holds_ambiguous == 0
+            && self.errors == 0
+    }
+}
+
 impl ConsolidateReport {
     /// The pass did not run, or it found nothing to count.
     #[must_use]
@@ -989,6 +1019,9 @@ pub struct IngestionReport {
     /// Consolidation counts. Blank, and omitted, when the switch is off.
     #[serde(default, skip_serializing_if = "ConsolidateReport::is_blank")]
     pub consolidate: ConsolidateReport,
+    /// Contradiction-hold counts. Blank, and omitted, when the hold is off.
+    #[serde(default, skip_serializing_if = "HoldReport::is_blank")]
+    pub hold: HoldReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {

@@ -75,6 +75,18 @@ With `[graph] consolidate = true` or `--consolidate`, after the session's writes
 
 A verdict the guards do not apply is counted on `consolidate.dropped`, and the bench report sums those counts as `consolidate_drops`. The reasons are `quote too short`, `quote not verbatim in the evidence`, `no departure cue`, `second supersede on the same anchor`, `no kept live copy (duplicate)`, `row opened this session`, and `anchor or pair no longer present`. While consolidation is on, every ingest prints one line per drop on stderr: the reason, the stored row's subject and key, the anchor's subject and key, and the first 80 characters of the quote. Off, both counters are absent and nothing is printed.
 
+### Contradiction hold (opt-in)
+
+`consolidate_hold` is off unless set. It applies only when `consolidate` is also on. If the hold is on and consolidation is off, the hold is off: nothing is stored pending, and the skip path is unchanged.
+
+With both on, a decided write that conflicts with a live row and would be left in place by `retirement_skip` does not close the old row and does not count a skip. The new value is stored with `pending`, an object `{ since, conflicts }` naming the session and the old row. A slot carries it on the slot. An edge carries it on the edge. The old row stays live. Pending rows are left out of live reads, the known-facts block, and current graph answers (query neighbours and traversal).
+
+The next session resolves a pending pair before the consolidation judge. Departure or replace evidence for that pair closes the old row (`valid_until` and `ended_by`) and clears `pending`, so the new row becomes the live value. A decided re-assertion of the old value closes the pending row with `ended_by` `<session>:hold_dropped`. Otherwise the pair stays pending and is added to the consolidation batch. That is still one call. A provider or parse error leaves the pending row unchanged and the ingest still succeeds. The report's `hold` object counts `holds_opened`, `holds_confirmed`, `holds_dropped`, and `holds_ambiguous`.
+
+Turning the hold off does not put a pending row into live reads, and it does not confirm or drop it. The row stays excluded until the hold is turned back on, when a later session can settle it.
+
+`--consolidate-hold` turns consolidation and the hold on for that bench run. The bench JSON includes `consolidate_hold` when the hold was on.
+
 ## Gate 5 — confidence and generic objects
 
 A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.

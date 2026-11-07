@@ -19,9 +19,7 @@ use super::super::types::{Entity, IngestionReport, Retirement};
 use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
 use super::ground::{is_stop_word, sentences};
-use super::known_match::{
-    coexist, cue_words, departure_near, key_tokens, mentioned_with_cue, value_spans,
-};
+use super::known_match::{coexist, cue_words, key_tokens, mention, value_spans};
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
@@ -72,6 +70,7 @@ struct Row {
     evidence: Value,
     from: String,
     here: bool,
+    pending: bool,
 }
 
 #[derive(Clone)]
@@ -99,6 +98,7 @@ struct Pair {
     score: i32,
     evidence: String,
     stored: String,
+    hold: bool,
 }
 
 struct Loaded {
@@ -125,20 +125,42 @@ pub(crate) async fn run(
     report: &mut IngestionReport,
 ) {
     let rough = rough_anchors(facts, stats);
-    if rough.is_empty() {
+    let ambiguous = if ctx.hold_on {
+        match super::hold::settle(gm, ctx, facts, report).await {
+            Ok(open) => open,
+            Err(err) => {
+                eprintln!("hold error: {err}");
+                report.hold.errors += 1;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if rough.is_empty() && ambiguous.is_empty() {
         return;
     }
     if define_cache(gm).await.is_err() {
         report.consolidate.errors += 1;
+        report.hold.errors += count(ambiguous.len());
         return;
     }
-    let names = wanted_names(&rough, ctx);
+    let mut names = wanted_names(&rough, ctx);
+    for hold in &ambiguous {
+        if names.len() >= NEIGHBOUR_CAP {
+            break;
+        }
+        if !names.iter().any(|name| name == &hold.subject) {
+            names.push(hold.subject.clone());
+        }
+    }
     let Ok(loaded) = load_rows(gm, ctx.session_id, &names).await else {
         report.consolidate.errors += 1;
+        report.hold.errors += count(ambiguous.len());
         return;
     };
-    let anchors = finish_anchors(rough, &loaded.rows);
-    if anchors.is_empty() {
+    let mut anchors = finish_anchors(rough, &loaded.rows);
+    if anchors.is_empty() && ambiguous.is_empty() {
         return;
     }
     report.consolidate.anchors = count(anchors.len());
@@ -195,6 +217,8 @@ pub(crate) async fn run(
             Step::Judge => waiting.push(pair.clone()),
         }
     }
+    let added = attach_holds(ctx, &ambiguous, &mut anchors, &loaded, &mut waiting, report);
+    report.consolidate.pairs = report.consolidate.pairs.saturating_add(added);
     let mut batch = Vec::new();
     let mut verdicts = Vec::new();
     for pair in waiting {
@@ -297,6 +321,20 @@ pub(crate) async fn run(
             continue;
         }
         if verdict == "supersedes" {
+            // A partner closed earlier in this batch already has one live
+            // successor. Clearing another hold against it would make a second.
+            if pair.hold && gone.contains(&pair.partner) {
+                note_drop(report, DROP_GONE, &anchors, &loaded.rows, pair, quote);
+                continue;
+            }
+            let taken = if pair.hold {
+                confirm_held(gm, &anchors, &loaded, pair, report).await
+            } else {
+                None
+            };
+            if pair.hold && taken.is_none() {
+                continue;
+            }
             let before = report.consolidate.closes_sup;
             let reason = close_partner(
                 gm,
@@ -310,6 +348,37 @@ pub(crate) async fn run(
             .await;
             if report.consolidate.closes_sup > before {
                 gone.insert(pair.partner);
+                if pair.hold {
+                    report.hold.holds_confirmed += 1;
+                    report.hold.holds_ambiguous = report.hold.holds_ambiguous.saturating_sub(1);
+                }
+            } else if pair.hold {
+                if let Some(pending) = taken {
+                    if let Some(index) = anchors[pair.anchor].live {
+                        let reference = ref_of(&loaded.rows[index]);
+                        let anchor = &anchors[pair.anchor];
+                        let until = session_midnight(ctx.date).unwrap_or_default();
+                        let dropped_by = format!("{}:hold_dropped", ctx.session_id);
+                        if let Ok(super::hold::PendingRecover::Dropped) =
+                            super::hold::recover_pending(
+                                gm,
+                                &super::hold::PendingTarget {
+                                    new_ref: &reference,
+                                    pred: &anchor.pred,
+                                    key: &anchor.key,
+                                    new_value: &anchor.new_value,
+                                },
+                                &pending,
+                                &until,
+                                &dropped_by,
+                            )
+                            .await
+                        {
+                            report.hold.holds_dropped += 1;
+                        }
+                    }
+                }
+                report.hold.errors += 1;
             } else if let Some(reason) = reason {
                 note_drop(report, reason, &anchors, &loaded.rows, pair, quote);
             }
@@ -467,7 +536,7 @@ fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>
     for (anchor_index, anchor) in anchors.iter().enumerate() {
         let turn = cited(ctx, anchor);
         for (partner_index, partner) in rows.iter().enumerate() {
-            if partner.here || !neighbourhood.contains(&partner.entity) {
+            if partner.pending || partner.here || !neighbourhood.contains(&partner.entity) {
                 continue;
             }
             if anchor.live == Some(partner_index) {
@@ -494,6 +563,7 @@ fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>
                 score,
                 evidence: cut_evidence(turn, &[&anchor.value, &anchor.replaces, &anchor.quote]),
                 stored: stored_session(&partner.evidence),
+                hold: false,
             });
         }
     }
@@ -733,10 +803,7 @@ fn wanted_names(anchors: &[Anchor], ctx: &WriteCtx<'_>) -> Vec<String> {
 }
 
 fn departs(turn: &str, old: &str, replaces: &str) -> bool {
-    let hit = |value: &str| {
-        !value.is_empty() && (mentioned_with_cue(value, turn) || departure_near(value, turn))
-    };
-    hit(old) || hit(replaces)
+    super::hold::departs(turn, old, replaces)
 }
 
 /// Replacement phrasing in the quote, when the old value is not in that quote.
@@ -1230,7 +1297,7 @@ async fn load_rows(
         let mut response = gm
             .db()
             .query(
-                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
+                "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence, pending FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
             )
             .bind(("id", entity.id_string()))
             .await?;
@@ -1296,6 +1363,7 @@ async fn load_rows(
                     .unwrap_or("")
                     .into(),
                 here: opened_here(slot.get("evidence"), session),
+                pending: super::write::is_pending(slot),
             });
         }
     }
@@ -1327,6 +1395,7 @@ async fn load_rows(
             value: names.get(&to).cloned().unwrap_or_default(),
             from: json_text(edge.get("valid_from")),
             here: opened_here(Some(&evidence), session),
+            pending: edge.get("pending").is_some_and(Value::is_object),
             evidence,
         });
     }
@@ -1361,11 +1430,7 @@ async fn load_entity(gm: &GraphMemory, id: &str) -> Result<Option<Entity>, Graph
 }
 
 fn id_text(id: Option<&Value>) -> String {
-    match id {
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    }
+    super::hold::id_text(id)
 }
 
 fn json_text(value: Option<&Value>) -> String {
@@ -1681,6 +1746,128 @@ fn stored_session(evidence: &Value) -> String {
         .to_string()
 }
 
+/// The turn the cue check should read. Prefer one that names both values,
+/// then the old value, then the new value. Turn 0 is only the fallback when
+/// none of the session's turns name either value.
+fn hold_turn(ctx: &WriteCtx<'_>, old: &str, new_value: &str) -> usize {
+    let hit = |text: &str, value: &str| !value.is_empty() && mention(value, text);
+    ctx.turns
+        .iter()
+        .find(|turn| hit(&turn.text, old) && hit(&turn.text, new_value))
+        .or_else(|| ctx.turns.iter().find(|turn| hit(&turn.text, old)))
+        .or_else(|| ctx.turns.iter().find(|turn| hit(&turn.text, new_value)))
+        .map(|turn| turn.index)
+        .unwrap_or(0)
+}
+
+fn attach_holds(
+    ctx: &WriteCtx<'_>,
+    open: &[super::hold::OpenHold],
+    anchors: &mut Vec<Anchor>,
+    loaded: &Loaded,
+    waiting: &mut Vec<Pair>,
+    report: &mut IngestionReport,
+) -> u32 {
+    let text = ctx
+        .turns
+        .iter()
+        .map(|turn| turn.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut added = 0u32;
+    for hold in open {
+        let Some(new_index) = find_ref(&loaded.rows, &hold.new_ref, hold, &hold.new_value) else {
+            report.hold.errors += 1;
+            continue;
+        };
+        let Some(old_index) = find_ref(&loaded.rows, &hold.old_ref, hold, &hold.old_value) else {
+            report.hold.errors += 1;
+            continue;
+        };
+        let anchor = anchors.len();
+        anchors.push(Anchor {
+            id: format!("h:{anchor}"),
+            subject: hold.subject.clone(),
+            pred: hold.pred.clone(),
+            key: hold.key.clone(),
+            value: hold.old_value.clone(),
+            text: format!("{} {}", hold.old_value, hold.new_value),
+            new_value: hold.new_value.clone(),
+            replaces: String::new(),
+            entity: hold.subject.clone(),
+            reason: "hold",
+            turn: hold_turn(ctx, &hold.old_value, &hold.new_value),
+            quote: String::new(),
+            live: Some(new_index),
+            a2: false,
+        });
+        waiting.push(Pair {
+            anchor,
+            partner: old_index,
+            score: 0,
+            evidence: cut_evidence(&text, &[&hold.old_value, &hold.new_value]),
+            stored: stored_session(&loaded.rows[old_index].evidence),
+            hold: true,
+        });
+        report.hold.holds_ambiguous += 1;
+        added += 1;
+    }
+    added
+}
+
+fn find_ref(
+    rows: &[Row],
+    reference: &str,
+    hold: &super::hold::OpenHold,
+    value: &str,
+) -> Option<usize> {
+    rows.iter()
+        .position(|row| ref_of(row) == reference)
+        .or_else(|| {
+            rows.iter().position(|row| {
+                values_equal(&row.value, value)
+                    && normalise(&row.subject) == normalise(&hold.subject)
+                    && row.pred == hold.pred
+                    && (row.edge.is_some()
+                        || keys_match(&row.key, &hold.key)
+                        || row.key == hold.key)
+            })
+        })
+}
+
+fn ref_of(row: &Row) -> String {
+    if let Some(edge) = &row.edge {
+        return edge.clone();
+    }
+    format!("{}#{}", row.entity, row.slot.unwrap_or(0))
+}
+
+async fn confirm_held(
+    gm: &GraphMemory,
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    pair: &Pair,
+    report: &mut IngestionReport,
+) -> Option<Value> {
+    let Some(index) = anchors[pair.anchor].live else {
+        report.hold.errors += 1;
+        return None;
+    };
+    let reference = ref_of(&loaded.rows[index]);
+    match super::hold::take_pending(gm, &reference).await {
+        Ok(Some(pending)) => Some(pending),
+        Ok(None) => {
+            report.hold.errors += 1;
+            None
+        }
+        Err(err) => {
+            eprintln!("hold error: {err}");
+            report.hold.errors += 1;
+            None
+        }
+    }
+}
+
 fn count(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
@@ -1739,6 +1926,10 @@ mod tests {
 
         fn calls(&self) -> u32 {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn message(&self) -> String {
+            self.message.lock().expect("message").clone()
         }
     }
 
@@ -2485,6 +2676,87 @@ mod tests {
             ))
             .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn hold_on_without_consolidate_opens_no_pending_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nknown_match = true\nconsolidate = false\nconsolidate_hold = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(memory.join("conversations")).unwrap();
+        std::fs::write(
+            memory.join("conversations/conversation-002.md"),
+            "---\nlog: 2\ndate: \"2026-04-02T00:00:00Z\"\nsession_id: \"s2\"\n---\n\n### User\n\nStore the pages in linen.\n",
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        ensure_v2_store(&gm).await.unwrap();
+        let project = ProjectIdentity {
+            name: "acme".into(),
+            aliases: Vec::new(),
+        };
+        let spoken = [turn("The binder is canvas.")];
+        let ctx = WriteCtx::new(&Quiet, &project, "s1", "2026-04-01", &spoken);
+        write_facts(
+            &gm,
+            &ctx,
+            &[setting(
+                "acme",
+                Kind::Project,
+                "binder",
+                "canvas",
+                "The binder is canvas.",
+            )],
+        )
+        .await
+        .unwrap();
+        struct Linen;
+        #[async_trait]
+        impl LlmProvider for Linen {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                panic!("plain complete was called");
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                _: &str,
+                _: &[crate::graph::llm::Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                Ok(Completion::unmeasured(
+                    r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"binder","object":"linen","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Store the pages in linen.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+                ))
+            }
+        }
+        let report = super::super::pass1::extract_session(
+            &gm,
+            memory,
+            2,
+            &IngestContext::new("s2", Some(2)),
+            &Linen,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.hold.holds_opened, 0);
+        assert_eq!(
+            report.known_match.skipped.get("no_mention").copied(),
+            Some(1)
+        );
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(canvas).is_none());
+        assert!(canvas.get("pending").is_none());
+        assert!(linen.get("pending").is_none());
+        assert!(ended(linen).is_none());
     }
 
     /// The probe: a one-letter duplicate quote, and a longer one, against the
@@ -3373,6 +3645,1901 @@ mod tests {
             .unwrap();
         assert!(cache_get(&gm, &current).await.unwrap().is_none());
         assert_eq!(cache_get(&gm, &v1).await.unwrap().unwrap().0, "supersedes");
+    }
+
+    async fn commit_flags(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        match_on: bool,
+        hold_on: bool,
+    ) -> WriteStats {
+        let project = project();
+        let mut ctx = WriteCtx::new(&Quiet, &project, session, date, turns);
+        ctx.match_on = match_on;
+        ctx.hold_on = hold_on;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pass_hold(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        stats: &WriteStats,
+        llm: &Stub,
+        hold_on: bool,
+    ) -> IngestionReport {
+        let project = project();
+        let mut ctx = WriteCtx::new(llm, &project, session, date, turns);
+        ctx.hold_on = hold_on;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, facts, stats, llm, &mut report).await;
+        report
+    }
+
+    fn slot_named<'a>(slots: &'a [Value], key: &str, value: &str) -> &'a Value {
+        slots
+            .iter()
+            .find(|slot| {
+                slot.get("key").and_then(Value::as_str) == Some(key)
+                    && slot.get("value").and_then(Value::as_str) == Some(value)
+            })
+            .unwrap()
+    }
+
+    async fn seed_binder(gm: &GraphMemory) {
+        let turns = [turn("The binder is canvas.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "canvas",
+            "The binder is canvas.",
+        )];
+        commit_flags(gm, "s1", "2026-04-01", &turns, &facts, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn hold_off_writes_no_pending_field() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let turns = [turn("Store the pages in linen.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, false).await;
+        assert_eq!(stats.holds_opened, 0);
+        assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(canvas.get("pending").is_none());
+        assert!(linen.get("pending").is_none());
+        assert!(ended(canvas).is_none());
+        assert!(ended(linen).is_none());
+    }
+
+    #[tokio::test]
+    async fn hold_stores_the_new_value_pending_and_keeps_the_old_live() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let before = slots(&gm, "acme").await;
+        let alpha = slot_named(&before, "binder", "canvas")["alpha"].clone();
+        let turns = [turn("Store the pages in linen.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        assert_eq!(stats.holds_opened, 1);
+        assert!(stats.match_skips.is_empty(), "{:?}", stats.match_skips);
+        assert!(stats.retirements.is_empty());
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(canvas).is_none());
+        assert_eq!(canvas["alpha"], alpha);
+        let pending = linen.get("pending").expect("pending");
+        assert_eq!(pending["since"], "s2");
+        assert!(pending["conflicts"].as_str().unwrap().ends_with("#0"));
+        let project = project();
+        let live = super::super::known::read_live(&gm, &project, "binder canvas linen").await;
+        assert!(live.iter().any(|row| row.value == "canvas"));
+        assert!(live.iter().all(|row| row.value != "linen"));
+        let block = super::super::known::render_known(&live);
+        assert!(block.contains("canvas"));
+        assert!(!block.contains("linen"));
+    }
+
+    #[tokio::test]
+    async fn a_second_conflict_is_counted_as_a_skip() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let stored = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let mut silk = stored[0].clone();
+        silk["value"] = json!("silk");
+        stored.push(silk);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("Store the pages in linen.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        assert_eq!(stats.holds_opened, 1);
+        assert_eq!(stats.match_skips.get("no_mention").copied(), Some(1));
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert!(ended(slot_named(&rows, "binder", "silk")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(linen.get("pending").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_restatement_keeps_the_pending_value_and_records_evidence() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let quote = "Keep using linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        assert_eq!(stats.holds_confirmed, 0);
+        assert_eq!(stats.holds_opened, 0);
+        assert_eq!(stats.already_seen, 0);
+        assert_eq!(stats.reinforced, 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(linen.get("pending").is_some());
+        assert!(ended(linen).is_none());
+        let evidence = linen["evidence"].as_array().unwrap();
+        assert!(evidence.iter().any(|item| {
+            item["session"] == "s3" && item["quote"] == quote && item["turn"] == 0
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_hold_reference_is_not_written() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let linen = attributes["v2"]["slots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot["value"] == "linen")
+            .unwrap();
+        linen["pending"]["conflicts"] = json!("user:other");
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("Switched canvas for linen.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert!(report.hold.errors >= 1);
+        assert_eq!(report.hold.holds_confirmed, 0);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_turn_cue_confirms_the_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let quote = "Moved off canvas yesterday.";
+        let turns = [
+            turn("The label is north."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: quote.into(),
+            },
+        ];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert_eq!(report.hold.errors, 0, "{:?}", report.consolidate.dropped);
+        assert_eq!(report.hold.holds_confirmed, 1);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "canvas")),
+            Some("s3:consolidated")
+        );
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_departure_confirms_the_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [
+            turn("Switched canvas for linen."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: "The label is north.".into(),
+            },
+        ];
+        let mut label = setting(
+            "acme",
+            Kind::Project,
+            "label",
+            "north",
+            "The label is north.",
+        );
+        label.turn = 1;
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[label], true, true).await;
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert_eq!(llm.calls(), 0);
+        assert_eq!(report.hold.holds_confirmed, 1);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "canvas")),
+            Some("s3:superseded")
+        );
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(linen.get("pending").is_none());
+        assert!(ended(linen).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_reassertion_drops_the_pending_row() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("The binder stays canvas.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "canvas",
+            "The binder stays canvas.",
+        )];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        assert_eq!(report.hold.holds_dropped, 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "linen")),
+            Some("s3:hold_dropped")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_evidence_keeps_the_hold_in_the_consolidation_batch() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("The harbor bell is brass.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "bell",
+            "brass",
+            "The harbor bell is brass.",
+        )];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        assert_eq!(llm.calls(), 1);
+        let message = llm.message();
+        assert!(message.contains("canvas"), "{message}");
+        assert!(message.contains("linen"), "{message}");
+        assert_eq!(report.hold.holds_ambiguous, 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_restated_replace_confirms_the_hold() {
+        let (tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        std::fs::write(
+            tmp.path().join(".recall-echo.toml"),
+            "[graph]\nknown_match = true\nconsolidate = true\nconsolidate_hold = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        std::fs::write(
+            tmp.path().join("conversations/conversation-001.md"),
+            "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
+             ### User\n\nSwitched canvas for linen.\n",
+        )
+        .unwrap();
+        struct Confirm;
+        #[async_trait]
+        impl LlmProvider for Confirm {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"pairs":[]}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                _: &str,
+                _: &[crate::graph::llm::Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                Ok(Completion::unmeasured(
+                    r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"binder","object":"linen","object_type":"literal","status":"decided","replaces":"canvas","turn":0,"quote":"Switched canvas for linen.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+                ))
+            }
+        }
+        let report = super::super::pass1::extract_session(
+            &gm,
+            tmp.path(),
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &Confirm,
+        )
+        .await
+        .unwrap();
+        assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
+        assert_eq!(report.hold.errors, 0);
+        let rows = slots(&gm, "acme").await;
+        let canvas = slot_named(&rows, "binder", "canvas");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(canvas).is_some(), "canvas stayed live");
+        assert!(linen.get("pending").is_none(), "linen still pending");
+        assert!(ended(linen).is_none());
+        let live: Vec<_> = rows
+            .iter()
+            .filter(|slot| {
+                slot.get("valid_until").is_none_or(Value::is_null) && slot.get("pending").is_none()
+            })
+            .filter_map(|slot| slot.get("value").and_then(Value::as_str))
+            .collect();
+        assert_eq!(live, vec!["linen"]);
+    }
+
+    #[tokio::test]
+    async fn a_third_value_does_not_promote_the_pending_rival() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let _report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        let silk = slot_named(&rows, "binder", "silk");
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_some());
+        assert!(silk.get("pending").is_none());
+        assert!(ended(silk).is_none());
+        assert!(
+            linen.get("pending").is_some(),
+            "linen was promoted beside silk"
+        );
+    }
+
+    async fn uses_edges(gm: &GraphMemory) -> Vec<Value> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, pending, valid_until, ended_by, description, out.name AS object FROM relates_to WHERE rel_type = 'uses'",
+            )
+            .await
+            .unwrap();
+        deserialize_take(&mut response, 0).unwrap()
+    }
+
+    fn edge_named<'a>(edges: &'a [Value], object: &str) -> &'a Value {
+        edges
+            .iter()
+            .find(|edge| edge.get("object").and_then(Value::as_str) == Some(object))
+            .unwrap_or_else(|| panic!("missing uses {object}"))
+    }
+
+    fn live_values(rows: &[Value]) -> Vec<String> {
+        rows.iter()
+            .filter(|slot| {
+                slot.get("valid_until").is_none_or(Value::is_null) && slot.get("pending").is_none()
+            })
+            .filter_map(|slot| {
+                slot.get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_shared_short_value_does_not_bind_another_subject() {
+        let (_tmp, gm) = open().await;
+        let on = [turn("The flag is on.")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &on,
+            &[setting(
+                "acme",
+                Kind::Project,
+                "flag",
+                "on",
+                "The flag is on.",
+            )],
+            false,
+            false,
+        )
+        .await;
+        commit_flags(
+            &gm,
+            "s1b",
+            "2026-04-01",
+            &on,
+            &[setting(
+                "bravo",
+                Kind::Project,
+                "flag",
+                "on",
+                "The flag is on.",
+            )],
+            false,
+            false,
+        )
+        .await;
+        let off = [turn("Store the pages in off.")];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &off,
+            &[setting(
+                "acme",
+                Kind::Project,
+                "flag",
+                "off",
+                "Store the pages in off.",
+            )],
+            true,
+            true,
+        )
+        .await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        attributes["v2"]["slots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot.get("value").and_then(Value::as_str) == Some("on"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .extend([
+                ("valid_until".into(), json!("2026-04-02T00:00:00Z")),
+                ("ended_by".into(), json!("s2:consolidated")),
+            ]);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("The harbor bell rang twice today.")];
+        let project = ProjectIdentity {
+            name: "acme".into(),
+            aliases: vec!["bravo".into()],
+        };
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let mut ctx = WriteCtx::new(&llm, &project, "s3", "2026-04-03", &turns);
+        ctx.hold_on = true;
+        let stats = WriteStats::default();
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &[], &stats, &llm, &mut report).await;
+        let bravo = slots(&gm, "bravo").await;
+        assert!(ended(slot_named(&bravo, "flag", "on")).is_none());
+        assert!(report.hold.errors >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
+    async fn a_cue_without_a_close_leaves_the_row_pending() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for linen.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Switched canvas for linen.",
+        );
+        fact.replaces = "canvas".into();
+        commit_flags(&gm, "s3", "not-a-day", &turns, &[fact], true, true).await;
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        assert!(!field_absent(
+            slot_named(&rows, "binder", "linen").get("pending")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_replaces_name_does_not_release_an_edge_hold() {
+        let (_tmp, gm) = open().await;
+        let turns = [turn("acme links canvas")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &turns,
+            &[edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "canvas",
+                Kind::Technology,
+            )],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Keep canvas and linen.")],
+            &[linen],
+            true,
+            true,
+        )
+        .await;
+        let mut again = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        again.replaces = "jute".into();
+        again.quote = "Replaced jute with linen.".into();
+        commit_flags(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[turn("Replaced jute with linen.")],
+            &[again],
+            true,
+            true,
+        )
+        .await;
+        let edges = uses_edges(&gm).await;
+        assert!(ended_edge(edge_named(&edges, "canvas")).is_none());
+        assert!(!field_absent(edge_named(&edges, "linen").get("pending")));
+    }
+
+    #[tokio::test]
+    async fn a_live_copy_drops_the_pending_duplicate() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let stored = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let mut live = stored
+            .iter()
+            .find(|slot| slot.get("value").and_then(Value::as_str) == Some("linen"))
+            .unwrap()
+            .clone();
+        live.as_object_mut().unwrap().remove("pending");
+        stored.push(live);
+        stored
+            .iter_mut()
+            .find(|slot| slot.get("value").and_then(Value::as_str) == Some("canvas"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .extend([
+                ("valid_until".into(), json!("2026-04-02T00:00:00Z")),
+                ("ended_by".into(), json!("s2:consolidated")),
+            ]);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let turns = [turn("Switched canvas for linen.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["linen".to_string()]);
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert!(report.hold.holds_dropped >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
+    async fn a_pending_uses_edge_stays_out_of_live_reads() {
+        let (_tmp, gm) = open().await;
+        let turns = [turn("acme links canvas")];
+        let canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        commit_flags(&gm, "s1", "2026-04-01", &turns, &[canvas], false, false).await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        let stats = commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        assert_eq!(stats.holds_opened, 1);
+        let edges = uses_edges(&gm).await;
+        assert!(ended_edge(edge_named(&edges, "canvas")).is_none());
+        assert!(!field_absent(edge_named(&edges, "linen").get("pending")));
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let acme = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let live = crate::graph::edge_view::live_edges_of(gm.db(), &acme.id_string())
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1, "{live:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_uses_edge_does_not_drop_a_roleless_hold() {
+        let (_tmp, gm) = open().await;
+        let turns = [turn("acme links canvas and rust")];
+        let facts = [
+            edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "canvas",
+                Kind::Technology,
+            ),
+            edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "rust",
+                Kind::Technology,
+            ),
+        ];
+        commit_flags(&gm, "s1", "2026-04-01", &turns, &facts, false, false).await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        let before = uses_edges(&gm).await;
+        assert!(
+            !field_absent(edge_named(&before, "linen").get("pending")),
+            "linen was not stored pending: {}",
+            edge_named(&before, "linen")
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let later = [turn("We moved off canvas. Linen is in.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &later, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &later, &[], &stats, &llm, true).await;
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        let rust_edge = edge_named(&edges, "rust");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(rust_edge.get("valid_until")), "{rust_edge}");
+        assert!(ended_edge(rust_edge).is_none(), "{rust_edge}");
+        assert_eq!(report.hold.holds_dropped, 0);
+        assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
+    async fn a_same_role_uses_edge_drops_the_pending_hold() {
+        let (_tmp, gm) = open().await;
+        let mut canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        let mut rust_edge = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "rust",
+            Kind::Technology,
+        );
+        canvas.role = Some(super::super::schema::Role::Database);
+        rust_edge.role = Some(super::super::schema::Role::Database);
+        let turns = [turn("acme links canvas and rust")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &turns,
+            &[canvas, rust_edge],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.role = Some(super::super::schema::Role::Database);
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        let before = uses_edges(&gm).await;
+        assert_eq!(
+            edge_named(&before, "linen")
+                .get("description")
+                .and_then(Value::as_str),
+            Some("role=database")
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let later = [turn("We moved off canvas. Linen is in.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &later, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &later, &[], &stats, &llm, true).await;
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert_eq!(
+            ended_edge(linen_edge),
+            Some("s3:hold_dropped"),
+            "{linen_edge}"
+        );
+        assert!(ended_edge(edge_named(&edges, "rust")).is_none());
+        assert!(report.hold.holds_dropped >= 1, "{:?}", report.hold);
+
+        // A live edge of another role does not occupy this one, so the hold promotes.
+        let (_tmp, gm) = open().await;
+        let mut canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        let mut rust_edge = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "rust",
+            Kind::Technology,
+        );
+        canvas.role = Some(super::super::schema::Role::Database);
+        rust_edge.role = Some(super::super::schema::Role::Language);
+        let turns = [turn("acme links canvas and rust")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &turns,
+            &[canvas, rust_edge],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.role = Some(super::super::schema::Role::Database);
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        let before = uses_edges(&gm).await;
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let later = [turn("We moved off canvas. Linen is in.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &later, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &later, &[], &stats, &llm, true).await;
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+        assert!(ended_edge(edge_named(&edges, "rust")).is_none());
+        assert_eq!(report.hold.holds_dropped, 0, "{:?}", report.hold);
+        assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
+    async fn a_closed_conflict_releases_a_roleless_edge_hold() {
+        let (_tmp, gm) = open().await;
+        let canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[turn("acme links canvas")],
+            &[canvas],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Keep canvas and linen.")],
+            &[linen],
+            true,
+            true,
+        )
+        .await;
+        let before = uses_edges(&gm).await;
+        assert!(
+            field_absent(edge_named(&before, "linen").get("description")),
+            "the pending edge should have no role"
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut again = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        again.quote = "acme links linen.".into();
+        let stats = commit_flags(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[turn("acme links linen.")],
+            &[again],
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(stats.holds_confirmed, 1, "{stats:?}");
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+    }
+
+    #[tokio::test]
+    async fn a_same_role_live_peer_does_not_release_an_edge_hold() {
+        let (_tmp, gm) = open().await;
+        let mut canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        let mut rust_edge = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "rust",
+            Kind::Technology,
+        );
+        canvas.role = Some(super::super::schema::Role::Database);
+        rust_edge.role = Some(super::super::schema::Role::Database);
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[turn("acme links canvas and rust")],
+            &[canvas, rust_edge],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.role = Some(super::super::schema::Role::Database);
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Keep canvas and linen.")],
+            &[linen],
+            true,
+            true,
+        )
+        .await;
+        let before = uses_edges(&gm).await;
+        assert_eq!(
+            edge_named(&before, "linen")
+                .get("description")
+                .and_then(Value::as_str),
+            Some("role=database")
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut again = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        again.role = Some(super::super::schema::Role::Database);
+        again.quote = "acme links linen.".into();
+        let stats = commit_flags(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[turn("acme links linen.")],
+            &[again],
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(stats.holds_confirmed, 0, "{stats:?}");
+        let edges = uses_edges(&gm).await;
+        assert!(
+            !field_absent(edge_named(&edges, "linen").get("pending")),
+            "{}",
+            edge_named(&edges, "linen")
+        );
+        assert!(ended_edge(edge_named(&edges, "rust")).is_none());
+
+        // A live edge of another role does not occupy this one, so the write releases it.
+        let (_tmp, gm) = open().await;
+        let mut canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        let mut rust_edge = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "rust",
+            Kind::Technology,
+        );
+        canvas.role = Some(super::super::schema::Role::Database);
+        rust_edge.role = Some(super::super::schema::Role::Language);
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[turn("acme links canvas and rust")],
+            &[canvas, rust_edge],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.role = Some(super::super::schema::Role::Database);
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Keep canvas and linen.")],
+            &[linen],
+            true,
+            true,
+        )
+        .await;
+        let before = uses_edges(&gm).await;
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut again = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        again.role = Some(super::super::schema::Role::Database);
+        again.quote = "acme links linen.".into();
+        let stats = commit_flags(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[turn("acme links linen.")],
+            &[again],
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(stats.holds_confirmed, 1, "{stats:?}");
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+        assert!(ended_edge(edge_named(&edges, "rust")).is_none());
+    }
+
+    fn ended_edge(edge: &Value) -> Option<&str> {
+        edge.get("ended_by").and_then(Value::as_str)
+    }
+
+    fn field_absent(value: Option<&Value>) -> bool {
+        value.is_none_or(Value::is_null)
+    }
+
+    #[tokio::test]
+    async fn a_mentioned_rival_is_dropped_beside_the_new_value() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk. The linen samples go back.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["silk".to_string()]);
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_some());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(linen).is_some_and(|reason| reason.ends_with("hold_dropped")));
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert!(report.hold.holds_dropped >= 1);
+    }
+
+    #[tokio::test]
+    async fn clearing_an_edge_without_pending_is_not_success() {
+        let (_tmp, gm) = open().await;
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[turn("acme links canvas")],
+            &[edge(
+                Predicate::Uses,
+                "acme",
+                Kind::Project,
+                "canvas",
+                Kind::Technology,
+            )],
+            false,
+            false,
+        )
+        .await;
+        let edges = uses_edges(&gm).await;
+        let id = id_text(edge_named(&edges, "canvas").get("id"));
+        assert!(super::super::hold::take_pending(&gm, &id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_hold_does_not_load_every_entity() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        super::super::hold::reset_full_loads();
+        let turns = [turn("The harbor bell rang twice today.")];
+        let stats = WriteStats::default();
+        let llm = Stub::new(Answer::Panic);
+        let report = pass_hold(&gm, "s2", "2026-04-02", &turns, &[], &stats, &llm, true).await;
+        assert_eq!(super::super::hold::full_loads(), 0);
+        assert_eq!(report.hold.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn a_split_turn_does_not_confirm_a_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Store the pages in linen.")],
+            &[setting(
+                "acme",
+                Kind::Project,
+                "binder",
+                "linen",
+                "Store the pages in linen.",
+            )],
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[fact], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let _ = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        let later = [
+            turn("We moved off canvas last month."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: "The linen swatches arrived today.".into(),
+            },
+        ];
+        let later_stats = commit_flags(&gm, "s4", "2026-04-04", &later, &[], true, true).await;
+        let later_llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_hold(
+            &gm,
+            "s4",
+            "2026-04-04",
+            &later,
+            &[],
+            &later_stats,
+            &later_llm,
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        assert!(!field_absent(
+            slot_named(&rows, "binder", "linen").get("pending")
+        ));
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert_eq!(report.hold.holds_dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn a_later_mention_drops_the_rival_beside_the_live_value() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("Switched canvas for silk.")];
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "silk",
+            "Switched canvas for silk.",
+        );
+        fact.replaces = "canvas".into();
+        let facts = [fact];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let _ = pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+        let later = [turn(
+            "We moved off canvas last month. The linen swatches arrived today.",
+        )];
+        let later_stats = commit_flags(&gm, "s4", "2026-04-04", &later, &[], true, true).await;
+        let later_llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(
+            &gm,
+            "s4",
+            "2026-04-04",
+            &later,
+            &[],
+            &later_stats,
+            &later_llm,
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["silk".to_string()]);
+        let linen = slot_named(&rows, "binder", "linen");
+        assert!(ended(linen).is_some_and(|reason| reason.ends_with("hold_dropped")));
+        assert_eq!(report.hold.holds_confirmed, 0);
+        assert!(report.hold.holds_dropped >= 1);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_hold_reaches_the_judge_without_session_anchors() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let turns = [turn("The harbor bell rang twice today.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &turns, &[], &stats, &llm, true).await;
+        assert!(llm.calls() >= 1, "hold pair never reached the judge");
+        assert!(report.consolidate.pairs >= 1 || llm.calls() >= 1);
+        let rows = slots(&gm, "acme").await;
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_some());
+        assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_consolidation_batch_leaves_the_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &open_turns,
+            &open_facts,
+            true,
+            true,
+        )
+        .await;
+        let before = slots(&gm, "acme").await;
+        let pending = slot_named(&before, "binder", "linen")["pending"].clone();
+        let turns = [turn("The harbor bell is brass.")];
+        let facts = [setting(
+            "acme",
+            Kind::Project,
+            "bell",
+            "brass",
+            "The harbor bell is brass.",
+        )];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &turns, &facts, true, true).await;
+        for answer in [Answer::Err, Answer::Bad] {
+            let llm = Stub::new(answer);
+            let report =
+                pass_hold(&gm, "s3", "2026-04-03", &turns, &facts, &stats, &llm, true).await;
+            assert!(report.consolidate.errors >= 1);
+            assert_eq!(report.hold.holds_confirmed, 0);
+            assert_eq!(report.hold.holds_dropped, 0);
+            let rows = slots(&gm, "acme").await;
+            assert_eq!(slot_named(&rows, "binder", "linen")["pending"], pending);
+            assert!(ended(slot_named(&rows, "binder", "canvas")).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_old_stamp_recovers_through_settle() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let quote = "Store the pages in linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        let rows = slots(&gm, "acme").await;
+        let index = rows
+            .iter()
+            .position(|slot| slot["value"] == "linen")
+            .unwrap();
+        let pending = slot_named(&rows, "binder", "linen")["pending"].clone();
+        let old_ref = pending["conflicts"].as_str().unwrap().to_string();
+        let entity = old_ref.rsplit_once('#').unwrap().0;
+        let new_ref = format!("{entity}#{index}");
+        // Loaded value was canvas. The stored value no longer matches, so the
+        // old-row stamp refuses while that row is still live.
+        rewrite_slot(&gm, "acme", "binder", "canvas", "jute").await;
+        let project = project();
+        let confirm = [turn("Switched canvas for linen.")];
+        let ctx = WriteCtx::new(&Quiet, &project, "s3", "2026-04-03", &confirm);
+        let mut report = IngestionReport::default();
+        let mut open = Vec::new();
+        super::super::hold::consider(
+            &gm,
+            &ctx,
+            &[],
+            &mut report,
+            &mut open,
+            &super::super::hold::OpenHold {
+                subject: "acme".into(),
+                pred: "setting".into(),
+                key: "binder".into(),
+                new_value: "linen".into(),
+                old_value: "canvas".into(),
+                new_ref,
+                old_ref,
+            },
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["jute".to_string()]);
+        assert!(ended(slot_named(&rows, "binder", "jute")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert_eq!(linen["pending"], pending);
+        assert!(ended(linen).is_none());
+        assert!(report.hold.errors >= 1, "{:?}", report.hold);
+        assert!(open.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_partner_close_recovers_through_the_judge() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let quote = "Store the pages in linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        let pending = slot_named(&slots(&gm, "acme").await, "binder", "linen")["pending"].clone();
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap()
+            .id_string();
+        struct RewriteOnJudge {
+            db: surrealdb::Surreal<crate::graph::store::Db>,
+            entity: String,
+        }
+        #[async_trait]
+        impl LlmProvider for RewriteOnJudge {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                panic!("plain complete was called");
+            }
+
+            async fn complete_structured(
+                &self,
+                _: &str,
+                _: &str,
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                let mut response = self
+                    .db
+                    .query("SELECT attributes FROM type::record($id)")
+                    .bind(("id", self.entity.clone()))
+                    .await
+                    .unwrap();
+                let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+                let mut attributes = rows[0]["attributes"].clone();
+                let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+                let canvas = slots
+                    .iter_mut()
+                    .find(|slot| slot["key"] == "binder" && slot["value"] == "canvas")
+                    .unwrap();
+                canvas["value"] = json!("jute");
+                self.db
+                    .query("UPDATE type::record($id) SET attributes = $attributes")
+                    .bind(("id", self.entity.clone()))
+                    .bind(("attributes", attributes))
+                    .await
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                Ok(Completion::unmeasured(
+                    r#"{"pairs":[{"i":1,"verdict":"supersedes","quote":"We moved off canvas."}]}"#,
+                ))
+            }
+        }
+        let judge = RewriteOnJudge {
+            db: gm.db().clone(),
+            entity,
+        };
+        let later = [turn("We moved off canvas.")];
+        let project = project();
+        let mut ctx = WriteCtx::new(&judge, &project, "s3", "2026-04-03", &later);
+        ctx.hold_on = true;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &[], &WriteStats::default(), &judge, &mut report).await;
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["jute".to_string()]);
+        assert!(ended(slot_named(&rows, "binder", "jute")).is_none());
+        let linen = slot_named(&rows, "binder", "linen");
+        assert_eq!(linen["pending"], pending, "linen was left live: {linen}");
+        assert!(ended(linen).is_none());
+        assert!(report.hold.errors >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
+    async fn a_failed_pending_restore_does_not_leave_two_live_values() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let quote = "Store the pages in linen.";
+        let turns = [turn(quote)];
+        let facts = [setting("acme", Kind::Project, "binder", "linen", quote)];
+        commit_flags(&gm, "s2", "2026-04-02", &turns, &facts, true, true).await;
+        let rows = slots(&gm, "acme").await;
+        let index = rows
+            .iter()
+            .position(|slot| slot["value"] == "linen")
+            .unwrap();
+        let conflicts = slot_named(&rows, "binder", "linen")["pending"]["conflicts"]
+            .as_str()
+            .unwrap();
+        let entity = conflicts.rsplit_once('#').unwrap().0;
+        let new_ref = format!("{entity}#{index}");
+        let taken = super::super::hold::take_pending(&gm, &new_ref)
+            .await
+            .unwrap()
+            .expect("pending object");
+        assert!(taken.is_object());
+        let taken_live = live_values(&slots(&gm, "acme").await);
+        assert!(
+            taken_live.iter().any(|value| value == "canvas")
+                && taken_live.iter().any(|value| value == "linen"),
+            "take left one value: {taken_live:?}"
+        );
+        // A non-object is not a pending payload, so the restore returns Ok(false).
+        let outcome = super::super::hold::recover_pending(
+            &gm,
+            &super::super::hold::PendingTarget {
+                new_ref: &new_ref,
+                pred: "setting",
+                key: "binder",
+                new_value: "linen",
+            },
+            &json!("not-an-object"),
+            "2026-04-03T00:00:00Z",
+            "s3:hold_dropped",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, super::super::hold::PendingRecover::Dropped);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(live_values(&rows), vec!["canvas".to_string()]);
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "linen")),
+            Some("s3:hold_dropped")
+        );
+    }
+
+    #[tokio::test]
+    async fn two_supersedes_on_one_old_row_promote_one_hold() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        for (session, date, value) in [("s2", "2026-04-02", "linen"), ("s3", "2026-04-03", "silk")]
+        {
+            let quote = format!("Store the pages in {value}.");
+            let turns = [turn(&quote)];
+            let facts = [setting("acme", Kind::Project, "binder", value, &quote)];
+            commit_flags(&gm, session, date, &turns, &facts, true, true).await;
+        }
+        let turns = [turn("We moved off canvas.")];
+        let stats = commit_flags(&gm, "s4", "2026-04-04", &turns, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"supersedes","quote":"We moved off canvas."},{"i":2,"verdict":"supersedes","quote":"We moved off canvas."}]}"#.into(),
+        ));
+        let report = pass_hold(&gm, "s4", "2026-04-04", &turns, &[], &stats, &llm, true).await;
+        let rows = slots(&gm, "acme").await;
+        let live = live_values(&rows);
+        assert!(live.len() <= 1, "two live binder values: {live:?}");
+        let promoted = ["linen", "silk"]
+            .into_iter()
+            .filter(|value| live.iter().any(|row| row == value))
+            .count();
+        assert_eq!(promoted, 1, "live {live:?} hold {:?}", report.hold);
+        for value in ["linen", "silk"] {
+            let slot = slot_named(&rows, "binder", value);
+            let is_live = slot.get("pending").is_none() && ended(slot).is_none();
+            if !is_live {
+                assert!(
+                    slot.get("pending").is_some()
+                        || ended(slot).is_some_and(|reason| reason.ends_with("hold_dropped")),
+                    "{value} became a second live value: {slot}"
+                );
+            }
+        }
     }
 }
 

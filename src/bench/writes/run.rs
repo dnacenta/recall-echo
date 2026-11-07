@@ -7,7 +7,7 @@
 //! Archives go through the same renderer ingestion already reads, so turn
 //! headings survive and provenance is classified the way a real session is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +99,18 @@ pub enum Consolidate {
     Off,
     /// Candidate pairs, a pre-filter, and at most one judge call per session.
     On,
+    /// Consolidation, and a hold for a conflict the retirement guard would skip.
+    Hold,
+}
+
+impl Consolidate {
+    fn writes_pass(self) -> bool {
+        matches!(self, Self::On | Self::Hold)
+    }
+
+    fn writes_hold(self) -> bool {
+        matches!(self, Self::Hold)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +152,7 @@ pub async fn run(
         .collect::<Result<Vec<_>, _>>()?;
     let mut report =
         grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
+    report.consolidate_hold = consolidate.writes_hold();
     report.setup_millis = setup_millis;
     Ok(report)
 }
@@ -202,6 +215,7 @@ async fn collect_sessions(
                 report.timing = extracted.timing;
                 report.known_match = extracted.known_match;
                 report.consolidate = extracted.consolidate;
+                report.hold = extracted.hold;
                 report
             }
         };
@@ -227,6 +241,7 @@ async fn collect_sessions(
             timing: report.timing,
             known_match: report.known_match,
             consolidate: report.consolidate,
+            hold: report.hold,
         });
         before = after;
     }
@@ -302,8 +317,12 @@ fn apply_graph_switches(
         body.push_str("known_match = true\n");
         any = true;
     }
-    if consolidate == Consolidate::On {
+    if consolidate.writes_pass() {
         body.push_str("consolidate = true\n");
+        any = true;
+    }
+    if consolidate.writes_hold() {
+        body.push_str("consolidate_hold = true\n");
         any = true;
     }
     if !any {
@@ -609,6 +628,22 @@ fn to_conversation(session: &ScriptSession) -> Conversation {
     }
 }
 
+async fn pending_edge_ids(gm: &GraphMemory) -> Result<HashSet<String>, RecallError> {
+    let mut response = gm
+        .db()
+        .query("SELECT id FROM relates_to WHERE pending != NONE")
+        .await
+        .map_err(crate::graph::error::GraphError::from)?;
+    let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            crate::graph::edge_view::record_id(row.get("id").unwrap_or(&serde_json::Value::Null))
+        })
+        .filter(|id| !id.is_empty())
+        .collect())
+}
+
 async fn snapshot(
     gm: &GraphMemory,
     first_beta: &mut HashMap<String, f64>,
@@ -616,6 +651,7 @@ async fn snapshot(
     // Names live on the entity records, not on the edge. The same lookup the
     // inspect path uses keeps a dangling id visible instead of dropping it.
     let relationships = crate::graph::crud::list_all_relationships(gm.db()).await?;
+    let pending_edge_ids = pending_edge_ids(gm).await?;
     let edge_evidence = edge_evidence(gm).await?;
     let mut names = crate::graph::edge_view::NameCache::new();
     let mut edges = Vec::with_capacity(relationships.len());
@@ -627,12 +663,13 @@ async fn snapshot(
         let beta = evidence.beta();
         let prior_alpha = starting_alpha(&id, beta, first_beta);
         let (assistant_steps, self_steps) = corroboration_steps(edge_evidence.get(&id));
+        let live = relationship.valid_until.is_none() && !pending_edge_ids.contains(&id);
         edges.push(ObservedEdge {
             id,
             subject: names.name_of(gm.db(), &from_id).await?,
             relation: relationship.rel_type.clone(),
             object: names.name_of(gm.db(), &to_id).await?,
-            live: relationship.valid_until.is_none(),
+            live,
             alpha: evidence.alpha(),
             beta,
             self_reinforcements: relationship.self_reinforcements.unwrap_or(0).max(0),
@@ -692,8 +729,13 @@ async fn snapshot(
             let beta = json_number(slot.get("beta"));
             let prior_alpha = starting_alpha(&id, beta, first_beta);
             let until = slot.get("valid_until");
-            let live = until
-                .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty));
+            let pending = slot
+                .get("pending")
+                .is_some_and(serde_json::Value::is_object);
+            let live = !pending
+                && until.is_none_or(|value| {
+                    value.is_null() || value.as_str().is_some_and(str::is_empty)
+                });
             let (assistant_steps, self_steps) = corroboration_steps(slot.get("evidence"));
             edges.push(ObservedEdge {
                 id,
@@ -1467,6 +1509,17 @@ mod tests {
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
         assert!(text.contains("consolidate = true\n"), "{text}");
         assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Hold,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_hold = true\n"), "{text}");
     }
 
     #[test]
@@ -2729,10 +2782,12 @@ mod tests {
         assert!(report.sessions.iter().all(|session| {
             session.known_match.is_blank()
                 && session.consolidate.is_blank()
+                && session.hold.is_blank()
                 && serde_json::to_value(session)
                     .unwrap()
                     .get("known_match")
                     .is_none()
+                && serde_json::to_value(session).unwrap().get("hold").is_none()
                 && serde_json::to_value(session)
                     .unwrap()
                     .get("consolidate")
@@ -2746,9 +2801,19 @@ mod tests {
         }));
         let encoded = serde_json::to_value(&report).unwrap();
         assert!(encoded.get("consolidate_drops").is_none());
+        assert!(encoded.get("consolidate_hold").is_none());
         let gm = GraphMemory::open(&tmp.path().join("memory/graph"))
             .await
             .unwrap();
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&entities)
+                .unwrap_or_default()
+                .contains("\"pending\""),
+            "hold off wrote a pending field"
+        );
         let mut info = gm.db().query("INFO FOR DB").await.unwrap();
         let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut info, 0).unwrap();
         assert!(!serde_json::to_string(&rows)
@@ -2864,6 +2929,62 @@ mod tests {
             open_and_fixed,
             literal: regex::Regex::new(r"^[\d.]+[a-z%]*$|[/~=(%]|^v?\d+(\.\d+)+").unwrap(),
         }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_pending_edge_is_not_live_in_the_bench_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        for (id, name) in [("one", "acme"), ("two", "linen"), ("three", "rust")] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = '{name}', entity_type = 'project', abstract = '', overview = ''"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:two SET rel_type = 'uses', confidence = 0.4, valid_from = time::now(), pending = { since: 's2', conflicts: 'relates_to:old' }",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        gm.db()
+            .query(
+                "RELATE entity:one->relates_to->entity:three SET rel_type = 'uses', confidence = 0.4, valid_from = time::now()",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut first_beta = std::collections::HashMap::new();
+        let edges = snapshot(&gm, &mut first_beta).await.unwrap();
+        let pending = edges
+            .iter()
+            .find(|edge| edge.object == "linen")
+            .expect("pending edge");
+        let live = edges
+            .iter()
+            .find(|edge| edge.object == "rust")
+            .expect("live edge");
+        let mut response = gm
+            .db()
+            .query("SELECT id FROM relates_to WHERE pending != NONE")
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> =
+            crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let stored = crate::graph::edge_view::record_id(rows[0].get("id").unwrap());
+        assert_eq!(pending.id, stored);
+        assert!(!pending.live);
+        assert!(live.live);
     }
 
     #[cfg(feature = "embedded")]

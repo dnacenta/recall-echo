@@ -253,6 +253,11 @@ enum BenchCommands {
         /// Close drifted copies after the session write. Off unless set.
         #[arg(long)]
         consolidate: bool,
+        /// Hold a conflicting write the retirement guard would skip.
+        /// Implies `--consolidate`. Off unless set. Pending rows stay out of
+        /// live reads if this is later turned off; see docs/grounding.md.
+        #[arg(long)]
+        consolidate_hold: bool,
     },
 }
 
@@ -1072,6 +1077,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             known_facts_context,
             known_match,
             consolidate,
+            consolidate_hold,
         } => run_writes(
             script,
             work_dir,
@@ -1089,7 +1095,9 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::KnownMatch::Off
             },
-            if consolidate {
+            if consolidate_hold {
+                recall_echo::bench::writes::Consolidate::Hold
+            } else if consolidate {
                 recall_echo::bench::writes::Consolidate::On
             } else {
                 recall_echo::bench::writes::Consolidate::Off

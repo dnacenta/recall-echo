@@ -704,6 +704,11 @@ pub struct GraphSection {
     /// Look across subjects and keys after a session's writes. Off unless set.
     #[serde(default = "default_consolidate", skip_serializing_if = "is_false")]
     pub consolidate: bool,
+    /// Hold a conflicting write that the retirement guard would skip.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// A pending row stays out of live reads if this is later turned off.
+    #[serde(default = "default_consolidate_hold", skip_serializing_if = "is_false")]
+    pub consolidate_hold: bool,
 }
 
 impl Default for GraphSection {
@@ -722,7 +727,16 @@ impl Default for GraphSection {
             known_facts_context: default_known_facts_context(),
             known_match: default_known_match(),
             consolidate: default_consolidate(),
+            consolidate_hold: default_consolidate_hold(),
         }
+    }
+}
+
+impl GraphSection {
+    /// The hold stores pending rows only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn hold_applies(&self) -> bool {
+        self.consolidate && self.consolidate_hold
     }
 }
 
@@ -1037,6 +1051,10 @@ fn default_consolidate() -> bool {
     false
 }
 
+fn default_consolidate_hold() -> bool {
+    false
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1338,6 +1356,12 @@ impl Config {
             }
             "graph.consolidate" => {
                 self.graph_section().consolidate = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_hold" => {
+                self.graph_section().consolidate_hold = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2169,6 +2193,22 @@ mod tests {
         cfg.set_key("graph.consolidate", "true").unwrap();
         assert!(cfg.graph.as_ref().expect("graph").consolidate);
         assert!(cfg.set_key("graph.consolidate", "yes").is_err());
+    }
+
+    #[test]
+    fn consolidate_hold_defaults_off_and_needs_consolidate() {
+        assert!(!default_consolidate_hold());
+        assert!(!GraphSection::default().consolidate_hold);
+        assert!(!GraphSection::default().hold_applies());
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().hold_applies());
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_hold", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_hold);
+        assert!(!cfg.graph.as_ref().expect("graph").hold_applies());
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").hold_applies());
+        assert!(cfg.set_key("graph.consolidate_hold", "yes").is_err());
     }
 
     #[test]

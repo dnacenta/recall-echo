@@ -297,7 +297,7 @@ async fn get_neighbor_details(
             r#"
             SELECT rel_type, confidence, last_reinforced, valid_from, out AS target_id
             FROM relates_to
-            WHERE in = type::record($id) AND valid_until IS NONE
+            WHERE in = type::record($id) AND valid_until IS NONE AND pending IS NONE
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -311,7 +311,7 @@ async fn get_neighbor_details(
             r#"
             SELECT rel_type, confidence, last_reinforced, valid_from, in AS target_id
             FROM relates_to
-            WHERE out = type::record($id) AND valid_until IS NONE
+            WHERE out = type::record($id) AND valid_until IS NONE AND pending IS NONE
             "#,
         )
         .bind(("id", entity_id.to_string()))
@@ -553,7 +553,7 @@ pub async fn pipeline_flow(
     let query_out = format!(
         r#"SELECT rel_type, out AS target_id
            FROM relates_to
-           WHERE in = type::record($id) AND rel_type IN [{rel_types_str}] AND valid_until IS NONE"#
+           WHERE in = type::record($id) AND rel_type IN [{rel_types_str}] AND valid_until IS NONE AND pending IS NONE"#
     );
     let mut response = db.query(&query_out).bind(("id", entity_id.clone())).await?;
     let outgoing: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;
@@ -575,7 +575,7 @@ pub async fn pipeline_flow(
     let query_in = format!(
         r#"SELECT rel_type, in AS target_id
            FROM relates_to
-           WHERE out = type::record($id) AND rel_type IN [{rel_types_str}] AND valid_until IS NONE"#
+           WHERE out = type::record($id) AND rel_type IN [{rel_types_str}] AND valid_until IS NONE AND pending IS NONE"#
     );
     let mut response = db.query(&query_in).bind(("id", entity_id.clone())).await?;
     let incoming: Vec<RelTarget> = super::deserialize_take(&mut response, 0)?;

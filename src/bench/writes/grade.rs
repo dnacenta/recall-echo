@@ -104,6 +104,8 @@ pub struct SessionObservation {
     pub known_match: crate::graph::types::MatchReport,
     /// Consolidation counts. Blank when the switch is off.
     pub consolidate: crate::graph::types::ConsolidateReport,
+    /// Contradiction-hold counts. Blank when the hold is off.
+    pub hold: crate::graph::types::HoldReport,
 }
 
 /// Precision and recall for one operation.
@@ -216,6 +218,12 @@ pub struct SessionReport {
         skip_serializing_if = "crate::graph::types::ConsolidateReport::is_blank"
     )]
     pub consolidate: crate::graph::types::ConsolidateReport,
+    /// Contradiction-hold counts. Omitted when the hold is off or nothing was counted.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::HoldReport::is_blank"
+    )]
+    pub hold: crate::graph::types::HoldReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -280,6 +288,14 @@ pub struct WriteReport {
     /// same shape.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub consolidate_drops: BTreeMap<String, u32>,
+    /// Whether this run held conflicting writes. Omitted when the hold is off,
+    /// so an off run keeps its previous shape.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub consolidate_hold: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// How many facts, pairs and noise items landed in each pattern bucket.
@@ -583,6 +599,7 @@ pub fn grade_with_pipeline(
                 timing: s.timing,
                 known_match: s.known_match.clone(),
                 consolidate: s.consolidate.clone(),
+                hold: s.hold.clone(),
             })
             .collect(),
         steps,
@@ -596,6 +613,7 @@ pub fn grade_with_pipeline(
         setup_millis: 0,
         patterns: score_patterns(script, sessions)?,
         consolidate_drops: sum_consolidate_drops(sessions),
+        consolidate_hold: false,
     })
 }
 
@@ -1757,6 +1775,7 @@ mod tests {
             timing: None,
             known_match: crate::graph::types::MatchReport::default(),
             consolidate: crate::graph::types::ConsolidateReport::default(),
+            hold: crate::graph::types::HoldReport::default(),
         }
     }
 

@@ -307,6 +307,10 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
         DEFINE FIELD IF NOT EXISTS provenance  ON relates_to TYPE option<string>;
         DEFINE FIELD IF NOT EXISTS ended_by    ON relates_to TYPE option<string>;
         DEFINE FIELD IF NOT EXISTS evidence    ON relates_to TYPE option<array<object>> FLEXIBLE;
+        -- A conflicting write held for a later session. Absent on every
+        -- edge written with the hold off, so reads treat that as not pending.
+        -- No backfill and no version bump.
+        DEFINE FIELD IF NOT EXISTS pending     ON relates_to TYPE option<object> FLEXIBLE;
 
         DEFINE INDEX IF NOT EXISTS rel_type_idx ON relates_to FIELDS rel_type;
 
