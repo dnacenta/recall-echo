@@ -4620,6 +4620,225 @@ mod tests {
         assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
     }
 
+    #[tokio::test]
+    async fn a_same_role_uses_edge_drops_the_pending_hold() {
+        let (_tmp, gm) = open().await;
+        let mut canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        let mut rust_edge = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "rust",
+            Kind::Technology,
+        );
+        canvas.role = Some(super::super::schema::Role::Database);
+        rust_edge.role = Some(super::super::schema::Role::Database);
+        let turns = [turn("acme links canvas and rust")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &turns,
+            &[canvas, rust_edge],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.role = Some(super::super::schema::Role::Database);
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        let before = uses_edges(&gm).await;
+        assert_eq!(
+            edge_named(&before, "linen")
+                .get("description")
+                .and_then(Value::as_str),
+            Some("role=database")
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let later = [turn("We moved off canvas. Linen is in.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &later, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &later, &[], &stats, &llm, true).await;
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert_eq!(
+            ended_edge(linen_edge),
+            Some("s3:hold_dropped"),
+            "{linen_edge}"
+        );
+        assert!(ended_edge(edge_named(&edges, "rust")).is_none());
+        assert!(report.hold.holds_dropped >= 1, "{:?}", report.hold);
+
+        // A live edge of another role does not occupy this one, so the hold promotes.
+        let (_tmp, gm) = open().await;
+        let mut canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        let mut rust_edge = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "rust",
+            Kind::Technology,
+        );
+        canvas.role = Some(super::super::schema::Role::Database);
+        rust_edge.role = Some(super::super::schema::Role::Language);
+        let turns = [turn("acme links canvas and rust")];
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &turns,
+            &[canvas, rust_edge],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.role = Some(super::super::schema::Role::Database);
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        let hold_turns = [turn("Keep canvas and linen.")];
+        commit_flags(&gm, "s2", "2026-04-02", &hold_turns, &[linen], true, true).await;
+        let before = uses_edges(&gm).await;
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let later = [turn("We moved off canvas. Linen is in.")];
+        let stats = commit_flags(&gm, "s3", "2026-04-03", &later, &[], true, true).await;
+        let llm = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let report = pass_hold(&gm, "s3", "2026-04-03", &later, &[], &stats, &llm, true).await;
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+        assert!(ended_edge(edge_named(&edges, "rust")).is_none());
+        assert_eq!(report.hold.holds_dropped, 0, "{:?}", report.hold);
+        assert!(report.hold.holds_confirmed >= 1, "{:?}", report.hold);
+    }
+
+    #[tokio::test]
+    async fn a_closed_conflict_releases_a_roleless_edge_hold() {
+        let (_tmp, gm) = open().await;
+        let canvas = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "canvas",
+            Kind::Technology,
+        );
+        commit_flags(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[turn("acme links canvas")],
+            &[canvas],
+            false,
+            false,
+        )
+        .await;
+        let mut linen = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        linen.replaces = "canvas".into();
+        linen.quote = "Keep canvas and linen.".into();
+        commit_flags(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[turn("Keep canvas and linen.")],
+            &[linen],
+            true,
+            true,
+        )
+        .await;
+        let before = uses_edges(&gm).await;
+        assert!(
+            field_absent(edge_named(&before, "linen").get("description")),
+            "the pending edge should have no role"
+        );
+        let canvas_id = id_text(edge_named(&before, "canvas").get("id"));
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET valid_until = <datetime>'2026-04-02T00:00:00Z', ended_by = 's2:consolidated'",
+            )
+            .bind(("id", canvas_id))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let mut again = edge(
+            Predicate::Uses,
+            "acme",
+            Kind::Project,
+            "linen",
+            Kind::Technology,
+        );
+        again.quote = "acme links linen.".into();
+        let stats = commit_flags(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[turn("acme links linen.")],
+            &[again],
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(stats.holds_confirmed, 1, "{stats:?}");
+        let edges = uses_edges(&gm).await;
+        let linen_edge = edge_named(&edges, "linen");
+        assert!(field_absent(linen_edge.get("pending")), "{linen_edge}");
+        assert!(ended_edge(linen_edge).is_none(), "{linen_edge}");
+        assert!(field_absent(linen_edge.get("valid_until")), "{linen_edge}");
+    }
+
     fn ended_edge(edge: &Value) -> Option<&str> {
         edge.get("ended_by").and_then(Value::as_str)
     }
