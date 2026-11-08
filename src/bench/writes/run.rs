@@ -2349,6 +2349,7 @@ mod tests {
         assert_eq!(drops.get("value_support").copied(), Some(7));
         assert_eq!(drops.get("key_binding").copied(), Some(2));
         assert!(!drops.contains_key("value_support_partial"));
+        assert!(!drops.contains_key("restatement"));
         assert_eq!(drops.len(), 2, "{drops:?}");
         assert_eq!(kept + drops.values().sum::<u32>(), candidates);
         let patterns = report.patterns.expect("linkshelf carries match blocks");

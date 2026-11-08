@@ -3993,30 +3993,29 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
-    #[tokio::test]
-    async fn an_empty_extraction_still_settles_a_pending_hold() {
-        let tmp = tempfile::tempdir().unwrap();
-        let memory = tmp.path();
+    fn hold_config(drop_restatements: bool) -> String {
+        let mut body = String::from("[graph]\nconsolidate = true\nconsolidate_hold = true\n");
+        if drop_restatements {
+            body.push_str("drop_restatements = true\n");
+        }
+        body
+    }
+
+    #[cfg(feature = "embedded")]
+    fn write_archive(memory: &std::path::Path, text: &str) {
         std::fs::create_dir_all(memory.join("conversations")).unwrap();
         std::fs::write(
-            memory.join(".recall-echo.toml"),
-            "[graph]\nconsolidate = true\nconsolidate_hold = true\n",
-        )
-        .unwrap();
-        std::fs::write(
             memory.join("conversations/conversation-001.md"),
-            "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
-             ### User\n\nSwitched canvas for linen.\n",
+            format!(
+                "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
+                 ### User\n\n{text}\n"
+            ),
         )
         .unwrap();
-        let gm = GraphMemory::open_embedded(&memory.join("graph"))
-            .await
-            .unwrap();
-        super::write::ensure_v2_store(&gm).await.unwrap();
-        let project = ProjectIdentity {
-            name: "acme".into(),
-            aliases: Vec::new(),
-        };
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn seed_pending_binder(gm: &GraphMemory) {
         struct Quiet;
         #[async_trait::async_trait]
         impl LlmProvider for Quiet {
@@ -4025,6 +4024,10 @@ mod tests {
             }
         }
         let quiet = Quiet;
+        let project = ProjectIdentity {
+            name: "acme".into(),
+            aliases: Vec::new(),
+        };
         let canvas_turns = [Turn {
             index: 0,
             role: TurnRole::User,
@@ -4046,7 +4049,7 @@ mod tests {
             replaces: String::new(),
         };
         let ctx = super::write::WriteCtx::new(&quiet, &project, "s1", "2026-04-01", &canvas_turns);
-        super::write::write_facts(&gm, &ctx, &[canvas])
+        super::write::write_facts(gm, &ctx, &[canvas])
             .await
             .unwrap();
         let linen_turns = [Turn {
@@ -4073,10 +4076,36 @@ mod tests {
             super::write::WriteCtx::new(&quiet, &project, "s2", "2026-04-02", &linen_turns);
         ctx.match_on = true;
         ctx.hold_on = true;
-        let opened = super::write::write_facts(&gm, &ctx, &[linen])
+        let opened = super::write::write_facts(gm, &ctx, &[linen]).await.unwrap();
+        assert_eq!(opened.holds_opened, 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn acme_slots(gm: &GraphMemory) -> Vec<Value> {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
             .await
             .unwrap();
-        assert_eq!(opened.holds_opened, 1);
+        let acme = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .expect("acme");
+        acme.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn empty_extraction_confirms_pending(config: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+        write_archive(memory, "Switched canvas for linen.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
 
         struct Empty;
         #[async_trait::async_trait]
@@ -4090,25 +4119,252 @@ mod tests {
             .unwrap();
         assert_eq!(report.slots_written, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
         assert!(
             report.hold.holds_confirmed >= 1,
             "empty facts left the hold: {:?}",
             report.hold
         );
-        let entities = crate::graph::crud::list_entities(gm.db(), None)
-            .await
-            .unwrap();
-        let acme = entities
-            .iter()
-            .find(|entity| entity.name == "acme")
-            .unwrap();
-        let slots = acme.attributes.as_ref().unwrap()["v2"]["slots"]
-            .as_array()
-            .unwrap();
+        assert_eq!(report.hold.holds_opened, 0);
+        let slots = acme_slots(&gm).await;
         let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
         let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
         assert_eq!(canvas["ended_by"], "s3:superseded");
         assert!(linen.get("pending").is_none());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_empty_extraction_still_settles_a_pending_hold() {
+        empty_extraction_confirms_pending(&hold_config(false)).await;
+        empty_extraction_confirms_pending(&hold_config(true)).await;
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn empty_extraction_with_the_flag_and_no_pending_hold_opens_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "Noted the shelf.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        struct Empty;
+        #[async_trait::async_trait]
+        impl LlmProvider for Empty {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string())
+            }
+        }
+        let report = extract_session(&gm, memory, 1, &IngestContext::new("s3", Some(1)), &Empty)
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.hold.is_blank(), "{:?}", report.hold);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+        assert_eq!(report.slots_written, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    struct PairReply {
+        reply: &'static str,
+        judge: &'static str,
+    }
+
+    #[cfg(feature = "embedded")]
+    #[async_trait::async_trait]
+    impl LlmProvider for PairReply {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            Ok(self.judge.to_string())
+        }
+
+        async fn complete_structured_chat(
+            &self,
+            system: &str,
+            _: &[Message],
+            _: &Value,
+            _: u32,
+        ) -> Result<crate::graph::llm::Completion, GraphError> {
+            assert_eq!(system, PASS1_SYSTEM_BARE);
+            Ok(crate::graph::llm::Completion::unmeasured(self.reply))
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_still_confirms_a_pending_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(
+            memory,
+            "Switched canvas for linen. The timeout is 10s. Use 10s.",
+        );
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.hold.holds_opened, 0, "{:?}", report.hold);
+        assert!(
+            report.hold.holds_confirmed >= 1,
+            "filtered pair changed confirmation: {:?}",
+            report.hold
+        );
+        let slots = acme_slots(&gm).await;
+        let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert_eq!(canvas["ended_by"], "s3:superseded");
+        assert!(linen.get("pending").is_none());
+        assert!(slots.iter().any(|slot| {
+            slot["predicate"] == "setting" && slot["key"] == "timeout" && slot["value"] == "10s"
+        }));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_still_drops_a_reasserted_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "The binder stays canvas. Use canvas.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"binder","object":"canvas","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The binder stays canvas.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use canvas","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use canvas.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.hold.holds_opened, 0, "{:?}", report.hold);
+        assert!(
+            report.hold.holds_dropped >= 1,
+            "filtered pair changed reassertion: {:?}",
+            report.hold
+        );
+        let slots = acme_slots(&gm).await;
+        let canvas = slots
+            .iter()
+            .find(|slot| {
+                slot["key"] == "binder" && slot["value"] == "canvas" && slot["pending"].is_null()
+            })
+            .expect("live canvas");
+        assert!(canvas["ended_by"].is_null(), "{canvas}");
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert_eq!(linen["ended_by"], "s3:hold_dropped");
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_leaves_an_ambiguous_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "The harbor bell is brass.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"bell","object":"brass","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The harbor bell is brass.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"bell is brass","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The harbor bell is brass.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.hold.holds_opened, 0, "{:?}", report.hold);
+        assert_eq!(report.hold.holds_confirmed, 0, "{:?}", report.hold);
+        assert_eq!(report.hold.holds_dropped, 0, "{:?}", report.hold);
+        assert!(
+            report.hold.holds_ambiguous >= 1,
+            "filtered pair settled an ambiguous hold: {:?}",
+            report.hold
+        );
+        let slots = acme_slots(&gm).await;
+        let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert!(canvas["ended_by"].is_null(), "{canvas}");
+        assert!(
+            linen.get("pending").is_some_and(Value::is_object),
+            "{linen}"
+        );
+        assert!(slots
+            .iter()
+            .any(|slot| slot["key"] == "bell" && slot["value"] == "brass"));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_does_not_open_a_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "The timeout is 10s. Use 10s.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.kept, 2);
+        assert!(report.hold.is_blank(), "{:?}", report.hold);
+        let slots = acme_slots(&gm).await;
+        assert!(slots.iter().any(|slot| {
+            slot["key"] == "timeout" && slot["value"] == "10s" && slot.get("pending").is_none()
+        }));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
     }
 
     fn harbor_setting(key: &str, value: &str) -> Fact {
