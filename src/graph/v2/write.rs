@@ -873,55 +873,10 @@ impl<'a> Attempt<'a> {
     async fn load_premises(&mut self) -> Result<Vec<super::links::Premise>, GraphError> {
         let mut response = self.tx.query(PREMISE_ENTITIES).await?;
         let entities: Vec<Value> = deserialize_take(&mut response, 0)?;
-        let mut names = HashMap::new();
-        let mut premises = Vec::new();
-        for entity in &entities {
-            let id = record_id_field(entity.get("id"));
-            if id.is_empty() {
-                continue;
-            }
-            if let Some(name) = entity.get("name").and_then(Value::as_str) {
-                if !name.is_empty() {
-                    names.insert(id.clone(), name.to_string());
-                }
-            }
-            let Some(slots) = entity
-                .pointer("/attributes/v2/slots")
-                .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            for (index, slot) in slots.iter().enumerate() {
-                if !premise_setting(slot) {
-                    continue;
-                }
-                premises.push(super::links::Premise {
-                    id: format!("{id}#{index}"),
-                    text: slot_str(slot, "value").unwrap_or("").to_string(),
-                    kind: super::links::PremiseKind::Setting,
-                });
-            }
-        }
+        let (names, mut premises) = entity_premises(&entities);
         let mut response = self.tx.query(PREMISE_EDGES).await?;
         let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
-        for edge in &edges {
-            if !premise_edge(edge) {
-                continue;
-            }
-            let object_id = record_id_field(edge.get("out"));
-            let Some(label) = names.get(&object_id) else {
-                continue;
-            };
-            let id = record_id_field(edge.get("id"));
-            if id.is_empty() {
-                continue;
-            }
-            premises.push(super::links::Premise {
-                id,
-                text: label.clone(),
-                kind: super::links::PremiseKind::Entity,
-            });
-        }
+        premises.extend(edge_premises(&edges, &names));
         Ok(premises)
     }
 
@@ -1784,8 +1739,9 @@ const LIVE_EDGES_OF: &str =
 const PREMISE_ENTITIES: &str = "SELECT id, name, attributes FROM entity";
 
 /// Edge premises. The object label is resolved from [`PREMISE_ENTITIES`].
+/// Closed edges are left out here; [`premise_edge`] still checks the row.
 const PREMISE_EDGES: &str = "SELECT id, rel_type, status, valid_until, pending, out \
-     FROM relates_to WHERE rel_type INSIDE ['uses', 'part_of', 'depends_on']";
+     FROM relates_to WHERE rel_type INSIDE ['uses', 'part_of', 'depends_on'] AND valid_until = NONE";
 
 /// Live `part_of` edges that point at one record. A graph-edge scan.
 const SCOPE_PART_OF: &str = "SELECT in FROM type::record($id)<-(relates_to \
@@ -2264,6 +2220,69 @@ pub(crate) fn is_pending(value: &Value) -> bool {
 
 fn link_dependent(fact: &Fact) -> bool {
     fact.status == "decided" && matches!(fact.predicate, Predicate::Setting | Predicate::Rule)
+}
+
+fn entity_premises(entities: &[Value]) -> (HashMap<String, String>, Vec<super::links::Premise>) {
+    let mut names = HashMap::new();
+    let mut premises = Vec::new();
+    for entity in entities {
+        let id = record_id_field(entity.get("id"));
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(name) = entity.get("name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                names.insert(id.clone(), name.to_string());
+            }
+        }
+        push_setting_premises(entity, &id, &mut premises);
+    }
+    (names, premises)
+}
+
+fn push_setting_premises(entity: &Value, id: &str, premises: &mut Vec<super::links::Premise>) {
+    let Some(slots) = entity
+        .pointer("/attributes/v2/slots")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for (index, slot) in slots.iter().enumerate() {
+        if !premise_setting(slot) {
+            continue;
+        }
+        premises.push(super::links::Premise {
+            id: format!("{id}#{index}"),
+            text: slot_str(slot, "value").unwrap_or("").to_string(),
+            kind: super::links::PremiseKind::Setting,
+        });
+    }
+}
+
+fn edge_premises(edges: &[Value], names: &HashMap<String, String>) -> Vec<super::links::Premise> {
+    let mut premises = Vec::new();
+    for edge in edges {
+        if let Some(premise) = edge_premise(edge, names) {
+            premises.push(premise);
+        }
+    }
+    premises
+}
+
+fn edge_premise(edge: &Value, names: &HashMap<String, String>) -> Option<super::links::Premise> {
+    if !premise_edge(edge) {
+        return None;
+    }
+    let label = names.get(&record_id_field(edge.get("out")))?;
+    let id = record_id_field(edge.get("id"));
+    if id.is_empty() {
+        return None;
+    }
+    Some(super::links::Premise {
+        id,
+        text: label.clone(),
+        kind: super::links::PremiseKind::Entity,
+    })
 }
 
 fn premise_setting(slot: &Value) -> bool {
