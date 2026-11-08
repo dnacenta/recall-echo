@@ -4418,6 +4418,44 @@ mod tests {
         assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
     }
 
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_restatement_is_dropped_instead_of_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nconsolidate = true\nconsolidate_links = true\ndrop_restatements = true\n",
+        )
+        .unwrap();
+        write_archive(memory, "The timeout is 10s. Use 10s.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert!(report.links.is_blank(), "{:?}", report.links);
+        let slots = acme_slots(&gm).await;
+        assert!(slots.iter().any(|slot| {
+            slot["key"] == "timeout" && slot["value"] == "10s" && slot.get("derived_from").is_none()
+        }));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+        assert!(slots.iter().all(|slot| slot.get("derived_from").is_none()));
+    }
+
     fn harbor_setting(key: &str, value: &str) -> Fact {
         Fact {
             subject_name: "harbor".into(),

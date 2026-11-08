@@ -106,6 +106,8 @@ pub struct SessionObservation {
     pub consolidate: crate::graph::types::ConsolidateReport,
     /// Contradiction-hold counts. Blank when the hold is off.
     pub hold: crate::graph::types::HoldReport,
+    /// Derived-from counts. Blank when that switch is off.
+    pub links: crate::graph::types::LinksReport,
 }
 
 /// Precision and recall for one operation.
@@ -224,6 +226,12 @@ pub struct SessionReport {
         skip_serializing_if = "crate::graph::types::HoldReport::is_blank"
     )]
     pub hold: crate::graph::types::HoldReport,
+    /// Derived-from counts. Omitted when that switch is off or nothing was counted.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::LinksReport::is_blank"
+    )]
+    pub links: crate::graph::types::LinksReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -600,6 +608,7 @@ pub fn grade_with_pipeline(
                 known_match: s.known_match.clone(),
                 consolidate: s.consolidate.clone(),
                 hold: s.hold.clone(),
+                links: s.links,
             })
             .collect(),
         steps,
@@ -1776,7 +1785,49 @@ mod tests {
             known_match: crate::graph::types::MatchReport::default(),
             consolidate: crate::graph::types::ConsolidateReport::default(),
             hold: crate::graph::types::HoldReport::default(),
+            links: crate::graph::types::LinksReport::default(),
         }
+    }
+
+    #[test]
+    fn a_blank_links_report_is_omitted_and_a_filled_one_round_trips() {
+        let session = obs("s1", Vec::new(), Vec::new());
+        let blank = SessionReport {
+            id: session.id.clone(),
+            calls: session.calls,
+            millis: session.millis,
+            input_tokens: session.input_tokens,
+            output_tokens: session.output_tokens,
+            warnings: session.warnings.clone(),
+            windows: session.windows,
+            candidates: session.candidates,
+            kept: session.kept,
+            drops: session.drops.clone(),
+            resolve: session.resolve.clone(),
+            retirements: session.retirements.clone(),
+            retirements_skipped: session.retirements_skipped,
+            timing: session.timing,
+            known_match: session.known_match.clone(),
+            consolidate: session.consolidate.clone(),
+            hold: session.hold.clone(),
+            links: session.links,
+        };
+        let encoded = serde_json::to_value(&blank).unwrap();
+        assert!(encoded.get("links").is_none(), "{encoded}");
+        let mut filled = blank;
+        filled.links.links_written = 1;
+        filled.links.premises_recorded = 2;
+        filled.links.fan_in_overflow = 3;
+        filled.links.d_anchors_added = 4;
+        filled.links.d_anchor_overflow = 1;
+        let encoded = serde_json::to_value(&filled).unwrap();
+        assert_eq!(encoded["links"]["links_written"], 1);
+        assert_eq!(encoded["links"]["d_anchors_added"], 4);
+        assert_eq!(encoded["links"]["d_anchor_overflow"], 1);
+        let loaded: crate::graph::types::LinksReport =
+            serde_json::from_value(encoded["links"].clone()).unwrap();
+        assert_eq!(loaded, filled.links);
+        assert!(!loaded.is_blank());
     }
 
     #[test]

@@ -87,6 +87,16 @@ Turning the hold off does not put a pending row into live reads, and it does not
 
 `--consolidate-hold` turns consolidation and the hold on for that bench run. The bench JSON includes `consolidate_hold` when the hold was on.
 
+### Derived-from links (opt-in)
+
+`consolidate_links` is off unless set. It applies only when `consolidate` is also on. `consolidate_links = true` alone does not apply: no `derived_from` list is stored, the edge field is not defined, and the report omits `links`. The flag is independent of `drop_restatements`, `known_match`, `known_facts_context`, and `consolidate_hold`. Hold and links may both be on. Turning it on does not change the pass-1 prompt.
+
+With both on, a new decided setting or rule records `derived_from`, a list of row ids it structurally depends on. The list is omitted when empty. A rule or setting can name a live decided `uses`, `part_of`, or `depends_on` edge when that entity label is mentioned as a whole-token run and the mention identifies one label. Overlapping mentions of two labels record neither label. A setting can copy one live decided setting when the punctuation-preserving projection of the values is equal, including across subjects. Several live settings with that projection, or an empty projection, record no copy. A rule can also name one live setting whose projected value is unique and is mentioned the same way. At most four premises are stored, the first in row-id order, and the rest count as `fan_in_overflow`. Pending, closed, and undecided rows are not premises. `uses`, `part_of`, `depends_on`, bugs, and releases do not receive the field. Slots store the list on the slot object. The edge field `derived_from` is defined on `relates_to` only when the switch applies.
+
+When a later session closes one of those premises for `rejected`, `superseded`, or `replaced`, each live dependent becomes an extra consolidation anchor. The anchor is built from the dependent, not from the closed premise. At most four dependents are added, in row-id order, and the rest count as `d_anchor_overflow`. They share the existing pair caps, six per session and two per anchor, and the same single judge call. The link does not close the dependent. A `promoted` close, and a close this consolidation pass makes itself, does not add an anchor. A stored link does not arm a hold.
+
+`--consolidate-links` turns consolidation and the link switch on for that bench run and writes both scratch-config keys. The bench session JSON includes `links` when the switch applied and something was counted. Off, the object is omitted.
+
 ## Gate 5 — confidence and generic objects
 
 A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.

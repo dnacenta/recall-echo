@@ -113,6 +113,19 @@ impl Consolidate {
     }
 }
 
+/// Whether a bench run records derived-from links.
+///
+/// On implies consolidation: the scratch config sets both `consolidate` and
+/// `consolidate_links`. It stays independent of [`DropRestatements`],
+/// [`KnownMatch`], [`KnownFactsContext`], and the hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateLinks {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `consolidate = true` and `consolidate_links = true` for this run.
+    On,
+}
+
 /// Whether a bench run opts in to dropping same-session rule restatements.
 ///
 /// On is independent of [`KnownFactsContext`], [`KnownMatch`], and
@@ -143,6 +156,7 @@ pub async fn run(
     known_match: KnownMatch,
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
+    consolidate_links: ConsolidateLinks,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -153,6 +167,7 @@ pub async fn run(
         known_match,
         consolidate,
         drop_restatements,
+        consolidate_links,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -236,6 +251,7 @@ async fn collect_sessions(
                 report.known_match = extracted.known_match;
                 report.consolidate = extracted.consolidate;
                 report.hold = extracted.hold;
+                report.links = extracted.links;
                 report
             }
         };
@@ -262,6 +278,7 @@ async fn collect_sessions(
             known_match: report.known_match,
             consolidate: report.consolidate,
             hold: report.hold,
+            links: report.links,
         });
         before = after;
     }
@@ -294,6 +311,7 @@ pub async fn run_repeat(
     known_match: KnownMatch,
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
+    consolidate_links: ConsolidateLinks,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -316,6 +334,7 @@ pub async fn run_repeat(
                 known_match,
                 consolidate,
                 drop_restatements,
+                consolidate_links,
             )
             .await?,
         );
@@ -330,6 +349,7 @@ fn apply_graph_switches(
     matched: KnownMatch,
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
+    consolidate_links: ConsolidateLinks,
 ) -> Result<(), RecallError> {
     let mut body = String::from("[graph]\n");
     let mut any = false;
@@ -341,12 +361,16 @@ fn apply_graph_switches(
         body.push_str("known_match = true\n");
         any = true;
     }
-    if consolidate.writes_pass() {
+    if consolidate.writes_pass() || consolidate_links == ConsolidateLinks::On {
         body.push_str("consolidate = true\n");
         any = true;
     }
     if consolidate.writes_hold() {
         body.push_str("consolidate_hold = true\n");
+        any = true;
+    }
+    if consolidate_links == ConsolidateLinks::On {
+        body.push_str("consolidate_links = true\n");
         any = true;
     }
     if drop_restatements == DropRestatements::On {
@@ -1525,6 +1549,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1534,23 +1559,27 @@ mod tests {
             KnownMatch::Off,
             Consolidate::On,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
         assert!(text.contains("consolidate = true\n"), "{text}");
         assert!(!text.contains("known_match"), "{text}");
         assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
         apply_graph_switches(
             &memory,
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Hold,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
         assert!(text.contains("consolidate = true\n"), "{text}");
         assert!(text.contains("consolidate_hold = true\n"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
         assert!(!text.contains("drop_restatements"), "{text}");
     }
 
@@ -1565,6 +1594,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1575,6 +1605,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::On,
+            ConsolidateLinks::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1586,6 +1617,81 @@ mod tests {
         assert!(!graph.known_match);
         assert!(!graph.consolidate);
         assert!(!graph.consolidate_hold);
+        assert!(!graph.consolidate_links);
+        assert!(!text.contains("consolidate_links"));
+    }
+
+    #[test]
+    fn consolidate_links_implies_consolidate_and_stays_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_links = true\n"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.links_apply());
+        assert!(!graph.hold_applies());
+        assert!(!graph.drop_restatements);
+        assert!(!graph.known_match);
+        assert!(!graph.known_facts_context);
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Hold,
+            DropRestatements::Off,
+            ConsolidateLinks::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_hold = true\n"), "{text}");
+        assert!(text.contains("consolidate_links = true\n"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        assert!(!graph.drop_restatements);
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::On,
+            ConsolidateLinks::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("drop_restatements = true\n"), "{text}");
+        assert!(text.contains("consolidate_links = true\n"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.drop_restatements);
+        assert!(graph.links_apply());
+        assert!(!graph.hold_applies());
+        assert!(!graph.known_match);
+        assert!(!graph.known_facts_context);
     }
 
     #[test]
@@ -1626,7 +1732,15 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let memory = tmp.path().join("memory");
             fs::create_dir_all(&memory).unwrap();
-            apply_graph_switches(&memory, known, matched, consolidate, drop_restatements).unwrap();
+            apply_graph_switches(
+                &memory,
+                known,
+                matched,
+                consolidate,
+                drop_restatements,
+                ConsolidateLinks::Off,
+            )
+            .unwrap();
             let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
             let loaded: crate::config::Config = toml::from_str(&text).unwrap();
             let graph = loaded.graph.expect("graph");
@@ -1638,6 +1752,8 @@ mod tests {
             assert_eq!(graph.known_match, matched == KnownMatch::On, "{text}");
             assert_eq!(graph.consolidate, consolidate.writes_pass(), "{text}");
             assert_eq!(graph.consolidate_hold, consolidate.writes_hold(), "{text}");
+            assert!(!graph.consolidate_links, "{text}");
+            assert!(!text.contains("consolidate_links"), "{text}");
             assert_eq!(
                 graph.drop_restatements,
                 drop_restatements == DropRestatements::On,
@@ -1671,6 +1787,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap_err();
@@ -1827,6 +1944,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap();
@@ -1932,6 +2050,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap_err();
@@ -1955,6 +2074,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap_err();
@@ -2030,6 +2150,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap();
@@ -2313,6 +2434,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap();
@@ -2526,6 +2648,7 @@ mod tests {
                 KnownMatch::Off,
                 Consolidate::Off,
                 DropRestatements::Off,
+                ConsolidateLinks::Off,
             )
             .await
             .unwrap();
@@ -2562,6 +2685,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap()
@@ -2850,6 +2974,7 @@ mod tests {
             KnownMatch::Off,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap();
@@ -2929,6 +3054,11 @@ mod tests {
                 && serde_json::to_value(session).unwrap().get("hold").is_none()
                 && serde_json::to_value(session)
                     .unwrap()
+                    .get("links")
+                    .is_none()
+                && session.links.is_blank()
+                && serde_json::to_value(session)
+                    .unwrap()
                     .get("consolidate")
                     .is_none()
                 && serde_json::to_value(session).unwrap()["timing"]
@@ -2976,6 +3106,7 @@ mod tests {
             KnownMatch::On,
             Consolidate::Off,
             DropRestatements::Off,
+            ConsolidateLinks::Off,
         )
         .await
         .unwrap();

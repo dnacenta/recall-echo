@@ -258,6 +258,11 @@ enum BenchCommands {
         /// live reads if this is later turned off; see docs/grounding.md.
         #[arg(long)]
         consolidate_hold: bool,
+        /// Record derived-from links that feed consolidation.
+        /// Implies `--consolidate`. Off unless set. Independent of
+        /// `--consolidate-hold` and `--drop-restatements`.
+        #[arg(long)]
+        consolidate_links: bool,
         /// Drop a decided rule that only restates a same-session setting.
         /// Off unless set.
         #[arg(long)]
@@ -1082,6 +1087,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             known_match,
             consolidate,
             consolidate_hold,
+            consolidate_links,
             drop_restatements,
         } => run_writes(
             script,
@@ -1112,6 +1118,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::DropRestatements::Off
             },
+            if consolidate_links {
+                recall_echo::bench::writes::ConsolidateLinks::On
+            } else {
+                recall_echo::bench::writes::ConsolidateLinks::Off
+            },
         ),
     }
 }
@@ -1129,6 +1140,7 @@ fn run_writes(
     known_match: recall_echo::bench::writes::KnownMatch,
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
+    consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1163,6 +1175,7 @@ fn run_writes(
             known_match,
             consolidate,
             drop_restatements,
+            consolidate_links,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1177,6 +1190,7 @@ fn run_writes(
             known_match,
             consolidate,
             drop_restatements,
+            consolidate_links,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1196,6 +1210,7 @@ async fn grade_once(
     known_match: recall_echo::bench::writes::KnownMatch,
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
+    consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1213,6 +1228,7 @@ async fn grade_once(
                 known_match,
                 consolidate,
                 drop_restatements,
+                consolidate_links,
             )
             .await
         }
@@ -1226,6 +1242,7 @@ async fn grade_once(
                 known_match,
                 consolidate,
                 drop_restatements,
+                consolidate_links,
             )
             .await
         }
@@ -1245,6 +1262,7 @@ async fn grade_repeat(
     known_match: recall_echo::bench::writes::KnownMatch,
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
+    consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1263,6 +1281,7 @@ async fn grade_repeat(
                 known_match,
                 consolidate,
                 drop_restatements,
+                consolidate_links,
             )
             .await
         }
@@ -1277,6 +1296,7 @@ async fn grade_repeat(
                 known_match,
                 consolidate,
                 drop_restatements,
+                consolidate_links,
             )
             .await
         }
@@ -1441,5 +1461,70 @@ mod tests {
     #[test]
     fn the_command_line_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_links_is_its_own_bench_flag() {
+        let links_only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-links",
+        ])
+        .expect("parse links");
+        match links_only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_links);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let both = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-hold",
+            "--consolidate-links",
+        ])
+        .expect("parse hold and links");
+        match both.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        drop_restatements,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_hold);
+                assert!(consolidate_links);
+                assert!(!consolidate);
+                assert!(!drop_restatements);
+            }
+            _ => panic!("bench writes"),
+        }
     }
 }
