@@ -6990,6 +6990,144 @@ mod usable_anchor_tests {
 }
 
 #[cfg(test)]
+mod push_capped_edge_tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::{json, Value};
+
+    use super::push_capped_edge;
+
+    fn names() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("entity:harbor".into(), "harbor".into()),
+            ("entity:queue".into(), "queue".into()),
+            ("entity:spool".into(), "spool".into()),
+        ])
+    }
+
+    fn call(edge: Value, rows: &mut Vec<super::Row>, part_of: &mut Vec<(String, String)>) {
+        push_capped_edge(&edge, "s2", &names(), rows, part_of);
+    }
+
+    #[test]
+    fn closed_undecided_and_non_edges_add_nothing() {
+        let mut rows = Vec::new();
+        let mut part_of = Vec::new();
+        call(
+            json!({
+                "id": "relates_to:closed",
+                "in": "entity:harbor",
+                "out": "entity:queue",
+                "rel_type": "uses",
+                "status": "decided",
+                "valid_until": "2026-04-11T00:00:00Z"
+            }),
+            &mut rows,
+            &mut part_of,
+        );
+        call(
+            json!({
+                "id": "relates_to:open",
+                "in": "entity:harbor",
+                "out": "entity:queue",
+                "rel_type": "uses",
+                "status": "considered"
+            }),
+            &mut rows,
+            &mut part_of,
+        );
+        call(
+            json!({
+                "id": "relates_to:setting",
+                "in": "entity:harbor",
+                "out": "entity:queue",
+                "rel_type": "setting",
+                "status": "decided"
+            }),
+            &mut rows,
+            &mut part_of,
+        );
+        assert!(rows.is_empty());
+        assert!(part_of.is_empty());
+    }
+
+    #[test]
+    fn a_decided_uses_edge_is_appended_once() {
+        let mut rows = Vec::new();
+        let mut part_of = Vec::new();
+        let edge = json!({
+            "id": "relates_to:uses1",
+            "in": "entity:harbor",
+            "out": "entity:queue",
+            "rel_type": "uses",
+            "status": "decided",
+            "valid_from": "2026-04-03T00:00:00Z"
+        });
+        call(edge.clone(), &mut rows, &mut part_of);
+        call(edge, &mut rows, &mut part_of);
+        assert_eq!(rows.len(), 1);
+        assert!(part_of.is_empty());
+        assert_eq!(rows[0].id, "e:relates_to:uses1");
+        assert_eq!(rows[0].edge.as_deref(), Some("relates_to:uses1"));
+        assert_eq!(rows[0].pred, "uses");
+        assert_eq!(rows[0].subject, "harbor");
+        assert_eq!(rows[0].value, "queue");
+        assert!(!rows[0].pending);
+        assert_eq!(rows[0].from, "2026-04-03T00:00:00Z");
+    }
+
+    #[test]
+    fn a_decided_part_of_records_the_link_and_the_row() {
+        let mut rows = Vec::new();
+        let mut part_of = Vec::new();
+        call(
+            json!({
+                "id": "relates_to:part1",
+                "in": "entity:spool",
+                "out": "entity:harbor",
+                "rel_type": "part_of",
+                "status": "decided"
+            }),
+            &mut rows,
+            &mut part_of,
+        );
+        assert_eq!(
+            part_of,
+            vec![("entity:spool".into(), "entity:harbor".into())]
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "e:relates_to:part1");
+        assert_eq!(rows[0].edge.as_deref(), Some("relates_to:part1"));
+        assert_eq!(rows[0].pred, "part_of");
+        assert_eq!(rows[0].subject, "spool");
+        assert_eq!(rows[0].value, "harbor");
+    }
+
+    #[test]
+    fn a_pending_decided_edge_is_kept() {
+        let mut rows = Vec::new();
+        let mut part_of = Vec::new();
+        call(
+            json!({
+                "id": "relates_to:held",
+                "in": "entity:harbor",
+                "out": "entity:queue",
+                "rel_type": "depends_on",
+                "status": "decided",
+                "pending": {"since": "s2", "conflicts": "entity:queue"}
+            }),
+            &mut rows,
+            &mut part_of,
+        );
+        assert!(part_of.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].pending);
+        assert_eq!(rows[0].id, "e:relates_to:held");
+        assert_eq!(rows[0].pred, "depends_on");
+    }
+}
+
+#[cfg(test)]
 mod drop_line_tests {
     use super::{drop_line, quote_head};
 
