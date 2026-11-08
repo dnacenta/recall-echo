@@ -113,6 +113,18 @@ impl Consolidate {
     }
 }
 
+/// Whether a bench run opts in to dropping same-session rule restatements.
+///
+/// On is independent of [`KnownFactsContext`], [`KnownMatch`], and
+/// [`Consolidate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropRestatements {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `drop_restatements = true` for this run.
+    On,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
@@ -121,6 +133,7 @@ impl Consolidate {
 /// Session `millis` is ingest time. Model load is measured first and reported
 /// as `setup_millis`, so the first session is not charged for it.
 /// `known_facts_context` turns the experimental pass-1 block on or leaves it off.
+/// `drop_restatements` writes that opt-in for this run alone.
 pub async fn run(
     script: &FactScript,
     work_dir: &Path,
@@ -129,11 +142,18 @@ pub async fn run(
     known_facts_context: KnownFactsContext,
     known_match: KnownMatch,
     consolidate: Consolidate,
+    drop_restatements: DropRestatements,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
     let written = write_archives(&memory_dir, script)?;
-    apply_graph_switches(&memory_dir, known_facts_context, known_match, consolidate)?;
+    apply_graph_switches(
+        &memory_dir,
+        known_facts_context,
+        known_match,
+        consolidate,
+        drop_restatements,
+    )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
     let (label, provider) = provider_for(script, extractor)?;
@@ -263,6 +283,7 @@ fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
 /// `k` starts at 1. One run still uses `run-1`; the command prints a single
 /// report itself when repeat is 1.
 /// `known_facts_context` is passed to every run.
+/// `drop_restatements` is passed to every run.
 pub async fn run_repeat(
     script: &FactScript,
     parent: &Path,
@@ -272,6 +293,7 @@ pub async fn run_repeat(
     known_facts_context: KnownFactsContext,
     known_match: KnownMatch,
     consolidate: Consolidate,
+    drop_restatements: DropRestatements,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -293,6 +315,7 @@ pub async fn run_repeat(
                 known_facts_context,
                 known_match,
                 consolidate,
+                drop_restatements,
             )
             .await?,
         );
@@ -306,6 +329,7 @@ fn apply_graph_switches(
     known: KnownFactsContext,
     matched: KnownMatch,
     consolidate: Consolidate,
+    drop_restatements: DropRestatements,
 ) -> Result<(), RecallError> {
     let mut body = String::from("[graph]\n");
     let mut any = false;
@@ -323,6 +347,10 @@ fn apply_graph_switches(
     }
     if consolidate.writes_hold() {
         body.push_str("consolidate_hold = true\n");
+        any = true;
+    }
+    if drop_restatements == DropRestatements::On {
+        body.push_str("drop_restatements = true\n");
         any = true;
     }
     if !any {
@@ -1496,6 +1524,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1504,6 +1533,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::On,
+            DropRestatements::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1515,11 +1545,110 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Hold,
+            DropRestatements::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
         assert!(text.contains("consolidate = true\n"), "{text}");
         assert!(text.contains("consolidate_hold = true\n"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+    }
+
+    #[test]
+    fn drop_restatements_switch_is_written_only_when_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\ndrop_restatements = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.drop_restatements);
+        assert!(!graph.known_facts_context);
+        assert!(!graph.known_match);
+        assert!(!graph.consolidate);
+        assert!(!graph.consolidate_hold);
+    }
+
+    #[test]
+    fn drop_restatements_switch_stays_independent() {
+        let switches = [
+            (
+                KnownFactsContext::On,
+                KnownMatch::Off,
+                Consolidate::Off,
+                DropRestatements::Off,
+            ),
+            (
+                KnownFactsContext::Off,
+                KnownMatch::On,
+                Consolidate::Off,
+                DropRestatements::Off,
+            ),
+            (
+                KnownFactsContext::Off,
+                KnownMatch::Off,
+                Consolidate::On,
+                DropRestatements::Off,
+            ),
+            (
+                KnownFactsContext::Off,
+                KnownMatch::Off,
+                Consolidate::Hold,
+                DropRestatements::Off,
+            ),
+            (
+                KnownFactsContext::On,
+                KnownMatch::On,
+                Consolidate::Hold,
+                DropRestatements::On,
+            ),
+        ];
+        for (known, matched, consolidate, drop_restatements) in switches {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = tmp.path().join("memory");
+            fs::create_dir_all(&memory).unwrap();
+            apply_graph_switches(&memory, known, matched, consolidate, drop_restatements).unwrap();
+            let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+            let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+            let graph = loaded.graph.expect("graph");
+            assert_eq!(
+                graph.known_facts_context,
+                known == KnownFactsContext::On,
+                "{text}"
+            );
+            assert_eq!(graph.known_match, matched == KnownMatch::On, "{text}");
+            assert_eq!(graph.consolidate, consolidate.writes_pass(), "{text}");
+            assert_eq!(graph.consolidate_hold, consolidate.writes_hold(), "{text}");
+            assert_eq!(
+                graph.drop_restatements,
+                drop_restatements == DropRestatements::On,
+                "{text}"
+            );
+            if drop_restatements == DropRestatements::On {
+                assert!(text.contains("drop_restatements = true\n"), "{text}");
+            } else {
+                assert!(!text.contains("drop_restatements"), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -1541,6 +1670,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap_err();
@@ -1696,6 +1826,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap();
@@ -1800,6 +1931,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap_err();
@@ -1822,6 +1954,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap_err();
@@ -1896,6 +2029,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap();
@@ -2178,6 +2312,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap();
@@ -2214,6 +2349,7 @@ mod tests {
         assert_eq!(drops.get("value_support").copied(), Some(7));
         assert_eq!(drops.get("key_binding").copied(), Some(2));
         assert!(!drops.contains_key("value_support_partial"));
+        assert!(!drops.contains_key("restatement"));
         assert_eq!(drops.len(), 2, "{drops:?}");
         assert_eq!(kept + drops.values().sum::<u32>(), candidates);
         let patterns = report.patterns.expect("linkshelf carries match blocks");
@@ -2389,6 +2525,7 @@ mod tests {
                 known,
                 KnownMatch::Off,
                 Consolidate::Off,
+                DropRestatements::Off,
             )
             .await
             .unwrap();
@@ -2424,6 +2561,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap()
@@ -2711,6 +2849,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::Off,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap();
@@ -2836,6 +2975,7 @@ mod tests {
             KnownFactsContext::Off,
             KnownMatch::On,
             Consolidate::Off,
+            DropRestatements::Off,
         )
         .await
         .unwrap();

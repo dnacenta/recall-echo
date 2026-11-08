@@ -109,6 +109,16 @@ A fact stored in the current session stays live for the rest of that session, so
 
 `kept` plus the whole-candidate drop counts equals `candidates`. Cause, fix, release contents, and a named `affects` edge that fail value support count as `value_support_partial`. They are listed separately and are not part of that sum. An empty optional field is not a drop. `unresolved` is counted at write time on a candidate that was already kept, so it sits outside the pass-1 sum.
 
+## Same-session restatements (opt-in)
+
+`drop_restatements` is off unless set. Off removes nothing, and the report has no `restatement` key.
+
+On, after exact dedupe and before known-row matching, a decided `rule` is left out of the write when it is a proven restatement of exactly one unambiguous decided `setting` with the same subject kind, subject name, and source turn. The decision reads the sibling list from before any removal, and keeps the facts that remain in that order. An ambiguous group, including several settings that could explain one rule or several rules that restate one setting, keeps every fact. The setting stays. A rule whose `replaces` field is set stays. Settings, every `uses` and `part_of` row, and bug and release rows stay. The removed rule is not stored as `considered`.
+
+The rule text has to be a whole expression: a bare `use` of the setting value, or an `is` copula of that value. The key may appear and need not. The comparison trims, collapses interior whitespace, and case-folds prose. It keeps numbers, unit tokens, and punctuation. A shared number, unit, or quote without that shape stays. Added words stay.
+
+Each removal counts as `restatement` on `report.drops`. The count sits outside `kept` plus the whole-candidate drops. `kept` counts accepted candidates and does not fall when a rule is removed. A session that removes nothing does not record `restatement`.
+
 ## Known facts
 
 The known-facts block is experimental and off by default. Pass 1 is not shown stored rows, and its request does not mention them, unless `[graph] known_facts_context` is true or `bench writes` is run with `--known-facts-context`. With the switch on, live rows from earlier sessions are listed after the session date as data. A quote still has to come from a turn; text that appears only in the block is not evidence.

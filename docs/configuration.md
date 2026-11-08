@@ -34,6 +34,7 @@ mode = "embedded"             # embedded (single-process SurrealKV) | server (sh
 url = "ws://localhost:8787"   # server mode only
 # known_facts_context = false # experimental: show stored facts to pass 1; off by default
 # known_match = false         # experimental: match new facts to stored rows after pass 1; off by default
+# drop_restatements = false   # drop a decided rule that only restates a same-session setting; off by default
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

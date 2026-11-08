@@ -24,10 +24,11 @@ use super::super::GraphMemory;
 use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
-    affects_target, component_of_project, filter_fact, map_subject, over_long, project_object,
-    release_name, remap, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING,
-    DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT,
-    DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
+    affects_target, component_of_project, filter_fact, key_is_empty, map_subject, over_long,
+    project_object, release_name, remap, restates_setting, Fact, Kind, Mention, Predicate, Role,
+    DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_RESTATEMENT,
+    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
+    MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -253,6 +254,13 @@ pub(crate) async fn extract_session(
     // quote is one write: a second copy must not corroborate the fact in the
     // session that created it.
     let facts = dedupe_facts(facts);
+    // Decide against this list, then drop. Reconcile below indexes targets by
+    // the facts it receives, so the list must not shrink after that.
+    let facts = if drop_restatements_enabled(memory_dir) {
+        drop_restating_rules(facts, &mut report)
+    } else {
+        facts
+    };
     let pass1_ms = elapsed_ms(pass1_started);
 
     let match_started = std::time::Instant::now();
@@ -385,6 +393,112 @@ fn hold_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .hold_applies()
+}
+
+fn drop_restatements_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .drop_restatements
+}
+
+/// Drop a decided rule only when it and one setting are a component by themselves.
+///
+/// Matches are edges in a bipartite graph. A larger component is ambiguous, so
+/// every fact in it stays. `kept` is left as the candidate count.
+fn drop_restating_rules(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
+    let drop = isolated_restatement_rules(&facts);
+    let mut kept = Vec::with_capacity(facts.len());
+    for (index, fact) in facts.into_iter().enumerate() {
+        if drop[index] {
+            count_drop(report, DROP_RESTATEMENT);
+            continue;
+        }
+        kept.push(fact);
+    }
+    kept
+}
+
+fn isolated_restatement_rules(facts: &[Fact]) -> Vec<bool> {
+    let mut parent: Vec<usize> = (0..facts.len()).collect();
+    link_restatement_edges(facts, &mut parent);
+    let (rules, settings) = component_counts(facts, &parent);
+    facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            let root = find(&parent, index);
+            eligible_rule(fact) && rules[root] == 1 && settings[root] == 1
+        })
+        .collect()
+}
+
+fn link_restatement_edges(facts: &[Fact], parent: &mut [usize]) {
+    for (rule_index, rule) in facts.iter().enumerate() {
+        if eligible_rule(rule) {
+            link_rule(facts, parent, rule_index, rule);
+        }
+    }
+}
+
+fn link_rule(facts: &[Fact], parent: &mut [usize], rule_index: usize, rule: &Fact) {
+    for (setting_index, setting) in facts.iter().enumerate() {
+        if restatement_edge(setting, rule) {
+            unite(parent, rule_index, setting_index);
+        }
+    }
+}
+
+fn restatement_edge(setting: &Fact, rule: &Fact) -> bool {
+    restatement_anchor(setting, rule)
+        && restates_setting(&rule.object_name, &setting.key, &setting.object_name)
+}
+
+fn component_counts(facts: &[Fact], parent: &[usize]) -> (Vec<u32>, Vec<u32>) {
+    let mut rules = vec![0u32; facts.len()];
+    let mut settings = vec![0u32; facts.len()];
+    for (index, fact) in facts.iter().enumerate() {
+        let root = find(parent, index);
+        if eligible_rule(fact) {
+            rules[root] = rules[root].saturating_add(1);
+        } else if anchor_setting(fact) {
+            settings[root] = settings[root].saturating_add(1);
+        }
+    }
+    (rules, settings)
+}
+
+fn eligible_rule(fact: &Fact) -> bool {
+    fact.predicate == Predicate::Rule && fact.status == "decided" && fact.replaces.trim().is_empty()
+}
+
+fn anchor_setting(fact: &Fact) -> bool {
+    fact.predicate == Predicate::Setting
+        && fact.status == "decided"
+        && !key_is_empty(&fact.key)
+        && !fact.object_name.trim().is_empty()
+}
+
+fn restatement_anchor(setting: &Fact, rule: &Fact) -> bool {
+    anchor_setting(setting)
+        && setting.turn == rule.turn
+        && setting.subject_kind == rule.subject_kind
+        && setting.subject_name == rule.subject_name
+}
+
+fn find(parent: &[usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        index = parent[index];
+    }
+    index
+}
+
+fn unite(parent: &mut [usize], left: usize, right: usize) {
+    let left = find(parent, left);
+    let right = find(parent, right);
+    if left != right {
+        parent[right] = left;
+    }
 }
 
 /// A decided setting, or a decided `uses` whose role can retire a stored edge.
@@ -3920,30 +4034,29 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
-    #[tokio::test]
-    async fn an_empty_extraction_still_settles_a_pending_hold() {
-        let tmp = tempfile::tempdir().unwrap();
-        let memory = tmp.path();
+    fn hold_config(drop_restatements: bool) -> String {
+        let mut body = String::from("[graph]\nconsolidate = true\nconsolidate_hold = true\n");
+        if drop_restatements {
+            body.push_str("drop_restatements = true\n");
+        }
+        body
+    }
+
+    #[cfg(feature = "embedded")]
+    fn write_archive(memory: &std::path::Path, text: &str) {
         std::fs::create_dir_all(memory.join("conversations")).unwrap();
         std::fs::write(
-            memory.join(".recall-echo.toml"),
-            "[graph]\nconsolidate = true\nconsolidate_hold = true\n",
-        )
-        .unwrap();
-        std::fs::write(
             memory.join("conversations/conversation-001.md"),
-            "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
-             ### User\n\nSwitched canvas for linen.\n",
+            format!(
+                "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
+                 ### User\n\n{text}\n"
+            ),
         )
         .unwrap();
-        let gm = GraphMemory::open_embedded(&memory.join("graph"))
-            .await
-            .unwrap();
-        super::write::ensure_v2_store(&gm).await.unwrap();
-        let project = ProjectIdentity {
-            name: "acme".into(),
-            aliases: Vec::new(),
-        };
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn seed_pending_binder(gm: &GraphMemory) {
         struct Quiet;
         #[async_trait::async_trait]
         impl LlmProvider for Quiet {
@@ -3952,6 +4065,10 @@ mod tests {
             }
         }
         let quiet = Quiet;
+        let project = ProjectIdentity {
+            name: "acme".into(),
+            aliases: Vec::new(),
+        };
         let canvas_turns = [Turn {
             index: 0,
             role: TurnRole::User,
@@ -3973,7 +4090,7 @@ mod tests {
             replaces: String::new(),
         };
         let ctx = super::write::WriteCtx::new(&quiet, &project, "s1", "2026-04-01", &canvas_turns);
-        super::write::write_facts(&gm, &ctx, &[canvas])
+        super::write::write_facts(gm, &ctx, &[canvas])
             .await
             .unwrap();
         let linen_turns = [Turn {
@@ -4000,10 +4117,36 @@ mod tests {
             super::write::WriteCtx::new(&quiet, &project, "s2", "2026-04-02", &linen_turns);
         ctx.match_on = true;
         ctx.hold_on = true;
-        let opened = super::write::write_facts(&gm, &ctx, &[linen])
+        let opened = super::write::write_facts(gm, &ctx, &[linen]).await.unwrap();
+        assert_eq!(opened.holds_opened, 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn acme_slots(gm: &GraphMemory) -> Vec<Value> {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
             .await
             .unwrap();
-        assert_eq!(opened.holds_opened, 1);
+        let acme = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .expect("acme");
+        acme.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn empty_extraction_confirms_pending(config: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+        write_archive(memory, "Switched canvas for linen.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
 
         struct Empty;
         #[async_trait::async_trait]
@@ -4017,24 +4160,1042 @@ mod tests {
             .unwrap();
         assert_eq!(report.slots_written, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
         assert!(
             report.hold.holds_confirmed >= 1,
             "empty facts left the hold: {:?}",
             report.hold
         );
-        let entities = crate::graph::crud::list_entities(gm.db(), None)
-            .await
-            .unwrap();
-        let acme = entities
-            .iter()
-            .find(|entity| entity.name == "acme")
-            .unwrap();
-        let slots = acme.attributes.as_ref().unwrap()["v2"]["slots"]
-            .as_array()
-            .unwrap();
+        assert_eq!(report.hold.holds_opened, 0);
+        let slots = acme_slots(&gm).await;
         let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
         let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
         assert_eq!(canvas["ended_by"], "s3:superseded");
         assert!(linen.get("pending").is_none());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_empty_extraction_still_settles_a_pending_hold() {
+        empty_extraction_confirms_pending(&hold_config(false)).await;
+        empty_extraction_confirms_pending(&hold_config(true)).await;
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn empty_extraction_with_the_flag_and_no_pending_hold_opens_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "Noted the shelf.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        struct Empty;
+        #[async_trait::async_trait]
+        impl LlmProvider for Empty {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string())
+            }
+        }
+        let report = extract_session(&gm, memory, 1, &IngestContext::new("s3", Some(1)), &Empty)
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.hold.is_blank(), "{:?}", report.hold);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+        assert_eq!(report.slots_written, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    struct PairReply {
+        reply: &'static str,
+        judge: &'static str,
+    }
+
+    #[cfg(feature = "embedded")]
+    #[async_trait::async_trait]
+    impl LlmProvider for PairReply {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            Ok(self.judge.to_string())
+        }
+
+        async fn complete_structured_chat(
+            &self,
+            system: &str,
+            _: &[Message],
+            _: &Value,
+            _: u32,
+        ) -> Result<crate::graph::llm::Completion, GraphError> {
+            assert_eq!(system, PASS1_SYSTEM_BARE);
+            Ok(crate::graph::llm::Completion::unmeasured(self.reply))
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_still_confirms_a_pending_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(
+            memory,
+            "Switched canvas for linen. The timeout is 10s. Use 10s.",
+        );
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.hold.holds_opened, 0, "{:?}", report.hold);
+        assert!(
+            report.hold.holds_confirmed >= 1,
+            "filtered pair changed confirmation: {:?}",
+            report.hold
+        );
+        let slots = acme_slots(&gm).await;
+        let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert_eq!(canvas["ended_by"], "s3:superseded");
+        assert!(linen.get("pending").is_none());
+        assert!(slots.iter().any(|slot| {
+            slot["predicate"] == "setting" && slot["key"] == "timeout" && slot["value"] == "10s"
+        }));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_still_drops_a_reasserted_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "The binder stays canvas. Use canvas.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"binder","object":"canvas","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The binder stays canvas.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use canvas","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use canvas.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.hold.holds_opened, 0, "{:?}", report.hold);
+        assert!(
+            report.hold.holds_dropped >= 1,
+            "filtered pair changed reassertion: {:?}",
+            report.hold
+        );
+        let slots = acme_slots(&gm).await;
+        let canvas = slots
+            .iter()
+            .find(|slot| {
+                slot["key"] == "binder" && slot["value"] == "canvas" && slot["pending"].is_null()
+            })
+            .expect("live canvas");
+        assert!(canvas["ended_by"].is_null(), "{canvas}");
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert_eq!(linen["ended_by"], "s3:hold_dropped");
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_leaves_an_ambiguous_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "The harbor bell is brass.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        super::write::ensure_v2_store(&gm).await.unwrap();
+        seed_pending_binder(&gm).await;
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"bell","object":"brass","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The harbor bell is brass.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"bell is brass","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The harbor bell is brass.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.hold.holds_opened, 0, "{:?}", report.hold);
+        assert_eq!(report.hold.holds_confirmed, 0, "{:?}", report.hold);
+        assert_eq!(report.hold.holds_dropped, 0, "{:?}", report.hold);
+        assert!(
+            report.hold.holds_ambiguous >= 1,
+            "filtered pair settled an ambiguous hold: {:?}",
+            report.hold
+        );
+        let slots = acme_slots(&gm).await;
+        let canvas = slots.iter().find(|slot| slot["value"] == "canvas").unwrap();
+        let linen = slots.iter().find(|slot| slot["value"] == "linen").unwrap();
+        assert!(canvas["ended_by"].is_null(), "{canvas}");
+        assert!(
+            linen.get("pending").is_some_and(Value::is_object),
+            "{linen}"
+        );
+        assert!(slots
+            .iter()
+            .any(|slot| slot["key"] == "bell" && slot["value"] == "brass"));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_filtered_restatement_does_not_open_a_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(memory.join(".recall-echo.toml"), hold_config(true)).unwrap();
+        write_archive(memory, "The timeout is 10s. Use 10s.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.kept, 2);
+        assert!(report.hold.is_blank(), "{:?}", report.hold);
+        let slots = acme_slots(&gm).await;
+        assert!(slots.iter().any(|slot| {
+            slot["key"] == "timeout" && slot["value"] == "10s" && slot.get("pending").is_none()
+        }));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    fn harbor_setting(key: &str, value: &str) -> Fact {
+        Fact {
+            subject_name: "harbor".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: key.into(),
+            object_name: value.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 0,
+            quote: "quoted".into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    fn harbor_rule(object: &str) -> Fact {
+        let mut fact = harbor_setting("", object);
+        fact.predicate = Predicate::Rule;
+        fact.key.clear();
+        fact
+    }
+
+    fn apply_restatements(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport) {
+        let mut report = IngestionReport::default();
+        let kept = drop_restating_rules(facts, &mut report);
+        (kept, report)
+    }
+
+    fn fact_keys(facts: &[Fact]) -> Vec<&str> {
+        facts.iter().map(|fact| fact.key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_restating_rule_is_dropped_and_the_setting_stays() {
+        let mut report = IngestionReport {
+            candidates: 2,
+            kept: 2,
+            ..IngestionReport::default()
+        };
+        let kept = drop_restating_rules(
+            vec![
+                harbor_setting("timeout", "10s"),
+                harbor_rule("use 10s"),
+                harbor_rule("timeout is 10s"),
+            ],
+            &mut report,
+        );
+        // Two rules restate one setting, so the group stays.
+        assert_eq!(kept.len(), 3);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+        assert_eq!(report.kept, 2);
+
+        let mut report = IngestionReport {
+            candidates: 2,
+            kept: 2,
+            ..IngestionReport::default()
+        };
+        let kept = drop_restating_rules(
+            vec![harbor_setting("timeout", "10s"), harbor_rule("use 10s")],
+            &mut report,
+        );
+        assert_eq!(fact_keys(&kept), vec!["timeout"]);
+        assert_eq!(kept[0].object_name, "10s");
+        assert_eq!(kept[0].predicate, Predicate::Setting);
+        assert_eq!(kept[0].status, "decided");
+        assert!(kept.iter().all(|fact| fact.predicate != Predicate::Rule));
+        assert!(kept.iter().all(|fact| fact.status != "considered"));
+        assert_eq!(report.candidates, 2);
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+
+        let (kept, report) = apply_restatements(vec![
+            harbor_rule("timeout is 10s"),
+            harbor_setting("timeout", "10s"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn projection_folds_prose_case_and_interior_whitespace() {
+        for object in ["Use   10s", "USE 10s", "Timeout   IS\t10s"] {
+            let (kept, report) =
+                apply_restatements(vec![harbor_setting("timeout", "10s"), harbor_rule(object)]);
+            assert_eq!(fact_keys(&kept), vec!["timeout"], "{object}");
+            assert_eq!(
+                report.drops.get(DROP_RESTATEMENT).copied(),
+                Some(1),
+                "{object}"
+            );
+        }
+    }
+
+    #[test]
+    fn exceptions_modality_negation_and_constraints_stay() {
+        for object in [
+            "use 10s unless retrying",
+            "do not use 10s",
+            "only on retry",
+            "must never go below 10s",
+            "use 10s on retry",
+            "use 10s as a fallback",
+        ] {
+            let (kept, report) =
+                apply_restatements(vec![harbor_setting("timeout", "10s"), harbor_rule(object)]);
+            assert_eq!(kept.len(), 2, "{object}");
+            assert!(!report.drops.contains_key(DROP_RESTATEMENT), "{object}");
+        }
+    }
+
+    #[test]
+    fn different_keys_values_units_subjects_kinds_and_turns_stay() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("interval", "10s"),
+            harbor_rule("timeout is 10s"),
+        ]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "30s"),
+            harbor_rule("use 10s"),
+        ]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10ms"),
+            harbor_rule("use 10s"),
+        ]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let mut other = harbor_rule("use 10s");
+        other.subject_name = "relay".into();
+        let (kept, report) = apply_restatements(vec![harbor_setting("timeout", "10s"), other]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let mut component = harbor_setting("timeout", "10s");
+        component.subject_kind = Kind::Component;
+        let (kept, report) = apply_restatements(vec![component, harbor_rule("use 10s")]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let mut later = harbor_rule("use 10s");
+        later.turn = 1;
+        let (kept, report) = apply_restatements(vec![harbor_setting("timeout", "10s"), later]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+    }
+
+    #[test]
+    fn quote_only_and_token_only_overlap_stays() {
+        for object in [
+            "10s",
+            "10",
+            "\"10s\"",
+            "the call waits 10s before giving up",
+        ] {
+            let (kept, report) =
+                apply_restatements(vec![harbor_setting("timeout", "10s"), harbor_rule(object)]);
+            assert_eq!(kept.len(), 2, "{object}");
+            assert!(!report.drops.contains_key(DROP_RESTATEMENT), "{object}");
+        }
+    }
+
+    #[test]
+    fn several_settings_or_rules_keep_every_fact() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_setting("interval", "10s"),
+            harbor_rule("use 10s"),
+        ]);
+        assert_eq!(kept.len(), 3);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_rule("use 10s"),
+            harbor_rule("timeout is 10s"),
+        ]);
+        assert_eq!(kept.len(), 3);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+    }
+
+    #[test]
+    fn a_mixed_ambiguous_group_keeps_every_fact() {
+        let orders = [
+            vec![
+                harbor_setting("timeout", "10s"),
+                harbor_setting("interval", "10s"),
+                harbor_rule("use 10s"),
+                harbor_rule("timeout is 10s"),
+            ],
+            vec![
+                harbor_rule("use 10s"),
+                harbor_rule("timeout is 10s"),
+                harbor_setting("timeout", "10s"),
+                harbor_setting("interval", "10s"),
+            ],
+            vec![
+                harbor_setting("timeout", "10s"),
+                harbor_rule("use 10s"),
+                harbor_setting("interval", "10s"),
+                harbor_rule("timeout is 10s"),
+            ],
+        ];
+        for facts in orders {
+            let (kept, report) = apply_restatements(facts.clone());
+            assert_eq!(kept, facts);
+            assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+        }
+    }
+
+    #[test]
+    fn an_isolated_pair_still_drops_the_rule() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_rule("use 10s"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn two_isolated_pairs_each_drop() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_rule("use 10s"),
+            harbor_setting("retries", "3"),
+            harbor_rule("use 3"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout", "retries"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(2));
+    }
+
+    #[test]
+    fn a_keyed_rule_beside_an_unconnected_setting_still_drops() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_setting("interval", "10s"),
+            harbor_rule("timeout is 10s"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout", "interval"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn a_rule_with_replaces_or_another_status_stays() {
+        let mut replaced = harbor_rule("use 10s");
+        replaced.replaces = "5s".into();
+        let (kept, report) = apply_restatements(vec![harbor_setting("timeout", "10s"), replaced]);
+        assert_eq!(kept.len(), 2);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+
+        let mut considered = harbor_rule("use 10s");
+        considered.status = "considered".into();
+        let (kept, report) = apply_restatements(vec![harbor_setting("timeout", "10s"), considered]);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].status, "considered");
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+    }
+
+    #[test]
+    fn unknown_expressions_stay() {
+        for object in [
+            "set the timeout to 10s",
+            "keep the shelf labeled",
+            "the timeout is 10s",
+            "apply 10s",
+        ] {
+            let (kept, report) =
+                apply_restatements(vec![harbor_setting("timeout", "10s"), harbor_rule(object)]);
+            assert_eq!(kept.len(), 2, "{object}");
+            assert!(!report.drops.contains_key(DROP_RESTATEMENT), "{object}");
+        }
+    }
+
+    #[test]
+    fn uses_roles_and_the_go_version_pair_stay() {
+        for role in [Role::Language, Role::Ci, Role::Hosting] {
+            let mut uses = harbor_setting("", "Go");
+            uses.predicate = Predicate::Uses;
+            uses.role = Some(role);
+            uses.object_kind = Some(Kind::Technology);
+            let mut version = harbor_setting("go_version", "1.22");
+            version.subject_name = "tidepool".into();
+            uses.subject_name = "tidepool".into();
+            let (kept, report) = apply_restatements(vec![uses, version]);
+            assert_eq!(kept.len(), 2, "{role:?}");
+            assert!(!report.drops.contains_key(DROP_RESTATEMENT), "{role:?}");
+        }
+
+        let mut uses = harbor_setting("", "Go");
+        uses.subject_name = "tidepool".into();
+        uses.predicate = Predicate::Uses;
+        uses.role = Some(Role::Language);
+        uses.object_kind = Some(Kind::Technology);
+        uses.quote = "a Go 1.22 service".into();
+        let mut version = harbor_setting("go_version", "1.22");
+        version.subject_name = "tidepool".into();
+        version.quote = "a Go 1.22 service".into();
+        let mut nearby = harbor_rule("use Go");
+        nearby.subject_name = "tidepool".into();
+        let (kept, report) = apply_restatements(vec![uses, version, nearby]);
+        assert_eq!(kept.len(), 3);
+        assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+    }
+
+    #[test]
+    fn remapped_part_of_stays() {
+        let mention = Mention {
+            subject: "tidepool".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Uses,
+            role: Role::None,
+            key: String::new(),
+            object: "export command".into(),
+            object_kind: Some(Kind::Component),
+            status: "decided".into(),
+            turn: 0,
+            quote: "We use the export command instead of csv".into(),
+            confidence: 0.9,
+            provenance: TurnRole::User,
+        };
+        let part = remap(mention).expect("project uses component");
+        assert_eq!(part.predicate, Predicate::PartOf);
+        let (kept, report) = apply_restatements(vec![
+            part,
+            harbor_setting("timeout", "10s"),
+            harbor_rule("use 10s"),
+        ]);
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::PartOf));
+        assert!(kept.iter().any(|fact| fact.key == "timeout"));
+        assert!(kept.iter().all(|fact| fact.predicate != Predicate::Rule));
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn bug_and_release_expansions_stay() {
+        let bug_turns = vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "The cache returned stale entries.".into(),
+        }];
+        let bug_reply = serde_json::json!({
+            "facts": [],
+            "bugs": [{
+                "symptom": "stale entries",
+                "cause": "",
+                "fix": "",
+                "status": "open",
+                "component": "cache",
+                "turn": 0,
+                "quote": "The cache returned stale entries.",
+                "confidence": 0.9
+            }],
+            "releases": []
+        });
+        let mut collected = IngestionReport::default();
+        let mut facts = facts_from_reply(
+            bug_reply.as_object().expect("bug"),
+            &session(bug_turns),
+            &mut collected,
+        );
+        assert!(facts
+            .iter()
+            .any(|fact| fact.predicate == Predicate::IssueSymptom));
+        facts.push(harbor_setting("timeout", "10s"));
+        facts.push(harbor_rule("use 10s"));
+        let (kept, report) = apply_restatements(facts);
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::IssueSymptom));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::IssueStatus));
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::Affects));
+        assert!(kept.iter().all(|fact| fact.predicate != Predicate::Rule));
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+
+        let release_reply = serde_json::json!({
+            "facts": [],
+            "bugs": [],
+            "releases": [{
+                "version": "1.4.0",
+                "status": "planned",
+                "contents": "the shelf",
+                "turn": 1,
+                "quote": "Tag v1.4.0 today.",
+                "confidence": 0.9
+            }]
+        });
+        let mut collected = IngestionReport::default();
+        let mut facts = facts_from_reply(
+            release_reply.as_object().expect("release"),
+            &session(turns()),
+            &mut collected,
+        );
+        assert!(facts
+            .iter()
+            .any(|fact| fact.predicate == Predicate::ReleaseStatus));
+        assert!(facts.iter().any(|fact| fact.predicate == Predicate::PartOf));
+        facts.push(harbor_setting("timeout", "10s"));
+        facts.push(harbor_rule("timeout is 10s"));
+        let (kept, report) = apply_restatements(facts);
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::ReleaseStatus));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::ReleaseContents));
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::PartOf));
+        assert!(kept.iter().all(|fact| fact.predicate != Predicate::Rule));
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn an_extra_setting_stays() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_setting("binder", "linen"),
+            harbor_rule("use 10s"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout", "binder"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn sibling_order_does_not_change_the_decision() {
+        let setting = harbor_setting("timeout", "10s");
+        let extra = harbor_setting("retries", "3");
+        let rule = harbor_rule("use 10s");
+        let (forward, forward_report) =
+            apply_restatements(vec![setting.clone(), rule.clone(), extra.clone()]);
+        let (backward, backward_report) = apply_restatements(vec![extra, rule, setting]);
+        assert_eq!(fact_keys(&forward), vec!["timeout", "retries"]);
+        assert_eq!(fact_keys(&backward), vec!["retries", "timeout"]);
+        assert_eq!(forward_report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(
+            backward_report.drops.get(DROP_RESTATEMENT).copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn filtering_before_reconcile_keeps_match_targets_aligned() {
+        let turn = "Switch the log format to json lines. The timeout is 10s. Use 10s.";
+        let mut timeout = harbor_setting("timeout", "10s");
+        timeout.subject_name = "tidepool".into();
+        timeout.quote = "The timeout is 10s.".into();
+        let mut rule = harbor_rule("use 10s");
+        rule.subject_name = "tidepool".into();
+        rule.quote = "Use 10s.".into();
+        let mut filled = harbor_setting("", "json lines");
+        filled.subject_name = "tidepool".into();
+        filled.quote = "Switch the log format to json lines.".into();
+        let (filtered, report) = apply_restatements(vec![rule, timeout, filled]);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        let ground = SessionGround::prepare(&[Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: turn.into(),
+        }]);
+        let rows = vec![super::super::known::KnownRow {
+            subject: "tidepool".into(),
+            predicate: "setting".into(),
+            key: "log_format".into(),
+            value: "plain".into(),
+            role: String::new(),
+            id: "slot:log".into(),
+            status: "decided".into(),
+        }];
+        let reconciled = super::super::known_match::reconcile(&filtered, &rows, &ground);
+        assert_eq!(reconciled.targets.len(), reconciled.facts.len());
+        let index = reconciled
+            .facts
+            .iter()
+            .position(|fact| fact.object_name == "json lines")
+            .expect("filled setting");
+        assert_eq!(index, 1);
+        assert_eq!(reconciled.facts[index].key, "log_format");
+        let target = reconciled.targets[index].as_ref().expect("aligned target");
+        assert_eq!(target.key, "log_format");
+        assert_eq!(target.value, "plain");
+        assert!(reconciled.targets[0].is_none());
+        assert_eq!(reconciled.report.key_filled, 1);
+    }
+
+    #[test]
+    fn drop_restatements_reads_only_its_own_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!drop_restatements_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ndrop_restatements = false\n",
+        )
+        .unwrap();
+        assert!(!drop_restatements_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nknown_match = true\nconsolidate = true\nknown_facts_context = true\nconsolidate_hold = true\n",
+        )
+        .unwrap();
+        assert!(!drop_restatements_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ndrop_restatements = true\n",
+        )
+        .unwrap();
+        assert!(drop_restatements_enabled(dir.path()));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_pair_writes_the_setting_without_a_rule() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::graph::llm::Completion;
+
+        const TURN: &str = "The timeout is 10s. Use 10s.";
+        const REPLY: &str = r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9},{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#;
+
+        struct Scripted {
+            reply: &'static str,
+            pass1_calls: AtomicU64,
+            other_calls: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Scripted {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                self.other_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                _: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                if system.starts_with(PASS1_SYSTEM_BARE) {
+                    self.pass1_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(system, PASS1_SYSTEM_BARE);
+                    return Ok(Completion::unmeasured(self.reply));
+                }
+                self.other_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Completion::unmeasured(
+                    r#"{"decision":"create","reason":"distinct"}"#,
+                ))
+            }
+        }
+
+        fn plant(memory: &std::path::Path, config: &str) {
+            let cwd = memory.join("tidepool");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                memory,
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    TURN.into(),
+                )],
+            )
+            .unwrap();
+            if !config.is_empty() {
+                std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+            }
+        }
+
+        async fn slots(gm: &GraphMemory) -> Vec<Value> {
+            let entities = crate::graph::crud::list_entities(gm.db(), None)
+                .await
+                .unwrap();
+            let tidepool = entities
+                .iter()
+                .find(|entity| entity.name == "tidepool")
+                .expect("tidepool");
+            tidepool.attributes.as_ref().unwrap()["v2"]["slots"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        let on_dir = tempfile::tempdir().unwrap();
+        plant(on_dir.path(), "[graph]\ndrop_restatements = true\n");
+        let on_gm = GraphMemory::open_embedded(&on_dir.path().join("graph"))
+            .await
+            .unwrap();
+        let on_provider = Scripted {
+            reply: REPLY,
+            pass1_calls: AtomicU64::new(0),
+            other_calls: AtomicU64::new(0),
+        };
+        let on_report = extract_session(
+            &on_gm,
+            on_dir.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &on_provider,
+        )
+        .await
+        .unwrap();
+        assert!(on_report.errors.is_empty(), "{:?}", on_report.errors);
+        assert_eq!(on_report.candidates, 2);
+        assert_eq!(on_report.kept, 2);
+        assert_eq!(on_report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(on_provider.pass1_calls.load(Ordering::SeqCst), 1);
+        let on_slots = slots(&on_gm).await;
+        assert!(
+            on_slots.iter().any(|slot| {
+                slot["predicate"] == "setting"
+                    && slot["key"] == "timeout"
+                    && slot["value"] == "10s"
+                    && slot["status"] == "decided"
+            }),
+            "{on_slots:?}"
+        );
+        assert!(
+            on_slots.iter().all(|slot| slot["predicate"] != "rule"),
+            "{on_slots:?}"
+        );
+        assert!(
+            on_slots
+                .iter()
+                .all(|slot| slot["value"] != "use 10s" && slot["status"] != "considered"),
+            "{on_slots:?}"
+        );
+
+        let off_dir = tempfile::tempdir().unwrap();
+        plant(off_dir.path(), "");
+        let off_gm = GraphMemory::open_embedded(&off_dir.path().join("graph"))
+            .await
+            .unwrap();
+        let off_provider = Scripted {
+            reply: REPLY,
+            pass1_calls: AtomicU64::new(0),
+            other_calls: AtomicU64::new(0),
+        };
+        let off_report = extract_session(
+            &off_gm,
+            off_dir.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &off_provider,
+        )
+        .await
+        .unwrap();
+        assert!(off_report.errors.is_empty(), "{:?}", off_report.errors);
+        assert!(!off_report.drops.contains_key(DROP_RESTATEMENT));
+        assert_eq!(off_report.candidates, 2);
+        assert_eq!(off_report.kept, 2);
+        assert_eq!(off_provider.pass1_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            on_provider.other_calls.load(Ordering::SeqCst),
+            off_provider.other_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(on_report.llm_calls, off_report.llm_calls);
+        let off_slots = slots(&off_gm).await;
+        assert!(off_slots
+            .iter()
+            .any(|slot| slot["predicate"] == "setting" && slot["value"] == "10s"));
+        assert!(
+            off_slots
+                .iter()
+                .any(|slot| slot["predicate"] == "rule" && slot["value"] == "use 10s"),
+            "{off_slots:?}"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_match_after_the_session_pass_fills_the_surviving_setting() {
+        use crate::graph::llm::Completion;
+
+        const TURN: &str = "Switch the log format to json lines. The timeout is 10s. Use 10s.";
+        const REPLY: &str = r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9},{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"","object":"json lines","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Switch the log format to json lines.","confidence":0.9}],"bugs":[],"releases":[]}"#;
+
+        struct Scripted(&'static str);
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Scripted {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                _: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                assert_eq!(system, PASS1_SYSTEM_BARE);
+                Ok(Completion::unmeasured(self.0))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("tidepool");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ndrop_restatements = true\nknown_match = true\n",
+        )
+        .unwrap();
+        input::write_turns_sidecar(
+            dir.path(),
+            1,
+            "s",
+            "2026-01-02",
+            Some(cwd.to_str().unwrap()),
+            &[crate::conversation::ConversationEntry::UserMessage(
+                TURN.into(),
+            )],
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+            .await
+            .unwrap();
+        write::ensure_v2_store(&gm).await.unwrap();
+        let project = ProjectIdentity {
+            name: "tidepool".into(),
+            aliases: vec!["tidepool".into()],
+        };
+        let seeded = Fact {
+            subject_name: "tidepool".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: "log_format".into(),
+            object_name: "plain".into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 0,
+            quote: "The log format was plain.".into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        };
+        let quiet = Scripted(REPLY);
+        let ctx = write::WriteCtx::new(&quiet, &project, "s0", "2026-01-01", &[]);
+        write::write_facts(&gm, &ctx, &[seeded]).await.unwrap();
+        let report = extract_session(
+            &gm,
+            dir.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &quiet,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.candidates, 3);
+        assert_eq!(report.kept, 3);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert_eq!(report.known_match.key_filled, 1);
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let tidepool = entities
+            .iter()
+            .find(|entity| entity.name == "tidepool")
+            .expect("tidepool");
+        let stored = tidepool.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap();
+        assert!(
+            stored.iter().any(|slot| {
+                slot["predicate"] == "setting"
+                    && slot["key"] == "log_format"
+                    && slot["value"] == "json lines"
+                    && slot["status"] == "decided"
+            }),
+            "{stored:?}"
+        );
+        assert!(stored.iter().any(|slot| {
+            slot["key"] == "timeout" && slot["value"] == "10s" && slot["status"] == "decided"
+        }));
+        assert!(stored.iter().all(|slot| slot["predicate"] != "rule"));
     }
 }
