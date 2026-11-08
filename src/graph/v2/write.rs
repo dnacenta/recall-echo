@@ -98,6 +98,19 @@ pub(crate) struct WriteStats {
     pub holds_confirmed: u32,
     /// Create-time link counts. Blank when the switch is off.
     pub links: crate::graph::types::LinksReport,
+    /// Writer closes in this attempt, in write order. Empty when links are off.
+    pub close_events: Vec<CloseEvent>,
+}
+
+/// A row this attempt closed for a writer reason consolidation may follow.
+///
+/// Not part of the public retirement report. `fact_index` is the fact that
+/// closed the row, into the slice passed to [`write_facts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloseEvent {
+    pub row_id: String,
+    pub reason: String,
+    pub fact_index: usize,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -971,7 +984,9 @@ impl<'a> Attempt<'a> {
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
-            self.closed_rows.insert(format!("{}#{}", stored.id, index));
+            let row_id = format!("{}#{}", stored.id, index);
+            self.closed_rows.insert(row_id.clone());
+            self.note_close(row_id, SUPERSEDED);
             changed = true;
             let subject_name = self.label(&stored.id, &fact.subject_name).await?;
             self.record(SUPERSEDED, &subject_name, closed, &fact.object_name);
@@ -1205,7 +1220,9 @@ impl<'a> Attempt<'a> {
             if !stamp_slot(slot, &until, &ended_by) {
                 continue;
             }
-            self.closed_rows.insert(format!("{id}#{index}"));
+            let row_id = format!("{id}#{index}");
+            self.closed_rows.insert(row_id.clone());
+            self.note_close(row_id, reason);
             changed = true;
             notes.push(closed);
         }
@@ -1264,6 +1281,7 @@ impl<'a> Attempt<'a> {
         if closed.is_empty() {
             return Ok(());
         }
+        self.note_close(id.clone(), reason);
         self.closed_rows.insert(id);
         let object_id = record_id(&edge.to_id);
         let old_value = self.label(&object_id, &object_id).await?;
@@ -1280,6 +1298,17 @@ impl<'a> Attempt<'a> {
         );
         self.forget_edges(subject_id, &object_id);
         Ok(())
+    }
+
+    fn note_close(&mut self, row_id: String, reason: &str) {
+        if !self.ctx.links_on || !matches!(reason, REJECTED | SUPERSEDED | REPLACED) {
+            return;
+        }
+        self.stats.close_events.push(CloseEvent {
+            row_id,
+            reason: reason.to_string(),
+            fact_index: self.index,
+        });
     }
 
     fn record(&mut self, reason: &str, subject: &str, closed: Closed, new_value: &str) {

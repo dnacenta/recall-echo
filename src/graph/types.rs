@@ -920,13 +920,23 @@ pub struct LinksReport {
     pub premises_recorded: u32,
     #[serde(default)]
     pub fan_in_overflow: u32,
+    /// Extra anchors added from a writer close of a linked premise.
+    #[serde(default)]
+    pub d_anchors_added: u32,
+    /// Dependents past the four-anchor cap.
+    #[serde(default)]
+    pub d_anchor_overflow: u32,
 }
 
 impl LinksReport {
-    /// No list was stored and nothing overflowed the fan-in cap.
+    /// No list was stored and no derived anchor was added or dropped.
     #[must_use]
     pub fn is_blank(&self) -> bool {
-        self.links_written == 0 && self.premises_recorded == 0 && self.fan_in_overflow == 0
+        self.links_written == 0
+            && self.premises_recorded == 0
+            && self.fan_in_overflow == 0
+            && self.d_anchors_added == 0
+            && self.d_anchor_overflow == 0
     }
 }
 
@@ -1198,6 +1208,16 @@ mod tests {
         assert_eq!(encoded["links"]["links_written"], 1);
         assert_eq!(encoded["links"]["premises_recorded"], 2);
         assert_eq!(encoded["links"]["fan_in_overflow"], 3);
+        assert_eq!(encoded["links"]["d_anchors_added"], 0);
+        assert_eq!(encoded["links"]["d_anchor_overflow"], 0);
+        report.links = LinksReport {
+            d_anchors_added: 4,
+            d_anchor_overflow: 1,
+            ..LinksReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["links"]["d_anchors_added"], 4);
+        assert_eq!(encoded["links"]["d_anchor_overflow"], 1);
         assert!(!report.links.is_blank());
 
         let mut value = encoded;

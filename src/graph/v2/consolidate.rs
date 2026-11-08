@@ -137,7 +137,9 @@ pub(crate) async fn run(
     } else {
         Vec::new()
     };
-    if rough.is_empty() && ambiguous.is_empty() {
+    // Dependents of this session's writer closes, outside the neighbourhood cap.
+    let (dependents, d_overflow) = derived_dependents(gm, ctx, stats, report).await;
+    if rough.is_empty() && ambiguous.is_empty() && dependents.is_empty() {
         return;
     }
     if define_cache(gm).await.is_err() {
@@ -154,12 +156,16 @@ pub(crate) async fn run(
             names.push(hold.subject.clone());
         }
     }
-    let Ok(loaded) = load_rows(gm, ctx.session_id, &names).await else {
+    let extra_ids = dependent_entities(&dependents);
+    let Ok(loaded) = load_rows(gm, ctx.session_id, &names, &extra_ids).await else {
         report.consolidate.errors += 1;
         report.hold.errors += count(ambiguous.len());
         return;
     };
     let mut anchors = finish_anchors(rough, &loaded.rows);
+    let added = push_derived_anchors(&mut anchors, &loaded.rows, &dependents, facts, stats);
+    report.links.d_anchors_added = added;
+    report.links.d_anchor_overflow = d_overflow;
     if anchors.is_empty() && ambiguous.is_empty() {
         return;
     }
@@ -1257,6 +1263,7 @@ async fn load_rows(
     gm: &GraphMemory,
     session: &str,
     names: &[String],
+    extra_ids: &[String],
 ) -> Result<Loaded, GraphError> {
     let mut entities = load_named(gm, names).await?;
     let mut seen: BTreeSet<String> = entities.iter().map(Entity::id_string).collect();
@@ -1399,11 +1406,340 @@ async fn load_rows(
             evidence,
         });
     }
+    for id in extra_ids {
+        if seen.contains(id) {
+            continue;
+        }
+        append_extra_entity(
+            gm,
+            session,
+            id,
+            &mut names,
+            &mut owners,
+            &mut rows,
+            &mut part_of,
+        )
+        .await?;
+        seen.insert(id.clone());
+    }
     Ok(Loaded {
         rows,
         owners,
         part_of,
     })
+}
+
+/// At most this many dependents become extra anchors in one session.
+const D_ANCHOR_CAP: usize = 4;
+
+struct DependentHit {
+    entity_id: String,
+    canonical: String,
+    derived_from: Vec<String>,
+}
+
+async fn derived_dependents(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    stats: &WriteStats,
+    report: &mut IngestionReport,
+) -> (Vec<DependentHit>, u32) {
+    if !ctx.links_on
+        || !stats
+            .close_events
+            .iter()
+            .any(|event| writer_a1(&event.reason))
+    {
+        return (Vec::new(), 0);
+    }
+    let closed: BTreeSet<String> = stats
+        .close_events
+        .iter()
+        .filter(|event| writer_a1(&event.reason))
+        .map(|event| event.row_id.clone())
+        .collect();
+    let hits = match linked_hits(gm, &closed).await {
+        Ok(hits) => hits,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            return (Vec::new(), 0);
+        }
+    };
+    let overflow = hits.len().saturating_sub(D_ANCHOR_CAP);
+    let mut hits = hits;
+    hits.truncate(D_ANCHOR_CAP);
+    (hits, u32::try_from(overflow).unwrap_or(u32::MAX))
+}
+
+fn writer_a1(reason: &str) -> bool {
+    matches!(reason, "rejected" | "superseded" | "replaced")
+}
+
+fn dependent_entities(hits: &[DependentHit]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for hit in hits {
+        if !ids.iter().any(|id| id == &hit.entity_id) {
+            ids.push(hit.entity_id.clone());
+        }
+    }
+    ids
+}
+
+async fn linked_hits(
+    gm: &GraphMemory,
+    closed: &BTreeSet<String>,
+) -> Result<Vec<DependentHit>, GraphError> {
+    let mut response = gm.db().query("SELECT id, attributes FROM entity").await?;
+    let entities: Vec<Value> = deserialize_take(&mut response, 0)?;
+    let mut hits = Vec::new();
+    for entity in &entities {
+        let entity_id = id_text(entity.get("id"));
+        if entity_id.is_empty() {
+            continue;
+        }
+        let Some(slots) = entity
+            .pointer("/attributes/v2/slots")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for (index, slot) in slots.iter().enumerate() {
+            if !eligible_dependent(slot) {
+                continue;
+            }
+            let derived = string_list(slot.get("derived_from"));
+            if !derived.iter().any(|id| closed.contains(id)) {
+                continue;
+            }
+            hits.push(DependentHit {
+                entity_id: entity_id.clone(),
+                canonical: format!("{entity_id}#{index}"),
+                derived_from: derived,
+            });
+        }
+    }
+    if let Ok(edges) = linked_edges(gm).await {
+        for edge in &edges {
+            let rel = edge.get("rel_type").and_then(Value::as_str).unwrap_or("");
+            if rel != "setting" && rel != "rule" {
+                continue;
+            }
+            if !eligible_edge(edge) {
+                continue;
+            }
+            let derived = string_list(edge.get("derived_from"));
+            if !derived.iter().any(|id| closed.contains(id)) {
+                continue;
+            }
+            let canonical = id_text(edge.get("id"));
+            if canonical.is_empty() {
+                continue;
+            }
+            hits.push(DependentHit {
+                entity_id: id_text(edge.get("in")),
+                canonical,
+                derived_from: derived,
+            });
+        }
+    }
+    hits.sort_by(|left, right| left.canonical.cmp(&right.canonical));
+    hits.dedup_by(|left, right| left.canonical == right.canonical);
+    Ok(hits)
+}
+
+async fn linked_edges(gm: &GraphMemory) -> Result<Vec<Value>, GraphError> {
+    let mut response = gm
+        .db()
+        .query(
+            "SELECT id, in, rel_type, status, valid_until, pending, derived_from FROM relates_to WHERE derived_from != NONE AND valid_until = NONE",
+        )
+        .await?;
+    deserialize_take(&mut response, 0)
+}
+
+fn eligible_dependent(slot: &Value) -> bool {
+    if crud::edge_already_closed(slot.get("valid_until")) || super::write::is_pending(slot) {
+        return false;
+    }
+    if slot.get("status").and_then(Value::as_str) != Some("decided") {
+        return false;
+    }
+    matches!(
+        slot.get("predicate").and_then(Value::as_str),
+        Some("setting" | "rule")
+    )
+}
+
+fn eligible_edge(edge: &Value) -> bool {
+    !crud::edge_already_closed(edge.get("valid_until"))
+        && !edge.get("pending").is_some_and(Value::is_object)
+        && edge.get("status").and_then(Value::as_str) == Some("decided")
+}
+
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn push_derived_anchors(
+    anchors: &mut Vec<Anchor>,
+    rows: &[Row],
+    dependents: &[DependentHit],
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+) -> u32 {
+    let mut added = 0u32;
+    for hit in dependents {
+        let Some(index) = rows.iter().position(|row| ref_of(row) == hit.canonical) else {
+            continue;
+        };
+        let row = &rows[index];
+        if row.pending || !matches!(row.pred.as_str(), "setting" | "rule") {
+            continue;
+        }
+        let Some(event) = stats.close_events.iter().find(|event| {
+            writer_a1(&event.reason) && hit.derived_from.iter().any(|id| id == &event.row_id)
+        }) else {
+            continue;
+        };
+        let (turn, quote) = facts
+            .get(event.fact_index)
+            .map(|fact| (fact.turn, fact.quote.clone()))
+            .unwrap_or((0, String::new()));
+        anchors.push(Anchor {
+            id: format!("d:{}", ref_of(row)),
+            subject: row.subject.clone(),
+            pred: row.pred.clone(),
+            key: row.key.clone(),
+            value: row.value.clone(),
+            text: row.value.clone(),
+            new_value: row.value.clone(),
+            replaces: String::new(),
+            entity: String::new(),
+            reason: "derived",
+            turn,
+            quote,
+            live: Some(index),
+            a2: false,
+        });
+        added += 1;
+    }
+    added
+}
+
+async fn append_extra_entity(
+    gm: &GraphMemory,
+    session: &str,
+    id: &str,
+    names: &mut BTreeMap<String, String>,
+    owners: &mut Vec<(String, String)>,
+    rows: &mut Vec<Row>,
+    part_of: &mut Vec<(String, String)>,
+) -> Result<(), GraphError> {
+    let Some(entity) = load_entity(gm, id).await? else {
+        return Ok(());
+    };
+    let entity_id = entity.id_string();
+    names.insert(entity_id.clone(), entity.name.clone());
+    let Some(attributes) = entity.attributes.as_ref() else {
+        return Ok(());
+    };
+    let Some(v2) = attributes.get("v2") else {
+        return Ok(());
+    };
+    if v2
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(Kind::parse)
+        .is_none()
+    {
+        return Ok(());
+    }
+    owners.push((entity_id.clone(), entity.name.clone()));
+    if let Some(slots) = v2.get("slots").and_then(Value::as_array) {
+        for (index, slot) in slots.iter().enumerate() {
+            if crud::edge_already_closed(slot.get("valid_until")) {
+                continue;
+            }
+            if slot.get("status").and_then(Value::as_str) != Some("decided") {
+                continue;
+            }
+            rows.push(Row {
+                id: format!("s:{entity_id}:{index}"),
+                entity: entity_id.clone(),
+                slot: Some(index),
+                edge: None,
+                subject: entity.name.clone(),
+                pred: slot
+                    .get("predicate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                key: slot.get("key").and_then(Value::as_str).unwrap_or("").into(),
+                value: slot
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                evidence: slot.get("evidence").cloned().unwrap_or(Value::Null),
+                from: slot
+                    .get("valid_from")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                here: opened_here(slot.get("evidence"), session),
+                pending: super::write::is_pending(slot),
+            });
+        }
+    }
+    let mut response = gm
+        .db()
+        .query(
+            "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence, pending FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
+        )
+        .bind(("id", entity_id.clone()))
+        .await?;
+    let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
+    for edge in &edges {
+        if crud::edge_already_closed(edge.get("valid_until")) {
+            continue;
+        }
+        let rel = edge.get("rel_type").and_then(Value::as_str).unwrap_or("");
+        let from = id_text(edge.get("in"));
+        let to = id_text(edge.get("out"));
+        if edge.get("status").and_then(Value::as_str) != Some("decided") {
+            continue;
+        }
+        if rel == "part_of" {
+            part_of.push((from.clone(), to.clone()));
+        }
+        if !Predicate::parse(rel).is_some_and(Predicate::is_edge) {
+            continue;
+        }
+        let evidence = edge.get("evidence").cloned().unwrap_or(Value::Null);
+        rows.push(Row {
+            id: format!("e:{}", id_text(edge.get("id"))),
+            entity: from.clone(),
+            slot: None,
+            edge: Some(id_text(edge.get("id"))),
+            subject: names.get(&from).cloned().unwrap_or_default(),
+            pred: rel.to_string(),
+            key: String::new(),
+            value: names.get(&to).cloned().unwrap_or_default(),
+            from: json_text(edge.get("valid_from")),
+            here: opened_here(Some(&evidence), session),
+            pending: edge.get("pending").is_some_and(Value::is_object),
+            evidence,
+        });
+    }
+    Ok(())
 }
 
 async fn load_named(gm: &GraphMemory, names: &[String]) -> Result<Vec<Entity>, GraphError> {
@@ -3522,7 +3858,9 @@ mod tests {
             ));
         }
         commit(&gm, "s1", "2026-03-01", &[turn("pieces")], &facts).await;
-        let loaded = super::load_rows(&gm, "s9", &["acme".into()]).await.unwrap();
+        let loaded = super::load_rows(&gm, "s9", &["acme".into()], &[])
+            .await
+            .unwrap();
         let project = loaded
             .owners
             .iter()
@@ -5540,6 +5878,634 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn commit_linked(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+    ) -> WriteStats {
+        let project = project();
+        let mut ctx = WriteCtx::new(&Quiet, &project, session, date, turns);
+        ctx.links_on = true;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    async fn pass_linked(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        stats: &WriteStats,
+        llm: &Stub,
+    ) -> IngestionReport {
+        let project = project();
+        let mut ctx = WriteCtx::new(llm, &project, session, date, turns);
+        ctx.links_on = true;
+        let mut report = IngestionReport {
+            links: stats.links,
+            ..IngestionReport::default()
+        };
+        run(gm, &ctx, facts, stats, llm, &mut report).await;
+        report
+    }
+
+    fn rule(subject: &str, kind: Kind, text: &str, quote: &str) -> Fact {
+        let mut fact = setting(subject, kind, "", text, quote);
+        fact.predicate = Predicate::Rule;
+        fact
+    }
+
+    fn uses(subject: &str, object: &str, quote: &str) -> Fact {
+        let mut fact = edge(
+            Predicate::Uses,
+            subject,
+            Kind::Project,
+            object,
+            Kind::Technology,
+        );
+        fact.quote = quote.into();
+        fact
+    }
+
+    async fn slot_canonical(gm: &GraphMemory, name: &str, value: &str) -> String {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let slots = entity.attributes.as_ref().unwrap()["v2"]["slots"]
+            .as_array()
+            .unwrap();
+        let index = slots
+            .iter()
+            .position(|slot| slot["value"] == value)
+            .unwrap_or_else(|| panic!("missing {value} on {name}"));
+        format!("{}#{index}", entity.id_string())
+    }
+
+    fn derived_marker(value: &str) -> String {
+        format!("NEW=\"{value}\" (s2, reason: derived)")
+    }
+
+    #[tokio::test]
+    async fn a_rejected_premise_adds_a_live_dependent_anchor() {
+        let (_tmp, gm) = open().await;
+        let premise = uses("harbor", "queue", "harbor uses queue");
+        let dependent = rule(
+            "harbor",
+            Kind::Project,
+            "keep one queue ready for the workers",
+            "keep one queue ready for the workers",
+        );
+        let partner = rule(
+            "harbor",
+            Kind::Project,
+            "keep one spool ready for the workers",
+            "keep one spool ready for the workers",
+        );
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("harbor uses queue")],
+            &[premise, dependent.clone(), partner],
+        )
+        .await;
+        let quote = "queue is retired from the dock";
+        let mut rejection = uses("harbor", "queue", quote);
+        rejection.status = "rejected".into();
+        let turns = [turn(quote)];
+        let stats = commit_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            std::slice::from_ref(&rejection),
+        )
+        .await;
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "rejected");
+        assert_eq!(stats.close_events.len(), 1, "{:?}", stats.close_events);
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unsure","quote":""}]}"#.into(),
+        ));
+        let report =
+            pass_linked(&gm, "s2", "2026-04-11", &turns, &[rejection], &stats, &stub).await;
+        assert_eq!(report.links.d_anchors_added, 1);
+        assert_eq!(report.links.d_anchor_overflow, 0);
+        assert!(report.consolidate.anchors >= 2, "{:?}", report.consolidate);
+        assert!(report.consolidate.pairs <= 6, "{:?}", report.consolidate);
+        assert_eq!(report.consolidate.calls, 1);
+        assert_eq!(stub.calls(), 1);
+        let message = stub.message();
+        assert!(
+            message.contains(&derived_marker("keep one queue ready for the workers")),
+            "{message}"
+        );
+        assert!(
+            message.contains("keep one spool ready for the workers"),
+            "{message}"
+        );
+        let rows = slots(&gm, "harbor").await;
+        assert!(ended(slot_of(&rows, "keep one queue ready for the workers")).is_none());
+        assert!(ended(slot_of(&rows, "keep one spool ready for the workers")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_superseded_premise_adds_a_live_dependent_anchor() {
+        let (_tmp, gm) = open().await;
+        let original = setting(
+            "maple",
+            Kind::Project,
+            "delay",
+            "north pier marker",
+            "delay is north pier marker",
+        );
+        let dependent = setting(
+            "birch",
+            Kind::Project,
+            "delay",
+            "north pier marker",
+            "birch delay is north pier marker",
+        );
+        let partner = setting(
+            "birch",
+            Kind::Project,
+            "note",
+            "north pier beacon",
+            "birch note is north pier beacon",
+        );
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("delay is north pier marker")],
+            &[original, dependent, partner],
+        )
+        .await;
+        let quote = "delay is now south pier marker";
+        let next = setting("maple", Kind::Project, "delay", "south pier marker", quote);
+        let turns = [turn(quote)];
+        let stats =
+            commit_linked(&gm, "s2", "2026-04-11", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats
+                .retirements
+                .iter()
+                .any(|item| item.reason == "superseded"),
+            "{:?}",
+            stats.retirements
+        );
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unsure","quote":""}]}"#.into(),
+        ));
+        let report = pass_linked(&gm, "s2", "2026-04-11", &turns, &[next], &stats, &stub).await;
+        assert_eq!(report.links.d_anchors_added, 1);
+        assert_eq!(stub.calls(), 1);
+        assert!(report.consolidate.pairs <= 6);
+        assert!(report.consolidate.calls <= 1);
+        let message = stub.message();
+        assert!(
+            message.contains(&derived_marker("north pier marker")),
+            "{message}"
+        );
+        let birch = slots(&gm, "birch").await;
+        assert!(ended(slot_named(&birch, "delay", "north pier marker")).is_none());
+        assert!(ended(slot_named(&birch, "note", "north pier beacon")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_replaced_premise_adds_a_live_dependent_anchor() {
+        let (_tmp, gm) = open().await;
+        let original = setting(
+            "maple",
+            Kind::Project,
+            "delay",
+            "north pier marker",
+            "delay is north pier marker",
+        );
+        let dependent = setting(
+            "birch",
+            Kind::Project,
+            "wait",
+            "north pier marker",
+            "wait is north pier marker",
+        );
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("delay is north pier marker")],
+            &[original, dependent],
+        )
+        .await;
+        let quote = "Use south pier marker instead of north pier marker";
+        let mut next = setting("maple", Kind::Project, "delay", "south pier marker", quote);
+        next.replaces = "north pier marker".into();
+        let turns = [turn(quote)];
+        let stats =
+            commit_linked(&gm, "s2", "2026-04-11", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats
+                .retirements
+                .iter()
+                .any(|item| item.reason == "replaced"),
+            "{:?}",
+            stats.retirements
+        );
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report = pass_linked(&gm, "s2", "2026-04-11", &turns, &[next], &stats, &stub).await;
+        assert_eq!(report.links.d_anchors_added, 1);
+        assert!(report.consolidate.pairs <= 6);
+        assert!(report.consolidate.calls <= 1);
+        let birch = slots(&gm, "birch").await;
+        assert!(ended(slot_named(&birch, "wait", "north pier marker")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dependent_without_a_partner_stays_live() {
+        let (_tmp, gm) = open().await;
+        let premise = uses("harbor", "queue", "harbor uses queue");
+        let dependent = rule(
+            "harbor",
+            Kind::Project,
+            "keep one queue ready for the workers",
+            "keep one queue ready for the workers",
+        );
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("harbor uses queue")],
+            &[premise, dependent],
+        )
+        .await;
+        let quote = "queue is retired from the dock";
+        let mut rejection = uses("harbor", "queue", quote);
+        rejection.status = "rejected".into();
+        let turns = [turn(quote)];
+        let stats = commit_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            std::slice::from_ref(&rejection),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unrelated","quote":""}]}"#.into(),
+        ));
+        let report =
+            pass_linked(&gm, "s2", "2026-04-11", &turns, &[rejection], &stats, &stub).await;
+        assert_eq!(report.links.d_anchors_added, 1);
+        assert!(
+            !stub.message().contains("reason: derived"),
+            "{}",
+            stub.message()
+        );
+        assert!(stub.calls() <= 1);
+        let rows = slots(&gm, "harbor").await;
+        assert!(ended(slot_of(&rows, "keep one queue ready for the workers")).is_none());
+    }
+
+    #[tokio::test]
+    async fn promoted_and_consolidation_closes_add_no_derived_anchor() {
+        let (_tmp, gm) = open().await;
+        let mut considered = uses("harbor", "queue", "harbor might use queue");
+        considered.status = "considered".into();
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("harbor might use queue")],
+            &[considered],
+        )
+        .await;
+        let decided = uses("harbor", "queue", "harbor uses queue");
+        let promoted = commit_linked(
+            &gm,
+            "s2",
+            "2026-04-04",
+            &[turn("harbor uses queue")],
+            std::slice::from_ref(&decided),
+        )
+        .await;
+        assert!(
+            promoted
+                .retirements
+                .iter()
+                .any(|item| item.reason == "promoted"),
+            "{:?}",
+            promoted.retirements
+        );
+        assert!(
+            promoted.close_events.is_empty(),
+            "{:?}",
+            promoted.close_events
+        );
+        let stub = Stub::new(Answer::Panic);
+        let report = pass_linked(
+            &gm,
+            "s2",
+            "2026-04-04",
+            &[turn("harbor uses queue")],
+            &[decided],
+            &promoted,
+            &stub,
+        )
+        .await;
+        assert_eq!(report.links.d_anchors_added, 0);
+        assert_eq!(stub.calls(), 0);
+
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "pool",
+            "logical cores",
+            "pool is logical cores",
+        );
+        let linked = rule(
+            "birch",
+            Kind::Project,
+            "keep logical cores available for the pool workers",
+            "keep logical cores available for the pool workers",
+        );
+        commit_linked(
+            &gm,
+            "s3",
+            "2026-04-05",
+            &[turn("pool is logical cores")],
+            &[old, linked],
+        )
+        .await;
+        let quote = "Use 4 workers instead of the core count.";
+        let mut next = setting("acme", Kind::Project, "workers", "4", quote);
+        next.replaces = "core count".into();
+        let turns = [turn(quote)];
+        let stats =
+            commit_linked(&gm, "s4", "2026-04-06", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats.replaces_unconsumed.contains(&0),
+            "{:?}",
+            stats.retirements
+        );
+        let stub = Stub::new(Answer::Panic);
+        let report = pass_linked(&gm, "s4", "2026-04-06", &turns, &[next], &stats, &stub).await;
+        assert_eq!(report.consolidate.closes_sup, 1);
+        assert_eq!(report.links.d_anchors_added, 0);
+        assert_eq!(stub.calls(), 0);
+        let rows = slots(&gm, "birch").await;
+        assert!(ended(slot_of(
+            &rows,
+            "keep logical cores available for the pool workers"
+        ))
+        .is_none());
+        assert_eq!(
+            ended(live_any(&slots(&gm, "acme").await, "pool", "logical cores")),
+            Some("s4:consolidated")
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_anchors_keep_the_first_four_ids_and_share_the_pair_cap() {
+        let (_tmp, gm) = open().await;
+        let names = ["maple", "birch", "holly", "ivory", "ochre"];
+        let mut facts = vec![uses("harbor", "queue", "harbor uses queue")];
+        for name in names {
+            facts.push(rule(
+                name,
+                Kind::Project,
+                &format!("keep one queue ready for {name} workers"),
+                &format!("keep one queue ready for {name} workers"),
+            ));
+            facts.push(rule(
+                name,
+                Kind::Project,
+                &format!("keep one spool ready for {name} workers"),
+                &format!("keep one spool ready for {name} workers"),
+            ));
+        }
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("harbor uses queue")],
+            &facts,
+        )
+        .await;
+        let mut ranked = Vec::new();
+        for name in names {
+            let value = format!("keep one queue ready for {name} workers");
+            ranked.push((slot_canonical(&gm, name, &value).await, value));
+        }
+        ranked.sort();
+        let kept: Vec<_> = ranked
+            .iter()
+            .take(4)
+            .map(|(_, value)| value.clone())
+            .collect();
+        let excluded = ranked[4].1.clone();
+        let quote = "queue is retired from the dock";
+        let mut rejection = uses("harbor", "queue", quote);
+        rejection.status = "rejected".into();
+        let turns = [turn(quote)];
+        let stats = commit_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            std::slice::from_ref(&rejection),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unsure","quote":""}]}"#.into(),
+        ));
+        let report =
+            pass_linked(&gm, "s2", "2026-04-11", &turns, &[rejection], &stats, &stub).await;
+        assert_eq!(report.links.d_anchors_added, 4);
+        assert_eq!(report.links.d_anchor_overflow, 1);
+        assert!(report.consolidate.pairs <= 6, "{:?}", report.consolidate);
+        assert!(report.consolidate.calls <= 1);
+        assert_eq!(stub.calls(), 1);
+        let message = stub.message();
+        for value in &kept {
+            assert!(
+                message.contains(&derived_marker(value)),
+                "{value} missing in {message}"
+            );
+        }
+        assert!(
+            !message.contains(&derived_marker(&excluded)),
+            "{excluded} was not dropped: {message}"
+        );
+        for name in names {
+            let rows = slots(&gm, name).await;
+            assert!(ended(slot_of(
+                &rows,
+                &format!("keep one queue ready for {name} workers")
+            ))
+            .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_earliest_writer_close_supplies_turn_and_quote() {
+        let (_tmp, gm) = open().await;
+        let queue = uses("harbor", "queue", "harbor uses queue");
+        let spool = uses("harbor", "spool", "harbor uses spool");
+        let dependent = rule(
+            "birch",
+            Kind::Project,
+            "keep one queue and one spool ready for the workers",
+            "keep one queue and one spool ready for the workers",
+        );
+        let partner = rule(
+            "birch",
+            Kind::Project,
+            "keep one latch and one valve ready for the workers",
+            "keep one latch and one valve ready for the workers",
+        );
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("harbor uses queue and spool")],
+            &[queue, spool, dependent, partner],
+        )
+        .await;
+        let first = "spool retired from the dock today";
+        let second = "queue retired from the dock today";
+        let mut drop_spool = uses("harbor", "spool", first);
+        drop_spool.status = "rejected".into();
+        drop_spool.turn = 0;
+        let mut drop_queue = uses("harbor", "queue", second);
+        drop_queue.status = "rejected".into();
+        drop_queue.turn = 1;
+        let turns = [
+            turn(first),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: second.into(),
+            },
+        ];
+        let stats = commit_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[drop_spool.clone(), drop_queue.clone()],
+        )
+        .await;
+        assert_eq!(stats.close_events.len(), 2, "{:?}", stats.close_events);
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unsure","quote":""}]}"#.into(),
+        ));
+        let report = pass_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[drop_spool, drop_queue],
+            &stats,
+            &stub,
+        )
+        .await;
+        assert_eq!(report.links.d_anchors_added, 1);
+        let message = stub.message();
+        let derived = message
+            .lines()
+            .find(|line| line.contains("reason: derived"))
+            .unwrap_or_else(|| panic!("{message}"));
+        assert!(derived.contains(first), "{derived}");
+        assert!(!derived.contains(second), "{derived}");
+        let rows = slots(&gm, "birch").await;
+        assert!(ended(slot_of(
+            &rows,
+            "keep one queue and one spool ready for the workers"
+        ))
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn hold_confirmation_still_runs_when_links_are_on() {
+        let (_tmp, gm) = open().await;
+        seed_binder(&gm).await;
+        let linked = rule(
+            "birch",
+            Kind::Project,
+            "keep the canvas cover on the binder",
+            "keep the canvas cover on the binder",
+        );
+        commit_linked(
+            &gm,
+            "s1b",
+            "2026-04-01",
+            &[turn("keep the canvas cover on the binder")],
+            &[linked],
+        )
+        .await;
+        let open_turns = [turn("Store the pages in linen.")];
+        let open_facts = [setting(
+            "acme",
+            Kind::Project,
+            "binder",
+            "linen",
+            "Store the pages in linen.",
+        )];
+        let identity = project();
+        let mut ctx = WriteCtx::new(&Quiet, &identity, "s2", "2026-04-02", &open_turns);
+        ctx.match_on = true;
+        ctx.hold_on = true;
+        ctx.links_on = true;
+        write_facts(&gm, &ctx, &open_facts).await.unwrap();
+        let quote = "Moved off canvas yesterday.";
+        let turns = [
+            turn("The label is north."),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: quote.into(),
+            },
+        ];
+        let identity = project();
+        let mut ctx = WriteCtx::new(&Quiet, &identity, "s3", "2026-04-03", &turns);
+        ctx.match_on = true;
+        ctx.hold_on = true;
+        ctx.links_on = true;
+        let stats = write_facts(&gm, &ctx, &[]).await.unwrap();
+        let llm = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let mut pass_ctx = WriteCtx::new(&llm, &identity, "s3", "2026-04-03", &turns);
+        pass_ctx.hold_on = true;
+        pass_ctx.links_on = true;
+        let mut report = IngestionReport {
+            links: stats.links,
+            ..IngestionReport::default()
+        };
+        run(&gm, &pass_ctx, &[], &stats, &llm, &mut report).await;
+        assert_eq!(report.hold.holds_confirmed, 1, "{:?}", report.hold);
+        assert_eq!(report.links.d_anchors_added, 0);
+        let rows = slots(&gm, "acme").await;
+        assert_eq!(
+            ended(slot_named(&rows, "binder", "canvas")),
+            Some("s3:consolidated")
+        );
+        assert!(slot_named(&rows, "binder", "linen")
+            .get("pending")
+            .is_none());
+        let birch = slots(&gm, "birch").await;
+        assert!(ended(slot_of(&birch, "keep the canvas cover on the binder")).is_none());
+    }
+
+    fn slot_of<'a>(rows: &'a [Value], value: &str) -> &'a Value {
+        rows.iter()
+            .find(|slot| slot["value"] == value)
+            .unwrap_or_else(|| panic!("missing {value} in {rows:?}"))
     }
 }
 

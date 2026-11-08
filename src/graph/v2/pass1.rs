@@ -325,6 +325,8 @@ pub(crate) async fn extract_session(
         if stats.unresolved > 0 {
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }
+        // Consolidation may add derived-anchor counts on top of the write totals.
+        report.links = stats.links;
         if consolidate_on {
             let started = std::time::Instant::now();
             super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -335,7 +337,6 @@ pub(crate) async fn extract_session(
             .hold
             .holds_confirmed
             .saturating_add(stats.holds_confirmed);
-        report.links = stats.links;
     } else if hold_enabled(memory_dir) {
         // No facts to write. A text-only session can still confirm or judge a hold.
         let mut write_ctx = write::WriteCtx::new(
