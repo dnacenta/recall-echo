@@ -156,8 +156,7 @@ pub(crate) async fn run(
             names.push(hold.subject.clone());
         }
     }
-    let extra_ids = dependent_entities(&dependents);
-    let Ok(loaded) = load_rows(gm, ctx.session_id, &names, &extra_ids).await else {
+    let Ok(loaded) = load_rows(gm, ctx.session_id, &names, &dependents).await else {
         report.consolidate.errors += 1;
         report.hold.errors += count(ambiguous.len());
         return;
@@ -1263,7 +1262,7 @@ async fn load_rows(
     gm: &GraphMemory,
     session: &str,
     names: &[String],
-    extra_ids: &[String],
+    extra: &[DependentHit],
 ) -> Result<Loaded, GraphError> {
     let mut entities = load_named(gm, names).await?;
     let mut seen: BTreeSet<String> = entities.iter().map(Entity::id_string).collect();
@@ -1406,21 +1405,22 @@ async fn load_rows(
             evidence,
         });
     }
-    for id in extra_ids {
-        if seen.contains(id) {
-            continue;
-        }
+    for hit in extra {
+        let already = seen.contains(&hit.entity_id);
         append_extra_entity(
             gm,
             session,
-            id,
-            &mut names,
-            &mut owners,
-            &mut rows,
-            &mut part_of,
+            hit,
+            already,
+            &mut ExtraRows {
+                names: &mut names,
+                owners: &mut owners,
+                rows: &mut rows,
+                part_of: &mut part_of,
+            },
         )
         .await?;
-        seen.insert(id.clone());
+        seen.insert(hit.entity_id.clone());
     }
     Ok(Loaded {
         rows,
@@ -1473,16 +1473,6 @@ async fn derived_dependents(
 
 fn writer_a1(reason: &str) -> bool {
     matches!(reason, "rejected" | "superseded" | "replaced")
-}
-
-fn dependent_entities(hits: &[DependentHit]) -> Vec<String> {
-    let mut ids = Vec::new();
-    for hit in hits {
-        if !ids.iter().any(|id| id == &hit.entity_id) {
-            ids.push(hit.entity_id.clone());
-        }
-    }
-    ids
 }
 
 async fn linked_hits(
@@ -1675,112 +1665,220 @@ fn push_derived_anchors(
     added
 }
 
+struct ExtraRows<'a> {
+    names: &'a mut BTreeMap<String, String>,
+    owners: &'a mut Vec<(String, String)>,
+    rows: &'a mut Vec<Row>,
+    part_of: &'a mut Vec<(String, String)>,
+}
+
 async fn append_extra_entity(
     gm: &GraphMemory,
     session: &str,
-    id: &str,
-    names: &mut BTreeMap<String, String>,
-    owners: &mut Vec<(String, String)>,
-    rows: &mut Vec<Row>,
-    part_of: &mut Vec<(String, String)>,
+    hit: &DependentHit,
+    already: bool,
+    extra: &mut ExtraRows<'_>,
 ) -> Result<(), GraphError> {
-    let Some(entity) = load_entity(gm, id).await? else {
+    let Some(entity) = load_entity(gm, &hit.entity_id).await? else {
         return Ok(());
     };
     let entity_id = entity.id_string();
-    names.insert(entity_id.clone(), entity.name.clone());
-    let Some(attributes) = entity.attributes.as_ref() else {
+    extra.names.insert(entity_id.clone(), entity.name.clone());
+    push_mandatory_slot(&entity, session, hit, extra.rows);
+    if already {
+        return Ok(());
+    }
+    let Some(v2) = entity
+        .attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get("v2"))
+    else {
         return Ok(());
     };
-    let Some(v2) = attributes.get("v2") else {
+    if !parsed_kind(v2) {
         return Ok(());
-    };
-    if v2
-        .get("kind")
+    }
+    extra.owners.push((entity_id.clone(), entity.name.clone()));
+    admit_sibling_slots(session, &entity_id, &entity.name, v2, extra.rows);
+    admit_sibling_edges(
+        gm,
+        session,
+        &entity_id,
+        extra.names,
+        extra.rows,
+        extra.part_of,
+    )
+    .await?;
+    Ok(())
+}
+
+fn parsed_kind(v2: &Value) -> bool {
+    v2.get("kind")
         .and_then(Value::as_str)
         .and_then(Kind::parse)
-        .is_none()
-    {
-        return Ok(());
+        .is_some()
+}
+
+fn push_mandatory_slot(entity: &Entity, session: &str, hit: &DependentHit, rows: &mut Vec<Row>) {
+    if rows.iter().any(|row| ref_of(row) == hit.canonical) {
+        return;
     }
-    owners.push((entity_id.clone(), entity.name.clone()));
-    if let Some(slots) = v2.get("slots").and_then(Value::as_array) {
-        for (index, slot) in slots.iter().enumerate() {
-            if crud::edge_already_closed(slot.get("valid_until")) {
-                continue;
-            }
-            if slot.get("status").and_then(Value::as_str) != Some("decided") {
-                continue;
-            }
-            rows.push(Row {
-                id: format!("s:{entity_id}:{index}"),
-                entity: entity_id.clone(),
-                slot: Some(index),
-                edge: None,
-                subject: entity.name.clone(),
-                pred: slot
-                    .get("predicate")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
-                key: slot.get("key").and_then(Value::as_str).unwrap_or("").into(),
-                value: slot
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
-                evidence: slot.get("evidence").cloned().unwrap_or(Value::Null),
-                from: slot
-                    .get("valid_from")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
-                here: opened_here(slot.get("evidence"), session),
-                pending: super::write::is_pending(slot),
-            });
+    let Some(index) = slot_index(hit) else {
+        return;
+    };
+    let Some(slot) = entity
+        .attributes
+        .as_ref()
+        .and_then(|attributes| attributes.pointer("/v2/slots"))
+        .and_then(Value::as_array)
+        .and_then(|slots| slots.get(index))
+    else {
+        return;
+    };
+    let entity_id = entity.id_string();
+    if let Some(row) = slot_row(&entity_id, &entity.name, index, slot, session) {
+        rows.push(row);
+    }
+}
+
+fn slot_index(hit: &DependentHit) -> Option<usize> {
+    let (owner, index) = hit.canonical.rsplit_once('#')?;
+    if owner != hit.entity_id {
+        return None;
+    }
+    index.parse().ok()
+}
+
+fn slot_row(entity_id: &str, name: &str, index: usize, slot: &Value, session: &str) -> Option<Row> {
+    if crud::edge_already_closed(slot.get("valid_until")) {
+        return None;
+    }
+    if slot.get("status").and_then(Value::as_str) != Some("decided") {
+        return None;
+    }
+    Some(Row {
+        id: format!("s:{entity_id}:{index}"),
+        entity: entity_id.to_string(),
+        slot: Some(index),
+        edge: None,
+        subject: name.to_string(),
+        pred: slot
+            .get("predicate")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        key: slot.get("key").and_then(Value::as_str).unwrap_or("").into(),
+        value: slot
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        evidence: slot.get("evidence").cloned().unwrap_or(Value::Null),
+        from: slot
+            .get("valid_from")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        here: opened_here(slot.get("evidence"), session),
+        pending: super::write::is_pending(slot),
+    })
+}
+
+fn admit_sibling_slots(
+    session: &str,
+    entity_id: &str,
+    name: &str,
+    v2: &Value,
+    rows: &mut Vec<Row>,
+) {
+    let Some(slots) = v2.get("slots").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, slot) in slots.iter().enumerate() {
+        if rows.len() >= ROW_CAP {
+            break;
+        }
+        if rows
+            .iter()
+            .any(|row| row.entity == entity_id && row.slot == Some(index))
+        {
+            continue;
+        }
+        if let Some(row) = slot_row(entity_id, name, index, slot, session) {
+            rows.push(row);
         }
     }
+}
+
+async fn admit_sibling_edges(
+    gm: &GraphMemory,
+    session: &str,
+    entity_id: &str,
+    names: &BTreeMap<String, String>,
+    rows: &mut Vec<Row>,
+    part_of: &mut Vec<(String, String)>,
+) -> Result<(), GraphError> {
     let mut response = gm
         .db()
         .query(
             "SELECT id, in, out, rel_type, status, valid_until, valid_from, evidence, pending FROM type::record($id)->(relates_to WHERE valid_until = NONE) ORDER BY id LIMIT 32",
         )
-        .bind(("id", entity_id.clone()))
+        .bind(("id", entity_id.to_string()))
         .await?;
     let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
     for edge in &edges {
-        if crud::edge_already_closed(edge.get("valid_until")) {
-            continue;
+        if rows.len() >= ROW_CAP {
+            break;
         }
-        let rel = edge.get("rel_type").and_then(Value::as_str).unwrap_or("");
-        let from = id_text(edge.get("in"));
-        let to = id_text(edge.get("out"));
-        if edge.get("status").and_then(Value::as_str) != Some("decided") {
-            continue;
-        }
-        if rel == "part_of" {
-            part_of.push((from.clone(), to.clone()));
-        }
-        if !Predicate::parse(rel).is_some_and(Predicate::is_edge) {
-            continue;
-        }
-        let evidence = edge.get("evidence").cloned().unwrap_or(Value::Null);
-        rows.push(Row {
-            id: format!("e:{}", id_text(edge.get("id"))),
-            entity: from.clone(),
-            slot: None,
-            edge: Some(id_text(edge.get("id"))),
-            subject: names.get(&from).cloned().unwrap_or_default(),
-            pred: rel.to_string(),
-            key: String::new(),
-            value: names.get(&to).cloned().unwrap_or_default(),
-            from: json_text(edge.get("valid_from")),
-            here: opened_here(Some(&evidence), session),
-            pending: edge.get("pending").is_some_and(Value::is_object),
-            evidence,
-        });
+        push_capped_edge(edge, session, names, rows, part_of);
     }
     Ok(())
+}
+
+fn push_capped_edge(
+    edge: &Value,
+    session: &str,
+    names: &BTreeMap<String, String>,
+    rows: &mut Vec<Row>,
+    part_of: &mut Vec<(String, String)>,
+) {
+    if crud::edge_already_closed(edge.get("valid_until")) {
+        return;
+    }
+    let rel = edge.get("rel_type").and_then(Value::as_str).unwrap_or("");
+    let from = id_text(edge.get("in"));
+    let to = id_text(edge.get("out"));
+    if edge.get("status").and_then(Value::as_str) != Some("decided") {
+        return;
+    }
+    if rel == "part_of" {
+        part_of.push((from.clone(), to.clone()));
+    }
+    if !Predicate::parse(rel).is_some_and(Predicate::is_edge) {
+        return;
+    }
+    let edge_id = id_text(edge.get("id"));
+    if rows
+        .iter()
+        .any(|row| row.edge.as_deref() == Some(edge_id.as_str()))
+    {
+        return;
+    }
+    let evidence = edge.get("evidence").cloned().unwrap_or(Value::Null);
+    rows.push(Row {
+        id: format!("e:{edge_id}"),
+        entity: from.clone(),
+        slot: None,
+        edge: Some(edge_id),
+        subject: names.get(&from).cloned().unwrap_or_default(),
+        pred: rel.to_string(),
+        key: String::new(),
+        value: names.get(&to).cloned().unwrap_or_default(),
+        from: json_text(edge.get("valid_from")),
+        here: opened_here(Some(&evidence), session),
+        pending: edge.get("pending").is_some_and(Value::is_object),
+        evidence,
+    });
 }
 
 async fn load_named(gm: &GraphMemory, names: &[String]) -> Result<Vec<Entity>, GraphError> {
@@ -3881,6 +3979,60 @@ mod tests {
             .filter(|slot| slot["value"] == "plain grid" && ended(slot).is_none())
             .count();
         assert_eq!(live, 1);
+    }
+
+    /// A dependent past the row cap is still loaded when its owner was already seen.
+    #[tokio::test]
+    async fn a_selected_dependent_is_loaded_when_its_owner_is_already_seen() {
+        let (_tmp, gm) = open().await;
+        let quote = "delay is north pier marker";
+        let mut facts = Vec::new();
+        for index in 0..super::ROW_CAP {
+            facts.push(setting(
+                "birch",
+                Kind::Project,
+                &format!("k{index:04}"),
+                &format!("v{index:04}"),
+                quote,
+            ));
+        }
+        facts.push(setting(
+            "birch",
+            Kind::Project,
+            "delay",
+            "north pier marker",
+            quote,
+        ));
+        commit(&gm, "s1", "2026-04-03", &[turn(quote)], &facts).await;
+        let canonical = slot_canonical(&gm, "birch", "north pier marker").await;
+        let entity_id = canonical
+            .rsplit_once('#')
+            .expect("slot canonical")
+            .0
+            .to_string();
+        let without = super::load_rows(&gm, "s9", &["birch".into()], &[])
+            .await
+            .unwrap();
+        assert!(
+            without
+                .rows
+                .iter()
+                .all(|row| super::ref_of(row) != canonical),
+            "the row cap kept the selected slot"
+        );
+        let hit = super::DependentHit {
+            entity_id,
+            canonical: canonical.clone(),
+            derived_from: vec!["entity:harbor#0".into()],
+        };
+        let with = super::load_rows(&gm, "s9", &["birch".into()], &[hit])
+            .await
+            .unwrap();
+        assert!(
+            with.rows.iter().any(|row| super::ref_of(row) == canonical),
+            "selected dependent missing from {:?}",
+            with.rows.len()
+        );
     }
 
     /// The part_of cap keeps the lowest edge ids, not an arbitrary 16.
