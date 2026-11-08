@@ -298,6 +298,7 @@ pub(crate) async fn extract_session(
         );
         write_ctx.match_on = match_on;
         write_ctx.hold_on = hold_enabled(memory_dir);
+        write_ctx.links_on = links_enabled(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -334,6 +335,7 @@ pub(crate) async fn extract_session(
             .hold
             .holds_confirmed
             .saturating_add(stats.holds_confirmed);
+        report.links = stats.links;
     } else if hold_enabled(memory_dir) {
         // No facts to write. A text-only session can still confirm or judge a hold.
         let mut write_ctx = write::WriteCtx::new(
@@ -393,6 +395,13 @@ fn hold_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .hold_applies()
+}
+
+fn links_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .links_apply()
 }
 
 fn drop_restatements_enabled(memory_dir: &Path) -> bool {

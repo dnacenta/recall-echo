@@ -26,7 +26,7 @@ use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Proven
 use super::super::crud;
 use super::super::error::GraphError;
 use super::super::llm::{LlmProvider, TokenUsage};
-use super::super::store::Db;
+use super::super::store::{define_derived_from, Db};
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
 use super::ground::punctuation_literal;
@@ -96,6 +96,8 @@ pub(crate) struct WriteStats {
     pub holds_opened: u32,
     /// Pending rows this batch released after the old row was closed.
     pub holds_confirmed: u32,
+    /// Create-time link counts. Blank when the switch is off.
+    pub links: crate::graph::types::LinksReport,
 }
 
 /// Runs after a conflict rolls the attempt back, before the next attempt.
@@ -134,6 +136,9 @@ pub(crate) struct WriteCtx<'a> {
     pub targets: Vec<Option<super::known_match::MatchTarget>>,
     /// Store a guard-skipped conflict as pending. Off leaves the skip path unchanged.
     pub hold_on: bool,
+    /// Store `derived_from` on a new decided setting or rule.
+    /// Off leaves the write unchanged.
+    pub links_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -157,6 +162,7 @@ impl<'a> WriteCtx<'a> {
             match_on: false,
             targets: Vec::new(),
             hold_on: false,
+            links_on: false,
         }
     }
 }
@@ -285,6 +291,10 @@ pub(crate) async fn write_facts(
     let resolve_started = Instant::now();
     let resolution = resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?;
     let resolve_ms = elapsed_ms(resolve_started);
+    // The field has to outlive a conflict rollback, or the retry cannot store a list.
+    if ctx.links_on {
+        define_derived_from(gm.db()).await?;
+    }
     let write_started = Instant::now();
     let mut attempt = 0u8;
     loop {
@@ -627,12 +637,18 @@ impl<'a> Attempt<'a> {
         let (provenance, label) = provenance_of(fact.provenance);
         let evidence = prior_evidence(provenance);
         let item = evidence_item(self.ctx.session_id, fact, label);
+        let links = self.fresh_links(fact).await?;
         let pending = self.hold_conflicts.take().map(|conflicts| {
             self.stats.holds_opened += 1;
             super::hold::pending_value(self.ctx.session_id, &conflicts)
         });
         let pending_line = if pending.is_some() {
             "pending = $pending,"
+        } else {
+            ""
+        };
+        let links_line = if links.is_some() {
+            "derived_from = $derived_from,"
         } else {
             ""
         };
@@ -655,6 +671,7 @@ impl<'a> Attempt<'a> {
                 provenance = $provenance,
                 ended_by = NONE,
                 {pending_line}
+                {links_line}
                 evidence = $evidence
             "#
         );
@@ -673,6 +690,9 @@ impl<'a> Attempt<'a> {
             .bind(("evidence", json!([item])));
         if let Some(pending) = pending {
             request = request.bind(("pending", pending));
+        }
+        if let Some(links) = links {
+            request = request.bind(("derived_from", json!(links)));
         }
         request.await?.check()?;
         self.forget_edges(&subject.id, &object.id);
@@ -775,7 +795,14 @@ impl<'a> Attempt<'a> {
                 }
             }
         } else {
+            // The index this slot will take is already known; premises are rows stored before it.
+            let links = self.fresh_links(fact).await?;
             let mut slot = new_slot(self.ctx.session_id, self.ctx.date, fact);
+            if let Some(ids) = links {
+                if let Some(object) = slot.as_object_mut() {
+                    object.insert("derived_from".to_string(), json!(ids));
+                }
+            }
             if let Some(conflicts) = self.hold_conflicts.take() {
                 if let Some(object) = slot.as_object_mut() {
                     object.insert(
@@ -806,6 +833,83 @@ impl<'a> Attempt<'a> {
             .check()?;
         self.catalog.set_attributes(id, attributes);
         Ok(())
+    }
+
+    /// Premises already stored in this transaction. The new row is not among them.
+    async fn fresh_links(&mut self, fact: &Fact) -> Result<Option<Vec<String>>, GraphError> {
+        if !self.ctx.links_on || !link_dependent(fact) {
+            return Ok(None);
+        }
+        let premises = self.load_premises().await?;
+        let selected = super::links::select_premises(&premises, fact.predicate, &fact.object_name);
+        if selected.ids.is_empty() {
+            return Ok(None);
+        }
+        let recorded = u32::try_from(selected.ids.len()).unwrap_or(u32::MAX);
+        self.stats.links.links_written = self.stats.links.links_written.saturating_add(1);
+        self.stats.links.premises_recorded =
+            self.stats.links.premises_recorded.saturating_add(recorded);
+        self.stats.links.fan_in_overflow = self
+            .stats
+            .links
+            .fan_in_overflow
+            .saturating_add(selected.overflow);
+        Ok(Some(selected.ids))
+    }
+
+    async fn load_premises(&mut self) -> Result<Vec<super::links::Premise>, GraphError> {
+        let mut response = self.tx.query(PREMISE_ENTITIES).await?;
+        let entities: Vec<Value> = deserialize_take(&mut response, 0)?;
+        let mut names = HashMap::new();
+        let mut premises = Vec::new();
+        for entity in &entities {
+            let id = record_id_field(entity.get("id"));
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(name) = entity.get("name").and_then(Value::as_str) {
+                if !name.is_empty() {
+                    names.insert(id.clone(), name.to_string());
+                }
+            }
+            let Some(slots) = entity
+                .pointer("/attributes/v2/slots")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for (index, slot) in slots.iter().enumerate() {
+                if !premise_setting(slot) {
+                    continue;
+                }
+                premises.push(super::links::Premise {
+                    id: format!("{id}#{index}"),
+                    text: slot_str(slot, "value").unwrap_or("").to_string(),
+                    kind: super::links::PremiseKind::Setting,
+                });
+            }
+        }
+        let mut response = self.tx.query(PREMISE_EDGES).await?;
+        let edges: Vec<Value> = deserialize_take(&mut response, 0)?;
+        for edge in &edges {
+            if !premise_edge(edge) {
+                continue;
+            }
+            let object_id = record_id_field(edge.get("out"));
+            let Some(label) = names.get(&object_id) else {
+                continue;
+            };
+            let id = record_id_field(edge.get("id"));
+            if id.is_empty() {
+                continue;
+            }
+            premises.push(super::links::Premise {
+                id,
+                text: label.clone(),
+                kind: super::links::PremiseKind::Entity,
+            });
+        }
+        Ok(premises)
     }
 
     async fn supersede_slot(
@@ -1647,6 +1751,13 @@ impl<'a> Attempt<'a> {
 const LIVE_EDGES_OF: &str =
     "SELECT * FROM type::record($id)->(relates_to WHERE valid_until = NONE)";
 
+/// Entities visible to premise selection, including rows written earlier in this transaction.
+const PREMISE_ENTITIES: &str = "SELECT id, name, attributes FROM entity";
+
+/// Edge premises. The object label is resolved from [`PREMISE_ENTITIES`].
+const PREMISE_EDGES: &str = "SELECT id, rel_type, status, valid_until, pending, out \
+     FROM relates_to WHERE rel_type INSIDE ['uses', 'part_of', 'depends_on']";
+
 /// Live `part_of` edges that point at one record. A graph-edge scan.
 const SCOPE_PART_OF: &str = "SELECT in FROM type::record($id)<-(relates_to \
      WHERE rel_type = 'part_of' AND valid_until = NONE)";
@@ -2120,6 +2231,30 @@ fn pending_conflicts(pending: Option<&Value>) -> Option<&str> {
 #[must_use]
 pub(crate) fn is_pending(value: &Value) -> bool {
     value.get("pending").is_some_and(Value::is_object)
+}
+
+fn link_dependent(fact: &Fact) -> bool {
+    fact.status == "decided" && matches!(fact.predicate, Predicate::Setting | Predicate::Rule)
+}
+
+fn premise_setting(slot: &Value) -> bool {
+    slot_live(slot)
+        && !is_pending(slot)
+        && slot_str(slot, "predicate") == Some("setting")
+        && slot_str(slot, "status") == Some("decided")
+}
+
+fn premise_edge(edge: &Value) -> bool {
+    if edge_closed(edge.get("valid_until")) || is_pending(edge) {
+        return false;
+    }
+    if edge.get("status").and_then(Value::as_str) != Some("decided") {
+        return false;
+    }
+    matches!(
+        edge.get("rel_type").and_then(Value::as_str),
+        Some("uses" | "part_of" | "depends_on")
+    )
 }
 
 fn same_fact(slot: &Value, fact: &Fact) -> bool {
@@ -3017,6 +3152,7 @@ mod tests {
                 match_on: false,
                 targets: Vec::new(),
                 hold_on: false,
+                links_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4281,6 +4417,7 @@ mod tests {
             match_on: false,
             targets: Vec::new(),
             hold_on: false,
+            links_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -5316,6 +5453,7 @@ mod tests {
             known: Vec::new(),
             match_on: true,
             hold_on: false,
+            links_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -6229,5 +6367,999 @@ mod tests {
         assert_eq!(stats.retirements[0].old_value, "4.2");
         assert!(!slot_named(&slots, "runtime_version", "4.2")["valid_until"].is_null());
         assert!(slot_named(&slots, "runtime_version", "4.3")["valid_until"].is_null());
+    }
+
+    struct Counting<'a>(&'a AtomicU32);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Counting<'_> {
+        async fn complete(
+            &self,
+            _system_prompt: &str,
+            _user_message: &str,
+            _max_tokens: u32,
+        ) -> Result<String, GraphError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(GraphError::Extraction("provider called".into()))
+        }
+    }
+
+    fn rule_fact(subject: &str, kind: Kind, text: &str, turn: usize) -> Fact {
+        let mut fact = project_setting(subject, kind, "", text, "decided", turn);
+        fact.predicate = Predicate::Rule;
+        fact.quote = format!("{text} [{turn}]");
+        fact
+    }
+
+    fn slot_kind(
+        subject: &str,
+        kind: Kind,
+        predicate: Predicate,
+        value: &str,
+        turn: usize,
+    ) -> Fact {
+        let mut fact = project_setting(subject, kind, "", value, "decided", turn);
+        fact.predicate = predicate;
+        fact.quote = format!("{subject} {value} {turn}");
+        fact
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn write_linked(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        facts: &[Fact],
+        links_on: bool,
+    ) -> WriteStats {
+        let calls = AtomicU32::new(0);
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Counting(&calls);
+        let mut ctx = WriteCtx::new(&llm, &project, session_id, date, &[]);
+        ctx.links_on = links_on;
+        let stats = write_facts(gm, &ctx, facts).await.expect("write");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "linking called the provider"
+        );
+        assert_eq!(stats.resolver_calls, 0);
+        assert!(stats.usage.is_none());
+        stats
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn edge_field_defined(gm: &GraphMemory) -> bool {
+        let mut response = gm.db().query("INFO FOR TABLE relates_to").await.unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        serde_json::to_string(&rows)
+            .unwrap_or_default()
+            .contains("derived_from")
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn link_edges(gm: &GraphMemory) -> Vec<Value> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, rel_type, status, valid_until, pending, derived_from, out.name AS object FROM relates_to",
+            )
+            .await
+            .unwrap();
+        crate::graph::deserialize_take(&mut response, 0).unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn named_slots(gm: &GraphMemory, name: &str) -> (String, Vec<Value>) {
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let slots = entity
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.pointer("/v2/slots"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        (entity.id_string(), slots)
+    }
+
+    fn derived_ids(value: &Value) -> Vec<String> {
+        value
+            .get("derived_from")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn assert_no_derived(value: &Value) {
+        assert!(
+            value.get("derived_from").is_none(),
+            "unexpected derived_from on {value}"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    fn live_edge_ids(rows: &[Value], rel: &str, object: &str) -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                row["rel_type"] == rel
+                    && row["object"] == object
+                    && row["status"] == "decided"
+                    && row["valid_until"].is_null()
+                    && row.get("pending").is_none_or(Value::is_null)
+            })
+            .map(|row| record_id(&row["id"]))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn slot_of<'a>(slots: &'a [Value], value: &str) -> &'a Value {
+        slots
+            .iter()
+            .find(|slot| slot["value"] == value)
+            .unwrap_or_else(|| panic!("missing {value} in {slots:?}"))
+    }
+
+    fn slot_ref(entity_id: &str, slots: &[Value], value: &str) -> String {
+        let index = slots
+            .iter()
+            .position(|slot| slot["value"] == value)
+            .unwrap_or_else(|| panic!("missing {value} in {slots:?}"));
+        format!("{entity_id}#{index}")
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn derived_from_records_a_unique_mention_and_a_cross_subject_copy() {
+        let (_tmp, gm) = open_store().await;
+        let both = crate::config::GraphSection {
+            consolidate: true,
+            consolidate_links: true,
+            ..crate::config::GraphSection::default()
+        };
+        assert!(both.links_apply());
+        assert!(!both.hold_applies());
+        assert!(!both.drop_restatements);
+        assert!(!both.known_match);
+        assert!(!both.known_facts_context);
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("alpha", Kind::Project, "queue", "decided", "", 1),
+                project_setting("alpha", Kind::Project, "delay", "10s", "decided", 2),
+            ],
+            both.links_apply(),
+        )
+        .await;
+        let stats = write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                rule_fact("bravo", Kind::Project, "keep one queue", 1),
+                rule_fact("bravo", Kind::Project, "wait 10s before retry", 2),
+                project_setting(
+                    "bravo",
+                    Kind::Project,
+                    "warmth",
+                    "warm the queue",
+                    "decided",
+                    3,
+                ),
+                project_setting("bravo", Kind::Project, "wait", "10s", "decided", 4),
+            ],
+            true,
+        )
+        .await;
+        assert!(edge_field_defined(&gm).await);
+        assert_eq!(stats.links.links_written, 4);
+        assert_eq!(stats.links.premises_recorded, 4);
+        assert_eq!(stats.links.fan_in_overflow, 0);
+        let edges = link_edges(&gm).await;
+        let queue = live_edge_ids(&edges, "uses", "queue");
+        assert_eq!(queue.len(), 1, "{edges:?}");
+        assert!(edges
+            .iter()
+            .all(|row| row.get("derived_from").is_none_or(Value::is_null)));
+        let (alpha_id, alpha_slots) = named_slots(&gm, "alpha").await;
+        let delay = slot_ref(&alpha_id, &alpha_slots, "10s");
+        assert_no_derived(slot_of(&alpha_slots, "10s"));
+        let (_bravo_id, bravo) = named_slots(&gm, "bravo").await;
+        assert_eq!(derived_ids(slot_of(&bravo, "keep one queue")), queue);
+        assert_eq!(derived_ids(slot_of(&bravo, "10s")), vec![delay.clone()]);
+        assert_eq!(derived_ids(slot_of(&bravo, "warm the queue")), queue);
+        assert_eq!(
+            derived_ids(slot_of(&bravo, "wait 10s before retry")),
+            vec![delay]
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn links_off_persists_nothing_and_defines_no_field() {
+        for (consolidate, consolidate_links) in [(false, false), (false, true), (true, false)] {
+            let section = crate::config::GraphSection {
+                consolidate,
+                consolidate_links,
+                ..crate::config::GraphSection::default()
+            };
+            assert!(!section.links_apply(), "{consolidate} {consolidate_links}");
+            let (_tmp, gm) = open_store().await;
+            let stats = write_linked(
+                &gm,
+                "s1",
+                "2026-04-03",
+                &[
+                    uses_named("alpha", Kind::Project, "queue", "decided", "", 1),
+                    project_setting("alpha", Kind::Project, "delay", "10s", "decided", 2),
+                    rule_fact("bravo", Kind::Project, "keep one queue", 3),
+                    project_setting("bravo", Kind::Project, "wait", "10s", "decided", 4),
+                ],
+                section.links_apply(),
+            )
+            .await;
+            assert!(stats.links.is_blank(), "{stats:?}");
+            assert!(
+                !edge_field_defined(&gm).await,
+                "{consolidate} {consolidate_links}"
+            );
+            let (_id, slots) = named_slots(&gm, "bravo").await;
+            assert_no_derived(slot_of(&slots, "keep one queue"));
+            assert_no_derived(slot_of(&slots, "10s"));
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn links_on_defines_the_edge_field_without_a_list() {
+        let (_tmp, gm) = open_store().await;
+        let stats = write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[uses_named(
+                "alpha",
+                Kind::Project,
+                "queue",
+                "decided",
+                "",
+                1,
+            )],
+            true,
+        )
+        .await;
+        assert!(stats.links.is_blank(), "{stats:?}");
+        assert!(edge_field_defined(&gm).await);
+        let edges = link_edges(&gm).await;
+        assert!(edges
+            .iter()
+            .all(|row| row.get("derived_from").is_none_or(Value::is_null)));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn overlapping_labels_record_no_entity_link() {
+        let (_tmp, gm) = open_store().await;
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("alpha", Kind::Project, "cache", "decided", "", 1),
+                uses_named("alpha", Kind::Project, "cache service", "decided", "", 2),
+                uses_named("alpha", Kind::Project, "broker", "decided", "", 3),
+            ],
+            true,
+        )
+        .await;
+        let stats = write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                rule_fact("bravo", Kind::Project, "use the cache service", 1),
+                rule_fact("bravo", Kind::Project, "leave the uncached path", 2),
+                rule_fact(
+                    "bravo",
+                    Kind::Project,
+                    "use the cache service and the broker",
+                    3,
+                ),
+                rule_fact("bravo", Kind::Project, "note the cache and the broker", 4),
+            ],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        let broker = live_edge_ids(&edges, "uses", "broker");
+        let cache = live_edge_ids(&edges, "uses", "cache");
+        let mut apart = cache.clone();
+        apart.extend(broker.iter().cloned());
+        apart.sort();
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&slots, "use the cache service"));
+        assert_no_derived(slot_of(&slots, "leave the uncached path"));
+        assert_eq!(
+            derived_ids(slot_of(&slots, "use the cache service and the broker")),
+            broker
+        );
+        assert_eq!(
+            derived_ids(slot_of(&slots, "note the cache and the broker")),
+            apart
+        );
+        assert_eq!(stats.links.links_written, 2);
+        assert_eq!(stats.links.fan_in_overflow, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn unique_labels_are_capped_at_four() {
+        let (_tmp, gm) = open_store().await;
+        let names = ["alpha", "bravo", "cedar", "delta", "ember"];
+        let facts: Vec<Fact> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| uses_named("host", Kind::Project, name, "decided", "", index + 1))
+            .collect();
+        write_linked(&gm, "s1", "2026-04-03", &facts, true).await;
+        let stats = write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[rule_fact(
+                "host",
+                Kind::Project,
+                "note alpha bravo cedar delta ember",
+                1,
+            )],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        let mut all = Vec::new();
+        for name in names {
+            all.extend(live_edge_ids(&edges, "uses", name));
+        }
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 5, "{edges:?}");
+        let (_id, slots) = named_slots(&gm, "host").await;
+        assert_eq!(
+            derived_ids(slot_of(&slots, "note alpha bravo cedar delta ember")),
+            all[..4]
+        );
+        assert_eq!(stats.links.links_written, 1);
+        assert_eq!(stats.links.premises_recorded, 4);
+        assert_eq!(stats.links.fan_in_overflow, 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn one_label_records_every_edge_and_each_edge_kind_can_be_a_premise() {
+        let (_tmp, gm) = open_store().await;
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("alpha", Kind::Project, "queue", "decided", "", 1),
+                uses_named("bravo", Kind::Project, "queue", "decided", "", 2),
+                raw_edge(Predicate::PartOf, "widget", Kind::Component, "tray"),
+                raw_edge(Predicate::DependsOn, "worker", Kind::Component, "spool"),
+            ],
+            true,
+        )
+        .await;
+        let stats = write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                rule_fact("host", Kind::Project, "keep one queue", 1),
+                rule_fact("host", Kind::Project, "lift the tray before the spool", 2),
+            ],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        let queue = live_edge_ids(&edges, "uses", "queue");
+        assert_eq!(queue.len(), 2, "{edges:?}");
+        let mut tray_spool = live_edge_ids(&edges, "part_of", "tray");
+        tray_spool.extend(live_edge_ids(&edges, "depends_on", "spool"));
+        tray_spool.sort();
+        let (_id, slots) = named_slots(&gm, "host").await;
+        assert_eq!(derived_ids(slot_of(&slots, "keep one queue")), queue);
+        assert_eq!(
+            derived_ids(slot_of(&slots, "lift the tray before the spool")),
+            tray_spool
+        );
+        assert_eq!(stats.links.links_written, 2);
+        assert_eq!(stats.links.premises_recorded, 4);
+        assert_eq!(stats.links.fan_in_overflow, 0);
+        assert!(edges
+            .iter()
+            .all(|row| row.get("derived_from").is_none_or(Value::is_null)));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn shared_empty_and_projected_values_follow_the_unique_value_rule() {
+        let (_tmp, gm) = open_store().await;
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                project_setting("maple", Kind::Project, "delay", "10s", "decided", 1),
+                project_setting("birch", Kind::Project, "delay", "10s", "decided", 2),
+            ],
+            false,
+        )
+        .await;
+        let shared = write_linked(
+            &gm,
+            "s2",
+            "2026-04-04",
+            &[project_setting(
+                "holly",
+                Kind::Project,
+                "delay",
+                "10s",
+                "decided",
+                1,
+            )],
+            true,
+        )
+        .await;
+        assert!(shared.links.is_blank(), "{shared:?}");
+        for name in ["maple", "birch", "holly"] {
+            let (_id, slots) = named_slots(&gm, name).await;
+            assert_no_derived(slot_of(&slots, "10s"));
+        }
+        let empty = write_linked(
+            &gm,
+            "s3",
+            "2026-04-05",
+            &[
+                project_setting("ivory", Kind::Project, "note", "   ", "decided", 1),
+                project_setting("ochre", Kind::Project, "note", "   ", "decided", 2),
+                rule_fact("ochre", Kind::Project, "keep the note", 3),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(empty.links.links_written, 0);
+        for name in ["ivory", "ochre"] {
+            let (_id, slots) = named_slots(&gm, name).await;
+            for slot in &slots {
+                assert_no_derived(slot);
+            }
+        }
+        write_linked(
+            &gm,
+            "s4",
+            "2026-04-06",
+            &[
+                project_setting(
+                    "cobalt",
+                    Kind::Project,
+                    "delay",
+                    "  Use   10s  ",
+                    "decided",
+                    1,
+                ),
+                project_setting(
+                    "cobalt",
+                    Kind::Project,
+                    "limit",
+                    "timeout=10s",
+                    "decided",
+                    2,
+                ),
+                project_setting("cobalt", Kind::Project, "unit", "10S", "decided", 3),
+            ],
+            true,
+        )
+        .await;
+        let copied = write_linked(
+            &gm,
+            "s5",
+            "2026-04-07",
+            &[
+                project_setting("amber", Kind::Project, "delay", "use 10s", "decided", 1),
+                project_setting("amber", Kind::Project, "unit", "10s", "decided", 2),
+                project_setting("amber", Kind::Project, "limit", "timeout=10s", "decided", 3),
+                project_setting(
+                    "amber",
+                    Kind::Project,
+                    "spaced",
+                    "timeout 10s",
+                    "decided",
+                    4,
+                ),
+            ],
+            true,
+        )
+        .await;
+        let (cobalt_id, cobalt) = named_slots(&gm, "cobalt").await;
+        let folded = slot_ref(&cobalt_id, &cobalt, "  Use   10s  ");
+        let exact = slot_ref(&cobalt_id, &cobalt, "timeout=10s");
+        let (_amber_id, amber) = named_slots(&gm, "amber").await;
+        assert_eq!(derived_ids(slot_of(&amber, "use 10s")), vec![folded]);
+        assert_no_derived(slot_of(&amber, "10s"));
+        assert_eq!(derived_ids(slot_of(&amber, "timeout=10s")), vec![exact]);
+        assert_no_derived(slot_of(&amber, "timeout 10s"));
+        assert_eq!(copied.links.links_written, 2);
+        assert_eq!(copied.links.fan_in_overflow, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn ineligible_rows_do_not_receive_derived_from() {
+        let (_tmp, gm) = open_store().await;
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                uses_named("host", Kind::Project, "queue", "decided", "", 1),
+                raw_edge(Predicate::PartOf, "widget", Kind::Component, "tray"),
+                raw_edge(Predicate::DependsOn, "worker", Kind::Component, "spool"),
+                slot_kind(
+                    "loader",
+                    Kind::Issue,
+                    Predicate::IssueSymptom,
+                    "disk full",
+                    2,
+                ),
+                slot_kind("ship", Kind::Release, Predicate::ReleaseStatus, "ready", 3),
+                slot_kind("host", Kind::Project, Predicate::Prefers, "plain logs", 4),
+            ],
+            true,
+        )
+        .await;
+        let mut considered = rule_fact("host", Kind::Project, "keep one queue", 1);
+        considered.status = "considered".into();
+        let stats = write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[
+                considered,
+                rule_fact("host", Kind::Project, "keep one queue", 2),
+            ],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        assert!(edges.iter().all(|row| {
+            row.get("derived_from").is_none_or(Value::is_null)
+                && matches!(
+                    row["rel_type"].as_str(),
+                    Some("uses" | "part_of" | "depends_on")
+                )
+        }));
+        let queue = live_edge_ids(&edges, "uses", "queue");
+        let (host_id, host) = named_slots(&gm, "host").await;
+        assert_no_derived(slot_of(&host, "plain logs"));
+        let considered_slot = host
+            .iter()
+            .find(|slot| slot["value"] == "keep one queue" && slot["status"] == "considered")
+            .expect("considered rule");
+        assert_no_derived(considered_slot);
+        let decided = host
+            .iter()
+            .find(|slot| slot["value"] == "keep one queue" && slot["status"] == "decided")
+            .expect("decided rule");
+        assert_eq!(derived_ids(decided), queue);
+        let (_loader, loader) = named_slots(&gm, "loader").await;
+        assert_no_derived(slot_of(&loader, "disk full"));
+        let (_ship, ship) = named_slots(&gm, "ship").await;
+        assert_no_derived(slot_of(&ship, "ready"));
+        assert_eq!(stats.links.links_written, 1);
+        assert_eq!(stats.links.premises_recorded, 1);
+        let _ = host_id;
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn pending_closed_and_undecided_rows_are_not_premises() {
+        let (_tmp, gm) = open_store().await;
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[uses_named(
+                "alpha",
+                Kind::Project,
+                "queue",
+                "considered",
+                "",
+                1,
+            )],
+            true,
+        )
+        .await;
+        let considered = write_linked(
+            &gm,
+            "s2",
+            "2026-04-04",
+            &[rule_fact("bravo", Kind::Project, "keep one queue", 1)],
+            true,
+        )
+        .await;
+        assert!(considered.links.is_blank(), "{considered:?}");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&slots, "keep one queue"));
+
+        write_linked(
+            &gm,
+            "s3",
+            "2026-04-05",
+            &[uses_named(
+                "alpha",
+                Kind::Project,
+                "spool",
+                "rejected",
+                "",
+                1,
+            )],
+            true,
+        )
+        .await;
+        let rejected = write_linked(
+            &gm,
+            "s4",
+            "2026-04-06",
+            &[rule_fact("bravo", Kind::Project, "keep one spool", 1)],
+            true,
+        )
+        .await;
+        assert!(rejected.links.is_blank(), "{rejected:?}");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&slots, "keep one spool"));
+
+        write_linked(
+            &gm,
+            "s5",
+            "2026-04-07",
+            &[uses_named(
+                "alpha",
+                Kind::Project,
+                "broker",
+                "decided",
+                "",
+                1,
+            )],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        let broker = live_edge_ids(&edges, "uses", "broker");
+        assert_eq!(broker.len(), 1, "{edges:?}");
+        gm.db()
+            .query("UPDATE type::record($id) SET pending = $pending")
+            .bind(("id", broker[0].clone()))
+            .bind((
+                "pending",
+                json!({"since": "s5", "conflicts": "relates_to:other"}),
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let pending_edge = write_linked(
+            &gm,
+            "s6",
+            "2026-04-08",
+            &[rule_fact("bravo", Kind::Project, "keep one broker", 1)],
+            true,
+        )
+        .await;
+        assert!(pending_edge.links.is_blank(), "{pending_edge:?}");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&slots, "keep one broker"));
+
+        write_linked(
+            &gm,
+            "s7",
+            "2026-04-09",
+            &[project_setting(
+                "alpha",
+                Kind::Project,
+                "delay",
+                "10s",
+                "decided",
+                1,
+            )],
+            true,
+        )
+        .await;
+        let (alpha_id, alpha_slots) = named_slots(&gm, "alpha").await;
+        let mut attributes = crud::list_entities(gm.db(), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "alpha")
+            .unwrap()
+            .attributes
+            .unwrap();
+        attributes["v2"]["slots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot["value"] == "10s")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "pending".into(),
+                json!({"since": "s7", "conflicts": format!("{alpha_id}#0")}),
+            );
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", alpha_id))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let pending_slot = write_linked(
+            &gm,
+            "s8",
+            "2026-04-10",
+            &[project_setting(
+                "gamma",
+                Kind::Project,
+                "delay",
+                "10s",
+                "decided",
+                1,
+            )],
+            true,
+        )
+        .await;
+        assert!(pending_slot.links.is_blank(), "{pending_slot:?}");
+        let (_id, gamma) = named_slots(&gm, "gamma").await;
+        assert_no_derived(slot_of(&gamma, "10s"));
+
+        let closed_edge = write_linked(
+            &gm,
+            "s9",
+            "2026-04-11",
+            &[uses_named("alpha", Kind::Project, "tray", "decided", "", 1)],
+            true,
+        )
+        .await;
+        assert!(closed_edge.links.is_blank(), "{closed_edge:?}");
+        let mut rejection = uses_named("alpha", Kind::Project, "tray", "rejected", "", 1);
+        rejection.quote = "tray is gone".into();
+        let closed = write_linked(&gm, "s10", "2026-04-12", &[rejection], true).await;
+        assert_eq!(closed.retirements.len(), 1, "{:?}", closed.retirements);
+        let after = write_linked(
+            &gm,
+            "s11",
+            "2026-04-13",
+            &[rule_fact("bravo", Kind::Project, "keep one tray", 1)],
+            true,
+        )
+        .await;
+        assert!(after.links.is_blank(), "{after:?}");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&slots, "keep one tray"));
+
+        write_linked(
+            &gm,
+            "s12",
+            "2026-04-14",
+            &[project_setting(
+                "delta",
+                Kind::Project,
+                "delay",
+                "20s",
+                "decided",
+                1,
+            )],
+            true,
+        )
+        .await;
+        let replaced = write_linked(
+            &gm,
+            "s13",
+            "2026-04-15",
+            &[project_setting(
+                "delta",
+                Kind::Project,
+                "delay",
+                "30s",
+                "decided",
+                1,
+            )],
+            true,
+        )
+        .await;
+        assert_eq!(replaced.retirements.len(), 1, "{:?}", replaced.retirements);
+        let copy = write_linked(
+            &gm,
+            "s14",
+            "2026-04-16",
+            &[project_setting(
+                "echo",
+                Kind::Project,
+                "delay",
+                "20s",
+                "decided",
+                1,
+            )],
+            true,
+        )
+        .await;
+        assert!(copy.links.is_blank(), "{copy:?}");
+        let (_id, echo) = named_slots(&gm, "echo").await;
+        assert_no_derived(slot_of(&echo, "20s"));
+        let _ = alpha_slots;
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_later_fact_can_link_and_an_earlier_fact_is_not_patched() {
+        let (_tmp, gm) = open_store().await;
+        let stats = write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                rule_fact("bravo", Kind::Project, "keep one spool", 1),
+                uses_named("alpha", Kind::Project, "spool", "decided", "", 1),
+                rule_fact("bravo", Kind::Project, "hold the spool", 2),
+                project_setting("alpha", Kind::Project, "delay", "10s", "decided", 3),
+                project_setting("charlie", Kind::Project, "wait", "10s", "decided", 4),
+            ],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        let spool = live_edge_ids(&edges, "uses", "spool");
+        assert_eq!(spool.len(), 1, "{edges:?}");
+        let (alpha_id, alpha) = named_slots(&gm, "alpha").await;
+        let delay = slot_ref(&alpha_id, &alpha, "10s");
+        let (_bravo, bravo) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&bravo, "keep one spool"));
+        assert_eq!(derived_ids(slot_of(&bravo, "hold the spool")), spool);
+        assert_no_derived(slot_of(&alpha, "10s"));
+        let (_charlie, charlie) = named_slots(&gm, "charlie").await;
+        assert_eq!(derived_ids(slot_of(&charlie, "10s")), vec![delay]);
+        assert_eq!(stats.links.links_written, 2);
+        assert_eq!(stats.links.premises_recorded, 2);
+        assert_eq!(stats.links.fan_in_overflow, 0);
+
+        let later = write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[rule_fact("delta", Kind::Project, "warm the spool", 1)],
+            true,
+        )
+        .await;
+        let (_bravo, bravo) = named_slots(&gm, "bravo").await;
+        assert_no_derived(slot_of(&bravo, "keep one spool"));
+        let (_delta, delta) = named_slots(&gm, "delta").await;
+        assert_eq!(derived_ids(slot_of(&delta, "warm the spool")), spool);
+        assert_eq!(later.links.links_written, 1);
+        assert_eq!(later.links.premises_recorded, 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn reinforcement_does_not_rewrite_derived_from() {
+        let (_tmp, gm) = open_store().await;
+        write_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[uses_named(
+                "alpha",
+                Kind::Project,
+                "queue",
+                "decided",
+                "",
+                1,
+            )],
+            true,
+        )
+        .await;
+        write_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &[rule_fact("bravo", Kind::Project, "keep one queue", 1)],
+            true,
+        )
+        .await;
+        let edges = link_edges(&gm).await;
+        let queue = live_edge_ids(&edges, "uses", "queue");
+        let (_id, before_slots) = named_slots(&gm, "bravo").await;
+        let before = derived_ids(slot_of(&before_slots, "keep one queue"));
+        assert_eq!(before, queue);
+        let mut again = rule_fact("bravo", Kind::Project, "keep one queue", 1);
+        again.quote = "keep one queue, restated".into();
+        let reinforced = write_linked(&gm, "s3", "2026-04-12", &[again.clone()], true).await;
+        assert_eq!(reinforced.reinforced, 1, "{reinforced:?}");
+        assert!(reinforced.links.is_blank(), "{reinforced:?}");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_eq!(derived_ids(slot_of(&slots, "keep one queue")), before);
+        let seen = write_linked(&gm, "s3", "2026-04-12", &[again], true).await;
+        assert_eq!(seen.already_seen, 1, "{seen:?}");
+        assert!(seen.links.is_blank(), "{seen:?}");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_eq!(derived_ids(slot_of(&slots, "keep one queue")), before);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_write_conflict_retry_recounts_derived_from() {
+        let (_tmp, gm) = open_store().await;
+        let calls = AtomicU32::new(0);
+        let budget = AtomicU32::new(1);
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Counting(&calls);
+        let date = "2026-04-03";
+        let ctx = WriteCtx {
+            llm: &llm,
+            project: &project,
+            session_id: "s1",
+            date,
+            turns: &[],
+            conflict_budget: &budget,
+            valid_until: session_midnight(date),
+            on_conflict: None,
+            known: Vec::new(),
+            match_on: false,
+            targets: Vec::new(),
+            hold_on: false,
+            links_on: true,
+        };
+        let result = write_facts(
+            &gm,
+            &ctx,
+            &[
+                uses_named("alpha", Kind::Project, "queue", "decided", "", 1),
+                rule_fact("bravo", Kind::Project, "keep one queue", 2),
+            ],
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "linking called the provider"
+        );
+        let stats = result.expect("write");
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.links.links_written, 1);
+        assert_eq!(stats.links.premises_recorded, 1);
+        assert_eq!(stats.links.fan_in_overflow, 0);
+        assert_eq!(stats.resolver_calls, 0);
+        let edges = link_edges(&gm).await;
+        let queue = live_edge_ids(&edges, "uses", "queue");
+        let (_id, slots) = named_slots(&gm, "bravo").await;
+        assert_eq!(derived_ids(slot_of(&slots, "keep one queue")), queue);
     }
 }

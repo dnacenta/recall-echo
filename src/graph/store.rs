@@ -366,6 +366,17 @@ async fn define_schema(db: &Surreal<Db>) -> Result<(), GraphError> {
     Ok(())
 }
 
+/// Optional edge field for a derived-from list.
+///
+/// Callers run this only when the link switch applies. An off store never
+/// gains the field, and there is no version bump or backfill.
+pub(crate) async fn define_derived_from(db: &Surreal<Db>) -> Result<(), GraphError> {
+    db.query("DEFINE FIELD IF NOT EXISTS derived_from ON relates_to TYPE option<array<string>>")
+        .await?
+        .check()?;
+    Ok(())
+}
+
 /// What one migration pass did. Both counts are zero on an already current
 /// store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
