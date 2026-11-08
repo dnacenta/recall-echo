@@ -37,9 +37,9 @@ use super::schema::{key_is_empty, normalise, Fact, Kind, Predicate};
 /// Production writes never fail a commit on purpose.
 pub(crate) static NO_CONFLICTS: AtomicU32 = AtomicU32::new(0);
 
-const SUPERSEDED: &str = "superseded";
-const REJECTED: &str = "rejected";
-const REPLACED: &str = "replaced";
+pub(super) const SUPERSEDED: &str = "superseded";
+pub(super) const REJECTED: &str = "rejected";
+pub(super) const REPLACED: &str = "replaced";
 const PROMOTED: &str = "promoted";
 
 /// Shown when v2 is asked to write into a store it did not build.

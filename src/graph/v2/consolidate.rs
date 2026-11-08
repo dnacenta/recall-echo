@@ -23,7 +23,7 @@ use super::known_match::{coexist, cue_words, key_tokens, mention, value_spans};
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
-    WriteCtx, WriteStats, CLOSE_EDGE,
+    WriteCtx, WriteStats, CLOSE_EDGE, REJECTED, REPLACED, SUPERSEDED,
 };
 
 const PROMPT: &str = "CONSOLIDATE_V2";
@@ -1469,7 +1469,7 @@ async fn derived_dependents(
 }
 
 fn writer_a1(reason: &str) -> bool {
-    matches!(reason, "rejected" | "superseded" | "replaced")
+    matches!(reason, REJECTED | SUPERSEDED | REPLACED)
 }
 
 async fn linked_hits(
