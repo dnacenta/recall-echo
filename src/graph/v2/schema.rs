@@ -739,9 +739,10 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
 
 /// Trim, collapse interior whitespace, and case-fold prose.
 ///
-/// A letter run glued to a digit keeps its case, so a unit token such as
-/// `10s` stays distinct from `10S`. Punctuation stays in place. This is not
-/// [`normalise`], which turns punctuation into spaces.
+/// A letter run keeps its case when a digit is the nearest non-whitespace
+/// neighbour, so `10s` stays distinct from `10S` and `10 mW` from `10 MW`.
+/// The shape words `use` and `is` still fold. Punctuation stays in place.
+/// This is not [`normalise`], which turns punctuation into spaces.
 #[must_use]
 pub(crate) fn restatement_projection(raw: &str) -> String {
     let chars: Vec<char> = raw.trim().chars().collect();
@@ -759,24 +760,56 @@ pub(crate) fn restatement_projection(raw: &str) -> String {
             spaced = false;
         }
         if chars[index].is_alphabetic() {
-            let start = index;
-            while index < chars.len() && chars[index].is_alphabetic() {
-                index += 1;
-            }
-            let glued_to_digit = (start > 0 && chars[start - 1].is_ascii_digit())
-                || (index < chars.len() && chars[index].is_ascii_digit());
-            let word: String = chars[start..index].iter().collect();
-            if glued_to_digit {
-                out.push_str(&word);
-            } else {
-                out.extend(word.chars().flat_map(char::to_lowercase));
-            }
+            let end = alphabetic_end(&chars, index);
+            out.push_str(&projected_word(&chars, index, end));
+            index = end;
         } else {
             out.push(chars[index]);
             index += 1;
         }
     }
     out
+}
+
+fn alphabetic_end(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    while index < chars.len() && chars[index].is_alphabetic() {
+        index += 1;
+    }
+    index
+}
+
+fn projected_word(chars: &[char], start: usize, end: usize) -> String {
+    let word: String = chars[start..end].iter().collect();
+    if shape_keyword(&word) || !unit_neighbour(chars, start, end) {
+        word.chars().flat_map(char::to_lowercase).collect()
+    } else {
+        word
+    }
+}
+
+fn shape_keyword(word: &str) -> bool {
+    word.eq_ignore_ascii_case("use") || word.eq_ignore_ascii_case("is")
+}
+
+fn unit_neighbour(chars: &[char], start: usize, end: usize) -> bool {
+    ascii_digit(skip_ws_before(chars, start)) || ascii_digit(skip_ws_after(chars, end))
+}
+
+fn ascii_digit(ch: Option<char>) -> bool {
+    ch.is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn skip_ws_before(chars: &[char], start: usize) -> Option<char> {
+    chars[..start]
+        .iter()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .copied()
+}
+
+fn skip_ws_after(chars: &[char], end: usize) -> Option<char> {
+    chars[end..].iter().find(|ch| !ch.is_whitespace()).copied()
 }
 
 /// Whether one rule object is a whole-expression restatement of one setting.
@@ -1377,5 +1410,28 @@ mod tests {
             "timeout",
             "10s"
         ));
+    }
+
+    #[test]
+    fn spaced_unit_case_stays_distinct_and_shape_words_still_fold() {
+        assert_eq!(restatement_projection("10 MW"), "10 MW");
+        assert_eq!(restatement_projection("10 mW"), "10 mW");
+        assert_ne!(
+            restatement_projection("10 MW"),
+            restatement_projection("10 mW")
+        );
+        assert_eq!(restatement_projection("10 MB"), "10 MB");
+        assert_eq!(restatement_projection("10 mB"), "10 mB");
+        assert_ne!(
+            restatement_projection("10 MB"),
+            restatement_projection("10 mB")
+        );
+        assert_ne!(
+            restatement_projection("10 s"),
+            restatement_projection("10 S")
+        );
+        assert!(!restates_setting("use 10 mW", "power", "10 MW"));
+        assert!(restates_setting("Use  10s", "timeout", "10s"));
+        assert!(restates_setting("Timeout IS 10s", "Timeout", "10s"));
     }
 }

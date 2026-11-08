@@ -402,22 +402,15 @@ fn drop_restatements_enabled(memory_dir: &Path) -> bool {
         .drop_restatements
 }
 
-/// Drop decided rules that restate one unambiguous same-turn setting.
+/// Drop a decided rule only when it and one setting are a component by themselves.
 ///
-/// The anchor set is the incoming list. An ambiguous group drops nothing.
-/// `kept` is left as the candidate count.
+/// Matches are edges in a bipartite graph. A larger component is ambiguous, so
+/// every fact in it stays. `kept` is left as the candidate count.
 fn drop_restating_rules(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
-    let anchor_of: Vec<Option<usize>> = facts
-        .iter()
-        .map(|fact| unique_restatement_anchor(fact, &facts))
-        .collect();
-    let mut rules_for_anchor = vec![0u32; facts.len()];
-    for anchor in anchor_of.iter().flatten() {
-        rules_for_anchor[*anchor] = rules_for_anchor[*anchor].saturating_add(1);
-    }
+    let drop = isolated_restatement_rules(&facts);
     let mut kept = Vec::with_capacity(facts.len());
     for (index, fact) in facts.into_iter().enumerate() {
-        if anchor_of[index].is_some_and(|anchor| rules_for_anchor[anchor] == 1) {
+        if drop[index] {
             count_drop(report, DROP_RESTATEMENT);
             continue;
         }
@@ -426,38 +419,86 @@ fn drop_restating_rules(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<F
     kept
 }
 
-/// The one decided setting this rule restates, when the binding is unique.
-fn unique_restatement_anchor(fact: &Fact, facts: &[Fact]) -> Option<usize> {
-    if fact.predicate != Predicate::Rule
-        || fact.status != "decided"
-        || !fact.replaces.trim().is_empty()
-    {
-        return None;
+fn isolated_restatement_rules(facts: &[Fact]) -> Vec<bool> {
+    let mut parent: Vec<usize> = (0..facts.len()).collect();
+    link_restatement_edges(facts, &mut parent);
+    let (rules, settings) = component_counts(facts, &parent);
+    facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            let root = find(&parent, index);
+            eligible_rule(fact) && rules[root] == 1 && settings[root] == 1
+        })
+        .collect()
+}
+
+fn link_restatement_edges(facts: &[Fact], parent: &mut [usize]) {
+    for (rule_index, rule) in facts.iter().enumerate() {
+        if eligible_rule(rule) {
+            link_rule(facts, parent, rule_index, rule);
+        }
     }
-    let mut found = None;
-    for (index, setting) in facts.iter().enumerate() {
-        if !restatement_anchor(setting, fact) {
-            continue;
+}
+
+fn link_rule(facts: &[Fact], parent: &mut [usize], rule_index: usize, rule: &Fact) {
+    for (setting_index, setting) in facts.iter().enumerate() {
+        if restatement_edge(setting, rule) {
+            unite(parent, rule_index, setting_index);
         }
-        if !restates_setting(&fact.object_name, &setting.key, &setting.object_name) {
-            continue;
-        }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(index);
     }
-    found
+}
+
+fn restatement_edge(setting: &Fact, rule: &Fact) -> bool {
+    restatement_anchor(setting, rule)
+        && restates_setting(&rule.object_name, &setting.key, &setting.object_name)
+}
+
+fn component_counts(facts: &[Fact], parent: &[usize]) -> (Vec<u32>, Vec<u32>) {
+    let mut rules = vec![0u32; facts.len()];
+    let mut settings = vec![0u32; facts.len()];
+    for (index, fact) in facts.iter().enumerate() {
+        let root = find(parent, index);
+        if eligible_rule(fact) {
+            rules[root] = rules[root].saturating_add(1);
+        } else if anchor_setting(fact) {
+            settings[root] = settings[root].saturating_add(1);
+        }
+    }
+    (rules, settings)
+}
+
+fn eligible_rule(fact: &Fact) -> bool {
+    fact.predicate == Predicate::Rule && fact.status == "decided" && fact.replaces.trim().is_empty()
+}
+
+fn anchor_setting(fact: &Fact) -> bool {
+    fact.predicate == Predicate::Setting
+        && fact.status == "decided"
+        && !key_is_empty(&fact.key)
+        && !fact.object_name.trim().is_empty()
 }
 
 fn restatement_anchor(setting: &Fact, rule: &Fact) -> bool {
-    setting.predicate == Predicate::Setting
-        && setting.status == "decided"
+    anchor_setting(setting)
         && setting.turn == rule.turn
         && setting.subject_kind == rule.subject_kind
         && setting.subject_name == rule.subject_name
-        && !key_is_empty(&setting.key)
-        && !setting.object_name.trim().is_empty()
+}
+
+fn find(parent: &[usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        index = parent[index];
+    }
+    index
+}
+
+fn unite(parent: &mut [usize], left: usize, right: usize) {
+    let left = find(parent, left);
+    let right = find(parent, right);
+    if left != right {
+        parent[right] = left;
+    }
 }
 
 /// A decided setting, or a decided `uses` whose role can retire a stored edge.
@@ -4554,6 +4595,68 @@ mod tests {
         ]);
         assert_eq!(kept.len(), 3);
         assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+    }
+
+    #[test]
+    fn a_mixed_ambiguous_group_keeps_every_fact() {
+        let orders = [
+            vec![
+                harbor_setting("timeout", "10s"),
+                harbor_setting("interval", "10s"),
+                harbor_rule("use 10s"),
+                harbor_rule("timeout is 10s"),
+            ],
+            vec![
+                harbor_rule("use 10s"),
+                harbor_rule("timeout is 10s"),
+                harbor_setting("timeout", "10s"),
+                harbor_setting("interval", "10s"),
+            ],
+            vec![
+                harbor_setting("timeout", "10s"),
+                harbor_rule("use 10s"),
+                harbor_setting("interval", "10s"),
+                harbor_rule("timeout is 10s"),
+            ],
+        ];
+        for facts in orders {
+            let (kept, report) = apply_restatements(facts.clone());
+            assert_eq!(kept, facts);
+            assert!(!report.drops.contains_key(DROP_RESTATEMENT));
+        }
+    }
+
+    #[test]
+    fn an_isolated_pair_still_drops_the_rule() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_rule("use 10s"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+    }
+
+    #[test]
+    fn two_isolated_pairs_each_drop() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_rule("use 10s"),
+            harbor_setting("retries", "3"),
+            harbor_rule("use 3"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout", "retries"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(2));
+    }
+
+    #[test]
+    fn a_keyed_rule_beside_an_unconnected_setting_still_drops() {
+        let (kept, report) = apply_restatements(vec![
+            harbor_setting("timeout", "10s"),
+            harbor_setting("interval", "10s"),
+            harbor_rule("timeout is 10s"),
+        ]);
+        assert_eq!(fact_keys(&kept), vec!["timeout", "interval"]);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
     }
 
     #[test]
