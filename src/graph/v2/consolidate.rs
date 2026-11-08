@@ -1491,60 +1491,101 @@ async fn linked_hits(
 ) -> Result<Vec<DependentHit>, GraphError> {
     let mut response = gm.db().query("SELECT id, attributes FROM entity").await?;
     let entities: Vec<Value> = deserialize_take(&mut response, 0)?;
-    let mut hits = Vec::new();
-    for entity in &entities {
-        let entity_id = id_text(entity.get("id"));
-        if entity_id.is_empty() {
-            continue;
-        }
-        let Some(slots) = entity
-            .pointer("/attributes/v2/slots")
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        for (index, slot) in slots.iter().enumerate() {
-            if !eligible_dependent(slot) {
-                continue;
-            }
-            let derived = string_list(slot.get("derived_from"));
-            if !derived.iter().any(|id| closed.contains(id)) {
-                continue;
-            }
-            hits.push(DependentHit {
-                entity_id: entity_id.clone(),
-                canonical: format!("{entity_id}#{index}"),
-                derived_from: derived,
-            });
-        }
-    }
-    if let Ok(edges) = linked_edges(gm).await {
-        for edge in &edges {
-            let rel = edge.get("rel_type").and_then(Value::as_str).unwrap_or("");
-            if rel != "setting" && rel != "rule" {
-                continue;
-            }
-            if !eligible_edge(edge) {
-                continue;
-            }
-            let derived = string_list(edge.get("derived_from"));
-            if !derived.iter().any(|id| closed.contains(id)) {
-                continue;
-            }
-            let canonical = id_text(edge.get("id"));
-            if canonical.is_empty() {
-                continue;
-            }
-            hits.push(DependentHit {
-                entity_id: id_text(edge.get("in")),
-                canonical,
-                derived_from: derived,
-            });
-        }
-    }
+    let mut hits = collect_slot_hits(&entities, closed);
+    hits.extend(collect_edge_hits(&linked_edges(gm).await?, closed));
+    sort_hits(&mut hits);
+    Ok(hits)
+}
+
+fn sort_hits(hits: &mut Vec<DependentHit>) {
     hits.sort_by(|left, right| left.canonical.cmp(&right.canonical));
     hits.dedup_by(|left, right| left.canonical == right.canonical);
-    Ok(hits)
+}
+
+fn collect_slot_hits(entities: &[Value], closed: &BTreeSet<String>) -> Vec<DependentHit> {
+    let mut hits = Vec::new();
+    for entity in entities {
+        push_entity_hits(&mut hits, entity, closed);
+    }
+    hits
+}
+
+fn push_entity_hits(hits: &mut Vec<DependentHit>, entity: &Value, closed: &BTreeSet<String>) {
+    let entity_id = id_text(entity.get("id"));
+    if entity_id.is_empty() {
+        return;
+    }
+    let Some(slots) = entity
+        .pointer("/attributes/v2/slots")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for (index, slot) in slots.iter().enumerate() {
+        if let Some(hit) = slot_dependent(&entity_id, index, slot, closed) {
+            hits.push(hit);
+        }
+    }
+}
+
+fn slot_dependent(
+    entity_id: &str,
+    index: usize,
+    slot: &Value,
+    closed: &BTreeSet<String>,
+) -> Option<DependentHit> {
+    if !eligible_dependent(slot) {
+        return None;
+    }
+    let derived = string_list(slot.get("derived_from"));
+    if !mentions_closed(&derived, closed) {
+        return None;
+    }
+    Some(DependentHit {
+        entity_id: entity_id.to_string(),
+        canonical: format!("{entity_id}#{index}"),
+        derived_from: derived,
+    })
+}
+
+fn collect_edge_hits(edges: &[Value], closed: &BTreeSet<String>) -> Vec<DependentHit> {
+    let mut hits = Vec::new();
+    for edge in edges {
+        if let Some(hit) = edge_dependent(edge, closed) {
+            hits.push(hit);
+        }
+    }
+    hits
+}
+
+fn edge_dependent(edge: &Value, closed: &BTreeSet<String>) -> Option<DependentHit> {
+    if !setting_or_rule(edge.get("rel_type").and_then(Value::as_str).unwrap_or("")) {
+        return None;
+    }
+    if !eligible_edge(edge) {
+        return None;
+    }
+    let derived = string_list(edge.get("derived_from"));
+    if !mentions_closed(&derived, closed) {
+        return None;
+    }
+    let canonical = id_text(edge.get("id"));
+    if canonical.is_empty() {
+        return None;
+    }
+    Some(DependentHit {
+        entity_id: id_text(edge.get("in")),
+        canonical,
+        derived_from: derived,
+    })
+}
+
+fn setting_or_rule(rel: &str) -> bool {
+    rel == "setting" || rel == "rule"
+}
+
+fn mentions_closed(derived: &[String], closed: &BTreeSet<String>) -> bool {
+    derived.iter().any(|id| closed.contains(id))
 }
 
 async fn linked_edges(gm: &GraphMemory) -> Result<Vec<Value>, GraphError> {
@@ -6506,6 +6547,90 @@ mod tests {
         rows.iter()
             .find(|slot| slot["value"] == value)
             .unwrap_or_else(|| panic!("missing {value} in {rows:?}"))
+    }
+}
+
+#[cfg(test)]
+mod linked_hit_tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::json;
+
+    use super::{
+        collect_edge_hits, collect_slot_hits, edge_dependent, eligible_edge, mentions_closed,
+    };
+
+    fn closed(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn eligible_edge_rejects_closed_pending_and_undecided() {
+        assert!(!eligible_edge(&json!({
+            "status": "decided",
+            "valid_until": "2026-04-11T00:00:00Z"
+        })));
+        assert!(!eligible_edge(&json!({
+            "status": "decided",
+            "pending": {"since": "s2", "conflicts": "entity:harbor#0"}
+        })));
+        assert!(!eligible_edge(&json!({"status": "considered"})));
+        assert!(eligible_edge(&json!({"status": "decided"})));
+    }
+
+    #[test]
+    fn an_edge_hit_keeps_only_a_live_setting_or_rule() {
+        let closed = closed(&["entity:harbor#0"]);
+        let live = json!({
+            "id": "relates_to:rule1",
+            "in": "entity:birch",
+            "rel_type": "rule",
+            "status": "decided",
+            "derived_from": ["entity:harbor#0"]
+        });
+        let hit = edge_dependent(&live, &closed).expect("live rule");
+        assert_eq!(hit.canonical, "relates_to:rule1");
+        assert_eq!(hit.entity_id, "entity:birch");
+        let skipped = [
+            json!({"id": "relates_to:uses1", "rel_type": "uses", "status": "decided", "derived_from": ["entity:harbor#0"]}),
+            json!({"id": "relates_to:closed", "rel_type": "setting", "status": "decided", "valid_until": "2026-04-11T00:00:00Z", "derived_from": ["entity:harbor#0"]}),
+            json!({"id": "relates_to:pending", "rel_type": "setting", "status": "decided", "pending": {"since": "s2"}, "derived_from": ["entity:harbor#0"]}),
+            json!({"id": "relates_to:open", "rel_type": "rule", "status": "considered", "derived_from": ["entity:harbor#0"]}),
+            json!({"id": "relates_to:other", "rel_type": "rule", "status": "decided", "derived_from": ["entity:maple#0"]}),
+            json!({"rel_type": "setting", "status": "decided", "derived_from": ["entity:harbor#0"]}),
+        ];
+        assert!(collect_edge_hits(&skipped, &closed).is_empty());
+        assert_eq!(collect_edge_hits(&[live], &closed).len(), 1);
+        assert!(!mentions_closed(&[], &closed));
+    }
+
+    #[test]
+    fn a_slot_hit_uses_the_entity_and_index() {
+        let closed = closed(&["entity:harbor#0"]);
+        let entities = [
+            json!({"attributes": {"v2": {"slots": []}}}),
+            json!({"id": "entity:maple"}),
+            json!({
+                "id": "entity:holly",
+                "attributes": {"v2": {"slots": [
+                    {"predicate": "rule", "status": "decided", "derived_from": ["entity:other#0"]},
+                    {"predicate": "uses", "status": "decided", "derived_from": ["entity:harbor#0"]}
+                ]}}
+            }),
+            json!({
+                "id": "entity:birch",
+                "attributes": {"v2": {"slots": [{
+                    "predicate": "setting",
+                    "status": "decided",
+                    "value": "10s",
+                    "derived_from": ["entity:harbor#0"]
+                }]}}
+            }),
+        ];
+        let hits = collect_slot_hits(&entities, &closed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].canonical, "entity:birch#0");
+        assert_eq!(hits[0].entity_id, "entity:birch");
     }
 }
 
