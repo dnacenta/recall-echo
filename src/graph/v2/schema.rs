@@ -32,6 +32,9 @@ pub(crate) const DROP_PARSE: &str = "parse";
 pub(crate) const DROP_TOO_LONG: &str = "too_long";
 pub(crate) const DROP_OVERFLOW: &str = "overflow";
 pub(crate) const DROP_UNRESOLVED: &str = "unresolved";
+/// A decided rule removed because it restated one same-session setting.
+/// Counted outside `kept` plus the whole-candidate drops.
+pub(crate) const DROP_RESTATEMENT: &str = "restatement";
 
 /// Confidence below this is not a durable fact.
 const MIN_CONFIDENCE: f64 = 0.6;
@@ -734,6 +737,72 @@ pub(crate) fn filter_fact(fact: &Fact) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Trim, collapse interior whitespace, and case-fold prose.
+///
+/// A letter run glued to a digit keeps its case, so a unit token such as
+/// `10s` stays distinct from `10S`. Punctuation stays in place. This is not
+/// [`normalise`], which turns punctuation into spaces.
+#[must_use]
+pub(crate) fn restatement_projection(raw: &str) -> String {
+    let chars: Vec<char> = raw.trim().chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    let mut spaced = false;
+    while index < chars.len() {
+        if chars[index].is_whitespace() {
+            spaced = !out.is_empty();
+            index += 1;
+            continue;
+        }
+        if spaced {
+            out.push(' ');
+            spaced = false;
+        }
+        if chars[index].is_alphabetic() {
+            let start = index;
+            while index < chars.len() && chars[index].is_alphabetic() {
+                index += 1;
+            }
+            let glued_to_digit = (start > 0 && chars[start - 1].is_ascii_digit())
+                || (index < chars.len() && chars[index].is_ascii_digit());
+            let word: String = chars[start..index].iter().collect();
+            if glued_to_digit {
+                out.push_str(&word);
+            } else {
+                out.extend(word.chars().flat_map(char::to_lowercase));
+            }
+        } else {
+            out.push(chars[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Whether one rule object is a whole-expression restatement of one setting.
+///
+/// Sibling choice stays with the session pass. The shapes are a bare `use`
+/// of the value, or an `is` copula of the value. The key may be present and
+/// need not be. Any other text is not a restatement.
+#[must_use]
+pub(crate) fn restates_setting(rule_object: &str, key: &str, value: &str) -> bool {
+    let rule = restatement_projection(rule_object);
+    let key = restatement_projection(key);
+    let value = restatement_projection(value);
+    if rule.is_empty() || key.is_empty() || value.is_empty() {
+        return false;
+    }
+    let shapes = [
+        format!("use {value}"),
+        format!("use {key} {value}"),
+        format!("use {value} {key}"),
+        format!("{key} is {value}"),
+        format!("is {value}"),
+        format!("{value} is {key}"),
+    ];
+    shapes.into_iter().any(|shape| shape == rule)
+}
+
 /// Version with one leading `v` or `V` removed. It must contain a digit, occur
 /// in the cited turn without running into a digit, a letter other than a
 /// leading `v` or `V`, or a dotted number, and each of its numbers must occur
@@ -1250,5 +1319,63 @@ mod tests {
         let mut rule = kept.clone();
         rule.predicate = Predicate::Rule;
         assert_eq!(filter_fact(&rule).unwrap_err(), DROP_GENERIC);
+    }
+
+    #[test]
+    fn restatement_projection_keeps_punctuation_numbers_units_and_qualifiers() {
+        assert_eq!(restatement_projection("  Use   10s  "), "use 10s");
+        assert_eq!(restatement_projection("Timeout\tis\n10s"), "timeout is 10s");
+        assert_eq!(restatement_projection("TIMEOUT IS 10s"), "timeout is 10s");
+        assert_eq!(restatement_projection("10s"), "10s");
+        assert_eq!(restatement_projection("10S"), "10S");
+        assert_eq!(restatement_projection("10ms"), "10ms");
+        assert_eq!(restatement_projection("use 10s."), "use 10s.");
+        assert_eq!(restatement_projection("timeout=10s"), "timeout=10s");
+        assert_ne!(
+            restatement_projection("timeout=10s"),
+            normalise("timeout=10s")
+        );
+        assert_eq!(
+            restatement_projection("use 10s unless retrying"),
+            "use 10s unless retrying"
+        );
+        assert_eq!(restatement_projection("do not use 10s"), "do not use 10s");
+        assert_eq!(
+            restatement_projection("must never go below 10s"),
+            "must never go below 10s"
+        );
+    }
+
+    #[test]
+    fn restatement_shapes_are_whole_expressions() {
+        assert!(restates_setting("use 10s", "timeout", "10s"));
+        assert!(restates_setting("Use  10s", "timeout", "10s"));
+        assert!(restates_setting("use timeout 10s", "timeout", "10s"));
+        assert!(restates_setting("timeout is 10s", "timeout", "10s"));
+        assert!(restates_setting("Timeout IS 10s", "Timeout", "10s"));
+        assert!(restates_setting("is 10s", "timeout", "10s"));
+        assert!(!restates_setting("10s", "timeout", "10s"));
+        assert!(!restates_setting("10", "timeout", "10"));
+        assert!(!restates_setting("use 10S", "timeout", "10s"));
+        assert!(!restates_setting("use 10ms", "timeout", "10s"));
+        assert!(!restates_setting(
+            "use 10s unless retrying",
+            "timeout",
+            "10s"
+        ));
+        assert!(!restates_setting("do not use 10s", "timeout", "10s"));
+        assert!(!restates_setting("only on retry", "timeout", "10s"));
+        assert!(!restates_setting(
+            "must never go below 10s",
+            "timeout",
+            "10s"
+        ));
+        assert!(!restates_setting("interval is 10s", "timeout", "10s"));
+        assert!(!restates_setting("the timeout is 10s", "timeout", "10s"));
+        assert!(!restates_setting(
+            "set the timeout to 10s",
+            "timeout",
+            "10s"
+        ));
     }
 }
