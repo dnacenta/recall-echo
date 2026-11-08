@@ -138,7 +138,7 @@ pub(crate) async fn run(
         Vec::new()
     };
     // Dependents of this session's writer closes, outside the neighbourhood cap.
-    let (dependents, d_overflow) = derived_dependents(gm, ctx, stats, report).await;
+    let dependents = derived_dependents(gm, ctx, stats, report).await;
     if rough.is_empty() && ambiguous.is_empty() && dependents.is_empty() {
         return;
     }
@@ -162,9 +162,10 @@ pub(crate) async fn run(
         return;
     };
     let mut anchors = finish_anchors(rough, &loaded.rows);
-    let added = push_derived_anchors(&mut anchors, &loaded.rows, &dependents, facts, stats);
+    let (added, overflow) =
+        push_derived_anchors(&mut anchors, &loaded.rows, &dependents, facts, stats);
     report.links.d_anchors_added = added;
-    report.links.d_anchor_overflow = d_overflow;
+    report.links.d_anchor_overflow = overflow;
     if anchors.is_empty() && ambiguous.is_empty() {
         return;
     }
@@ -1443,14 +1444,14 @@ async fn derived_dependents(
     ctx: &WriteCtx<'_>,
     stats: &WriteStats,
     report: &mut IngestionReport,
-) -> (Vec<DependentHit>, u32) {
+) -> Vec<DependentHit> {
     if !ctx.links_on
         || !stats
             .close_events
             .iter()
             .any(|event| writer_a1(&event.reason))
     {
-        return (Vec::new(), 0);
+        return Vec::new();
     }
     let closed: BTreeSet<String> = stats
         .close_events
@@ -1458,17 +1459,13 @@ async fn derived_dependents(
         .filter(|event| writer_a1(&event.reason))
         .map(|event| event.row_id.clone())
         .collect();
-    let hits = match linked_hits(gm, &closed).await {
+    match linked_hits(gm, &closed).await {
         Ok(hits) => hits,
         Err(_) => {
             report.consolidate.errors += 1;
-            return (Vec::new(), 0);
+            Vec::new()
         }
-    };
-    let overflow = hits.len().saturating_sub(D_ANCHOR_CAP);
-    let mut hits = hits;
-    hits.truncate(D_ANCHOR_CAP);
-    (hits, u32::try_from(overflow).unwrap_or(u32::MAX))
+    }
 }
 
 fn writer_a1(reason: &str) -> bool {
@@ -1625,44 +1622,85 @@ fn push_derived_anchors(
     dependents: &[DependentHit],
     facts: &[super::schema::Fact],
     stats: &WriteStats,
-) -> u32 {
+) -> (u32, u32) {
+    let (kept, overflow) = capped_usable(dependents, rows, anchors, stats);
     let mut added = 0u32;
-    for hit in dependents {
-        let Some(index) = rows.iter().position(|row| ref_of(row) == hit.canonical) else {
-            continue;
-        };
-        let row = &rows[index];
-        if row.pending || !matches!(row.pred.as_str(), "setting" | "rule") {
-            continue;
+    for hit in kept {
+        if let Some(anchor) = derived_anchor(hit, rows, facts, stats) {
+            anchors.push(anchor);
+            added += 1;
         }
-        let Some(event) = stats.close_events.iter().find(|event| {
-            writer_a1(&event.reason) && hit.derived_from.iter().any(|id| id == &event.row_id)
-        }) else {
-            continue;
-        };
-        let (turn, quote) = facts
-            .get(event.fact_index)
-            .map(|fact| (fact.turn, fact.quote.clone()))
-            .unwrap_or((0, String::new()));
-        anchors.push(Anchor {
-            id: format!("d:{}", ref_of(row)),
-            subject: row.subject.clone(),
-            pred: row.pred.clone(),
-            key: row.key.clone(),
-            value: row.value.clone(),
-            text: row.value.clone(),
-            new_value: row.value.clone(),
-            replaces: String::new(),
-            entity: String::new(),
-            reason: "derived",
-            turn,
-            quote,
-            live: Some(index),
-            a2: false,
-        });
-        added += 1;
     }
-    added
+    (added, overflow)
+}
+
+fn capped_usable<'a>(
+    dependents: &'a [DependentHit],
+    rows: &[Row],
+    anchors: &[Anchor],
+    stats: &WriteStats,
+) -> (Vec<&'a DependentHit>, u32) {
+    let usable: Vec<&DependentHit> = dependents
+        .iter()
+        .filter(|hit| hit_usable(hit, rows, anchors, stats))
+        .collect();
+    let overflow = u32::try_from(usable.len().saturating_sub(D_ANCHOR_CAP)).unwrap_or(u32::MAX);
+    let kept = usable.into_iter().take(D_ANCHOR_CAP).collect();
+    (kept, overflow)
+}
+
+fn hit_usable(hit: &DependentHit, rows: &[Row], anchors: &[Anchor], stats: &WriteStats) -> bool {
+    let Some(index) = rows.iter().position(|row| ref_of(row) == hit.canonical) else {
+        return false;
+    };
+    if anchors.iter().any(|anchor| anchor.live == Some(index)) {
+        return false;
+    }
+    let row = &rows[index];
+    if row.pending || !setting_or_rule(&row.pred) {
+        return false;
+    }
+    close_for(hit, stats).is_some()
+}
+
+fn close_for<'a>(
+    hit: &DependentHit,
+    stats: &'a WriteStats,
+) -> Option<&'a super::write::CloseEvent> {
+    stats.close_events.iter().find(|event| {
+        writer_a1(&event.reason) && hit.derived_from.iter().any(|id| id == &event.row_id)
+    })
+}
+
+fn derived_anchor(
+    hit: &DependentHit,
+    rows: &[Row],
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+) -> Option<Anchor> {
+    let index = rows.iter().position(|row| ref_of(row) == hit.canonical)?;
+    let row = &rows[index];
+    let event = close_for(hit, stats)?;
+    let (turn, quote) = facts
+        .get(event.fact_index)
+        .map(|fact| (fact.turn, fact.quote.clone()))
+        .unwrap_or((0, String::new()));
+    Some(Anchor {
+        id: format!("d:{}", ref_of(row)),
+        subject: row.subject.clone(),
+        pred: row.pred.clone(),
+        key: row.key.clone(),
+        value: row.value.clone(),
+        text: row.value.clone(),
+        new_value: row.value.clone(),
+        replaces: String::new(),
+        entity: String::new(),
+        reason: "derived",
+        turn,
+        quote,
+        live: Some(index),
+        a2: false,
+    })
 }
 
 struct ExtraRows<'a> {
@@ -6144,6 +6182,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rule_opened_this_session_keeps_its_new_anchor_only() {
+        let (_tmp, gm) = open().await;
+        let premise = uses("harbor", "queue", "harbor uses queue");
+        let partner = rule(
+            "birch",
+            Kind::Project,
+            "keep one spool ready for the workers",
+            "keep one spool ready for the workers",
+        );
+        commit_linked(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[turn("harbor uses queue")],
+            &[premise, partner],
+        )
+        .await;
+        let fresh = "keep one queue ready for the workers";
+        let mut created = rule("birch", Kind::Project, fresh, fresh);
+        created.turn = 0;
+        let quote = "queue is retired from the dock";
+        let mut rejection = uses("harbor", "queue", quote);
+        rejection.status = "rejected".into();
+        rejection.turn = 1;
+        let turns = [
+            turn(fresh),
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: quote.into(),
+            },
+        ];
+        let stats = commit_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[created.clone(), rejection.clone()],
+        )
+        .await;
+        assert_eq!(stats.close_events.len(), 1, "{:?}", stats.close_events);
+        let birch = slots(&gm, "birch").await;
+        let linked = slot_of(&birch, fresh);
+        assert!(
+            linked
+                .get("derived_from")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| !ids.is_empty()),
+            "{linked}"
+        );
+        let stub = Stub::new(Answer::Reply(
+            r#"{"pairs":[{"i":1,"verdict":"unsure","quote":""}]}"#.into(),
+        ));
+        let report = pass_linked(
+            &gm,
+            "s2",
+            "2026-04-11",
+            &turns,
+            &[created, rejection],
+            &stats,
+            &stub,
+        )
+        .await;
+        assert_eq!(report.links.d_anchors_added, 0);
+        assert_eq!(report.links.d_anchor_overflow, 0);
+        let message = stub.message();
+        let lines: Vec<_> = message
+            .lines()
+            .filter(|line| line.contains(fresh))
+            .collect();
+        assert_eq!(lines.len(), 1, "{message}");
+        assert!(lines[0].contains("reason: new"), "{message}");
+        assert!(!message.contains("reason: derived"), "{message}");
+        let birch = slots(&gm, "birch").await;
+        assert!(ended(slot_of(&birch, fresh)).is_none());
+    }
+
+    #[tokio::test]
     async fn a_rejected_premise_adds_a_live_dependent_anchor() {
         let (_tmp, gm) = open().await;
         let premise = uses("harbor", "queue", "harbor uses queue");
@@ -6783,6 +6899,93 @@ mod linked_hit_tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].canonical, "entity:birch#0");
         assert_eq!(hits[0].entity_id, "entity:birch");
+    }
+}
+
+#[cfg(test)]
+mod usable_anchor_tests {
+    use serde_json::Value;
+
+    use super::super::write::{CloseEvent, WriteStats};
+    use super::{capped_usable, DependentHit, Row};
+
+    fn hit(canonical: &str) -> DependentHit {
+        let entity_id = canonical.rsplit_once('#').unwrap().0.to_string();
+        DependentHit {
+            entity_id,
+            canonical: canonical.to_string(),
+            derived_from: vec!["premise".into()],
+        }
+    }
+
+    fn setting_row(canonical: &str, pending: bool, pred: &str) -> Row {
+        let (entity, index) = canonical.rsplit_once('#').unwrap();
+        Row {
+            id: format!("s:{canonical}"),
+            entity: entity.to_string(),
+            slot: Some(index.parse().unwrap()),
+            edge: None,
+            subject: "birch".into(),
+            pred: pred.into(),
+            key: "delay".into(),
+            value: canonical.into(),
+            evidence: Value::Null,
+            from: String::new(),
+            here: false,
+            pending,
+        }
+    }
+
+    #[test]
+    fn an_unusable_hit_among_the_first_four_does_not_inflate_overflow() {
+        let hits = ["e:1#0", "e:2#0", "e:3#0", "e:4#0", "e:5#0", "e:6#0"]
+            .into_iter()
+            .map(hit)
+            .collect::<Vec<_>>();
+        let rows = ["e:2#0", "e:3#0", "e:4#0", "e:5#0", "e:6#0"]
+            .into_iter()
+            .map(|canonical| setting_row(canonical, false, "setting"))
+            .collect::<Vec<_>>();
+        let stats = WriteStats {
+            close_events: vec![CloseEvent {
+                row_id: "premise".into(),
+                reason: "rejected".into(),
+                fact_index: 0,
+            }],
+            ..WriteStats::default()
+        };
+        let (kept, overflow) = capped_usable(&hits, &rows, &[], &stats);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(overflow, 1);
+        assert!(kept.iter().all(|hit| hit.canonical != "e:1#0"));
+        let pending = setting_row("e:2#0", true, "setting");
+        assert_eq!(
+            capped_usable(&hits[..2], &[pending], &[], &stats).0.len(),
+            0
+        );
+        let uses = setting_row("e:2#0", false, "uses");
+        assert_eq!(capped_usable(&hits[..2], &[uses], &[], &stats).0.len(), 0);
+        let quiet = WriteStats::default();
+        assert_eq!(capped_usable(&hits, &rows, &[], &quiet).1, 0);
+        let bound = [super::Anchor {
+            id: "a3:0".into(),
+            subject: "birch".into(),
+            pred: "setting".into(),
+            key: "delay".into(),
+            value: "e:2#0".into(),
+            text: "e:2#0".into(),
+            new_value: "e:2#0".into(),
+            replaces: String::new(),
+            entity: String::new(),
+            reason: "new",
+            turn: 0,
+            quote: "quoted".into(),
+            live: Some(0),
+            a2: false,
+        }];
+        let (kept, overflow) = capped_usable(&hits[1..2], &rows[..1], &bound, &stats);
+        assert!(kept.is_empty());
+        assert_eq!(overflow, 0);
     }
 }
 
