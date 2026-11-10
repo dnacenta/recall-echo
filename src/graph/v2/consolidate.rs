@@ -1899,19 +1899,19 @@ async fn close_duplicate(
     if close_partner_row {
         let before = report.consolidate.closes_dup;
         let reason = close_partner(
-                gm,
-                ctx,
-                anchors,
-                rows,
-                pair,
-                CloseWhy {
-                    reason: "duplicate",
-                    quote: None,
-                    tally: CueTally::none(),
-                },
-                report,
-            )
-            .await;
+            gm,
+            ctx,
+            anchors,
+            rows,
+            pair,
+            CloseWhy {
+                reason: "duplicate",
+                quote: None,
+                tally: CueTally::none(),
+            },
+            report,
+        )
+        .await;
         if report.consolidate.closes_dup > before {
             gone.insert(pair.partner);
             return None;
@@ -8021,7 +8021,11 @@ mod tests {
             assert_eq!(judged.report.consolidate.closes_sup, 0, "{verdict}");
             assert_eq!(judged.report.consolidate.link_sibling, Some(0), "{verdict}");
             assert_eq!(judged.report.consolidate.link_derived, Some(0), "{verdict}");
-            assert_eq!(judged.report.consolidate.quote_trailing, Some(0), "{verdict}");
+            assert_eq!(
+                judged.report.consolidate.quote_trailing,
+                Some(0),
+                "{verdict}"
+            );
             assert!(ended.is_none(), "{verdict}");
         }
     }
@@ -8237,7 +8241,9 @@ mod tests {
             &anchor, &partner, rows, &one, &owners, &session
         ));
         let same = row_named("acme widget", "s", "port", "8080");
-        assert!(!sibling_link(&anchor, &same, rows, &live, &owners, &session));
+        assert!(!sibling_link(
+            &anchor, &same, rows, &live, &owners, &session
+        ));
         let mut aliased = project();
         aliased.aliases = vec!["acme labs".into()];
         let via_alias = vec![("w".into(), "a".into()), ("s".into(), "a".into())];
