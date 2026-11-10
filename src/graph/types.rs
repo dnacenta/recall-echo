@@ -967,6 +967,9 @@ pub struct ComponentEdgesReport {
     pub component_edge_technology: u32,
     #[serde(default)]
     pub component_edge_foreign: u32,
+    /// Seeds whose incoming decided `part_of` page came back full.
+    #[serde(default)]
+    pub part_of_children_truncated: u32,
 }
 
 impl ComponentEdgesReport {
@@ -977,6 +980,7 @@ impl ComponentEdgesReport {
             && self.component_edges_kept_object == 0
             && self.component_edge_technology == 0
             && self.component_edge_foreign == 0
+            && self.part_of_children_truncated == 0
     }
 
     pub(crate) fn add(&mut self, other: Self) {
@@ -992,6 +996,9 @@ impl ComponentEdgesReport {
         self.component_edge_foreign = self
             .component_edge_foreign
             .saturating_add(other.component_edge_foreign);
+        self.part_of_children_truncated = self
+            .part_of_children_truncated
+            .saturating_add(other.part_of_children_truncated);
     }
 }
 
@@ -1339,6 +1346,7 @@ mod tests {
         assert_eq!(encoded["component_edges"]["component_edges_kept_object"], 2);
         assert_eq!(encoded["component_edges"]["component_edge_technology"], 0);
         assert_eq!(encoded["component_edges"]["component_edge_foreign"], 0);
+        assert_eq!(encoded["component_edges"]["part_of_children_truncated"], 0);
         report.component_edges.add(ComponentEdgesReport {
             component_edge_technology: 3,
             component_edge_foreign: 4,

@@ -161,7 +161,16 @@ pub(crate) async fn run(
             names.push(hold.subject.clone());
         }
     }
-    let Ok(loaded) = load_rows(gm, ctx.session_id, &names, &dependents).await else {
+    let Ok(loaded) = load_rows(
+        gm,
+        ctx.session_id,
+        &names,
+        &dependents,
+        ctx.ground_on,
+        &mut report.component_edges.part_of_children_truncated,
+    )
+    .await
+    else {
         report.consolidate.errors += 1;
         report.hold.errors += count(ambiguous.len());
         return;
@@ -2005,38 +2014,108 @@ async fn load_rows(
     session: &str,
     names: &[String],
     extra: &[DependentHit],
+    ground_on: bool,
+    truncated_out: &mut u32,
 ) -> Result<Loaded, GraphError> {
-    let mut entities = load_named(gm, names).await?;
+    let entities = load_named(gm, names).await?;
+    let children = load_part_children(gm, entities, ground_on).await?;
+    let edges = load_live_edges(gm, &children.entities).await?;
+    let mut built = rows_from_entities(session, &children.entities);
+    built.part_of = children.links;
+    append_edge_rows(session, &edges, &mut built);
+    append_extra_rows(gm, session, extra, children.seen, &mut built).await?;
+    note_truncated_children(truncated_out, children.truncated);
+    Ok(Loaded {
+        rows: built.rows,
+        owners: built.owners,
+        part_of: built.part_of,
+    })
+}
+
+struct PartChildren {
+    entities: Vec<Entity>,
+    links: Vec<(String, String)>,
+    seen: BTreeSet<String>,
+    truncated: u32,
+}
+
+struct BuiltRows {
+    names: BTreeMap<String, String>,
+    owners: Vec<(String, String)>,
+    rows: Vec<Row>,
+    part_of: Vec<(String, String)>,
+}
+
+fn note_truncated_children(count: &mut u32, extra: u32) {
+    *count = count.saturating_add(extra);
+}
+
+fn truncated_seed(ground_on: bool, len: usize) -> u32 {
+    u32::from(ground_on && len == 16)
+}
+
+async fn load_part_children(
+    gm: &GraphMemory,
+    mut entities: Vec<Entity>,
+    ground_on: bool,
+) -> Result<PartChildren, GraphError> {
     let mut seen: BTreeSet<String> = entities.iter().map(Entity::id_string).collect();
     let seeds: Vec<String> = seen.iter().cloned().collect();
-    let mut part_links = Vec::new();
+    let mut links = Vec::new();
+    let mut truncated = 0u32;
     for id in &seeds {
-        if part_links.len() >= NEIGHBOUR_CAP {
+        if links.len() >= NEIGHBOUR_CAP {
             break;
         }
-        let mut response = gm
-            .db()
-            .query(
-                "SELECT id, in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE) ORDER BY id LIMIT 16",
-            )
-            .bind(("id", id.clone()))
-            .await?;
-        let incoming: Vec<Value> = deserialize_take(&mut response, 0)?;
-        for row in incoming {
-            let from = id_text(row.get("in"));
-            if from.is_empty() {
-                continue;
-            }
-            part_links.push((from.clone(), id.clone()));
-            if seen.contains(&from) || seen.len() >= NEIGHBOUR_CAP {
-                continue;
-            }
-            seen.insert(from.clone());
-            if let Some(entity) = load_entity(gm, &from).await? {
-                entities.push(entity);
-            }
+        let incoming = part_of_incoming(gm, id).await?;
+        truncated = truncated.saturating_add(truncated_seed(ground_on, incoming.len()));
+        take_incoming(gm, id, incoming, &mut seen, &mut entities, &mut links).await?;
+    }
+    Ok(PartChildren {
+        entities,
+        links,
+        seen,
+        truncated,
+    })
+}
+
+async fn part_of_incoming(gm: &GraphMemory, id: &str) -> Result<Vec<Value>, GraphError> {
+    let mut response = gm
+        .db()
+        .query(
+            "SELECT id, in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE) ORDER BY id LIMIT 16",
+        )
+        .bind(("id", id.to_string()))
+        .await?;
+    deserialize_take(&mut response, 0)
+}
+
+async fn take_incoming(
+    gm: &GraphMemory,
+    id: &str,
+    incoming: Vec<Value>,
+    seen: &mut BTreeSet<String>,
+    entities: &mut Vec<Entity>,
+    links: &mut Vec<(String, String)>,
+) -> Result<(), GraphError> {
+    for row in incoming {
+        let from = id_text(row.get("in"));
+        if from.is_empty() {
+            continue;
+        }
+        links.push((from.clone(), id.to_string()));
+        if seen.contains(&from) || seen.len() >= NEIGHBOUR_CAP {
+            continue;
+        }
+        seen.insert(from.clone());
+        if let Some(entity) = load_entity(gm, &from).await? {
+            entities.push(entity);
         }
     }
+    Ok(())
+}
+
+async fn load_live_edges(gm: &GraphMemory, entities: &[Entity]) -> Result<Vec<Value>, GraphError> {
     let mut edges = Vec::new();
     for entity in entities.iter().take(NEIGHBOUR_CAP) {
         if edges.len() >= ROW_CAP {
@@ -2052,13 +2131,19 @@ async fn load_rows(
         let batch: Vec<Value> = deserialize_take(&mut response, 0)?;
         edges.extend(batch);
     }
-    let mut part_of = part_links;
-    let mut names = BTreeMap::new();
-    let mut owners = Vec::new();
-    let mut rows = Vec::new();
-    for entity in &entities {
+    Ok(edges)
+}
+
+fn rows_from_entities(session: &str, entities: &[Entity]) -> BuiltRows {
+    let mut built = BuiltRows {
+        names: BTreeMap::new(),
+        owners: Vec::new(),
+        rows: Vec::new(),
+        part_of: Vec::new(),
+    };
+    for entity in entities {
         let id = entity.id_string();
-        names.insert(id.clone(), entity.name.clone());
+        built.names.insert(id.clone(), entity.name.clone());
         let Some(attributes) = entity.attributes.as_ref() else {
             continue;
         };
@@ -2073,48 +2158,62 @@ async fn load_rows(
         {
             continue;
         }
-        owners.push((id.clone(), entity.name.clone()));
-        let Some(slots) = v2.get("slots").and_then(Value::as_array) else {
-            continue;
-        };
-        for (index, slot) in slots.iter().enumerate() {
-            if rows.len() >= ROW_CAP {
-                break;
-            }
-            if crud::edge_already_closed(slot.get("valid_until")) {
-                continue;
-            }
-            if slot.get("status").and_then(Value::as_str) != Some("decided") {
-                continue;
-            }
-            rows.push(Row {
-                id: format!("s:{id}:{index}"),
-                entity: id.clone(),
-                slot: Some(index),
-                edge: None,
-                subject: entity.name.clone(),
-                pred: slot
-                    .get("predicate")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
-                key: slot.get("key").and_then(Value::as_str).unwrap_or("").into(),
-                value: slot
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
-                evidence: slot.get("evidence").cloned().unwrap_or(Value::Null),
-                from: slot
-                    .get("valid_from")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
-                here: opened_here(slot.get("evidence"), session),
-                pending: super::write::is_pending(slot),
-            });
-        }
+        built.owners.push((id.clone(), entity.name.clone()));
+        push_open_slots(session, entity, &id, v2, &mut built.rows);
     }
+    built
+}
+
+fn push_open_slots(session: &str, entity: &Entity, id: &str, v2: &Value, rows: &mut Vec<Row>) {
+    let Some(slots) = v2.get("slots").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, slot) in slots.iter().enumerate() {
+        if rows.len() >= ROW_CAP {
+            break;
+        }
+        if !open_decided_slot(slot) {
+            continue;
+        }
+        rows.push(decided_slot_row(session, entity, id, index, slot));
+    }
+}
+
+fn open_decided_slot(slot: &Value) -> bool {
+    !crud::edge_already_closed(slot.get("valid_until"))
+        && slot.get("status").and_then(Value::as_str) == Some("decided")
+}
+
+fn decided_slot_row(session: &str, entity: &Entity, id: &str, index: usize, slot: &Value) -> Row {
+    Row {
+        id: format!("s:{id}:{index}"),
+        entity: id.to_string(),
+        slot: Some(index),
+        edge: None,
+        subject: entity.name.clone(),
+        pred: slot
+            .get("predicate")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        key: slot.get("key").and_then(Value::as_str).unwrap_or("").into(),
+        value: slot
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        evidence: slot.get("evidence").cloned().unwrap_or(Value::Null),
+        from: slot
+            .get("valid_from")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        here: opened_here(slot.get("evidence"), session),
+        pending: super::write::is_pending(slot),
+    }
+}
+
+fn append_edge_rows(session: &str, edges: &[Value], built: &mut BuiltRows) {
     for edge in edges.iter().take(ROW_CAP) {
         if crud::edge_already_closed(edge.get("valid_until")) {
             continue;
@@ -2126,27 +2225,51 @@ async fn load_rows(
             continue;
         }
         if rel == "part_of" {
-            part_of.push((from.clone(), to.clone()));
+            built.part_of.push((from.clone(), to.clone()));
         }
         if !Predicate::parse(rel).is_some_and(Predicate::is_edge) {
             continue;
         }
-        let evidence = edge.get("evidence").cloned().unwrap_or(Value::Null);
-        rows.push(Row {
-            id: format!("e:{}", id_text(edge.get("id"))),
-            entity: from.clone(),
-            slot: None,
-            edge: Some(id_text(edge.get("id"))),
-            subject: names.get(&from).cloned().unwrap_or_default(),
-            pred: rel.to_string(),
-            key: String::new(),
-            value: names.get(&to).cloned().unwrap_or_default(),
-            from: json_text(edge.get("valid_from")),
-            here: opened_here(Some(&evidence), session),
-            pending: edge.get("pending").is_some_and(Value::is_object),
-            evidence,
-        });
+        let subject = built.names.get(&from).cloned().unwrap_or_default();
+        let value = built.names.get(&to).cloned().unwrap_or_default();
+        built
+            .rows
+            .push(edge_row(session, edge, rel, &from, subject, value));
     }
+}
+
+fn edge_row(
+    session: &str,
+    edge: &Value,
+    rel: &str,
+    from: &str,
+    subject: String,
+    value: String,
+) -> Row {
+    let evidence = edge.get("evidence").cloned().unwrap_or(Value::Null);
+    Row {
+        id: format!("e:{}", id_text(edge.get("id"))),
+        entity: from.to_string(),
+        slot: None,
+        edge: Some(id_text(edge.get("id"))),
+        subject,
+        pred: rel.to_string(),
+        key: String::new(),
+        value,
+        from: json_text(edge.get("valid_from")),
+        here: opened_here(Some(&evidence), session),
+        pending: edge.get("pending").is_some_and(Value::is_object),
+        evidence,
+    }
+}
+
+async fn append_extra_rows(
+    gm: &GraphMemory,
+    session: &str,
+    extra: &[DependentHit],
+    mut seen: BTreeSet<String>,
+    built: &mut BuiltRows,
+) -> Result<(), GraphError> {
     for hit in extra {
         let already = seen.contains(&hit.entity_id);
         append_extra_entity(
@@ -2155,20 +2278,16 @@ async fn load_rows(
             hit,
             already,
             &mut ExtraRows {
-                names: &mut names,
-                owners: &mut owners,
-                rows: &mut rows,
-                part_of: &mut part_of,
+                names: &mut built.names,
+                owners: &mut built.owners,
+                rows: &mut built.rows,
+                part_of: &mut built.part_of,
             },
         )
         .await?;
         seen.insert(hit.entity_id.clone());
     }
-    Ok(Loaded {
-        rows,
-        owners,
-        part_of,
-    })
+    Ok(())
 }
 
 /// At most this many dependents become extra anchors in one session.
@@ -4799,7 +4918,8 @@ mod tests {
             .expect("slot canonical")
             .0
             .to_string();
-        let without = super::load_rows(&gm, "s9", &["birch".into()], &[])
+        let mut unused = 0;
+        let without = super::load_rows(&gm, "s9", &["birch".into()], &[], false, &mut unused)
             .await
             .unwrap();
         assert!(
@@ -4814,7 +4934,8 @@ mod tests {
             canonical: canonical.clone(),
             derived_from: vec!["entity:harbor#0".into()],
         };
-        let with = super::load_rows(&gm, "s9", &["birch".into()], &[hit])
+        let mut unused = 0;
+        let with = super::load_rows(&gm, "s9", &["birch".into()], &[hit], false, &mut unused)
             .await
             .unwrap();
         assert!(
@@ -4840,7 +4961,8 @@ mod tests {
             ));
         }
         commit(&gm, "s1", "2026-03-01", &[turn("pieces")], &facts).await;
-        let loaded = super::load_rows(&gm, "s9", &["acme".into()], &[])
+        let mut unused = 0;
+        let loaded = super::load_rows(&gm, "s9", &["acme".into()], &[], false, &mut unused)
             .await
             .unwrap();
         let project = loaded
@@ -4873,6 +4995,65 @@ mod tests {
             .collect();
         assert_eq!(loaded_ids.len(), 16);
         assert_eq!(loaded_ids, first);
+    }
+
+    /// A full incoming page counts only while component grounding is on.
+    #[tokio::test]
+    async fn part_of_children_truncated_counts_a_full_page_when_grounding() {
+        let (_tmp, gm) = open().await;
+        store_parts(&gm, 17).await;
+        let mut counted = 0;
+        let on = super::load_rows(&gm, "s9", &["acme".into()], &[], true, &mut counted)
+            .await
+            .unwrap();
+        let mut quiet = 0;
+        let off = super::load_rows(&gm, "s9", &["acme".into()], &[], false, &mut quiet)
+            .await
+            .unwrap();
+        assert_eq!(counted, 1);
+        assert_eq!(quiet, 0);
+        assert_eq!(part_children(&on), 16);
+        assert_eq!(part_children(&off), 16);
+        let report = crate::graph::types::ComponentEdgesReport {
+            part_of_children_truncated: counted,
+            ..crate::graph::types::ComponentEdgesReport::default()
+        };
+        assert_eq!(report.part_of_children_truncated, 1);
+        assert!(!report.is_blank());
+        let encoded = serde_json::to_value(report).unwrap();
+        assert_eq!(encoded["part_of_children_truncated"], 1);
+
+        let (_tmp, small) = open().await;
+        store_parts(&small, 15).await;
+        let mut page_count = 0;
+        let page = super::load_rows(&small, "s9", &["acme".into()], &[], true, &mut page_count)
+            .await
+            .unwrap();
+        assert_eq!(page_count, 0);
+        assert_eq!(part_children(&page), 15);
+    }
+
+    async fn store_parts(gm: &GraphMemory, count: usize) {
+        let mut facts = vec![setting("acme", Kind::Project, "note", "acme note", "note")];
+        for index in 0..count {
+            let name = format!("piece{index:02}");
+            facts.push(edge(
+                Predicate::PartOf,
+                &name,
+                Kind::Component,
+                "acme",
+                Kind::Project,
+            ));
+        }
+        commit(gm, "s1", "2026-03-01", &[turn("pieces")], &facts).await;
+    }
+
+    fn part_children(loaded: &super::Loaded) -> usize {
+        loaded
+            .owners
+            .iter()
+            .filter(|(_, name)| name != "acme")
+            .count()
     }
 
     fn one(text: &str) -> (String, String) {
