@@ -8496,6 +8496,7 @@ mod tests {
             "The picker timeout is 15 seconds now.",
             "They said the outbound timeout is 15 seconds now.",
             "The outbound timeout is 15 seconds now from 10.",
+            "The outbound timeout is 15 or 20 seconds now.",
         ] {
             let judged = quote_case(
                 "outbound_timeout_seconds",
