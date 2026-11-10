@@ -152,6 +152,10 @@ pub(crate) struct WriteCtx<'a> {
     /// Store `derived_from` on a new decided setting or rule.
     /// Off leaves the write unchanged.
     pub links_on: bool,
+    /// Accept component `part_of` the session project on subject support,
+    /// and follow only decided `part_of` edges in retirement scope.
+    /// Off leaves both paths unchanged.
+    pub ground_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -176,6 +180,7 @@ impl<'a> WriteCtx<'a> {
             targets: Vec::new(),
             hold_on: false,
             links_on: false,
+            ground_on: false,
         }
     }
 }
@@ -1310,7 +1315,7 @@ impl<'a> Attempt<'a> {
         }
         let mut response = self
             .tx
-            .query(SCOPE_PART_OF)
+            .query(scope_part_of(self.ctx.ground_on))
             .bind(("id", subject.id.clone()))
             .await?;
         let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
@@ -1746,6 +1751,18 @@ const PREMISE_EDGES: &str = "SELECT id, rel_type, status, valid_until, pending, 
 /// Live `part_of` edges that point at one record. A graph-edge scan.
 const SCOPE_PART_OF: &str = "SELECT in FROM type::record($id)<-(relates_to \
      WHERE rel_type = 'part_of' AND valid_until = NONE)";
+
+/// Decided live `part_of` edges. Selected only when component grounding is on.
+const SCOPE_PART_OF_DECIDED: &str = "SELECT in FROM type::record($id)<-(relates_to \
+     WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE)";
+
+fn scope_part_of(ground_on: bool) -> &'static str {
+    if ground_on {
+        SCOPE_PART_OF_DECIDED
+    } else {
+        SCOPE_PART_OF
+    }
+}
 
 pub(crate) const CLOSE_EDGE: &str = r#"
     UPDATE type::record($id) SET
@@ -3201,6 +3218,7 @@ mod tests {
                 targets: Vec::new(),
                 hold_on: false,
                 links_on: false,
+                ground_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4466,6 +4484,7 @@ mod tests {
             targets: Vec::new(),
             hold_on: false,
             links_on: false,
+            ground_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -4533,6 +4552,29 @@ mod tests {
             !plan_has_operator(&plan, "TableScan"),
             "scope scanned the table. Plan: {plan}"
         );
+        let plan = explain_full(gm.db(), SCOPE_PART_OF_DECIDED, &app_id).await;
+        assert!(
+            plan_has_operator(&plan, "GraphEdgeScan"),
+            "decided scope must be a graph-edge scan. Plan: {plan}"
+        );
+        assert!(
+            !plan_has_operator(&plan, "TableScan"),
+            "decided scope scanned the table. Plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn scope_part_of_constant_is_unchanged_until_the_flag_selects_decided() {
+        assert_eq!(
+            SCOPE_PART_OF,
+            "SELECT in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND valid_until = NONE)"
+        );
+        assert_eq!(
+            SCOPE_PART_OF_DECIDED,
+            "SELECT in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE)"
+        );
+        assert_eq!(scope_part_of(false), SCOPE_PART_OF);
+        assert_eq!(scope_part_of(true), SCOPE_PART_OF_DECIDED);
     }
 
     #[cfg(feature = "embedded")]
@@ -4813,6 +4855,103 @@ mod tests {
         );
         let edges = crud::list_all_relationships(gm.db()).await.unwrap();
         assert_eq!(live(&edges), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_part_of_does_not_widen_scope_when_the_flag_is_on() {
+        assert!(
+            !undecided_part_of_closes_setting("rejected", true).await,
+            "a rejected part_of widened scope"
+        );
+        assert!(
+            undecided_part_of_closes_setting("rejected", false).await,
+            "flag off stopped following a rejected part_of"
+        );
+        assert!(
+            !undecided_part_of_closes_setting("considered", true).await,
+            "a considered part_of widened scope"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn undecided_part_of_closes_setting(status: &str, ground_on: bool) -> bool {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            ground_on,
+            &[
+                project_setting(
+                    "exporter",
+                    Kind::Component,
+                    "format",
+                    "csv",
+                    "decided",
+                    1,
+                ),
+                component_part_of("exporter", "acme", status),
+            ],
+        )
+        .await;
+        write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            ground_on,
+            &[project_setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await;
+        let slots = slots_of(&gm, "exporter").await;
+        !slot_named(&slots, "format", "csv")["valid_until"].is_null()
+    }
+
+    #[cfg(feature = "embedded")]
+    fn component_part_of(subject: &str, project: &str, status: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: None,
+            key: String::new(),
+            object_name: project.into(),
+            object_kind: Some(Kind::Project),
+            status: status.into(),
+            turn: 1,
+            quote: format!("{subject} belongs to {project}"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn write_project(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        project: &str,
+        ground_on: bool,
+        facts: &[Fact],
+    ) {
+        let project = ProjectIdentity {
+            name: project.into(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let mut ctx = WriteCtx::new(&llm, &project, session_id, date, &[]);
+        ctx.ground_on = ground_on;
+        write_facts(gm, &ctx, facts).await.unwrap();
     }
 
     #[cfg(feature = "embedded")]
@@ -5502,6 +5641,7 @@ mod tests {
             match_on: true,
             hold_on: false,
             links_on: false,
+            ground_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -7384,6 +7524,7 @@ mod tests {
             targets: Vec::new(),
             hold_on: false,
             links_on: true,
+            ground_on: false,
         };
         let result = write_facts(
             &gm,

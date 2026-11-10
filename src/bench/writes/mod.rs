@@ -26,6 +26,7 @@ pub use grade::{
 };
 pub use run::{
     require_scratch, run, run_repeat, Consolidate, ConsolidateLinks, DropRestatements, Extractor,
+    GroundComponentEdges,
     KnownFactsContext, KnownMatch, MetricRange, MetricSet, MetricSpan, RepeatReport,
 };
 pub use script::{
