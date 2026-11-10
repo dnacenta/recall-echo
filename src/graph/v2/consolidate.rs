@@ -1415,9 +1415,6 @@ struct CueInputs<'a> {
 }
 
 enum CueBranch {
-    None,
-    Same,
-    PartOf,
     Sibling,
     Derived,
     Trailing,
@@ -1486,10 +1483,10 @@ fn component_cue(
     (accept, tally)
 }
 
-fn kept_tally(links: &PairLinks, branch: CueBranch, made: bool) -> CueTally {
-    if !made {
+fn kept_tally(links: &PairLinks, branch: Option<CueBranch>, made: bool) -> CueTally {
+    let Some(branch) = branch.filter(|_| made) else {
         return CueTally::none();
-    }
+    };
     CueTally {
         trailing: matches!(branch, CueBranch::Trailing),
         sibling: sibling_branch(links, &branch),
@@ -1511,14 +1508,8 @@ fn derived_branch(links: &PairLinks, branch: &CueBranch) -> bool {
             && !links.sibling)
 }
 
-fn cue_branch(links: &PairLinks, quoted: bool, trailing: bool) -> CueBranch {
-    if let Some(branch) = quote_branch(quoted, trailing) {
-        return branch;
-    }
-    if let Some(branch) = open_link(links) {
-        return branch;
-    }
-    direct_branch(links)
+fn cue_branch(links: &PairLinks, quoted: bool, trailing: bool) -> Option<CueBranch> {
+    quote_branch(quoted, trailing).or_else(|| open_link(links))
 }
 
 fn quote_branch(quoted: bool, trailing: bool) -> Option<CueBranch> {
@@ -1533,16 +1524,6 @@ fn open_link(links: &PairLinks) -> Option<CueBranch> {
         return Some(CueBranch::Sibling);
     }
     links.derived.then_some(CueBranch::Derived)
-}
-
-fn direct_branch(links: &PairLinks) -> CueBranch {
-    if links.direct {
-        CueBranch::PartOf
-    } else if links.same {
-        CueBranch::Same
-    } else {
-        CueBranch::None
-    }
 }
 
 fn joined_cue(depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool {
