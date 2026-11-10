@@ -110,6 +110,31 @@ pub struct SessionObservation {
     pub links: crate::graph::types::LinksReport,
     /// Component `part_of` counts. Blank when that switch is off.
     pub component_edges: crate::graph::types::ComponentEdgesReport,
+    /// Stored status, pending rows and rejected slots around this session.
+    /// Grading diffs `before` and `after` only and does not read this.
+    pub status_rows: StatusWindow,
+}
+
+/// One store row with the status the grader does not read.
+///
+/// Rejected slots are included here. A relationship's `status` is the stored
+/// value, and is absent when the row has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRow {
+    pub id: String,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub live: bool,
+    pub status: Option<String>,
+    pub pending: bool,
+}
+
+/// Status rows before and after one session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusWindow {
+    pub before: Vec<StatusRow>,
+    pub after: Vec<StatusRow>,
 }
 
 /// Precision and recall for one operation.
@@ -158,6 +183,29 @@ pub struct JunkEdge {
     pub subject: String,
     pub relation: String,
     pub object: String,
+}
+
+/// One row of the final store.
+///
+/// Exact-key hits and rejected slots are included. `status`, `pending`,
+/// `retired_in`, `matched` and `pattern_fact` are omitted when they do not apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FinalEdge {
+    pub id: String,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub live: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_in: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern_fact: Option<String>,
 }
 
 /// One claim, and the operation the graph actually performed.
@@ -308,6 +356,10 @@ pub struct WriteReport {
     /// so an off run keeps its previous shape.
     #[serde(default, skip_serializing_if = "is_false")]
     pub consolidate_hold: bool,
+    /// Every row in the final store. Omitted when there are none, so a report
+    /// with no rows keeps its previous shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_edges: Vec<FinalEdge>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -542,34 +594,8 @@ pub fn grade_with_pipeline(
     extractor: ExtractorLabel,
     pipeline: PipelineVersion,
 ) -> Result<WriteReport, RecallError> {
-    if sessions.len() != script.sessions.len() {
-        return Err(RecallError::Config(format!(
-            "expected {} session observations, got {}",
-            script.sessions.len(),
-            sessions.len()
-        )));
-    }
-    if keyword_hits.len() != script.questions.len() {
-        return Err(RecallError::Config(format!(
-            "expected {} keyword results, got {}",
-            script.questions.len(),
-            keyword_hits.len()
-        )));
-    }
-
-    let mut tally = Tally::new();
-    let mut steps = Vec::new();
-    for (session, observed) in script.sessions.iter().zip(sessions) {
-        if session.id != observed.id {
-            return Err(RecallError::Config(format!(
-                "observation '{}' does not match session '{}'",
-                observed.id, session.id
-            )));
-        }
-        grade_session(
-            script, session, observed, weights, pipeline, &mut tally, &mut steps,
-        )?;
-    }
+    check_grade_inputs(script, sessions, keyword_hits)?;
+    let (tally, steps) = score_sessions(script, sessions, weights, pipeline)?;
 
     let final_edges = sessions.last().map(|s| s.after.as_slice()).unwrap_or(&[]);
     let mut wrong_facts = end_state(script, final_edges, weights)?;
@@ -632,7 +658,52 @@ pub fn grade_with_pipeline(
         patterns: score_patterns(script, sessions)?,
         consolidate_drops: sum_consolidate_drops(sessions),
         consolidate_hold: false,
+        final_edges: final_edge_rows(script, sessions)?,
     })
+}
+
+fn check_grade_inputs(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+    keyword_hits: &[bool],
+) -> Result<(), RecallError> {
+    if sessions.len() != script.sessions.len() {
+        return Err(RecallError::Config(format!(
+            "expected {} session observations, got {}",
+            script.sessions.len(),
+            sessions.len()
+        )));
+    }
+    if keyword_hits.len() != script.questions.len() {
+        return Err(RecallError::Config(format!(
+            "expected {} keyword results, got {}",
+            script.questions.len(),
+            keyword_hits.len()
+        )));
+    }
+    Ok(())
+}
+
+fn score_sessions(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+    weights: &ProvenanceWeights,
+    pipeline: PipelineVersion,
+) -> Result<(Tally, Vec<StepLog>), RecallError> {
+    let mut tally = Tally::new();
+    let mut steps = Vec::new();
+    for (session, observed) in script.sessions.iter().zip(sessions) {
+        if session.id != observed.id {
+            return Err(RecallError::Config(format!(
+                "observation '{}' does not match session '{}'",
+                observed.id, session.id
+            )));
+        }
+        grade_session(
+            script, session, observed, weights, pipeline, &mut tally, &mut steps,
+        )?;
+    }
+    Ok((tally, steps))
 }
 
 /// Reasons a consolidation guard dropped a verdict, summed over the run.
@@ -1126,6 +1197,257 @@ impl ObservedEdge {
 
 fn fold(text: &str) -> String {
     text.trim().to_lowercase()
+}
+
+impl StatusRow {
+    fn key(&self) -> EdgeKey {
+        (
+            fold(&self.subject),
+            fold(&self.relation),
+            fold(&self.object),
+        )
+    }
+}
+
+fn final_edge_rows(
+    script: &FactScript,
+    sessions: &[SessionObservation],
+) -> Result<Vec<FinalEdge>, RecallError> {
+    let Some(last) = sessions.last() else {
+        return Ok(Vec::new());
+    };
+    let retired = retirement_by_id(sessions);
+    let matched = exact_fact_by_key(script);
+    let patterned = pattern_fact_by_record(script, &last.after)?;
+    let status = index_status(&last.status_rows.after);
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for edge in &last.after {
+        seen.insert(edge.id.clone());
+        rows.push(final_from_observed(
+            edge,
+            status.get(&edge.id).copied(),
+            &retired,
+            &matched,
+            &patterned,
+        ));
+    }
+    for row in &last.status_rows.after {
+        if seen.contains(&row.id) {
+            continue;
+        }
+        rows.push(final_from_status(row, &retired, &matched, &patterned));
+    }
+    rows.sort_by(final_edge_order);
+    Ok(rows)
+}
+
+fn index_status(rows: &[StatusRow]) -> HashMap<String, &StatusRow> {
+    rows.iter().map(|row| (row.id.clone(), row)).collect()
+}
+
+fn final_from_observed(
+    edge: &ObservedEdge,
+    status: Option<&StatusRow>,
+    retired: &HashMap<String, String>,
+    matched: &HashMap<EdgeKey, String>,
+    patterned: &HashMap<String, String>,
+) -> FinalEdge {
+    FinalEdge {
+        id: edge.id.clone(),
+        subject: edge.subject.clone(),
+        relation: edge.relation.clone(),
+        object: edge.object.clone(),
+        live: reported_live(edge.live, status),
+        status: status.and_then(|row| row.status.clone()),
+        pending: status.is_some_and(|row| row.pending),
+        retired_in: retired.get(&edge.id).cloned(),
+        matched: matched.get(&edge.key()).cloned(),
+        pattern_fact: patterned.get(&edge.id).cloned(),
+    }
+}
+
+fn reported_live(live: bool, status: Option<&StatusRow>) -> bool {
+    live && !rejected_status(status)
+}
+
+fn rejected_status(status: Option<&StatusRow>) -> bool {
+    let Some(row) = status else {
+        return false;
+    };
+    row.status.as_deref() == Some("rejected")
+}
+
+fn final_from_status(
+    row: &StatusRow,
+    retired: &HashMap<String, String>,
+    matched: &HashMap<EdgeKey, String>,
+    patterned: &HashMap<String, String>,
+) -> FinalEdge {
+    FinalEdge {
+        id: row.id.clone(),
+        subject: row.subject.clone(),
+        relation: row.relation.clone(),
+        object: row.object.clone(),
+        live: row.live,
+        status: row.status.clone(),
+        pending: row.pending,
+        retired_in: retired.get(&row.id).cloned(),
+        matched: matched.get(&row.key()).cloned(),
+        pattern_fact: patterned.get(&row.id).cloned(),
+    }
+}
+
+fn final_edge_order(left: &FinalEdge, right: &FinalEdge) -> std::cmp::Ordering {
+    (&left.subject, &left.relation, &left.object, &left.id).cmp(&(
+        &right.subject,
+        &right.relation,
+        &right.object,
+        &right.id,
+    ))
+}
+
+fn exact_fact_by_key(script: &FactScript) -> HashMap<EdgeKey, String> {
+    let mut matched = HashMap::new();
+    for fact in &script.facts {
+        matched
+            .entry(fact_key(fact))
+            .or_insert_with(|| fact.id.clone());
+    }
+    matched
+}
+
+fn pattern_fact_by_record(
+    script: &FactScript,
+    edges: &[ObservedEdge],
+) -> Result<HashMap<String, String>, RecallError> {
+    let facts = compile_pattern_facts(script)?;
+    if facts.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(assigned_fact_ids(&facts, &record_refs(edges)))
+}
+
+fn assigned_fact_ids(facts: &[PatternFact<'_>], records: &[RecordRef]) -> HashMap<String, String> {
+    let assignment = assign_records(facts, records);
+    let mut by_record = HashMap::new();
+    for (fact_index, record_index) in assignment.by_fact.iter().enumerate() {
+        let Some(record_index) = *record_index else {
+            continue;
+        };
+        by_record.insert(
+            records[record_index].id.clone(),
+            facts[fact_index].fact.id.clone(),
+        );
+    }
+    by_record
+}
+
+fn retirement_by_id(sessions: &[SessionObservation]) -> HashMap<String, String> {
+    let mut earlier_live = HashMap::new();
+    let mut retired = HashMap::new();
+    for session in sessions {
+        record_session_closes(session, &earlier_live, &mut retired);
+        earlier_live = after_live_map(session);
+    }
+    retired
+}
+
+fn record_session_closes(
+    session: &SessionObservation,
+    earlier_live: &HashMap<String, bool>,
+    retired: &mut HashMap<String, String>,
+) {
+    let before = live_map(&session.before, &session.status_rows.before);
+    let after = live_map(&session.after, &session.status_rows.after);
+    for id in session_ids(session) {
+        apply_close(session, &id, &before, &after, earlier_live, retired);
+    }
+}
+
+fn apply_close(
+    session: &SessionObservation,
+    id: &str,
+    before: &HashMap<String, bool>,
+    after: &HashMap<String, bool>,
+    earlier_live: &HashMap<String, bool>,
+    retired: &mut HashMap<String, String>,
+) {
+    let now_live = after.get(id).copied().unwrap_or(false);
+    if now_live {
+        retired.remove(id);
+        return;
+    }
+    if seen_live(before, id, earlier_live) || same_session_close(session, id, before, earlier_live)
+    {
+        retired.insert(id.to_string(), session.id.clone());
+    }
+}
+
+fn seen_live(before: &HashMap<String, bool>, id: &str, earlier: &HashMap<String, bool>) -> bool {
+    before.get(id).copied().unwrap_or(false) || earlier.get(id).copied().unwrap_or(false)
+}
+
+/// Opened and closed inside this session: the after-state is the first time
+/// the row is seen, and it is already not live.
+fn same_session_close(
+    session: &SessionObservation,
+    id: &str,
+    before: &HashMap<String, bool>,
+    earlier: &HashMap<String, bool>,
+) -> bool {
+    if before.contains_key(id) || earlier.contains_key(id) {
+        return false;
+    }
+    closed_edge(&session.after, id) && !aside_birth(&session.status_rows.after, id)
+}
+
+fn closed_edge(edges: &[ObservedEdge], id: &str) -> bool {
+    edges.iter().any(|edge| edge.id == id && !edge.live)
+}
+
+fn aside_birth(rows: &[StatusRow], id: &str) -> bool {
+    rows.iter().any(|row| row.id == id && held_or_rejected(row))
+}
+
+fn held_or_rejected(row: &StatusRow) -> bool {
+    row.pending || row.status.as_deref() == Some("rejected")
+}
+
+fn session_ids(session: &SessionObservation) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    collect_edge_ids(&mut ids, &session.before);
+    collect_edge_ids(&mut ids, &session.after);
+    collect_status_ids(&mut ids, &session.status_rows.before);
+    collect_status_ids(&mut ids, &session.status_rows.after);
+    ids
+}
+
+fn collect_edge_ids(ids: &mut HashSet<String>, edges: &[ObservedEdge]) {
+    for edge in edges {
+        ids.insert(edge.id.clone());
+    }
+}
+
+fn collect_status_ids(ids: &mut HashSet<String>, rows: &[StatusRow]) {
+    for row in rows {
+        ids.insert(row.id.clone());
+    }
+}
+
+fn after_live_map(session: &SessionObservation) -> HashMap<String, bool> {
+    live_map(&session.after, &session.status_rows.after)
+}
+
+fn live_map(edges: &[ObservedEdge], rows: &[StatusRow]) -> HashMap<String, bool> {
+    let mut live = HashMap::new();
+    for edge in edges {
+        live.insert(edge.id.clone(), edge.live);
+    }
+    for row in rows {
+        live.insert(row.id.clone(), row.live);
+    }
+    live
 }
 
 fn approx(actual: f64, expected: f64) -> bool {
@@ -1796,6 +2118,7 @@ mod tests {
             hold: crate::graph::types::HoldReport::default(),
             links: crate::graph::types::LinksReport::default(),
             component_edges: crate::graph::types::ComponentEdgesReport::default(),
+            status_rows: StatusWindow::default(),
         }
     }
 
@@ -2021,6 +2344,432 @@ mod tests {
         assert!(report.patterns.is_none());
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("patterns"), "{json}");
+    }
+
+    #[test]
+    fn grading_ignores_the_status_side_channel() {
+        let user = weights().weight_user;
+        let sessions = perfect_observations(user);
+        let mut with_status = sessions.clone();
+        let last = with_status.last_mut().expect("sessions");
+        last.status_rows.after.push(StatusRow {
+            id: "entity:host|setting|host|birch|t0|rejected".into(),
+            subject: "deploy".into(),
+            relation: "setting".into(),
+            object: "birch".into(),
+            live: false,
+            status: Some("rejected".into()),
+            pending: false,
+        });
+        let plain = grade_history(sessions, true);
+        let extra = grade_history(with_status, true);
+        assert_eq!(plain.operations, extra.operations);
+        assert_eq!(plain.junk_edges, extra.junk_edges);
+        assert_eq!(plain.wrong_facts, extra.wrong_facts);
+        assert_eq!(plain.steps, extra.steps);
+        assert_eq!(plain.patterns, extra.patterns);
+        assert!(extra.junk_edges.iter().all(|edge| edge.object != "birch"));
+        let birch = extra
+            .final_edges
+            .iter()
+            .find(|edge| edge.object == "birch")
+            .expect("rejected row");
+        assert_eq!(birch.status.as_deref(), Some("rejected"));
+        assert!(plain.final_edges.iter().all(|edge| edge.object != "birch"));
+    }
+
+    fn assert_final_edges_are_additive(report: &WriteReport) {
+        let full = serde_json::to_string(report).unwrap();
+        let mut disabled = report.clone();
+        disabled.final_edges.clear();
+        let bare = serde_json::to_string(&disabled).unwrap();
+        if report.final_edges.is_empty() {
+            assert_eq!(full, bare);
+            return;
+        }
+        let prefix = &bare[..bare.len() - 1];
+        assert_eq!(&full[..prefix.len()], prefix);
+        assert!(full[prefix.len()..].starts_with(",\"final_edges\":"));
+        assert!(full.ends_with('}'));
+    }
+
+    #[test]
+    fn existing_reports_stay_byte_identical_without_final_edges() {
+        let user = weights().weight_user;
+        assert_final_edges_are_additive(&grade_history(perfect_observations(user), true));
+        let mut sessions = perfect_observations(user);
+        let mut after = sessions[5].after.clone();
+        after.push(edge("junk", "kettle", true, 9.0, 1.0, 0));
+        sessions[5].after = after;
+        assert_final_edges_are_additive(&grade_history(sessions, true));
+        let empty = grade(
+            &script_of(vec![]),
+            &[obs("s1", vec![], vec![])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert_final_edges_are_additive(&empty);
+        assert_final_edges_are_additive(
+            &grade(
+                &pattern_script(),
+                &pattern_observations(),
+                &weights(),
+                &[],
+                ExtractorLabel::Scripted,
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn an_exact_key_row_is_listed_and_still_absent_from_junk() {
+        let pine = edge("pine", "Pine", true, 9.0, 1.0, 0);
+        let mut kettle = edge("junk", "kettle", true, 9.0, 1.0, 0);
+        kettle.subject = "weather".into();
+        kettle.relation = "mentions".into();
+        let report = grade(
+            &script_of(vec![fact("host", "pine")]),
+            &[obs("s1", vec![], vec![kettle, pine])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert_eq!(report.junk_edges.len(), 1);
+        assert_eq!(report.junk_edges[0].object, "kettle");
+        assert_eq!(report.final_edges.len(), 2);
+        assert_eq!(report.final_edges[0].id, "pine");
+        assert_eq!(report.final_edges[0].matched.as_deref(), Some("host"));
+        assert_eq!(report.final_edges[1].object, "kettle");
+        assert!(report.final_edges[1].matched.is_none());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["final_edges"][0]["matched"], "host");
+        assert!(json["final_edges"][1].get("matched").is_none());
+    }
+
+    fn grade_named(ids: &[&str], observations: Vec<SessionObservation>) -> WriteReport {
+        let mut script = script_of(vec![
+            fact("host", "pine"),
+            fact("oak", "oak"),
+            fact("birch", "birch"),
+        ]);
+        script.sessions = ids
+            .iter()
+            .map(|id| session(id, turn(Speaker::User, id, vec![], false)))
+            .collect();
+        grade(
+            &script,
+            &observations,
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap()
+    }
+
+    fn final_row<'a>(report: &'a WriteReport, id: &str) -> &'a FinalEdge {
+        report
+            .final_edges
+            .iter()
+            .find(|edge| edge.id == id)
+            .unwrap_or_else(|| panic!("missing {id}"))
+    }
+
+    #[test]
+    fn retired_in_is_the_session_that_closed_the_row() {
+        let pine_live = edge("pine", "pine", true, 9.0, 1.0, 0);
+        let pine_dead = edge("pine", "pine", false, 9.0, 1.0, 0);
+        let oak = edge("oak", "oak", true, 9.0, 1.0, 0);
+        let birch = edge("birch", "birch", false, 9.0, 1.0, 0);
+        let closed = grade_named(
+            &["s1", "s2", "s3"],
+            vec![
+                obs("s1", vec![], vec![pine_live.clone()]),
+                obs("s2", vec![pine_live.clone()], vec![pine_live.clone()]),
+                obs(
+                    "s3",
+                    vec![pine_live.clone()],
+                    vec![pine_dead.clone(), oak.clone(), birch.clone()],
+                ),
+            ],
+        );
+        assert!(closed
+            .sessions
+            .iter()
+            .all(|session| session.retirements.is_empty()));
+        assert_eq!(final_row(&closed, "pine").retired_in.as_deref(), Some("s3"));
+        assert!(final_row(&closed, "oak").retired_in.is_none());
+        assert_eq!(
+            final_row(&closed, "birch").retired_in.as_deref(),
+            Some("s3")
+        );
+        let oak_json = serde_json::to_value(final_row(&closed, "oak")).unwrap();
+        assert!(oak_json.get("retired_in").is_none());
+
+        let reopened = grade_named(
+            &["s1", "s2", "s3", "s4"],
+            vec![
+                obs("s1", vec![], vec![pine_live.clone()]),
+                obs("s2", vec![pine_live.clone()], vec![pine_dead.clone()]),
+                obs("s3", vec![pine_dead.clone()], vec![pine_live.clone()]),
+                obs("s4", vec![pine_live.clone()], vec![pine_dead.clone()]),
+            ],
+        );
+        assert_eq!(
+            final_row(&reopened, "pine").retired_in.as_deref(),
+            Some("s4")
+        );
+
+        let live_again = grade_named(
+            &["s1", "s2", "s3"],
+            vec![
+                obs("s1", vec![], vec![pine_live.clone()]),
+                obs("s2", vec![pine_live.clone()], vec![pine_dead.clone()]),
+                obs("s3", vec![pine_dead.clone()], vec![pine_live.clone()]),
+            ],
+        );
+        assert!(final_row(&live_again, "pine").retired_in.is_none());
+
+        let from_before = grade_named(&["s1"], vec![obs("s1", vec![pine_live], vec![pine_dead])]);
+        assert_eq!(
+            final_row(&from_before, "pine").retired_in.as_deref(),
+            Some("s1")
+        );
+    }
+
+    #[test]
+    fn a_row_that_first_appears_closed_records_that_session() {
+        let open = edge("open", "open", false, 9.0, 1.0, 0);
+        let mut held = edge("held", "held", false, 9.0, 1.0, 0);
+        held.relation = "uses".into();
+        let mut session = obs("s04", vec![], vec![open, held.clone()]);
+        session.status_rows.after = vec![
+            StatusRow {
+                id: held.id.clone(),
+                subject: held.subject.clone(),
+                relation: held.relation.clone(),
+                object: held.object.clone(),
+                live: false,
+                status: Some("decided".into()),
+                pending: true,
+            },
+            StatusRow {
+                id: "entity:host|setting|host|nope|t0|rejected".into(),
+                subject: "deploy".into(),
+                relation: "setting".into(),
+                object: "nope".into(),
+                live: false,
+                status: Some("rejected".into()),
+                pending: false,
+            },
+        ];
+        let report = grade_named(&["s04"], vec![session]);
+        assert!(report.sessions[0].retirements.is_empty());
+        assert!(!final_row(&report, "open").live);
+        assert_eq!(
+            final_row(&report, "open").retired_in.as_deref(),
+            Some("s04")
+        );
+        assert!(final_row(&report, "held").retired_in.is_none());
+        let nope = report
+            .final_edges
+            .iter()
+            .find(|edge| edge.object == "nope")
+            .expect("rejected row");
+        assert!(nope.retired_in.is_none());
+        let json = serde_json::to_value(final_row(&report, "open")).unwrap();
+        assert_eq!(json["retired_in"], "s04");
+    }
+
+    #[test]
+    fn a_rejected_relationship_is_not_live_in_final_edges() {
+        let mut kept = edge("clay", "clay", true, 9.0, 1.0, 0);
+        kept.relation = "uses".into();
+        let mut session = obs("s1", vec![], vec![kept.clone()]);
+        session.status_rows.after.push(StatusRow {
+            id: kept.id.clone(),
+            subject: kept.subject.clone(),
+            relation: kept.relation.clone(),
+            object: kept.object.clone(),
+            live: true,
+            status: Some("rejected".into()),
+            pending: false,
+        });
+        let report = grade(
+            &script_of(vec![]),
+            &[session],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        let row = final_row(&report, "clay");
+        assert!(!row.live);
+        assert_eq!(row.status.as_deref(), Some("rejected"));
+        assert!(row.retired_in.is_none());
+    }
+
+    #[test]
+    fn pattern_fact_names_the_assigned_fact_only_when_a_match_block_exists() {
+        let mut component = edge("comp", "box", true, 9.0, 1.0, 0);
+        component.subject = "relay".into();
+        component.relation = "part_of".into();
+        let exact = edge("pine", "pine", true, 9.0, 1.0, 0);
+        let mut patterned_fact = fact("F18", "other");
+        patterned_fact.pattern = Some(FactPattern {
+            core_all: vec!["relay".into()],
+            detail_all: vec![],
+            wrong_any: vec![],
+        });
+        let report = grade(
+            &script_of(vec![patterned_fact, fact("host", "pine")]),
+            &[obs("s1", vec![], vec![component, exact])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert!(report.patterns.is_some());
+        let relay = final_row(&report, "comp");
+        assert_eq!(relay.pattern_fact.as_deref(), Some("F18"));
+        assert!(relay.matched.is_none());
+        let pine = final_row(&report, "pine");
+        assert_eq!(pine.matched.as_deref(), Some("host"));
+        assert!(pine.pattern_fact.is_none());
+
+        let bare = grade(
+            &script_of(vec![fact("host", "pine")]),
+            &[obs(
+                "s1",
+                vec![],
+                vec![edge("pine", "pine", true, 9.0, 1.0, 0)],
+            )],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert!(bare.patterns.is_none());
+        assert!(!serde_json::to_string(&bare)
+            .unwrap()
+            .contains("pattern_fact"));
+    }
+
+    #[test]
+    fn a_report_with_no_edges_omits_final_edges() {
+        let report = grade(
+            &script_of(vec![]),
+            &[obs("s1", vec![], vec![])],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert!(report.final_edges.is_empty());
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("final_edges"));
+    }
+
+    #[test]
+    fn final_edges_carry_status_pending_and_rejected_rows() {
+        let pine = edge("pine", "pine", true, 9.0, 1.0, 0);
+        let mut wool = edge("wool", "wool", false, 9.0, 1.0, 0);
+        wool.relation = "uses".into();
+        let mut rust = edge("rust", "rust", true, 9.0, 1.0, 0);
+        rust.relation = "uses".into();
+        let edges = vec![pine.clone(), wool.clone(), rust.clone()];
+        let status = vec![
+            StatusRow {
+                id: pine.id.clone(),
+                subject: pine.subject.clone(),
+                relation: pine.relation.clone(),
+                object: pine.object.clone(),
+                live: true,
+                status: Some("decided".into()),
+                pending: false,
+            },
+            StatusRow {
+                id: wool.id.clone(),
+                subject: wool.subject.clone(),
+                relation: wool.relation.clone(),
+                object: wool.object.clone(),
+                live: false,
+                status: Some("considered".into()),
+                pending: true,
+            },
+            StatusRow {
+                id: "entity:host|setting|host|birch|t0|rejected".into(),
+                subject: "deploy".into(),
+                relation: "setting".into(),
+                object: "birch".into(),
+                live: false,
+                status: Some("rejected".into()),
+                pending: false,
+            },
+            StatusRow {
+                id: rust.id.clone(),
+                subject: rust.subject.clone(),
+                relation: rust.relation.clone(),
+                object: rust.object.clone(),
+                live: true,
+                status: None,
+                pending: false,
+            },
+        ];
+        let mut with_status = obs("s1", vec![], edges.clone());
+        with_status.status_rows.after = status;
+        let plain = obs("s1", vec![], edges);
+        let script = script_of(vec![fact("host", "pine")]);
+        let report = grade(
+            &script,
+            &[with_status],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        let unchanged =
+            grade(&script, &[plain], &weights(), &[], ExtractorLabel::Scripted).unwrap();
+        assert_eq!(report.operations, unchanged.operations);
+        assert_eq!(report.junk_edges, unchanged.junk_edges);
+        assert_eq!(report.patterns, unchanged.patterns);
+        assert!(report.junk_edges.iter().all(|edge| edge.object != "birch"));
+        assert_eq!(
+            final_row(&report, "pine").status.as_deref(),
+            Some("decided")
+        );
+        assert!(!final_row(&report, "pine").pending);
+        let wool_row = final_row(&report, "wool");
+        assert!(wool_row.pending);
+        assert!(!wool_row.live);
+        assert_eq!(wool_row.status.as_deref(), Some("considered"));
+        let birch = report
+            .final_edges
+            .iter()
+            .find(|edge| edge.object == "birch")
+            .expect("birch");
+        assert_eq!(birch.status.as_deref(), Some("rejected"));
+        assert!(!birch.live);
+        assert!(final_row(&report, "rust").status.is_none());
+        let json = serde_json::to_value(&report).unwrap();
+        let rust_json = json["final_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "rust")
+            .unwrap();
+        assert!(rust_json.get("status").is_none());
+        assert!(rust_json.get("pending").is_none());
+        let wool_json = json["final_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "wool")
+            .unwrap();
+        assert_eq!(wool_json["pending"], true);
     }
 
     #[test]

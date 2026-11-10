@@ -158,6 +158,9 @@ pub(crate) struct WriteCtx<'a> {
     /// and follow only decided `part_of` edges in retirement scope.
     /// Off leaves both paths unchanged.
     pub ground_on: bool,
+    /// Widen the post-judge cue to a sibling or a derived-from partner.
+    /// Off leaves that cue unchanged.
+    pub components_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -183,6 +186,7 @@ impl<'a> WriteCtx<'a> {
             hold_on: false,
             links_on: false,
             ground_on: false,
+            components_on: false,
         }
     }
 }
@@ -3445,6 +3449,7 @@ mod tests {
                 hold_on: false,
                 links_on: false,
                 ground_on: false,
+                components_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4711,6 +4716,7 @@ mod tests {
             hold_on: false,
             links_on: false,
             ground_on: false,
+            components_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -6209,6 +6215,7 @@ mod tests {
             hold_on: false,
             links_on: false,
             ground_on: false,
+            components_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -8092,6 +8099,7 @@ mod tests {
             hold_on: false,
             links_on: true,
             ground_on: false,
+            components_on: false,
         };
         let result = write_facts(
             &gm,
