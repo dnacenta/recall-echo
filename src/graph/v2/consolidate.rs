@@ -296,7 +296,10 @@ pub(crate) async fn run(
             partner,
             &loaded,
             &dependents,
-            (turn, quote.as_str()),
+            CueText {
+                turn,
+                quote: quote.as_str(),
+            },
             report,
         );
         match accept(
@@ -934,14 +937,24 @@ fn departs(turn: &str, old: &str, replaces: &str) -> bool {
 /// item is not a replacement. The phrase has to be in the quote itself.
 fn replacement_quote(quote: &str, old: &str, new_value: &str, key: &str) -> bool {
     let words = cue_words(quote);
+    replacement_guards(quote, old, new_value, key, &words)
+        && plain_shape(quote, key, &words)
+        && quote_replaces(quote)
+}
+
+fn replacement_guards(
+    quote: &str,
+    old: &str,
+    new_value: &str,
+    key: &str,
+    words: &[(String, usize, usize)],
+) -> bool {
     !names_value(old, quote)
         && names_value(new_value, quote)
         && !listed_new(new_value, quote)
-        && !hedged(quote, &words)
-        && names_key(key, &words)
-        && !tentative(&words)
-        && plain_shape(quote, key, &words)
-        && quote_replaces(quote)
+        && !hedged(quote, words)
+        && names_key(key, words)
+        && !tentative(words)
 }
 
 /// A question, a negation, a condition, a hedge, or an addition is not a
@@ -1223,23 +1236,8 @@ fn numeric_class(class: &str) -> bool {
 
 fn trailing_quote(quote: &str, old: &str, new_value: &str, key: &str) -> bool {
     let words = cue_words(quote);
-    trailing_guards(quote, old, new_value, key, &words)
+    replacement_guards(quote, old, new_value, key, &words)
         && trailing_shape(quote, new_value, key, &words)
-}
-
-fn trailing_guards(
-    quote: &str,
-    old: &str,
-    new_value: &str,
-    key: &str,
-    words: &[(String, usize, usize)],
-) -> bool {
-    !names_value(old, quote)
-        && names_value(new_value, quote)
-        && !listed_new(new_value, quote)
-        && !hedged(quote, words)
-        && names_key(key, words)
-        && !tentative(words)
 }
 
 fn trailing_shape(
@@ -1395,30 +1393,44 @@ fn component_link(
     })
 }
 
+struct CueText<'a> {
+    turn: &'a str,
+    quote: &'a str,
+}
+
+struct CueInputs<'a> {
+    depart: bool,
+    quoted: bool,
+    quote: &'a str,
+}
+
+enum CueBranch {
+    None,
+    Same,
+    PartOf,
+    Sibling,
+    Derived,
+    Trailing,
+}
+
 fn accept_cue(
     ctx: &WriteCtx<'_>,
     anchor: &Anchor,
     partner: &Row,
     loaded: &Loaded,
     dependents: &[DependentHit],
-    text: (&str, &str),
+    text: CueText<'_>,
     report: &mut IngestionReport,
 ) -> bool {
-    let (turn, quote) = text;
-    let depart = departs(turn, &partner.value, &anchor.replaces);
-    let quoted = replacement_quote(quote, &partner.value, &anchor.new_value, &anchor.key);
+    let inputs = CueInputs {
+        depart: departs(text.turn, &partner.value, &anchor.replaces),
+        quoted: replacement_quote(text.quote, &partner.value, &anchor.new_value, &anchor.key),
+        quote: text.quote,
+    };
     if !ctx.components_on {
-        return plain_cue(anchor, partner, loaded, depart, quoted);
+        return plain_cue(anchor, partner, loaded, inputs.depart, inputs.quoted);
     }
-    component_cue(
-        ctx,
-        anchor,
-        partner,
-        loaded,
-        dependents,
-        (depart, quoted, quote),
-        report,
-    )
+    component_cue(ctx, anchor, partner, loaded, dependents, inputs, report)
 }
 
 fn plain_cue(anchor: &Anchor, partner: &Row, loaded: &Loaded, depart: bool, quoted: bool) -> bool {
@@ -1432,15 +1444,38 @@ fn component_cue(
     partner: &Row,
     loaded: &Loaded,
     dependents: &[DependentHit],
-    parts: (bool, bool, &str),
+    inputs: CueInputs<'_>,
     report: &mut IngestionReport,
 ) -> bool {
-    let (depart, quoted, quote) = parts;
     let kind = widened_cue(ctx, anchor, partner, loaded, dependents);
-    let trailing = trailing_allowed(&kind.links, anchor, partner, quote);
-    let accept = joined_cue(depart, kind.paired, quoted, trailing);
-    record_component_cue(report, &kind, depart, quoted, trailing, accept);
+    let trailing = trailing_allowed(&kind.links, anchor, partner, inputs.quote);
+    let accept = joined_cue(inputs.depart, kind.paired, inputs.quoted, trailing);
+    record_component_cue(
+        report,
+        &kind.links,
+        cue_branch(&kind.links, inputs.quoted, trailing),
+        accept && !inputs.depart && kind.paired,
+    );
     accept
+}
+
+fn cue_branch(links: &PairLinks, quoted: bool, trailing: bool) -> CueBranch {
+    if trailing && !quoted {
+        return CueBranch::Trailing;
+    }
+    if links.sibling && !links.same && !links.direct {
+        return CueBranch::Sibling;
+    }
+    if links.derived && !links.same && !links.direct {
+        return CueBranch::Derived;
+    }
+    if links.direct {
+        return CueBranch::PartOf;
+    }
+    if links.same {
+        return CueBranch::Same;
+    }
+    CueBranch::None
 }
 
 fn joined_cue(depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool {
@@ -1449,18 +1484,17 @@ fn joined_cue(depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool 
 
 fn record_component_cue(
     report: &mut IngestionReport,
-    kind: &Widened,
-    depart: bool,
-    quoted: bool,
-    trailing: bool,
-    accept: bool,
+    links: &PairLinks,
+    branch: CueBranch,
+    made: bool,
 ) {
-    if link_made_cue(accept, depart, kind.paired, quoted || trailing) {
-        note_link(report, &kind.links);
+    if !made {
+        return;
     }
-    if trailing_made(accept, depart, kind.paired, quoted, trailing) {
+    if matches!(branch, CueBranch::Trailing) {
         add_count(&mut report.consolidate.quote_trailing);
     }
+    note_link(report, links);
 }
 
 struct Widened {
@@ -1483,14 +1517,6 @@ fn widened_cue(
         paired: key && (links.same || links.direct || links.sibling || links.derived),
         links,
     }
-}
-
-fn link_made_cue(accept: bool, depart: bool, paired: bool, quoted: bool) -> bool {
-    accept && !depart && paired && quoted
-}
-
-fn trailing_made(accept: bool, depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool {
-    accept && !depart && paired && !quoted && trailing
 }
 
 fn trailing_allowed(links: &PairLinks, anchor: &Anchor, partner: &Row, quote: &str) -> bool {
