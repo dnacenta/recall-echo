@@ -876,6 +876,19 @@ pub struct ConsolidateReport {
     pub calls: u32,
     #[serde(default)]
     pub errors: u32,
+    /// Times a sibling link made the cue true. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_sibling: Option<u32>,
+    /// Times a derived-from link made the cue true. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_derived: Option<u32>,
+    /// Times the trailing numeric quote made the cue true. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_trailing: Option<u32>,
+    /// Consolidation closes whose partner subject differs from the anchor.
+    /// Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closes_component: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -944,18 +957,32 @@ impl ConsolidateReport {
     /// The pass did not run, or it found nothing to count.
     #[must_use]
     pub fn is_blank(&self) -> bool {
+        self.pass_blank() && self.outcome_blank() && self.component_counts_blank()
+    }
+
+    fn pass_blank(&self) -> bool {
         self.anchors == 0
             && self.pairs == 0
             && self.overflow == 0
             && self.prefilter == ConsolidatePrefilter::default()
             && self.judged == 0
             && self.cache_hits == 0
-            && self.closes_sup == 0
+    }
+
+    fn outcome_blank(&self) -> bool {
+        self.closes_sup == 0
             && self.closes_dup == 0
             && self.skips.is_empty()
             && self.dropped.is_empty()
             && self.calls == 0
             && self.errors == 0
+    }
+
+    fn component_counts_blank(&self) -> bool {
+        self.link_sibling.unwrap_or(0) == 0
+            && self.link_derived.unwrap_or(0) == 0
+            && self.quote_trailing.unwrap_or(0) == 0
+            && self.closes_component.unwrap_or(0) == 0
     }
 }
 
@@ -1192,6 +1219,32 @@ mod tests {
         assert!(ConsolidateReport::default().is_blank());
         let blank = serde_json::to_value(IngestionReport::default()).unwrap();
         assert!(blank.get("consolidate").is_none());
+    }
+
+    #[test]
+    fn component_counters_are_omitted_until_the_switch_applies() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("link_sibling").is_none());
+        assert!(encoded.get("link_derived").is_none());
+        assert!(encoded.get("quote_trailing").is_none());
+        assert!(encoded.get("closes_component").is_none());
+        let mut report = ConsolidateReport {
+            link_sibling: Some(0),
+            link_derived: Some(1),
+            quote_trailing: Some(3),
+            closes_component: Some(2),
+            ..ConsolidateReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["link_sibling"], 0);
+        assert_eq!(encoded["link_derived"], 1);
+        assert_eq!(encoded["quote_trailing"], 3);
+        assert_eq!(encoded["closes_component"], 2);
+        assert!(!report.is_blank());
+        report.link_derived = Some(0);
+        report.quote_trailing = Some(0);
+        report.closes_component = Some(0);
+        assert!(report.is_blank());
     }
 
     #[test]

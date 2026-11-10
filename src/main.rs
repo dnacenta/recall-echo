@@ -263,6 +263,11 @@ enum BenchCommands {
         /// `--consolidate-hold` and `--drop-restatements`.
         #[arg(long)]
         consolidate_links: bool,
+        /// Close a sibling or derived-from partner after the judge.
+        /// Implies `--consolidate`. Off unless set. Independent of
+        /// `--consolidate-hold`, `--consolidate-links`, and `--drop-restatements`.
+        #[arg(long)]
+        consolidate_components: bool,
         /// Drop a decided rule that only restates a same-session setting.
         /// Off unless set.
         #[arg(long)]
@@ -1088,6 +1093,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate,
             consolidate_hold,
             consolidate_links,
+            consolidate_components,
             drop_restatements,
         } => run_writes(
             script,
@@ -1123,6 +1129,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateLinks::Off
             },
+            if consolidate_components {
+                recall_echo::bench::writes::ConsolidateComponents::On
+            } else {
+                recall_echo::bench::writes::ConsolidateComponents::Off
+            },
         ),
     }
 }
@@ -1141,6 +1152,7 @@ fn run_writes(
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
+    consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1176,6 +1188,7 @@ fn run_writes(
             consolidate,
             drop_restatements,
             consolidate_links,
+            consolidate_components,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1191,6 +1204,7 @@ fn run_writes(
             consolidate,
             drop_restatements,
             consolidate_links,
+            consolidate_components,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1211,6 +1225,7 @@ async fn grade_once(
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
+    consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1229,6 +1244,7 @@ async fn grade_once(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                consolidate_components,
             )
             .await
         }
@@ -1243,6 +1259,7 @@ async fn grade_once(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                consolidate_components,
             )
             .await
         }
@@ -1263,6 +1280,7 @@ async fn grade_repeat(
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
+    consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1282,6 +1300,7 @@ async fn grade_repeat(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                consolidate_components,
             )
             .await
         }
@@ -1297,6 +1316,7 @@ async fn grade_repeat(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                consolidate_components,
             )
             .await
         }
@@ -1482,6 +1502,7 @@ mod tests {
                         consolidate,
                         consolidate_hold,
                         consolidate_links,
+                        consolidate_components,
                         drop_restatements,
                         known_match,
                         known_facts_context,
@@ -1491,6 +1512,7 @@ mod tests {
                 assert!(consolidate_links);
                 assert!(!consolidate);
                 assert!(!consolidate_hold);
+                assert!(!consolidate_components);
                 assert!(!drop_restatements);
                 assert!(!known_match);
                 assert!(!known_facts_context);
@@ -1515,6 +1537,7 @@ mod tests {
                         consolidate,
                         consolidate_hold,
                         consolidate_links,
+                        consolidate_components,
                         drop_restatements,
                         ..
                     },
@@ -1522,9 +1545,57 @@ mod tests {
                 assert!(consolidate_hold);
                 assert!(consolidate_links);
                 assert!(!consolidate);
+                assert!(!consolidate_components);
                 assert!(!drop_restatements);
             }
             _ => panic!("bench writes"),
         }
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_components_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-components",
+        ])
+        .expect("parse components");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        consolidate_components,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_components);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!consolidate_links);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--consolidate-components"), "{help}");
     }
 }
