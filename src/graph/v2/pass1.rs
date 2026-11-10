@@ -725,7 +725,10 @@ fn accept_fact(
     report: &mut IngestionReport,
 ) -> Result<Fact, &'static str> {
     let (mut fact, swapped) = open_fact(object, session, ground)?;
-    let prior_name = fact.subject_name.clone();
+    let mut prior_name = String::new();
+    if ground_on {
+        prior_name.clone_from(&fact.subject_name);
+    }
     let prior = ComponentPrior {
         name: &prior_name,
         kind: fact.subject_kind,

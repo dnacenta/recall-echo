@@ -292,7 +292,7 @@ async fn push_pending(
         return Ok(());
     }
     let open = open_mention(mention);
-    if open.norm.is_empty() || seen_already(seen, &open) {
+    if seen_already(seen, &open) {
         return Ok(());
     }
     if !take_tier(gm, index, bound, report, &open).await? {

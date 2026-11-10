@@ -577,7 +577,8 @@ impl<'a> Attempt<'a> {
             .insert(subject.id.clone(), source.subject_name.clone());
         let mut fact = source.clone();
         fact.key = fold_key(&fact.key);
-        // A skipped component edge must not retire or promote anything first.
+        // A rejection still retires. Any other status skips retire and promote
+        // when the guard will not write the edge.
         if self.component_edge_blocked(&fact, &subject).await? {
             return Ok(());
         }
@@ -1955,7 +1956,7 @@ fn edge_description(fact: &Fact) -> Option<String> {
 }
 
 fn component_guard_applies(ctx: &WriteCtx<'_>, fact: &Fact) -> bool {
-    ctx.ground_on && component_session_part_of(fact, ctx.project)
+    ctx.ground_on && fact.status != "rejected" && component_session_part_of(fact, ctx.project)
 }
 
 fn peek_object(catalog: &Catalog, fact: &Fact) -> Option<Stored> {
@@ -5405,6 +5406,102 @@ mod tests {
         let open = open_part_of(&gm, "acme", "considered").await;
         assert_eq!(open.len(), 1, "{open:?}");
         assert!(open[0]["valid_until"].is_null(), "{open:?}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_part_of_still_closes_the_session_edge() {
+        let on = reject_stored_part_of(true, false).await;
+        assert!(!on.acme_live, "decided acme edge stayed live: {on:?}");
+        assert!(on.other_live, "the other project's edge was closed");
+        assert_eq!(on.stats.edges, 0, "{:?}", on.stats);
+        assert_eq!(on.stats.retirements.len(), 1, "{:?}", on.stats.retirements);
+        assert_eq!(on.stats.retirements[0].reason, "rejected");
+        assert_eq!(on.stats.retirements[0].subject, "exporter");
+        assert_eq!(on.stats.component_edges.component_edge_foreign, 1);
+        assert_eq!(on.stats.component_edges.component_edge_technology, 0);
+        assert!(on.rejected_live.is_empty(), "{:?}", on.rejected_live);
+
+        let off = reject_stored_part_of(false, false).await;
+        assert!(!off.acme_live, "flag off left the acme edge live");
+        assert!(off.other_live);
+        assert!(off.stats.component_edges.is_blank());
+        assert_eq!(
+            off.stats.retirements.len(),
+            1,
+            "{:?}",
+            off.stats.retirements
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_part_of_still_closes_a_technology_edge() {
+        let on = reject_stored_part_of(true, true).await;
+        assert!(!on.acme_live, "decided acme edge stayed live: {on:?}");
+        assert!(on.other_live, "the other project's edge was closed");
+        assert_eq!(on.stats.edges, 0, "{:?}", on.stats);
+        assert_eq!(on.stats.retirements.len(), 1, "{:?}", on.stats.retirements);
+        assert_eq!(on.stats.retirements[0].reason, "rejected");
+        assert_eq!(on.stats.retirements[0].subject, "redis");
+        assert_eq!(on.stats.component_edges.component_edge_technology, 1);
+        assert_eq!(on.stats.component_edges.component_edge_foreign, 0);
+        assert_eq!(on.kind.as_deref(), Some("technology"));
+        assert!(on.rejected_live.is_empty(), "{:?}", on.rejected_live);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[derive(Debug)]
+    struct RejectionProbe {
+        stats: WriteStats,
+        acme_live: bool,
+        other_live: bool,
+        rejected_live: Vec<Value>,
+        kind: Option<String>,
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn reject_stored_part_of(ground_on: bool, technology: bool) -> RejectionProbe {
+        let (_tmp, gm) = open_store().await;
+        let name = if technology { "redis" } else { "exporter" };
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "other",
+            false,
+            &[
+                stored_part_of(name, "other", "decided", technology),
+                stored_part_of(name, "acme", "decided", technology),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            ground_on,
+            &[component_part_of(name, "acme", "rejected")],
+        )
+        .await;
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        RejectionProbe {
+            stats,
+            acme_live: !open_part_of(&gm, "acme", "decided").await.is_empty(),
+            other_live: !open_part_of(&gm, "other", "decided").await.is_empty(),
+            rejected_live: open_part_of(&gm, "acme", "rejected").await,
+            kind: v2_kind(&entities, name),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn stored_part_of(name: &str, object: &str, status: &str, technology: bool) -> Fact {
+        let mut fact = component_part_of(name, object, status);
+        if technology {
+            fact.subject_kind = Kind::Technology;
+        }
+        fact
     }
 
     #[cfg(feature = "embedded")]
