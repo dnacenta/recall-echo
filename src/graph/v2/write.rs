@@ -32,7 +32,7 @@ use super::super::{deserialize_take, GraphMemory};
 use super::ground::punctuation_literal;
 use super::input::{ProjectIdentity, Turn};
 use super::resolve::{self, MentionDraft};
-use super::schema::{key_is_empty, normalise, Fact, Kind, Predicate};
+use super::schema::{is_project_name, key_is_empty, normalise, Fact, Kind, Predicate};
 
 /// Production writes never fail a commit on purpose.
 pub(crate) static NO_CONFLICTS: AtomicU32 = AtomicU32::new(0);
@@ -309,7 +309,12 @@ pub(crate) async fn write_facts(
     facts: &[Fact],
 ) -> Result<WriteStats, GraphError> {
     let resolve_started = Instant::now();
-    let resolution = resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?;
+    let resolution = if ctx.ground_on {
+        let hold = technology_hold(facts, ctx.project);
+        resolve::resolve_with_hold(gm, ctx.llm, ctx.project, &drafts_of(facts), &hold).await?
+    } else {
+        resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?
+    };
     let resolve_ms = elapsed_ms(resolve_started);
     // The field has to outlive a conflict rollback, or the retry cannot store a list.
     if ctx.links_on {
@@ -625,9 +630,76 @@ impl<'a> Attempt<'a> {
             }
             return Ok(());
         }
+        if self
+            .skip_component_project_edge(fact, subject, object)
+            .await?
+        {
+            return Ok(());
+        }
         self.create_edge(fact, subject, object, description).await?;
         self.stats.edges += 1;
         Ok(())
+    }
+
+    async fn skip_component_project_edge(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        object: &Stored,
+    ) -> Result<bool, GraphError> {
+        if !self.ctx.ground_on || !component_session_part_of(fact, self.ctx.project) {
+            return Ok(false);
+        }
+        if stored_kind(&subject.attributes) == Some(Kind::Technology) {
+            self.stats.component_edges.component_edge_technology += 1;
+            return Ok(true);
+        }
+        if self.part_of_other_project(&subject.id, &object.id).await? {
+            self.stats.component_edges.component_edge_foreign += 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn part_of_other_project(
+        &mut self,
+        subject_id: &str,
+        project_id: &str,
+    ) -> Result<bool, GraphError> {
+        let targets = self.other_part_of_targets(subject_id, project_id).await?;
+        for id in targets {
+            if self.stored_entity_kind(&id).await? == Some(Kind::Project) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn other_part_of_targets(
+        &mut self,
+        subject_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<String>, GraphError> {
+        let edges = self.live_edges(subject_id).await?;
+        let mut targets = Vec::new();
+        for edge in edges {
+            if !is_decided_part_of(&edge) {
+                continue;
+            }
+            let to = record_id(&edge.to_id);
+            if to.is_empty() || to == project_id {
+                continue;
+            }
+            targets.push(to);
+        }
+        Ok(targets)
+    }
+
+    async fn stored_entity_kind(&mut self, id: &str) -> Result<Option<Kind>, GraphError> {
+        let Some(stored) = self.ensure_entity(id).await? else {
+            return Ok(None);
+        };
+        Ok(stored_kind(&stored.attributes))
     }
 
     async fn find_edge(
@@ -1764,6 +1836,32 @@ fn scope_part_of(ground_on: bool) -> &'static str {
     } else {
         SCOPE_PART_OF
     }
+}
+
+fn component_session_part_of(fact: &Fact, project: &ProjectIdentity) -> bool {
+    fact.predicate == Predicate::PartOf
+        && fact.subject_kind == Kind::Component
+        && fact.object_kind == Some(Kind::Project)
+        && !project.name.is_empty()
+        && is_project_name(&normalise(&fact.object_name), project)
+}
+
+fn technology_hold(facts: &[Fact], project: &ProjectIdentity) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for fact in facts {
+        if !component_session_part_of(fact, project) {
+            continue;
+        }
+        let name = normalise(&fact.subject_name);
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn is_decided_part_of(edge: &StoredEdge) -> bool {
+    edge.rel_type == "part_of" && edge.status.as_deref() == Some("decided")
 }
 
 pub(crate) const CLOSE_EDGE: &str = r#"
@@ -4886,14 +4984,7 @@ mod tests {
             "acme",
             ground_on,
             &[
-                project_setting(
-                    "exporter",
-                    Kind::Component,
-                    "format",
-                    "csv",
-                    "decided",
-                    1,
-                ),
+                project_setting("exporter", Kind::Component, "format", "csv", "decided", 1),
                 component_part_of("exporter", "acme", status),
             ],
         )
@@ -4945,7 +5036,7 @@ mod tests {
         project: &str,
         ground_on: bool,
         facts: &[Fact],
-    ) {
+    ) -> WriteStats {
         let project = ProjectIdentity {
             name: project.into(),
             aliases: Vec::new(),
@@ -4953,7 +5044,209 @@ mod tests {
         let llm = Quiet;
         let mut ctx = WriteCtx::new(&llm, &project, session_id, date, &[]);
         ctx.ground_on = ground_on;
-        write_facts(gm, &ctx, facts).await.unwrap();
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    fn uses_technology(project: &str, name: &str) -> Fact {
+        Fact {
+            subject_name: project.into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Uses,
+            role: Some(Role::Library),
+            key: String::new(),
+            object_name: name.into(),
+            object_kind: Some(Kind::Technology),
+            status: "decided".into(),
+            turn: 1,
+            quote: format!("{project} uses {name}"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn v2_kind(entities: &[crate::graph::types::Entity], name: &str) -> Option<String> {
+        let entity = entities.iter().find(|entity| entity.name == name)?;
+        entity
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.pointer("/v2/kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn grounded_part_of_lets_a_project_rejection_close_the_component() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            true,
+            &[
+                project_setting("exporter", Kind::Component, "format", "csv", "decided", 1),
+                component_part_of("exporter", "acme", "decided"),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[project_setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await;
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "rejected");
+        assert_eq!(stats.retirements[0].subject, "exporter");
+        assert_eq!(stats.retirements[0].key, "format");
+        assert_eq!(stats.retirements[0].old_value, "csv");
+        let slots = slots_of(&gm, "exporter").await;
+        assert_eq!(
+            slot_named(&slots, "format", "csv")["ended_by"],
+            "s2:rejected"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_stored_technology_is_not_upgraded_or_linked() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            false,
+            &[uses_technology("acme", "redis")],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[component_part_of("redis", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 0, "{stats:?}");
+        assert_eq!(stats.component_edges.component_edge_technology, 1);
+        assert_eq!(stats.component_edges.component_edge_foreign, 0);
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(v2_kind(&entities, "redis").as_deref(), Some("technology"));
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        assert!(
+            edges.iter().all(|edge| edge.rel_type != "part_of"),
+            "{edges:?}"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn flag_off_still_links_a_technology_named_as_a_component() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            false,
+            &[uses_technology("acme", "redis")],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            false,
+            &[component_part_of("redis", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 1, "{stats:?}");
+        assert!(stats.component_edges.is_blank());
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(v2_kind(&entities, "redis").as_deref(), Some("component"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_foreign_project_edge_is_skipped_and_does_not_close_rows() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "other",
+            false,
+            &[
+                project_setting("exporter", Kind::Component, "format", "csv", "decided", 1),
+                component_part_of("exporter", "other", "decided"),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[component_part_of("exporter", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 0, "{stats:?}");
+        assert_eq!(stats.component_edges.component_edge_foreign, 1);
+        assert_eq!(stats.component_edges.component_edge_technology, 0);
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(v2_kind(&entities, "exporter").as_deref(), Some("component"));
+        let other = entities
+            .iter()
+            .find(|entity| entity.name == "other")
+            .expect("other");
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        let live: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.rel_type == "part_of" && edge.valid_until.is_none())
+            .collect();
+        assert_eq!(live.len(), 1, "{edges:?}");
+        assert_eq!(live[0].to_id, other.id);
+        let rejection = write_project(
+            &gm,
+            "s3",
+            "2026-04-12",
+            "acme",
+            true,
+            &[project_setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await;
+        assert!(
+            rejection.retirements.is_empty(),
+            "{:?}",
+            rejection.retirements
+        );
+        let slots = slots_of(&gm, "exporter").await;
+        assert!(slot_named(&slots, "format", "csv")["valid_until"].is_null());
     }
 
     #[cfg(feature = "embedded")]

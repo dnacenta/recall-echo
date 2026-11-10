@@ -696,9 +696,7 @@ fn accept_item(
     }
     let object = item.as_object().ok_or(DROP_PARSE)?;
     match section {
-        "facts" => {
-            accept_fact(object, session, ground, ground_on, report).map(|fact| vec![fact])
-        }
+        "facts" => accept_fact(object, session, ground, ground_on, report).map(|fact| vec![fact]),
         "bugs" => expand_bug(object, session, ground, report),
         "releases" => expand_release(object, session, ground, report),
         _ => Err(DROP_PARSE),
@@ -757,7 +755,14 @@ fn accept_fact(
     filter_fact(&fact)?;
     note_component_edge(
         grounded,
-        kept_component_object(&fact, prior_kind, value_ok, swapped, ground_on, &session.project),
+        kept_component_object(
+            &fact,
+            prior_kind,
+            value_ok,
+            swapped,
+            ground_on,
+            &session.project,
+        ),
         report,
     );
     Ok(fact)
@@ -1666,6 +1671,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn component_edge_case(
         turn: &str,
         subject: &str,
@@ -1862,10 +1868,7 @@ mod tests {
             true,
         );
         assert!(store.is_empty());
-        assert_eq!(
-            store_report.drops.get(DROP_VALUE_SUPPORT).copied(),
-            Some(1)
-        );
+        assert_eq!(store_report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
         assert!(store_report.component_edges.is_blank());
     }
 

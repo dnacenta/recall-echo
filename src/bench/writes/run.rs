@@ -398,12 +398,7 @@ fn write_known_switches(
         known == KnownFactsContext::On,
         "known_facts_context = true\n",
     );
-    remember_switch(
-        body,
-        any,
-        matched == KnownMatch::On,
-        "known_match = true\n",
-    );
+    remember_switch(body, any, matched == KnownMatch::On, "known_match = true\n");
 }
 
 fn write_tail_switches(

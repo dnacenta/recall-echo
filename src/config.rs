@@ -2471,7 +2471,8 @@ mod tests {
         let parsed: Config = toml::from_str(&rendered).expect("reparse true");
         assert!(parsed.graph.expect("graph").ground_component_edges);
 
-        cfg.set_key("graph.ground_component_edges", "false").unwrap();
+        cfg.set_key("graph.ground_component_edges", "false")
+            .unwrap();
         assert!(!cfg.graph.as_ref().expect("graph").ground_component_edges);
         let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
         assert!(!cleared.contains("ground_component_edges"));
