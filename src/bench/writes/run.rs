@@ -868,15 +868,20 @@ async fn relationship_status_row(
     let from_id = crate::graph::edge_view::record_id(&relationship.from_id);
     let to_id = crate::graph::edge_view::record_id(&relationship.to_id);
     let pending_row = pending.contains(&id);
+    let status = stored.get(&id).map(String::as_str);
     Ok(StatusRow {
         id: id.clone(),
         subject: names.name_of(gm.db(), &from_id).await?,
         relation: relationship.rel_type.clone(),
         object: names.name_of(gm.db(), &to_id).await?,
-        live: relationship.valid_until.is_none() && !pending_row,
-        status: stored.get(&id).cloned(),
+        live: relation_live(relationship.valid_until.is_none(), pending_row, status),
+        status: status.map(str::to_string),
         pending: pending_row,
     })
+}
+
+fn relation_live(open: bool, pending: bool, status: Option<&str>) -> bool {
+    open && !pending && status != Some("rejected")
 }
 
 async fn stored_relationship_status(
@@ -3668,8 +3673,22 @@ mod tests {
             assert_eq!(row.subject, edge.subject);
             assert_eq!(row.relation, edge.relation);
             assert_eq!(row.object, edge.object);
-            assert_eq!(row.live, edge.live);
+            assert_side_live(edge, row);
         }
+        let clay = edges
+            .iter()
+            .find(|edge| edge.object == "clay")
+            .expect("clay");
+        assert!(clay.live);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_side_live(edge: &ObservedEdge, row: &StatusRow) {
+        if row.status.as_deref() == Some("rejected") {
+            assert!(!row.live);
+            return;
+        }
+        assert_eq!(row.live, edge.live);
     }
 
     #[cfg(feature = "embedded")]
@@ -3712,7 +3731,7 @@ mod tests {
         assert!(rust.status.is_none());
         assert!(rust.live);
         assert_eq!(clay.status.as_deref(), Some("rejected"));
-        assert!(clay.live);
+        assert!(!clay.live);
         assert_eq!(wool.status.as_deref(), Some("considered"));
         assert!(wool.pending);
         assert!(!wool.live);
@@ -3763,7 +3782,7 @@ mod tests {
         expect_final(&json, "fast", Some("decided"), true, false);
         expect_final(&json, "linen", Some("decided"), false, true);
         expect_final(&json, "rust", None, false, true);
-        expect_final(&json, "clay", Some("rejected"), false, true);
+        expect_final(&json, "clay", Some("rejected"), false, false);
         expect_final(&json, "wool", Some("considered"), true, false);
         let stripped = {
             let mut value = json.clone();

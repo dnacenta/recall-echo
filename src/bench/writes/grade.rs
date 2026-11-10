@@ -1249,13 +1249,24 @@ fn final_from_observed(
         subject: edge.subject.clone(),
         relation: edge.relation.clone(),
         object: edge.object.clone(),
-        live: edge.live,
+        live: reported_live(edge.live, status),
         status: status.and_then(|row| row.status.clone()),
         pending: status.is_some_and(|row| row.pending),
         retired_in: retired.get(&edge.id).cloned(),
         matched: matched.get(&edge.key()).cloned(),
         pattern_fact: patterned.get(&edge.id).cloned(),
     }
+}
+
+fn reported_live(live: bool, status: Option<&StatusRow>) -> bool {
+    live && !rejected_status(status)
+}
+
+fn rejected_status(status: Option<&StatusRow>) -> bool {
+    let Some(row) = status else {
+        return false;
+    };
+    row.status.as_deref() == Some("rejected")
 }
 
 fn final_from_status(
@@ -2559,6 +2570,34 @@ mod tests {
         assert!(nope.retired_in.is_none());
         let json = serde_json::to_value(final_row(&report, "open")).unwrap();
         assert_eq!(json["retired_in"], "s04");
+    }
+
+    #[test]
+    fn a_rejected_relationship_is_not_live_in_final_edges() {
+        let mut kept = edge("clay", "clay", true, 9.0, 1.0, 0);
+        kept.relation = "uses".into();
+        let mut session = obs("s1", vec![], vec![kept.clone()]);
+        session.status_rows.after.push(StatusRow {
+            id: kept.id.clone(),
+            subject: kept.subject.clone(),
+            relation: kept.relation.clone(),
+            object: kept.object.clone(),
+            live: true,
+            status: Some("rejected".into()),
+            pending: false,
+        });
+        let report = grade(
+            &script_of(vec![]),
+            &[session],
+            &weights(),
+            &[],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        let row = final_row(&report, "clay");
+        assert!(!row.live);
+        assert_eq!(row.status.as_deref(), Some("rejected"));
+        assert!(row.retired_in.is_none());
     }
 
     #[test]
