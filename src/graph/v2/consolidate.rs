@@ -8251,6 +8251,44 @@ mod tests {
         assert!(unique_owner("widget", &doubled).is_none());
     }
 
+    #[test]
+    fn a_colliding_name_uses_the_partner_entity_not_the_first_owner() {
+        let owners = [
+            ("acme", "acme"),
+            ("acme-widget", "widget"),
+            ("acme-client", "http client"),
+            ("other", "other"),
+            ("other-widget", "widget"),
+            ("other-client", "http client"),
+        ]
+        .into_iter()
+        .map(|(id, name)| (id.to_string(), name.to_string()))
+        .collect::<Vec<_>>();
+        let part_of = [
+            ("acme-widget", "acme"),
+            ("acme-client", "acme"),
+            ("other-widget", "other"),
+            ("other-client", "other-widget"),
+        ]
+        .into_iter()
+        .map(|(from, to)| (from.to_string(), to.to_string()))
+        .collect::<Vec<_>>();
+        assert_eq!(owner_id("widget", &owners), Some("acme-widget"));
+        assert_eq!(owner_id("http client", &owners), Some("acme-client"));
+        let mut anchor = anchor_named("widget", "port", "8765");
+        anchor.live = Some(0);
+        let rows = [row_named("widget", "acme-widget", "port", "8765")];
+        let partner = row_named("http client", "other-client", "port", "8080");
+        assert!(!sibling_link(
+            &anchor,
+            &partner,
+            &rows,
+            &part_of,
+            &owners,
+            &project()
+        ));
+    }
+
     #[tokio::test]
     async fn a_same_named_component_in_another_project_is_not_closed() {
         let (_tmp, gm) = open().await;
