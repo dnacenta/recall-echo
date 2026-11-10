@@ -126,6 +126,19 @@ pub enum ConsolidateLinks {
     On,
 }
 
+/// Whether a bench run widens the post-judge cue to sibling and derived-from partners.
+///
+/// On implies consolidation: the scratch config sets both `consolidate` and
+/// `consolidate_components`. It stays independent of [`DropRestatements`],
+/// [`ConsolidateLinks`], [`KnownMatch`], [`KnownFactsContext`], and the hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateComponents {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `consolidate = true` and `consolidate_components = true` for this run.
+    On,
+}
+
 /// Whether a bench run opts in to dropping same-session rule restatements.
 ///
 /// On is independent of [`KnownFactsContext`], [`KnownMatch`], and
@@ -157,6 +170,7 @@ pub async fn run(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    consolidate_components: ConsolidateComponents,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -168,6 +182,7 @@ pub async fn run(
         consolidate,
         drop_restatements,
         consolidate_links,
+        consolidate_components,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -312,6 +327,7 @@ pub async fn run_repeat(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    consolidate_components: ConsolidateComponents,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -335,6 +351,7 @@ pub async fn run_repeat(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                consolidate_components,
             )
             .await?,
         );
@@ -350,6 +367,7 @@ fn apply_graph_switches(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    consolidate_components: ConsolidateComponents,
 ) -> Result<(), RecallError> {
     let mut body = String::from("[graph]\n");
     let mut any = false;
@@ -361,7 +379,10 @@ fn apply_graph_switches(
         body.push_str("known_match = true\n");
         any = true;
     }
-    if consolidate.writes_pass() || consolidate_links == ConsolidateLinks::On {
+    if consolidate.writes_pass()
+        || consolidate_links == ConsolidateLinks::On
+        || consolidate_components == ConsolidateComponents::On
+    {
         body.push_str("consolidate = true\n");
         any = true;
     }
@@ -371,6 +392,10 @@ fn apply_graph_switches(
     }
     if consolidate_links == ConsolidateLinks::On {
         body.push_str("consolidate_links = true\n");
+        any = true;
+    }
+    if consolidate_components == ConsolidateComponents::On {
+        body.push_str("consolidate_components = true\n");
         any = true;
     }
     if drop_restatements == DropRestatements::On {
@@ -1550,6 +1575,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1560,6 +1586,7 @@ mod tests {
             Consolidate::On,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1574,6 +1601,7 @@ mod tests {
             Consolidate::Hold,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1595,6 +1623,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1606,6 +1635,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::On,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1633,6 +1663,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::On,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1657,6 +1688,7 @@ mod tests {
             Consolidate::Hold,
             DropRestatements::Off,
             ConsolidateLinks::On,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1678,6 +1710,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::On,
             ConsolidateLinks::On,
+            ConsolidateComponents::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1689,6 +1722,100 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.drop_restatements);
         assert!(graph.links_apply());
+        assert!(!graph.hold_applies());
+        assert!(!graph.known_match);
+        assert!(!graph.known_facts_context);
+    }
+
+    #[test]
+    fn consolidate_components_implies_consolidate_and_stays_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            ConsolidateComponents::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_components = true\n"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.components_apply());
+        assert!(!graph.links_apply());
+        assert!(!graph.hold_applies());
+        assert!(!graph.drop_restatements);
+        assert!(!graph.known_match);
+        assert!(!graph.known_facts_context);
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Hold,
+            DropRestatements::Off,
+            ConsolidateLinks::On,
+            ConsolidateComponents::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_hold = true\n"), "{text}");
+        assert!(text.contains("consolidate_links = true\n"), "{text}");
+        assert!(text.contains("consolidate_components = true\n"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.components_apply());
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        assert!(!graph.drop_restatements);
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::On,
+            ConsolidateLinks::Off,
+            ConsolidateComponents::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("drop_restatements = true\n"), "{text}");
+        assert!(text.contains("consolidate_components = true\n"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.drop_restatements);
+        assert!(graph.components_apply());
+        assert!(!graph.links_apply());
         assert!(!graph.hold_applies());
         assert!(!graph.known_match);
         assert!(!graph.known_facts_context);
@@ -1739,6 +1866,7 @@ mod tests {
                 consolidate,
                 drop_restatements,
                 ConsolidateLinks::Off,
+                ConsolidateComponents::Off,
             )
             .unwrap();
             let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1788,6 +1916,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap_err();
@@ -1945,6 +2074,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap();
@@ -2051,6 +2181,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap_err();
@@ -2075,6 +2206,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap_err();
@@ -2151,6 +2283,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap();
@@ -2435,6 +2568,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap();
@@ -2649,6 +2783,7 @@ mod tests {
                 Consolidate::Off,
                 DropRestatements::Off,
                 ConsolidateLinks::Off,
+                ConsolidateComponents::Off,
             )
             .await
             .unwrap();
@@ -2686,6 +2821,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap()
@@ -2975,6 +3111,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap();
@@ -3107,6 +3244,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            ConsolidateComponents::Off,
         )
         .await
         .unwrap();

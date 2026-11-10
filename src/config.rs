@@ -716,6 +716,13 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_links: bool,
+    /// Let the post-judge cue accept a sibling or a derived-from partner.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_components",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_components: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// Off unless set.
     #[serde(
@@ -743,6 +750,7 @@ impl Default for GraphSection {
             consolidate: default_consolidate(),
             consolidate_hold: default_consolidate_hold(),
             consolidate_links: default_consolidate_links(),
+            consolidate_components: default_consolidate_components(),
             drop_restatements: default_drop_restatements(),
         }
     }
@@ -759,6 +767,12 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn links_apply(&self) -> bool {
         self.consolidate && self.consolidate_links
+    }
+
+    /// Sibling and derived-from cues apply only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn components_apply(&self) -> bool {
+        self.consolidate && self.consolidate_components
     }
 }
 
@@ -1081,6 +1095,10 @@ fn default_consolidate_links() -> bool {
     false
 }
 
+fn default_consolidate_components() -> bool {
+    false
+}
+
 fn default_drop_restatements() -> bool {
     false
 }
@@ -1398,6 +1416,12 @@ impl Config {
             }
             "graph.consolidate_links" => {
                 self.graph_section().consolidate_links = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_components" => {
+                self.graph_section().consolidate_components = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2339,6 +2363,99 @@ mod tests {
         assert!(cfg.graph.as_ref().expect("graph").consolidate_links);
         assert!(cfg.set_key("graph.consolidate_links", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").consolidate_links);
+    }
+
+    #[test]
+    fn consolidate_components_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_components());
+        assert!(!GraphSection::default().consolidate_components);
+        assert!(!GraphSection::default().components_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().components_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_components"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_components = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_components);
+        assert!(!false_graph.components_apply());
+        assert!(!false_graph.consolidate);
+        assert!(!false_graph.consolidate_hold);
+        assert!(!false_graph.consolidate_links);
+        assert!(!false_graph.drop_restatements);
+        assert!(!false_graph.known_match);
+        assert!(!false_graph.known_facts_context);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_components"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_components", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_components);
+        assert!(!graph.components_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.consolidate_hold);
+        assert!(!graph.consolidate_links);
+        assert!(!graph.drop_restatements);
+        assert!(!graph.known_match);
+        assert!(!graph.known_facts_context);
+        let rendered = toml::to_string_pretty(&cfg).expect("render components only");
+        assert!(rendered.contains("consolidate_components = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_hold"));
+        assert!(!rendered.contains("consolidate_links"));
+        assert!(!rendered.contains("drop_restatements"));
+        assert!(!rendered.contains("known_match"));
+        assert!(!rendered.contains("known_facts_context"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse components only");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.consolidate_components);
+        assert!(!parsed_graph.components_apply());
+        assert!(!parsed_graph.consolidate);
+        assert!(!parsed_graph.consolidate_hold);
+        assert!(!parsed_graph.consolidate_links);
+        assert!(!parsed_graph.drop_restatements);
+        assert!(!parsed_graph.known_match);
+        assert!(!parsed_graph.known_facts_context);
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").components_apply());
+        cfg.set_key("graph.consolidate_hold", "true").unwrap();
+        cfg.set_key("graph.consolidate_links", "true").unwrap();
+        cfg.set_key("graph.drop_restatements", "true").unwrap();
+        cfg.set_key("graph.known_match", "true").unwrap();
+        cfg.set_key("graph.known_facts_context", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.components_apply());
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        assert!(graph.drop_restatements);
+        assert!(graph.known_match);
+        assert!(graph.known_facts_context);
+
+        cfg.set_key("graph.consolidate_components", "false")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(!graph.consolidate_components);
+        assert!(!graph.components_apply());
+        assert!(graph.consolidate);
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_components"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse cleared");
+        let cleared = parsed.graph.unwrap_or_default();
+        assert!(!cleared.consolidate_components);
+        assert!(!cleared.components_apply());
+
+        cfg.set_key("graph.consolidate_components", "true").unwrap();
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").components_apply());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_components);
+        assert!(cfg.set_key("graph.consolidate_components", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_components);
     }
 
     #[test]
