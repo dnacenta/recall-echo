@@ -369,44 +369,83 @@ fn apply_graph_switches(
     consolidate_links: ConsolidateLinks,
     consolidate_components: ConsolidateComponents,
 ) -> Result<(), RecallError> {
-    let mut body = String::from("[graph]\n");
-    let mut any = false;
-    if known == KnownFactsContext::On {
-        body.push_str("known_facts_context = true\n");
-        any = true;
-    }
-    if matched == KnownMatch::On {
-        body.push_str("known_match = true\n");
-        any = true;
-    }
-    if consolidate.writes_pass()
-        || consolidate_links == ConsolidateLinks::On
-        || consolidate_components == ConsolidateComponents::On
-    {
-        body.push_str("consolidate = true\n");
-        any = true;
-    }
-    if consolidate.writes_hold() {
-        body.push_str("consolidate_hold = true\n");
-        any = true;
-    }
-    if consolidate_links == ConsolidateLinks::On {
-        body.push_str("consolidate_links = true\n");
-        any = true;
-    }
-    if consolidate_components == ConsolidateComponents::On {
-        body.push_str("consolidate_components = true\n");
-        any = true;
-    }
-    if drop_restatements == DropRestatements::On {
-        body.push_str("drop_restatements = true\n");
-        any = true;
-    }
-    if !any {
+    let lines = switch_lines(
+        known,
+        matched,
+        consolidate,
+        drop_restatements,
+        consolidate_links,
+        consolidate_components,
+    );
+    if lines.is_empty() {
         return Ok(());
+    }
+    let mut body = String::from("[graph]\n");
+    for line in lines {
+        body.push_str(line);
+        body.push('\n');
     }
     fs::write(crate::config::config_path(memory_dir), body)?;
     Ok(())
+}
+
+fn switch_lines(
+    known: KnownFactsContext,
+    matched: KnownMatch,
+    consolidate: Consolidate,
+    drop_restatements: DropRestatements,
+    consolidate_links: ConsolidateLinks,
+    consolidate_components: ConsolidateComponents,
+) -> Vec<&'static str> {
+    let mut lines = Vec::new();
+    push_line(
+        &mut lines,
+        known == KnownFactsContext::On,
+        "known_facts_context = true",
+    );
+    push_line(&mut lines, matched == KnownMatch::On, "known_match = true");
+    push_line(
+        &mut lines,
+        writes_consolidate(consolidate, consolidate_links, consolidate_components),
+        "consolidate = true",
+    );
+    push_line(
+        &mut lines,
+        consolidate.writes_hold(),
+        "consolidate_hold = true",
+    );
+    push_line(
+        &mut lines,
+        consolidate_links == ConsolidateLinks::On,
+        "consolidate_links = true",
+    );
+    push_line(
+        &mut lines,
+        consolidate_components == ConsolidateComponents::On,
+        "consolidate_components = true",
+    );
+    push_line(
+        &mut lines,
+        drop_restatements == DropRestatements::On,
+        "drop_restatements = true",
+    );
+    lines
+}
+
+fn writes_consolidate(
+    consolidate: Consolidate,
+    consolidate_links: ConsolidateLinks,
+    consolidate_components: ConsolidateComponents,
+) -> bool {
+    consolidate.writes_pass()
+        || consolidate_links == ConsolidateLinks::On
+        || consolidate_components == ConsolidateComponents::On
+}
+
+fn push_line(lines: &mut Vec<&'static str>, on: bool, line: &'static str) {
+    if on {
+        lines.push(line);
+    }
 }
 
 /// N fresh runs, plus the median and the min/max of each graded count.
