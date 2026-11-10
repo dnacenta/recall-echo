@@ -108,6 +108,31 @@ pub struct SessionObservation {
     pub hold: crate::graph::types::HoldReport,
     /// Derived-from counts. Blank when that switch is off.
     pub links: crate::graph::types::LinksReport,
+    /// Stored status, pending rows and rejected slots around this session.
+    /// Grading diffs `before` and `after` only and does not read this.
+    pub status_rows: StatusWindow,
+}
+
+/// One store row with the status the grader does not read.
+///
+/// Rejected slots are included here. A relationship's `status` is the stored
+/// value, and is absent when the row has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRow {
+    pub id: String,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub live: bool,
+    pub status: Option<String>,
+    pub pending: bool,
+}
+
+/// Status rows before and after one session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusWindow {
+    pub before: Vec<StatusRow>,
+    pub after: Vec<StatusRow>,
 }
 
 /// Precision and recall for one operation.
@@ -1786,6 +1811,7 @@ mod tests {
             consolidate: crate::graph::types::ConsolidateReport::default(),
             hold: crate::graph::types::HoldReport::default(),
             links: crate::graph::types::LinksReport::default(),
+            status_rows: StatusWindow::default(),
         }
     }
 
@@ -2010,6 +2036,27 @@ mod tests {
         assert!(report.patterns.is_none());
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("patterns"), "{json}");
+    }
+
+    #[test]
+    fn grading_ignores_the_status_side_channel() {
+        let user = weights().weight_user;
+        let sessions = perfect_observations(user);
+        let mut with_status = sessions.clone();
+        let last = with_status.last_mut().expect("sessions");
+        last.status_rows.after.push(StatusRow {
+            id: "entity:host|setting|host|birch|t0|rejected".into(),
+            subject: "deploy".into(),
+            relation: "setting".into(),
+            object: "birch".into(),
+            live: false,
+            status: Some("rejected".into()),
+            pending: false,
+        });
+        assert_eq!(
+            grade_history(sessions, true),
+            grade_history(with_status, true)
+        );
     }
 
     #[test]

@@ -21,8 +21,8 @@ mod script;
 
 pub use grade::{
     grade, ExtractorLabel, JunkEdge, ObservedEdge, OpScore, OpTable, PatternBucket, PatternScore,
-    QuestionScore, SessionObservation, SessionReport, StepLog, WriteOp, WriteReport, WrongFact,
-    WrongReason,
+    QuestionScore, SessionObservation, SessionReport, StatusRow, StatusWindow, StepLog, WriteOp,
+    WriteReport, WrongFact, WrongReason,
 };
 pub use run::{
     require_scratch, run, run_repeat, Consolidate, ConsolidateLinks, DropRestatements, Extractor,
