@@ -358,9 +358,6 @@ pub(crate) async fn run(
             if pair.hold && taken.is_none() {
                 continue;
             }
-            if ctx.components_on {
-                count_kept(report, tally);
-            }
             let before = report.consolidate.closes_sup;
             let reason = close_partner(
                 gm,
@@ -377,6 +374,9 @@ pub(crate) async fn run(
             )
             .await;
             if report.consolidate.closes_sup > before {
+                if ctx.components_on {
+                    count_kept(report, tally);
+                }
                 gone.insert(pair.partner);
                 if pair.hold {
                     report.hold.holds_confirmed += 1;
