@@ -1791,14 +1791,14 @@ fn note_component_close(
     if !ctx.components_on {
         return;
     }
+    let Some(quote) = quote else {
+        return;
+    };
     let anchor = &anchors[pair.anchor];
     let partner = &rows[pair.partner];
     if !same_name(&anchor.subject, &partner.subject) {
         add_count(&mut report.consolidate.closes_component);
     }
-    let Some(quote) = quote else {
-        return;
-    };
     eprintln!(
         "{}",
         component_close_line(
