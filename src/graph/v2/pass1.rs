@@ -298,6 +298,7 @@ pub(crate) async fn extract_session(
         );
         write_ctx.match_on = match_on;
         write_ctx.hold_on = hold_enabled(memory_dir);
+        write_ctx.links_on = links_enabled(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -324,6 +325,8 @@ pub(crate) async fn extract_session(
         if stats.unresolved > 0 {
             *report.drops.entry(DROP_UNRESOLVED.to_string()).or_insert(0) += stats.unresolved;
         }
+        // Consolidation may add derived-anchor counts on top of the write totals.
+        report.links = stats.links;
         if consolidate_on {
             let started = std::time::Instant::now();
             super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -393,6 +396,13 @@ fn hold_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .hold_applies()
+}
+
+fn links_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .links_apply()
 }
 
 fn drop_restatements_enabled(memory_dir: &Path) -> bool {
@@ -4406,6 +4416,44 @@ mod tests {
             slot["key"] == "timeout" && slot["value"] == "10s" && slot.get("pending").is_none()
         }));
         assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_restatement_is_dropped_instead_of_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nconsolidate = true\nconsolidate_links = true\ndrop_restatements = true\n",
+        )
+        .unwrap();
+        write_archive(memory, "The timeout is 10s. Use 10s.");
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let provider = PairReply {
+            reply: r#"{"facts":[{"subject":"acme","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"The timeout is 10s.","confidence":0.9},{"subject":"acme","subject_type":"project","predicate":"rule","role":"none","key":"","object":"use 10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Use 10s.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            judge: r#"{"pairs":[]}"#,
+        };
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+        assert!(report.links.is_blank(), "{:?}", report.links);
+        let slots = acme_slots(&gm).await;
+        assert!(slots.iter().any(|slot| {
+            slot["key"] == "timeout" && slot["value"] == "10s" && slot.get("derived_from").is_none()
+        }));
+        assert!(slots.iter().all(|slot| slot["predicate"] != "rule"));
+        assert!(slots.iter().all(|slot| slot.get("derived_from").is_none()));
     }
 
     fn harbor_setting(key: &str, value: &str) -> Fact {

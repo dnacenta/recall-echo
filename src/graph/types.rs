@@ -908,6 +908,38 @@ impl HoldReport {
     }
 }
 
+/// Counts from create-time derived-from links.
+///
+/// Older bench JSON has no object here. A blank report is left out of new JSON.
+/// The counters are filled only when consolidation and the link switch are both on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinksReport {
+    #[serde(default)]
+    pub links_written: u32,
+    #[serde(default)]
+    pub premises_recorded: u32,
+    #[serde(default)]
+    pub fan_in_overflow: u32,
+    /// Extra anchors added from a writer close of a linked premise.
+    #[serde(default)]
+    pub d_anchors_added: u32,
+    /// Dependents past the four-anchor cap.
+    #[serde(default)]
+    pub d_anchor_overflow: u32,
+}
+
+impl LinksReport {
+    /// No list was stored and no derived anchor was added or dropped.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.links_written == 0
+            && self.premises_recorded == 0
+            && self.fan_in_overflow == 0
+            && self.d_anchors_added == 0
+            && self.d_anchor_overflow == 0
+    }
+}
+
 impl ConsolidateReport {
     /// The pass did not run, or it found nothing to count.
     #[must_use]
@@ -1022,6 +1054,9 @@ pub struct IngestionReport {
     /// Contradiction-hold counts. Blank, and omitted, when the hold is off.
     #[serde(default, skip_serializing_if = "HoldReport::is_blank")]
     pub hold: HoldReport,
+    /// Derived-from counts. Blank, and omitted, when that switch is off.
+    #[serde(default, skip_serializing_if = "LinksReport::is_blank")]
+    pub links: LinksReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -1157,6 +1192,39 @@ mod tests {
         assert!(ConsolidateReport::default().is_blank());
         let blank = serde_json::to_value(IngestionReport::default()).unwrap();
         assert!(blank.get("consolidate").is_none());
+    }
+
+    #[test]
+    fn links_report_is_omitted_when_blank_and_older_json_loads() {
+        let encoded = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(encoded.get("links").is_none());
+        assert!(LinksReport::default().is_blank());
+
+        let mut report = IngestionReport::default();
+        report.links.links_written = 1;
+        report.links.premises_recorded = 2;
+        report.links.fan_in_overflow = 3;
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["links"]["links_written"], 1);
+        assert_eq!(encoded["links"]["premises_recorded"], 2);
+        assert_eq!(encoded["links"]["fan_in_overflow"], 3);
+        assert_eq!(encoded["links"]["d_anchors_added"], 0);
+        assert_eq!(encoded["links"]["d_anchor_overflow"], 0);
+        report.links = LinksReport {
+            d_anchors_added: 4,
+            d_anchor_overflow: 1,
+            ..LinksReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["links"]["d_anchors_added"], 4);
+        assert_eq!(encoded["links"]["d_anchor_overflow"], 1);
+        assert!(!report.links.is_blank());
+
+        let mut value = encoded;
+        value.as_object_mut().unwrap().remove("links");
+        let loaded: IngestionReport = serde_json::from_value(value).unwrap();
+        assert!(loaded.links.is_blank());
+        assert_eq!(loaded.entities_created, 0);
     }
 
     #[test]
