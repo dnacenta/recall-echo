@@ -1314,10 +1314,8 @@ fn sentence_head<'a>(
 }
 
 fn sentence_stops(quote: &str, end: usize) -> bool {
-    matches!(
-        quote[end..].trim_start().chars().next(),
-        None | Some('.' | '!' | '\n')
-    )
+    let rest = quote[end..].trim_start_matches([' ', '\t']);
+    matches!(rest.chars().next(), None | Some('.' | '!' | '\n'))
 }
 
 fn blank_between(quote: &str, from: usize, to: usize) -> bool {
@@ -8543,6 +8541,12 @@ mod tests {
         assert!(!numeric_pair(&percent, &minimum));
         assert!(trailing_quote(
             "Outbound timeout is 15 seconds now.",
+            "10",
+            "15",
+            "outbound_timeout_seconds",
+        ));
+        assert!(trailing_quote(
+            "Outbound timeout is 15 seconds now\nRetries stay at three.",
             "10",
             "15",
             "outbound_timeout_seconds",
