@@ -16,7 +16,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde::Serialize;
 
-use super::grade::{self, ExtractorLabel, ObservedEdge, SessionObservation, WriteReport};
+use super::grade::{
+    self, ExtractorLabel, ObservedEdge, SessionObservation, StatusRow, StatusWindow, WriteReport,
+};
 use super::script::{Claim, ClaimOp, FactScript, ScriptFact, ScriptSession, Side, Speaker};
 use crate::archive::{append_index, highest_conversation_number};
 use crate::conversation::{self, conversation_to_markdown, Conversation, ConversationEntry};
@@ -221,58 +223,17 @@ async fn collect_sessions(
 ) -> Result<Vec<SessionObservation>, RecallError> {
     let mut first_beta = HashMap::new();
     let mut before = snapshot(gm, &mut first_beta).await?;
+    let mut status_before = snapshot_status(gm).await?;
     let mut sessions = Vec::with_capacity(written.len());
     for archive in written {
         let text = fs::read_to_string(&archive.path)?;
         let calls_before = provider.calls();
         let started = Instant::now();
-        let context = IngestContext::new(&archive.id, Some(archive.log_number));
-        let report = match pipeline {
-            PipelineVersion::V1 => {
-                gm.ingest_archive(&text, &context, Some(provider.as_provider()))
-                    .await?
-            }
-            PipelineVersion::V2 => {
-                // Episodes stay a separate step, with no model call. The
-                // pass-1 calls are the only ones the run is billed for.
-                let mut report = gm.ingest_archive(&text, &context, None).await?;
-                let extracted = crate::graph::v2::extract_log(
-                    gm,
-                    memory_dir,
-                    archive.log_number,
-                    &text,
-                    &context,
-                    provider.as_provider(),
-                    PipelineVersion::V2,
-                )
-                .await?;
-                report.errors.extend(extracted.errors);
-                report.entities_created += extracted.entities_created;
-                report.relationships_created += extracted.relationships_created;
-                report.slots_written += extracted.slots_written;
-                report.estimated_tokens += extracted.estimated_tokens;
-                report.measured_tokens += extracted.measured_tokens;
-                report.input_tokens = add_reported(report.input_tokens, extracted.input_tokens);
-                report.output_tokens = add_reported(report.output_tokens, extracted.output_tokens);
-                report.llm_calls += extracted.llm_calls;
-                report.windows = extracted.windows;
-                report.candidates = extracted.candidates;
-                report.kept = extracted.kept;
-                report.drops = extracted.drops;
-                report.resolve = extracted.resolve;
-                report.retirements = extracted.retirements;
-                report.retirements_skipped = extracted.retirements_skipped;
-                report.timing = extracted.timing;
-                report.known_match = extracted.known_match;
-                report.consolidate = extracted.consolidate;
-                report.hold = extracted.hold;
-                report.links = extracted.links;
-                report
-            }
-        };
+        let report = ingest_session(gm, memory_dir, archive, &text, provider, pipeline).await?;
         let calls = provider.calls().saturating_sub(calls_before);
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let after = snapshot(gm, &mut first_beta).await?;
+        let status_after = snapshot_status(gm).await?;
         sessions.push(SessionObservation {
             id: archive.id.clone(),
             before,
@@ -294,10 +255,77 @@ async fn collect_sessions(
             consolidate: report.consolidate,
             hold: report.hold,
             links: report.links,
+            status_rows: StatusWindow {
+                before: status_before,
+                after: status_after.clone(),
+            },
         });
         before = after;
+        status_before = status_after;
     }
     Ok(sessions)
+}
+
+async fn ingest_session(
+    gm: &GraphMemory,
+    memory_dir: &Path,
+    archive: &WrittenArchive,
+    text: &str,
+    provider: &Counting<'_>,
+    pipeline: PipelineVersion,
+) -> Result<crate::graph::types::IngestionReport, RecallError> {
+    let context = IngestContext::new(&archive.id, Some(archive.log_number));
+    match pipeline {
+        PipelineVersion::V1 => Ok(gm
+            .ingest_archive(text, &context, Some(provider.as_provider()))
+            .await?),
+        PipelineVersion::V2 => ingest_v2(gm, memory_dir, archive, text, provider, &context).await,
+    }
+}
+
+/// Episodes stay a separate step, with no model call. The pass-1 calls are
+/// the only ones the run is billed for.
+async fn ingest_v2(
+    gm: &GraphMemory,
+    memory_dir: &Path,
+    archive: &WrittenArchive,
+    text: &str,
+    provider: &Counting<'_>,
+    context: &IngestContext,
+) -> Result<crate::graph::types::IngestionReport, RecallError> {
+    let mut report = gm.ingest_archive(text, context, None).await?;
+    let extracted = crate::graph::v2::extract_log(
+        gm,
+        memory_dir,
+        archive.log_number,
+        text,
+        context,
+        provider.as_provider(),
+        PipelineVersion::V2,
+    )
+    .await?;
+    report.errors.extend(extracted.errors);
+    report.entities_created += extracted.entities_created;
+    report.relationships_created += extracted.relationships_created;
+    report.slots_written += extracted.slots_written;
+    report.estimated_tokens += extracted.estimated_tokens;
+    report.measured_tokens += extracted.measured_tokens;
+    report.input_tokens = add_reported(report.input_tokens, extracted.input_tokens);
+    report.output_tokens = add_reported(report.output_tokens, extracted.output_tokens);
+    report.llm_calls += extracted.llm_calls;
+    report.windows = extracted.windows;
+    report.candidates = extracted.candidates;
+    report.kept = extracted.kept;
+    report.drops = extracted.drops;
+    report.resolve = extracted.resolve;
+    report.retirements = extracted.retirements;
+    report.retirements_skipped = extracted.retirements_skipped;
+    report.timing = extracted.timing;
+    report.known_match = extracted.known_match;
+    report.consolidate = extracted.consolidate;
+    report.hold = extracted.hold;
+    report.links = extracted.links;
+    Ok(report)
 }
 
 fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
@@ -869,6 +897,220 @@ async fn snapshot(
         }
     }
     Ok(edges)
+}
+
+/// Every stored row, including rejected slots, with status and pending.
+///
+/// `snapshot` keeps its grading filter. This sibling supplies the rows and
+/// the stored status that filter drops.
+async fn snapshot_status(gm: &GraphMemory) -> Result<Vec<StatusRow>, RecallError> {
+    let mut rows = relationship_status_rows(gm).await?;
+    rows.extend(slot_status_rows(gm).await?);
+    Ok(rows)
+}
+
+async fn relationship_status_rows(gm: &GraphMemory) -> Result<Vec<StatusRow>, RecallError> {
+    let relationships = crate::graph::crud::list_all_relationships(gm.db()).await?;
+    let pending = pending_edge_ids(gm).await?;
+    let stored = stored_relationship_status(gm).await?;
+    let mut names = crate::graph::edge_view::NameCache::new();
+    let mut rows = Vec::with_capacity(relationships.len());
+    for relationship in &relationships {
+        rows.push(relationship_status_row(gm, relationship, &pending, &stored, &mut names).await?);
+    }
+    Ok(rows)
+}
+
+async fn relationship_status_row(
+    gm: &GraphMemory,
+    relationship: &crate::graph::types::Relationship,
+    pending: &HashSet<String>,
+    stored: &HashMap<String, String>,
+    names: &mut crate::graph::edge_view::NameCache,
+) -> Result<StatusRow, RecallError> {
+    let id = relationship.id_string();
+    let from_id = crate::graph::edge_view::record_id(&relationship.from_id);
+    let to_id = crate::graph::edge_view::record_id(&relationship.to_id);
+    let pending_row = pending.contains(&id);
+    let status = stored.get(&id).map(String::as_str);
+    Ok(StatusRow {
+        id: id.clone(),
+        subject: names.name_of(gm.db(), &from_id).await?,
+        relation: relationship.rel_type.clone(),
+        object: names.name_of(gm.db(), &to_id).await?,
+        live: relation_live(relationship.valid_until.is_none(), pending_row, status),
+        status: status.map(str::to_string),
+        pending: pending_row,
+    })
+}
+
+fn relation_live(open: bool, pending: bool, status: Option<&str>) -> bool {
+    open && !pending && status != Some("rejected")
+}
+
+async fn stored_relationship_status(
+    gm: &GraphMemory,
+) -> Result<HashMap<String, String>, RecallError> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: serde_json::Value,
+        #[serde(default)]
+        status: Option<String>,
+    }
+    let mut response = gm
+        .db()
+        .query("SELECT id, status FROM relates_to")
+        .await
+        .map_err(crate::graph::error::GraphError::from)?;
+    let rows: Vec<Row> = crate::graph::deserialize_take(&mut response, 0)?;
+    let mut by_id = HashMap::new();
+    for row in rows {
+        let Some(status) = present_status(row.status) else {
+            continue;
+        };
+        by_id.insert(crate::graph::edge_view::record_id(&row.id), status);
+    }
+    Ok(by_id)
+}
+
+fn present_status(status: Option<String>) -> Option<String> {
+    status.filter(|value| !value.is_empty())
+}
+
+async fn slot_status_rows(gm: &GraphMemory) -> Result<Vec<StatusRow>, RecallError> {
+    let entities = crate::graph::crud::list_entities(gm.db(), None).await?;
+    let mut rows = Vec::new();
+    for entity in &entities {
+        let Some(slots) = entity_slots(entity) else {
+            continue;
+        };
+        rows.extend(status_rows_for_slots(
+            &entity.id_string(),
+            &entity.name,
+            slots,
+        ));
+    }
+    Ok(rows)
+}
+
+fn entity_slots(entity: &crate::graph::types::Entity) -> Option<&Vec<serde_json::Value>> {
+    entity
+        .attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get("v2"))
+        .and_then(|v2| v2.get("slots"))
+        .and_then(|slots| slots.as_array())
+}
+
+fn status_rows_for_slots(
+    entity_id: &str,
+    name: &str,
+    slots: &[serde_json::Value],
+) -> Vec<StatusRow> {
+    let mut grading_seen = HashMap::new();
+    let mut side_seen = HashMap::new();
+    slots
+        .iter()
+        .map(|slot| status_row_for_slot(entity_id, name, slot, &mut grading_seen, &mut side_seen))
+        .collect()
+}
+
+fn status_row_for_slot(
+    entity_id: &str,
+    name: &str,
+    slot: &serde_json::Value,
+    grading_seen: &mut HashMap<String, u32>,
+    side_seen: &mut HashMap<String, u32>,
+) -> StatusRow {
+    let predicate = slot_text(slot, "predicate");
+    let key = slot_text(slot, "key");
+    let value = slot_text(slot, "value");
+    let valid_from = slot_text(slot, "valid_from");
+    let status = slot_status_text(slot);
+    let base = format!("{entity_id}|{predicate}|{key}|{value}|{valid_from}");
+    let id = if grading_slot(status) {
+        grading_slot_id(&base, grading_seen)
+    } else {
+        side_slot_id(&base, side_suffix(status), side_seen)
+    };
+    StatusRow {
+        id,
+        subject: name.to_string(),
+        relation: slot_relation(predicate, key),
+        object: value.to_string(),
+        live: slot_live(slot),
+        status: present_status(Some(status.to_string())),
+        pending: slot_pending(slot),
+    }
+}
+
+fn slot_text<'a>(slot: &'a serde_json::Value, field: &str) -> &'a str {
+    slot.get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn slot_status_text(slot: &serde_json::Value) -> &str {
+    slot_text(slot, "status")
+}
+
+fn grading_slot(status: &str) -> bool {
+    status == "decided" || status == "considered"
+}
+
+fn side_suffix(status: &str) -> &str {
+    if status.is_empty() {
+        "nostatus"
+    } else {
+        status
+    }
+}
+
+fn grading_slot_id(base: &str, seen: &mut HashMap<String, u32>) -> String {
+    let count = next_count(seen, base);
+    if count > 1 {
+        format!("{base}|{count}")
+    } else {
+        base.to_string()
+    }
+}
+
+fn side_slot_id(base: &str, suffix: &str, seen: &mut HashMap<String, u32>) -> String {
+    let key = format!("{base}|{suffix}");
+    let count = next_count(seen, &key);
+    if count > 1 {
+        format!("{base}|{count}|{suffix}")
+    } else {
+        key
+    }
+}
+
+fn next_count(seen: &mut HashMap<String, u32>, key: &str) -> u32 {
+    let count = seen.entry(key.to_string()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+fn slot_pending(slot: &serde_json::Value) -> bool {
+    slot.get("pending")
+        .is_some_and(serde_json::Value::is_object)
+}
+
+fn slot_live(slot: &serde_json::Value) -> bool {
+    !slot_pending(slot)
+        && open_until(slot.get("valid_until"))
+        && slot_status_text(slot) != "rejected"
+}
+
+fn open_until(until: Option<&serde_json::Value>) -> bool {
+    let Some(value) = until else {
+        return true;
+    };
+    value.is_null() || empty_text(value)
+}
+
+fn empty_text(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(str::is_empty)
 }
 
 /// A setting whose key is empty or `value` is the bare `setting` relation.
@@ -1544,7 +1786,7 @@ fn extracted_entity(fact: &ScriptFact, side: Side) -> Result<ExtractedEntity, Re
 
 #[cfg(test)]
 mod tests {
-    use super::super::script::ScriptTurn;
+    use super::super::script::{ScriptFact, ScriptTurn, Speaker};
     use super::*;
     use super::{map_relation, RelationMap};
     use crate::graph::extract::chunk_conversation;
@@ -3433,6 +3675,403 @@ mod tests {
         assert_eq!(pending.id, stored);
         assert!(!pending.live);
         assert!(live.live);
+    }
+
+    #[test]
+    fn grading_slot_ids_follow_the_snapshot_counter() {
+        let mut seen = std::collections::HashMap::new();
+        assert_eq!(grading_slot_id("base", &mut seen), "base");
+        assert_eq!(grading_slot_id("base", &mut seen), "base|2");
+        assert_eq!(grading_slot_id("other", &mut seen), "other");
+    }
+
+    #[test]
+    fn rejected_slots_do_not_consume_the_grading_counter() {
+        let rejected = serde_json::json!({
+            "predicate": "setting",
+            "key": "host",
+            "value": "pine",
+            "status": "rejected",
+            "valid_from": "t0"
+        });
+        let decided = serde_json::json!({
+            "predicate": "setting",
+            "key": "host",
+            "value": "pine",
+            "status": "decided",
+            "valid_from": "t0"
+        });
+        let mut grading = std::collections::HashMap::new();
+        let mut side = std::collections::HashMap::new();
+        let first =
+            status_row_for_slot("entity:host", "deploy", &rejected, &mut grading, &mut side);
+        let second =
+            status_row_for_slot("entity:host", "deploy", &decided, &mut grading, &mut side);
+        let third =
+            status_row_for_slot("entity:host", "deploy", &rejected, &mut grading, &mut side);
+        assert_eq!(first.id, "entity:host|setting|host|pine|t0|rejected");
+        assert!(!first.live);
+        assert_eq!(first.status.as_deref(), Some("rejected"));
+        assert_eq!(second.id, "entity:host|setting|host|pine|t0");
+        assert_eq!(second.status.as_deref(), Some("decided"));
+        assert_eq!(third.id, "entity:host|setting|host|pine|t0|2|rejected");
+    }
+
+    #[test]
+    fn a_blank_status_string_is_omitted() {
+        assert_eq!(present_status(None), None);
+        assert_eq!(present_status(Some(String::new())), None);
+        assert_eq!(
+            present_status(Some("decided".into())),
+            Some("decided".into())
+        );
+        let slot = serde_json::json!({
+            "predicate": "setting",
+            "key": "host",
+            "value": "pine",
+            "valid_from": "t0"
+        });
+        let row = status_row_for_slot(
+            "entity:host",
+            "deploy",
+            &slot,
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        );
+        assert_eq!(row.id, "entity:host|setting|host|pine|t0|nostatus");
+        assert!(row.status.is_none());
+    }
+
+    #[test]
+    fn slot_liveness_matches_the_grading_rule() {
+        let open = serde_json::json!({"status": "considered"});
+        assert!(slot_live(&open));
+        assert!(grading_slot("considered"));
+        let pending = serde_json::json!({"pending": {"since": "s2"}, "status": "decided"});
+        assert!(slot_pending(&pending));
+        assert!(!slot_live(&pending));
+        let closed = serde_json::json!({"valid_until": "2026-02-01"});
+        assert!(!slot_live(&closed));
+        let blank_until = serde_json::json!({"valid_until": ""});
+        assert!(slot_live(&blank_until));
+        let null_until = serde_json::json!({"valid_until": null});
+        assert!(slot_live(&null_until));
+        let rejected = serde_json::json!({"status": "rejected"});
+        assert!(!slot_live(&rejected));
+        assert!(!grading_slot("rejected"));
+        assert!(!grading_slot(""));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn stored_status_includes_rejected_slots_and_pending_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        seed_status_graph(&gm).await;
+        let mut first_beta = std::collections::HashMap::new();
+        let edges = snapshot(&gm, &mut first_beta).await.unwrap();
+        let status = snapshot_status(&gm).await.unwrap();
+        assert_side_channel_matches_grading(&edges, &status);
+        assert_stored_slot_status(&status);
+        assert_stored_relationship_status(&status);
+        assert_grading_unchanged_by_rejected_slots(&edges, &status);
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn seed_status_graph(gm: &GraphMemory) {
+        for (id, name) in [
+            ("host", "deploy"),
+            ("linen", "linen"),
+            ("rust", "rust"),
+            ("clay", "clay"),
+            ("wool", "wool"),
+        ] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = '{name}', entity_type = 'project', abstract = '', overview = ''"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        let slots = serde_json::json!([
+            {"predicate": "setting", "key": "host", "value": "birch", "status": "rejected", "valid_from": "t0", "valid_until": "2026-02-01"},
+            {"predicate": "setting", "key": "host", "value": "pine", "status": "decided", "valid_from": "t0"},
+            {"predicate": "setting", "key": "host", "value": "oak", "status": "considered", "valid_from": "t0"},
+            {"predicate": "setting", "key": "dup", "value": "same", "status": "decided", "valid_from": "t0"},
+            {"predicate": "setting", "key": "dup", "value": "same", "status": "decided", "valid_from": "t0"},
+            {"predicate": "setting", "key": "mode", "value": "fast", "status": "decided", "valid_from": "t0", "pending": {"since": "s2"}}
+        ]);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", "entity:host".to_string()))
+            .bind((
+                "attributes",
+                serde_json::json!({"v2": {"kind": "", "slots": slots}}),
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        relate(gm, "host", "linen", ", status = 'decided'").await;
+        relate(gm, "host", "rust", "").await;
+        relate(gm, "host", "clay", ", status = 'rejected'").await;
+        relate(
+            gm,
+            "host",
+            "wool",
+            ", status = 'considered', pending = { since: 's2' }",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn relate(gm: &GraphMemory, from: &str, to: &str, extra: &str) {
+        gm.db()
+            .query(format!(
+                "RELATE entity:{from}->relates_to->entity:{to} SET rel_type = 'uses', confidence = 0.4, valid_from = time::now(){extra}"
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_side_channel_matches_grading(edges: &[ObservedEdge], status: &[StatusRow]) {
+        assert!(edges.iter().all(|edge| edge.object != "birch"));
+        assert!(edges.iter().all(|edge| !edge.id.ends_with("|rejected")));
+        assert!(status.iter().any(|row| row.object == "birch"));
+        for edge in edges {
+            let row = status.iter().find(|row| row.id == edge.id).expect(&edge.id);
+            assert_eq!(row.subject, edge.subject);
+            assert_eq!(row.relation, edge.relation);
+            assert_eq!(row.object, edge.object);
+            assert_side_live(edge, row);
+        }
+        let clay = edges
+            .iter()
+            .find(|edge| edge.object == "clay")
+            .expect("clay");
+        assert!(clay.live);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_side_live(edge: &ObservedEdge, row: &StatusRow) {
+        if row.status.as_deref() == Some("rejected") {
+            assert!(!row.live);
+            return;
+        }
+        assert_eq!(row.live, edge.live);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_stored_slot_status(status: &[StatusRow]) {
+        let pine = status_object(status, "pine");
+        let oak = status_object(status, "oak");
+        let birch = status_object(status, "birch");
+        let fast = status_object(status, "fast");
+        assert_eq!(pine.status.as_deref(), Some("decided"));
+        assert!(pine.live);
+        assert_eq!(pine.relation, "setting:host");
+        assert_eq!(oak.status.as_deref(), Some("considered"));
+        assert!(oak.live);
+        assert_eq!(birch.status.as_deref(), Some("rejected"));
+        assert!(!birch.live);
+        assert!(birch.id.ends_with("|rejected"));
+        assert!(fast.pending);
+        assert!(!fast.live);
+        assert_eq!(fast.status.as_deref(), Some("decided"));
+        let mut dups: Vec<&str> = status
+            .iter()
+            .filter(|row| row.object == "same")
+            .map(|row| row.id.as_str())
+            .collect();
+        dups.sort();
+        assert_eq!(dups.len(), 2);
+        assert!(dups[0].ends_with("|setting|dup|same|t0"));
+        assert!(dups[1].ends_with("|setting|dup|same|t0|2"));
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_stored_relationship_status(status: &[StatusRow]) {
+        let linen = status_object(status, "linen");
+        let rust = status_object(status, "rust");
+        let clay = status_object(status, "clay");
+        let wool = status_object(status, "wool");
+        assert_eq!(linen.status.as_deref(), Some("decided"));
+        assert!(linen.live);
+        assert!(!linen.pending);
+        assert!(rust.status.is_none());
+        assert!(rust.live);
+        assert_eq!(clay.status.as_deref(), Some("rejected"));
+        assert!(!clay.live);
+        assert_eq!(wool.status.as_deref(), Some("considered"));
+        assert!(wool.pending);
+        assert!(!wool.live);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn status_object<'a>(status: &'a [StatusRow], object: &str) -> &'a StatusRow {
+        status
+            .iter()
+            .find(|row| row.object == object)
+            .unwrap_or_else(|| panic!("missing {object}"))
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_grading_unchanged_by_rejected_slots(edges: &[ObservedEdge], status: &[StatusRow]) {
+        let script = status_script();
+        let weights = crate::graph::ProvenanceWeights::default();
+        let plain = grade::grade(
+            &script,
+            &[observed_session("s1", edges.to_vec(), Vec::new())],
+            &weights,
+            &[],
+            grade::ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        let with_status = grade::grade(
+            &script,
+            &[observed_session("s1", edges.to_vec(), status.to_vec())],
+            &weights,
+            &[],
+            grade::ExtractorLabel::Scripted,
+        )
+        .unwrap();
+        assert_eq!(plain.operations, with_status.operations);
+        assert_eq!(plain.junk_edges, with_status.junk_edges);
+        assert_eq!(plain.patterns, with_status.patterns);
+        assert!(plain.patterns.is_some());
+        assert!(plain.junk_edges.iter().all(|edge| edge.object != "birch"));
+        assert_final_edge_json(&with_status);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_final_edge_json(report: &grade::WriteReport) {
+        let json = serde_json::to_value(report).unwrap();
+        expect_final(&json, "pine", Some("decided"), false, true);
+        expect_final(&json, "oak", Some("considered"), false, true);
+        expect_final(&json, "birch", Some("rejected"), false, false);
+        expect_final(&json, "fast", Some("decided"), true, false);
+        expect_final(&json, "linen", Some("decided"), false, true);
+        expect_final(&json, "rust", None, false, true);
+        expect_final(&json, "clay", Some("rejected"), false, false);
+        expect_final(&json, "wool", Some("considered"), true, false);
+        let stripped = {
+            let mut value = json.clone();
+            value.as_object_mut().unwrap().remove("final_edges");
+            value
+        };
+        let mut disabled = report.clone();
+        disabled.final_edges.clear();
+        assert_eq!(stripped, serde_json::to_value(&disabled).unwrap());
+    }
+
+    #[cfg(feature = "embedded")]
+    fn expect_final(
+        json: &serde_json::Value,
+        object: &str,
+        status: Option<&str>,
+        pending: bool,
+        live: bool,
+    ) {
+        let row = json["final_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["object"] == object)
+            .unwrap_or_else(|| panic!("missing {object}"));
+        assert_eq!(row["live"], live);
+        match status {
+            Some(value) => assert_eq!(row["status"], value),
+            None => assert!(row.get("status").is_none()),
+        }
+        if pending {
+            assert_eq!(row["pending"], true);
+        } else {
+            assert!(row.get("pending").is_none());
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn observed_session(
+        id: &str,
+        edges: Vec<ObservedEdge>,
+        status: Vec<StatusRow>,
+    ) -> SessionObservation {
+        SessionObservation {
+            id: id.to_string(),
+            before: Vec::new(),
+            after: edges,
+            calls: 0,
+            millis: 0,
+            input_tokens: None,
+            output_tokens: None,
+            warnings: Vec::new(),
+            windows: 0,
+            candidates: 0,
+            kept: 0,
+            drops: std::collections::HashMap::new(),
+            resolve: crate::graph::types::ResolveStats::default(),
+            retirements: Vec::new(),
+            retirements_skipped: 0,
+            timing: None,
+            known_match: crate::graph::types::MatchReport::default(),
+            consolidate: crate::graph::types::ConsolidateReport::default(),
+            hold: crate::graph::types::HoldReport::default(),
+            links: crate::graph::types::LinksReport::default(),
+            status_rows: StatusWindow {
+                before: Vec::new(),
+                after: status,
+            },
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn status_script() -> FactScript {
+        FactScript {
+            name: "status".into(),
+            project: None,
+            cwd: None,
+            sessions: vec![super::super::script::ScriptSession {
+                id: "s1".into(),
+                date: "2026-01-01T00:00:00Z".into(),
+                turns: vec![ScriptTurn {
+                    role: Speaker::User,
+                    text: "status".into(),
+                    claims: vec![],
+                    noise: false,
+                }],
+                transcript: None,
+                transcript_path: None,
+                claims: vec![],
+            }],
+            facts: vec![ScriptFact {
+                id: "host".into(),
+                subject: "deploy".into(),
+                relation: "setting:host".into(),
+                object: "pine".into(),
+                subject_type: "project".into(),
+                object_type: "literal".into(),
+                subject_abstract: None,
+                object_abstract: None,
+                end_state: super::super::script::EndState::Live,
+                superseded_in: None,
+                pattern: Some(super::super::script::FactPattern {
+                    core_all: vec!["pine".into()],
+                    detail_all: vec![],
+                    wrong_any: vec![],
+                }),
+            }],
+            expect: vec![],
+            questions: vec![],
+            superseded_pairs: vec![],
+            noise: vec![],
+        }
     }
 
     #[cfg(feature = "embedded")]

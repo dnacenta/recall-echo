@@ -20,9 +20,9 @@ mod run;
 mod script;
 
 pub use grade::{
-    grade, ExtractorLabel, JunkEdge, ObservedEdge, OpScore, OpTable, PatternBucket, PatternScore,
-    QuestionScore, SessionObservation, SessionReport, StepLog, WriteOp, WriteReport, WrongFact,
-    WrongReason,
+    grade, ExtractorLabel, FinalEdge, JunkEdge, ObservedEdge, OpScore, OpTable, PatternBucket,
+    PatternScore, QuestionScore, SessionObservation, SessionReport, StatusRow, StatusWindow,
+    StepLog, WriteOp, WriteReport, WrongFact, WrongReason,
 };
 pub use run::{
     require_scratch, run, run_repeat, Consolidate, ConsolidateComponents, ConsolidateLinks,
