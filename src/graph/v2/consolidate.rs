@@ -290,7 +290,7 @@ pub(crate) async fn run(
         let anchor = &anchors[pair.anchor];
         let partner = &loaded.rows[pair.partner];
         let turn = cited(ctx, anchor);
-        let cue = accept_cue(
+        let (cue, tally) = accept_cue(
             ctx,
             anchor,
             partner,
@@ -300,7 +300,6 @@ pub(crate) async fn run(
                 turn,
                 quote: quote.as_str(),
             },
-            report,
         );
         match accept(
             &verdict,
@@ -310,13 +309,13 @@ pub(crate) async fn run(
             &anchor.new_value,
             cue,
         ) {
-            Ok(verdict) => accepted.push((pair, verdict.to_string(), quote)),
+            Ok(verdict) => accepted.push((pair, verdict.to_string(), quote, tally)),
             Err(reason) => note_drop(report, reason, &anchors, &loaded.rows, &pair, &quote),
         }
     }
     let mut blocked = BTreeSet::new();
     let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (index, (pair, verdict, _)) in accepted.iter().enumerate() {
+    for (index, (pair, verdict, _, _)) in accepted.iter().enumerate() {
         if verdict == "supersedes" {
             grouped.entry(pair.anchor).or_default().push(index);
         }
@@ -331,12 +330,12 @@ pub(crate) async fn run(
                     .skips
                     .entry("consolidate_ambiguous".into())
                     .or_insert(0) += 1;
-                let (pair, _, quote) = &accepted[*index];
+                let (pair, _, quote, _) = &accepted[*index];
                 note_drop(report, DROP_SECOND, &anchors, &loaded.rows, pair, quote);
             }
         }
     }
-    for (index, (pair, verdict, quote)) in accepted.iter().enumerate() {
+    for (index, (pair, verdict, quote, tally)) in accepted.iter().enumerate() {
         if blocked.contains(&index) {
             continue;
         }
@@ -354,6 +353,9 @@ pub(crate) async fn run(
             };
             if pair.hold && taken.is_none() {
                 continue;
+            }
+            if ctx.components_on {
+                count_kept(report, tally);
             }
             let before = report.consolidate.closes_sup;
             let reason = close_partner(
@@ -1413,6 +1415,23 @@ enum CueBranch {
     Trailing,
 }
 
+#[derive(Clone, Copy)]
+struct CueTally {
+    sibling: bool,
+    derived: bool,
+    trailing: bool,
+}
+
+impl CueTally {
+    fn none() -> Self {
+        Self {
+            sibling: false,
+            derived: false,
+            trailing: false,
+        }
+    }
+}
+
 fn accept_cue(
     ctx: &WriteCtx<'_>,
     anchor: &Anchor,
@@ -1420,17 +1439,19 @@ fn accept_cue(
     loaded: &Loaded,
     dependents: &[DependentHit],
     text: CueText<'_>,
-    report: &mut IngestionReport,
-) -> bool {
+) -> (bool, CueTally) {
     let inputs = CueInputs {
         depart: departs(text.turn, &partner.value, &anchor.replaces),
         quoted: replacement_quote(text.quote, &partner.value, &anchor.new_value, &anchor.key),
         quote: text.quote,
     };
     if !ctx.components_on {
-        return plain_cue(anchor, partner, loaded, inputs.depart, inputs.quoted);
+        return (
+            plain_cue(anchor, partner, loaded, inputs.depart, inputs.quoted),
+            CueTally::none(),
+        );
     }
-    component_cue(ctx, anchor, partner, loaded, dependents, inputs, report)
+    component_cue(ctx, anchor, partner, loaded, dependents, inputs)
 }
 
 fn plain_cue(anchor: &Anchor, partner: &Row, loaded: &Loaded, depart: bool, quoted: bool) -> bool {
@@ -1445,18 +1466,41 @@ fn component_cue(
     loaded: &Loaded,
     dependents: &[DependentHit],
     inputs: CueInputs<'_>,
-    report: &mut IngestionReport,
-) -> bool {
+) -> (bool, CueTally) {
     let kind = widened_cue(ctx, anchor, partner, loaded, dependents);
     let trailing = trailing_allowed(&kind.links, anchor, partner, inputs.quote);
     let accept = joined_cue(inputs.depart, kind.paired, inputs.quoted, trailing);
-    record_component_cue(
-        report,
+    let tally = kept_tally(
         &kind.links,
         cue_branch(&kind.links, inputs.quoted, trailing),
         accept && !inputs.depart && kind.paired,
     );
-    accept
+    (accept, tally)
+}
+
+fn kept_tally(links: &PairLinks, branch: CueBranch, made: bool) -> CueTally {
+    if !made {
+        return CueTally::none();
+    }
+    CueTally {
+        trailing: matches!(branch, CueBranch::Trailing),
+        sibling: sibling_branch(links, &branch),
+        derived: derived_branch(links, &branch),
+    }
+}
+
+fn sibling_branch(links: &PairLinks, branch: &CueBranch) -> bool {
+    matches!(branch, CueBranch::Sibling)
+        || (matches!(branch, CueBranch::Trailing) && links.sibling && !links.same && !links.direct)
+}
+
+fn derived_branch(links: &PairLinks, branch: &CueBranch) -> bool {
+    matches!(branch, CueBranch::Derived)
+        || (matches!(branch, CueBranch::Trailing)
+            && links.derived
+            && !links.same
+            && !links.direct
+            && !links.sibling)
 }
 
 fn cue_branch(links: &PairLinks, quoted: bool, trailing: bool) -> CueBranch {
@@ -1482,19 +1526,16 @@ fn joined_cue(depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool 
     depart || (paired && (quoted || trailing))
 }
 
-fn record_component_cue(
-    report: &mut IngestionReport,
-    links: &PairLinks,
-    branch: CueBranch,
-    made: bool,
-) {
-    if !made {
-        return;
+fn count_kept(report: &mut IngestionReport, tally: &CueTally) {
+    if tally.sibling {
+        add_count(&mut report.consolidate.link_sibling);
     }
-    if matches!(branch, CueBranch::Trailing) {
+    if tally.derived {
+        add_count(&mut report.consolidate.link_derived);
+    }
+    if tally.trailing {
         add_count(&mut report.consolidate.quote_trailing);
     }
-    note_link(report, links);
 }
 
 struct Widened {
@@ -1558,19 +1599,6 @@ fn pair_links(
             ctx.project,
         ),
         derived: derived_link(anchor, partner, dependents, ctx.links_on),
-    }
-}
-
-fn note_link(report: &mut IngestionReport, kind: &PairLinks) {
-    if kind.same || kind.direct {
-        return;
-    }
-    if kind.sibling {
-        add_count(&mut report.consolidate.link_sibling);
-        return;
-    }
-    if kind.derived {
-        add_count(&mut report.consolidate.link_derived);
     }
 }
 
@@ -7542,6 +7570,10 @@ mod tests {
     }
 
     async fn sibling_port(components_on: bool) -> (Judged, Option<String>) {
+        sibling_verdict(components_on, "supersedes").await
+    }
+
+    async fn sibling_verdict(components_on: bool, verdict: &str) -> (Judged, Option<String>) {
         let (_tmp, gm) = open().await;
         let widget = edge(
             Predicate::PartOf,
@@ -7570,7 +7602,7 @@ mod tests {
         let next = setting("acme widget", Kind::Component, "port", "8765", quote);
         let turns = [turn(quote)];
         let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
-        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let stub = Stub::new(Answer::Reply(judged(&[(1, verdict, quote)])));
         let report = pass_switches(
             &gm,
             "s2",
@@ -7905,6 +7937,8 @@ mod tests {
         .await;
         assert_eq!(stub.calls(), 1, "{}", stub.message());
         assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.link_sibling, Some(0));
+        assert_eq!(report.consolidate.quote_trailing, Some(0));
         assert_eq!(dropped(&report, "second supersede on the same anchor"), 2);
         assert!(
             report
@@ -7917,6 +7951,18 @@ mod tests {
         );
         assert!(ended(live_any(&slots(&gm, "widget").await, "port", "8080")).is_none());
         assert!(ended(live_any(&slots(&gm, "panel").await, "port", "9090")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_non_supersede_leaves_component_counters_at_zero() {
+        for verdict in ["unrelated", "duplicate", "unsure"] {
+            let (judged, ended) = sibling_verdict(true, verdict).await;
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{verdict}");
+            assert_eq!(judged.report.consolidate.link_sibling, Some(0), "{verdict}");
+            assert_eq!(judged.report.consolidate.link_derived, Some(0), "{verdict}");
+            assert_eq!(judged.report.consolidate.quote_trailing, Some(0), "{verdict}");
+            assert!(ended.is_none(), "{verdict}");
+        }
     }
 
     #[tokio::test]
