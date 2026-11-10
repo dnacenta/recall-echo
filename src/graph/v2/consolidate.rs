@@ -550,7 +550,7 @@ fn unique_closed_row(
         return None;
     }
     let fact_index = sole_fact_index(retirement, facts)?;
-    if !sole_identity(retirement, fact_index, facts, stats) {
+    if !one_retirement(fact_index, facts, stats) {
         return None;
     }
     let events = a1_events(fact_index, &stats.close_events);
@@ -587,30 +587,15 @@ fn a1_events(
         .collect()
 }
 
-fn sole_identity(
-    retirement: &Retirement,
-    fact_index: usize,
-    facts: &[super::schema::Fact],
-    stats: &WriteStats,
-) -> bool {
+fn one_retirement(fact_index: usize, facts: &[super::schema::Fact], stats: &WriteStats) -> bool {
     stats
         .retirements
         .iter()
         .filter(|other| {
-            writer_a1(&other.reason)
-                && same_retirement(other, retirement)
-                && sole_fact_index(other, facts) == Some(fact_index)
+            writer_a1(&other.reason) && sole_fact_index(other, facts) == Some(fact_index)
         })
         .count()
         == 1
-}
-
-fn same_retirement(left: &Retirement, right: &Retirement) -> bool {
-    left.reason == right.reason
-        && left.predicate == right.predicate
-        && left.key == right.key
-        && normalise(&left.subject) == normalise(&right.subject)
-        && values_equal(&left.old_value, &right.old_value)
 }
 
 fn anchor_from_fact(fact: &super::schema::Fact, index: usize, a2: bool) -> Anchor {
@@ -8317,6 +8302,45 @@ mod tests {
             fact_index: 0,
         });
         assert!(unique_closed_row(&retirement, &[fact], &ambiguous).is_none());
+    }
+
+    #[test]
+    fn two_retirements_for_one_fact_are_not_a_link() {
+        use super::super::write::CloseEvent;
+
+        let fact = setting(
+            "acme",
+            Kind::Project,
+            "storage_path",
+            "sqlite index",
+            "Storage is now sqlite index for the rows.",
+        );
+        let first = crate::graph::types::Retirement {
+            reason: "superseded".into(),
+            subject: "acme".into(),
+            predicate: "setting".into(),
+            key: "storage_path".into(),
+            old_value: "walnut marker".into(),
+            new_value: "sqlite index".into(),
+        };
+        let second = crate::graph::types::Retirement {
+            reason: "superseded".into(),
+            subject: "acme".into(),
+            predicate: "setting".into(),
+            key: "archive_path".into(),
+            old_value: "cedar marker".into(),
+            new_value: "sqlite index".into(),
+        };
+        let stats = WriteStats {
+            retirements: vec![first.clone(), second],
+            close_events: vec![CloseEvent {
+                row_id: "entity:acme#0".into(),
+                reason: "superseded".into(),
+                fact_index: 0,
+            }],
+            ..WriteStats::default()
+        };
+        assert!(unique_closed_row(&first, std::slice::from_ref(&fact), &stats).is_none());
     }
 
     #[allow(clippy::too_many_arguments)]
