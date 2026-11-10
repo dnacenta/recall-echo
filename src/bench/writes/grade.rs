@@ -1338,46 +1338,60 @@ fn record_session_closes(
     earlier_live: &HashMap<String, bool>,
     retired: &mut HashMap<String, String>,
 ) {
+    let before = live_map(&session.before, &session.status_rows.before);
+    let after = live_map(&session.after, &session.status_rows.after);
     for id in session_ids(session) {
-        apply_close(session, &id, earlier_live, retired);
+        apply_close(session, &id, &before, &after, earlier_live, retired);
     }
 }
 
 fn apply_close(
     session: &SessionObservation,
     id: &str,
+    before: &HashMap<String, bool>,
+    after: &HashMap<String, bool>,
     earlier_live: &HashMap<String, bool>,
     retired: &mut HashMap<String, String>,
 ) {
-    let was_live = seen_live(session, id, earlier_live);
-    let now_live = live_after(session, id).unwrap_or(false);
-    if was_live && !now_live {
-        retired.insert(id.to_string(), session.id.clone());
-    } else if now_live {
+    let now_live = after.get(id).copied().unwrap_or(false);
+    if now_live {
         retired.remove(id);
+        return;
+    }
+    if seen_live(before, id, earlier_live) || same_session_close(session, id, before, earlier_live)
+    {
+        retired.insert(id.to_string(), session.id.clone());
     }
 }
 
-fn seen_live(session: &SessionObservation, id: &str, earlier: &HashMap<String, bool>) -> bool {
-    live_before(session, id).unwrap_or(false) || earlier.get(id).copied().unwrap_or(false)
+fn seen_live(before: &HashMap<String, bool>, id: &str, earlier: &HashMap<String, bool>) -> bool {
+    before.get(id).copied().unwrap_or(false) || earlier.get(id).copied().unwrap_or(false)
 }
 
-fn live_before(session: &SessionObservation, id: &str) -> Option<bool> {
-    live_flag(&session.before, &session.status_rows.before, id)
-}
-
-fn live_after(session: &SessionObservation, id: &str) -> Option<bool> {
-    live_flag(&session.after, &session.status_rows.after, id)
-}
-
-fn live_flag(edges: &[ObservedEdge], rows: &[StatusRow], id: &str) -> Option<bool> {
-    if let Some(row) = rows.iter().find(|row| row.id == id) {
-        return Some(row.live);
+/// Opened and closed inside this session: the after-state is the first time
+/// the row is seen, and it is already not live.
+fn same_session_close(
+    session: &SessionObservation,
+    id: &str,
+    before: &HashMap<String, bool>,
+    earlier: &HashMap<String, bool>,
+) -> bool {
+    if before.contains_key(id) || earlier.contains_key(id) {
+        return false;
     }
-    edges
-        .iter()
-        .find(|edge| edge.id == id)
-        .map(|edge| edge.live)
+    closed_edge(&session.after, id) && !aside_birth(&session.status_rows.after, id)
+}
+
+fn closed_edge(edges: &[ObservedEdge], id: &str) -> bool {
+    edges.iter().any(|edge| edge.id == id && !edge.live)
+}
+
+fn aside_birth(rows: &[StatusRow], id: &str) -> bool {
+    rows.iter().any(|row| row.id == id && held_or_rejected(row))
+}
+
+fn held_or_rejected(row: &StatusRow) -> bool {
+    row.pending || row.status.as_deref() == Some("rejected")
 }
 
 fn session_ids(session: &SessionObservation) -> HashSet<String> {
@@ -1402,12 +1416,16 @@ fn collect_status_ids(ids: &mut HashSet<String>, rows: &[StatusRow]) {
 }
 
 fn after_live_map(session: &SessionObservation) -> HashMap<String, bool> {
+    live_map(&session.after, &session.status_rows.after)
+}
+
+fn live_map(edges: &[ObservedEdge], rows: &[StatusRow]) -> HashMap<String, bool> {
     let mut live = HashMap::new();
-    for row in &session.status_rows.after {
-        live.insert(row.id.clone(), row.live);
+    for edge in edges {
+        live.insert(edge.id.clone(), edge.live);
     }
-    for edge in &session.after {
-        live.entry(edge.id.clone()).or_insert(edge.live);
+    for row in rows {
+        live.insert(row.id.clone(), row.live);
     }
     live
 }
@@ -2461,7 +2479,10 @@ mod tests {
             .all(|session| session.retirements.is_empty()));
         assert_eq!(final_row(&closed, "pine").retired_in.as_deref(), Some("s3"));
         assert!(final_row(&closed, "oak").retired_in.is_none());
-        assert!(final_row(&closed, "birch").retired_in.is_none());
+        assert_eq!(
+            final_row(&closed, "birch").retired_in.as_deref(),
+            Some("s3")
+        );
         let oak_json = serde_json::to_value(final_row(&closed, "oak")).unwrap();
         assert!(oak_json.get("retired_in").is_none());
 
@@ -2494,6 +2515,50 @@ mod tests {
             final_row(&from_before, "pine").retired_in.as_deref(),
             Some("s1")
         );
+    }
+
+    #[test]
+    fn a_row_that_first_appears_closed_records_that_session() {
+        let open = edge("open", "open", false, 9.0, 1.0, 0);
+        let mut held = edge("held", "held", false, 9.0, 1.0, 0);
+        held.relation = "uses".into();
+        let mut session = obs("s04", vec![], vec![open, held.clone()]);
+        session.status_rows.after = vec![
+            StatusRow {
+                id: held.id.clone(),
+                subject: held.subject.clone(),
+                relation: held.relation.clone(),
+                object: held.object.clone(),
+                live: false,
+                status: Some("decided".into()),
+                pending: true,
+            },
+            StatusRow {
+                id: "entity:host|setting|host|nope|t0|rejected".into(),
+                subject: "deploy".into(),
+                relation: "setting".into(),
+                object: "nope".into(),
+                live: false,
+                status: Some("rejected".into()),
+                pending: false,
+            },
+        ];
+        let report = grade_named(&["s04"], vec![session]);
+        assert!(report.sessions[0].retirements.is_empty());
+        assert!(!final_row(&report, "open").live);
+        assert_eq!(
+            final_row(&report, "open").retired_in.as_deref(),
+            Some("s04")
+        );
+        assert!(final_row(&report, "held").retired_in.is_none());
+        let nope = report
+            .final_edges
+            .iter()
+            .find(|edge| edge.object == "nope")
+            .expect("rejected row");
+        assert!(nope.retired_in.is_none());
+        let json = serde_json::to_value(final_row(&report, "open")).unwrap();
+        assert_eq!(json["retired_in"], "s04");
     }
 
     #[test]
