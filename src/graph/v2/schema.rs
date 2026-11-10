@@ -618,7 +618,7 @@ pub(crate) fn map_subject(fact: &mut Fact, project: &ProjectIdentity) {
     }
 }
 
-fn is_project_name(norm: &str, project: &ProjectIdentity) -> bool {
+pub(crate) fn is_project_name(norm: &str, project: &ProjectIdentity) -> bool {
     if PROJECT_SUBJECTS.contains(&norm) {
         return true;
     }
@@ -627,6 +627,32 @@ fn is_project_name(norm: &str, project: &ProjectIdentity) -> bool {
         return true;
     }
     project.aliases.iter().any(|alias| normalise(alias) == norm)
+}
+
+/// A decided component `part_of` whose object names the session project.
+#[must_use]
+pub(crate) fn component_project_candidate(
+    kind: Kind,
+    fact: &Fact,
+    project: &ProjectIdentity,
+) -> bool {
+    kind == Kind::Component
+        && fact.predicate == Predicate::PartOf
+        && fact.status == "decided"
+        && !project.name.is_empty()
+        && is_project_name(&normalise(&fact.object_name), project)
+}
+
+/// Subject support must not retarget a generic name, a project name, or a self-edge.
+#[must_use]
+pub(crate) fn component_subject_blocked(
+    subject: &str,
+    object: &str,
+    project: &ProjectIdentity,
+) -> bool {
+    generic_object(subject, "")
+        || is_project_name(&normalise(subject), project)
+        || normalise(subject) == normalise(object)
 }
 
 /// Point a swapped edge at the session project, or reject it.

@@ -108,6 +108,8 @@ pub struct SessionObservation {
     pub hold: crate::graph::types::HoldReport,
     /// Derived-from counts. Blank when that switch is off.
     pub links: crate::graph::types::LinksReport,
+    /// Component `part_of` counts. Blank when that switch is off.
+    pub component_edges: crate::graph::types::ComponentEdgesReport,
 }
 
 /// Precision and recall for one operation.
@@ -232,6 +234,12 @@ pub struct SessionReport {
         skip_serializing_if = "crate::graph::types::LinksReport::is_blank"
     )]
     pub links: crate::graph::types::LinksReport,
+    /// Component `part_of` counts. Omitted when that switch is off or nothing was counted.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::ComponentEdgesReport::is_blank"
+    )]
+    pub component_edges: crate::graph::types::ComponentEdgesReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -609,6 +617,7 @@ pub fn grade_with_pipeline(
                 consolidate: s.consolidate.clone(),
                 hold: s.hold.clone(),
                 links: s.links,
+                component_edges: s.component_edges,
             })
             .collect(),
         steps,
@@ -1786,6 +1795,7 @@ mod tests {
             consolidate: crate::graph::types::ConsolidateReport::default(),
             hold: crate::graph::types::HoldReport::default(),
             links: crate::graph::types::LinksReport::default(),
+            component_edges: crate::graph::types::ComponentEdgesReport::default(),
         }
     }
 
@@ -1811,6 +1821,7 @@ mod tests {
             consolidate: session.consolidate.clone(),
             hold: session.hold.clone(),
             links: session.links,
+            component_edges: session.component_edges,
         };
         let encoded = serde_json::to_value(&blank).unwrap();
         assert!(encoded.get("links").is_none(), "{encoded}");

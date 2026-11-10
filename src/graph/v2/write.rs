@@ -98,6 +98,8 @@ pub(crate) struct WriteStats {
     pub holds_confirmed: u32,
     /// Create-time link counts. Blank when the switch is off.
     pub links: crate::graph::types::LinksReport,
+    /// Component `part_of` skips. Blank when the switch is off.
+    pub component_edges: crate::graph::types::ComponentEdgesReport,
     /// Writer closes in this attempt, in write order. Empty when links are off.
     pub close_events: Vec<CloseEvent>,
 }

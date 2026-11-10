@@ -292,6 +292,7 @@ async fn collect_sessions(
             consolidate: report.consolidate,
             hold: report.hold,
             links: report.links,
+            component_edges: report.component_edges,
         });
         before = after;
     }

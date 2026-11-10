@@ -24,11 +24,11 @@ use super::super::GraphMemory;
 use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, SessionInput, Turn, TurnRole};
 use super::schema::{
-    affects_target, component_of_project, filter_fact, key_is_empty, map_subject, over_long,
-    project_object, release_name, remap, restates_setting, Fact, Kind, Mention, Predicate, Role,
-    DROP_CONFIDENCE, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_RESTATEMENT,
-    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
-    MAX_ITEMS,
+    affects_target, component_of_project, component_project_candidate, component_subject_blocked,
+    filter_fact, key_is_empty, map_subject, over_long, project_object, release_name, remap,
+    restates_setting, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING,
+    DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_REJECTED, DROP_RESTATEMENT, DROP_TOO_LONG,
+    DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -217,6 +217,7 @@ pub(crate) async fn extract_session(
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
     let ground = SessionGround::prepare(&session.turns);
     let known_on = known_facts_context_enabled(memory_dir);
+    let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
     let system = if known_on {
         PASS1_SYSTEM
@@ -243,7 +244,13 @@ pub(crate) async fn extract_session(
     let mut facts = Vec::new();
     for window in &windows {
         match call_window(llm, &session, window, &known_block, system, &mut report).await {
-            Ok(reply) => facts.extend(collect_facts(&reply, &session, &ground, &mut report)),
+            Ok(reply) => facts.extend(collect_facts(
+                &reply,
+                &session,
+                &ground,
+                &mut report,
+                ground_edges,
+            )),
             Err(reason) => {
                 report.errors.push(reason);
                 report.chunks_failed += 1;
@@ -299,6 +306,7 @@ pub(crate) async fn extract_session(
         write_ctx.match_on = match_on;
         write_ctx.hold_on = hold_enabled(memory_dir);
         write_ctx.links_on = links_enabled(memory_dir);
+        write_ctx.ground_on = ground_edges;
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -327,6 +335,7 @@ pub(crate) async fn extract_session(
         }
         // Consolidation may add derived-anchor counts on top of the write totals.
         report.links = stats.links;
+        report.component_edges.add(stats.component_edges);
         if consolidate_on {
             let started = std::time::Instant::now();
             super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -347,6 +356,7 @@ pub(crate) async fn extract_session(
             &session.turns,
         );
         write_ctx.hold_on = true;
+        write_ctx.ground_on = ground_edges;
         let started = std::time::Instant::now();
         let stats = write::WriteStats::default();
         super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -410,6 +420,13 @@ fn drop_restatements_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .drop_restatements
+}
+
+fn ground_component_edges_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .ground_component_edges
 }
 
 /// Drop a decided rule only when it and one setting are a component by themselves.
@@ -622,8 +639,18 @@ fn facts_from_reply(
     session: &SessionInput,
     report: &mut IngestionReport,
 ) -> Vec<Fact> {
+    facts_with_ground(reply, session, report, false)
+}
+
+#[cfg(test)]
+fn facts_with_ground(
+    reply: &Map<String, Value>,
+    session: &SessionInput,
+    report: &mut IngestionReport,
+    ground_on: bool,
+) -> Vec<Fact> {
     let ground = SessionGround::prepare(&session.turns);
-    collect_facts(reply, session, &ground, report)
+    collect_facts(reply, session, &ground, report, ground_on)
 }
 
 fn collect_facts(
@@ -631,6 +658,7 @@ fn collect_facts(
     session: &SessionInput,
     ground: &SessionGround,
     report: &mut IngestionReport,
+    ground_on: bool,
 ) -> Vec<Fact> {
     let mut facts = Vec::new();
     for section in ["facts", "bugs", "releases"] {
@@ -643,7 +671,7 @@ fn collect_facts(
                 count_drop(report, DROP_OVERFLOW);
                 continue;
             }
-            match accept_item(section, item, session, ground, report) {
+            match accept_item(section, item, session, ground, report, ground_on) {
                 Ok(batch) => {
                     report.kept += 1;
                     facts.extend(batch);
@@ -661,13 +689,16 @@ fn accept_item(
     session: &SessionInput,
     ground: &SessionGround,
     report: &mut IngestionReport,
+    ground_on: bool,
 ) -> Result<Vec<Fact>, &'static str> {
     if !element_matches(section, item) {
         return Err(DROP_PARSE);
     }
     let object = item.as_object().ok_or(DROP_PARSE)?;
     match section {
-        "facts" => accept_fact(object, session, ground).map(|fact| vec![fact]),
+        "facts" => {
+            accept_fact(object, session, ground, ground_on, report).map(|fact| vec![fact])
+        }
         "bugs" => expand_bug(object, session, ground, report),
         "releases" => expand_release(object, session, ground, report),
         _ => Err(DROP_PARSE),
@@ -678,6 +709,8 @@ fn accept_fact(
     object: &Map<String, Value>,
     session: &SessionInput,
     ground: &SessionGround,
+    ground_on: bool,
+    report: &mut IngestionReport,
 ) -> Result<Fact, &'static str> {
     let cited = cite_object(object, ground)?;
     let mut mention = mention_from(object, &session.turns)?;
@@ -692,10 +725,52 @@ fn accept_fact(
         .unwrap_or("")
         .trim()
         .to_string();
+    let prior_name = ground_on.then(|| fact.subject_name.clone());
+    let prior_kind = fact.subject_kind;
     if swapped {
         project_object(&mut fact, &session.project)?;
     } else {
         map_subject(&mut fact, &session.project);
+    }
+    let value_ok = object_supported(swapped, &fact, ground);
+    let mut grounded = false;
+    if !value_ok {
+        recover_component_edge(
+            &mut fact,
+            prior_name.as_deref(),
+            prior_kind,
+            swapped,
+            ground_on,
+            session,
+            ground,
+        )?;
+        grounded = true;
+    }
+    if fact.predicate == Predicate::Setting
+        && !ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
+    {
+        return Err(DROP_KEY_BINDING);
+    }
+    if !ground.replaces_grounded(&fact.replaces, &fact.status, fact.turn) {
+        fact.replaces.clear();
+    }
+    filter_fact(&fact)?;
+    note_component_edge(
+        grounded,
+        kept_component_object(&fact, prior_kind, value_ok, swapped, ground_on, &session.project),
+        report,
+    );
+    Ok(fact)
+}
+
+fn object_supported(swapped: bool, fact: &Fact, ground: &SessionGround) -> bool {
+    if swapped {
+        return ground.supports_value(
+            &fact.subject_name,
+            fact.turn,
+            &fact.quote,
+            ValueShape::Entity,
+        );
     }
     let shape = if fact.object_kind.is_some() {
         ValueShape::Entity
@@ -712,30 +787,63 @@ fn accept_fact(
             fact.turn,
             &fact.quote,
         );
-    let value_ok = if swapped {
-        ground.supports_value(
-            &fact.subject_name,
-            fact.turn,
-            &fact.quote,
-            ValueShape::Entity,
-        )
-    } else {
-        punctuation_setting
-            || ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape)
-    };
-    if !value_ok {
+    punctuation_setting || ground.supports_value(&fact.object_name, fact.turn, &fact.quote, shape)
+}
+
+fn recover_component_edge(
+    fact: &mut Fact,
+    prior_name: Option<&str>,
+    prior_kind: Kind,
+    swapped: bool,
+    ground_on: bool,
+    session: &SessionInput,
+    ground: &SessionGround,
+) -> Result<(), &'static str> {
+    if !ground_on || swapped {
         return Err(DROP_VALUE_SUPPORT);
     }
-    if fact.predicate == Predicate::Setting
-        && !ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
-    {
-        return Err(DROP_KEY_BINDING);
+    let Some(name) = prior_name else {
+        return Err(DROP_VALUE_SUPPORT);
+    };
+    if !component_project_candidate(prior_kind, fact, &session.project) {
+        return Err(DROP_VALUE_SUPPORT);
     }
-    if !ground.replaces_grounded(&fact.replaces, &fact.status, fact.turn) {
-        fact.replaces.clear();
+    if component_subject_blocked(name, &fact.object_name, &session.project) {
+        return Err(DROP_REJECTED);
     }
-    filter_fact(&fact)?;
-    Ok(fact)
+    if !ground.supports_value(name, fact.turn, &fact.quote, ValueShape::Entity) {
+        return Err(DROP_VALUE_SUPPORT);
+    }
+    fact.subject_name = name.to_string();
+    fact.subject_kind = Kind::Component;
+    fact.object_name = session.project.name.clone();
+    fact.object_kind = Some(Kind::Project);
+    fact.replaces.clear();
+    fact.provenance = Provenance::SelfGenerated;
+    Ok(())
+}
+
+fn kept_component_object(
+    fact: &Fact,
+    prior_kind: Kind,
+    value_ok: bool,
+    swapped: bool,
+    ground_on: bool,
+    project: &super::input::ProjectIdentity,
+) -> bool {
+    ground_on
+        && !swapped
+        && value_ok
+        && fact.subject_kind == Kind::Component
+        && component_project_candidate(prior_kind, fact, project)
+}
+
+fn note_component_edge(grounded: bool, kept_object: bool, report: &mut IngestionReport) {
+    if grounded {
+        report.component_edges.component_edges_grounded += 1;
+    } else if kept_object {
+        report.component_edges.component_edges_kept_object += 1;
+    }
 }
 
 fn mention_from(object: &Map<String, Value>, turns: &[Turn]) -> Result<Mention, &'static str> {
@@ -1556,6 +1664,282 @@ mod tests {
                 assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
             }
         }
+    }
+
+    fn component_edge_case(
+        turn: &str,
+        subject: &str,
+        object: &str,
+        status: &str,
+        quote: &str,
+        replaces: &str,
+        aliases: &[&str],
+        ground_on: bool,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let mut item = fact_json(0, quote);
+        let fields = item.as_object_mut().expect("fact");
+        for (key, value) in [
+            ("subject", subject),
+            ("subject_type", "component"),
+            ("predicate", "part_of"),
+            ("object", object),
+            ("object_type", "project"),
+            ("status", status),
+            ("key", ""),
+            ("replaces", replaces),
+        ] {
+            fields.insert(key.into(), Value::String(value.into()));
+        }
+        let reply = serde_json::json!({"facts": [item], "bugs": [], "releases": []});
+        let session = SessionInput {
+            session_id: "s".into(),
+            date: "2026-01-02".into(),
+            project: ProjectIdentity {
+                name: "tidepool".into(),
+                aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+            },
+            turns: vec![Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: turn.into(),
+            }],
+            tool_lines: Vec::new(),
+        };
+        let mut report = IngestionReport::default();
+        let facts = facts_with_ground(
+            reply.as_object().expect("reply"),
+            &session,
+            &mut report,
+            ground_on,
+        );
+        assert_candidate_balance(&report);
+        (facts, report)
+    }
+
+    #[test]
+    fn decided_component_part_of_grounds_on_the_subject() {
+        let (facts, report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "export command",
+            "tidepool",
+            "decided",
+            "Add an export command",
+            "csv",
+            &[],
+            true,
+        );
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        let fact = &facts[0];
+        assert_eq!(fact.subject_name, "export command");
+        assert_eq!(fact.subject_kind, Kind::Component);
+        assert_eq!(fact.predicate, Predicate::PartOf);
+        assert_eq!(fact.object_name, "tidepool");
+        assert_eq!(fact.object_kind, Some(Kind::Project));
+        assert_eq!(fact.status, "decided");
+        assert_eq!(fact.provenance, Provenance::SelfGenerated);
+        assert!(fact.replaces.is_empty());
+        assert_eq!(fact.quote, "Add an export command");
+        assert_eq!(report.component_edges.component_edges_grounded, 1);
+        assert_eq!(report.component_edges.component_edges_kept_object, 0);
+        assert!(report.drops.is_empty());
+
+        let (off, off_report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "export command",
+            "tidepool",
+            "decided",
+            "Add an export command",
+            "csv",
+            &[],
+            false,
+        );
+        assert!(off.is_empty());
+        assert_eq!(off_report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(off_report.component_edges.is_blank());
+    }
+
+    #[test]
+    fn component_part_of_keeps_cited_provenance_when_the_project_is_named() {
+        let (facts, report) = component_edge_case(
+            "Add an export command to tidepool.",
+            "export command",
+            "tidepool",
+            "decided",
+            "export command to tidepool",
+            "",
+            &[],
+            true,
+        );
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        let fact = &facts[0];
+        assert_eq!(fact.subject_name, "export command");
+        assert_eq!(fact.object_name, "tidepool");
+        assert_eq!(fact.provenance, Provenance::User);
+        assert_eq!(fact.quote, "export command to tidepool");
+        assert_eq!(report.component_edges.component_edges_kept_object, 1);
+        assert_eq!(report.component_edges.component_edges_grounded, 0);
+    }
+
+    #[test]
+    fn component_part_of_an_alias_is_canonicalised() {
+        let (facts, report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "export command",
+            "tp",
+            "decided",
+            "Add an export command",
+            "old",
+            &["tp"],
+            true,
+        );
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        assert_eq!(facts[0].object_name, "tidepool");
+        assert_eq!(facts[0].provenance, Provenance::SelfGenerated);
+        assert!(facts[0].replaces.is_empty());
+        assert_eq!(report.component_edges.component_edges_grounded, 1);
+    }
+
+    #[test]
+    fn undecided_component_part_of_stays_dropped_when_the_flag_is_on() {
+        for status in ["considered", "rejected"] {
+            let (facts, report) = component_edge_case(
+                "Add an export command with CSV output.",
+                "export command",
+                "tidepool",
+                status,
+                "Add an export command",
+                "",
+                &[],
+                true,
+            );
+            assert!(facts.is_empty(), "{status}");
+            assert_eq!(
+                report.drops.get(DROP_VALUE_SUPPORT).copied(),
+                Some(1),
+                "{status}"
+            );
+            assert!(report.component_edges.is_blank(), "{status}");
+        }
+    }
+
+    #[test]
+    fn self_edge_and_project_subject_are_not_repointed() {
+        let (self_edge, report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "tidepool",
+            "tidepool",
+            "decided",
+            "Add an export command",
+            "",
+            &[],
+            true,
+        );
+        assert!(self_edge.is_empty());
+        assert_eq!(report.drops.get(DROP_REJECTED).copied(), Some(1));
+        assert!(report.component_edges.is_blank());
+
+        let (alias, alias_report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "tp",
+            "tidepool",
+            "decided",
+            "Add an export command",
+            "",
+            &["tp"],
+            true,
+        );
+        assert!(alias.is_empty());
+        assert_eq!(alias_report.drops.get(DROP_REJECTED).copied(), Some(1));
+
+        let (store, store_report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "store",
+            "store",
+            "decided",
+            "Add an export command",
+            "",
+            &[],
+            true,
+        );
+        assert!(store.is_empty());
+        assert_eq!(
+            store_report.drops.get(DROP_VALUE_SUPPORT).copied(),
+            Some(1)
+        );
+        assert!(store_report.component_edges.is_blank());
+    }
+
+    #[test]
+    fn a_different_project_stays_on_the_object_check() {
+        let (dropped, report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "export command",
+            "harbor",
+            "decided",
+            "Add an export command",
+            "",
+            &[],
+            true,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(report.component_edges.is_blank());
+
+        let (kept, kept_report) = component_edge_case(
+            "Add an export command for harbor.",
+            "export command",
+            "harbor",
+            "decided",
+            "export command for harbor",
+            "",
+            &[],
+            true,
+        );
+        assert_eq!(kept.len(), 1, "{:?}", kept_report.drops);
+        assert_eq!(kept[0].object_name, "harbor");
+        assert_eq!(kept[0].provenance, Provenance::User);
+        assert!(kept_report.component_edges.is_blank());
+    }
+
+    #[test]
+    fn generic_component_subject_is_rejected_on_the_new_path() {
+        for subject in ["it", "code", "app"] {
+            let (facts, report) = component_edge_case(
+                "Add an export command with CSV output.",
+                subject,
+                "tidepool",
+                "decided",
+                "Add an export command",
+                "",
+                &[],
+                true,
+            );
+            assert!(facts.is_empty(), "{subject}");
+            assert_eq!(
+                report.drops.get(DROP_REJECTED).copied(),
+                Some(1),
+                "{subject} {:?}",
+                report.drops
+            );
+            assert!(report.component_edges.is_blank(), "{subject}");
+        }
+    }
+
+    #[test]
+    fn unsupported_component_name_stays_dropped() {
+        let (facts, report) = component_edge_case(
+            "Add an export command with CSV output.",
+            "export command",
+            "tidepool",
+            "decided",
+            "CSV output",
+            "",
+            &[],
+            true,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert!(report.component_edges.is_blank());
     }
 
     #[test]
