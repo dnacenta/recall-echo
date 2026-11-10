@@ -272,6 +272,10 @@ enum BenchCommands {
         /// Off unless set.
         #[arg(long)]
         drop_restatements: bool,
+        /// Accept a decided component part_of the session project when the
+        /// turn names the component. Off unless set. Implies nothing.
+        #[arg(long)]
+        ground_component_edges: bool,
     },
 }
 
@@ -1095,6 +1099,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_links,
             consolidate_components,
             drop_restatements,
+            ground_component_edges,
         } => run_writes(
             script,
             work_dir,
@@ -1129,6 +1134,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateLinks::Off
             },
+            if ground_component_edges {
+                recall_echo::bench::writes::GroundComponentEdges::On
+            } else {
+                recall_echo::bench::writes::GroundComponentEdges::Off
+            },
             if consolidate_components {
                 recall_echo::bench::writes::ConsolidateComponents::On
             } else {
@@ -1152,6 +1162,7 @@ fn run_writes(
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
+    ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
@@ -1188,6 +1199,7 @@ fn run_writes(
             consolidate,
             drop_restatements,
             consolidate_links,
+            ground_component_edges,
             consolidate_components,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1204,6 +1216,7 @@ fn run_writes(
             consolidate,
             drop_restatements,
             consolidate_links,
+            ground_component_edges,
             consolidate_components,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1225,6 +1238,7 @@ async fn grade_once(
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
+    ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1244,6 +1258,7 @@ async fn grade_once(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                ground_component_edges,
                 consolidate_components,
             )
             .await
@@ -1259,6 +1274,7 @@ async fn grade_once(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                ground_component_edges,
                 consolidate_components,
             )
             .await
@@ -1280,6 +1296,7 @@ async fn grade_repeat(
     consolidate: recall_echo::bench::writes::Consolidate,
     drop_restatements: recall_echo::bench::writes::DropRestatements,
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
+    ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1300,6 +1317,7 @@ async fn grade_repeat(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                ground_component_edges,
                 consolidate_components,
             )
             .await
@@ -1316,6 +1334,7 @@ async fn grade_repeat(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                ground_component_edges,
                 consolidate_components,
             )
             .await
@@ -1506,6 +1525,7 @@ mod tests {
                         drop_restatements,
                         known_match,
                         known_facts_context,
+                        ground_component_edges,
                         ..
                     },
             } => {
@@ -1516,6 +1536,7 @@ mod tests {
                 assert!(!drop_restatements);
                 assert!(!known_match);
                 assert!(!known_facts_context);
+                assert!(!ground_component_edges);
             }
             _ => panic!("bench writes"),
         }
@@ -1554,6 +1575,55 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn ground_component_edges_is_its_own_bench_flag() {
+        let parsed = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--ground-component-edges",
+        ])
+        .expect("parse ground");
+        match parsed.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        consolidate_components,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ground_component_edges,
+                        ..
+                    },
+            } => {
+                assert!(ground_component_edges);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!consolidate_links);
+                assert!(!consolidate_components);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--ground-component-edges"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn consolidate_components_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -1575,10 +1645,12 @@ mod tests {
                         drop_restatements,
                         known_match,
                         known_facts_context,
+                        ground_component_edges,
                         ..
                     },
             } => {
                 assert!(consolidate_components);
+                assert!(!ground_component_edges);
                 assert!(!consolidate);
                 assert!(!consolidate_hold);
                 assert!(!consolidate_links);

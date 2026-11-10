@@ -29,6 +29,16 @@ Three content tokens or fewer need at least half of them in the turn and at leas
 
 A release whose version does not occur in the cited turn drops as `bad_version`. The drop is a whole candidate. One leading `v` or `V` is removed. The remainder must be non-empty, contain a digit, and occur as a plain substring of the cited turn, so the non-numeric part of a version such as `1.4.0-rc1` or `2024.10b` is still stated. At least one of those occurrences must not run into a digit, a letter other than a leading `v` or `V`, or a dotted number. Every number in that remainder must also occur there as a maximal number, under the number rule above. `1.0` therefore drops inside `Ship 1.0.0`.
 
+## Component edges (opt-in)
+
+`ground_component_edges` is off unless set. It stands alone: it does not turn on consolidation, known-row matching, the known-facts block, restatement dropping, or the hold. Off, a component `part_of` the session project is kept only when the cited turn supports the project name, and the writer's retirement scope follows every live `part_of` into that project.
+
+On, a decided component `part_of` whose object is the session project (its name or an alias) is also kept when the component name itself is supported in the cited turn and today's object check does not pass. The object is stored as the session project name, `replaces` is cleared, and the edge is inferred (`self`). An edge that already passes the object check keeps the cited provenance. A considered or rejected edge stays on the ordinary check. A generic subject, a subject that is the project name or an alias, and a subject equal to the object are rejected and are not pointed at the project.
+
+With the switch on, the writer's retirement scope follows only decided live `part_of` edges. A component the store already holds as a technology is not relabelled and gets no new edge (`component_edge_technology`). A component that already has a decided live `part_of` to a different project gets no new edge (`component_edge_foreign`). Edges already stored are left as they are. The report's `component_edges` object counts `component_edges_grounded`, `component_edges_kept_object`, `component_edge_technology`, and `component_edge_foreign`. When this switch is on, a seed whose incoming decided `part_of` page is full (16) also counts as `part_of_children_truncated`. The page size stays 16. The object is omitted when every counter is zero.
+
+`--ground-component-edges` writes `ground_component_edges = true` for that bench run and implies nothing else.
+
 ## Gate 3 — key binding
 
 A setting whose value contains a number has to name its key in the quote or in the sentence that contains the quote. The key is split on `_`. At least one token that is not generic (`value`, `number`, `setting`, `default`, `current`, `new`, `min`, `max`) has to occur there as a whole token. A key whose tokens are all generic has nothing to bind, so the setting drops as `key_binding`. A key ending in `_version` also needs every stem token, and an empty stem fails.

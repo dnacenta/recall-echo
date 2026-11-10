@@ -32,7 +32,7 @@ use super::super::{deserialize_take, GraphMemory};
 use super::ground::punctuation_literal;
 use super::input::{ProjectIdentity, Turn};
 use super::resolve::{self, MentionDraft};
-use super::schema::{key_is_empty, normalise, Fact, Kind, Predicate};
+use super::schema::{is_project_name, key_is_empty, normalise, Fact, Kind, Predicate};
 
 /// Production writes never fail a commit on purpose.
 pub(crate) static NO_CONFLICTS: AtomicU32 = AtomicU32::new(0);
@@ -98,6 +98,8 @@ pub(crate) struct WriteStats {
     pub holds_confirmed: u32,
     /// Create-time link counts. Blank when the switch is off.
     pub links: crate::graph::types::LinksReport,
+    /// Component `part_of` skips. Blank when the switch is off.
+    pub component_edges: crate::graph::types::ComponentEdgesReport,
     /// Writer closes in this attempt, in write order. Empty when links are off.
     pub close_events: Vec<CloseEvent>,
 }
@@ -152,6 +154,10 @@ pub(crate) struct WriteCtx<'a> {
     /// Store `derived_from` on a new decided setting or rule.
     /// Off leaves the write unchanged.
     pub links_on: bool,
+    /// Accept component `part_of` the session project on subject support,
+    /// and follow only decided `part_of` edges in retirement scope.
+    /// Off leaves both paths unchanged.
+    pub ground_on: bool,
     /// Widen the post-judge cue to a sibling or a derived-from partner.
     /// Off leaves that cue unchanged.
     pub components_on: bool,
@@ -179,6 +185,7 @@ impl<'a> WriteCtx<'a> {
             targets: Vec::new(),
             hold_on: false,
             links_on: false,
+            ground_on: false,
             components_on: false,
         }
     }
@@ -306,16 +313,38 @@ pub(crate) async fn write_facts(
     facts: &[Fact],
 ) -> Result<WriteStats, GraphError> {
     let resolve_started = Instant::now();
-    let resolution = resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?;
+    let resolution = resolve_for(gm, ctx, facts).await?;
     let resolve_ms = elapsed_ms(resolve_started);
     // The field has to outlive a conflict rollback, or the retry cannot store a list.
     if ctx.links_on {
         define_derived_from(gm.db()).await?;
     }
+    commit_writes(gm, ctx, facts, &resolution, resolve_ms).await
+}
+
+async fn resolve_for(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+) -> Result<resolve::Resolution, GraphError> {
+    if !ctx.ground_on {
+        return resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await;
+    }
+    let hold = technology_hold(facts, ctx.project);
+    resolve::resolve_with_hold(gm, ctx.llm, ctx.project, &drafts_of(facts), &hold).await
+}
+
+async fn commit_writes(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    resolution: &resolve::Resolution,
+    resolve_ms: u64,
+) -> Result<WriteStats, GraphError> {
     let write_started = Instant::now();
     let mut attempt = 0u8;
     loop {
-        match write_attempt(gm, ctx, facts, &resolution).await {
+        match write_attempt(gm, ctx, facts, resolution).await {
             Ok(mut stats) => {
                 stats.resolve_ms = resolve_ms;
                 stats.write_ms = elapsed_ms(write_started);
@@ -552,49 +581,130 @@ impl<'a> Attempt<'a> {
             .insert(subject.id.clone(), source.subject_name.clone());
         let mut fact = source.clone();
         fact.key = fold_key(&fact.key);
-        if fact.status == "rejected" {
-            self.retire_rejected(&fact, &subject).await?;
-        } else if fact.status == "decided" {
-            let turn = self.cited_turn(&fact).to_string();
-            self.block = super::enumeration::enumeration_skip(&fact, &turn);
-            self.held_slots.clear();
-            self.held_edges.clear();
-            if replaces_supported(&fact, self.ctx.turns) {
-                let before = self.stats.retirements.len();
-                self.retire_replaced(&fact, &subject).await?;
-                if self.stats.retirements.len() == before {
-                    self.stats.replaces_unconsumed.push(self.index);
-                }
-            }
-            let mut listed_conflict = false;
-            if single_valued(fact.predicate) {
-                listed_conflict = self.supersede_slot(&mut fact, &subject).await?;
-            }
-            if let Some(target) = self.edge_target().cloned() {
-                self.retire_matched(&fact, &subject, &target).await?;
-            }
-            self.block = None;
-            if listed_conflict && fact.predicate == Predicate::Setting {
-                self.stats.drops_enumeration += 1;
-                return Ok(());
-            }
-            self.promote(&fact, &subject).await?;
+        // A rejection still retires. Any other status skips retire and promote
+        // when the guard will not write the edge.
+        if self.component_edge_blocked(&fact, &subject).await? {
+            return Ok(());
         }
+        self.retire_then_write(&mut fact, &subject).await
+    }
+
+    async fn retire_then_write(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        if fact.status == "rejected" {
+            self.retire_rejected(fact, subject).await?;
+        } else if fact.status == "decided" && !self.prepare_decided(fact, subject).await? {
+            return Ok(());
+        }
+        self.write_prepared(fact, subject).await
+    }
+
+    async fn prepare_decided(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<bool, GraphError> {
+        let turn = self.cited_turn(fact).to_string();
+        self.block = super::enumeration::enumeration_skip(fact, &turn);
+        self.held_slots.clear();
+        self.held_edges.clear();
+        self.retire_replaced_if_supported(fact, subject).await?;
+        let listed = self.supersede_if_single(fact, subject).await?;
+        self.retire_matched_target(fact, subject).await?;
+        self.block = None;
+        if listed && fact.predicate == Predicate::Setting {
+            self.stats.drops_enumeration += 1;
+            return Ok(false);
+        }
+        self.promote(fact, subject).await?;
+        Ok(true)
+    }
+
+    async fn retire_replaced_if_supported(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        if !replaces_supported(fact, self.ctx.turns) {
+            return Ok(());
+        }
+        let before = self.stats.retirements.len();
+        self.retire_replaced(fact, subject).await?;
+        if self.stats.retirements.len() == before {
+            self.stats.replaces_unconsumed.push(self.index);
+        }
+        Ok(())
+    }
+
+    async fn supersede_if_single(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<bool, GraphError> {
+        if !single_valued(fact.predicate) {
+            return Ok(false);
+        }
+        self.supersede_slot(fact, subject).await
+    }
+
+    async fn retire_matched_target(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        let Some(target) = self.edge_target().cloned() else {
+            return Ok(());
+        };
+        self.retire_matched(fact, subject, &target).await
+    }
+
+    async fn write_prepared(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
         let Some(subject) = self.catalog.by_id.get(&subject.id).cloned() else {
             return Ok(());
         };
-        if fact.predicate.is_edge() {
-            let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
-            let Some(object) = bound(self.catalog, &fact.object_name, object_kind, self.stats)?
-            else {
-                return Ok(());
-            };
-            self.names
-                .insert(object.id.clone(), fact.object_name.clone());
-            self.write_edge(&fact, &subject, &object).await
-        } else {
-            self.write_slot(&fact, &subject).await
+        if !fact.predicate.is_edge() {
+            return self.write_slot(fact, &subject).await;
         }
+        let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
+        let Some(object) = bound(self.catalog, &fact.object_name, object_kind, self.stats)? else {
+            return Ok(());
+        };
+        self.names
+            .insert(object.id.clone(), fact.object_name.clone());
+        self.write_edge(fact, &subject, &object).await
+    }
+
+    async fn component_edge_blocked(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+    ) -> Result<bool, GraphError> {
+        if !component_guard_applies(self.ctx, fact) {
+            return Ok(false);
+        }
+        let Some(object) = peek_object(self.catalog, fact) else {
+            return Ok(false);
+        };
+        if self.same_edge_exists(fact, subject, &object).await? {
+            return Ok(false);
+        }
+        self.skip_component_project_edge(fact, subject, &object)
+            .await
+    }
+
+    async fn same_edge_exists(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        object: &Stored,
+    ) -> Result<bool, GraphError> {
+        let found = self
+            .find_edge(subject, object, fact, edge_description(fact).as_deref())
+            .await?;
+        Ok(found.is_some())
     }
 
     async fn write_edge(
@@ -603,28 +713,110 @@ impl<'a> Attempt<'a> {
         subject: &Stored,
         object: &Stored,
     ) -> Result<(), GraphError> {
-        let description = fact.role.map(|role| format!("role={}", role.as_str()));
+        let description = edge_description(fact);
         if let Some(existing) = self
             .find_edge(subject, object, fact, description.as_deref())
             .await?
         {
-            if let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) {
-                let pending_id = record_id(&existing.id);
-                if self.releases_edge(conflicts, &pending_id).await?
-                    && self.clear_edge_pending(&pending_id).await?
-                {
-                    self.stats.holds_confirmed += 1;
-                }
-            }
-            match self.reinforce_edge(&subject.id, &existing, fact).await? {
-                Sight::Recorded => self.stats.reinforced += 1,
-                Sight::AlreadySeen => self.stats.already_seen += 1,
-            }
+            return self.reinforce_found(fact, subject, existing).await;
+        }
+        if self
+            .skip_component_project_edge(fact, subject, object)
+            .await?
+        {
             return Ok(());
         }
         self.create_edge(fact, subject, object, description).await?;
         self.stats.edges += 1;
         Ok(())
+    }
+
+    async fn reinforce_found(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        existing: StoredEdge,
+    ) -> Result<(), GraphError> {
+        self.release_pending_edge(&existing).await?;
+        match self.reinforce_edge(&subject.id, &existing, fact).await? {
+            Sight::Recorded => self.stats.reinforced += 1,
+            Sight::AlreadySeen => self.stats.already_seen += 1,
+        }
+        Ok(())
+    }
+
+    async fn release_pending_edge(&mut self, existing: &StoredEdge) -> Result<(), GraphError> {
+        let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) else {
+            return Ok(());
+        };
+        let pending_id = record_id(&existing.id);
+        if self.releases_edge(conflicts, &pending_id).await?
+            && self.clear_edge_pending(&pending_id).await?
+        {
+            self.stats.holds_confirmed += 1;
+        }
+        Ok(())
+    }
+
+    async fn skip_component_project_edge(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        object: &Stored,
+    ) -> Result<bool, GraphError> {
+        if !self.ctx.ground_on || !component_session_part_of(fact, self.ctx.project) {
+            return Ok(false);
+        }
+        if stored_kind(&subject.attributes) == Some(Kind::Technology) {
+            self.stats.component_edges.component_edge_technology += 1;
+            return Ok(true);
+        }
+        if self.part_of_other_project(&subject.id, &object.id).await? {
+            self.stats.component_edges.component_edge_foreign += 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn part_of_other_project(
+        &mut self,
+        subject_id: &str,
+        project_id: &str,
+    ) -> Result<bool, GraphError> {
+        let targets = self.other_part_of_targets(subject_id, project_id).await?;
+        for id in targets {
+            if self.stored_entity_kind(&id).await? == Some(Kind::Project) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn other_part_of_targets(
+        &mut self,
+        subject_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<String>, GraphError> {
+        let edges = self.live_edges(subject_id).await?;
+        let mut targets = Vec::new();
+        for edge in edges {
+            if !is_decided_part_of(&edge) {
+                continue;
+            }
+            let to = record_id(&edge.to_id);
+            if to.is_empty() || to == project_id {
+                continue;
+            }
+            targets.push(to);
+        }
+        Ok(targets)
+    }
+
+    async fn stored_entity_kind(&mut self, id: &str) -> Result<Option<Kind>, GraphError> {
+        let Some(stored) = self.ensure_entity(id).await? else {
+            return Ok(None);
+        };
+        Ok(stored_kind(&stored.attributes))
     }
 
     async fn find_edge(
@@ -1314,7 +1506,7 @@ impl<'a> Attempt<'a> {
         }
         let mut response = self
             .tx
-            .query(SCOPE_PART_OF)
+            .query(scope_part_of(self.ctx.ground_on))
             .bind(("id", subject.id.clone()))
             .await?;
         let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
@@ -1750,6 +1942,57 @@ const PREMISE_EDGES: &str = "SELECT id, rel_type, status, valid_until, pending, 
 /// Live `part_of` edges that point at one record. A graph-edge scan.
 const SCOPE_PART_OF: &str = "SELECT in FROM type::record($id)<-(relates_to \
      WHERE rel_type = 'part_of' AND valid_until = NONE)";
+
+/// Decided live `part_of` edges. Selected only when component grounding is on.
+const SCOPE_PART_OF_DECIDED: &str = "SELECT in FROM type::record($id)<-(relates_to \
+     WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE)";
+
+fn scope_part_of(ground_on: bool) -> &'static str {
+    if ground_on {
+        SCOPE_PART_OF_DECIDED
+    } else {
+        SCOPE_PART_OF
+    }
+}
+
+fn edge_description(fact: &Fact) -> Option<String> {
+    fact.role.map(|role| format!("role={}", role.as_str()))
+}
+
+fn component_guard_applies(ctx: &WriteCtx<'_>, fact: &Fact) -> bool {
+    ctx.ground_on && fact.status != "rejected" && component_session_part_of(fact, ctx.project)
+}
+
+fn peek_object(catalog: &Catalog, fact: &Fact) -> Option<Stored> {
+    let kind = fact.object_kind.unwrap_or(Kind::Technology);
+    catalog.get(&fact.object_name, kind).ok()
+}
+
+fn component_session_part_of(fact: &Fact, project: &ProjectIdentity) -> bool {
+    fact.predicate == Predicate::PartOf
+        && fact.subject_kind == Kind::Component
+        && fact.object_kind == Some(Kind::Project)
+        && !project.name.is_empty()
+        && is_project_name(&normalise(&fact.object_name), project)
+}
+
+fn technology_hold(facts: &[Fact], project: &ProjectIdentity) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for fact in facts {
+        if !component_session_part_of(fact, project) {
+            continue;
+        }
+        let name = normalise(&fact.subject_name);
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn is_decided_part_of(edge: &StoredEdge) -> bool {
+    edge.rel_type == "part_of" && edge.status.as_deref() == Some("decided")
+}
 
 pub(crate) const CLOSE_EDGE: &str = r#"
     UPDATE type::record($id) SET
@@ -3205,6 +3448,7 @@ mod tests {
                 targets: Vec::new(),
                 hold_on: false,
                 links_on: false,
+                ground_on: false,
                 components_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
@@ -4471,6 +4715,7 @@ mod tests {
             targets: Vec::new(),
             hold_on: false,
             links_on: false,
+            ground_on: false,
             components_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
@@ -4539,6 +4784,29 @@ mod tests {
             !plan_has_operator(&plan, "TableScan"),
             "scope scanned the table. Plan: {plan}"
         );
+        let plan = explain_full(gm.db(), SCOPE_PART_OF_DECIDED, &app_id).await;
+        assert!(
+            plan_has_operator(&plan, "GraphEdgeScan"),
+            "decided scope must be a graph-edge scan. Plan: {plan}"
+        );
+        assert!(
+            !plan_has_operator(&plan, "TableScan"),
+            "decided scope scanned the table. Plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn scope_part_of_constant_is_unchanged_until_the_flag_selects_decided() {
+        assert_eq!(
+            SCOPE_PART_OF,
+            "SELECT in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND valid_until = NONE)"
+        );
+        assert_eq!(
+            SCOPE_PART_OF_DECIDED,
+            "SELECT in FROM type::record($id)<-(relates_to WHERE rel_type = 'part_of' AND status = 'decided' AND valid_until = NONE)"
+        );
+        assert_eq!(scope_part_of(false), SCOPE_PART_OF);
+        assert_eq!(scope_part_of(true), SCOPE_PART_OF_DECIDED);
     }
 
     #[cfg(feature = "embedded")]
@@ -4819,6 +5087,444 @@ mod tests {
         );
         let edges = crud::list_all_relationships(gm.db()).await.unwrap();
         assert_eq!(live(&edges), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_part_of_does_not_widen_scope_when_the_flag_is_on() {
+        assert!(
+            !undecided_part_of_closes_setting("rejected", true).await,
+            "a rejected part_of widened scope"
+        );
+        assert!(
+            undecided_part_of_closes_setting("rejected", false).await,
+            "flag off stopped following a rejected part_of"
+        );
+        assert!(
+            !undecided_part_of_closes_setting("considered", true).await,
+            "a considered part_of widened scope"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn undecided_part_of_closes_setting(status: &str, ground_on: bool) -> bool {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            ground_on,
+            &[
+                project_setting("exporter", Kind::Component, "format", "csv", "decided", 1),
+                component_part_of("exporter", "acme", status),
+            ],
+        )
+        .await;
+        write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            ground_on,
+            &[project_setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await;
+        let slots = slots_of(&gm, "exporter").await;
+        !slot_named(&slots, "format", "csv")["valid_until"].is_null()
+    }
+
+    #[cfg(feature = "embedded")]
+    fn component_part_of(subject: &str, project: &str, status: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: None,
+            key: String::new(),
+            object_name: project.into(),
+            object_kind: Some(Kind::Project),
+            status: status.into(),
+            turn: 1,
+            quote: format!("{subject} belongs to {project}"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn write_project(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        project: &str,
+        ground_on: bool,
+        facts: &[Fact],
+    ) -> WriteStats {
+        let project = ProjectIdentity {
+            name: project.into(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let mut ctx = WriteCtx::new(&llm, &project, session_id, date, &[]);
+        ctx.ground_on = ground_on;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    fn uses_technology(project: &str, name: &str) -> Fact {
+        Fact {
+            subject_name: project.into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Uses,
+            role: Some(Role::Library),
+            key: String::new(),
+            object_name: name.into(),
+            object_kind: Some(Kind::Technology),
+            status: "decided".into(),
+            turn: 1,
+            quote: format!("{project} uses {name}"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn v2_kind(entities: &[crate::graph::types::Entity], name: &str) -> Option<String> {
+        let entity = entities.iter().find(|entity| entity.name == name)?;
+        entity
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.pointer("/v2/kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn grounded_part_of_lets_a_project_rejection_close_the_component() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            true,
+            &[
+                project_setting("exporter", Kind::Component, "format", "csv", "decided", 1),
+                component_part_of("exporter", "acme", "decided"),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[project_setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await;
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "rejected");
+        assert_eq!(stats.retirements[0].subject, "exporter");
+        assert_eq!(stats.retirements[0].key, "format");
+        assert_eq!(stats.retirements[0].old_value, "csv");
+        let slots = slots_of(&gm, "exporter").await;
+        assert_eq!(
+            slot_named(&slots, "format", "csv")["ended_by"],
+            "s2:rejected"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_stored_technology_is_not_upgraded_or_linked() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            false,
+            &[uses_technology("acme", "redis")],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[component_part_of("redis", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 0, "{stats:?}");
+        assert_eq!(stats.component_edges.component_edge_technology, 1);
+        assert_eq!(stats.component_edges.component_edge_foreign, 0);
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(v2_kind(&entities, "redis").as_deref(), Some("technology"));
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        assert!(
+            edges.iter().all(|edge| edge.rel_type != "part_of"),
+            "{edges:?}"
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn flag_off_still_links_a_technology_named_as_a_component() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "acme",
+            false,
+            &[uses_technology("acme", "redis")],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            false,
+            &[component_part_of("redis", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 1, "{stats:?}");
+        assert!(stats.component_edges.is_blank());
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(v2_kind(&entities, "redis").as_deref(), Some("component"));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_foreign_project_edge_is_skipped_and_does_not_close_rows() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "other",
+            false,
+            &[
+                project_setting("exporter", Kind::Component, "format", "csv", "decided", 1),
+                component_part_of("exporter", "other", "decided"),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[component_part_of("exporter", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 0, "{stats:?}");
+        assert_eq!(stats.component_edges.component_edge_foreign, 1);
+        assert_eq!(stats.component_edges.component_edge_technology, 0);
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        assert_eq!(v2_kind(&entities, "exporter").as_deref(), Some("component"));
+        let other = entities
+            .iter()
+            .find(|entity| entity.name == "other")
+            .expect("other");
+        let edges = crud::list_all_relationships(gm.db()).await.unwrap();
+        let live: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.rel_type == "part_of" && edge.valid_until.is_none())
+            .collect();
+        assert_eq!(live.len(), 1, "{edges:?}");
+        assert_eq!(live[0].to_id, other.id);
+        let rejection = write_project(
+            &gm,
+            "s3",
+            "2026-04-12",
+            "acme",
+            true,
+            &[project_setting(
+                "acme",
+                Kind::Project,
+                "format",
+                "csv",
+                "rejected",
+                1,
+            )],
+        )
+        .await;
+        assert!(
+            rejection.retirements.is_empty(),
+            "{:?}",
+            rejection.retirements
+        );
+        let slots = slots_of(&gm, "exporter").await;
+        assert!(slot_named(&slots, "format", "csv")["valid_until"].is_null());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn considered_part_of_stays_open_when_the_guard_skips() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "other",
+            false,
+            &[
+                component_part_of("exporter", "other", "decided"),
+                component_part_of("exporter", "acme", "considered"),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[component_part_of("exporter", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 0, "{stats:?}");
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        assert_eq!(stats.component_edges.component_edge_foreign, 1);
+        let open = open_part_of(&gm, "acme", "considered").await;
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(open[0]["valid_until"].is_null(), "{open:?}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_part_of_still_closes_the_session_edge() {
+        let on = reject_stored_part_of(true, false).await;
+        assert!(!on.acme_live, "decided acme edge stayed live: {on:?}");
+        assert!(on.other_live, "the other project's edge was closed");
+        assert_eq!(on.stats.edges, 0, "{:?}", on.stats);
+        assert_eq!(on.stats.retirements.len(), 1, "{:?}", on.stats.retirements);
+        assert_eq!(on.stats.retirements[0].reason, "rejected");
+        assert_eq!(on.stats.retirements[0].subject, "exporter");
+        assert_eq!(on.stats.component_edges.component_edge_foreign, 1);
+        assert_eq!(on.stats.component_edges.component_edge_technology, 0);
+        assert!(on.rejected_live.is_empty(), "{:?}", on.rejected_live);
+
+        let off = reject_stored_part_of(false, false).await;
+        assert!(!off.acme_live, "flag off left the acme edge live");
+        assert!(off.other_live);
+        assert!(off.stats.component_edges.is_blank());
+        assert_eq!(
+            off.stats.retirements.len(),
+            1,
+            "{:?}",
+            off.stats.retirements
+        );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn rejected_part_of_still_closes_a_technology_edge() {
+        let on = reject_stored_part_of(true, true).await;
+        assert!(!on.acme_live, "decided acme edge stayed live: {on:?}");
+        assert!(on.other_live, "the other project's edge was closed");
+        assert_eq!(on.stats.edges, 0, "{:?}", on.stats);
+        assert_eq!(on.stats.retirements.len(), 1, "{:?}", on.stats.retirements);
+        assert_eq!(on.stats.retirements[0].reason, "rejected");
+        assert_eq!(on.stats.retirements[0].subject, "redis");
+        assert_eq!(on.stats.component_edges.component_edge_technology, 1);
+        assert_eq!(on.stats.component_edges.component_edge_foreign, 0);
+        assert_eq!(on.kind.as_deref(), Some("technology"));
+        assert!(on.rejected_live.is_empty(), "{:?}", on.rejected_live);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[derive(Debug)]
+    struct RejectionProbe {
+        stats: WriteStats,
+        acme_live: bool,
+        other_live: bool,
+        rejected_live: Vec<Value>,
+        kind: Option<String>,
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn reject_stored_part_of(ground_on: bool, technology: bool) -> RejectionProbe {
+        let (_tmp, gm) = open_store().await;
+        let name = if technology { "redis" } else { "exporter" };
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "other",
+            false,
+            &[
+                stored_part_of(name, "other", "decided", technology),
+                stored_part_of(name, "acme", "decided", technology),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            ground_on,
+            &[component_part_of(name, "acme", "rejected")],
+        )
+        .await;
+        let entities = crud::list_entities(gm.db(), None).await.unwrap();
+        RejectionProbe {
+            stats,
+            acme_live: !open_part_of(&gm, "acme", "decided").await.is_empty(),
+            other_live: !open_part_of(&gm, "other", "decided").await.is_empty(),
+            rejected_live: open_part_of(&gm, "acme", "rejected").await,
+            kind: v2_kind(&entities, name),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn stored_part_of(name: &str, object: &str, status: &str, technology: bool) -> Fact {
+        let mut fact = component_part_of(name, object, status);
+        if technology {
+            fact.subject_kind = Kind::Technology;
+        }
+        fact
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn open_part_of(gm: &GraphMemory, object: &str, status: &str) -> Vec<Value> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT status, valid_until, ended_by, out.name AS object FROM relates_to \
+                 WHERE rel_type = 'part_of' AND status = $status AND valid_until = NONE",
+            )
+            .bind(("status", status.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        rows.into_iter()
+            .filter(|row| row["object"] == object)
+            .collect()
     }
 
     #[cfg(feature = "embedded")]
@@ -5508,6 +6214,7 @@ mod tests {
             match_on: true,
             hold_on: false,
             links_on: false,
+            ground_on: false,
             components_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
@@ -7391,6 +8098,7 @@ mod tests {
             targets: Vec::new(),
             hold_on: false,
             links_on: true,
+            ground_on: false,
             components_on: false,
         };
         let result = write_facts(

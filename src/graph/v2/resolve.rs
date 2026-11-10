@@ -108,6 +108,8 @@ struct Index {
     by_id: HashMap<String, usize>,
     by_norm: HashMap<String, Vec<usize>>,
     alias_of: HashMap<String, String>,
+    /// Component mentions of these names must not upgrade a stored technology.
+    hold_technology: HashSet<String>,
 }
 
 struct PromptGroup {
@@ -193,30 +195,26 @@ pub(crate) async fn resolve_session(
     project: &ProjectIdentity,
     mentions: &[MentionDraft],
 ) -> Result<Resolution, GraphError> {
+    resolve_with_hold(gm, llm, project, mentions, &HashSet::new()).await
+}
+
+pub(crate) async fn resolve_with_hold(
+    gm: &GraphMemory,
+    llm: &dyn LlmProvider,
+    project: &ProjectIdentity,
+    mentions: &[MentionDraft],
+    hold: &HashSet<String>,
+) -> Result<Resolution, GraphError> {
     let mut index = Index::load(gm).await?;
+    index.hold_technology.clone_from(hold);
     seed_project(gm, &mut index, project).await?;
     let mut report = ResolveStats {
         mentions: u32::try_from(mentions.len()).unwrap_or(u32::MAX),
         ..ResolveStats::default()
     };
     let project_norm = normalise(&project.name);
-    let mut created = 0u32;
     let mut bound: HashMap<(String, Kind), String> = HashMap::new();
-    let mut seen = HashSet::new();
-    let mut pending = Vec::new();
-    for mention in mentions {
-        if !mention.creates {
-            continue;
-        }
-        let open = open_mention(mention);
-        if open.norm.is_empty() || !seen.insert((open.norm.clone(), open.kind)) {
-            continue;
-        }
-        if take_tier(gm, &mut index, &mut bound, &mut report, &open).await? {
-            continue;
-        }
-        pending.push(open);
-    }
+    let mut pending = bind_mentions(gm, &mut index, &mut bound, &mut report, mentions).await?;
     let usage = ask_resolver(gm, llm, &mut index, &mut bound, &mut report, &mut pending).await?;
     pending.sort_by(|left, right| {
         right
@@ -225,22 +223,86 @@ pub(crate) async fn resolve_session(
             .cmp(&left.kind.priority())
             .then_with(|| left.norm.cmp(&right.norm))
     });
-    for mention in pending {
-        if take_tier(gm, &mut index, &mut bound, &mut report, &mention).await? {
-            continue;
-        }
-        create_entity(gm, &mut index, &mut bound, &mention).await?;
-        created += 1;
-        if mention.kind == Kind::Project && mention.norm == project_norm {
-            seed_project(gm, &mut index, project).await?;
-        }
-    }
+    let created = create_unbound(
+        gm,
+        &mut index,
+        &mut bound,
+        &mut report,
+        pending,
+        project,
+        &project_norm,
+    )
+    .await?;
     Ok(Resolution {
         bindings: snapshot(&index, &bound),
         report,
         entities_created: created,
         usage,
     })
+}
+
+async fn create_unbound(
+    gm: &GraphMemory,
+    index: &mut Index,
+    bound: &mut HashMap<(String, Kind), String>,
+    report: &mut ResolveReport,
+    pending: Vec<OpenMention>,
+    project: &ProjectIdentity,
+    project_norm: &str,
+) -> Result<u32, GraphError> {
+    let mut created = 0u32;
+    for mention in pending {
+        if take_tier(gm, index, bound, report, &mention).await? {
+            continue;
+        }
+        create_entity(gm, index, bound, &mention).await?;
+        created += 1;
+        if mention.kind == Kind::Project && mention.norm == project_norm {
+            seed_project(gm, index, project).await?;
+        }
+    }
+    Ok(created)
+}
+
+async fn bind_mentions(
+    gm: &GraphMemory,
+    index: &mut Index,
+    bound: &mut HashMap<(String, Kind), String>,
+    report: &mut ResolveReport,
+    mentions: &[MentionDraft],
+) -> Result<Vec<OpenMention>, GraphError> {
+    let mut seen = HashSet::new();
+    let mut pending = Vec::new();
+    for mention in mentions {
+        push_pending(gm, index, bound, report, &mut seen, &mut pending, mention).await?;
+    }
+    Ok(pending)
+}
+
+async fn push_pending(
+    gm: &GraphMemory,
+    index: &mut Index,
+    bound: &mut HashMap<(String, Kind), String>,
+    report: &mut ResolveReport,
+    seen: &mut HashSet<(String, Kind)>,
+    pending: &mut Vec<OpenMention>,
+    mention: &MentionDraft,
+) -> Result<(), GraphError> {
+    if !mention.creates {
+        return Ok(());
+    }
+    let open = open_mention(mention);
+    if seen_already(seen, &open) {
+        return Ok(());
+    }
+    if !take_tier(gm, index, bound, report, &open).await? {
+        pending.push(open);
+    }
+    Ok(())
+}
+
+fn seen_already(seen: &mut HashSet<(String, Kind)>, open: &OpenMention) -> bool {
+    open.norm.is_empty() || !seen.insert((open.norm.clone(), open.kind))
 }
 
 fn open_mention(mention: &MentionDraft) -> OpenMention {
@@ -280,7 +342,9 @@ async fn commit(
     mention: &OpenMention,
     id: &str,
 ) -> Result<(), GraphError> {
-    maybe_upgrade(gm, index, id, mention.kind).await?;
+    if !holds_technology(index, id, &mention.norm, mention.kind) {
+        maybe_upgrade(gm, index, id, mention.kind).await?;
+    }
     if mention.norm != index.norm_of(id) {
         remember_alias(gm, index, &mention.norm, id).await?;
     }
@@ -458,6 +522,12 @@ async fn create_entity(
     });
     bound.insert((mention.norm.clone(), mention.kind), id);
     Ok(())
+}
+
+fn holds_technology(index: &Index, id: &str, norm: &str, kind: Kind) -> bool {
+    kind == Kind::Component
+        && index.kind_of(id) == Some(Kind::Technology)
+        && index.hold_technology.contains(norm)
 }
 
 async fn maybe_upgrade(
@@ -835,6 +905,7 @@ impl Index {
             by_id: HashMap::new(),
             by_norm: HashMap::new(),
             alias_of: HashMap::new(),
+            hold_technology: HashSet::new(),
         }
     }
 

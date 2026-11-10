@@ -953,6 +953,55 @@ impl LinksReport {
     }
 }
 
+/// Counts for a component `part_of` the session project.
+///
+/// Older bench JSON has no object here. A blank report is left out of new JSON.
+/// The counters are filled only when `ground_component_edges` is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentEdgesReport {
+    #[serde(default)]
+    pub component_edges_grounded: u32,
+    #[serde(default)]
+    pub component_edges_kept_object: u32,
+    #[serde(default)]
+    pub component_edge_technology: u32,
+    #[serde(default)]
+    pub component_edge_foreign: u32,
+    /// Seeds whose incoming decided `part_of` page came back full.
+    #[serde(default)]
+    pub part_of_children_truncated: u32,
+}
+
+impl ComponentEdgesReport {
+    /// Nothing was grounded, kept, or skipped.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.component_edges_grounded == 0
+            && self.component_edges_kept_object == 0
+            && self.component_edge_technology == 0
+            && self.component_edge_foreign == 0
+            && self.part_of_children_truncated == 0
+    }
+
+    pub(crate) fn add(&mut self, other: Self) {
+        self.component_edges_grounded = self
+            .component_edges_grounded
+            .saturating_add(other.component_edges_grounded);
+        self.component_edges_kept_object = self
+            .component_edges_kept_object
+            .saturating_add(other.component_edges_kept_object);
+        self.component_edge_technology = self
+            .component_edge_technology
+            .saturating_add(other.component_edge_technology);
+        self.component_edge_foreign = self
+            .component_edge_foreign
+            .saturating_add(other.component_edge_foreign);
+        self.part_of_children_truncated = self
+            .part_of_children_truncated
+            .saturating_add(other.part_of_children_truncated);
+    }
+}
+
 impl ConsolidateReport {
     /// The pass did not run, or it found nothing to count.
     #[must_use]
@@ -1084,6 +1133,9 @@ pub struct IngestionReport {
     /// Derived-from counts. Blank, and omitted, when that switch is off.
     #[serde(default, skip_serializing_if = "LinksReport::is_blank")]
     pub links: LinksReport,
+    /// Component `part_of` counts. Blank, and omitted, when that switch is off.
+    #[serde(default, skip_serializing_if = "ComponentEdgesReport::is_blank")]
+    pub component_edges: ComponentEdgesReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -1278,6 +1330,37 @@ mod tests {
         let loaded: IngestionReport = serde_json::from_value(value).unwrap();
         assert!(loaded.links.is_blank());
         assert_eq!(loaded.entities_created, 0);
+    }
+
+    #[test]
+    fn component_edges_report_is_omitted_when_blank_and_older_json_loads() {
+        let encoded = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(encoded.get("component_edges").is_none());
+        assert!(ComponentEdgesReport::default().is_blank());
+
+        let mut report = IngestionReport::default();
+        report.component_edges.component_edges_grounded = 1;
+        report.component_edges.component_edges_kept_object = 2;
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["component_edges"]["component_edges_grounded"], 1);
+        assert_eq!(encoded["component_edges"]["component_edges_kept_object"], 2);
+        assert_eq!(encoded["component_edges"]["component_edge_technology"], 0);
+        assert_eq!(encoded["component_edges"]["component_edge_foreign"], 0);
+        assert_eq!(encoded["component_edges"]["part_of_children_truncated"], 0);
+        report.component_edges.add(ComponentEdgesReport {
+            component_edge_technology: 3,
+            component_edge_foreign: 4,
+            ..ComponentEdgesReport::default()
+        });
+        assert_eq!(report.component_edges.component_edges_grounded, 1);
+        assert_eq!(report.component_edges.component_edge_technology, 3);
+        assert_eq!(report.component_edges.component_edge_foreign, 4);
+        assert!(!report.component_edges.is_blank());
+
+        let mut value = serde_json::to_value(IngestionReport::default()).unwrap();
+        value.as_object_mut().unwrap().remove("component_edges");
+        let loaded: IngestionReport = serde_json::from_value(value).unwrap();
+        assert!(loaded.component_edges.is_blank());
     }
 
     #[test]

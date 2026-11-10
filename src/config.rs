@@ -730,6 +730,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub drop_restatements: bool,
+    /// Accept a decided component `part_of` the session project when the
+    /// component name is supported in the cited turn. Off unless set.
+    /// Stands alone: it does not turn any other switch on.
+    #[serde(
+        default = "default_ground_component_edges",
+        skip_serializing_if = "is_false"
+    )]
+    pub ground_component_edges: bool,
 }
 
 impl Default for GraphSection {
@@ -752,6 +760,7 @@ impl Default for GraphSection {
             consolidate_links: default_consolidate_links(),
             consolidate_components: default_consolidate_components(),
             drop_restatements: default_drop_restatements(),
+            ground_component_edges: default_ground_component_edges(),
         }
     }
 }
@@ -1103,6 +1112,10 @@ fn default_drop_restatements() -> bool {
     false
 }
 
+fn default_ground_component_edges() -> bool {
+    false
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1428,6 +1441,12 @@ impl Config {
             }
             "graph.drop_restatements" => {
                 self.graph_section().drop_restatements = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.ground_component_edges" => {
+                self.graph_section().ground_component_edges = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2532,6 +2551,51 @@ mod tests {
 
         assert!(cfg.set_key("graph.drop_restatements", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").drop_restatements);
+    }
+
+    #[test]
+    fn ground_component_edges_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_ground_component_edges());
+        assert!(!GraphSection::default().ground_component_edges);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().ground_component_edges);
+        let explicit_false: Config =
+            toml::from_str("[graph]\nground_component_edges = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.ground_component_edges);
+        assert!(!false_graph.consolidate);
+        assert!(!false_graph.drop_restatements);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("ground_component_edges"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nground_component_edges = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.ground_component_edges);
+        assert!(!true_graph.consolidate);
+        assert!(!true_graph.consolidate_links);
+        assert!(!true_graph.known_facts_context);
+        assert!(!true_graph.known_match);
+        assert!(!true_graph.drop_restatements);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.ground_component_edges", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.ground_component_edges);
+        assert!(!graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("ground_component_edges = true"));
+        assert!(!rendered.contains("consolidate"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        assert!(parsed.graph.expect("graph").ground_component_edges);
+
+        cfg.set_key("graph.ground_component_edges", "false")
+            .unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").ground_component_edges);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("ground_component_edges"));
+        cfg.set_key("graph.ground_component_edges", "true").unwrap();
+        assert!(cfg.set_key("graph.ground_component_edges", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").ground_component_edges);
     }
 
     #[test]

@@ -153,6 +153,17 @@ pub enum DropRestatements {
     On,
 }
 
+/// Whether a bench run grounds component `part_of` edges on the component.
+///
+/// On writes `ground_component_edges = true` and implies nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroundComponentEdges {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `ground_component_edges = true` for this run.
+    On,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
@@ -172,6 +183,7 @@ pub async fn run(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
@@ -184,6 +196,7 @@ pub async fn run(
         consolidate,
         drop_restatements,
         consolidate_links,
+        ground_component_edges,
         consolidate_components,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
@@ -255,6 +268,7 @@ async fn collect_sessions(
             consolidate: report.consolidate,
             hold: report.hold,
             links: report.links,
+            component_edges: report.component_edges,
             status_rows: StatusWindow {
                 before: status_before,
                 after: status_after.clone(),
@@ -355,6 +369,7 @@ pub async fn run_repeat(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
@@ -379,6 +394,7 @@ pub async fn run_repeat(
                 consolidate,
                 drop_restatements,
                 consolidate_links,
+                ground_component_edges,
                 consolidate_components,
             )
             .await?,
@@ -388,6 +404,7 @@ pub async fn run_repeat(
 }
 
 /// Opt in by writing the graph switches into the fresh memory dir.
+#[allow(clippy::too_many_arguments)]
 fn apply_graph_switches(
     memory_dir: &Path,
     known: KnownFactsContext,
@@ -395,6 +412,7 @@ fn apply_graph_switches(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
@@ -403,6 +421,7 @@ fn apply_graph_switches(
         consolidate,
         drop_restatements,
         consolidate_links,
+        ground_component_edges,
         consolidate_components,
     );
     if lines.is_empty() {
@@ -423,6 +442,7 @@ fn switch_lines(
     consolidate: Consolidate,
     drop_restatements: DropRestatements,
     consolidate_links: ConsolidateLinks,
+    ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
@@ -456,6 +476,11 @@ fn switch_lines(
         &mut lines,
         drop_restatements == DropRestatements::On,
         "drop_restatements = true",
+    );
+    push_line(
+        &mut lines,
+        ground_component_edges == GroundComponentEdges::On,
+        "ground_component_edges = true",
     );
     lines
 }
@@ -1856,6 +1881,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1867,6 +1893,7 @@ mod tests {
             Consolidate::On,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1882,6 +1909,7 @@ mod tests {
             Consolidate::Hold,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1904,6 +1932,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1916,6 +1945,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::On,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1944,6 +1974,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::On,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1969,6 +2000,7 @@ mod tests {
             Consolidate::Hold,
             DropRestatements::Off,
             ConsolidateLinks::On,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -1991,6 +2023,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::On,
             ConsolidateLinks::On,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -2006,6 +2039,51 @@ mod tests {
         assert!(!graph.hold_applies());
         assert!(!graph.known_match);
         assert!(!graph.known_facts_context);
+        assert!(!graph.ground_component_edges);
+        assert!(!text.contains("ground_component_edges"), "{text}");
+    }
+
+    #[test]
+    fn ground_component_edges_is_written_only_when_passed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::On,
+            ConsolidateComponents::Off,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nground_component_edges = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.ground_component_edges);
+        assert!(!graph.consolidate);
+        assert!(!graph.consolidate_links);
+        assert!(!graph.consolidate_hold);
+        assert!(!graph.drop_restatements);
+        assert!(!graph.known_facts_context);
+        assert!(!graph.known_match);
+        assert!(!text.contains("consolidate"));
     }
 
     #[test]
@@ -2020,6 +2098,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .unwrap();
@@ -2032,6 +2111,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::On,
         )
         .unwrap();
@@ -2059,6 +2139,7 @@ mod tests {
             Consolidate::Hold,
             DropRestatements::Off,
             ConsolidateLinks::On,
+            GroundComponentEdges::Off,
             ConsolidateComponents::On,
         )
         .unwrap();
@@ -2083,6 +2164,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::On,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::On,
         )
         .unwrap();
@@ -2147,6 +2229,7 @@ mod tests {
                 consolidate,
                 drop_restatements,
                 ConsolidateLinks::Off,
+                GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
             )
             .unwrap();
@@ -2163,6 +2246,8 @@ mod tests {
             assert_eq!(graph.consolidate_hold, consolidate.writes_hold(), "{text}");
             assert!(!graph.consolidate_links, "{text}");
             assert!(!text.contains("consolidate_links"), "{text}");
+            assert!(!graph.ground_component_edges, "{text}");
+            assert!(!text.contains("ground_component_edges"), "{text}");
             assert_eq!(
                 graph.drop_restatements,
                 drop_restatements == DropRestatements::On,
@@ -2197,6 +2282,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -2355,6 +2441,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -2462,6 +2549,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -2487,6 +2575,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -2564,6 +2653,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -2849,6 +2939,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -3064,6 +3155,7 @@ mod tests {
                 Consolidate::Off,
                 DropRestatements::Off,
                 ConsolidateLinks::Off,
+                GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
             )
             .await
@@ -3102,6 +3194,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -3392,6 +3485,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -3525,6 +3619,7 @@ mod tests {
             Consolidate::Off,
             DropRestatements::Off,
             ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
             ConsolidateComponents::Off,
         )
         .await
@@ -4024,6 +4119,7 @@ mod tests {
             consolidate: crate::graph::types::ConsolidateReport::default(),
             hold: crate::graph::types::HoldReport::default(),
             links: crate::graph::types::LinksReport::default(),
+            component_edges: crate::graph::types::ComponentEdgesReport::default(),
             status_rows: StatusWindow {
                 before: Vec::new(),
                 after: status,
