@@ -1512,22 +1512,37 @@ fn derived_branch(links: &PairLinks, branch: &CueBranch) -> bool {
 }
 
 fn cue_branch(links: &PairLinks, quoted: bool, trailing: bool) -> CueBranch {
-    if trailing && !quoted {
-        return CueBranch::Trailing;
+    if let Some(branch) = quote_branch(quoted, trailing) {
+        return branch;
     }
-    if links.sibling && !links.same && !links.direct {
-        return CueBranch::Sibling;
+    if let Some(branch) = open_link(links) {
+        return branch;
     }
-    if links.derived && !links.same && !links.direct {
-        return CueBranch::Derived;
+    direct_branch(links)
+}
+
+fn quote_branch(quoted: bool, trailing: bool) -> Option<CueBranch> {
+    (trailing && !quoted).then_some(CueBranch::Trailing)
+}
+
+fn open_link(links: &PairLinks) -> Option<CueBranch> {
+    if links.same || links.direct {
+        return None;
     }
+    if links.sibling {
+        return Some(CueBranch::Sibling);
+    }
+    links.derived.then_some(CueBranch::Derived)
+}
+
+fn direct_branch(links: &PairLinks) -> CueBranch {
     if links.direct {
-        return CueBranch::PartOf;
+        CueBranch::PartOf
+    } else if links.same {
+        CueBranch::Same
+    } else {
+        CueBranch::None
     }
-    if links.same {
-        return CueBranch::Same;
-    }
-    CueBranch::None
 }
 
 fn joined_cue(depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool {
