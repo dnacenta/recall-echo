@@ -207,7 +207,11 @@ pub(crate) async fn run(
                     &anchors,
                     &loaded.rows,
                     pair,
-                    "consolidated",
+                    CloseWhy {
+                        reason: "consolidated",
+                        quote: None,
+                        tally: CueTally::none(),
+                    },
                     report,
                 )
                 .await;
@@ -364,7 +368,11 @@ pub(crate) async fn run(
                 &anchors,
                 &loaded.rows,
                 pair,
-                "consolidated",
+                CloseWhy {
+                    reason: "consolidated",
+                    quote: Some(quote.as_str()),
+                    tally: *tally,
+                },
                 report,
             )
             .await;
@@ -1726,13 +1734,19 @@ fn owner_id<'a>(name: &str, owners: &'a [(String, String)]) -> Option<&'a str> {
         .map(|(id, _)| id.as_str())
 }
 
+struct CloseWhy<'a> {
+    reason: &'a str,
+    quote: Option<&'a str>,
+    tally: CueTally,
+}
+
 async fn close_partner(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     anchors: &[Anchor],
     rows: &[Row],
     pair: &Pair,
-    reason: &str,
+    why: CloseWhy<'_>,
     report: &mut IngestionReport,
 ) -> Option<&'static str> {
     let partner = &rows[pair.partner];
@@ -1740,7 +1754,7 @@ async fn close_partner(
         return Some(DROP_OPENED_HERE);
     }
     let until = session_midnight(ctx.date)?;
-    let ended = format!("{}:{reason}", ctx.session_id);
+    let ended = format!("{}:{}", ctx.session_id, why.reason);
     let closed = match close_row(gm, partner, &until, &ended).await {
         Ok(closed) => closed,
         Err(_) => {
@@ -1751,15 +1765,15 @@ async fn close_partner(
     if !closed {
         return Some(DROP_GONE);
     }
-    if reason == "consolidated" {
+    if why.reason == "consolidated" {
         report.consolidate.closes_sup += 1;
-        note_component_close(ctx, anchors, rows, pair, report);
+        note_component_close(ctx, anchors, rows, pair, why.quote, why.tally, report);
     } else {
         report.consolidate.closes_dup += 1;
     }
     let anchor = &anchors[pair.anchor];
     report.retirements.push(Retirement {
-        reason: reason.to_string(),
+        reason: why.reason.to_string(),
         subject: partner.subject.clone(),
         predicate: partner.pred.clone(),
         key: partner.key.clone(),
@@ -1774,6 +1788,8 @@ fn note_component_close(
     anchors: &[Anchor],
     rows: &[Row],
     pair: &Pair,
+    quote: Option<&str>,
+    tally: CueTally,
     report: &mut IngestionReport,
 ) {
     if !ctx.components_on {
@@ -1781,23 +1797,42 @@ fn note_component_close(
     }
     let anchor = &anchors[pair.anchor];
     let partner = &rows[pair.partner];
-    if same_name(&anchor.subject, &partner.subject) {
-        return;
+    if !same_name(&anchor.subject, &partner.subject) {
+        add_count(&mut report.consolidate.closes_component);
     }
-    add_count(&mut report.consolidate.closes_component);
+    let Some(quote) = quote else {
+        return;
+    };
     eprintln!(
         "{}",
         component_close_line(
+            close_tag(&tally, same_name(&anchor.subject, &partner.subject)),
             &format!("{}:{}", partner.subject, partner.key),
             &format!("{}:{}", anchor.subject, anchor.key),
-            &anchor.quote,
+            quote,
         )
     );
 }
 
-fn component_close_line(old_key: &str, new_key: &str, quote: &str) -> String {
+fn close_tag(tally: &CueTally, same: bool) -> &'static str {
+    if tally.trailing {
+        return "trailing";
+    }
+    if tally.sibling {
+        return "sibling";
+    }
+    if tally.derived {
+        return "derived";
+    }
+    if same {
+        return "same subject";
+    }
+    "part_of"
+}
+
+fn component_close_line(kind: &str, old_key: &str, new_key: &str, quote: &str) -> String {
     format!(
-        "consolidate close: component | {old_key} | {new_key} | {}",
+        "consolidate close: component {kind} | {old_key} | {new_key} | {}",
         quote_head(quote)
     )
 }
@@ -1823,7 +1858,20 @@ async fn close_duplicate(
         }
         if kept_copy(rows, gone, pair.partner, &partner.value) {
             let before = report.consolidate.closes_dup;
-            let reason = close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+            let reason = close_partner(
+                gm,
+                ctx,
+                anchors,
+                rows,
+                pair,
+                CloseWhy {
+                    reason: "duplicate",
+                    quote: None,
+                    tally: CueTally::none(),
+                },
+                report,
+            )
+            .await;
             if report.consolidate.closes_dup > before {
                 gone.insert(pair.partner);
                 return None;
@@ -1850,7 +1898,20 @@ async fn close_duplicate(
         partner.from > mine.from || (partner.from == mine.from && !partner.here);
     if close_partner_row {
         let before = report.consolidate.closes_dup;
-        let reason = close_partner(gm, ctx, anchors, rows, pair, "duplicate", report).await;
+        let reason = close_partner(
+                gm,
+                ctx,
+                anchors,
+                rows,
+                pair,
+                CloseWhy {
+                    reason: "duplicate",
+                    quote: None,
+                    tally: CueTally::none(),
+                },
+                report,
+            )
+            .await;
         if report.consolidate.closes_dup > before {
             gone.insert(pair.partner);
             return None;
@@ -8336,11 +8397,36 @@ mod tests {
     fn component_close_line_tags_the_pair() {
         assert_eq!(
             component_close_line(
+                "sibling",
                 "widget:port",
                 "acme widget:port",
                 "Default port is now 8765."
             ),
-            "consolidate close: component | widget:port | acme widget:port | Default port is now 8765."
+            "consolidate close: component sibling | widget:port | acme widget:port | Default port is now 8765."
+        );
+        assert_eq!(close_tag(&CueTally::none(), true), "same subject");
+        assert_eq!(close_tag(&CueTally::none(), false), "part_of");
+        assert_eq!(
+            close_tag(
+                &CueTally {
+                    sibling: false,
+                    derived: true,
+                    trailing: false,
+                },
+                false
+            ),
+            "derived"
+        );
+        assert_eq!(
+            close_tag(
+                &CueTally {
+                    sibling: true,
+                    derived: false,
+                    trailing: true,
+                },
+                false
+            ),
+            "trailing"
         );
     }
 
