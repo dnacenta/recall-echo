@@ -1534,6 +1534,7 @@ fn pair_links(
         sibling: sibling_link(
             anchor,
             partner,
+            &loaded.rows,
             &loaded.part_of,
             &loaded.owners,
             ctx.project,
@@ -1558,20 +1559,45 @@ fn note_link(report: &mut IngestionReport, kind: &PairLinks) {
 fn sibling_link(
     anchor: &Anchor,
     partner: &Row,
+    rows: &[Row],
     part_of: &[(String, String)],
     owners: &[(String, String)],
     project: &super::input::ProjectIdentity,
 ) -> bool {
-    let Some(anchor_id) = owner_id(&anchor.subject, owners) else {
+    let Some(anchor_id) = anchor_entity(anchor, rows, owners) else {
         return false;
     };
-    let Some(partner_id) = owner_id(&partner.subject, owners) else {
-        return false;
-    };
+    let partner_id = partner.entity.as_str();
     if anchor_id == partner_id {
         return false;
     }
     shared_project_parent(anchor_id, partner_id, part_of, owners, project)
+}
+
+fn anchor_entity<'a>(
+    anchor: &Anchor,
+    rows: &'a [Row],
+    owners: &'a [(String, String)],
+) -> Option<&'a str> {
+    if let Some(row) = anchor.live.and_then(|index| rows.get(index)) {
+        return Some(row.entity.as_str());
+    }
+    unique_owner(&anchor.subject, owners)
+}
+
+fn unique_owner<'a>(name: &str, owners: &'a [(String, String)]) -> Option<&'a str> {
+    let name = normalise(name);
+    let mut found = None;
+    for (id, owned) in owners {
+        if normalise(owned) != name {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(id.as_str());
+    }
+    found
 }
 
 fn shared_project_parent(
@@ -8072,20 +8098,157 @@ mod tests {
         let anchor = anchor_named("acme widget", "port", "8765");
         let partner = row_named("widget", "w", "port", "8080");
         let session = project();
+        let rows: &[Row] = &[];
         let live = vec![("w".into(), "p".into()), ("s".into(), "p".into())];
-        assert!(sibling_link(&anchor, &partner, &live, &owners, &session));
+        assert!(sibling_link(
+            &anchor, &partner, rows, &live, &owners, &session
+        ));
         let panel = vec![("w".into(), "n".into()), ("s".into(), "n".into())];
-        assert!(!sibling_link(&anchor, &partner, &panel, &owners, &session));
+        assert!(!sibling_link(
+            &anchor, &partner, rows, &panel, &owners, &session
+        ));
         let one = vec![("w".into(), "p".into())];
-        assert!(!sibling_link(&anchor, &partner, &one, &owners, &session));
+        assert!(!sibling_link(
+            &anchor, &partner, rows, &one, &owners, &session
+        ));
         let same = row_named("acme widget", "s", "port", "8080");
-        assert!(!sibling_link(&anchor, &same, &live, &owners, &session));
+        assert!(!sibling_link(&anchor, &same, rows, &live, &owners, &session));
         let mut aliased = project();
         aliased.aliases = vec!["acme labs".into()];
         let via_alias = vec![("w".into(), "a".into()), ("s".into(), "a".into())];
         assert!(sibling_link(
-            &anchor, &partner, &via_alias, &owners, &aliased
+            &anchor, &partner, rows, &via_alias, &owners, &aliased
         ));
+        let mut doubled = owners.clone();
+        doubled.push(("w2".into(), "widget".into()));
+        assert!(unique_owner("widget", &doubled).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_same_named_component_in_another_project_is_not_closed() {
+        let (_tmp, gm) = open().await;
+        let widget = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let client = edge(
+            Predicate::PartOf,
+            "http client",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let other = setting("other", Kind::Project, "title", "host", "other is host");
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("stored")],
+            &[widget, client, other],
+        )
+        .await;
+        let acme_widget = id_named(&gm, "widget").await;
+        let other_widget = format!("{acme_widget}z");
+        let other_client = format!("{}z", id_named(&gm, "http client").await);
+        let other_project = id_named(&gm, "other").await;
+        create_named(&gm, &other_widget, "widget", empty_component()).await;
+        create_named(&gm, &other_client, "http client", port_slot()).await;
+        relate_part_of(&gm, &other_widget, &other_project).await;
+        relate_part_of(&gm, &other_client, &other_widget).await;
+        let quote = "Default port is now 8765.";
+        let next = setting("widget", Kind::Component, "port", "8765", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            flags(false, true),
+        )
+        .await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message());
+        assert!(stub.message().contains("8080"), "{}", stub.message());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.link_sibling, Some(0));
+        let stored = attributes_of(&gm, &other_client).await;
+        let slot = &stored["v2"]["slots"][0];
+        assert_eq!(slot["value"], "8080");
+        assert!(slot.get("ended_by").is_none(), "{slot}");
+    }
+
+    async fn id_named(gm: &GraphMemory, name: &str) -> String {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        entities
+            .iter()
+            .find(|entity| entity.name == name)
+            .unwrap()
+            .id_string()
+    }
+
+    async fn create_named(gm: &GraphMemory, id: &str, name: &str, attributes: Value) {
+        gm.db()
+            .query(
+                "CREATE type::record($id) SET name = $name, entity_type = 'concept', abstract = 'host', overview = '', attributes = $attributes, mutable = true",
+            )
+            .bind(("id", id.to_string()))
+            .bind(("name", name.to_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    async fn relate_part_of(gm: &GraphMemory, from: &str, to: &str) {
+        gm.db()
+            .query(format!(
+                "RELATE {from}->relates_to->{to} SET rel_type = 'part_of', status = 'decided', valid_from = d'2026-03-01T00:00:00Z'"
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    async fn attributes_of(gm: &GraphMemory, id: &str) -> Value {
+        let mut response = gm
+            .db()
+            .query("SELECT attributes FROM type::record($id)")
+            .bind(("id", id.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        rows[0]["attributes"].clone()
+    }
+
+    fn empty_component() -> Value {
+        json!({"v2": {"kind": "component", "slots": []}})
+    }
+
+    fn port_slot() -> Value {
+        json!({
+            "v2": {
+                "kind": "component",
+                "slots": [{
+                    "predicate": "setting",
+                    "key": "port",
+                    "value": "8080",
+                    "status": "decided",
+                    "valid_from": "2026-03-01T00:00:00Z",
+                    "evidence": [{"session": "s0", "turn": 0, "quote": "port is 8080", "role": "user"}]
+                }]
+            }
+        })
     }
 
     #[test]
