@@ -309,21 +309,38 @@ pub(crate) async fn write_facts(
     facts: &[Fact],
 ) -> Result<WriteStats, GraphError> {
     let resolve_started = Instant::now();
-    let resolution = if ctx.ground_on {
-        let hold = technology_hold(facts, ctx.project);
-        resolve::resolve_with_hold(gm, ctx.llm, ctx.project, &drafts_of(facts), &hold).await?
-    } else {
-        resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await?
-    };
+    let resolution = resolve_for(gm, ctx, facts).await?;
     let resolve_ms = elapsed_ms(resolve_started);
     // The field has to outlive a conflict rollback, or the retry cannot store a list.
     if ctx.links_on {
         define_derived_from(gm.db()).await?;
     }
+    commit_writes(gm, ctx, facts, &resolution, resolve_ms).await
+}
+
+async fn resolve_for(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+) -> Result<resolve::Resolution, GraphError> {
+    if !ctx.ground_on {
+        return resolve::resolve_session(gm, ctx.llm, ctx.project, &drafts_of(facts)).await;
+    }
+    let hold = technology_hold(facts, ctx.project);
+    resolve::resolve_with_hold(gm, ctx.llm, ctx.project, &drafts_of(facts), &hold).await
+}
+
+async fn commit_writes(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    resolution: &resolve::Resolution,
+    resolve_ms: u64,
+) -> Result<WriteStats, GraphError> {
     let write_started = Instant::now();
     let mut attempt = 0u8;
     loop {
-        match write_attempt(gm, ctx, facts, &resolution).await {
+        match write_attempt(gm, ctx, facts, resolution).await {
             Ok(mut stats) => {
                 stats.resolve_ms = resolve_ms;
                 stats.write_ms = elapsed_ms(write_started);
@@ -560,49 +577,129 @@ impl<'a> Attempt<'a> {
             .insert(subject.id.clone(), source.subject_name.clone());
         let mut fact = source.clone();
         fact.key = fold_key(&fact.key);
-        if fact.status == "rejected" {
-            self.retire_rejected(&fact, &subject).await?;
-        } else if fact.status == "decided" {
-            let turn = self.cited_turn(&fact).to_string();
-            self.block = super::enumeration::enumeration_skip(&fact, &turn);
-            self.held_slots.clear();
-            self.held_edges.clear();
-            if replaces_supported(&fact, self.ctx.turns) {
-                let before = self.stats.retirements.len();
-                self.retire_replaced(&fact, &subject).await?;
-                if self.stats.retirements.len() == before {
-                    self.stats.replaces_unconsumed.push(self.index);
-                }
-            }
-            let mut listed_conflict = false;
-            if single_valued(fact.predicate) {
-                listed_conflict = self.supersede_slot(&mut fact, &subject).await?;
-            }
-            if let Some(target) = self.edge_target().cloned() {
-                self.retire_matched(&fact, &subject, &target).await?;
-            }
-            self.block = None;
-            if listed_conflict && fact.predicate == Predicate::Setting {
-                self.stats.drops_enumeration += 1;
-                return Ok(());
-            }
-            self.promote(&fact, &subject).await?;
+        // A skipped component edge must not retire or promote anything first.
+        if self.component_edge_blocked(&fact, &subject).await? {
+            return Ok(());
         }
+        self.retire_then_write(&mut fact, &subject).await
+    }
+
+    async fn retire_then_write(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        if fact.status == "rejected" {
+            self.retire_rejected(fact, subject).await?;
+        } else if fact.status == "decided" && !self.prepare_decided(fact, subject).await? {
+            return Ok(());
+        }
+        self.write_prepared(fact, subject).await
+    }
+
+    async fn prepare_decided(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<bool, GraphError> {
+        let turn = self.cited_turn(fact).to_string();
+        self.block = super::enumeration::enumeration_skip(fact, &turn);
+        self.held_slots.clear();
+        self.held_edges.clear();
+        self.retire_replaced_if_supported(fact, subject).await?;
+        let listed = self.supersede_if_single(fact, subject).await?;
+        self.retire_matched_target(fact, subject).await?;
+        self.block = None;
+        if listed && fact.predicate == Predicate::Setting {
+            self.stats.drops_enumeration += 1;
+            return Ok(false);
+        }
+        self.promote(fact, subject).await?;
+        Ok(true)
+    }
+
+    async fn retire_replaced_if_supported(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        if !replaces_supported(fact, self.ctx.turns) {
+            return Ok(());
+        }
+        let before = self.stats.retirements.len();
+        self.retire_replaced(fact, subject).await?;
+        if self.stats.retirements.len() == before {
+            self.stats.replaces_unconsumed.push(self.index);
+        }
+        Ok(())
+    }
+
+    async fn supersede_if_single(
+        &mut self,
+        fact: &mut Fact,
+        subject: &Stored,
+    ) -> Result<bool, GraphError> {
+        if !single_valued(fact.predicate) {
+            return Ok(false);
+        }
+        self.supersede_slot(fact, subject).await
+    }
+
+    async fn retire_matched_target(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+    ) -> Result<(), GraphError> {
+        let Some(target) = self.edge_target().cloned() else {
+            return Ok(());
+        };
+        self.retire_matched(fact, subject, &target).await
+    }
+
+    async fn write_prepared(&mut self, fact: &Fact, subject: &Stored) -> Result<(), GraphError> {
         let Some(subject) = self.catalog.by_id.get(&subject.id).cloned() else {
             return Ok(());
         };
-        if fact.predicate.is_edge() {
-            let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
-            let Some(object) = bound(self.catalog, &fact.object_name, object_kind, self.stats)?
-            else {
-                return Ok(());
-            };
-            self.names
-                .insert(object.id.clone(), fact.object_name.clone());
-            self.write_edge(&fact, &subject, &object).await
-        } else {
-            self.write_slot(&fact, &subject).await
+        if !fact.predicate.is_edge() {
+            return self.write_slot(fact, &subject).await;
         }
+        let object_kind = fact.object_kind.unwrap_or(Kind::Technology);
+        let Some(object) = bound(self.catalog, &fact.object_name, object_kind, self.stats)? else {
+            return Ok(());
+        };
+        self.names
+            .insert(object.id.clone(), fact.object_name.clone());
+        self.write_edge(fact, &subject, &object).await
+    }
+
+    async fn component_edge_blocked(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+    ) -> Result<bool, GraphError> {
+        if !component_guard_applies(self.ctx, fact) {
+            return Ok(false);
+        }
+        let Some(object) = peek_object(self.catalog, fact) else {
+            return Ok(false);
+        };
+        if self.same_edge_exists(fact, subject, &object).await? {
+            return Ok(false);
+        }
+        self.skip_component_project_edge(fact, subject, &object)
+            .await
+    }
+
+    async fn same_edge_exists(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        object: &Stored,
+    ) -> Result<bool, GraphError> {
+        let found = self
+            .find_edge(subject, object, fact, edge_description(fact).as_deref())
+            .await?;
+        Ok(found.is_some())
     }
 
     async fn write_edge(
@@ -611,24 +708,12 @@ impl<'a> Attempt<'a> {
         subject: &Stored,
         object: &Stored,
     ) -> Result<(), GraphError> {
-        let description = fact.role.map(|role| format!("role={}", role.as_str()));
+        let description = edge_description(fact);
         if let Some(existing) = self
             .find_edge(subject, object, fact, description.as_deref())
             .await?
         {
-            if let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) {
-                let pending_id = record_id(&existing.id);
-                if self.releases_edge(conflicts, &pending_id).await?
-                    && self.clear_edge_pending(&pending_id).await?
-                {
-                    self.stats.holds_confirmed += 1;
-                }
-            }
-            match self.reinforce_edge(&subject.id, &existing, fact).await? {
-                Sight::Recorded => self.stats.reinforced += 1,
-                Sight::AlreadySeen => self.stats.already_seen += 1,
-            }
-            return Ok(());
+            return self.reinforce_found(fact, subject, existing).await;
         }
         if self
             .skip_component_project_edge(fact, subject, object)
@@ -638,6 +723,33 @@ impl<'a> Attempt<'a> {
         }
         self.create_edge(fact, subject, object, description).await?;
         self.stats.edges += 1;
+        Ok(())
+    }
+
+    async fn reinforce_found(
+        &mut self,
+        fact: &Fact,
+        subject: &Stored,
+        existing: StoredEdge,
+    ) -> Result<(), GraphError> {
+        self.release_pending_edge(&existing).await?;
+        match self.reinforce_edge(&subject.id, &existing, fact).await? {
+            Sight::Recorded => self.stats.reinforced += 1,
+            Sight::AlreadySeen => self.stats.already_seen += 1,
+        }
+        Ok(())
+    }
+
+    async fn release_pending_edge(&mut self, existing: &StoredEdge) -> Result<(), GraphError> {
+        let Some(conflicts) = pending_conflicts(existing.pending.as_ref()) else {
+            return Ok(());
+        };
+        let pending_id = record_id(&existing.id);
+        if self.releases_edge(conflicts, &pending_id).await?
+            && self.clear_edge_pending(&pending_id).await?
+        {
+            self.stats.holds_confirmed += 1;
+        }
         Ok(())
     }
 
@@ -1836,6 +1948,19 @@ fn scope_part_of(ground_on: bool) -> &'static str {
     } else {
         SCOPE_PART_OF
     }
+}
+
+fn edge_description(fact: &Fact) -> Option<String> {
+    fact.role.map(|role| format!("role={}", role.as_str()))
+}
+
+fn component_guard_applies(ctx: &WriteCtx<'_>, fact: &Fact) -> bool {
+    ctx.ground_on && component_session_part_of(fact, ctx.project)
+}
+
+fn peek_object(catalog: &Catalog, fact: &Fact) -> Option<Stored> {
+    let kind = fact.object_kind.unwrap_or(Kind::Technology);
+    catalog.get(&fact.object_name, kind).ok()
 }
 
 fn component_session_part_of(fact: &Fact, project: &ProjectIdentity) -> bool {
@@ -5247,6 +5372,56 @@ mod tests {
         );
         let slots = slots_of(&gm, "exporter").await;
         assert!(slot_named(&slots, "format", "csv")["valid_until"].is_null());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn considered_part_of_stays_open_when_the_guard_skips() {
+        let (_tmp, gm) = open_store().await;
+        write_project(
+            &gm,
+            "s1",
+            "2026-04-03",
+            "other",
+            false,
+            &[
+                component_part_of("exporter", "other", "decided"),
+                component_part_of("exporter", "acme", "considered"),
+            ],
+        )
+        .await;
+        let stats = write_project(
+            &gm,
+            "s2",
+            "2026-04-11",
+            "acme",
+            true,
+            &[component_part_of("exporter", "acme", "decided")],
+        )
+        .await;
+        assert_eq!(stats.edges, 0, "{stats:?}");
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        assert_eq!(stats.component_edges.component_edge_foreign, 1);
+        let open = open_part_of(&gm, "acme", "considered").await;
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(open[0]["valid_until"].is_null(), "{open:?}");
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn open_part_of(gm: &GraphMemory, object: &str, status: &str) -> Vec<Value> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT status, valid_until, ended_by, out.name AS object FROM relates_to \
+                 WHERE rel_type = 'part_of' AND status = $status AND valid_until = NONE",
+            )
+            .bind(("status", status.to_string()))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        rows.into_iter()
+            .filter(|row| row["object"] == object)
+            .collect()
     }
 
     #[cfg(feature = "embedded")]
