@@ -969,7 +969,7 @@ fn status_row_for_slot(
         subject: name.to_string(),
         relation: slot_relation(predicate, key),
         object: value.to_string(),
-        live: slot_live(slot),
+        live: slot_live(slot) && status != "rejected",
         status: present_status(Some(status.to_string())),
         pending: slot_pending(slot),
     }
@@ -1028,7 +1028,9 @@ fn slot_pending(slot: &serde_json::Value) -> bool {
 }
 
 fn slot_live(slot: &serde_json::Value) -> bool {
-    !slot_pending(slot) && open_until(slot.get("valid_until"))
+    !slot_pending(slot)
+        && open_until(slot.get("valid_until"))
+        && slot_status_text(slot) != "rejected"
 }
 
 fn open_until(until: Option<&serde_json::Value>) -> bool {
@@ -3526,7 +3528,7 @@ mod tests {
         let third =
             status_row_for_slot("entity:host", "deploy", &rejected, &mut grading, &mut side);
         assert_eq!(first.id, "entity:host|setting|host|pine|t0|rejected");
-        assert!(first.live);
+        assert!(!first.live);
         assert_eq!(first.status.as_deref(), Some("rejected"));
         assert_eq!(second.id, "entity:host|setting|host|pine|t0");
         assert_eq!(second.status.as_deref(), Some("decided"));
@@ -3572,6 +3574,8 @@ mod tests {
         assert!(slot_live(&blank_until));
         let null_until = serde_json::json!({"valid_until": null});
         assert!(slot_live(&null_until));
+        let rejected = serde_json::json!({"status": "rejected"});
+        assert!(!slot_live(&rejected));
         assert!(!grading_slot("rejected"));
         assert!(!grading_slot(""));
     }
