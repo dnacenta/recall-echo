@@ -876,6 +876,16 @@ pub struct ConsolidateReport {
     pub calls: u32,
     #[serde(default)]
     pub errors: u32,
+    /// Times a sibling link made the cue true. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_sibling: Option<u32>,
+    /// Times a derived-from link made the cue true. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_derived: Option<u32>,
+    /// Consolidation closes whose partner subject differs from the anchor.
+    /// Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closes_component: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -956,6 +966,9 @@ impl ConsolidateReport {
             && self.dropped.is_empty()
             && self.calls == 0
             && self.errors == 0
+            && self.link_sibling.unwrap_or(0) == 0
+            && self.link_derived.unwrap_or(0) == 0
+            && self.closes_component.unwrap_or(0) == 0
     }
 }
 
@@ -1192,6 +1205,28 @@ mod tests {
         assert!(ConsolidateReport::default().is_blank());
         let blank = serde_json::to_value(IngestionReport::default()).unwrap();
         assert!(blank.get("consolidate").is_none());
+    }
+
+    #[test]
+    fn component_counters_are_omitted_until_the_switch_applies() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("link_sibling").is_none());
+        assert!(encoded.get("link_derived").is_none());
+        assert!(encoded.get("closes_component").is_none());
+        let mut report = ConsolidateReport {
+            link_sibling: Some(0),
+            link_derived: Some(1),
+            closes_component: Some(2),
+            ..ConsolidateReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["link_sibling"], 0);
+        assert_eq!(encoded["link_derived"], 1);
+        assert_eq!(encoded["closes_component"], 2);
+        assert!(!report.is_blank());
+        report.link_derived = Some(0);
+        report.closes_component = Some(0);
+        assert!(report.is_blank());
     }
 
     #[test]

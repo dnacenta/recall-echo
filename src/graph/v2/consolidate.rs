@@ -89,6 +89,8 @@ struct Anchor {
     quote: String,
     live: Option<usize>,
     a2: bool,
+    /// Row id of the unique writer close that produced this anchor.
+    closed_row: Option<String>,
 }
 
 #[derive(Clone)]
@@ -139,6 +141,9 @@ pub(crate) async fn run(
     };
     // Dependents of this session's writer closes, outside the neighbourhood cap.
     let dependents = derived_dependents(gm, ctx, stats, report).await;
+    if ctx.components_on {
+        arm_component_counts(&mut report.consolidate);
+    }
     if rough.is_empty() && ambiguous.is_empty() && dependents.is_empty() {
         return;
     }
@@ -285,9 +290,15 @@ pub(crate) async fn run(
         let anchor = &anchors[pair.anchor];
         let partner = &loaded.rows[pair.partner];
         let turn = cited(ctx, anchor);
-        let cue = departs(turn, &partner.value, &anchor.replaces)
-            || (shares_pair(anchor, partner, &loaded.part_of, &loaded.owners)
-                && replacement_quote(&quote, &partner.value, &anchor.new_value, &anchor.key));
+        let cue = accept_cue(
+            ctx,
+            anchor,
+            partner,
+            &loaded,
+            &dependents,
+            (turn, quote.as_str()),
+            report,
+        );
         match accept(
             &verdict,
             &quote,
@@ -407,65 +418,7 @@ fn rough_anchors(facts: &[super::schema::Fact], stats: &WriteStats) -> Vec<Ancho
         ) {
             continue;
         }
-        let fact = facts.iter().find(|fact| {
-            normalise(&fact.subject_name) == normalise(&retirement.subject)
-                && ((!retirement.new_value.is_empty()
-                    && values_equal(&fact.object_name, &retirement.new_value))
-                    || (retirement.reason == "rejected"
-                        && values_equal(&fact.object_name, &retirement.old_value)))
-        });
-        let edge = Predicate::parse(&retirement.predicate).is_some_and(Predicate::is_edge);
-        let rejected = retirement.reason == "rejected";
-        let (turn, quote, replaces, new_value) = fact.map_or(
-            (
-                0,
-                String::new(),
-                String::new(),
-                retirement.new_value.clone(),
-            ),
-            |fact| {
-                (
-                    fact.turn,
-                    fact.quote.clone(),
-                    fact.replaces.clone(),
-                    if rejected {
-                        String::new()
-                    } else {
-                        fact.object_name.clone()
-                    },
-                )
-            },
-        );
-        let reason = if rejected {
-            "rejected"
-        } else if edge {
-            "closed-edge"
-        } else {
-            "replaces"
-        };
-        anchors.push(Anchor {
-            id: format!(
-                "a1:{index}:{}:{}:{}",
-                retirement.subject, retirement.predicate, retirement.key
-            ),
-            subject: retirement.subject.clone(),
-            pred: retirement.predicate.clone(),
-            key: retirement.key.clone(),
-            value: retirement.old_value.clone(),
-            text: format!("{} {replaces}", retirement.old_value),
-            new_value,
-            replaces: replaces.clone(),
-            entity: if edge {
-                retirement.old_value.clone()
-            } else {
-                replaces
-            },
-            reason,
-            turn,
-            quote,
-            live: None,
-            a2: false,
-        });
+        anchors.push(a1_anchor(index, retirement, facts, stats));
     }
     for &index in &stats.replaces_unconsumed {
         let Some(fact) = facts.get(index) else {
@@ -492,6 +445,161 @@ fn rough_anchors(facts: &[super::schema::Fact], stats: &WriteStats) -> Vec<Ancho
     anchors
 }
 
+fn a1_anchor(
+    index: usize,
+    retirement: &Retirement,
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+) -> Anchor {
+    let fact = retirement_fact(retirement, facts);
+    let edge = Predicate::parse(&retirement.predicate).is_some_and(Predicate::is_edge);
+    let rejected = retirement.reason == "rejected";
+    let (turn, quote, replaces, new_value) = fact.map_or(
+        (
+            0,
+            String::new(),
+            String::new(),
+            retirement.new_value.clone(),
+        ),
+        |fact| {
+            (
+                fact.turn,
+                fact.quote.clone(),
+                fact.replaces.clone(),
+                if rejected {
+                    String::new()
+                } else {
+                    fact.object_name.clone()
+                },
+            )
+        },
+    );
+    let reason = if rejected {
+        "rejected"
+    } else if edge {
+        "closed-edge"
+    } else {
+        "replaces"
+    };
+    Anchor {
+        id: format!(
+            "a1:{index}:{}:{}:{}",
+            retirement.subject, retirement.predicate, retirement.key
+        ),
+        subject: retirement.subject.clone(),
+        pred: retirement.predicate.clone(),
+        key: retirement.key.clone(),
+        value: retirement.old_value.clone(),
+        text: format!("{} {replaces}", retirement.old_value),
+        new_value,
+        replaces: replaces.clone(),
+        entity: if edge {
+            retirement.old_value.clone()
+        } else {
+            replaces
+        },
+        reason,
+        turn,
+        quote,
+        live: None,
+        a2: false,
+        closed_row: unique_closed_row(retirement, facts, stats),
+    }
+}
+
+fn retirement_fact<'a>(
+    retirement: &Retirement,
+    facts: &'a [super::schema::Fact],
+) -> Option<&'a super::schema::Fact> {
+    facts
+        .iter()
+        .find(|fact| fact_matches_retirement(fact, retirement))
+}
+
+fn fact_matches_retirement(fact: &super::schema::Fact, retirement: &Retirement) -> bool {
+    normalise(&fact.subject_name) == normalise(&retirement.subject)
+        && value_matches_retirement(fact, retirement)
+}
+
+fn value_matches_retirement(fact: &super::schema::Fact, retirement: &Retirement) -> bool {
+    if !retirement.new_value.is_empty() && values_equal(&fact.object_name, &retirement.new_value) {
+        return true;
+    }
+    retirement.reason == "rejected" && values_equal(&fact.object_name, &retirement.old_value)
+}
+
+fn unique_closed_row(
+    retirement: &Retirement,
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+) -> Option<String> {
+    if !writer_a1(&retirement.reason) {
+        return None;
+    }
+    let fact_index = sole_fact_index(retirement, facts)?;
+    if !sole_identity(retirement, fact_index, facts, stats) {
+        return None;
+    }
+    let events = a1_events(fact_index, &stats.close_events);
+    let [event] = events.as_slice() else {
+        return None;
+    };
+    if event.reason != retirement.reason {
+        return None;
+    }
+    Some(event.row_id.clone())
+}
+
+fn sole_fact_index(retirement: &Retirement, facts: &[super::schema::Fact]) -> Option<usize> {
+    let mut found = None;
+    for (index, fact) in facts.iter().enumerate() {
+        if !fact_matches_retirement(fact, retirement) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(index);
+    }
+    found
+}
+
+fn a1_events(
+    fact_index: usize,
+    events: &[super::write::CloseEvent],
+) -> Vec<&super::write::CloseEvent> {
+    events
+        .iter()
+        .filter(|event| event.fact_index == fact_index && writer_a1(&event.reason))
+        .collect()
+}
+
+fn sole_identity(
+    retirement: &Retirement,
+    fact_index: usize,
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+) -> bool {
+    stats
+        .retirements
+        .iter()
+        .filter(|other| {
+            writer_a1(&other.reason)
+                && same_retirement(other, retirement)
+                && sole_fact_index(other, facts) == Some(fact_index)
+        })
+        .count()
+        == 1
+}
+
+fn same_retirement(left: &Retirement, right: &Retirement) -> bool {
+    left.reason == right.reason
+        && left.predicate == right.predicate
+        && left.key == right.key
+        && normalise(&left.subject) == normalise(&right.subject)
+        && values_equal(&left.old_value, &right.old_value)
+}
+
 fn anchor_from_fact(fact: &super::schema::Fact, index: usize, a2: bool) -> Anchor {
     Anchor {
         id: format!("{}:{index}", if a2 { "a2" } else { "a3" }),
@@ -508,6 +616,7 @@ fn anchor_from_fact(fact: &super::schema::Fact, index: usize, a2: bool) -> Ancho
         quote: fact.quote.clone(),
         live: None,
         a2,
+        closed_row: None,
     }
 }
 
@@ -1068,6 +1177,191 @@ fn component_link(
     })
 }
 
+fn accept_cue(
+    ctx: &WriteCtx<'_>,
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    dependents: &[DependentHit],
+    text: (&str, &str),
+    report: &mut IngestionReport,
+) -> bool {
+    let (turn, quote) = text;
+    let depart = departs(turn, &partner.value, &anchor.replaces);
+    let quoted = replacement_quote(quote, &partner.value, &anchor.new_value, &anchor.key);
+    if !ctx.components_on {
+        let paired = shares_pair(anchor, partner, &loaded.part_of, &loaded.owners);
+        return depart || (paired && quoted);
+    }
+    let kind = widened_cue(ctx, anchor, partner, loaded, dependents, depart, quoted);
+    if link_made_cue(kind.accept, depart, kind.paired, quoted) {
+        note_link(report, &kind.links);
+    }
+    kind.accept
+}
+
+struct Widened {
+    accept: bool,
+    paired: bool,
+    links: PairLinks,
+}
+
+fn widened_cue(
+    ctx: &WriteCtx<'_>,
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    dependents: &[DependentHit],
+    depart: bool,
+    quoted: bool,
+) -> Widened {
+    let links = pair_links(anchor, partner, loaded, dependents, ctx);
+    let names = tokens(&partner.subject);
+    let key =
+        keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names);
+    let paired = key && (links.same || links.direct || links.sibling || links.derived);
+    Widened {
+        accept: depart || (paired && quoted),
+        paired,
+        links,
+    }
+}
+
+fn link_made_cue(accept: bool, depart: bool, paired: bool, quoted: bool) -> bool {
+    accept && !depart && paired && quoted
+}
+
+struct PairLinks {
+    same: bool,
+    direct: bool,
+    sibling: bool,
+    derived: bool,
+}
+
+fn pair_links(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    dependents: &[DependentHit],
+    ctx: &WriteCtx<'_>,
+) -> PairLinks {
+    PairLinks {
+        same: same_name(&anchor.subject, &partner.subject),
+        direct: component_link(anchor, partner, &loaded.part_of, &loaded.owners),
+        sibling: sibling_link(
+            anchor,
+            partner,
+            &loaded.part_of,
+            &loaded.owners,
+            ctx.project,
+        ),
+        derived: derived_link(anchor, partner, dependents, ctx.links_on),
+    }
+}
+
+fn note_link(report: &mut IngestionReport, kind: &PairLinks) {
+    if kind.same || kind.direct {
+        return;
+    }
+    if kind.sibling {
+        add_count(&mut report.consolidate.link_sibling);
+        return;
+    }
+    if kind.derived {
+        add_count(&mut report.consolidate.link_derived);
+    }
+}
+
+fn sibling_link(
+    anchor: &Anchor,
+    partner: &Row,
+    part_of: &[(String, String)],
+    owners: &[(String, String)],
+    project: &super::input::ProjectIdentity,
+) -> bool {
+    let Some(anchor_id) = owner_id(&anchor.subject, owners) else {
+        return false;
+    };
+    let Some(partner_id) = owner_id(&partner.subject, owners) else {
+        return false;
+    };
+    if anchor_id == partner_id {
+        return false;
+    }
+    shared_project_parent(anchor_id, partner_id, part_of, owners, project)
+}
+
+fn shared_project_parent(
+    anchor_id: &str,
+    partner_id: &str,
+    part_of: &[(String, String)],
+    owners: &[(String, String)],
+    project: &super::input::ProjectIdentity,
+) -> bool {
+    project_owner_ids(project, owners)
+        .iter()
+        .any(|parent| edge_to(anchor_id, parent, part_of) && edge_to(partner_id, parent, part_of))
+}
+
+fn edge_to(child: &str, parent: &str, part_of: &[(String, String)]) -> bool {
+    part_of
+        .iter()
+        .any(|(from, to)| from == child && to == parent)
+}
+
+fn project_owner_ids<'a>(
+    project: &super::input::ProjectIdentity,
+    owners: &'a [(String, String)],
+) -> Vec<&'a str> {
+    let mut ids = Vec::new();
+    push_owner(&mut ids, &project.name, owners);
+    for alias in &project.aliases {
+        push_owner(&mut ids, alias, owners);
+    }
+    ids
+}
+
+fn push_owner<'a>(ids: &mut Vec<&'a str>, name: &str, owners: &'a [(String, String)]) {
+    let Some(id) = owner_id(name, owners) else {
+        return;
+    };
+    if !ids.contains(&id) {
+        ids.push(id);
+    }
+}
+
+fn derived_link(
+    anchor: &Anchor,
+    partner: &Row,
+    dependents: &[DependentHit],
+    links_on: bool,
+) -> bool {
+    if !links_on {
+        return false;
+    }
+    let Some(closed) = anchor.closed_row.as_deref() else {
+        return false;
+    };
+    let canonical = ref_of(partner);
+    dependents
+        .iter()
+        .any(|hit| hit_closes(hit, &canonical, closed))
+}
+
+fn hit_closes(hit: &DependentHit, canonical: &str, closed: &str) -> bool {
+    hit.canonical == canonical && hit.derived_from.iter().any(|id| id == closed)
+}
+
+fn arm_component_counts(report: &mut crate::graph::types::ConsolidateReport) {
+    report.link_sibling.get_or_insert(0);
+    report.link_derived.get_or_insert(0);
+    report.closes_component.get_or_insert(0);
+}
+
+fn add_count(slot: &mut Option<u32>) {
+    *slot = Some(slot.unwrap_or(0).saturating_add(1));
+}
+
 fn owner_id<'a>(name: &str, owners: &'a [(String, String)]) -> Option<&'a str> {
     let name = normalise(name);
     owners
@@ -1103,6 +1397,7 @@ async fn close_partner(
     }
     if reason == "consolidated" {
         report.consolidate.closes_sup += 1;
+        note_component_close(ctx, anchors, rows, pair, report);
     } else {
         report.consolidate.closes_dup += 1;
     }
@@ -1116,6 +1411,39 @@ async fn close_partner(
         new_value: anchor.new_value.clone(),
     });
     None
+}
+
+fn note_component_close(
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    rows: &[Row],
+    pair: &Pair,
+    report: &mut IngestionReport,
+) {
+    if !ctx.components_on {
+        return;
+    }
+    let anchor = &anchors[pair.anchor];
+    let partner = &rows[pair.partner];
+    if same_name(&anchor.subject, &partner.subject) {
+        return;
+    }
+    add_count(&mut report.consolidate.closes_component);
+    eprintln!(
+        "{}",
+        component_close_line(
+            &format!("{}:{}", partner.subject, partner.key),
+            &format!("{}:{}", anchor.subject, anchor.key),
+            &anchor.quote,
+        )
+    );
+}
+
+fn component_close_line(old_key: &str, new_key: &str, quote: &str) -> String {
+    format!(
+        "consolidate close: component | {old_key} | {new_key} | {}",
+        quote_head(quote)
+    )
 }
 
 async fn close_duplicate(
@@ -1700,6 +2028,7 @@ fn derived_anchor(
         quote,
         live: Some(index),
         a2: false,
+        closed_row: None,
     })
 }
 
@@ -2313,6 +2642,7 @@ fn attach_holds(
             quote: String::new(),
             live: Some(new_index),
             a2: false,
+            closed_row: None,
         });
         waiting.push(Pair {
             anchor,
@@ -6816,6 +7146,725 @@ mod tests {
             .find(|slot| slot["value"] == value)
             .unwrap_or_else(|| panic!("missing {value} in {rows:?}"))
     }
+    struct PassFlags {
+        links_on: bool,
+        components_on: bool,
+        hold_on: bool,
+    }
+
+    async fn commit_mode(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        links_on: bool,
+    ) -> WriteStats {
+        let project = project();
+        let mut ctx = WriteCtx::new(&Quiet, &project, session, date, turns);
+        ctx.links_on = links_on;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pass_switches(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        stats: &WriteStats,
+        llm: &Stub,
+        flags: PassFlags,
+    ) -> IngestionReport {
+        let project = project();
+        let mut ctx = WriteCtx::new(llm, &project, session, date, turns);
+        ctx.links_on = flags.links_on;
+        ctx.components_on = flags.components_on;
+        ctx.hold_on = flags.hold_on;
+        let mut report = IngestionReport {
+            links: stats.links,
+            ..IngestionReport::default()
+        };
+        run(gm, &ctx, facts, stats, llm, &mut report).await;
+        report
+    }
+
+    fn flags(links_on: bool, components_on: bool) -> PassFlags {
+        PassFlags {
+            links_on,
+            components_on,
+            hold_on: false,
+        }
+    }
+
+    struct Judged {
+        report: IngestionReport,
+        message: String,
+        calls: u32,
+        ended: Option<String>,
+    }
+
+    async fn sibling_port(components_on: bool) -> (Judged, Option<String>) {
+        let (_tmp, gm) = open().await;
+        let widget = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let serve = edge(
+            Predicate::PartOf,
+            "acme widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old = setting("widget", Kind::Component, "port", "8080", "port is 8080");
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("widget is part of acme. port is 8080")],
+            &[widget, serve, old],
+        )
+        .await;
+        let quote = "Default port is now 8765.";
+        let next = setting("acme widget", Kind::Component, "port", "8765", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            flags(false, components_on),
+        )
+        .await;
+        let ended =
+            ended(live_any(&slots(&gm, "widget").await, "port", "8080")).map(str::to_string);
+        (
+            Judged {
+                report,
+                message: stub.message(),
+                calls: stub.calls(),
+                ended: None,
+            },
+            ended,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_sibling_under_the_project_closes_when_components_are_on() {
+        let off = sibling_port(false).await;
+        let on = sibling_port(true).await;
+        assert_eq!(off.0.calls, 1);
+        assert_eq!(on.0.calls, off.0.calls);
+        assert_eq!(on.0.message, off.0.message);
+        assert_eq!(dropped(&off.0.report, "no departure cue"), 1);
+        assert_eq!(off.0.report.consolidate.closes_sup, 0);
+        assert!(off.1.is_none());
+        assert!(off.0.report.consolidate.link_sibling.is_none());
+        assert!(off.0.report.consolidate.link_derived.is_none());
+        assert!(off.0.report.consolidate.closes_component.is_none());
+        let omitted = serde_json::to_value(&off.0.report.consolidate).unwrap();
+        assert!(omitted.get("link_sibling").is_none());
+        assert_eq!(on.1.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.0.report.consolidate.closes_sup, 1);
+        assert_eq!(on.0.report.consolidate.link_sibling, Some(1));
+        assert_eq!(on.0.report.consolidate.link_derived, Some(0));
+        assert_eq!(on.0.report.consolidate.closes_component, Some(1));
+    }
+
+    async fn derived_storage(links_on: bool, components_on: bool, ambiguous: bool) -> Judged {
+        let (_tmp, gm) = open().await;
+        let project_row = setting(
+            "acme",
+            Kind::Project,
+            "storage_path",
+            "walnut marker",
+            "storage_path is walnut marker",
+        );
+        let copy = setting(
+            "store",
+            Kind::Component,
+            "storage_path",
+            "walnut marker",
+            "store storage_path is walnut marker",
+        );
+        commit_mode(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("storage_path is walnut marker")],
+            &[project_row, copy],
+            true,
+        )
+        .await;
+        let quote = "Storage is now sqlite index for the rows.";
+        let next = setting("acme", Kind::Project, "storage_path", "sqlite index", quote);
+        let label = setting(
+            "store",
+            Kind::Component,
+            "label",
+            "blue ribbon",
+            "The store label is blue ribbon.",
+        );
+        let turns = [turn(
+            "Storage is now sqlite index for the rows. The store label is blue ribbon.",
+        )];
+        let mut stats = commit_mode(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next.clone(), label.clone()],
+            true,
+        )
+        .await;
+        assert_eq!(stats.close_events.len(), 1, "{:?}", stats.close_events);
+        let closed = stats.close_events[0].row_id.clone();
+        let stored = slots(&gm, "store").await;
+        let derived = stored
+            .iter()
+            .find(|slot| slot["value"] == "walnut marker")
+            .expect("stored copy");
+        let ids = derived["derived_from"].as_array().expect("derived_from");
+        assert!(
+            ids.iter().any(|id| id.as_str() == Some(closed.as_str())),
+            "{derived}"
+        );
+        if ambiguous {
+            stats.close_events.push(super::super::write::CloseEvent {
+                row_id: format!("{closed}-other"),
+                reason: stats.close_events[0].reason.clone(),
+                fact_index: stats.close_events[0].fact_index,
+            });
+        }
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next, label],
+            &stats,
+            &stub,
+            flags(links_on, components_on),
+        )
+        .await;
+        let ended = ended(live_any(
+            &slots(&gm, "store").await,
+            "storage_path",
+            "walnut marker",
+        ))
+        .map(str::to_string);
+        Judged {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_derived_from_partner_closes_only_when_links_and_components_are_on() {
+        let off = derived_storage(true, false, false).await;
+        let on = derived_storage(true, true, false).await;
+        let unlinked = derived_storage(false, true, false).await;
+        assert_eq!(off.calls, 1);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(unlinked.calls, 1);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert!(off.report.consolidate.link_derived.is_none());
+        assert_eq!(dropped(&unlinked.report, "no departure cue"), 1);
+        assert_eq!(unlinked.report.consolidate.closes_sup, 0);
+        assert_eq!(unlinked.report.consolidate.link_derived, Some(0));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(off.ended, None);
+        assert_eq!(unlinked.ended, None);
+        assert_eq!(on.report.consolidate.link_derived, Some(1));
+        assert_eq!(on.report.consolidate.link_sibling, Some(0));
+        assert_eq!(on.report.consolidate.closes_component, Some(1));
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_close_event_makes_no_derived_link() {
+        let judged = derived_storage(true, true, true).await;
+        assert_eq!(judged.calls, 1);
+        assert_eq!(dropped(&judged.report, "no departure cue"), 1);
+        assert_eq!(judged.report.consolidate.closes_sup, 0);
+        assert_eq!(judged.report.consolidate.link_derived, Some(0));
+    }
+
+    async fn loose_parent(kind: &str) -> Judged {
+        let (_tmp, gm) = open().await;
+        let parent = if kind == "panel" { "panel" } else { "acme" };
+        let parent_kind = if kind == "panel" {
+            Kind::Component
+        } else {
+            Kind::Project
+        };
+        let widget = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            parent,
+            parent_kind,
+        );
+        let serve = edge(
+            Predicate::PartOf,
+            "acme widget",
+            Kind::Component,
+            parent,
+            parent_kind,
+        );
+        let old = setting("widget", Kind::Component, "port", "8080", "port is 8080");
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("widget links its parent. port is 8080")],
+            &[widget, serve, old],
+        )
+        .await;
+        match kind {
+            "considered" => set_part_of(&gm, "considered", None).await,
+            "rejected" => set_part_of(&gm, "rejected", None).await,
+            "closed" => set_part_of(&gm, "decided", Some("2026-03-01T00:00:00Z")).await,
+            _ => {}
+        }
+        let quote = "Default port is now 8765.";
+        let next = setting("acme widget", Kind::Component, "port", "8765", quote);
+        let label = setting(
+            "widget",
+            Kind::Component,
+            "label",
+            "blue ribbon",
+            "The widget label is blue ribbon.",
+        );
+        let turns = [turn(
+            "Default port is now 8765. The widget label is blue ribbon.",
+        )];
+        let stats = commit(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next.clone(), label.clone()],
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next, label],
+            &stats,
+            &stub,
+            flags(false, true),
+        )
+        .await;
+        let ended =
+            ended(live_any(&slots(&gm, "widget").await, "port", "8080")).map(str::to_string);
+        Judged {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    async fn set_part_of(gm: &GraphMemory, status: &str, until: Option<&str>) {
+        if let Some(until) = until {
+            gm.db()
+                .query(
+                    "UPDATE relates_to SET status = $status, valid_until = type::datetime($until) WHERE rel_type = 'part_of'",
+                )
+                .bind(("status", status.to_string()))
+                .bind(("until", until.to_string()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            return;
+        }
+        gm.db()
+            .query("UPDATE relates_to SET status = $status WHERE rel_type = 'part_of'")
+            .bind(("status", status.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_non_project_or_inactive_parent_is_not_a_sibling() {
+        for kind in ["panel", "considered", "rejected", "closed"] {
+            let judged = loose_parent(kind).await;
+            assert_eq!(judged.calls, 1, "{kind} {}", judged.message);
+            assert_eq!(dropped(&judged.report, "no departure cue"), 1, "{kind}");
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{kind}");
+            assert_eq!(judged.ended, None, "{kind}");
+            assert_eq!(judged.report.consolidate.link_sibling, Some(0), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_sibling_supersedes_on_one_anchor_close_none() {
+        let (_tmp, gm) = open().await;
+        let mut facts = Vec::new();
+        for (name, value) in [("widget", "8080"), ("panel", "9090")] {
+            facts.push(edge(
+                Predicate::PartOf,
+                name,
+                Kind::Component,
+                "acme",
+                Kind::Project,
+            ));
+            facts.push(setting(
+                name,
+                Kind::Component,
+                "port",
+                value,
+                &format!("port is {value}"),
+            ));
+        }
+        facts.push(edge(
+            Predicate::PartOf,
+            "acme widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        ));
+        commit(&gm, "s1", "2026-03-01", &[turn("ports stay")], &facts).await;
+        let turn_text = "Default port is now 8765. The port is now 8765.";
+        let next = setting("acme widget", Kind::Component, "port", "8765", turn_text);
+        let turns = [turn(turn_text)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let body = judged(&[
+            (1, "supersedes", "Default port is now 8765."),
+            (2, "supersedes", "The port is now 8765."),
+        ]);
+        let stub = Stub::new(Answer::Reply(body));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            flags(false, true),
+        )
+        .await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(dropped(&report, "second supersede on the same anchor"), 2);
+        assert!(
+            report
+                .consolidate
+                .skips
+                .get("consolidate_ambiguous")
+                .copied()
+                .unwrap_or(0)
+                >= 2
+        );
+        assert!(ended(live_any(&slots(&gm, "widget").await, "port", "8080")).is_none());
+        assert!(ended(live_any(&slots(&gm, "panel").await, "port", "9090")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pending_sibling_is_skipped_and_arms_no_hold() {
+        let (_tmp, gm) = open().await;
+        let widget = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let serve = edge(
+            Predicate::PartOf,
+            "acme widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old = setting("widget", Kind::Component, "port", "8080", "port is 8080");
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("widget is part of acme")],
+            &[widget, serve, old],
+        )
+        .await;
+        mark_pending(&gm, "widget", "port", "8080").await;
+        let quote = "Default port is now 8765.";
+        let next = setting("acme widget", Kind::Component, "port", "8765", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Panic);
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            PassFlags {
+                links_on: false,
+                components_on: true,
+                hold_on: true,
+            },
+        )
+        .await;
+        assert_eq!(stub.calls(), 0);
+        assert!(report.hold.is_blank(), "{:?}", report.hold);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.link_sibling, Some(0));
+        assert!(ended(live_any(&slots(&gm, "widget").await, "port", "8080")).is_none());
+    }
+
+    async fn mark_pending(gm: &GraphMemory, name: &str, key: &str, value: &str) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let slot = slots
+            .iter_mut()
+            .find(|slot| slot["key"] == key && slot["value"] == value)
+            .unwrap();
+        slot["pending"] = json!({"since": "s2", "conflicts": "entity:none#0"});
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_partner_outside_the_neighbourhood_is_not_paired_with_components_on() {
+        let (_tmp, gm) = open().await;
+        let link = edge(
+            Predicate::PartOf,
+            "picker",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let inside = setting(
+            "picker",
+            Kind::Component,
+            "swatch",
+            "marigold token",
+            "swatch is marigold token",
+        );
+        let outside = setting(
+            "bravo",
+            Kind::Project,
+            "swatch",
+            "marigold token",
+            "swatch is marigold token",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("picker is part of acme")],
+            &[link, inside, outside],
+        )
+        .await;
+        let quote = "Use marigold signal instead of marigold token.";
+        let next = setting("acme", Kind::Project, "hue", "marigold signal", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", "instead of marigold token"),
+            (2, "supersedes", "instead of marigold token"),
+        ])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            flags(false, true),
+        )
+        .await;
+        let message = stub.message();
+        assert!(message.contains("picker:"), "{message}");
+        assert!(!message.contains("bravo"), "{message}");
+        assert_eq!(report.consolidate.closes_sup, 1);
+        assert!(ended(live_any(
+            &slots(&gm, "picker").await,
+            "swatch",
+            "marigold token"
+        ))
+        .is_some());
+        assert!(ended(live_any(
+            &slots(&gm, "bravo").await,
+            "swatch",
+            "marigold token"
+        ))
+        .is_none());
+    }
+
+    fn anchor_named(subject: &str, key: &str, new_value: &str) -> Anchor {
+        Anchor {
+            id: "a3:0".into(),
+            subject: subject.into(),
+            pred: "setting".into(),
+            key: key.into(),
+            value: String::new(),
+            text: String::new(),
+            new_value: new_value.into(),
+            replaces: String::new(),
+            entity: String::new(),
+            reason: "new",
+            turn: 0,
+            quote: String::new(),
+            live: None,
+            a2: false,
+            closed_row: None,
+        }
+    }
+
+    fn row_named(subject: &str, entity: &str, key: &str, value: &str) -> Row {
+        Row {
+            id: format!("s:{entity}:0"),
+            entity: entity.into(),
+            slot: Some(0),
+            edge: None,
+            subject: subject.into(),
+            pred: "setting".into(),
+            key: key.into(),
+            value: value.into(),
+            evidence: Value::Null,
+            from: String::new(),
+            here: false,
+            pending: false,
+        }
+    }
+
+    #[test]
+    fn sibling_link_needs_two_children_of_the_session_project() {
+        let owners = [
+            ("p", "acme"),
+            ("w", "widget"),
+            ("s", "acme widget"),
+            ("n", "panel"),
+            ("a", "acme labs"),
+        ]
+        .into_iter()
+        .map(|(id, name)| (id.to_string(), name.to_string()))
+        .collect::<Vec<_>>();
+        let anchor = anchor_named("acme widget", "port", "8765");
+        let partner = row_named("widget", "w", "port", "8080");
+        let session = project();
+        let live = vec![("w".into(), "p".into()), ("s".into(), "p".into())];
+        assert!(sibling_link(&anchor, &partner, &live, &owners, &session));
+        let panel = vec![("w".into(), "n".into()), ("s".into(), "n".into())];
+        assert!(!sibling_link(&anchor, &partner, &panel, &owners, &session));
+        let one = vec![("w".into(), "p".into())];
+        assert!(!sibling_link(&anchor, &partner, &one, &owners, &session));
+        let same = row_named("acme widget", "s", "port", "8080");
+        assert!(!sibling_link(&anchor, &same, &live, &owners, &session));
+        let mut aliased = project();
+        aliased.aliases = vec!["acme labs".into()];
+        let via_alias = vec![("w".into(), "a".into()), ("s".into(), "a".into())];
+        assert!(sibling_link(
+            &anchor, &partner, &via_alias, &owners, &aliased
+        ));
+    }
+
+    #[test]
+    fn derived_link_needs_links_and_the_closed_row() {
+        let mut anchor = anchor_named("acme", "storage_path", "sqlite index");
+        anchor.closed_row = Some("entity:acme#0".into());
+        let partner = row_named("store", "entity:store", "storage_path", "walnut marker");
+        let hit = DependentHit {
+            entity_id: "entity:store".into(),
+            canonical: "entity:store#0".into(),
+            derived_from: vec!["entity:acme#0".into(), "relates_to:other".into()],
+        };
+        let hits = std::slice::from_ref(&hit);
+        assert!(derived_link(&anchor, &partner, hits, true));
+        assert!(!derived_link(&anchor, &partner, hits, false));
+        anchor.closed_row = None;
+        assert!(!derived_link(&anchor, &partner, hits, true));
+    }
+
+    #[test]
+    fn component_close_line_tags_the_pair() {
+        assert_eq!(
+            component_close_line(
+                "widget:port",
+                "acme widget:port",
+                "Default port is now 8765."
+            ),
+            "consolidate close: component | widget:port | acme widget:port | Default port is now 8765."
+        );
+    }
+
+    #[test]
+    fn two_close_events_for_one_fact_are_not_a_link() {
+        use super::super::write::CloseEvent;
+
+        let fact = setting(
+            "acme",
+            Kind::Project,
+            "storage_path",
+            "sqlite index",
+            "Storage is now sqlite index for the rows.",
+        );
+        let retirement = crate::graph::types::Retirement {
+            reason: "superseded".into(),
+            subject: "acme".into(),
+            predicate: "setting".into(),
+            key: "storage_path".into(),
+            old_value: "walnut marker".into(),
+            new_value: "sqlite index".into(),
+        };
+        let stats = WriteStats {
+            retirements: vec![retirement.clone()],
+            close_events: vec![CloseEvent {
+                row_id: "entity:acme#0".into(),
+                reason: "superseded".into(),
+                fact_index: 0,
+            }],
+            ..WriteStats::default()
+        };
+        assert_eq!(
+            unique_closed_row(&retirement, std::slice::from_ref(&fact), &stats).as_deref(),
+            Some("entity:acme#0")
+        );
+        let mut ambiguous = stats.clone();
+        ambiguous.close_events.push(CloseEvent {
+            row_id: "entity:acme#1".into(),
+            reason: "superseded".into(),
+            fact_index: 0,
+        });
+        assert!(unique_closed_row(&retirement, &[fact], &ambiguous).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -6982,6 +8031,7 @@ mod usable_anchor_tests {
             quote: "quoted".into(),
             live: Some(0),
             a2: false,
+            closed_row: None,
         }];
         let (kept, overflow) = capped_usable(&hits[1..2], &rows[..1], &bound, &stats);
         assert!(kept.is_empty());

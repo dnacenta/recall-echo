@@ -154,7 +154,6 @@ pub(crate) struct WriteCtx<'a> {
     pub links_on: bool,
     /// Widen the post-judge cue to a sibling or a derived-from partner.
     /// Off leaves that cue unchanged.
-    #[allow(dead_code)]
     pub components_on: bool,
 }
 
