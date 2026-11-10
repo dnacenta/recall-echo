@@ -3745,7 +3745,56 @@ mod tests {
         assert_eq!(plain.operations, with_status.operations);
         assert_eq!(plain.junk_edges, with_status.junk_edges);
         assert_eq!(plain.patterns, with_status.patterns);
+        assert!(plain.patterns.is_some());
         assert!(plain.junk_edges.iter().all(|edge| edge.object != "birch"));
+        assert_final_edge_json(&with_status);
+    }
+
+    #[cfg(feature = "embedded")]
+    fn assert_final_edge_json(report: &grade::WriteReport) {
+        let json = serde_json::to_value(report).unwrap();
+        expect_final(&json, "pine", Some("decided"), false, true);
+        expect_final(&json, "oak", Some("considered"), false, true);
+        expect_final(&json, "birch", Some("rejected"), false, false);
+        expect_final(&json, "fast", Some("decided"), true, false);
+        expect_final(&json, "linen", Some("decided"), false, true);
+        expect_final(&json, "rust", None, false, true);
+        expect_final(&json, "clay", Some("rejected"), false, true);
+        expect_final(&json, "wool", Some("considered"), true, false);
+        let stripped = {
+            let mut value = json.clone();
+            value.as_object_mut().unwrap().remove("final_edges");
+            value
+        };
+        let mut disabled = report.clone();
+        disabled.final_edges.clear();
+        assert_eq!(stripped, serde_json::to_value(&disabled).unwrap());
+    }
+
+    #[cfg(feature = "embedded")]
+    fn expect_final(
+        json: &serde_json::Value,
+        object: &str,
+        status: Option<&str>,
+        pending: bool,
+        live: bool,
+    ) {
+        let row = json["final_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["object"] == object)
+            .unwrap_or_else(|| panic!("missing {object}"));
+        assert_eq!(row["live"], live);
+        match status {
+            Some(value) => assert_eq!(row["status"], value),
+            None => assert!(row.get("status").is_none()),
+        }
+        if pending {
+            assert_eq!(row["pending"], true);
+        } else {
+            assert!(row.get("pending").is_none());
+        }
     }
 
     #[cfg(feature = "embedded")]
@@ -3812,7 +3861,11 @@ mod tests {
                 object_abstract: None,
                 end_state: super::super::script::EndState::Live,
                 superseded_in: None,
-                pattern: None,
+                pattern: Some(super::super::script::FactPattern {
+                    core_all: vec!["pine".into()],
+                    detail_all: vec![],
+                    wrong_any: vec![],
+                }),
             }],
             expect: vec![],
             questions: vec![],
