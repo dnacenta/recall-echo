@@ -126,7 +126,7 @@ pub(crate) async fn run(
     llm: &dyn LlmProvider,
     report: &mut IngestionReport,
 ) {
-    let rough = rough_anchors(facts, stats);
+    let rough = rough_anchors(facts, stats, ctx.components_on && ctx.links_on);
     let ambiguous = if ctx.hold_on {
         match super::hold::settle(gm, ctx, facts, report).await {
             Ok(open) => open,
@@ -409,19 +409,33 @@ pub(crate) async fn run(
     }
 }
 
-fn rough_anchors(facts: &[super::schema::Fact], stats: &WriteStats) -> Vec<Anchor> {
+fn rough_anchors(
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+    link_rows: bool,
+) -> Vec<Anchor> {
     let mut anchors = Vec::new();
-    push_retired(&mut anchors, facts, stats);
+    push_retired(&mut anchors, facts, stats, link_rows);
     push_unconsumed(&mut anchors, facts, stats);
     push_new_anchors(&mut anchors, facts, stats);
     anchors
 }
 
-fn push_retired(anchors: &mut Vec<Anchor>, facts: &[super::schema::Fact], stats: &WriteStats) {
+fn push_retired(
+    anchors: &mut Vec<Anchor>,
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+    link_rows: bool,
+) {
     for (index, retirement) in stats.retirements.iter().enumerate() {
-        if writer_a1(&retirement.reason) {
-            anchors.push(a1_anchor(index, retirement, facts, stats));
+        if !writer_a1(&retirement.reason) {
+            continue;
         }
+        let mut anchor = a1_anchor(index, retirement, facts);
+        if link_rows {
+            anchor.closed_row = unique_closed_row(retirement, facts, stats);
+        }
+        anchors.push(anchor);
     }
 }
 
@@ -458,12 +472,7 @@ fn open_setting_or_rule(fact: &super::schema::Fact, index: usize, stats: &WriteS
         && !closed_by(fact, stats)
 }
 
-fn a1_anchor(
-    index: usize,
-    retirement: &Retirement,
-    facts: &[super::schema::Fact],
-    stats: &WriteStats,
-) -> Anchor {
+fn a1_anchor(index: usize, retirement: &Retirement, facts: &[super::schema::Fact]) -> Anchor {
     let fact = retirement_fact(retirement, facts);
     let edge = Predicate::parse(&retirement.predicate).is_some_and(Predicate::is_edge);
     let rejected = retirement.reason == "rejected";
@@ -516,7 +525,7 @@ fn a1_anchor(
         quote,
         live: None,
         a2: false,
-        closed_row: unique_closed_row(retirement, facts, stats),
+        closed_row: None,
     }
 }
 
