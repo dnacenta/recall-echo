@@ -359,7 +359,6 @@ pub async fn run_repeat(
 }
 
 /// Opt in by writing the graph switches into the fresh memory dir.
-#[allow(clippy::too_many_arguments)]
 fn apply_graph_switches(
     memory_dir: &Path,
     known: KnownFactsContext,

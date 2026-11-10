@@ -214,21 +214,7 @@ pub(crate) async fn resolve_with_hold(
     };
     let project_norm = normalise(&project.name);
     let mut bound: HashMap<(String, Kind), String> = HashMap::new();
-    let mut seen = HashSet::new();
-    let mut pending = Vec::new();
-    for mention in mentions {
-        if !mention.creates {
-            continue;
-        }
-        let open = open_mention(mention);
-        if open.norm.is_empty() || !seen.insert((open.norm.clone(), open.kind)) {
-            continue;
-        }
-        if take_tier(gm, &mut index, &mut bound, &mut report, &open).await? {
-            continue;
-        }
-        pending.push(open);
-    }
+    let mut pending = bind_mentions(gm, &mut index, &mut bound, &mut report, mentions).await?;
     let usage = ask_resolver(gm, llm, &mut index, &mut bound, &mut report, &mut pending).await?;
     pending.sort_by(|left, right| {
         right
@@ -276,6 +262,47 @@ async fn create_unbound(
         }
     }
     Ok(created)
+}
+
+async fn bind_mentions(
+    gm: &GraphMemory,
+    index: &mut Index,
+    bound: &mut HashMap<(String, Kind), String>,
+    report: &mut ResolveReport,
+    mentions: &[MentionDraft],
+) -> Result<Vec<OpenMention>, GraphError> {
+    let mut seen = HashSet::new();
+    let mut pending = Vec::new();
+    for mention in mentions {
+        push_pending(gm, index, bound, report, &mut seen, &mut pending, mention).await?;
+    }
+    Ok(pending)
+}
+
+async fn push_pending(
+    gm: &GraphMemory,
+    index: &mut Index,
+    bound: &mut HashMap<(String, Kind), String>,
+    report: &mut ResolveReport,
+    seen: &mut HashSet<(String, Kind)>,
+    pending: &mut Vec<OpenMention>,
+    mention: &MentionDraft,
+) -> Result<(), GraphError> {
+    if !mention.creates {
+        return Ok(());
+    }
+    let open = open_mention(mention);
+    if open.norm.is_empty() || seen_already(seen, &open) {
+        return Ok(());
+    }
+    if !take_tier(gm, index, bound, report, &open).await? {
+        pending.push(open);
+    }
+    Ok(())
+}
+
+fn seen_already(seen: &mut HashSet<(String, Kind)>, open: &OpenMention) -> bool {
+    open.norm.is_empty() || !seen.insert((open.norm.clone(), open.kind))
 }
 
 fn open_mention(mention: &MentionDraft) -> OpenMention {
