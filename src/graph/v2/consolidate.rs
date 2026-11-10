@@ -411,38 +411,51 @@ pub(crate) async fn run(
 
 fn rough_anchors(facts: &[super::schema::Fact], stats: &WriteStats) -> Vec<Anchor> {
     let mut anchors = Vec::new();
+    push_retired(&mut anchors, facts, stats);
+    push_unconsumed(&mut anchors, facts, stats);
+    push_new_anchors(&mut anchors, facts, stats);
+    anchors
+}
+
+fn push_retired(anchors: &mut Vec<Anchor>, facts: &[super::schema::Fact], stats: &WriteStats) {
     for (index, retirement) in stats.retirements.iter().enumerate() {
-        if !matches!(
-            retirement.reason.as_str(),
-            "rejected" | "superseded" | "replaced"
-        ) {
-            continue;
+        if writer_a1(&retirement.reason) {
+            anchors.push(a1_anchor(index, retirement, facts, stats));
         }
-        anchors.push(a1_anchor(index, retirement, facts, stats));
     }
+}
+
+fn push_unconsumed(anchors: &mut Vec<Anchor>, facts: &[super::schema::Fact], stats: &WriteStats) {
     for &index in &stats.replaces_unconsumed {
         let Some(fact) = facts.get(index) else {
             continue;
         };
-        if fact.status != "decided" {
-            continue;
+        if fact.status == "decided" {
+            anchors.push(anchor_from_fact(fact, index, true));
         }
-        anchors.push(anchor_from_fact(fact, index, true));
     }
+}
+
+fn push_new_anchors(anchors: &mut Vec<Anchor>, facts: &[super::schema::Fact], stats: &WriteStats) {
     for (index, fact) in facts.iter().enumerate() {
-        if fact.status != "decided"
-            || !matches!(fact.predicate, Predicate::Setting | Predicate::Rule)
-            || stats.replaces_unconsumed.contains(&index)
-            || closed_by(fact, stats)
-        {
-            continue;
+        if new_anchor(fact, index, stats) {
+            anchors.push(anchor_from_fact(fact, index, false));
         }
-        if fact.key.trim().is_empty() && tokens(&fact.object_name).len() < 3 {
-            continue;
-        }
-        anchors.push(anchor_from_fact(fact, index, false));
     }
-    anchors
+}
+
+fn new_anchor(fact: &super::schema::Fact, index: usize, stats: &WriteStats) -> bool {
+    if !open_setting_or_rule(fact, index, stats) {
+        return false;
+    }
+    !fact.key.trim().is_empty() || tokens(&fact.object_name).len() >= 3
+}
+
+fn open_setting_or_rule(fact: &super::schema::Fact, index: usize, stats: &WriteStats) -> bool {
+    fact.status == "decided"
+        && matches!(fact.predicate, Predicate::Setting | Predicate::Rule)
+        && !stats.replaces_unconsumed.contains(&index)
+        && !closed_by(fact, stats)
 }
 
 fn a1_anchor(
@@ -1022,50 +1035,101 @@ fn plain_shape(quote: &str, key: &str, words: &[(String, usize, usize)]) -> bool
     let tokens = key_tokens(key);
     let mut any = false;
     for (index, pair) in words.windows(2).enumerate() {
-        let cue = matches!(
-            (pair[0].0.as_str(), pair[1].0.as_str()),
-            ("is" | "are", "now") | ("now", "uses")
-        );
-        let label =
-            pair[0].0 == "new" && sentence_start(quote, pair[0].1) && colon_after(quote, pair[1].2);
-        if label {
-            if !tokens.contains(&pair[1].0) {
-                return false;
-            }
-            any = true;
-            continue;
+        match shape_step(quote, words, index, pair, &tokens) {
+            ShapeStep::Keep => any = true,
+            ShapeStep::Skip => {}
+            ShapeStep::Reject => return false,
         }
-        if !cue {
-            continue;
-        }
-        let mut from = index;
-        while from > 0 && !sentence_start(quote, words[from].1) {
-            from -= 1;
-        }
-        let mut seen_key = false;
-        let mut extra = 0;
-        for (word, _, _) in &words[from..index] {
-            if tokens.contains(word) {
-                seen_key = true;
-            } else if matches!(
-                word.as_str(),
-                "the" | "a" | "an" | "our" | "its" | "default"
-            ) {
-                if seen_key && extra == 0 && word != "default" {
-                    return false;
-                }
-            } else if seen_key && extra == 0 {
-                extra += 1;
-            } else {
-                return false;
-            }
-        }
-        if !seen_key {
-            return false;
-        }
-        any = true;
     }
     any
+}
+
+enum ShapeStep {
+    Keep,
+    Skip,
+    Reject,
+}
+
+fn shape_step(
+    quote: &str,
+    words: &[(String, usize, usize)],
+    index: usize,
+    pair: &[(String, usize, usize)],
+    tokens: &[String],
+) -> ShapeStep {
+    if new_label(quote, pair) {
+        return label_step(&pair[1].0, tokens);
+    }
+    if !adjacent_cue(pair) {
+        return ShapeStep::Skip;
+    }
+    if cue_head(quote, words, index, tokens) {
+        ShapeStep::Keep
+    } else {
+        ShapeStep::Reject
+    }
+}
+
+fn label_step(word: &str, tokens: &[String]) -> ShapeStep {
+    if token_is(tokens, word) {
+        ShapeStep::Keep
+    } else {
+        ShapeStep::Reject
+    }
+}
+
+fn adjacent_cue(pair: &[(String, usize, usize)]) -> bool {
+    matches!(
+        (pair[0].0.as_str(), pair[1].0.as_str()),
+        ("is" | "are", "now") | ("now", "uses")
+    )
+}
+
+fn cue_head(
+    quote: &str,
+    words: &[(String, usize, usize)],
+    index: usize,
+    tokens: &[String],
+) -> bool {
+    let mut from = index;
+    while from > 0 && !sentence_start(quote, words[from].1) {
+        from -= 1;
+    }
+    head_allows(&words[from..index], tokens)
+}
+
+/// Articles, `default`, the key's tokens, and one extra word after a key token.
+fn head_allows(words: &[(String, usize, usize)], tokens: &[String]) -> bool {
+    let mut seen_key = false;
+    let mut extra = false;
+    for (word, _, _) in words {
+        if token_is(tokens, word) {
+            seen_key = true;
+            continue;
+        }
+        if !head_word(word, seen_key, extra) {
+            return false;
+        }
+        if !head_filler(word) {
+            extra = true;
+        }
+    }
+    seen_key
+}
+
+fn token_is(tokens: &[String], word: &str) -> bool {
+    tokens.iter().any(|token| token == word)
+}
+
+fn head_word(word: &str, seen_key: bool, extra: bool) -> bool {
+    if head_filler(word) {
+        return !(seen_key && !extra && word != "default");
+    }
+    seen_key && !extra
+}
+
+fn head_filler(word: &str) -> bool {
+    matches!(word, "the" | "a" | "an" | "our" | "its" | "default")
 }
 
 /// The quote names the setting being replaced: a token of the anchor's key.
@@ -1096,6 +1160,168 @@ fn list_mark(quote: &str) -> bool {
 
 fn names_value(value: &str, text: &str) -> bool {
     !value.is_empty() && !value_spans(text, value).is_empty()
+}
+
+fn same_slot(anchor: &Anchor, partner: &Row) -> bool {
+    let left = slot_tokens(&anchor.key, &partner.subject);
+    let right = slot_tokens(&partner.key, &anchor.subject);
+    !left.is_empty() && left == right
+}
+
+fn slot_tokens(key: &str, subject: &str) -> BTreeSet<String> {
+    let names = tokens(subject);
+    key_tokens(key)
+        .into_iter()
+        .filter(|token| !names.iter().any(|name| name == token))
+        .filter(|token| !slot_unit(token))
+        .collect()
+}
+
+/// Duration and size words peeled from a slot.
+///
+/// `min` and `mins` stay. `coverage_min` is a different slot from `coverage`.
+fn slot_unit(token: &str) -> bool {
+    matches!(
+        token,
+        "ms" | "sec"
+            | "secs"
+            | "second"
+            | "seconds"
+            | "minute"
+            | "minutes"
+            | "hr"
+            | "hrs"
+            | "hour"
+            | "hours"
+            | "day"
+            | "days"
+            | "byte"
+            | "bytes"
+            | "kb"
+            | "kib"
+            | "mb"
+            | "mib"
+            | "gb"
+            | "gib"
+            | "pct"
+            | "percent"
+    )
+}
+
+fn quote_unit(token: &str) -> bool {
+    token == "min" || token == "mins" || slot_unit(token)
+}
+
+fn numeric_pair(anchor: &Anchor, partner: &Row) -> bool {
+    if anchor.new_value.is_empty() || partner.value.is_empty() {
+        return false;
+    }
+    if values_equal(&anchor.new_value, &partner.value) {
+        return false;
+    }
+    let class = value_class(&anchor.new_value);
+    class == value_class(&partner.value) && numeric_class(class)
+}
+
+fn numeric_class(class: &str) -> bool {
+    matches!(class, "number" | "duration" | "version")
+}
+
+fn trailing_quote(quote: &str, old: &str, new_value: &str, key: &str) -> bool {
+    let words = cue_words(quote);
+    trailing_guards(quote, old, new_value, key, &words)
+        && trailing_shape(quote, new_value, key, &words)
+}
+
+fn trailing_guards(
+    quote: &str,
+    old: &str,
+    new_value: &str,
+    key: &str,
+    words: &[(String, usize, usize)],
+) -> bool {
+    !names_value(old, quote)
+        && names_value(new_value, quote)
+        && !listed_new(new_value, quote)
+        && !hedged(quote, words)
+        && names_key(key, words)
+        && !tentative(words)
+}
+
+fn trailing_shape(
+    quote: &str,
+    new_value: &str,
+    key: &str,
+    words: &[(String, usize, usize)],
+) -> bool {
+    let tokens = key_tokens(key);
+    value_spans(quote, new_value)
+        .iter()
+        .any(|&(start, end)| trailing_span(quote, &tokens, words, start, end))
+}
+
+fn trailing_span(
+    quote: &str,
+    tokens: &[String],
+    words: &[(String, usize, usize)],
+    start: usize,
+    end: usize,
+) -> bool {
+    let Some(verb) = word_ending_at(words, quote, start) else {
+        return false;
+    };
+    if !matches!(words[verb].0.as_str(), "is" | "are") {
+        return false;
+    }
+    let Some(now) = now_after_value(quote, words, end) else {
+        return false;
+    };
+    sentence_stops(quote, words[now].2) && head_allows(sentence_head(quote, words, verb), tokens)
+}
+
+fn word_ending_at(words: &[(String, usize, usize)], quote: &str, start: usize) -> Option<usize> {
+    words.iter().enumerate().rev().find_map(|(index, word)| {
+        (word.2 <= start && blank_between(quote, word.2, start)).then_some(index)
+    })
+}
+
+fn now_after_value(quote: &str, words: &[(String, usize, usize)], end: usize) -> Option<usize> {
+    let next = words.iter().position(|word| word.1 >= end)?;
+    if !blank_between(quote, end, words[next].1) {
+        return None;
+    }
+    if words[next].0 == "now" {
+        return Some(next);
+    }
+    if !quote_unit(&words[next].0) {
+        return None;
+    }
+    let now = next + 1;
+    let follows = words.get(now)?;
+    (follows.0 == "now" && blank_between(quote, words[next].2, follows.1)).then_some(now)
+}
+
+fn sentence_head<'a>(
+    quote: &str,
+    words: &'a [(String, usize, usize)],
+    verb: usize,
+) -> &'a [(String, usize, usize)] {
+    let mut from = verb;
+    while from > 0 && !sentence_start(quote, words[from].1) {
+        from -= 1;
+    }
+    &words[from..verb]
+}
+
+fn sentence_stops(quote: &str, end: usize) -> bool {
+    matches!(
+        quote[end..].trim_start().chars().next(),
+        None | Some('.' | '!' | '\n')
+    )
+}
+
+fn blank_between(quote: &str, from: usize, to: usize) -> bool {
+    from <= to && quote[from..to].chars().all(char::is_whitespace)
 }
 
 /// Whole-phrase replacement wording, case-insensitive.
@@ -1190,18 +1416,62 @@ fn accept_cue(
     let depart = departs(turn, &partner.value, &anchor.replaces);
     let quoted = replacement_quote(quote, &partner.value, &anchor.new_value, &anchor.key);
     if !ctx.components_on {
-        let paired = shares_pair(anchor, partner, &loaded.part_of, &loaded.owners);
-        return depart || (paired && quoted);
+        return plain_cue(anchor, partner, loaded, depart, quoted);
     }
-    let kind = widened_cue(ctx, anchor, partner, loaded, dependents, depart, quoted);
-    if link_made_cue(kind.accept, depart, kind.paired, quoted) {
+    component_cue(
+        ctx,
+        anchor,
+        partner,
+        loaded,
+        dependents,
+        (depart, quoted, quote),
+        report,
+    )
+}
+
+fn plain_cue(anchor: &Anchor, partner: &Row, loaded: &Loaded, depart: bool, quoted: bool) -> bool {
+    let paired = shares_pair(anchor, partner, &loaded.part_of, &loaded.owners);
+    depart || (paired && quoted)
+}
+
+fn component_cue(
+    ctx: &WriteCtx<'_>,
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    dependents: &[DependentHit],
+    parts: (bool, bool, &str),
+    report: &mut IngestionReport,
+) -> bool {
+    let (depart, quoted, quote) = parts;
+    let kind = widened_cue(ctx, anchor, partner, loaded, dependents);
+    let trailing = trailing_allowed(&kind.links, anchor, partner, quote);
+    let accept = joined_cue(depart, kind.paired, quoted, trailing);
+    record_component_cue(report, &kind, depart, quoted, trailing, accept);
+    accept
+}
+
+fn joined_cue(depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool {
+    depart || (paired && (quoted || trailing))
+}
+
+fn record_component_cue(
+    report: &mut IngestionReport,
+    kind: &Widened,
+    depart: bool,
+    quoted: bool,
+    trailing: bool,
+    accept: bool,
+) {
+    if link_made_cue(accept, depart, kind.paired, quoted || trailing) {
         note_link(report, &kind.links);
     }
-    kind.accept
+    if trailing_made(accept, depart, kind.paired, quoted, trailing) {
+        add_count(&mut report.consolidate.quote_trailing);
+    }
 }
 
 struct Widened {
-    accept: bool,
     paired: bool,
     links: PairLinks,
 }
@@ -1212,17 +1482,13 @@ fn widened_cue(
     partner: &Row,
     loaded: &Loaded,
     dependents: &[DependentHit],
-    depart: bool,
-    quoted: bool,
 ) -> Widened {
     let links = pair_links(anchor, partner, loaded, dependents, ctx);
     let names = tokens(&partner.subject);
     let key =
         keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names);
-    let paired = key && (links.same || links.direct || links.sibling || links.derived);
     Widened {
-        accept: depart || (paired && quoted),
-        paired,
+        paired: key && (links.same || links.direct || links.sibling || links.derived),
         links,
     }
 }
@@ -1231,11 +1497,28 @@ fn link_made_cue(accept: bool, depart: bool, paired: bool, quoted: bool) -> bool
     accept && !depart && paired && quoted
 }
 
+fn trailing_made(accept: bool, depart: bool, paired: bool, quoted: bool, trailing: bool) -> bool {
+    accept && !depart && paired && !quoted && trailing
+}
+
+fn trailing_allowed(links: &PairLinks, anchor: &Anchor, partner: &Row, quote: &str) -> bool {
+    links.waiver()
+        && same_slot(anchor, partner)
+        && numeric_pair(anchor, partner)
+        && trailing_quote(quote, &partner.value, &anchor.new_value, &anchor.key)
+}
+
 struct PairLinks {
     same: bool,
     direct: bool,
     sibling: bool,
     derived: bool,
+}
+
+impl PairLinks {
+    fn waiver(&self) -> bool {
+        !self.same && (self.direct || self.sibling || self.derived)
+    }
 }
 
 fn pair_links(
@@ -1355,6 +1638,7 @@ fn hit_closes(hit: &DependentHit, canonical: &str, closed: &str) -> bool {
 fn arm_component_counts(report: &mut crate::graph::types::ConsolidateReport) {
     report.link_sibling.get_or_insert(0);
     report.link_derived.get_or_insert(0);
+    report.quote_trailing.get_or_insert(0);
     report.closes_component.get_or_insert(0);
 }
 
@@ -3968,6 +4252,14 @@ mod tests {
             "The picker layout is now sqlite for the rows.",
             "The layout is now sqlite temporarily for rows.",
             "The layout is now sqlite, redis for the rows.",
+            "The layout is sqlite now.",
+            "Maybe the layout is sqlite now.",
+            "The layout is sqlite now?",
+            "The layout is sqlite for now.",
+            "They said the layout is sqlite now.",
+            "The picker layout is sqlite now.",
+            "The layout is sqlite now, really.",
+            "The layout is also sqlite now.",
         ] {
             let (report, slot) =
                 judge_keyed(quote, quote, "layout", "sqlite", "layout_name", "walnut").await;
@@ -7864,6 +8156,246 @@ mod tests {
             fact_index: 0,
         });
         assert!(unique_closed_row(&retirement, &[fact], &ambiguous).is_none());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn quote_case(
+        anchor_key: &str,
+        anchor_value: &str,
+        partner_subject: &str,
+        partner_key: &str,
+        partner_value: &str,
+        quote: &str,
+        components_on: bool,
+    ) -> Judged {
+        let (_tmp, gm) = open().await;
+        let kind = if partner_subject == "acme" {
+            Kind::Project
+        } else {
+            Kind::Component
+        };
+        let mut seeded = Vec::new();
+        if partner_subject != "acme" {
+            seeded.push(edge(
+                Predicate::PartOf,
+                partner_subject,
+                Kind::Component,
+                "acme",
+                Kind::Project,
+            ));
+        }
+        seeded.push(setting(
+            partner_subject,
+            kind,
+            partner_key,
+            partner_value,
+            &format!("{partner_key} is {partner_value}"),
+        ));
+        commit(&gm, "s1", "2026-03-01", &[turn("stored")], &seeded).await;
+        let next = setting("acme", Kind::Project, anchor_key, anchor_value, quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            flags(false, components_on),
+        )
+        .await;
+        let rows = slots(&gm, partner_subject).await;
+        let ended = ended(live_any(&rows, partner_key, partner_value)).map(str::to_string);
+        Judged {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_linked_same_slot_number_closes_on_a_trailing_quote() {
+        let quote = "Outbound timeout is 15 seconds now.";
+        let off = quote_case(
+            "outbound_timeout_seconds",
+            "15",
+            "outbound client",
+            "timeout_seconds",
+            "10",
+            quote,
+            false,
+        )
+        .await;
+        let on = quote_case(
+            "outbound_timeout_seconds",
+            "15",
+            "outbound client",
+            "timeout_seconds",
+            "10",
+            quote,
+            true,
+        )
+        .await;
+        assert_eq!(off.calls, 1);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.quote_trailing.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.quote_trailing, Some(1));
+        assert_eq!(on.report.consolidate.link_sibling, Some(0));
+        assert_eq!(on.report.consolidate.closes_component, Some(1));
+    }
+
+    #[tokio::test]
+    async fn coverage_is_not_a_trailing_close() {
+        for (value, quote) in [
+            ("88%", "Coverage is 88% now."),
+            ("88", "Coverage is 88 now."),
+        ] {
+            let judged = quote_case(
+                "coverage",
+                value,
+                "acme part",
+                "coverage_min",
+                "85",
+                quote,
+                true,
+            )
+            .await;
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{quote}");
+            assert!(judged.ended.is_none(), "{quote}");
+            assert_ne!(judged.report.consolidate.quote_trailing, Some(1), "{quote}");
+            if value == "88" {
+                assert_eq!(judged.calls, 1, "{quote}");
+                assert_eq!(dropped(&judged.report, "no departure cue"), 1, "{quote}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unit_only_key_overlap_is_not_a_trailing_close() {
+        let quote = "The shutdown wait is 15 seconds now.";
+        let judged = quote_case(
+            "shutdown_wait_seconds",
+            "15",
+            "outbound client",
+            "timeout_seconds",
+            "10",
+            quote,
+            true,
+        )
+        .await;
+        assert_eq!(judged.calls, 1, "{}", judged.message);
+        assert_eq!(dropped(&judged.report, "no departure cue"), 1);
+        assert_eq!(judged.report.consolidate.closes_sup, 0);
+        assert_eq!(judged.report.consolidate.quote_trailing, Some(0));
+        assert!(judged.ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn trailing_hedged_or_off_key_phrasing_stays_dropped() {
+        for quote in [
+            "Maybe the outbound timeout is 15 seconds now.",
+            "The outbound timeout is 15 seconds now, really.",
+            "The outbound timeout is also 15 seconds now.",
+            "The outbound timeout is 15 seconds for now.",
+            "The outbound timeout is 15 seconds now?",
+            "The picker timeout is 15 seconds now.",
+            "They said the outbound timeout is 15 seconds now.",
+            "The outbound timeout is 15 seconds now from 10.",
+        ] {
+            let judged = quote_case(
+                "outbound_timeout_seconds",
+                "15",
+                "outbound client",
+                "timeout_seconds",
+                "10",
+                quote,
+                true,
+            )
+            .await;
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{quote}");
+            assert!(judged.ended.is_none(), "{quote}");
+            assert_eq!(judged.report.consolidate.quote_trailing, Some(0), "{quote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_same_subject_pair_gets_no_trailing_waiver() {
+        let quote = "The timeout is 15 seconds now.";
+        let off = quote_case(
+            "timeout_seconds",
+            "15",
+            "acme",
+            "timeout",
+            "10",
+            quote,
+            false,
+        )
+        .await;
+        let on = quote_case(
+            "timeout_seconds",
+            "15",
+            "acme",
+            "timeout",
+            "10",
+            quote,
+            true,
+        )
+        .await;
+        assert_eq!(off.calls, 1);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(dropped(&on.report, "no departure cue"), 1);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert_eq!(on.report.consolidate.quote_trailing, Some(0));
+        assert!(on.ended.is_none());
+        assert!(off.ended.is_none());
+    }
+
+    #[test]
+    fn same_slot_ignores_units_and_keeps_a_minimum() {
+        let folded = anchor_named("acme", "outbound_timeout_seconds", "15");
+        let client = row_named("outbound client", "c", "timeout_seconds", "10");
+        assert!(same_slot(&folded, &client));
+        let coverage = anchor_named("acme", "coverage", "88");
+        let minimum = row_named("acme part", "p", "coverage_min", "85");
+        assert!(!same_slot(&coverage, &minimum));
+        let wait = anchor_named("acme", "shutdown_wait_seconds", "15");
+        let timeout = row_named("outbound client", "c", "timeout_seconds", "10");
+        assert!(!same_slot(&wait, &timeout));
+        assert!(numeric_pair(&coverage, &minimum));
+        let mut percent = coverage;
+        percent.new_value = "88%".into();
+        assert!(!numeric_pair(&percent, &minimum));
+        assert!(trailing_quote(
+            "Outbound timeout is 15 seconds now.",
+            "10",
+            "15",
+            "outbound_timeout_seconds",
+        ));
+        assert!(trailing_quote(
+            "Coverage is 88 now.",
+            "85",
+            "88",
+            "coverage"
+        ));
+        assert!(!trailing_quote(
+            "Maybe the outbound timeout is 15 seconds now.",
+            "10",
+            "15",
+            "outbound_timeout_seconds",
+        ));
     }
 }
 
