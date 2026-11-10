@@ -974,7 +974,7 @@ fn status_row_for_slot(
         subject: name.to_string(),
         relation: slot_relation(predicate, key),
         object: value.to_string(),
-        live: slot_live(slot) && status != "rejected",
+        live: slot_live(slot),
         status: present_status(Some(status.to_string())),
         pending: slot_pending(slot),
     }
