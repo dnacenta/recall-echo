@@ -19,7 +19,7 @@ use super::super::types::{Entity, IngestionReport, Retirement};
 use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
 use super::ground::{is_stop_word, sentences};
-use super::known_match::{coexist, cue_words, key_tokens, mention, value_spans};
+use super::known_match::{coexist, cue_words, departure_near, key_tokens, mention, value_spans};
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
@@ -1446,6 +1446,7 @@ enum CueBranch {
 enum RenameKind {
     Key,
     Becomes,
+    Entity,
 }
 
 impl RenameKind {
@@ -1453,6 +1454,7 @@ impl RenameKind {
         match self {
             Self::Key => "key",
             Self::Becomes => "becomes",
+            Self::Entity => "entity_drop",
         }
     }
 
@@ -1460,6 +1462,7 @@ impl RenameKind {
         let slot = match self {
             Self::Key => &mut report.rename_key,
             Self::Becomes => &mut report.rename_becomes,
+            Self::Entity => &mut report.rename_entity_drop,
         };
         add_count(slot);
     }
@@ -1847,8 +1850,10 @@ fn count_rename(report: &mut IngestionReport, tally: &CueTally) {
 fn rename_cue(cue: &RenameCue<'_>) -> Option<RenameKind> {
     if key_rename(cue) {
         Some(RenameKind::Key)
+    } else if becomes_rename(cue) {
+        Some(RenameKind::Becomes)
     } else {
-        becomes_rename(cue).then_some(RenameKind::Becomes)
+        entity_drop(cue.anchor, cue.partner, cue.quote, cue.loaded).then_some(RenameKind::Entity)
     }
 }
 
@@ -2133,6 +2138,69 @@ fn mask_spans(quote: &str, spans: &[(usize, usize)]) -> String {
 
 fn span_fits(text: &str, start: usize, end: usize) -> bool {
     start <= end && text.is_char_boundary(start) && text.is_char_boundary(end)
+}
+
+fn entity_drop(anchor: &Anchor, partner: &Row, quote: &str, loaded: &Loaded) -> bool {
+    rejected_uses(anchor)
+        && entity_partner(anchor, partner, quote, loaded)
+        && entity_cue(&anchor.value, quote)
+        && !live_entity(anchor, &loaded.rows)
+}
+
+fn rejected_uses(anchor: &Anchor) -> bool {
+    anchor.reason == "rejected" && anchor.pred == "uses" && alphanumeric_count(&anchor.value) >= 2
+}
+
+fn alphanumeric_count(text: &str) -> usize {
+    text.chars().filter(|ch| ch.is_alphanumeric()).count()
+}
+
+fn entity_partner(anchor: &Anchor, partner: &Row, quote: &str, loaded: &Loaded) -> bool {
+    entity_kind(partner)
+        && names_value(&anchor.value, &partner.value)
+        && !names_value(&partner.value, quote)
+        && entity_linked(anchor, partner, loaded)
+}
+
+fn entity_kind(partner: &Row) -> bool {
+    partner.pred == "rule" || partner.pred == "setting"
+}
+
+fn entity_linked(anchor: &Anchor, partner: &Row, loaded: &Loaded) -> bool {
+    same_name(&anchor.subject, &partner.subject)
+        || component_link(anchor, partner, &loaded.part_of, &loaded.owners)
+}
+
+fn entity_cue(value: &str, quote: &str) -> bool {
+    let words = cue_words(quote);
+    departure_near(value, quote)
+        && !hedged(quote, &words)
+        && !tentative(&words)
+        && !entity_listed(quote)
+}
+
+fn entity_listed(quote: &str) -> bool {
+    quote.contains(',') || listed_word(quote)
+}
+
+fn listed_word(quote: &str) -> bool {
+    quote.split_whitespace().any(|word| {
+        let word = word
+            .trim_matches(|ch: char| !ch.is_alphanumeric())
+            .to_lowercase();
+        matches!(word.as_str(), "or" | "nor" | "plus")
+    })
+}
+
+fn live_entity(anchor: &Anchor, rows: &[Row]) -> bool {
+    rows.iter().any(|row| live_same_use(anchor, row))
+}
+
+fn live_same_use(anchor: &Anchor, row: &Row) -> bool {
+    !row.pending
+        && row.pred == "uses"
+        && same_name(&row.subject, &anchor.subject)
+        && values_equal(&row.value, &anchor.value)
 }
 
 fn add_count(slot: &mut Option<u32>) {
@@ -9635,6 +9703,84 @@ mod tests {
     }
 
     #[test]
+    fn entity_drop_needs_a_rejected_use_and_a_departure() {
+        let anchor = rejected_use("acme", "Redis");
+        let partner = rule_row("acme", "Keep one Redis list per endpoint.");
+        let loaded = Loaded {
+            rows: vec![partner.clone()],
+            owners: Vec::new(),
+            part_of: Vec::new(),
+        };
+        let quote = "Do that and drop Redis completely.";
+        assert!(entity_drop(&anchor, &partner, quote, &loaded));
+        assert!(!entity_drop(
+            &anchor,
+            &rule_row("acme", "Keep one list per endpoint."),
+            quote,
+            &loaded
+        ));
+        assert!(!entity_drop(
+            &anchor,
+            &rule_row("other", "Keep one Redis list per endpoint."),
+            quote,
+            &loaded
+        ));
+        let mut live = row_named("acme", "entity:acme", "", "Redis");
+        live.pred = "uses".into();
+        let blocked = Loaded {
+            rows: vec![partner.clone(), live],
+            owners: Vec::new(),
+            part_of: Vec::new(),
+        };
+        assert!(!entity_drop(&anchor, &partner, quote, &blocked));
+        assert!(!entity_cue("Redis", "Maybe drop Redis completely now."));
+        assert!(!entity_cue("Redis", "Do that and drop Redis completely?"));
+        assert!(!entity_cue("Redis", "They said drop Redis completely."));
+        assert!(!entity_cue("Redis", "Drop Redis for now completely."));
+        assert!(!entity_cue(
+            "Redis",
+            "Do that and drop Redis completely, today."
+        ));
+        assert!(!entity_cue("Redis", "Do that or drop Redis completely."));
+        assert!(!entity_drop(
+            &anchor,
+            &partner,
+            "Do that and drop Redis completely. Keep one Redis list per endpoint.",
+            &loaded
+        ));
+        let mut kept = rejected_use("acme", "Redis");
+        kept.reason = "replaces";
+        assert!(!rejected_uses(&kept));
+        assert!(!rejected_uses(&rejected_use("acme", "R")));
+        let owners = vec![
+            ("entity:acme".into(), "acme".into()),
+            ("entity:widget".into(), "widget".into()),
+        ];
+        let linked = rule_row("widget", "Keep one Redis list per endpoint.");
+        let linked_loaded = Loaded {
+            rows: vec![linked.clone()],
+            owners,
+            part_of: vec![("entity:widget".into(), "entity:acme".into())],
+        };
+        assert!(entity_drop(&anchor, &linked, quote, &linked_loaded));
+    }
+
+    fn rejected_use(subject: &str, value: &str) -> Anchor {
+        let mut anchor = anchor_named(subject, "", value);
+        anchor.pred = "uses".into();
+        anchor.reason = "rejected";
+        anchor.value = value.into();
+        anchor.new_value.clear();
+        anchor
+    }
+
+    fn rule_row(subject: &str, value: &str) -> Row {
+        let mut row = row_named(subject, "entity:row", "", value);
+        row.pred = "rule".into();
+        row
+    }
+
+    #[test]
     fn a_rename_close_line_carries_the_branch_tag() {
         assert_eq!(
             rename_close_line("key", "acme:path_template", "acme:layout", PATH_QUOTE),
@@ -10182,6 +10328,215 @@ mod tests {
             calls: stub.calls(),
             ended,
         }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_entity_closes_only_when_the_flag_is_on() {
+        let quote = "Do that and drop Redis completely.";
+        let off = entity_case(false, "acme", "Keep one Redis list per endpoint.", quote).await;
+        let on = entity_case(true, "acme", "Keep one Redis list per endpoint.", quote).await;
+        assert_eq!(off.calls, 1, "{}", off.message);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.rename_entity_drop.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.rename_entity_drop, Some(1));
+        assert_eq!(on.report.consolidate.rename_key, Some(0));
+    }
+
+    #[tokio::test]
+    async fn entity_drop_guards_stay_dropped() {
+        for quote in [
+            "Maybe drop Redis completely now.",
+            "Do that and drop Redis completely?",
+            "They said drop Redis completely.",
+            "Drop Redis for now completely.",
+            "Do that and drop Redis completely, today.",
+            "Do that or drop Redis completely.",
+            "Keep one Redis list per endpoint today and tomorrow and next week. Do that and drop Redis completely.",
+        ] {
+            let judged =
+                entity_case(true, "acme", "Keep one Redis list per endpoint.", quote).await;
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{quote}");
+            assert!(judged.ended.is_none(), "{quote}");
+            assert_ne!(
+                judged.report.consolidate.rename_entity_drop,
+                Some(1),
+                "{quote}"
+            );
+        }
+        let unnamed = entity_case(
+            true,
+            "acme",
+            "Keep one list per endpoint.",
+            "Do that and drop Redis completely.",
+        )
+        .await;
+        assert_eq!(unnamed.report.consolidate.closes_sup, 0);
+        assert!(unnamed.ended.is_none());
+        let other = entity_case(
+            true,
+            "other",
+            "Keep one Redis list per endpoint.",
+            "Do that and drop Redis completely.",
+        )
+        .await;
+        assert_eq!(other.report.consolidate.closes_sup, 0);
+        assert!(other.ended.is_none());
+        let live = live_redis_case().await;
+        assert_eq!(live.report.consolidate.closes_sup, 0);
+        assert!(live.ended.is_none());
+        assert_ne!(live.report.consolidate.rename_entity_drop, Some(1));
+    }
+
+    async fn entity_case(
+        rename_on: bool,
+        partner_subject: &str,
+        partner_value: &str,
+        quote: &str,
+    ) -> RenamePass {
+        let (_tmp, gm) = open().await;
+        let used = uses("acme", "Redis", "acme uses Redis");
+        let kept = rule(partner_subject, Kind::Project, partner_value, partner_value);
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("acme uses Redis")],
+            &[used, kept],
+        )
+        .await;
+        let mut rejection = uses("acme", "Redis", quote);
+        rejection.status = "rejected".into();
+        let turns = [turn(quote)];
+        let stats = commit(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            std::slice::from_ref(&rejection),
+        )
+        .await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let project = if partner_subject == "acme" {
+            project()
+        } else {
+            ProjectIdentity {
+                name: "acme".into(),
+                aliases: vec![partner_subject.into()],
+            }
+        };
+        let mut ctx = WriteCtx::new(&stub, &project, "s2", "2026-03-02", &turns);
+        ctx.rename_on = rename_on;
+        let mut report = IngestionReport::default();
+        run(
+            &gm,
+            &ctx,
+            std::slice::from_ref(&rejection),
+            &stats,
+            &stub,
+            &mut report,
+        )
+        .await;
+        let rows = slots(&gm, partner_subject).await;
+        let ended = rows
+            .iter()
+            .find(|slot| slot["value"] == partner_value)
+            .and_then(ended)
+            .map(str::to_string);
+        RenamePass {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    async fn live_redis_case() -> RenamePass {
+        let (_tmp, gm) = open().await;
+        let used = uses("acme", "Redis", "acme uses Redis");
+        let kept = rule(
+            "acme",
+            Kind::Project,
+            "Keep one Redis list per endpoint.",
+            "Keep one Redis list per endpoint.",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("acme uses Redis")],
+            &[used, kept],
+        )
+        .await;
+        let quote = "Do that and drop Redis completely.";
+        let mut rejection = uses("acme", "Redis", quote);
+        rejection.status = "rejected".into();
+        let turns = [turn(quote)];
+        let stats = commit(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            std::slice::from_ref(&rejection),
+        )
+        .await;
+        add_live_uses_slot(&gm).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[rejection],
+            &stats,
+            &stub,
+            rename_flags(true),
+        )
+        .await;
+        let ended = slots(&gm, "acme")
+            .await
+            .iter()
+            .find(|slot| slot["value"] == "Keep one Redis list per endpoint.")
+            .and_then(ended)
+            .map(str::to_string);
+        RenamePass {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    async fn add_live_uses_slot(gm: &GraphMemory) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let acme = entities
+            .iter()
+            .find(|entity| entity.name == "acme")
+            .unwrap();
+        let mut attributes = acme.attributes.clone().unwrap();
+        let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+        slots.push(json!({
+            "predicate": "uses",
+            "key": "",
+            "value": "Redis",
+            "status": "decided",
+            "valid_from": "2026-03-02T00:00:00Z",
+            "evidence": [{"session": "s2", "turn": 0, "quote": "acme still uses Redis", "role": "user"}]
+        }));
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", acme.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
     }
 }
 
