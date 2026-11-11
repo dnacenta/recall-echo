@@ -1445,19 +1445,23 @@ enum CueBranch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenameKind {
     Key,
+    Becomes,
 }
 
 impl RenameKind {
     fn tag(self) -> &'static str {
         match self {
             Self::Key => "key",
+            Self::Becomes => "becomes",
         }
     }
 
     fn count(self, report: &mut crate::graph::types::ConsolidateReport) {
-        match self {
-            Self::Key => add_count(&mut report.rename_key),
-        }
+        let slot = match self {
+            Self::Key => &mut report.rename_key,
+            Self::Becomes => &mut report.rename_becomes,
+        };
+        add_count(slot);
     }
 }
 
@@ -1841,7 +1845,11 @@ fn count_rename(report: &mut IngestionReport, tally: &CueTally) {
 }
 
 fn rename_cue(cue: &RenameCue<'_>) -> Option<RenameKind> {
-    key_rename(cue).then_some(RenameKind::Key)
+    if key_rename(cue) {
+        Some(RenameKind::Key)
+    } else {
+        becomes_rename(cue).then_some(RenameKind::Becomes)
+    }
 }
 
 fn key_rename(cue: &RenameCue<'_>) -> bool {
@@ -1938,6 +1946,193 @@ fn key_reused(key: &str, look: &RenameLook<'_>) -> bool {
         .iter()
         .enumerate()
         .any(|(index, anchor)| index != look.anchor_index && keys_match(&anchor.key, key))
+}
+
+fn becomes_rename(cue: &RenameCue<'_>) -> bool {
+    becomes_allowed(cue)
+        && becomes_quote(
+            cue.quote,
+            &cue.partner.value,
+            &cue.anchor.new_value,
+            &cue.anchor.key,
+            &cue.partner.key,
+        )
+        && becomes_measure_ok(cue.anchor, cue.partner)
+}
+
+fn becomes_allowed(cue: &RenameCue<'_>) -> bool {
+    today_paired(cue) || rename_body(cue.anchor, cue.partner, cue.look, &cue.loaded.rows)
+}
+
+fn today_paired(cue: &RenameCue<'_>) -> bool {
+    if cue.ctx.components_on {
+        widened_cue(cue.ctx, cue.anchor, cue.partner, cue.loaded, cue.dependents).paired
+    } else {
+        shares_pair(
+            cue.anchor,
+            cue.partner,
+            &cue.loaded.part_of,
+            &cue.loaded.owners,
+        )
+    }
+}
+
+fn becomes_measure_ok(anchor: &Anchor, partner: &Row) -> bool {
+    let class = value_class(&anchor.new_value);
+    !measure_class(class) || same_slot(anchor, partner)
+}
+
+fn measure_class(class: &str) -> bool {
+    class == "number" || class == "duration"
+}
+
+fn becomes_quote(
+    quote: &str,
+    old: &str,
+    new_value: &str,
+    anchor_key: &str,
+    partner_key: &str,
+) -> bool {
+    let words = cue_words(quote);
+    let tokens = union_tokens(anchor_key, partner_key);
+    becomes_guards(quote, old, new_value, &tokens, &words)
+        && becomes_shape(quote, new_value, old, &tokens, &words)
+}
+
+fn union_tokens(left: &str, right: &str) -> Vec<String> {
+    let mut tokens = key_tokens(left);
+    for token in key_tokens(right) {
+        if !token_is(&tokens, &token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+fn names_tokens(tokens: &[String], words: &[(String, usize, usize)]) -> bool {
+    !tokens.is_empty() && words.iter().any(|(word, _, _)| token_is(tokens, word))
+}
+
+fn becomes_guards(
+    quote: &str,
+    old: &str,
+    new_value: &str,
+    tokens: &[String],
+    words: &[(String, usize, usize)],
+) -> bool {
+    !names_value(old, quote)
+        && names_value(new_value, quote)
+        && !hedged(quote, words)
+        && !tentative(words)
+        && names_tokens(tokens, words)
+        && !masked_list(quote, new_value)
+}
+
+fn becomes_shape(
+    quote: &str,
+    new_value: &str,
+    partner_value: &str,
+    tokens: &[String],
+    words: &[(String, usize, usize)],
+) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        word.0 == "becomes" && becomes_hit(quote, new_value, partner_value, tokens, words, index)
+    })
+}
+
+fn becomes_hit(
+    quote: &str,
+    new_value: &str,
+    partner_value: &str,
+    tokens: &[String],
+    words: &[(String, usize, usize)],
+    index: usize,
+) -> bool {
+    head_allows(sentence_head(quote, words, index), tokens)
+        && becomes_value(quote, new_value, partner_value, words, index)
+}
+
+fn becomes_value(
+    quote: &str,
+    new_value: &str,
+    partner_value: &str,
+    words: &[(String, usize, usize)],
+    index: usize,
+) -> bool {
+    let from = words[index].2;
+    value_spans(quote, new_value)
+        .into_iter()
+        .any(|(start, end)| {
+            start >= from
+                && label_between(quote, partner_value, from, start)
+                && sentence_stops(quote, value_end(quote, new_value, end))
+        })
+}
+
+fn value_end(quote: &str, value: &str, end: usize) -> usize {
+    let suffix = value_suffix(value);
+    match quote.get(end..) {
+        Some(rest) if rest.starts_with(suffix) => end + suffix.len(),
+        _ => end,
+    }
+}
+
+fn value_suffix(value: &str) -> &str {
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        if ch.is_alphanumeric() {
+            end = index + ch.len_utf8();
+        }
+    }
+    &value[end..]
+}
+
+fn label_between(quote: &str, partner_value: &str, from: usize, to: usize) -> bool {
+    let Some(gap) = quote.get(from..to) else {
+        return false;
+    };
+    let gap = gap.trim();
+    if gap.is_empty() {
+        return true;
+    }
+    let Some(label) = gap.strip_suffix(':') else {
+        return false;
+    };
+    let label = label.trim();
+    !label.is_empty() && label_is_words(label) && label_runs_fit(label, partner_value)
+}
+
+fn label_is_words(label: &str) -> bool {
+    label
+        .chars()
+        .all(|ch| ch.is_alphanumeric() || ch == '-' || ch.is_whitespace())
+}
+
+fn label_runs_fit(label: &str, partner_value: &str) -> bool {
+    let have = alphanumeric_runs(partner_value);
+    alphanumeric_runs(label)
+        .iter()
+        .all(|run| have.iter().any(|item| item == run))
+}
+
+fn masked_list(quote: &str, value: &str) -> bool {
+    list_mark(&mask_spans(quote, &value_spans(quote, value)))
+}
+
+fn mask_spans(quote: &str, spans: &[(usize, usize)]) -> String {
+    let mut out = quote.to_string();
+    for &(start, end) in spans {
+        if !span_fits(&out, start, end) {
+            continue;
+        }
+        let width = end - start;
+        out.replace_range(start..end, &" ".repeat(width));
+    }
+    out
+}
+
+fn span_fits(text: &str, start: usize, end: usize) -> bool {
+    start <= end && text.is_char_boundary(start) && text.is_char_boundary(end)
 }
 
 fn add_count(slot: &mut Option<u32>) {
@@ -9390,6 +9585,56 @@ mod tests {
     }
 
     #[test]
+    fn becomes_quote_allows_a_label_and_a_comma_inside_the_value() {
+        let old = "X-Acme-Signature: sha256=<hex>";
+        let new_value = "t=<ts>,v1=<hex>";
+        let quote = "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>";
+        assert!(becomes_quote(
+            quote,
+            old,
+            new_value,
+            "signature_format",
+            "signature_header"
+        ));
+        assert!(!masked_list(quote, new_value));
+        assert!(masked_list(
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>, and more",
+            new_value
+        ));
+        assert!(!becomes_quote(
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>, and more",
+            old,
+            new_value,
+            "signature_format",
+            "signature_header"
+        ));
+        assert!(!becomes_quote(
+            "Maybe header becomes X-Acme-Signature: t=<ts>,v1=<hex>",
+            old,
+            new_value,
+            "signature_format",
+            "signature_header"
+        ));
+        assert!(!becomes_quote(
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>?",
+            old,
+            new_value,
+            "signature_format",
+            "signature_header"
+        ));
+        assert!(becomes_quote(
+            "Coverage becomes 88.",
+            "85",
+            "88",
+            "coverage",
+            "coverage_min"
+        ));
+        let anchor = path_anchor("acme", "coverage", "88", "");
+        let partner = row_named("acme part", "entity:part", "coverage_min", "85");
+        assert!(!becomes_measure_ok(&anchor, &partner));
+    }
+
+    #[test]
     fn a_rename_close_line_carries_the_branch_tag() {
         assert_eq!(
             rename_close_line("key", "acme:path_template", "acme:layout", PATH_QUOTE),
@@ -9722,6 +9967,221 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_becomes_quote_closes_only_when_the_flag_is_on() {
+        let off = becomes_case(false).await;
+        let on = becomes_case(true).await;
+        assert_eq!(off.calls, 1, "{}", off.message);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.rename_becomes.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.rename_becomes, Some(1));
+        assert_eq!(on.report.consolidate.rename_key, Some(0));
+    }
+
+    async fn becomes_case(rename_on: bool) -> RenamePass {
+        let (_tmp, gm) = open().await;
+        let link = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old_value = "X-Acme-Signature: sha256=<hex>";
+        let new_value = "t=<ts>,v1=<hex>";
+        let quote = "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>";
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "signature_header",
+            old_value,
+            "header is stored",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("widget is part of acme")],
+            &[link, old],
+        )
+        .await;
+        let next = setting(
+            "widget",
+            Kind::Component,
+            "signature_format",
+            new_value,
+            quote,
+        );
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            rename_flags(rename_on),
+        )
+        .await;
+        let ended = ended(live_any(
+            &slots(&gm, "acme").await,
+            "signature_header",
+            old_value,
+        ))
+        .map(str::to_string);
+        RenamePass {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn becomes_guards_and_a_different_number_slot_stay_dropped() {
+        let old_value = "X-Acme-Signature: sha256=<hex>";
+        let new_value = "t=<ts>,v1=<hex>";
+        for quote in [
+            "Maybe header becomes X-Acme-Signature: t=<ts>,v1=<hex>",
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>?",
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex>, and more",
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex> also",
+            "Header becomes X-Acme-Signature: t=<ts>,v1=<hex> for now",
+            "They said header becomes X-Acme-Signature: t=<ts>,v1=<hex>",
+            "Header becomes X-Acme-Signature: sha256=<hex>",
+        ] {
+            let judged = header_becomes(old_value, new_value, quote).await;
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{quote}");
+            assert!(judged.ended.is_none(), "{quote}");
+            assert_ne!(judged.report.consolidate.rename_becomes, Some(1), "{quote}");
+        }
+        let coverage = coverage_becomes().await;
+        assert_eq!(coverage.report.consolidate.closes_sup, 0);
+        assert!(coverage.ended.is_none());
+        assert_ne!(coverage.report.consolidate.rename_becomes, Some(1));
+    }
+
+    async fn header_becomes(old_value: &str, new_value: &str, quote: &str) -> RenamePass {
+        let (_tmp, gm) = open().await;
+        let link = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "signature_header",
+            old_value,
+            "header is stored",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("widget is part of acme")],
+            &[link, old],
+        )
+        .await;
+        let next = setting(
+            "widget",
+            Kind::Component,
+            "signature_format",
+            new_value,
+            quote,
+        );
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            rename_flags(true),
+        )
+        .await;
+        let ended = ended(live_any(
+            &slots(&gm, "acme").await,
+            "signature_header",
+            old_value,
+        ))
+        .map(str::to_string);
+        RenamePass {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    async fn coverage_becomes() -> RenamePass {
+        let (_tmp, gm) = open().await;
+        let link = edge(
+            Predicate::PartOf,
+            "acme part",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old = setting(
+            "acme part",
+            Kind::Component,
+            "coverage_min",
+            "85",
+            "coverage is 85",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("acme part is stored")],
+            &[link, old],
+        )
+        .await;
+        let quote = "Coverage becomes 88.";
+        let next = setting("acme", Kind::Project, "coverage", "88", quote);
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            rename_flags(true),
+        )
+        .await;
+        let ended = ended(live_any(
+            &slots(&gm, "acme part").await,
+            "coverage_min",
+            "85",
+        ))
+        .map(str::to_string);
+        RenamePass {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
     }
 }
 
