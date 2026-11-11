@@ -115,7 +115,7 @@ With both on, a cross-subject pair the judge calls supersedes can pass the cue t
 
 For a linked pair that is not the same subject, on the same slot, whose values share the class number, duration, or version and are not equal, the quote may also end a sentence with `<head> is` or `are`, the new value, an optional unit, and `now`. The head follows the same rule as `is now`. Every other replacement guard stays. `Coverage is 88% now` beside a live `coverage_min` does not close, and neither does a key overlap that is only a unit token.
 
-When the switch applies, the consolidate report counts `link_sibling`, `link_derived`, `quote_trailing`, and `closes_component`. A cross-subject close is also printed on stderr with a `component` tag. Off, those fields are absent.
+When the switch applies, the consolidate report counts `link_sibling`, `link_derived`, `quote_trailing`, and `closes_component`. `closes_component` counts closes whose partner subject differs from the anchor, excluding closes kept by `consolidate_key_rename` (counted under `rename_*`). A cross-subject close is also printed on stderr with a `component` tag. Off, those fields are absent.
 
 `--consolidate-components` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, or restatement dropping.
 
@@ -127,7 +127,7 @@ With both on, a judged supersede that today's cue drops can be kept in three cas
 
 The judge must still say supersedes, the quote must still be a verbatim span of the evidence, and two supersedes on one anchor still close none. A pending partner stays skipped, and none of these branches arms a hold.
 
-When the switch applies, the consolidate report counts `rename_key`, `rename_becomes`, and `rename_entity_drop`. A close made by one of these branches is also printed on stderr with a `rename` tag. Off, those fields are absent.
+When the switch applies, the consolidate report counts `rename_key`, `rename_becomes`, and `rename_entity_drop`. A close kept by this switch is not also counted in `closes_component`. A close made by one of these branches is also printed on stderr with a `rename` tag. Off, those fields are absent.
 
 `--consolidate-key-rename` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, component cues, or restatement dropping.
 

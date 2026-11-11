@@ -8321,10 +8321,14 @@ mod tests {
     }
 
     async fn sibling_port(components_on: bool) -> (Judged, Option<String>) {
-        sibling_verdict(components_on, "supersedes").await
+        sibling_verdict(components_on, false, "supersedes").await
     }
 
-    async fn sibling_verdict(components_on: bool, verdict: &str) -> (Judged, Option<String>) {
+    async fn sibling_verdict(
+        components_on: bool,
+        rename_on: bool,
+        verdict: &str,
+    ) -> (Judged, Option<String>) {
         let (_tmp, gm) = open().await;
         let widget = edge(
             Predicate::PartOf,
@@ -8362,7 +8366,12 @@ mod tests {
             &[next],
             &stats,
             &stub,
-            flags(false, components_on),
+            PassFlags {
+                links_on: false,
+                components_on,
+                hold_on: false,
+                rename_on,
+            },
         )
         .await;
         let ended =
@@ -8398,6 +8407,19 @@ mod tests {
         assert_eq!(on.0.report.consolidate.link_sibling, Some(1));
         assert_eq!(on.0.report.consolidate.link_derived, Some(0));
         assert_eq!(on.0.report.consolidate.closes_component, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_component_close_still_counts_when_key_rename_is_on() {
+        let (judged, ended) = sibling_verdict(true, true, "supersedes").await;
+        assert_eq!(judged.calls, 1, "{}", judged.message);
+        assert_eq!(ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(judged.report.consolidate.closes_sup, 1);
+        assert_eq!(judged.report.consolidate.link_sibling, Some(1));
+        assert_eq!(judged.report.consolidate.closes_component, Some(1));
+        assert_eq!(judged.report.consolidate.rename_key, Some(0));
+        assert_eq!(judged.report.consolidate.rename_becomes, Some(0));
+        assert_eq!(judged.report.consolidate.rename_entity_drop, Some(0));
     }
 
     async fn derived_storage(links_on: bool, components_on: bool, ambiguous: bool) -> Judged {
@@ -8707,7 +8729,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_supersede_leaves_component_counters_at_zero() {
         for verdict in ["unrelated", "duplicate", "unsure"] {
-            let (judged, ended) = sibling_verdict(true, verdict).await;
+            let (judged, ended) = sibling_verdict(true, false, verdict).await;
             assert_eq!(judged.report.consolidate.closes_sup, 0, "{verdict}");
             assert_eq!(judged.report.consolidate.link_sibling, Some(0), "{verdict}");
             assert_eq!(judged.report.consolidate.link_derived, Some(0), "{verdict}");

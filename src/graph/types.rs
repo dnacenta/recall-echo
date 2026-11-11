@@ -885,7 +885,8 @@ pub struct ConsolidateReport {
     /// Times the trailing numeric quote made the cue true. Absent when that switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote_trailing: Option<u32>,
-    /// Consolidation closes whose partner subject differs from the anchor.
+    /// Closes whose partner subject differs from the anchor, excluding closes
+    /// kept by `consolidate_key_rename` (counted under `rename_*`).
     /// Absent when that switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closes_component: Option<u32>,
