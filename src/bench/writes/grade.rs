@@ -110,6 +110,9 @@ pub struct SessionObservation {
     pub links: crate::graph::types::LinksReport,
     /// Component `part_of` counts. Blank when that switch is off.
     pub component_edges: crate::graph::types::ComponentEdgesReport,
+    /// Raw-turn values missing from the store. Blank when that switch is off.
+    /// The items are not stored.
+    pub recovered: crate::graph::types::RecoveredReport,
     /// Stored status, pending rows and rejected slots around this session.
     /// Grading diffs `before` and `after` only and does not read this.
     pub status_rows: StatusWindow,
@@ -288,6 +291,13 @@ pub struct SessionReport {
         skip_serializing_if = "crate::graph::types::ComponentEdgesReport::is_blank"
     )]
     pub component_edges: crate::graph::types::ComponentEdgesReport,
+    /// Raw-turn values missing from the store. Omitted when that switch is off
+    /// or the list is empty and nothing overflowed. The items are not stored.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graph::types::RecoveredReport::is_blank"
+    )]
+    pub recovered: crate::graph::types::RecoveredReport,
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -644,6 +654,7 @@ pub fn grade_with_pipeline(
                 hold: s.hold.clone(),
                 links: s.links,
                 component_edges: s.component_edges,
+                recovered: s.recovered.clone(),
             })
             .collect(),
         steps,
@@ -2118,6 +2129,7 @@ mod tests {
             hold: crate::graph::types::HoldReport::default(),
             links: crate::graph::types::LinksReport::default(),
             component_edges: crate::graph::types::ComponentEdgesReport::default(),
+            recovered: crate::graph::types::RecoveredReport::default(),
             status_rows: StatusWindow::default(),
         }
     }
@@ -2145,6 +2157,7 @@ mod tests {
             hold: session.hold.clone(),
             links: session.links,
             component_edges: session.component_edges,
+            recovered: session.recovered.clone(),
         };
         let encoded = serde_json::to_value(&blank).unwrap();
         assert!(encoded.get("links").is_none(), "{encoded}");

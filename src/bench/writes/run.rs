@@ -164,6 +164,17 @@ pub enum GroundComponentEdges {
     On,
 }
 
+/// Whether a bench run lists raw-turn values missing from the store.
+///
+/// On writes `recover_turns = true` and implies nothing else. The pass never writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverTurns {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `recover_turns = true` for this run.
+    On,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
@@ -185,6 +196,7 @@ pub async fn run(
     consolidate_links: ConsolidateLinks,
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
+    recover_turns: RecoverTurns,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -198,6 +210,7 @@ pub async fn run(
         consolidate_links,
         ground_component_edges,
         consolidate_components,
+        recover_turns,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -269,6 +282,7 @@ async fn collect_sessions(
             hold: report.hold,
             links: report.links,
             component_edges: report.component_edges,
+            recovered: report.recovered,
             status_rows: StatusWindow {
                 before: status_before,
                 after: status_after.clone(),
@@ -340,6 +354,7 @@ async fn ingest_v2(
     report.hold = extracted.hold;
     report.links = extracted.links;
     report.component_edges = extracted.component_edges;
+    report.recovered = extracted.recovered;
     Ok(report)
 }
 
@@ -372,6 +387,7 @@ pub async fn run_repeat(
     consolidate_links: ConsolidateLinks,
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
+    recover_turns: RecoverTurns,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -397,6 +413,7 @@ pub async fn run_repeat(
                 consolidate_links,
                 ground_component_edges,
                 consolidate_components,
+                recover_turns,
             )
             .await?,
         );
@@ -415,6 +432,7 @@ fn apply_graph_switches(
     consolidate_links: ConsolidateLinks,
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
+    recover_turns: RecoverTurns,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
         known,
@@ -424,6 +442,7 @@ fn apply_graph_switches(
         consolidate_links,
         ground_component_edges,
         consolidate_components,
+        recover_turns,
     );
     if lines.is_empty() {
         return Ok(());
@@ -437,6 +456,7 @@ fn apply_graph_switches(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn switch_lines(
     known: KnownFactsContext,
     matched: KnownMatch,
@@ -445,6 +465,7 @@ fn switch_lines(
     consolidate_links: ConsolidateLinks,
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
+    recover_turns: RecoverTurns,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
     push_line(
@@ -482,6 +503,11 @@ fn switch_lines(
         &mut lines,
         ground_component_edges == GroundComponentEdges::On,
         "ground_component_edges = true",
+    );
+    push_line(
+        &mut lines,
+        recover_turns == RecoverTurns::On,
+        "recover_turns = true",
     );
     lines
 }
@@ -1884,6 +1910,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1896,6 +1923,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1912,6 +1940,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1935,6 +1964,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -1948,6 +1978,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -1977,6 +2008,7 @@ mod tests {
             ConsolidateLinks::On,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2003,6 +2035,7 @@ mod tests {
             ConsolidateLinks::On,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2026,6 +2059,7 @@ mod tests {
             ConsolidateLinks::On,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2058,6 +2092,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2071,6 +2106,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::On,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2088,6 +2124,51 @@ mod tests {
     }
 
     #[test]
+    fn recover_turns_is_written_only_when_passed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nrecover_turns = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.recover_applies());
+        assert!(!graph.ground_component_edges);
+        assert!(!graph.consolidate);
+        assert!(!graph.known_facts_context);
+        assert!(!graph.known_match);
+        assert!(!graph.drop_restatements);
+        assert!(!text.contains("consolidate"));
+        assert!(!text.contains("ground_component_edges"));
+    }
+
+    #[test]
     fn consolidate_components_implies_consolidate_and_stays_independent() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
@@ -2101,6 +2182,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2114,6 +2196,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::On,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2142,6 +2225,7 @@ mod tests {
             ConsolidateLinks::On,
             GroundComponentEdges::Off,
             ConsolidateComponents::On,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2167,6 +2251,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::On,
+            RecoverTurns::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2232,6 +2317,7 @@ mod tests {
                 ConsolidateLinks::Off,
                 GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
+                RecoverTurns::Off,
             )
             .unwrap();
             let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2285,6 +2371,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap_err();
@@ -2444,6 +2531,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap();
@@ -2552,6 +2640,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap_err();
@@ -2578,6 +2667,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap_err();
@@ -2656,6 +2746,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap();
@@ -2964,6 +3055,7 @@ mod tests {
             ConsolidateLinks::Off,
             ground,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -3114,6 +3206,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap();
@@ -3330,6 +3423,7 @@ mod tests {
                 ConsolidateLinks::Off,
                 GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
+                RecoverTurns::Off,
             )
             .await
             .unwrap();
@@ -3369,6 +3463,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap()
@@ -3660,6 +3755,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap();
@@ -3794,6 +3890,7 @@ mod tests {
             ConsolidateLinks::Off,
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
+            RecoverTurns::Off,
         )
         .await
         .unwrap();
@@ -4293,6 +4390,7 @@ mod tests {
             hold: crate::graph::types::HoldReport::default(),
             links: crate::graph::types::LinksReport::default(),
             component_edges: crate::graph::types::ComponentEdgesReport::default(),
+            recovered: crate::graph::types::RecoveredReport::default(),
             status_rows: StatusWindow {
                 before: Vec::new(),
                 after: status,

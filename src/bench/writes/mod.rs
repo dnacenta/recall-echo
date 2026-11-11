@@ -27,7 +27,7 @@ pub use grade::{
 pub use run::{
     require_scratch, run, run_repeat, Consolidate, ConsolidateComponents, ConsolidateLinks,
     DropRestatements, Extractor, GroundComponentEdges, KnownFactsContext, KnownMatch, MetricRange,
-    MetricSet, MetricSpan, RepeatReport,
+    MetricSet, MetricSpan, RecoverTurns, RepeatReport,
 };
 pub use script::{
     load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState,
