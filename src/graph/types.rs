@@ -885,10 +885,21 @@ pub struct ConsolidateReport {
     /// Times the trailing numeric quote made the cue true. Absent when that switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote_trailing: Option<u32>,
-    /// Consolidation closes whose partner subject differs from the anchor.
+    /// Closes whose partner subject differs from the anchor, excluding closes
+    /// kept by `consolidate_key_rename` (counted under `rename_*`).
     /// Absent when that switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closes_component: Option<u32>,
+    /// Closes kept by a same-subject key rename. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_key: Option<u32>,
+    /// Closes kept by a "becomes" replacement quote. Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_becomes: Option<u32>,
+    /// Closes kept because a rule names an entity the writer rejected.
+    /// Absent when that switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_entity_drop: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1006,7 +1017,10 @@ impl ConsolidateReport {
     /// The pass did not run, or it found nothing to count.
     #[must_use]
     pub fn is_blank(&self) -> bool {
-        self.pass_blank() && self.outcome_blank() && self.component_counts_blank()
+        self.pass_blank()
+            && self.outcome_blank()
+            && self.component_counts_blank()
+            && self.rename_counts_blank()
     }
 
     fn pass_blank(&self) -> bool {
@@ -1032,6 +1046,12 @@ impl ConsolidateReport {
             && self.link_derived.unwrap_or(0) == 0
             && self.quote_trailing.unwrap_or(0) == 0
             && self.closes_component.unwrap_or(0) == 0
+    }
+
+    fn rename_counts_blank(&self) -> bool {
+        self.rename_key.unwrap_or(0) == 0
+            && self.rename_becomes.unwrap_or(0) == 0
+            && self.rename_entity_drop.unwrap_or(0) == 0
     }
 }
 
@@ -1352,6 +1372,35 @@ mod tests {
         report.quote_trailing = Some(0);
         report.closes_component = Some(0);
         assert!(report.is_blank());
+    }
+
+    #[test]
+    fn rename_counters_are_omitted_until_the_switch_applies() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("rename_key").is_none());
+        assert!(encoded.get("rename_becomes").is_none());
+        assert!(encoded.get("rename_entity_drop").is_none());
+        let mut report = ConsolidateReport {
+            rename_key: Some(0),
+            rename_becomes: Some(0),
+            rename_entity_drop: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(report.is_blank());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["rename_key"], 0);
+        assert_eq!(encoded["rename_becomes"], 0);
+        assert_eq!(encoded["rename_entity_drop"], 0);
+        report.rename_key = Some(1);
+        assert!(!report.is_blank());
+        report.rename_key = Some(0);
+        report.rename_becomes = Some(2);
+        assert!(!report.is_blank());
+        report.rename_becomes = Some(0);
+        report.rename_entity_drop = Some(3);
+        assert!(!report.is_blank());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["rename_entity_drop"], 3);
     }
 
     #[test]

@@ -123,9 +123,21 @@ With both on, a cross-subject pair the judge calls supersedes can pass the cue t
 
 For a linked pair that is not the same subject, on the same slot, whose values share the class number, duration, or version and are not equal, the quote may also end a sentence with `<head> is` or `are`, the new value, an optional unit, and `now`. The head follows the same rule as `is now`. Every other replacement guard stays. `Coverage is 88% now` beside a live `coverage_min` does not close, and neither does a key overlap that is only a unit token.
 
-When the switch applies, the consolidate report counts `link_sibling`, `link_derived`, `quote_trailing`, and `closes_component`. A cross-subject close is also printed on stderr with a `component` tag. Off, those fields are absent.
+When the switch applies, the consolidate report counts `link_sibling`, `link_derived`, `quote_trailing`, and `closes_component`. `closes_component` counts closes whose partner subject differs from the anchor, excluding closes kept by `consolidate_key_rename` (counted under `rename_*`). A cross-subject close is also printed on stderr with a `component` tag. Off, those fields are absent.
 
 `--consolidate-components` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, or restatement dropping.
+
+### Key renames (opt-in)
+
+`consolidate_key_rename` is off unless set. It applies only when `consolidate` is also on. `consolidate_key_rename = true` alone does not apply: the post-judge cue stays as it is, and the report omits `rename_key`, `rename_becomes`, and `rename_entity_drop`. The flag is independent of `drop_restatements`, `known_match`, `known_facts_context`, `consolidate_hold`, `consolidate_links`, and `consolidate_components`. Turning the flag on does not change the pass-1 prompt, does not add a partner or a pair, and does not add a judge call.
+
+With both on, a judged supersede that today's cue drops can be kept in three cases. A same-subject setting whose key does not overlap the stored key is kept when the quote is a replacement quote, both values share a class other than free text, and the values show a rename: a shared path token, or `replaces` naming the stored value. The anchor must have only one such partner, and no other anchor of the session may reuse the stored key. A quote of the form `<key> becomes <new value>`, including a label kept from the old value and a comma inside the new value, is kept when the pair is already paired or meets the rename conditions above. A number or a duration also needs the same slot. A writer-rejected `uses` anchor can close a same-subject or directly linked rule or setting that names the rejected entity, when the quote puts a departure word beside that entity and no live `uses` of it remains.
+
+The judge must still say supersedes, the quote must still be a verbatim span of the evidence, and two supersedes on one anchor still close none. A pending partner stays skipped, and none of these branches arms a hold.
+
+When the switch applies, the consolidate report counts `rename_key`, `rename_becomes`, and `rename_entity_drop`. A close kept by this switch is not also counted in `closes_component`. A close made by one of these branches is also printed on stderr with a `rename` tag. Off, those fields are absent.
+
+`--consolidate-key-rename` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, component cues, or restatement dropping.
 
 ## Gate 5 — confidence and generic objects
 
