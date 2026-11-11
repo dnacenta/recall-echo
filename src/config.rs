@@ -723,6 +723,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_components: bool,
+    /// Keep a judged supersede that renames a key, says "becomes", or drops
+    /// a rule that names an entity the writer just rejected.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_key_rename",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_key_rename: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// Off unless set.
     #[serde(
@@ -759,6 +767,7 @@ impl Default for GraphSection {
             consolidate_hold: default_consolidate_hold(),
             consolidate_links: default_consolidate_links(),
             consolidate_components: default_consolidate_components(),
+            consolidate_key_rename: default_consolidate_key_rename(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
         }
@@ -782,6 +791,13 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn components_apply(&self) -> bool {
         self.consolidate && self.consolidate_components
+    }
+
+    /// Renames, "becomes" quotes, and dropped-entity rules apply only when
+    /// consolidation is on as well.
+    #[must_use]
+    pub(crate) fn rename_apply(&self) -> bool {
+        self.consolidate && self.consolidate_key_rename
     }
 }
 
@@ -1105,6 +1121,10 @@ fn default_consolidate_links() -> bool {
 }
 
 fn default_consolidate_components() -> bool {
+    false
+}
+
+fn default_consolidate_key_rename() -> bool {
     false
 }
 
@@ -1435,6 +1455,12 @@ impl Config {
             }
             "graph.consolidate_components" => {
                 self.graph_section().consolidate_components = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_key_rename" => {
+                self.graph_section().consolidate_key_rename = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2475,6 +2501,62 @@ mod tests {
         assert!(cfg.graph.as_ref().expect("graph").consolidate_components);
         assert!(cfg.set_key("graph.consolidate_components", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").consolidate_components);
+    }
+
+    #[test]
+    fn consolidate_key_rename_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_key_rename());
+        assert!(!GraphSection::default().consolidate_key_rename);
+        assert!(!GraphSection::default().rename_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().rename_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_key_rename"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_key_rename = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_key_rename);
+        assert!(!false_graph.rename_apply());
+        assert!(!false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_key_rename"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_key_rename", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_key_rename);
+        assert!(!graph.rename_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.consolidate_components);
+        assert!(!graph.consolidate_hold);
+        assert!(!graph.consolidate_links);
+        let rendered = toml::to_string_pretty(&cfg).expect("render rename only");
+        assert!(rendered.contains("consolidate_key_rename = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_components"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse rename only");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.consolidate_key_rename);
+        assert!(!parsed_graph.rename_apply());
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").rename_apply());
+        cfg.set_key("graph.consolidate_key_rename", "false")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(!graph.consolidate_key_rename);
+        assert!(!graph.rename_apply());
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_key_rename"));
+        cfg.set_key("graph.consolidate_key_rename", "true").unwrap();
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").rename_apply());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_key_rename);
+        assert!(cfg.set_key("graph.consolidate_key_rename", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_key_rename);
     }
 
     #[test]
