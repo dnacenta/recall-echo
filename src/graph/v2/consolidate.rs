@@ -976,80 +976,94 @@ fn replacement_guards(
         && !tentative(words)
 }
 
+const HEDGE_WORDS: &[&str] = &[
+    "not",
+    "no",
+    "never",
+    "nor",
+    "neither",
+    "if",
+    "unless",
+    "whether",
+    "maybe",
+    "perhaps",
+    "might",
+    "could",
+    "would",
+    "should",
+    "may",
+    "suppose",
+    "suggest",
+    "propose",
+    "proposal",
+    "idea",
+    "consider",
+    "also",
+    "too",
+    "well",
+    "additionally",
+    "available",
+    "plus",
+];
+
+const TENTATIVE_WORDS: &[&str] = &[
+    "said",
+    "says",
+    "say",
+    "told",
+    "thinks",
+    "think",
+    "thought",
+    "proposes",
+    "proposed",
+    "suggests",
+    "suggested",
+    "tried",
+    "trying",
+    "try",
+    "testing",
+    "trial",
+    "temporarily",
+    "temporary",
+    "briefly",
+    "only",
+    "until",
+    "but",
+    "reverted",
+    "revert",
+    "later",
+];
+
 /// A question, a negation, a condition, a hedge, or an addition is not a
 /// decided replacement, wherever it sits in the quote.
 fn hedged(quote: &str, words: &[(String, usize, usize)]) -> bool {
-    quote.contains('?')
-        || words.iter().any(|(word, _, _)| {
-            word.ends_with("n't")
-                || matches!(
-                    word.as_str(),
-                    "not"
-                        | "no"
-                        | "never"
-                        | "nor"
-                        | "neither"
-                        | "if"
-                        | "unless"
-                        | "whether"
-                        | "maybe"
-                        | "perhaps"
-                        | "might"
-                        | "could"
-                        | "would"
-                        | "should"
-                        | "may"
-                        | "suppose"
-                        | "suggest"
-                        | "propose"
-                        | "proposal"
-                        | "idea"
-                        | "consider"
-                        | "also"
-                        | "too"
-                        | "well"
-                        | "additionally"
-                        | "available"
-                        | "plus"
-                )
-        })
+    quote.contains('?') || words.iter().any(|(word, _, _)| hedge_word(word))
+}
+
+/// One word from the hedge list, including a contraction that ends in `n't`.
+#[must_use]
+pub(super) fn hedge_word(word: &str) -> bool {
+    word.ends_with("n't") || HEDGE_WORDS.contains(&word)
 }
 
 /// Reported speech, a trial, a revert, or a time limit is not a decision.
 fn tentative(words: &[(String, usize, usize)]) -> bool {
     words
         .windows(2)
-        .any(|pair| pair[0].0 == "for" && pair[1].0 == "now")
-        || words.iter().any(|(word, _, _)| {
-            matches!(
-                word.as_str(),
-                "said"
-                    | "says"
-                    | "say"
-                    | "told"
-                    | "thinks"
-                    | "think"
-                    | "thought"
-                    | "proposes"
-                    | "proposed"
-                    | "suggests"
-                    | "suggested"
-                    | "tried"
-                    | "trying"
-                    | "try"
-                    | "testing"
-                    | "trial"
-                    | "temporarily"
-                    | "temporary"
-                    | "briefly"
-                    | "only"
-                    | "until"
-                    | "but"
-                    | "reverted"
-                    | "revert"
-                    | "later"
-            )
-        })
+        .any(|pair| for_now_pair(&pair[0].0, &pair[1].0))
+        || words.iter().any(|(word, _, _)| tentative_word(word))
+}
+
+/// `for now` is a time limit, not a decision.
+#[must_use]
+pub(super) fn for_now_pair(left: &str, right: &str) -> bool {
+    left == "for" && right == "now"
+}
+
+/// One word from the tentative list.
+#[must_use]
+pub(super) fn tentative_word(word: &str) -> bool {
+    TENTATIVE_WORDS.contains(&word)
 }
 
 /// Each cue is the head of its sentence: before `is now`, `are now` or
