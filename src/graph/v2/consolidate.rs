@@ -301,11 +301,17 @@ pub(crate) async fn run(
             Err(_) => report.consolidate.errors += 1,
         }
     }
+    let supersedes = rename_supersedes(ctx.rename_on, &verdicts);
     let mut accepted = Vec::new();
     for (pair, verdict, quote, _) in verdicts {
         let anchor = &anchors[pair.anchor];
         let partner = &loaded.rows[pair.partner];
         let turn = cited(ctx, anchor);
+        let look = RenameLook {
+            anchors: &anchors,
+            supersedes: &supersedes,
+            anchor_index: pair.anchor,
+        };
         let (cue, tally) = accept_cue(
             ctx,
             anchor,
@@ -316,6 +322,7 @@ pub(crate) async fn run(
                 turn,
                 quote: quote.as_str(),
             },
+            &look,
         );
         match accept(
             &verdict,
@@ -388,6 +395,9 @@ pub(crate) async fn run(
             if report.consolidate.closes_sup > before {
                 if ctx.components_on {
                     count_kept(report, tally);
+                }
+                if ctx.rename_on {
+                    count_rename(report, tally);
                 }
                 gone.insert(pair.partner);
                 if pair.hold {
@@ -1432,11 +1442,31 @@ enum CueBranch {
     Trailing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameKind {
+    Key,
+}
+
+impl RenameKind {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+        }
+    }
+
+    fn count(self, report: &mut crate::graph::types::ConsolidateReport) {
+        match self {
+            Self::Key => add_count(&mut report.rename_key),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CueTally {
     sibling: bool,
     derived: bool,
     trailing: bool,
+    rename: Option<RenameKind>,
 }
 
 impl CueTally {
@@ -1445,6 +1475,7 @@ impl CueTally {
             sibling: false,
             derived: false,
             trailing: false,
+            rename: None,
         }
     }
 }
@@ -1456,19 +1487,58 @@ fn accept_cue(
     loaded: &Loaded,
     dependents: &[DependentHit],
     text: CueText<'_>,
+    look: &RenameLook<'_>,
 ) -> (bool, CueTally) {
     let inputs = CueInputs {
         depart: departs(text.turn, &partner.value, &anchor.replaces),
         quoted: replacement_quote(text.quote, &partner.value, &anchor.new_value, &anchor.key),
         quote: text.quote,
     };
-    if !ctx.components_on {
-        return (
+    let (cue, tally) = if !ctx.components_on {
+        (
             plain_cue(anchor, partner, loaded, inputs.depart, inputs.quoted),
             CueTally::none(),
-        );
+        )
+    } else {
+        component_cue(ctx, anchor, partner, loaded, dependents, inputs)
+    };
+    if !ctx.rename_on || cue {
+        return (cue, tally);
     }
-    component_cue(ctx, anchor, partner, loaded, dependents, inputs)
+    apply_rename(
+        tally,
+        rename_cue(&cue_of(
+            ctx, anchor, partner, loaded, dependents, text.quote, look,
+        )),
+    )
+}
+
+fn cue_of<'a>(
+    ctx: &'a WriteCtx<'a>,
+    anchor: &'a Anchor,
+    partner: &'a Row,
+    loaded: &'a Loaded,
+    dependents: &'a [DependentHit],
+    quote: &'a str,
+    look: &'a RenameLook<'a>,
+) -> RenameCue<'a> {
+    RenameCue {
+        ctx,
+        anchor,
+        partner,
+        loaded,
+        dependents,
+        quote,
+        look,
+    }
+}
+
+fn apply_rename(mut tally: CueTally, kind: Option<RenameKind>) -> (bool, CueTally) {
+    let Some(kind) = kind else {
+        return (false, tally);
+    };
+    tally.rename = Some(kind);
+    (true, tally)
 }
 
 fn plain_cue(anchor: &Anchor, partner: &Row, loaded: &Loaded, depart: bool, quoted: bool) -> bool {
@@ -1503,6 +1573,7 @@ fn kept_tally(links: &PairLinks, branch: Option<CueBranch>, made: bool) -> CueTa
         trailing: matches!(branch, CueBranch::Trailing),
         sibling: sibling_branch(links, &branch),
         derived: derived_branch(links, &branch),
+        rename: None,
     }
 }
 
@@ -1736,6 +1807,139 @@ fn arm_rename_counts(report: &mut crate::graph::types::ConsolidateReport) {
     report.rename_entity_drop.get_or_insert(0);
 }
 
+struct RenameLook<'a> {
+    anchors: &'a [Anchor],
+    supersedes: &'a [Pair],
+    anchor_index: usize,
+}
+
+struct RenameCue<'a> {
+    ctx: &'a WriteCtx<'a>,
+    anchor: &'a Anchor,
+    partner: &'a Row,
+    loaded: &'a Loaded,
+    dependents: &'a [DependentHit],
+    quote: &'a str,
+    look: &'a RenameLook<'a>,
+}
+
+fn rename_supersedes(on: bool, verdicts: &[(Pair, String, String, bool)]) -> Vec<Pair> {
+    if !on {
+        return Vec::new();
+    }
+    verdicts
+        .iter()
+        .filter(|item| item.1 == "supersedes")
+        .map(|item| item.0.clone())
+        .collect()
+}
+
+fn count_rename(report: &mut IngestionReport, tally: &CueTally) {
+    if let Some(kind) = tally.rename {
+        kind.count(&mut report.consolidate);
+    }
+}
+
+fn rename_cue(cue: &RenameCue<'_>) -> Option<RenameKind> {
+    key_rename(cue).then_some(RenameKind::Key)
+}
+
+fn key_rename(cue: &RenameCue<'_>) -> bool {
+    rename_body(cue.anchor, cue.partner, cue.look, &cue.loaded.rows)
+        && replacement_quote(
+            cue.quote,
+            &cue.partner.value,
+            &cue.anchor.new_value,
+            &cue.anchor.key,
+        )
+}
+
+fn rename_body(anchor: &Anchor, partner: &Row, look: &RenameLook<'_>, rows: &[Row]) -> bool {
+    rename_shape(anchor, partner)
+        && rename_values(anchor, partner)
+        && rename_unique(partner, look, rows)
+}
+
+fn rename_shape(anchor: &Anchor, partner: &Row) -> bool {
+    same_setting(anchor, partner) && both_keys(anchor, partner) && key_disjoint(anchor, partner)
+}
+
+fn same_setting(anchor: &Anchor, partner: &Row) -> bool {
+    same_name(&anchor.subject, &partner.subject)
+        && anchor.pred == "setting"
+        && partner.pred == "setting"
+}
+
+fn both_keys(anchor: &Anchor, partner: &Row) -> bool {
+    !anchor.key.is_empty() && !partner.key.is_empty()
+}
+
+fn key_disjoint(anchor: &Anchor, partner: &Row) -> bool {
+    let names = tokens(&partner.subject);
+    !keys_match(&anchor.key, &partner.key) && !key_overlap(&anchor.key, &partner.key, &names)
+}
+
+fn rename_values(anchor: &Anchor, partner: &Row) -> bool {
+    let class = value_class(&anchor.new_value);
+    filled_values(&anchor.new_value, &partner.value)
+        && class == value_class(&partner.value)
+        && class != "prose"
+        && value_evidence(class, &anchor.replaces, &anchor.new_value, &partner.value)
+}
+
+fn filled_values(left: &str, right: &str) -> bool {
+    !left.is_empty() && !right.is_empty() && !values_equal(left, right)
+}
+
+fn value_evidence(class: &str, replaces: &str, new_value: &str, old: &str) -> bool {
+    if class == "path" {
+        shared_run(new_value, old)
+    } else {
+        replaces_names(replaces, old)
+    }
+}
+
+fn shared_run(left: &str, right: &str) -> bool {
+    let right = alphanumeric_runs(right);
+    alphanumeric_runs(left)
+        .into_iter()
+        .any(|run| run.chars().count() >= 2 && right.iter().any(|other| other == &run))
+}
+
+fn replaces_names(replaces: &str, old: &str) -> bool {
+    values_equal(replaces, old) || names_value(old, replaces)
+}
+
+fn rename_unique(partner: &Row, look: &RenameLook<'_>, rows: &[Row]) -> bool {
+    disjoint_count(look, rows) == 1 && !key_reused(&partner.key, look)
+}
+
+fn disjoint_count(look: &RenameLook<'_>, rows: &[Row]) -> usize {
+    look.supersedes
+        .iter()
+        .filter(|pair| pair.anchor == look.anchor_index && pair_disjoint(look.anchors, rows, pair))
+        .count()
+}
+
+fn pair_disjoint(anchors: &[Anchor], rows: &[Row], pair: &Pair) -> bool {
+    let Some(anchor) = anchors.get(pair.anchor) else {
+        return false;
+    };
+    let Some(partner) = rows.get(pair.partner) else {
+        return false;
+    };
+    both_keys(anchor, partner)
+        && same_name(&anchor.subject, &partner.subject)
+        && key_disjoint(anchor, partner)
+}
+
+fn key_reused(key: &str, look: &RenameLook<'_>) -> bool {
+    look.anchors
+        .iter()
+        .enumerate()
+        .any(|(index, anchor)| index != look.anchor_index && keys_match(&anchor.key, key))
+}
+
 fn add_count(slot: &mut Option<u32>) {
     *slot = Some(slot.unwrap_or(0).saturating_add(1));
 }
@@ -1806,7 +2010,7 @@ fn note_component_close(
     tally: CueTally,
     report: &mut IngestionReport,
 ) {
-    if !ctx.components_on {
+    if tally.rename.is_none() && !ctx.components_on {
         return;
     }
     let Some(quote) = quote else {
@@ -1814,18 +2018,52 @@ fn note_component_close(
     };
     let anchor = &anchors[pair.anchor];
     let partner = &rows[pair.partner];
+    let old_key = format!("{}:{}", partner.subject, partner.key);
+    let new_key = format!("{}:{}", anchor.subject, anchor.key);
+    print_rename(tally.rename, &old_key, &new_key, quote);
+    if ctx.components_on {
+        print_component(anchor, partner, quote, &tally, &old_key, &new_key, report);
+    }
+}
+
+fn print_rename(kind: Option<RenameKind>, old_key: &str, new_key: &str, quote: &str) {
+    let Some(kind) = kind else {
+        return;
+    };
+    eprintln!("{}", rename_close_line(kind.tag(), old_key, new_key, quote));
+}
+
+fn print_component(
+    anchor: &Anchor,
+    partner: &Row,
+    quote: &str,
+    tally: &CueTally,
+    old_key: &str,
+    new_key: &str,
+    report: &mut IngestionReport,
+) {
     if !same_name(&anchor.subject, &partner.subject) {
         add_count(&mut report.consolidate.closes_component);
+    }
+    if tally.rename.is_some() {
+        return;
     }
     eprintln!(
         "{}",
         component_close_line(
-            close_tag(&tally, same_name(&anchor.subject, &partner.subject)),
-            &format!("{}:{}", partner.subject, partner.key),
-            &format!("{}:{}", anchor.subject, anchor.key),
+            close_tag(tally, same_name(&anchor.subject, &partner.subject)),
+            old_key,
+            new_key,
             quote,
         )
     );
+}
+
+fn rename_close_line(kind: &str, old_key: &str, new_key: &str, quote: &str) -> String {
+    format!(
+        "consolidate close: rename {kind} | {old_key} | {new_key} | {}",
+        quote_head(quote)
+    )
 }
 
 fn close_tag(tally: &CueTally, same: bool) -> &'static str {
@@ -7761,6 +7999,7 @@ mod tests {
         links_on: bool,
         components_on: bool,
         hold_on: bool,
+        rename_on: bool,
     }
 
     async fn commit_mode(
@@ -7793,6 +8032,7 @@ mod tests {
         ctx.links_on = flags.links_on;
         ctx.components_on = flags.components_on;
         ctx.hold_on = flags.hold_on;
+        ctx.rename_on = flags.rename_on;
         let mut report = IngestionReport {
             links: stats.links,
             ..IngestionReport::default()
@@ -7806,6 +8046,7 @@ mod tests {
             links_on,
             components_on,
             hold_on: false,
+            rename_on: false,
         }
     }
 
@@ -8260,6 +8501,7 @@ mod tests {
                 links_on: false,
                 components_on: true,
                 hold_on: true,
+                rename_on: false,
             },
         )
         .await;
@@ -8642,6 +8884,7 @@ mod tests {
                     sibling: false,
                     derived: true,
                     trailing: false,
+                    rename: None,
                 },
                 false
             ),
@@ -8653,6 +8896,7 @@ mod tests {
                     sibling: true,
                     derived: false,
                     trailing: true,
+                    rename: None,
                 },
                 false
             ),
@@ -8985,6 +9229,499 @@ mod tests {
             "15",
             "outbound_timeout_seconds",
         ));
+    }
+
+    const NEW_PATH: &str = "YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext>";
+    const OLD_PATH: &str = "<DEST>/YYYY/MM/YYYY-MM-DD_HHMMSS.<ext>";
+    const PATH_QUOTE: &str = "New layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext>.";
+
+    struct RenamePass {
+        report: IngestionReport,
+        message: String,
+        calls: u32,
+        ended: Option<String>,
+    }
+
+    fn rename_flags(rename_on: bool) -> PassFlags {
+        PassFlags {
+            links_on: false,
+            components_on: false,
+            hold_on: false,
+            rename_on,
+        }
+    }
+
+    async fn setting_rename(
+        new_key: &str,
+        new_value: &str,
+        replaces: &str,
+        old_key: &str,
+        old_value: &str,
+        quote: &str,
+        rename_on: bool,
+    ) -> RenamePass {
+        let (_tmp, gm) = open().await;
+        let old = setting(
+            "acme",
+            Kind::Project,
+            old_key,
+            old_value,
+            &format!("{old_key} is {old_value}"),
+        );
+        commit(&gm, "s1", "2026-03-01", &[turn(&old.quote)], &[old]).await;
+        let mut next = setting("acme", Kind::Project, new_key, new_value, quote);
+        next.replaces = replaces.into();
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            rename_flags(rename_on),
+        )
+        .await;
+        let rows = slots(&gm, "acme").await;
+        let ended = ended(live_any(&rows, old_key, old_value)).map(str::to_string);
+        RenamePass {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    fn one_pair(anchor: usize, partner: usize) -> Pair {
+        Pair {
+            anchor,
+            partner,
+            score: 1,
+            evidence: String::new(),
+            stored: String::new(),
+            hold: false,
+        }
+    }
+
+    fn path_anchor(subject: &str, key: &str, value: &str, replaces: &str) -> Anchor {
+        let mut anchor = anchor_named(subject, key, value);
+        anchor.replaces = replaces.into();
+        anchor
+    }
+
+    #[test]
+    fn key_rename_accepts_a_shared_path_and_a_named_version() {
+        let anchor = path_anchor("acme", "layout", NEW_PATH, "");
+        let partner = row_named("acme", "entity:acme", "path_template", OLD_PATH);
+        let anchors = vec![anchor];
+        let rows = vec![partner];
+        let pairs = vec![one_pair(0, 0)];
+        let look = RenameLook {
+            anchors: &anchors,
+            supersedes: &pairs,
+            anchor_index: 0,
+        };
+        assert!(rename_body(&anchors[0], &rows[0], &look, &rows));
+        assert!(replacement_quote(PATH_QUOTE, OLD_PATH, NEW_PATH, "layout"));
+
+        let version = path_anchor("acme", "rust_version", "1.80", "1.74");
+        let msrv = row_named("acme", "entity:acme", "msrv", "1.74");
+        assert!(rename_values(&version, &msrv));
+        let empty = path_anchor("acme", "rust_version", "1.80", "");
+        assert!(!rename_values(&empty, &msrv));
+    }
+
+    #[test]
+    fn key_rename_rejects_the_false_close_guards() {
+        let prose = path_anchor("acme", "coverage", "88%", "");
+        let floor = row_named("acme", "entity:acme", "test_floor", "85");
+        assert!(!rename_values(&prose, &floor));
+        let number = path_anchor("acme", "coverage", "88", "");
+        let eighty = row_named("acme", "entity:acme", "test_floor", "85");
+        assert!(!rename_values(&number, &eighty));
+        let same = path_anchor("acme", "layout", NEW_PATH, "");
+        let copy = row_named("acme", "entity:acme", "path_template", NEW_PATH);
+        assert!(!rename_values(&same, &copy));
+        let cross = row_named("acme", "entity:acme", "floor", "85");
+        assert!(!rename_values(
+            &path_anchor("acme", "layout", NEW_PATH, ""),
+            &cross
+        ));
+        assert!(!shared_run("YYYY/ab", "/ef/gh"));
+        let other = path_anchor("widget", "layout", NEW_PATH, "");
+        let stored = row_named("acme", "entity:acme", "path_template", OLD_PATH);
+        assert!(!rename_shape(&other, &stored));
+        let overlap = row_named("acme", "entity:acme", "layout_name", OLD_PATH);
+        assert!(!key_disjoint(
+            &path_anchor("acme", "layout", NEW_PATH, ""),
+            &overlap
+        ));
+
+        let first = path_anchor("acme", "layout", NEW_PATH, "");
+        let second = path_anchor("acme", "path_template", "other", "");
+        let anchors = vec![first, second];
+        let partner = row_named("acme", "entity:acme", "path_template", OLD_PATH);
+        let rows = vec![partner];
+        let pairs = vec![one_pair(0, 0)];
+        let look = RenameLook {
+            anchors: &anchors,
+            supersedes: &pairs,
+            anchor_index: 0,
+        };
+        assert!(key_reused("path_template", &look));
+        assert!(!rename_unique(&rows[0], &look, &rows));
+
+        let anchors = vec![path_anchor("acme", "layout", NEW_PATH, "")];
+        let rows = vec![
+            row_named("acme", "entity:acme", "path_template", OLD_PATH),
+            row_named("acme", "entity:acme", "path_format", OLD_PATH),
+        ];
+        let pairs = vec![one_pair(0, 0), one_pair(0, 1)];
+        let look = RenameLook {
+            anchors: &anchors,
+            supersedes: &pairs,
+            anchor_index: 0,
+        };
+        assert_eq!(disjoint_count(&look, &rows), 2);
+        assert!(!rename_unique(&rows[0], &look, &rows));
+    }
+
+    #[test]
+    fn a_rename_close_line_carries_the_branch_tag() {
+        assert_eq!(
+            rename_close_line("key", "acme:path_template", "acme:layout", PATH_QUOTE),
+            format!(
+                "consolidate close: rename key | acme:path_template | acme:layout | {PATH_QUOTE}"
+            )
+        );
+        let (cue, tally) = apply_rename(CueTally::none(), Some(RenameKind::Key));
+        assert!(cue);
+        assert_eq!(tally.rename, Some(RenameKind::Key));
+        let (cue, tally) = apply_rename(CueTally::none(), None);
+        assert!(!cue);
+        assert!(tally.rename.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_path_key_rename_closes_only_when_the_flag_is_on() {
+        let off = setting_rename(
+            "layout",
+            NEW_PATH,
+            "",
+            "path_template",
+            OLD_PATH,
+            PATH_QUOTE,
+            false,
+        )
+        .await;
+        let on = setting_rename(
+            "layout",
+            NEW_PATH,
+            "",
+            "path_template",
+            OLD_PATH,
+            PATH_QUOTE,
+            true,
+        )
+        .await;
+        assert_eq!(off.calls, 1);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.rename_key.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.rename_key, Some(1));
+        assert_eq!(on.report.consolidate.rename_becomes, Some(0));
+        assert_eq!(on.report.consolidate.rename_entity_drop, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_version_key_rename_needs_replaces_evidence() {
+        let quote = "rust-version is now 1.80.";
+        let on = setting_rename("rust_version", "1.80", "1.74", "msrv", "1.74", quote, true).await;
+        let off =
+            setting_rename("rust_version", "1.80", "1.74", "msrv", "1.74", quote, false).await;
+        let empty_on =
+            setting_rename("rust_version", "1.80", "", "msrv", "1.74", quote, true).await;
+        let empty_off =
+            setting_rename("rust_version", "1.80", "", "msrv", "1.74", quote, false).await;
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.rename_key, Some(1));
+        assert!(empty_on.ended.is_none());
+        assert_eq!(empty_on.report.consolidate.closes_sup, 0);
+        assert_eq!(empty_on.calls, empty_off.calls);
+        assert_eq!(empty_on.message, empty_off.message);
+    }
+
+    #[tokio::test]
+    async fn a_key_overlapping_quote_adds_no_rename_counter() {
+        let quote = "The layout is now sqlite for the index rows.";
+        let off = setting_rename(
+            "layout",
+            "sqlite",
+            "",
+            "layout_name",
+            "walnut",
+            quote,
+            false,
+        )
+        .await;
+        let on = setting_rename("layout", "sqlite", "", "layout_name", "walnut", quote, true).await;
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(off.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.rename_key, Some(0));
+        assert_eq!(on.report.consolidate.rename_becomes, Some(0));
+        assert!(off.report.consolidate.rename_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn key_rename_guards_stay_dropped() {
+        let new_value = NEW_PATH;
+        let old_value = OLD_PATH;
+        for quote in [
+            "Maybe new layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext>.",
+            "New layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext>?",
+            "New layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext>, really.",
+            "New layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext> also.",
+            "New layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext> for now.",
+            "They said new layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext>.",
+            "New layout: YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext> was <DEST>/YYYY/MM/YYYY-MM-DD_HHMMSS.<ext>.",
+            "the YYYY/YYYY-MM-DD/HHMMSS_<stem>.<ext> layout",
+        ] {
+            let judged = setting_rename(
+                "layout", new_value, "", "path_template", old_value, quote, true,
+            )
+            .await;
+            assert_eq!(judged.report.consolidate.closes_sup, 0, "{quote}");
+            assert!(judged.ended.is_none(), "{quote}");
+            assert_ne!(judged.report.consolidate.rename_key, Some(1), "{quote}");
+        }
+        let coverage = setting_rename(
+            "coverage",
+            "88%",
+            "",
+            "test_floor",
+            "85",
+            "Coverage is 88% now.",
+            true,
+        )
+        .await;
+        assert_eq!(coverage.report.consolidate.closes_sup, 0);
+        assert!(coverage.ended.is_none());
+        let number = setting_rename(
+            "coverage",
+            "88",
+            "",
+            "test_floor",
+            "85",
+            "Coverage is now 88.",
+            true,
+        )
+        .await;
+        assert_eq!(number.report.consolidate.closes_sup, 0);
+        assert!(number.ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_restatement_stays_identical_with_the_flag_on() {
+        let quote = "New layout: per-project folders under data.";
+        let value = "per-project folders under data";
+        let off = setting_rename("layout", value, "", "layout", value, quote, false).await;
+        let on = setting_rename("layout", value, "", "layout", value, quote, true).await;
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert_ne!(on.report.consolidate.rename_key, Some(1));
+        let disjoint =
+            setting_rename("layout", value, "", "path_template", value, quote, true).await;
+        let disjoint_off =
+            setting_rename("layout", value, "", "path_template", value, quote, false).await;
+        assert_eq!(disjoint.calls, disjoint_off.calls);
+        assert_eq!(disjoint.message, disjoint_off.message);
+        assert_eq!(disjoint.report.consolidate.closes_sup, 0);
+        assert!(disjoint.ended.is_none());
+        assert_ne!(disjoint.report.consolidate.rename_key, Some(1));
+    }
+
+    #[tokio::test]
+    async fn two_key_disjoint_supersedes_close_none() {
+        let (_tmp, gm) = open().await;
+        let first = setting(
+            "acme",
+            Kind::Project,
+            "path_template",
+            OLD_PATH,
+            "path_template is stored",
+        );
+        let second = setting(
+            "acme",
+            Kind::Project,
+            "path_format",
+            "<ROOT>/YYYY/DD/YYYY-MM-DD_HHMMSS.<ext>",
+            "path_format is stored",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("stored paths")],
+            &[first, second],
+        )
+        .await;
+        let next = setting("acme", Kind::Project, "layout", NEW_PATH, PATH_QUOTE);
+        let turns = [turn(PATH_QUOTE)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", PATH_QUOTE),
+            (2, "supersedes", PATH_QUOTE),
+        ])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            rename_flags(true),
+        )
+        .await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(dropped(&report, "no departure cue"), 2);
+        assert_ne!(report.consolidate.rename_key, Some(1));
+        let rows = slots(&gm, "acme").await;
+        assert!(ended(live_any(&rows, "path_template", OLD_PATH)).is_none());
+        assert!(ended(live_any(
+            &rows,
+            "path_format",
+            "<ROOT>/YYYY/DD/YYYY-MM-DD_HHMMSS.<ext>"
+        ))
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_component_subject_is_not_a_key_rename() {
+        let (_tmp, gm) = open().await;
+        let link = edge(
+            Predicate::PartOf,
+            "widget",
+            Kind::Component,
+            "acme",
+            Kind::Project,
+        );
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "path_template",
+            OLD_PATH,
+            "path_template is stored",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("widget is part of acme")],
+            &[link, old],
+        )
+        .await;
+        let next = setting("widget", Kind::Component, "layout", NEW_PATH, PATH_QUOTE);
+        let turns = [turn(PATH_QUOTE)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", PATH_QUOTE)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            rename_flags(true),
+        )
+        .await;
+        assert_eq!(stub.calls(), 1, "{}", stub.message());
+        assert_eq!(dropped(&report, "no departure cue"), 1);
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert!(ended(live_any(
+            &slots(&gm, "acme").await,
+            "path_template",
+            OLD_PATH
+        ))
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pending_partner_is_skipped_and_arms_no_hold() {
+        let (_tmp, gm) = open().await;
+        let old = setting(
+            "acme",
+            Kind::Project,
+            "path_template",
+            OLD_PATH,
+            "path_template is stored",
+        );
+        commit(&gm, "s1", "2026-03-01", &[turn(&old.quote)], &[old]).await;
+        mark_slot_pending(&gm, "acme", "path_template", OLD_PATH).await;
+        let next = setting("acme", Kind::Project, "layout", NEW_PATH, PATH_QUOTE);
+        let turns = [turn(PATH_QUOTE)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", PATH_QUOTE)])));
+        let on = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            std::slice::from_ref(&next),
+            &stats,
+            &stub,
+            rename_flags(true),
+        )
+        .await;
+        assert_eq!(stub.calls(), 0);
+        assert_eq!(on.consolidate.closes_sup, 0);
+        assert_eq!(on.hold.holds_opened, 0);
+        assert_ne!(on.consolidate.rename_key, Some(1));
+        assert!(ended(live_any(
+            &slots(&gm, "acme").await,
+            "path_template",
+            OLD_PATH
+        ))
+        .is_none());
+    }
+
+    async fn mark_slot_pending(gm: &GraphMemory, name: &str, key: &str, value: &str) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let slot = slots
+            .iter_mut()
+            .find(|slot| slot["key"] == key && slot["value"] == value)
+            .unwrap();
+        slot["pending"] = json!({"since": "s1", "conflicts": "held"});
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
     }
 }
 
