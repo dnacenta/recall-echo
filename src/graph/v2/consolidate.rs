@@ -2148,7 +2148,7 @@ fn entity_drop(anchor: &Anchor, partner: &Row, quote: &str, loaded: &Loaded) -> 
 }
 
 fn rejected_uses(anchor: &Anchor) -> bool {
-    anchor.reason == "rejected" && anchor.pred == "uses" && alphanumeric_count(&anchor.value) >= 2
+    anchor.reason == REJECTED && anchor.pred == "uses" && alphanumeric_count(&anchor.value) >= 2
 }
 
 fn alphanumeric_count(text: &str) -> usize {
@@ -2305,11 +2305,11 @@ fn print_component(
     new_key: &str,
     report: &mut IngestionReport,
 ) {
-    if !same_name(&anchor.subject, &partner.subject) {
-        add_count(&mut report.consolidate.closes_component);
-    }
     if tally.rename.is_some() {
         return;
+    }
+    if !same_name(&anchor.subject, &partner.subject) {
+        add_count(&mut report.consolidate.closes_component);
     }
     eprintln!(
         "{}",
@@ -9896,7 +9896,7 @@ mod tests {
             .await;
             assert_eq!(judged.report.consolidate.closes_sup, 0, "{quote}");
             assert!(judged.ended.is_none(), "{quote}");
-            assert_ne!(judged.report.consolidate.rename_key, Some(1), "{quote}");
+            assert_eq!(judged.report.consolidate.rename_key, Some(0), "{quote}");
         }
         let coverage = setting_rename(
             "coverage",
@@ -9934,7 +9934,7 @@ mod tests {
         assert_eq!(on.message, off.message);
         assert_eq!(on.report.consolidate.closes_sup, 0);
         assert_eq!(off.report.consolidate.closes_sup, 0);
-        assert_ne!(on.report.consolidate.rename_key, Some(1));
+        assert_eq!(on.report.consolidate.rename_key, Some(0));
         let disjoint =
             setting_rename("layout", value, "", "path_template", value, quote, true).await;
         let disjoint_off =
@@ -9943,7 +9943,7 @@ mod tests {
         assert_eq!(disjoint.message, disjoint_off.message);
         assert_eq!(disjoint.report.consolidate.closes_sup, 0);
         assert!(disjoint.ended.is_none());
-        assert_ne!(disjoint.report.consolidate.rename_key, Some(1));
+        assert_eq!(disjoint.report.consolidate.rename_key, Some(0));
     }
 
     #[tokio::test]
@@ -9992,7 +9992,7 @@ mod tests {
         assert_eq!(stub.calls(), 1, "{}", stub.message());
         assert_eq!(report.consolidate.closes_sup, 0);
         assert_eq!(dropped(&report, "no departure cue"), 2);
-        assert_ne!(report.consolidate.rename_key, Some(1));
+        assert_eq!(report.consolidate.rename_key, Some(0));
         let rows = slots(&gm, "acme").await;
         assert!(ended(live_any(&rows, "path_template", OLD_PATH)).is_none());
         assert!(ended(live_any(
@@ -10084,7 +10084,7 @@ mod tests {
         assert_eq!(stub.calls(), 0);
         assert_eq!(on.consolidate.closes_sup, 0);
         assert_eq!(on.hold.holds_opened, 0);
-        assert_ne!(on.consolidate.rename_key, Some(1));
+        assert_eq!(on.consolidate.rename_key, Some(0));
         assert!(ended(live_any(
             &slots(&gm, "acme").await,
             "path_template",
@@ -10117,8 +10117,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_becomes_quote_closes_only_when_the_flag_is_on() {
-        let off = becomes_case(false).await;
-        let on = becomes_case(true).await;
+        let off = becomes_case(false, false).await;
+        let on = becomes_case(true, false).await;
         assert_eq!(off.calls, 1, "{}", off.message);
         assert_eq!(on.calls, off.calls);
         assert_eq!(on.message, off.message);
@@ -10131,7 +10131,7 @@ mod tests {
         assert_eq!(on.report.consolidate.rename_key, Some(0));
     }
 
-    async fn becomes_case(rename_on: bool) -> RenamePass {
+    async fn becomes_case(rename_on: bool, components_on: bool) -> RenamePass {
         let (_tmp, gm) = open().await;
         let link = edge(
             Predicate::PartOf,
@@ -10176,7 +10176,12 @@ mod tests {
             &[next],
             &stats,
             &stub,
-            rename_flags(rename_on),
+            PassFlags {
+                links_on: false,
+                components_on,
+                hold_on: false,
+                rename_on,
+            },
         )
         .await;
         let ended = ended(live_any(
@@ -10191,6 +10196,38 @@ mod tests {
             calls: stub.calls(),
             ended,
         }
+    }
+
+    #[tokio::test]
+    async fn a_becomes_quote_with_components_on_does_not_move_component_counters() {
+        let off = becomes_case(false, true).await;
+        let on = becomes_case(true, true).await;
+        assert_eq!(off.calls, 1, "{}", off.message);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.rename_becomes.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.rename_becomes, Some(1));
+        assert_eq!(
+            on.report.consolidate.link_sibling,
+            off.report.consolidate.link_sibling
+        );
+        assert_eq!(
+            on.report.consolidate.link_derived,
+            off.report.consolidate.link_derived
+        );
+        assert_eq!(
+            on.report.consolidate.quote_trailing,
+            off.report.consolidate.quote_trailing
+        );
+        assert_eq!(
+            on.report.consolidate.closes_component,
+            off.report.consolidate.closes_component
+        );
+        assert_eq!(off.report.consolidate.closes_component, Some(0));
     }
 
     #[tokio::test]
