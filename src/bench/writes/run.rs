@@ -7,7 +7,7 @@
 //! Archives go through the same renderer ingestion already reads, so turn
 //! headings survive and provenance is classified the way a real session is.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -356,6 +356,63 @@ async fn ingest_v2(
     report.component_edges = extracted.component_edges;
     report.recovered = extracted.recovered;
     Ok(report)
+}
+
+/// Read each archived session and print nothing to the store.
+///
+/// One JSON line per session: the log number, the session id, the `recovered`
+/// report, and any read error. Listed values are not stored.
+pub async fn recover_replay(memory_dir: &Path) -> Result<Vec<String>, RecallError> {
+    let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
+    let mut lines = Vec::new();
+    for log in archived_logs(memory_dir)? {
+        lines.push(replay_line(&gm, memory_dir, log).await?);
+    }
+    Ok(lines)
+}
+
+async fn replay_line(gm: &GraphMemory, memory_dir: &Path, log: u32) -> Result<String, RecallError> {
+    let session = crate::graph::v2::input::load_session(memory_dir, log)?;
+    let mut report = crate::graph::types::IngestionReport::default();
+    crate::graph::v2::recover::fill_report(gm, true, &session, &[], &mut report).await;
+    let line = serde_json::json!({
+        "log": log,
+        "session": session.session_id,
+        "recovered": report.recovered,
+        "errors": report.errors,
+    });
+    Ok(serde_json::to_string(&line)?)
+}
+
+fn archived_logs(memory_dir: &Path) -> Result<Vec<u32>, RecallError> {
+    let mut logs = BTreeSet::new();
+    push_logs(&memory_dir.join("turns"), &mut logs)?;
+    push_logs(&memory_dir.join("conversations"), &mut logs)?;
+    Ok(logs.into_iter().collect())
+}
+
+fn push_logs(dir: &Path, logs: &mut BTreeSet<u32>) -> Result<(), RecallError> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if let Some(log) = log_of(&name.to_string_lossy()) {
+            logs.insert(log);
+        }
+    }
+    Ok(())
+}
+
+fn log_of(name: &str) -> Option<u32> {
+    let stem = name
+        .strip_suffix(".json")
+        .or_else(|| name.strip_suffix(".md"))?;
+    let digits = stem.strip_prefix("conversation-")?;
+    if digits.len() != 3 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
@@ -2166,6 +2223,216 @@ mod tests {
         assert!(!graph.drop_restatements);
         assert!(!text.contains("consolidate"));
         assert!(!text.contains("ground_component_edges"));
+    }
+
+    #[cfg(feature = "embedded")]
+    fn recover_script() -> FactScript {
+        FactScript {
+            name: "recover".into(),
+            sessions: vec![ScriptSession {
+                id: "s1".into(),
+                date: "2026-01-02T00:00:00Z".into(),
+                turns: vec![ScriptTurn {
+                    role: Speaker::User,
+                    text: "Default jobs is now 4. The helper is `scripts/migrate.py` (12 rows, 3 tags).".into(),
+                    claims: vec![],
+                    noise: false,
+                }],
+                transcript: None,
+                transcript_path: None,
+                claims: vec![],
+            }],
+            facts: vec![],
+            expect: vec![],
+            questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    struct RecoverReply;
+
+    #[cfg(feature = "embedded")]
+    #[async_trait]
+    impl LlmProvider for RecoverReply {
+        async fn complete(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+        ) -> Result<String, crate::graph::error::GraphError> {
+            Ok(r#"{"decision":"create","reason":"distinct"}"#.into())
+        }
+
+        async fn complete_structured_chat(
+            &self,
+            _: &str,
+            _: &[Message],
+            _: &serde_json::Value,
+            _: u32,
+        ) -> Result<Completion, crate::graph::error::GraphError> {
+            Ok(Completion::unmeasured(
+                r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"jobs","object":"4","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Default jobs is now 4.","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            ))
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn collect_recovered(on: bool) -> grade::WriteReport {
+        let script = recover_script();
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let written = write_archives(&memory_dir, &script).unwrap();
+        let project = tmp.path().join("tidepool");
+        fs::create_dir(&project).unwrap();
+        crate::graph::v2::input::write_turns_sidecar(
+            &memory_dir,
+            written[0].log_number,
+            &written[0].id,
+            "2026-01-02",
+            project.to_str(),
+            &[crate::conversation::ConversationEntry::UserMessage(
+                script.sessions[0].turns[0].text.clone(),
+            )],
+        )
+        .unwrap();
+        apply_graph_switches(
+            &memory_dir,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            if on {
+                RecoverTurns::On
+            } else {
+                RecoverTurns::Off
+            },
+        )
+        .unwrap();
+        let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
+        gm.embedder().unwrap();
+        let provider = Counting::new(Box::new(RecoverReply));
+        let sessions = collect_sessions(&gm, &memory_dir, &written, &provider, PipelineVersion::V2)
+            .await
+            .unwrap();
+        let weights = *gm.provenance_weights();
+        grade::grade_with_pipeline(
+            &script,
+            &sessions,
+            &weights,
+            &[],
+            grade::ExtractorLabel::Provider,
+            PipelineVersion::V2,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovered_items_reach_the_session_report_through_ingest_v2() {
+        let on = collect_recovered(true).await;
+        let off = collect_recovered(false).await;
+        assert!(
+            on.sessions[0].warnings.is_empty(),
+            "{:?}",
+            on.sessions[0].warnings
+        );
+        assert!(
+            off.sessions[0].warnings.is_empty(),
+            "{:?}",
+            off.sessions[0].warnings
+        );
+        let encoded = serde_json::to_value(&on.sessions[0]).unwrap();
+        let items = encoded["recovered"]["items"].as_array().unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item["pattern"] == "backtick_span"
+                    && item["value"] == "scripts/migrate.py"),
+            "{encoded}"
+        );
+        assert!(
+            encoded["recovered"]["redundant"].as_u64().unwrap() >= 1,
+            "{encoded}"
+        );
+        let off_json = serde_json::to_value(&off.sessions[0]).unwrap();
+        assert!(off_json.get("recovered").is_none(), "{off_json}");
+        assert_eq!(on.final_edges.len(), off.final_edges.len());
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn dump_rows(memory_dir: &Path) -> Vec<String> {
+        let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for entity in &entities {
+            rows.push(format!("entity|{}", entity.name));
+        }
+        let edges = crate::graph::crud::list_all_relationships(gm.db())
+            .await
+            .unwrap();
+        for edge in &edges {
+            rows.push(format!(
+                "edge|{}|{}",
+                edge.rel_type,
+                edge.valid_until.is_none()
+            ));
+        }
+        rows.sort();
+        rows
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recover_replay_prints_one_line_and_does_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("turns")).unwrap();
+        let project = tmp.path().join("tidepool");
+        fs::create_dir(&project).unwrap();
+        crate::graph::v2::input::write_turns_sidecar(
+            &memory,
+            1,
+            "s1",
+            "2026-01-02",
+            project.to_str(),
+            &[crate::conversation::ConversationEntry::UserMessage(
+                "Run `scripts/migrate.py` (12 rows, 3 tags).".into(),
+            )],
+        )
+        .unwrap();
+        {
+            let gm = GraphMemory::open(&memory.join("graph")).await.unwrap();
+            crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        }
+        let before = dump_rows(&memory).await;
+        let lines = recover_replay(&memory).await.unwrap();
+        let after = dump_rows(&memory).await;
+        assert_eq!(before, after);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(value["log"], 1);
+        assert_eq!(value["session"], "s1");
+        assert!(value["errors"].as_array().unwrap().is_empty(), "{value}");
+        let items = value["recovered"]["items"].as_array().unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item["value"] == "scripts/migrate.py"
+                    && item["quote"]
+                        .as_str()
+                        .unwrap()
+                        .contains("(12 rows, 3 tags)")),
+            "{value}"
+        );
     }
 
     #[test]

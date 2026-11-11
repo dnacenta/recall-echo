@@ -281,6 +281,12 @@ enum BenchCommands {
         #[arg(long)]
         recover_turns: bool,
     },
+    /// List raw-turn values missing from a store. Writes nothing.
+    RecoverReplay {
+        /// Memory directory whose archives and graph are read.
+        #[arg(long)]
+        memory_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1155,6 +1161,15 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 recall_echo::bench::writes::RecoverTurns::Off
             },
         ),
+        BenchCommands::RecoverReplay { memory_dir } => {
+            let rt =
+                tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
+            let lines = rt.block_on(recall_echo::bench::writes::recover_replay(&memory_dir))?;
+            for line in lines {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
