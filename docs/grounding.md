@@ -119,6 +119,18 @@ When the switch applies, the consolidate report counts `link_sibling`, `link_der
 
 `--consolidate-components` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, or restatement dropping.
 
+### Key renames (opt-in)
+
+`consolidate_key_rename` is off unless set. It applies only when `consolidate` is also on. `consolidate_key_rename = true` alone does not apply: the post-judge cue stays as it is, and the report omits `rename_key`, `rename_becomes`, and `rename_entity_drop`. The flag is independent of `drop_restatements`, `known_match`, `known_facts_context`, `consolidate_hold`, `consolidate_links`, and `consolidate_components`. Turning the flag on does not change the pass-1 prompt, does not add a partner or a pair, and does not add a judge call.
+
+With both on, a judged supersede that today's cue drops can be kept in three cases. A same-subject setting whose key does not overlap the stored key is kept when the quote is a replacement quote, both values share a class other than free text, and the values show a rename: a shared path token, or `replaces` naming the stored value. The anchor must have only one such partner, and no other anchor of the session may reuse the stored key. A quote of the form `<key> becomes <new value>`, including a label kept from the old value and a comma inside the new value, is kept when the pair is already paired or meets the rename conditions above. A number or a duration also needs the same slot. A writer-rejected `uses` anchor can close a same-subject or directly linked rule or setting that names the rejected entity, when the quote puts a departure word beside that entity and no live `uses` of it remains.
+
+The judge must still say supersedes, the quote must still be a verbatim span of the evidence, and two supersedes on one anchor still close none. A pending partner stays skipped, and none of these branches arms a hold.
+
+When the switch applies, the consolidate report counts `rename_key`, `rename_becomes`, and `rename_entity_drop`. A close made by one of these branches is also printed on stderr with a `rename` tag. Off, those fields are absent.
+
+`--consolidate-key-rename` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, component cues, or restatement dropping.
+
 ## Gate 5 — confidence and generic objects
 
 A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.

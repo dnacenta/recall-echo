@@ -268,6 +268,12 @@ enum BenchCommands {
         /// `--consolidate-hold`, `--consolidate-links`, and `--drop-restatements`.
         #[arg(long)]
         consolidate_components: bool,
+        /// Keep a judged rename, a "becomes" replacement, or a dropped-entity rule.
+        /// Implies `--consolidate`. Off unless set. Independent of
+        /// `--consolidate-hold`, `--consolidate-links`, `--consolidate-components`,
+        /// and `--drop-restatements`.
+        #[arg(long)]
+        consolidate_key_rename: bool,
         /// Drop a decided rule that only restates a same-session setting.
         /// Off unless set.
         #[arg(long)]
@@ -1098,6 +1104,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_hold,
             consolidate_links,
             consolidate_components,
+            consolidate_key_rename,
             drop_restatements,
             ground_component_edges,
         } => run_writes(
@@ -1144,6 +1151,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateComponents::Off
             },
+            if consolidate_key_rename {
+                recall_echo::bench::writes::ConsolidateKeyRename::On
+            } else {
+                recall_echo::bench::writes::ConsolidateKeyRename::Off
+            },
         ),
     }
 }
@@ -1164,6 +1176,7 @@ fn run_writes(
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
     ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
+    consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1201,6 +1214,7 @@ fn run_writes(
             consolidate_links,
             ground_component_edges,
             consolidate_components,
+            consolidate_key_rename,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1218,6 +1232,7 @@ fn run_writes(
             consolidate_links,
             ground_component_edges,
             consolidate_components,
+            consolidate_key_rename,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1240,6 +1255,7 @@ async fn grade_once(
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
     ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
+    consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1260,6 +1276,7 @@ async fn grade_once(
                 consolidate_links,
                 ground_component_edges,
                 consolidate_components,
+                consolidate_key_rename,
             )
             .await
         }
@@ -1276,6 +1293,7 @@ async fn grade_once(
                 consolidate_links,
                 ground_component_edges,
                 consolidate_components,
+                consolidate_key_rename,
             )
             .await
         }
@@ -1298,6 +1316,7 @@ async fn grade_repeat(
     consolidate_links: recall_echo::bench::writes::ConsolidateLinks,
     ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
+    consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1319,6 +1338,7 @@ async fn grade_repeat(
                 consolidate_links,
                 ground_component_edges,
                 consolidate_components,
+                consolidate_key_rename,
             )
             .await
         }
@@ -1336,6 +1356,7 @@ async fn grade_repeat(
                 consolidate_links,
                 ground_component_edges,
                 consolidate_components,
+                consolidate_key_rename,
             )
             .await
         }
@@ -1669,5 +1690,56 @@ mod tests {
             .expect("writes");
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--consolidate-components"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_key_rename_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-key-rename",
+        ])
+        .expect("parse key rename");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        consolidate_components,
+                        consolidate_key_rename,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ground_component_edges,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_key_rename);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!consolidate_links);
+                assert!(!consolidate_components);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+                assert!(!ground_component_edges);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--consolidate-key-rename"), "{help}");
     }
 }

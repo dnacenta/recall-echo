@@ -161,6 +161,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Widen the post-judge cue to a sibling or a derived-from partner.
     /// Off leaves that cue unchanged.
     pub components_on: bool,
+    /// Keep a judged rename, a "becomes" replacement, or a dropped-entity rule.
+    /// Off leaves that cue unchanged.
+    pub rename_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -187,6 +190,7 @@ impl<'a> WriteCtx<'a> {
             links_on: false,
             ground_on: false,
             components_on: false,
+            rename_on: false,
         }
     }
 }
@@ -3450,6 +3454,7 @@ mod tests {
                 links_on: false,
                 ground_on: false,
                 components_on: false,
+                rename_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4717,6 +4722,7 @@ mod tests {
             links_on: false,
             ground_on: false,
             components_on: false,
+            rename_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -6216,6 +6222,7 @@ mod tests {
             links_on: false,
             ground_on: false,
             components_on: false,
+            rename_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -8100,6 +8107,7 @@ mod tests {
             links_on: true,
             ground_on: false,
             components_on: false,
+            rename_on: false,
         };
         let result = write_facts(
             &gm,

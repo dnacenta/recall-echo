@@ -144,6 +144,9 @@ pub(crate) async fn run(
     if ctx.components_on {
         arm_component_counts(&mut report.consolidate);
     }
+    if ctx.rename_on {
+        arm_rename_counts(&mut report.consolidate);
+    }
     if rough.is_empty() && ambiguous.is_empty() && dependents.is_empty() {
         return;
     }
@@ -1725,6 +1728,12 @@ fn arm_component_counts(report: &mut crate::graph::types::ConsolidateReport) {
     report.link_derived.get_or_insert(0);
     report.quote_trailing.get_or_insert(0);
     report.closes_component.get_or_insert(0);
+}
+
+fn arm_rename_counts(report: &mut crate::graph::types::ConsolidateReport) {
+    report.rename_key.get_or_insert(0);
+    report.rename_becomes.get_or_insert(0);
+    report.rename_entity_drop.get_or_insert(0);
 }
 
 fn add_count(slot: &mut Option<u32>) {

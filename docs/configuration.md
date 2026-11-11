@@ -38,6 +38,7 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_links = false   # record derived_from on new settings and rules; off by default, and ignored unless consolidate is also on
 # ground_component_edges = false # accept a decided component part_of the session project when the turn names the component; off by default
 # consolidate_components = false # close a sibling or derived-from partner after the judge; off by default, and ignored unless consolidate is also on
+# consolidate_key_rename = false # keep a judged rename, a "becomes" replacement, or a dropped-entity rule; off by default, and ignored unless consolidate is also on
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

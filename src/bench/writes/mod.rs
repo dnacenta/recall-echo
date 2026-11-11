@@ -25,9 +25,9 @@ pub use grade::{
     StepLog, WriteOp, WriteReport, WrongFact, WrongReason,
 };
 pub use run::{
-    require_scratch, run, run_repeat, Consolidate, ConsolidateComponents, ConsolidateLinks,
-    DropRestatements, Extractor, GroundComponentEdges, KnownFactsContext, KnownMatch, MetricRange,
-    MetricSet, MetricSpan, RepeatReport,
+    require_scratch, run, run_repeat, Consolidate, ConsolidateComponents, ConsolidateKeyRename,
+    ConsolidateLinks, DropRestatements, Extractor, GroundComponentEdges, KnownFactsContext,
+    KnownMatch, MetricRange, MetricSet, MetricSpan, RepeatReport,
 };
 pub use script::{
     load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState,
