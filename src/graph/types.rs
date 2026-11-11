@@ -1156,6 +1156,61 @@ pub struct IngestionReport {
     /// Component `part_of` counts. Blank, and omitted, when that switch is off.
     #[serde(default, skip_serializing_if = "ComponentEdgesReport::is_blank")]
     pub component_edges: ComponentEdgesReport,
+    /// Raw-turn values missing from the store. Omitted when the switch is off
+    /// or the list is empty and nothing overflowed. These items are not stored.
+    #[serde(default, skip_serializing_if = "RecoveredReport::is_blank")]
+    pub recovered: RecoveredReport,
+}
+
+/// One live row that shares key tokens with a recovered value.
+///
+/// Shown so a missing value is not read as a stored fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredNearest {
+    pub subject: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// A candidate value from a text turn that is not a live stored value.
+///
+/// `quote` is the sentence, clipped to 200 characters. `nearest` is omitted
+/// when no single live row is closer than the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredItem {
+    pub turn: usize,
+    pub role: String,
+    pub pattern: String,
+    pub key: String,
+    pub value: String,
+    pub quote: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nearest: Option<RecoveredNearest>,
+}
+
+/// Missing raw-turn values for one session.
+///
+/// `redundant` counts hits whose value is already live. Those hits are not
+/// listed. `overflow` counts hits past the per-turn or per-session cap.
+/// A blank report is left out of JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredReport {
+    #[serde(default)]
+    pub items: Vec<RecoveredItem>,
+    #[serde(default)]
+    pub redundant: u32,
+    #[serde(default)]
+    pub overflow: u32,
+}
+
+impl RecoveredReport {
+    /// No listed item and nothing past the cap.
+    ///
+    /// A redundant count alone is left out of JSON. The list is what was missing.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.items.is_empty() && self.overflow == 0
+    }
 }
 
 fn u32_is_zero(value: &u32) -> bool {
@@ -1410,6 +1465,43 @@ mod tests {
         value.as_object_mut().unwrap().remove("component_edges");
         let loaded: IngestionReport = serde_json::from_value(value).unwrap();
         assert!(loaded.component_edges.is_blank());
+    }
+
+    #[test]
+    fn recovered_report_is_omitted_when_blank_and_older_json_loads() {
+        let encoded = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(encoded.get("recovered").is_none());
+        assert!(RecoveredReport::default().is_blank());
+
+        let mut report = IngestionReport::default();
+        report.recovered.redundant = 3;
+        assert!(report.recovered.is_blank());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(encoded.get("recovered").is_none(), "{encoded}");
+        report.recovered = RecoveredReport::default();
+        report.recovered.overflow = 2;
+        assert!(!report.recovered.is_blank());
+        report.recovered = RecoveredReport {
+            items: vec![RecoveredItem {
+                turn: 0,
+                role: "user".into(),
+                pattern: "is_now_value".into(),
+                key: "jobs".into(),
+                value: "4".into(),
+                quote: "Default jobs is now 4.".into(),
+                nearest: None,
+            }],
+            redundant: 0,
+            overflow: 0,
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["recovered"]["items"][0]["value"], "4");
+        assert!(encoded["recovered"]["items"][0].get("nearest").is_none());
+
+        let mut value = serde_json::to_value(IngestionReport::default()).unwrap();
+        value.as_object_mut().unwrap().remove("recovered");
+        let loaded: IngestionReport = serde_json::from_value(value).unwrap();
+        assert!(loaded.recovered.is_blank());
     }
 
     #[test]

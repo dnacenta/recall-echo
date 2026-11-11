@@ -375,6 +375,16 @@ pub(crate) async fn extract_session(
         match_ms,
         consolidate_ms,
     });
+    // After the report clock, so a scan does not change `timing`. The pass
+    // only reads and only when its switch is on.
+    super::recover::fill_report(
+        gm,
+        recover_turns_enabled(memory_dir),
+        &session,
+        &facts,
+        &mut report,
+    )
+    .await;
     Ok(report)
 }
 
@@ -443,6 +453,13 @@ fn ground_component_edges_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .ground_component_edges
+}
+
+fn recover_turns_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .recover_applies()
 }
 
 /// Drop a decided rule only when it and one setting are a component by themselves.

@@ -18,6 +18,7 @@ pub(crate) mod known;
 pub(crate) mod known_match;
 mod links;
 pub(crate) mod pass1;
+pub(crate) mod recover;
 pub(crate) mod resolve;
 pub(crate) mod schema;
 mod write;

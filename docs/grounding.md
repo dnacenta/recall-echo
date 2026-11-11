@@ -39,6 +39,14 @@ With the switch on, the writer's retirement scope follows only decided live `par
 
 `--ground-component-edges` writes `ground_component_edges = true` for that bench run and implies nothing else.
 
+## Raw-turn recovery (opt-in)
+
+`recover_turns` is off unless set. It stands alone: it does not turn on consolidation, known-row matching, the known-facts block, restatement dropping, component edges, or the hold. It never writes, never adds anchors, and never calls a model. Stored facts stay as they are.
+
+On, after a session's writes, user turns are scanned, and so is the assistant turn directly after a user turn. A candidate value that is not already a live stored value or edge object is listed on the session report as `recovered`. Those items are not stored. Each item carries the turn, the role (`user` or `assistant`), the pattern, the key, the value, the sentence (at most 200 characters), and `nearest` when one live row shares more key tokens than any other. A tie leaves `nearest` out. A value that is already live adds one to `redundant` and is not listed. At most 4 items are listed per turn and 16 per session; further hits add to `overflow` and do not fail the session. The object is omitted when the list is empty and `overflow` is zero, including when every hit was only `redundant`. A failed store read adds one report error, lists nothing, and the session still succeeds.
+
+`--recover-turns` writes `recover_turns = true` for that bench run and implies nothing else. `bench recover-replay --memory-dir <dir>` reads each archived session, prints one JSON line with that session's `recovered` report, and writes nothing.
+
 ## Gate 3 — key binding
 
 A setting whose value contains a number has to name its key in the quote or in the sentence that contains the quote. The key is split on `_`. At least one token that is not generic (`value`, `number`, `setting`, `default`, `current`, `new`, `min`, `max`) has to occur there as a whole token. A key whose tokens are all generic has nothing to bind, so the setting drops as `key_binding`. A key ending in `_version` also needs every stem token, and an empty stem fails.

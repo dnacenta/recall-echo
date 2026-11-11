@@ -746,6 +746,10 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub ground_component_edges: bool,
+    /// List raw-turn values that never reached the store. Off unless set.
+    /// Stands alone: it does not turn any other switch on, and it never writes.
+    #[serde(default = "default_recover_turns", skip_serializing_if = "is_false")]
+    pub recover_turns: bool,
 }
 
 impl Default for GraphSection {
@@ -770,6 +774,7 @@ impl Default for GraphSection {
             consolidate_key_rename: default_consolidate_key_rename(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
+            recover_turns: default_recover_turns(),
         }
     }
 }
@@ -791,6 +796,12 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn components_apply(&self) -> bool {
         self.consolidate && self.consolidate_components
+    }
+
+    /// Raw-turn recovery runs only when its own switch is on.
+    #[must_use]
+    pub(crate) fn recover_applies(&self) -> bool {
+        self.recover_turns
     }
 
     /// Renames, "becomes" quotes, and dropped-entity rules apply only when
@@ -1136,6 +1147,10 @@ fn default_ground_component_edges() -> bool {
     false
 }
 
+fn default_recover_turns() -> bool {
+    false
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1473,6 +1488,12 @@ impl Config {
             }
             "graph.ground_component_edges" => {
                 self.graph_section().ground_component_edges = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.recover_turns" => {
+                self.graph_section().recover_turns = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2678,6 +2699,51 @@ mod tests {
         cfg.set_key("graph.ground_component_edges", "true").unwrap();
         assert!(cfg.set_key("graph.ground_component_edges", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").ground_component_edges);
+    }
+
+    #[test]
+    fn recover_turns_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_recover_turns());
+        assert!(!GraphSection::default().recover_turns);
+        assert!(!GraphSection::default().recover_applies());
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().recover_turns);
+        let explicit_false: Config =
+            toml::from_str("[graph]\nrecover_turns = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.recover_applies());
+        assert!(!false_graph.ground_component_edges);
+        assert!(!false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("recover_turns"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nrecover_turns = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.recover_applies());
+        assert!(!true_graph.consolidate);
+        assert!(!true_graph.known_facts_context);
+        assert!(!true_graph.known_match);
+        assert!(!true_graph.drop_restatements);
+        assert!(!true_graph.ground_component_edges);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.recover_turns", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.recover_turns);
+        assert!(!graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("recover_turns = true"));
+        assert!(!rendered.contains("consolidate"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        assert!(parsed.graph.expect("graph").recover_turns);
+
+        cfg.set_key("graph.recover_turns", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").recover_turns);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("recover_turns"));
+        cfg.set_key("graph.recover_turns", "true").unwrap();
+        assert!(cfg.set_key("graph.recover_turns", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").recover_turns);
     }
 
     #[test]

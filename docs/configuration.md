@@ -37,6 +37,7 @@ url = "ws://localhost:8787"   # server mode only
 # drop_restatements = false   # drop a decided rule that only restates a same-session setting; off by default
 # consolidate_links = false   # record derived_from on new settings and rules; off by default, and ignored unless consolidate is also on
 # ground_component_edges = false # accept a decided component part_of the session project when the turn names the component; off by default
+# recover_turns = false       # list raw-turn values missing from the store; off by default; never writes
 # consolidate_components = false # close a sibling or derived-from partner after the judge; off by default, and ignored unless consolidate is also on
 # consolidate_key_rename = false # keep a judged rename, a "becomes" replacement, or a dropped-entity rule; off by default, and ignored unless consolidate is also on
 
