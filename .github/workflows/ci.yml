@@ -31,8 +31,24 @@ jobs:
       - name: Clippy (bench)
         run: cargo clippy --all-targets --features bench -- -D warnings
 
+      - name: Restore embedding model
+        id: hf-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: hf-${{ runner.os }}-Xenova-bge-small-en-v1.5-v1
+
       - name: Test
+        env:
+          HF_HOME: ${{ github.workspace }}/.hf-cache
         run: cargo test
+
+      - name: Save embedding model
+        if: always() && steps.hf-cache.outputs.cache-hit != 'true' && hashFiles('.hf-cache/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: hf-${{ runner.os }}-Xenova-bge-small-en-v1.5-v1
 
       - name: E9 check
         run: cargo run --example e9_provenance_ablation -- check
