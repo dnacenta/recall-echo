@@ -1339,8 +1339,10 @@ mod tests {
         assert_eq!(report.redundant, 1);
         assert_eq!(report.overflow, 0);
         assert!(report.is_blank());
-        let mut ingestion = crate::graph::types::IngestionReport::default();
-        ingestion.recovered = report;
+        let ingestion = crate::graph::types::IngestionReport {
+            recovered: report,
+            ..crate::graph::types::IngestionReport::default()
+        };
         let encoded = serde_json::to_value(&ingestion).unwrap();
         assert!(encoded.get("recovered").is_none(), "{encoded}");
     }
