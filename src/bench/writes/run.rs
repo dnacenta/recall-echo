@@ -2363,7 +2363,53 @@ mod tests {
         );
         let off_json = serde_json::to_value(&off.sessions[0]).unwrap();
         assert!(off_json.get("recovered").is_none(), "{off_json}");
-        assert_eq!(on.final_edges.len(), off.final_edges.len());
+        assert_eq!(comparable_run(off), comparable_run(on));
+    }
+
+    /// Durations and record ids differ between two runs. The rest of the
+    /// report, and the store rows under those ids, are compared in full.
+    #[cfg(feature = "embedded")]
+    fn comparable_run(mut report: grade::WriteReport) -> serde_json::Value {
+        report.millis = 0;
+        report.setup_millis = 0;
+        for session in &mut report.sessions {
+            session.millis = 0;
+            if let Some(timing) = session.timing.as_mut() {
+                timing.pass1_ms = 0;
+                timing.resolve_ms = 0;
+                timing.write_ms = 0;
+                timing.total_ms = 0;
+                if timing.match_ms.is_some() {
+                    timing.match_ms = Some(0);
+                }
+                if timing.consolidate_ms.is_some() {
+                    timing.consolidate_ms = Some(0);
+                }
+            }
+            session.recovered = crate::graph::types::RecoveredReport::default();
+        }
+        report.final_edges.sort_by(|left, right| {
+            (
+                &left.subject,
+                &left.relation,
+                &left.object,
+                left.live,
+                &left.status,
+                left.pending,
+            )
+                .cmp(&(
+                    &right.subject,
+                    &right.relation,
+                    &right.object,
+                    right.live,
+                    &right.status,
+                    right.pending,
+                ))
+        });
+        for edge in &mut report.final_edges {
+            edge.id.clear();
+        }
+        serde_json::to_value(&report).unwrap()
     }
 
     #[cfg(feature = "embedded")]

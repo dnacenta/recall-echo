@@ -1184,10 +1184,12 @@ pub struct RecoveredReport {
 }
 
 impl RecoveredReport {
-    /// Nothing missing, nothing redundant, and nothing past the cap.
+    /// No listed item and nothing past the cap.
+    ///
+    /// A redundant count alone is left out of JSON. The list is what was missing.
     #[must_use]
     pub fn is_blank(&self) -> bool {
-        self.items.is_empty() && self.redundant == 0 && self.overflow == 0
+        self.items.is_empty() && self.overflow == 0
     }
 }
 
@@ -1423,11 +1425,10 @@ mod tests {
         assert!(RecoveredReport::default().is_blank());
 
         let mut report = IngestionReport::default();
-        report.recovered.redundant = 1;
+        report.recovered.redundant = 3;
+        assert!(report.recovered.is_blank());
         let encoded = serde_json::to_value(&report).unwrap();
-        assert_eq!(encoded["recovered"]["redundant"], 1);
-        assert_eq!(encoded["recovered"]["overflow"], 0);
-        assert!(encoded["recovered"]["items"].as_array().unwrap().is_empty());
+        assert!(encoded.get("recovered").is_none(), "{encoded}");
         report.recovered = RecoveredReport::default();
         report.recovered.overflow = 2;
         assert!(!report.recovered.is_blank());

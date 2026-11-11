@@ -794,10 +794,7 @@ fn is_command(span: &str) -> bool {
     let Some(head) = pieces.next() else {
         return false;
     };
-    let Some(flag) = pieces.next() else {
-        return false;
-    };
-    is_key(head) && flag_option(flag)
+    is_key(head) && pieces.any(flag_option)
 }
 
 fn flag_option(flag: &str) -> bool {
@@ -1340,7 +1337,48 @@ mod tests {
         let report = classify(&hits, &live);
         assert!(report.items.is_empty());
         assert_eq!(report.redundant, 1);
-        assert!(!report.is_blank());
+        assert_eq!(report.overflow, 0);
+        assert!(report.is_blank());
+        let mut ingestion = crate::graph::types::IngestionReport::default();
+        ingestion.recovered = report;
+        let encoded = serde_json::to_value(&ingestion).unwrap();
+        assert!(encoded.get("recovered").is_none(), "{encoded}");
+    }
+
+    #[test]
+    fn versions_keep_a_patch_and_stop_before_a_trailing_dot() {
+        let bumped = one("Bump the crate to v1.2.3.");
+        let hit = item(&bumped, "to_value");
+        assert_eq!(hit.key, "crate");
+        assert_eq!(hit.value, "v1.2.3");
+
+        let minor = one("The version is now 0.4.");
+        let hit = item(&minor, "is_now_value");
+        assert_eq!(hit.key, "version");
+        assert_eq!(hit.value, "0.4");
+
+        let trailing = one("The release is now 1.2.");
+        let hit = item(&trailing, "is_now_value");
+        assert_eq!(hit.key, "release");
+        assert_eq!(hit.value, "1.2");
+
+        let spaced = one("The version is now 0.4 today.");
+        let hit = item(&spaced, "is_now_value");
+        assert_eq!(hit.value, "0.4");
+    }
+
+    #[test]
+    fn backtick_commands_need_a_real_option() {
+        let long = one("Run `cargo test --lib`.");
+        let hit = item(&long, "backtick_span");
+        assert_eq!(hit.value, "cargo test --lib");
+
+        let short = one("Run `rg -n foo`.");
+        let hit = item(&short, "backtick_span");
+        assert_eq!(hit.value, "rg -n foo");
+
+        assert!(one("Run `foo -`.").items.is_empty());
+        assert!(one("Run `run --`.").items.is_empty());
     }
 
     #[test]
@@ -1438,26 +1476,62 @@ mod store_tests {
         (dir, gm, report)
     }
 
-    async fn fact_rows(gm: &GraphMemory) -> Vec<String> {
+    async fn store_snapshot(gm: &GraphMemory) -> Vec<String> {
         let entities = crate::graph::crud::list_entities(gm.db(), None)
             .await
             .unwrap();
+        let mut names = std::collections::HashMap::new();
         let mut rows = Vec::new();
         for entity in &entities {
+            names.insert(entity.id_string(), entity.name.clone());
+            let kind = serde_json::to_string(&entity.entity_type).unwrap();
+            rows.push(format!("entity|{}|{kind}", entity.name));
             push_slot_lines(&entity.name, entity.attributes.as_ref(), &mut rows);
         }
         let edges = crate::graph::crud::list_all_relationships(gm.db())
             .await
             .unwrap();
         for edge in edges {
+            let from = names
+                .get(&crate::graph::edge_view::record_id(&edge.from_id))
+                .map(String::as_str)
+                .unwrap_or("");
+            let to = names
+                .get(&crate::graph::edge_view::record_id(&edge.to_id))
+                .map(String::as_str)
+                .unwrap_or("");
             rows.push(format!(
-                "edge|{}|{}",
+                "edge|{from}|{}|{to}|{}|{}|{}|{}|{}",
                 edge.rel_type,
-                edge.valid_until.is_none()
+                edge.description.as_deref().unwrap_or(""),
+                edge.valid_until.is_none(),
+                edge.confidence,
+                edge.alpha.unwrap_or(0.0),
+                edge.beta.unwrap_or(0.0),
             ));
         }
         rows.sort();
         rows
+    }
+
+    /// Durations differ between two runs. Everything else, including which
+    /// timing fields are present, is the report.
+    fn report_without_recovered(report: &crate::graph::types::IngestionReport) -> Value {
+        let mut copy = report.clone();
+        if let Some(timing) = copy.timing.as_mut() {
+            timing.pass1_ms = 0;
+            timing.resolve_ms = 0;
+            timing.write_ms = 0;
+            timing.total_ms = 0;
+            if timing.match_ms.is_some() {
+                timing.match_ms = Some(0);
+            }
+            if timing.consolidate_ms.is_some() {
+                timing.consolidate_ms = Some(0);
+            }
+        }
+        copy.recovered = crate::graph::types::RecoveredReport::default();
+        serde_json::to_value(&copy).unwrap()
     }
 
     fn push_slot_lines(name: &str, attributes: Option<&Value>, rows: &mut Vec<String>) {
@@ -1484,11 +1558,11 @@ mod store_tests {
         let (_on_dir, on_gm, on) = open_and_extract(true).await;
         assert!(off.errors.is_empty(), "{:?}", off.errors);
         assert!(on.errors.is_empty(), "{:?}", on.errors);
-        assert_eq!(fact_rows(&off_gm).await, fact_rows(&on_gm).await);
-        assert_eq!(off.candidates, on.candidates);
-        assert_eq!(off.kept, on.kept);
-        assert_eq!(off.slots_written, on.slots_written);
-        assert_eq!(off.drops, on.drops);
+        assert_eq!(store_snapshot(&off_gm).await, store_snapshot(&on_gm).await);
+        assert_eq!(
+            report_without_recovered(&off),
+            report_without_recovered(&on)
+        );
         assert!(off.recovered.is_blank());
         assert!(serde_json::to_value(&off)
             .unwrap()
@@ -1528,7 +1602,7 @@ mod store_tests {
         assert_eq!(report.errors, vec![READ_ERROR.to_string()]);
         assert!(report.recovered.is_blank());
         assert!(report.slots_written >= 1, "{report:?}");
-        let rows = fact_rows(&gm).await;
+        let rows = store_snapshot(&gm).await;
         assert!(rows.iter().any(|row| row.contains("|jobs|4|")), "{rows:?}");
     }
 
@@ -1537,7 +1611,7 @@ mod store_tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("tidepool");
         std::fs::create_dir_all(&cwd).unwrap();
-        let turn = "The helper is `scripts/migrate.py`.";
+        let turn = "Call it with httpx.AsyncClient.";
         crate::graph::v2::input::write_turns_sidecar(
             dir.path(),
             1,
@@ -1557,7 +1631,7 @@ mod store_tests {
         let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
             .await
             .unwrap();
-        let reply = r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"none","key":"","object":"scripts/migrate.py","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"The helper is `scripts/migrate.py`.","confidence":0.9}],"bugs":[],"releases":[]}"#;
+        let reply = r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"uses","role":"library","key":"","object":"httpx.AsyncClient","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"Call it with httpx.AsyncClient.","confidence":0.9}],"bugs":[],"releases":[]}"#;
         let provider = Scripted { reply };
         let report = extract_session(
             &gm,
@@ -1569,9 +1643,21 @@ mod store_tests {
         .await
         .unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let rows = store_snapshot(&gm).await;
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("edge|tidepool|uses|httpx.AsyncClient|")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("|httpx.AsyncClient|")
+                || row.starts_with("edge|")
+                || row.starts_with("entity|")),
+            "{rows:?}"
+        );
         assert!(
             report.recovered.redundant >= 1,
-            "drops {:?} recovered {:?}",
+            "drops {:?} recovered {:?} rows {rows:?}",
             report.drops,
             report.recovered
         );
@@ -1579,6 +1665,6 @@ mod store_tests {
             .recovered
             .items
             .iter()
-            .all(|item| item.value != "scripts/migrate.py"));
+            .all(|item| item.value != "httpx.AsyncClient"));
     }
 }
