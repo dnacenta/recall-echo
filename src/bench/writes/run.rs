@@ -339,6 +339,7 @@ async fn ingest_v2(
     report.consolidate = extracted.consolidate;
     report.hold = extracted.hold;
     report.links = extracted.links;
+    report.component_edges = extracted.component_edges;
     Ok(report)
 }
 
@@ -2856,6 +2857,178 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1, "edges: {edges:?}");
         found[0]
+    }
+
+    /// User turn for a decided component `part_of` the session project.
+    /// The quote names the component alone.
+    #[cfg(feature = "embedded")]
+    const COMPONENT_TURN: &str = "Add an export command with CSV output.";
+
+    #[cfg(feature = "embedded")]
+    fn component_part_of_reply() -> String {
+        serde_json::json!({
+            "facts": [{
+                "subject": "export command",
+                "subject_type": "component",
+                "predicate": "part_of",
+                "role": "none",
+                "key": "",
+                "object": "tidepool",
+                "object_type": "project",
+                "status": "decided",
+                "replaces": "csv",
+                "turn": 0,
+                "quote": "Add an export command",
+                "confidence": 0.9
+            }],
+            "bugs": [],
+            "releases": []
+        })
+        .to_string()
+    }
+
+    #[cfg(feature = "embedded")]
+    struct ComponentPartOfReply;
+
+    #[cfg(feature = "embedded")]
+    #[async_trait]
+    impl LlmProvider for ComponentPartOfReply {
+        async fn complete(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+        ) -> Result<String, crate::graph::error::GraphError> {
+            Ok(component_part_of_reply())
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn component_part_of_script() -> FactScript {
+        FactScript {
+            name: "component-edge".into(),
+            sessions: vec![ScriptSession {
+                id: "s1".into(),
+                date: "2026-01-02T00:00:00Z".into(),
+                turns: vec![ScriptTurn {
+                    role: Speaker::User,
+                    text: COMPONENT_TURN.into(),
+                    claims: vec![],
+                    noise: false,
+                }],
+                transcript: None,
+                transcript_path: None,
+                claims: vec![],
+            }],
+            facts: vec![],
+            expect: vec![],
+            questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
+        }
+    }
+
+    /// Run one v2 session through `collect_sessions` with a grounded `part_of`.
+    ///
+    /// The sidecar project is `tidepool`, the object the reply names. The
+    /// bench writer leaves the project empty, so the test stamps it.
+    #[cfg(feature = "embedded")]
+    async fn collect_component_edge(
+        ground: GroundComponentEdges,
+    ) -> (Vec<SessionObservation>, grade::WriteReport) {
+        let script = component_part_of_script();
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let written = write_archives(&memory_dir, &script).unwrap();
+        let project = tmp.path().join("tidepool");
+        fs::create_dir(&project).unwrap();
+        crate::graph::v2::input::write_turns_sidecar(
+            &memory_dir,
+            written[0].log_number,
+            &written[0].id,
+            "2026-01-02",
+            project.to_str(),
+            &[crate::conversation::ConversationEntry::UserMessage(
+                COMPONENT_TURN.into(),
+            )],
+        )
+        .unwrap();
+        apply_graph_switches(
+            &memory_dir,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            ground,
+            ConsolidateComponents::Off,
+        )
+        .unwrap();
+        let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
+        gm.embedder().unwrap();
+        let provider = Counting::new(Box::new(ComponentPartOfReply));
+        let sessions = collect_sessions(&gm, &memory_dir, &written, &provider, PipelineVersion::V2)
+            .await
+            .unwrap();
+        let weights = *gm.provenance_weights();
+        let report = grade::grade_with_pipeline(
+            &script,
+            &sessions,
+            &weights,
+            &[],
+            grade::ExtractorLabel::Provider,
+            PipelineVersion::V2,
+        )
+        .unwrap();
+        (sessions, report)
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn grounded_component_edge_reaches_the_session_report() {
+        let (sessions, report) = collect_component_edge(GroundComponentEdges::On).await;
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        let session = &sessions[0];
+        assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+        assert!(
+            session.component_edges.component_edges_grounded >= 1,
+            "windows {} calls {} candidates {} kept {} drops {:?} counters {:?}",
+            session.windows,
+            session.calls,
+            session.candidates,
+            session.kept,
+            session.drops,
+            session.component_edges
+        );
+        let encoded = serde_json::to_value(&report.sessions[0]).unwrap();
+        let grounded = encoded["component_edges"]["component_edges_grounded"]
+            .as_u64()
+            .unwrap();
+        assert!(grounded >= 1, "{encoded}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_edge_counters_stay_off_the_session_report() {
+        let (sessions, report) = collect_component_edge(GroundComponentEdges::Off).await;
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+        assert!(
+            session.component_edges.is_blank(),
+            "{:?}",
+            session.component_edges
+        );
+        let encoded = serde_json::to_value(&report.sessions[0]).unwrap();
+        assert!(encoded.get("component_edges").is_none(), "{encoded}");
+        let mut as_main = report.clone();
+        as_main.sessions[0].component_edges = crate::graph::types::ComponentEdgesReport::default();
+        assert_eq!(
+            serde_json::to_vec(&report).unwrap(),
+            serde_json::to_vec(&as_main).unwrap()
+        );
     }
 
     #[test]
