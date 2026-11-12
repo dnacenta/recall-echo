@@ -900,6 +900,14 @@ pub struct ConsolidateReport {
     /// Absent when that switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rename_entity_drop: Option<u32>,
+    /// Closes kept because a unique `replaces` match supplied the cue.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_cue: Option<u32>,
+    /// Closes in [`Self::replaces_cue`] that needed the relaxed quote floor.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_floor: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1021,6 +1029,7 @@ impl ConsolidateReport {
             && self.outcome_blank()
             && self.component_counts_blank()
             && self.rename_counts_blank()
+            && self.replaces_counts_blank()
     }
 
     fn pass_blank(&self) -> bool {
@@ -1052,6 +1061,10 @@ impl ConsolidateReport {
         self.rename_key.unwrap_or(0) == 0
             && self.rename_becomes.unwrap_or(0) == 0
             && self.rename_entity_drop.unwrap_or(0) == 0
+    }
+
+    fn replaces_counts_blank(&self) -> bool {
+        self.replaces_cue.unwrap_or(0) == 0 && self.replaces_floor.unwrap_or(0) == 0
     }
 }
 
@@ -1401,6 +1414,29 @@ mod tests {
         assert!(!report.is_blank());
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["rename_entity_drop"], 3);
+    }
+
+    #[test]
+    fn replaces_counters_are_omitted_when_zero() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("replaces_cue").is_none());
+        assert!(encoded.get("replaces_floor").is_none());
+        let mut report = ConsolidateReport {
+            replaces_cue: Some(1),
+            replaces_floor: Some(1),
+            ..ConsolidateReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["replaces_cue"], 1);
+        assert_eq!(encoded["replaces_floor"], 1);
+        assert!(!report.is_blank());
+        report.replaces_floor = None;
+        assert!(!report.is_blank());
+        report.replaces_cue = None;
+        assert!(report.is_blank());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(encoded.get("replaces_cue").is_none());
+        assert!(encoded.get("replaces_floor").is_none());
     }
 
     #[test]

@@ -139,6 +139,18 @@ When the switch applies, the consolidate report counts `rename_key`, `rename_bec
 
 `--consolidate-key-rename` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, component cues, or restatement dropping.
 
+### Replaces as the departure cue (opt-in)
+
+`consolidate_replaces_cue` is off unless set. It applies only when `consolidate` is also on. `consolidate_replaces_cue = true` alone does not apply: the post-judge cue stays as it is, and the report omits `replaces_cue` and `replaces_floor`. The flag is independent of `drop_restatements`, `known_match`, `known_facts_context`, `consolidate_hold`, `consolidate_links`, `consolidate_components`, and `consolidate_key_rename`. Turning the flag on does not change the pass-1 prompt, and it does not add a partner or a pair.
+
+With both on, a judged supersede whose ordinary cue is false can be kept when the anchor's pass-1 `replaces` names the partner's stored value and that partner is the only live row in the neighbourhood that it names. A setting matches when the values are equal and the keys match or overlap. A rule matches when `replaces` has at least two tokens and those tokens are a subset of the stored rule, using the same tokenizer and stop words as the overlap test. Any other predicate, including `uses`, does not match. The partner has to be the same subject, or a component linked by `part_of` to the anchor's subject. A hedged or tentative quote does not match. A row opened in this session is not a partner, so it does not count toward uniqueness.
+
+For those closes only, the quote floor is "the quote names the new value": the quote is still verbatim in the evidence and still has at least two alphanumeric runs. A quote that fails that floor is dropped as `quote too short`. Every other pair keeps the 12-character floor. The judge's `supersedes`, the verbatim-quote check, and the rule that two supersedes on one anchor close none all stay.
+
+When a close is kept by this cue, the consolidate report counts `replaces_cue`. `replaces_floor` counts how many of those needed the relaxed floor. Both are omitted when zero. Off, those fields are absent.
+
+`--consolidate-replaces-cue` turns consolidation and this switch on for that bench run and writes both scratch-config keys. It does not turn on the hold, derived-from recording, component cues, key renames, or restatement dropping.
+
 ## Gate 5 — confidence and generic objects
 
 A fact whose confidence is below 0.6 drops as `low_confidence`. A generic object, an object equal to its subject, or an object past the length cap drops as `generic_object`. Bugs and releases use the same confidence floor before their fields are read. A setting with a named key whose value is one to three characters and contains no alphanumeric character and no whitespace skips the generic-object check, and the confidence floor still applies.
