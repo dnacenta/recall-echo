@@ -251,18 +251,37 @@ pub(crate) fn recall_binary() -> String {
 /// `/opt/apps/release/deps/bin/recall-echo`.
 #[must_use]
 pub(crate) fn is_build_dir(exe: &str) -> bool {
-    fn dir_name(dir: Option<&Path>) -> Option<&str> {
-        dir?.file_name()?.to_str()
+    let path = Path::new(exe);
+    profile_dir(path.parent()) || deps_profile(path) || cargo_out_dir(path)
+}
+
+fn dir_name(dir: Option<&Path>) -> Option<&str> {
+    dir?.file_name()?.to_str()
+}
+
+fn profile_dir(dir: Option<&Path>) -> bool {
+    matches!(dir_name(dir), Some("debug" | "release"))
+}
+
+fn deps_profile(path: &Path) -> bool {
+    dir_name(path.parent()) == Some("deps") && profile_dir(path.parent().and_then(Path::parent))
+}
+
+/// Cargo puts a test or build binary at `target/<profile>/build/<pkg>/<hash>/out`.
+fn cargo_out_dir(path: &Path) -> bool {
+    if dir_name(path.parent()) != Some("out") {
+        return false;
     }
-    let parent = Path::new(exe).parent();
-    match dir_name(parent) {
-        Some("debug" | "release") => true,
-        Some("deps") => matches!(
-            dir_name(parent.and_then(Path::parent)),
-            Some("debug" | "release")
-        ),
-        _ => false,
+    let mut saw_build = false;
+    let mut saw_profile = false;
+    for dir in path.ancestors().skip(2).take(4) {
+        match dir_name(Some(dir)) {
+            Some("build") => saw_build = true,
+            Some("debug" | "release") => saw_profile = true,
+            _ => {}
+        }
     }
+    saw_build && saw_profile
 }
 
 /// Environment variables an agent CLI reads to find its own user config, and
@@ -1299,6 +1318,7 @@ mod tests {
             "/opt/shared/target/debug/deps/recall_echo-1a2b3c",
             "/home/d/.cache/rust/release/deps/recall_echo-1a2b3c",
             "/home/d/build/debug/recall-echo",
+            "/opt/recall-echo/target/debug/build/recall-echo/abc/out/recall_echo-abc",
         ] {
             assert!(is_build_dir(exe), "{exe}");
         }
