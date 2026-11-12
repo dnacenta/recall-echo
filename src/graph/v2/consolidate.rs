@@ -101,6 +101,8 @@ struct Pair {
     evidence: String,
     stored: String,
     hold: bool,
+    /// Added by scoring `tokens(replaces)` after the ordinary candidates.
+    via_replaces: bool,
 }
 
 struct Loaded {
@@ -241,7 +243,10 @@ pub(crate) async fn run(
                 }
             }
             Step::Drop => report.consolidate.prefilter.drop += 1,
-            Step::Judge => waiting.push(pair.clone()),
+            Step::Judge => {
+                note_replaces_pair(ctx, pair, report);
+                waiting.push(pair.clone());
+            }
         }
     }
     let added = attach_holds(ctx, &ambiguous, &mut anchors, &loaded, &mut waiting, report);
@@ -689,43 +694,114 @@ fn finish_anchors(mut anchors: Vec<Anchor>, rows: &[Row]) -> Vec<Anchor> {
 }
 
 fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>, u32) {
-    let rows = &loaded.rows;
+    let (kept, overflow) = cap_candidates(gather_candidates(anchors, loaded, ctx));
+    extend_replaces(anchors, loaded, ctx, kept, overflow)
+}
+
+fn gather_candidates(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> Vec<Pair> {
     let neighbourhood = neighbourhood(anchors, loaded, ctx);
     let mut pairs = Vec::new();
     for (anchor_index, anchor) in anchors.iter().enumerate() {
-        let turn = cited(ctx, anchor);
-        for (partner_index, partner) in rows.iter().enumerate() {
-            if partner.pending || partner.here || !neighbourhood.contains(&partner.entity) {
-                continue;
-            }
-            if anchor.live == Some(partner_index) {
-                continue;
-            }
-            if sentences(turn).any(|sentence| enumerated(&partner.value, sentence)) {
-                continue;
-            }
-            // Identical values are pre-filter (d), not a coexist pair: the same
-            // string occupies one span, so the coexist helper would always match.
-            if !anchor.new_value.is_empty()
-                && !values_equal(&partner.value, &anchor.new_value)
-                && sentences(turn)
-                    .any(|sentence| coexist(&partner.value, &anchor.new_value, sentence))
-            {
-                continue;
-            }
-            let Some(score) = score(anchor, partner) else {
-                continue;
-            };
-            pairs.push(Pair {
-                anchor: anchor_index,
-                partner: partner_index,
+        collect_anchor(
+            &mut pairs,
+            anchor_index,
+            anchor,
+            loaded,
+            ctx,
+            &neighbourhood,
+        );
+    }
+    sort_candidates(&mut pairs, anchors, &loaded.rows);
+    pairs
+}
+
+fn collect_anchor(
+    pairs: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    neighbourhood: &BTreeSet<String>,
+) {
+    let turn = cited(ctx, anchor);
+    for (partner_index, partner) in loaded.rows.iter().enumerate() {
+        if let Some(score) = open_score(anchor, partner, partner_index, turn, neighbourhood) {
+            pairs.push(scored_pair(
+                anchor_index,
+                partner_index,
+                anchor,
+                partner,
+                turn,
                 score,
-                evidence: cut_evidence(turn, &[&anchor.value, &anchor.replaces, &anchor.quote]),
-                stored: stored_session(&partner.evidence),
-                hold: false,
-            });
+                false,
+            ));
         }
     }
+}
+
+fn open_score(
+    anchor: &Anchor,
+    partner: &Row,
+    partner_index: usize,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> Option<i32> {
+    if skip_partner(anchor, partner, partner_index, turn, neighbourhood) {
+        return None;
+    }
+    score(anchor, partner)
+}
+
+fn skip_partner(
+    anchor: &Anchor,
+    partner: &Row,
+    partner_index: usize,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> bool {
+    blocked_partner(partner, neighbourhood)
+        || anchor.live == Some(partner_index)
+        || listed_partner(turn, &partner.value)
+        || coexist_partner(anchor, partner, turn)
+}
+
+fn blocked_partner(partner: &Row, neighbourhood: &BTreeSet<String>) -> bool {
+    partner.pending || partner.here || !neighbourhood.contains(&partner.entity)
+}
+
+fn listed_partner(turn: &str, value: &str) -> bool {
+    sentences(turn).any(|sentence| enumerated(value, sentence))
+}
+
+/// Identical values are pre-filter, not a coexist pair: one string occupies
+/// one span, so the coexist helper would always match.
+fn coexist_partner(anchor: &Anchor, partner: &Row, turn: &str) -> bool {
+    !anchor.new_value.is_empty()
+        && !values_equal(&partner.value, &anchor.new_value)
+        && sentences(turn).any(|sentence| coexist(&partner.value, &anchor.new_value, sentence))
+}
+
+fn scored_pair(
+    anchor_index: usize,
+    partner_index: usize,
+    anchor: &Anchor,
+    partner: &Row,
+    turn: &str,
+    score: i32,
+    via_replaces: bool,
+) -> Pair {
+    Pair {
+        anchor: anchor_index,
+        partner: partner_index,
+        score,
+        evidence: cut_evidence(turn, &[&anchor.value, &anchor.replaces, &anchor.quote]),
+        stored: stored_session(&partner.evidence),
+        hold: false,
+        via_replaces,
+    }
+}
+
+fn sort_candidates(pairs: &mut [Pair], anchors: &[Anchor], rows: &[Row]) {
     pairs.sort_by(|left, right| {
         right
             .score
@@ -733,19 +809,123 @@ fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>
             .then_with(|| anchors[left.anchor].id.cmp(&anchors[right.anchor].id))
             .then_with(|| rows[left.partner].id.cmp(&rows[right.partner].id))
     });
+}
+
+fn cap_candidates(pairs: Vec<Pair>) -> (Vec<Pair>, u32) {
     let mut kept = Vec::new();
     let mut used: BTreeMap<usize, usize> = BTreeMap::new();
     let mut overflow = 0u32;
     for pair in pairs {
-        let count = used.entry(pair.anchor).or_insert(0);
-        if *count >= PER_ANCHOR || kept.len() >= CAP {
+        if !anchor_room(&used, &kept, pair.anchor) {
             overflow += 1;
             continue;
         }
-        *count += 1;
+        *used.entry(pair.anchor).or_insert(0) += 1;
         kept.push(pair);
     }
     (kept, overflow)
+}
+
+fn anchor_room(used: &BTreeMap<usize, usize>, kept: &[Pair], anchor: usize) -> bool {
+    used.get(&anchor).copied().unwrap_or(0) < PER_ANCHOR && kept.len() < CAP
+}
+
+fn extend_replaces(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    kept: Vec<Pair>,
+    overflow: u32,
+) -> (Vec<Pair>, u32) {
+    if !ctx.replaces_cue_on {
+        return (kept, overflow);
+    }
+    append_replaces(anchors, loaded, ctx, kept, overflow)
+}
+
+fn append_replaces(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    mut kept: Vec<Pair>,
+    mut overflow: u32,
+) -> (Vec<Pair>, u32) {
+    let neighbourhood = neighbourhood(anchors, loaded, ctx);
+    for (anchor_index, anchor) in anchors.iter().enumerate() {
+        let turn = cited(ctx, anchor);
+        for (partner_index, partner) in loaded.rows.iter().enumerate() {
+            overflow += push_replaces(
+                &mut kept,
+                anchor_index,
+                anchor,
+                partner_index,
+                partner,
+                turn,
+                &neighbourhood,
+            );
+        }
+    }
+    (kept, overflow)
+}
+
+fn push_replaces(
+    kept: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    partner_index: usize,
+    partner: &Row,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> u32 {
+    if skip_partner(anchor, partner, partner_index, turn, neighbourhood)
+        || score(anchor, partner).is_some()
+    {
+        return 0;
+    }
+    let Some(score) = score_replaces(anchor, partner) else {
+        return 0;
+    };
+    if !kept_room(kept, anchor_index) {
+        return 1;
+    }
+    kept.push(scored_pair(
+        anchor_index,
+        partner_index,
+        anchor,
+        partner,
+        turn,
+        score,
+        true,
+    ));
+    0
+}
+
+fn kept_room(kept: &[Pair], anchor: usize) -> bool {
+    let count = kept.iter().filter(|pair| pair.anchor == anchor).count();
+    count < PER_ANCHOR && kept.len() < CAP
+}
+
+fn score_replaces(anchor: &Anchor, partner: &Row) -> Option<i32> {
+    if !replaces_rule_pair(anchor, partner) {
+        return None;
+    }
+    let left = tokens(&anchor.replaces);
+    let right = tokens(&partner.value);
+    let shared = shared(&left, &right);
+    if !overlap_ok(shared, left.len(), right.len(), true) {
+        return None;
+    }
+    Some(2 + i32::from(same_name(&anchor.subject, &partner.subject)))
+}
+
+fn replaces_rule_pair(anchor: &Anchor, partner: &Row) -> bool {
+    anchor.pred == "rule" && partner.pred == "rule" && !anchor.replaces.trim().is_empty()
+}
+
+fn note_replaces_pair(ctx: &WriteCtx<'_>, pair: &Pair, report: &mut IngestionReport) {
+    if ctx.replaces_cue_on && pair.via_replaces {
+        add_count(&mut report.consolidate.pair_via_replaces);
+    }
 }
 
 fn classify(
@@ -3886,6 +4066,7 @@ fn attach_holds(
             evidence: cut_evidence(&text, &[&hold.old_value, &hold.new_value]),
             stored: stored_session(&loaded.rows[old_index].evidence),
             hold: true,
+            via_replaces: false,
         });
         report.hold.holds_ambiguous += 1;
         added += 1;
@@ -9791,6 +9972,7 @@ mod tests {
             evidence: String::new(),
             stored: String::new(),
             hold: false,
+            via_replaces: false,
         }
     }
 
@@ -11190,6 +11372,148 @@ mod tests {
         assert!(on.report.consolidate.replaces_cue.is_none());
         assert!(on.ended.is_none());
         assert!(off.ended.is_none());
+    }
+
+    fn rule_anchor() -> Anchor {
+        let mut anchor = cue_anchor(
+            "rule",
+            "",
+            "Move dupes into a holding folder",
+            "Only list dupes.",
+        );
+        anchor.value = anchor.new_value.clone();
+        anchor.text = format!("{} {}", anchor.value, anchor.replaces);
+        anchor.id = "a2:0".into();
+        anchor
+    }
+
+    fn rule_rows(values: &[&str]) -> Loaded {
+        let rows = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let mut row = cue_row("ent", "rule", "", value);
+                row.id = format!("s:ent:{index}");
+                row
+            })
+            .collect();
+        Loaded {
+            rows,
+            owners: vec![("ent".into(), "svc".into())],
+            part_of: Vec::new(),
+        }
+    }
+
+    fn select_both(loaded: &Loaded, on: bool) -> (Vec<Pair>, u32) {
+        let quiet = Quiet;
+        let project = ProjectIdentity {
+            name: "svc".into(),
+            aliases: Vec::new(),
+        };
+        let turns = [turn("Move dupes into a holding folder")];
+        let mut ctx = WriteCtx::new(&quiet, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_cue_on = on;
+        let anchors = vec![rule_anchor()];
+        select(&anchors, loaded, &ctx)
+    }
+
+    #[test]
+    fn a_rule_replaces_pair_is_scored_only_when_the_flag_is_on() {
+        let stored = "Only report dupes, list them at the end, leave them alone.";
+        let loaded = rule_rows(&[stored]);
+        let anchor = rule_anchor();
+        assert!(score(&anchor, &loaded.rows[0]).is_none());
+        assert!(score_replaces(&anchor, &loaded.rows[0]).is_some());
+        let (off, off_overflow) = select_both(&loaded, false);
+        let (on, on_overflow) = select_both(&loaded, true);
+        assert!(off.is_empty());
+        assert_eq!(off_overflow, 0);
+        assert_eq!(on.len(), 1);
+        assert!(on[0].via_replaces);
+        assert_eq!(on[0].partner, 0);
+        assert_eq!(on_overflow, 0);
+    }
+
+    #[test]
+    fn replaces_pairs_append_after_main_candidates_and_do_not_evict_them() {
+        let stored = "Only report dupes, list them at the end, leave them alone.";
+        let loaded = rule_rows(&[
+            "Move dupes into a holding folder soon",
+            "Move dupes into a holding folder today",
+            stored,
+        ]);
+        let anchor = rule_anchor();
+        assert!(score(&anchor, &loaded.rows[0]).is_some());
+        assert!(score(&anchor, &loaded.rows[1]).is_some());
+        assert!(score(&anchor, &loaded.rows[2]).is_none());
+        let (off, off_overflow) = select_both(&loaded, false);
+        let (on, on_overflow) = select_both(&loaded, true);
+        assert_eq!(off.len(), 2);
+        assert!(off.iter().all(|pair| !pair.via_replaces));
+        assert_eq!(off_overflow, 0);
+        assert_eq!(on.len(), 2);
+        assert_eq!(
+            on.iter().map(|pair| pair.partner).collect::<Vec<_>>(),
+            off.iter().map(|pair| pair.partner).collect::<Vec<_>>()
+        );
+        assert!(on.iter().all(|pair| !pair.via_replaces));
+        assert_eq!(on_overflow, 1);
+    }
+
+    async fn run_rule_pair(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let old = "Only report dupes, list them at the end, leave them alone.";
+        let new_value = "Move dupes into a holding folder";
+        let stored = rule("svc", Kind::Project, old, old);
+        commit(&gm, "s1", "2026-03-01", &[turn(old)], &[stored]).await;
+        let mut next = rule("svc", Kind::Project, new_value, new_value);
+        next.replaces = "Only list dupes.".into();
+        let turns = [turn(new_value)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", new_value)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended = ended(live_any(&slots(&gm, "svc").await, "", old)).map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_replaces_pair_is_judged_and_closed_only_when_the_flag_is_on() {
+        let off = run_rule_pair(false).await;
+        let again = run_rule_pair(false).await;
+        let on = run_rule_pair(true).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&again.report)
+        );
+        assert_eq!(off.ended, again.ended);
+        assert_eq!(off.message, again.message);
+        assert_eq!(off.calls, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert!(off.report.consolidate.pair_via_replaces.is_none());
+        assert!(!consolidate_snapshot(&off.report).contains("pair_via_replaces"));
+        assert_eq!(on.calls, 1);
+        assert!(on.message.contains("Only report dupes"));
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.replaces_cue, Some(1));
+        assert!(on.report.consolidate.replaces_floor.is_none());
+        assert_eq!(on.report.consolidate.pair_via_replaces, Some(1));
     }
 }
 

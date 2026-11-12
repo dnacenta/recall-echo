@@ -908,6 +908,10 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_floor: Option<u32>,
+    /// Pairs added by scoring `tokens(replaces)` that reached the judge.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_via_replaces: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1064,7 +1068,9 @@ impl ConsolidateReport {
     }
 
     fn replaces_counts_blank(&self) -> bool {
-        self.replaces_cue.unwrap_or(0) == 0 && self.replaces_floor.unwrap_or(0) == 0
+        self.replaces_cue.unwrap_or(0) == 0
+            && self.replaces_floor.unwrap_or(0) == 0
+            && self.pair_via_replaces.unwrap_or(0) == 0
     }
 }
 
@@ -1421,22 +1427,27 @@ mod tests {
         let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
         assert!(encoded.get("replaces_cue").is_none());
         assert!(encoded.get("replaces_floor").is_none());
+        assert!(encoded.get("pair_via_replaces").is_none());
         let mut report = ConsolidateReport {
             replaces_cue: Some(1),
             replaces_floor: Some(1),
+            pair_via_replaces: Some(1),
             ..ConsolidateReport::default()
         };
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["replaces_cue"], 1);
         assert_eq!(encoded["replaces_floor"], 1);
+        assert_eq!(encoded["pair_via_replaces"], 1);
         assert!(!report.is_blank());
         report.replaces_floor = None;
-        assert!(!report.is_blank());
         report.replaces_cue = None;
+        assert!(!report.is_blank());
+        report.pair_via_replaces = None;
         assert!(report.is_blank());
         let encoded = serde_json::to_value(&report).unwrap();
         assert!(encoded.get("replaces_cue").is_none());
         assert!(encoded.get("replaces_floor").is_none());
+        assert!(encoded.get("pair_via_replaces").is_none());
     }
 
     #[test]
