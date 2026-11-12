@@ -1827,12 +1827,79 @@ fn replaces_cue(
 }
 
 fn replaces_open(anchor: &Anchor, quote: &str) -> bool {
-    !anchor.replaces.trim().is_empty() && anchor.pred != "uses" && !quote_blocked(quote)
+    !anchor.replaces.trim().is_empty()
+        && anchor.pred != "uses"
+        && value_unhedged(quote, &anchor.new_value)
 }
 
-fn quote_blocked(quote: &str) -> bool {
+const SCOPED_HEDGE: &[&str] = &[
+    "maybe",
+    "might",
+    "perhaps",
+    "possibly",
+    "probably",
+    "could",
+    "considering",
+    "consider",
+    "if",
+    "unless",
+];
+
+/// The new value has a span, and that span is not under a nearby hedge.
+///
+/// Contrastive `not` and conditional `would` elsewhere in the quote do not count.
+/// The ordinary cue still uses [`hedged`] and [`tentative`] on the whole quote.
+fn value_unhedged(quote: &str, new_value: &str) -> bool {
+    let spans = value_spans(quote, new_value);
+    !spans.is_empty() && spans.iter().any(|span| clean_span(quote, *span))
+}
+
+fn clean_span(quote: &str, span: (usize, usize)) -> bool {
+    !clause_conditional(quote, span.0) && !marker_near(quote, span.0)
+}
+
+fn clause_conditional(quote: &str, at: usize) -> bool {
+    let words = cue_words(clause_head(quote, at));
+    matches!(
+        words.first().map(|(word, _, _)| word.as_str()),
+        Some("if" | "unless")
+    )
+}
+
+fn clause_head(quote: &str, at: usize) -> &str {
+    let start = clause_start(&quote[..at]);
+    &quote[start..at]
+}
+
+fn clause_start(head: &str) -> usize {
+    head.rfind(['.', '?', '!', ';', '\n'])
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn marker_near(quote: &str, at: usize) -> bool {
     let words = cue_words(quote);
-    hedged(quote, &words) || tentative(&words)
+    let mut before = Vec::new();
+    for (word, _, stop) in &words {
+        if *stop <= at {
+            before.push(word.as_str());
+        }
+    }
+    let start = before.len().saturating_sub(4);
+    scoped_in(&before[start..])
+}
+
+fn scoped_in(words: &[&str]) -> bool {
+    words.iter().any(|word| SCOPED_HEDGE.contains(word)) || hedge_phrase(words)
+}
+
+fn hedge_phrase(words: &[&str]) -> bool {
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0], pair[1]),
+            ("thinking", "about") | ("planning", "to")
+        )
+    })
 }
 
 fn replaces_match(anchor: &Anchor, partner: &Row) -> bool {
@@ -11179,14 +11246,14 @@ mod tests {
             &area,
             "maybe 8 attempts"
         ));
-        assert!(!replaces_cue(
+        assert!(replaces_cue(
             &anchor,
             &both.rows[0],
             &cue_loaded(vec![both.rows[0].clone()]),
             &area,
             "they said 8 attempts"
         ));
-        assert!(!replaces_cue(
+        assert!(replaces_cue(
             &anchor,
             &both.rows[0],
             &cue_loaded(vec![both.rows[0].clone()]),
@@ -11361,13 +11428,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_quote_that_misses_the_new_value_stays_too_short() {
+    async fn a_quote_that_misses_the_new_value_is_not_a_replaces_cue() {
         let quote = "the attempts";
         let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
         let on = run_setting_cue(quote, "retry_attempts", "5", &[], true).await;
         assert_eq!(on.message, off.message);
         assert_eq!(dropped(&off.report, "no departure cue"), 1);
-        assert_eq!(dropped(&on.report, "quote too short"), 1);
+        assert_eq!(dropped(&on.report, "no departure cue"), 1);
         assert_eq!(on.report.consolidate.closes_sup, 0);
         assert!(on.report.consolidate.replaces_cue.is_none());
         assert!(on.ended.is_none());
@@ -11514,6 +11581,114 @@ mod tests {
         assert_eq!(on.report.consolidate.replaces_cue, Some(1));
         assert!(on.report.consolidate.replaces_floor.is_none());
         assert_eq!(on.report.consolidate.pair_via_replaces, Some(1));
+    }
+
+    fn rule_cue(stored: &str, quote: &str) -> bool {
+        let anchor = cue_anchor(
+            "rule",
+            "",
+            "Move copies into a holding folder",
+            "Only list dupes.",
+        );
+        let partner = cue_row("ent", "rule", "", stored);
+        let loaded = cue_loaded(vec![partner]);
+        replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn contrastive_not_and_would_away_from_the_value_do_not_block() {
+        let stored = "Only report dupes, list them at the end, leave them alone.";
+        let open =
+            "Move copies into a holding folder, not just listed as the path they would have had";
+        let near = "might soon Move copies into a holding folder, not just listed as the path they would have had";
+        assert!(rule_cue(stored, open));
+        assert!(!rule_cue(stored, near));
+
+        let anchor = cue_anchor("setting", "max_attempts", "8", "5");
+        let partner = cue_row("ent", "setting", "retry_attempts", "5");
+        let loaded = cue_loaded(vec![partner]);
+        let area = cue_area(&["ent"]);
+        let holds = |quote: &str| replaces_cue(&anchor, &loaded.rows[0], &loaded, &area, quote);
+        assert!(holds(
+            "now 8 attempts, not just listed as the count they would have had"
+        ));
+        assert!(!holds("might take 8 attempts"));
+        assert!(!holds("If the saved count is later revised use 8 attempts"));
+        assert!(!holds("thinking about 8 attempts"));
+        assert!(!holds("planning to 8 attempts"));
+        assert!(!holds("perhaps 8 attempts"));
+        assert!(!holds("Unless revised, 8 attempts"));
+        assert!(holds("8 attempts?"));
+    }
+
+    #[test]
+    fn dupes_does_not_match_a_stored_rule_that_says_duplicates() {
+        let stored = "Only report duplicates, list them at the end, leave them alone.";
+        let quote = "Move copies into a holding folder";
+        assert!(!rule_cue(stored, quote));
+        assert!(rule_cue(
+            "Only report dupes, list them at the end, leave them alone.",
+            quote
+        ));
+    }
+
+    async fn run_exact_replaces(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let old = "Keep one copy and leave the rest.";
+        let new_value = "Move copies into a holding folder";
+        let quote =
+            "Move copies into a holding folder, not just listed as the path they would have had";
+        let stored = rule("svc", Kind::Project, old, old);
+        commit(&gm, "s1", "2026-03-01", &[turn(old)], &[stored]).await;
+        let mut next = rule("svc", Kind::Project, new_value, quote);
+        next.replaces = old.into();
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended = ended(live_any(&slots(&gm, "svc").await, "", old)).map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exact_replaces_closes_when_not_and_would_sit_away_from_the_value() {
+        let off = run_exact_replaces(false).await;
+        let again = run_exact_replaces(false).await;
+        let on = run_exact_replaces(true).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&again.report)
+        );
+        assert_eq!(off.ended, again.ended);
+        assert_eq!(off.message, on.message);
+        assert_eq!(off.calls, 1);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert!(on.report.consolidate.replaces_cue.unwrap_or(0) >= 1);
+        assert_eq!(on.report.consolidate.closes_sup, 1);
     }
 }
 
