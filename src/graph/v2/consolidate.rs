@@ -71,6 +71,9 @@ struct Row {
     from: String,
     here: bool,
     pending: bool,
+    /// Name of an edge object that was outside the loaded set.
+    /// The uses arm and earlier-turn scoring read this. `value` stays as loaded.
+    object_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -91,6 +94,9 @@ struct Anchor {
     a2: bool,
     /// Row id of the unique writer close that produced this anchor.
     closed_row: Option<String>,
+    /// `replaces` was named in an earlier turn of this session.
+    /// The cue still reads the cited turn. Counted, then ignored.
+    earlier_turn: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +109,9 @@ struct Pair {
     hold: bool,
     /// Added by scoring `tokens(replaces)` after the ordinary candidates.
     via_replaces: bool,
+    /// Added by the uses arm or the earlier-turn step.
+    /// When `value` is empty, those pairs read `object_name` instead.
+    named_object: bool,
 }
 
 struct Loaded {
@@ -128,7 +137,7 @@ pub(crate) async fn run(
     llm: &dyn LlmProvider,
     report: &mut IngestionReport,
 ) {
-    let rough = rough_anchors(facts, stats, ctx.components_on && ctx.links_on);
+    let rough = rough_anchors(facts, stats, ctx.components_on && ctx.links_on, ctx);
     let ambiguous = if ctx.hold_on {
         match super::hold::settle(gm, ctx, facts, report).await {
             Ok(open) => open,
@@ -166,7 +175,7 @@ pub(crate) async fn run(
             names.push(hold.subject.clone());
         }
     }
-    let Ok(loaded) = load_rows(
+    let Ok(mut loaded) = load_rows(
         gm,
         ctx.session_id,
         &names,
@@ -180,6 +189,11 @@ pub(crate) async fn run(
         report.hold.errors += count(ambiguous.len());
         return;
     };
+    if ctx.replaces_cue_on {
+        fill_edge_object_names(gm, &mut loaded.rows).await;
+    }
+    let (rough, skipped) = keep_loaded_earlier(rough, &loaded);
+    note_earlier_counts(ctx, &rough, skipped, report);
     let mut anchors = finish_anchors(rough, &loaded.rows);
     let (added, overflow) =
         push_derived_anchors(&mut anchors, &loaded.rows, &dependents, facts, stats);
@@ -244,7 +258,7 @@ pub(crate) async fn run(
             }
             Step::Drop => report.consolidate.prefilter.drop += 1,
             Step::Judge => {
-                note_replaces_pair(ctx, pair, report);
+                note_replaces_pair(ctx, &anchors, pair, report);
                 waiting.push(pair.clone());
             }
         }
@@ -256,7 +270,7 @@ pub(crate) async fn run(
     for pair in waiting {
         let key = cache_key(
             &anchors[pair.anchor],
-            &loaded.rows[pair.partner],
+            pair_old(&pair, &loaded.rows[pair.partner]),
             &pair.evidence,
         );
         match cache_get(gm, &key).await {
@@ -293,7 +307,11 @@ pub(crate) async fn run(
                         let anchor = &anchors[pair.anchor];
                         let _ = cache_put(
                             gm,
-                            &cache_key(anchor, &loaded.rows[pair.partner], &pair.evidence),
+                            &cache_key(
+                                anchor,
+                                pair_old(&pair, &loaded.rows[pair.partner]),
+                                &pair.evidence,
+                            ),
                             &verdict,
                             &quote,
                         )
@@ -326,6 +344,7 @@ pub(crate) async fn run(
             CueText {
                 turn,
                 quote: quote.as_str(),
+                old: pair_old(&pair, partner),
             },
             &look,
         );
@@ -333,7 +352,7 @@ pub(crate) async fn run(
             &verdict,
             &quote,
             &pair.evidence,
-            &partner.value,
+            pair_old(&pair, partner),
             &anchor.new_value,
             cue,
             Floor {
@@ -459,12 +478,125 @@ fn rough_anchors(
     facts: &[super::schema::Fact],
     stats: &WriteStats,
     link_rows: bool,
+    ctx: &WriteCtx<'_>,
 ) -> Vec<Anchor> {
     let mut anchors = Vec::new();
     push_retired(&mut anchors, facts, stats, link_rows);
     push_unconsumed(&mut anchors, facts, stats);
     push_new_anchors(&mut anchors, facts, stats);
+    if ctx.replaces_cue_on {
+        push_earlier_turn(&mut anchors, facts, stats, ctx);
+    }
     anchors
+}
+
+fn note_earlier_counts(
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    skipped: usize,
+    report: &mut IngestionReport,
+) {
+    if !ctx.replaces_cue_on {
+        return;
+    }
+    let made = anchors.iter().filter(|anchor| anchor.earlier_turn).count();
+    if made > 0 {
+        report.consolidate.anchor_earlier_turn = Some(count(made));
+    }
+    if skipped > 0 {
+        report.consolidate.anchor_earlier_turn_skipped = Some(count(skipped));
+    }
+}
+
+fn keep_loaded_earlier(anchors: Vec<Anchor>, loaded: &Loaded) -> (Vec<Anchor>, usize) {
+    let mut skipped = 0usize;
+    let kept = anchors
+        .into_iter()
+        .filter(|anchor| {
+            if !anchor.earlier_turn || subject_loaded(&anchor.subject, loaded) {
+                return true;
+            }
+            skipped += 1;
+            false
+        })
+        .collect();
+    (kept, skipped)
+}
+
+fn subject_loaded(subject: &str, loaded: &Loaded) -> bool {
+    loaded
+        .owners
+        .iter()
+        .any(|(_, name)| same_name(subject, name))
+}
+
+fn push_earlier_turn(
+    anchors: &mut Vec<Anchor>,
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+    ctx: &WriteCtx<'_>,
+) {
+    for (index, fact) in facts.iter().enumerate() {
+        if earlier_fact(fact, index, stats, ctx) {
+            anchors.push(earlier_anchor(fact, index));
+        }
+    }
+}
+
+fn earlier_fact(
+    fact: &super::schema::Fact,
+    index: usize,
+    stats: &WriteStats,
+    ctx: &WriteCtx<'_>,
+) -> bool {
+    fact.status == "decided"
+        && !fact.replaces.trim().is_empty()
+        && !stats.replaces_unconsumed.contains(&index)
+        && !new_anchor(fact, index, stats)
+        && cited_lacks_replaces(fact, ctx)
+        && earlier_has_replaces(fact, ctx)
+}
+
+/// Support failed because the cited turn has none of the content tokens.
+///
+/// A `replaces` value with no content token failed for a different reason.
+fn cited_lacks_replaces(fact: &super::schema::Fact, ctx: &WriteCtx<'_>) -> bool {
+    let need = support_tokens(fact.replaces.trim());
+    if need.is_empty() {
+        return false;
+    }
+    let have = support_tokens(cited_fact(fact, ctx));
+    !need.iter().any(|token| have.contains(token))
+}
+
+fn support_tokens(text: &str) -> Vec<String> {
+    alphanumeric_runs(text)
+        .into_iter()
+        .filter(|token| token.chars().count() >= 3)
+        .collect()
+}
+
+fn cited_fact<'a>(fact: &'a super::schema::Fact, ctx: &'a WriteCtx<'_>) -> &'a str {
+    ctx.turns
+        .iter()
+        .find(|turn| turn.index == fact.turn)
+        .map(|turn| turn.text.as_str())
+        .unwrap_or(fact.quote.as_str())
+}
+
+fn earlier_has_replaces(fact: &super::schema::Fact, ctx: &WriteCtx<'_>) -> bool {
+    let needle = fact.replaces.trim().to_lowercase();
+    !needle.is_empty()
+        && ctx
+            .turns
+            .iter()
+            .any(|turn| turn.index < fact.turn && turn.text.to_lowercase().contains(&needle))
+}
+
+fn earlier_anchor(fact: &super::schema::Fact, index: usize) -> Anchor {
+    let mut anchor = anchor_from_fact(fact, index, true);
+    anchor.earlier_turn = true;
+    anchor
 }
 
 fn push_retired(
@@ -572,6 +704,7 @@ fn a1_anchor(index: usize, retirement: &Retirement, facts: &[super::schema::Fact
         live: None,
         a2: false,
         closed_row: None,
+        earlier_turn: false,
     }
 }
 
@@ -670,6 +803,7 @@ fn anchor_from_fact(fact: &super::schema::Fact, index: usize, a2: bool) -> Ancho
         live: None,
         a2,
         closed_row: None,
+        earlier_turn: false,
     }
 }
 
@@ -706,6 +840,9 @@ fn gather_candidates(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) ->
     let neighbourhood = neighbourhood(anchors, loaded, ctx);
     let mut pairs = Vec::new();
     for (anchor_index, anchor) in anchors.iter().enumerate() {
+        if anchor.earlier_turn {
+            continue;
+        }
         collect_anchor(
             &mut pairs,
             anchor_index,
@@ -802,6 +939,7 @@ fn scored_pair(
         stored: stored_session(&partner.evidence),
         hold: false,
         via_replaces,
+        named_object: false,
     }
 }
 
@@ -844,7 +982,139 @@ fn extend_replaces(
     if !ctx.replaces_cue_on {
         return (kept, overflow);
     }
-    append_replaces(anchors, loaded, ctx, kept, overflow)
+    let (kept, overflow) = append_replaces(anchors, loaded, ctx, kept, overflow);
+    let (kept, overflow) = append_uses(anchors, loaded, ctx, kept, overflow);
+    append_earlier(anchors, loaded, ctx, kept, overflow)
+}
+
+fn append_uses(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    mut kept: Vec<Pair>,
+    mut overflow: u32,
+) -> (Vec<Pair>, u32) {
+    let neighbourhood = neighbourhood(anchors, loaded, ctx);
+    for (anchor_index, anchor) in anchors.iter().enumerate() {
+        if anchor.pred != "uses" || anchor.earlier_turn {
+            continue;
+        }
+        let turn = cited(ctx, anchor);
+        for (partner_index, partner) in loaded.rows.iter().enumerate() {
+            overflow += push_uses(
+                &mut kept,
+                anchor_index,
+                anchor,
+                partner_index,
+                partner,
+                turn,
+                &neighbourhood,
+            );
+        }
+    }
+    (kept, overflow)
+}
+
+fn push_uses(
+    kept: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    partner_index: usize,
+    partner: &Row,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> u32 {
+    if already_paired(kept, anchor_index, partner_index)
+        || skip_partner(anchor, partner, partner_index, turn, neighbourhood)
+        || score(anchor, partner).is_some()
+        || !uses_partner_match(anchor, partner)
+    {
+        return 0;
+    }
+    if !kept_room(kept, anchor_index) {
+        return 1;
+    }
+    let mut scored = scored_pair(anchor_index, partner_index, anchor, partner, turn, 1, false);
+    scored.named_object = true;
+    kept.push(scored);
+    0
+}
+
+fn append_earlier(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    mut kept: Vec<Pair>,
+    mut overflow: u32,
+) -> (Vec<Pair>, u32) {
+    let neighbourhood = neighbourhood(anchors, loaded, ctx);
+    for (anchor_index, anchor) in anchors.iter().enumerate() {
+        if !anchor.earlier_turn {
+            continue;
+        }
+        let turn = cited(ctx, anchor);
+        for (partner_index, partner) in loaded.rows.iter().enumerate() {
+            overflow += push_earlier(
+                &mut kept,
+                anchor_index,
+                anchor,
+                partner_index,
+                partner,
+                turn,
+                &neighbourhood,
+            );
+        }
+    }
+    (kept, overflow)
+}
+
+fn push_earlier(
+    kept: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    partner_index: usize,
+    partner: &Row,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> u32 {
+    if already_paired(kept, anchor_index, partner_index)
+        || skip_partner(anchor, partner, partner_index, turn, neighbourhood)
+    {
+        return 0;
+    }
+    let Some(found) = earlier_score(anchor, partner) else {
+        return 0;
+    };
+    if !kept_room(kept, anchor_index) {
+        return 1;
+    }
+    let mut scored = scored_pair(
+        anchor_index,
+        partner_index,
+        anchor,
+        partner,
+        turn,
+        found,
+        false,
+    );
+    scored.named_object = true;
+    kept.push(scored);
+    0
+}
+
+fn already_paired(kept: &[Pair], anchor: usize, partner: usize) -> bool {
+    kept.iter()
+        .any(|pair| pair.anchor == anchor && pair.partner == partner)
+}
+
+fn earlier_score(anchor: &Anchor, partner: &Row) -> Option<i32> {
+    if let Some(found) = score(anchor, partner) {
+        return Some(found);
+    }
+    if anchor.pred == "uses" && uses_partner_match(anchor, partner) {
+        return Some(1);
+    }
+    score_replaces(anchor, partner)
 }
 
 fn append_replaces(
@@ -926,9 +1196,20 @@ fn replaces_rule_pair(anchor: &Anchor, partner: &Row) -> bool {
     anchor.pred == "rule" && partner.pred == "rule" && !anchor.replaces.trim().is_empty()
 }
 
-fn note_replaces_pair(ctx: &WriteCtx<'_>, pair: &Pair, report: &mut IngestionReport) {
-    if ctx.replaces_cue_on && pair.via_replaces {
+fn note_replaces_pair(
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    pair: &Pair,
+    report: &mut IngestionReport,
+) {
+    if !ctx.replaces_cue_on {
+        return;
+    }
+    if pair.via_replaces {
         add_count(&mut report.consolidate.pair_via_replaces);
+    }
+    if anchors[pair.anchor].earlier_turn {
+        add_count(&mut report.consolidate.pair_via_earlier_turn);
     }
 }
 
@@ -1017,6 +1298,9 @@ fn neighbourhood(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> BTr
         names.insert(normalise(alias));
     }
     for anchor in anchors {
+        if anchor.earlier_turn {
+            continue;
+        }
         names.insert(normalise(&anchor.subject));
     }
     names.remove("");
@@ -1203,9 +1487,10 @@ fn wanted_names(anchors: &[Anchor], ctx: &WriteCtx<'_>) -> Vec<String> {
         }
     }
     for anchor in anchors {
-        if !anchor.subject.is_empty() {
-            names.insert(anchor.subject.clone());
+        if anchor.earlier_turn || anchor.subject.is_empty() {
+            continue;
         }
+        names.insert(anchor.subject.clone());
     }
     names.into_iter().take(NEIGHBOUR_CAP).collect()
 }
@@ -1693,6 +1978,7 @@ fn component_link(
 struct CueText<'a> {
     turn: &'a str,
     quote: &'a str,
+    old: &'a str,
 }
 
 struct CueInputs<'a> {
@@ -1741,6 +2027,7 @@ struct CueTally {
     rename: Option<RenameKind>,
     replaces: bool,
     replaces_floor: bool,
+    uses: bool,
 }
 
 impl CueTally {
@@ -1752,6 +2039,7 @@ impl CueTally {
             rename: None,
             replaces: false,
             replaces_floor: false,
+            uses: false,
         }
     }
 }
@@ -1766,8 +2054,8 @@ fn accept_cue(
     look: &RenameLook<'_>,
 ) -> (bool, CueTally) {
     let inputs = CueInputs {
-        depart: departs(text.turn, &partner.value, &anchor.replaces),
-        quoted: replacement_quote(text.quote, &partner.value, &anchor.new_value, &anchor.key),
+        depart: departs(text.turn, text.old, &anchor.replaces),
+        quoted: replacement_quote(text.quote, text.old, &anchor.new_value, &anchor.key),
         quote: text.quote,
     };
     let (cue, tally) = if !ctx.components_on {
@@ -1811,12 +2099,27 @@ fn mark_replaces(
     mut tally: CueTally,
 ) -> (bool, CueTally) {
     let area = neighbourhood(look.anchors, loaded, ctx);
-    if !replaces_cue(anchor, partner, loaded, &area, quote) {
+    let Some(uses) = replaces_hit_kind(anchor, partner, loaded, &area, quote) else {
         return (false, tally);
-    }
+    };
     tally.replaces = true;
     tally.replaces_floor = !quote_span(quote);
+    tally.uses = uses;
     (true, tally)
+}
+
+/// `Some(true)` when the uses arm matched. `Some(false)` for a setting or a rule.
+fn replaces_hit_kind(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    quote: &str,
+) -> Option<bool> {
+    if anchor.pred == "uses" {
+        return uses_replaces_cue(anchor, partner, loaded, area, quote).then_some(true);
+    }
+    replaces_cue(anchor, partner, loaded, area, quote).then_some(false)
 }
 
 fn replaces_relaxed(ctx: &WriteCtx<'_>, tally: &CueTally) -> bool {
@@ -1830,6 +2133,9 @@ fn count_replaces_close(ctx: &WriteCtx<'_>, report: &mut IngestionReport, tally:
     add_count(&mut report.consolidate.replaces_cue);
     if tally.replaces_floor {
         add_count(&mut report.consolidate.replaces_floor);
+    }
+    if tally.uses {
+        add_count(&mut report.consolidate.replaces_cue_uses);
     }
 }
 
@@ -1921,7 +2227,7 @@ fn clause_ready(
     new_value: &str,
     old: &str,
 ) -> bool {
-    clause_covers(have, want) && adds_word(have, old) && !negation_mismatch(clause, new_value)
+    clause_covers(have, want) && adds_word(have, want, old) && !negation_mismatch(clause, new_value)
 }
 
 fn hit_clean(quote: &str, have: &[NamePiece], want: &[NamePiece]) -> bool {
@@ -1937,9 +2243,10 @@ fn first_hit(have: &[NamePiece], want: &[NamePiece]) -> Option<usize> {
         .map(|got| got.at)
 }
 
-fn adds_word(have: &[NamePiece], old: &str) -> bool {
+fn adds_word(have: &[NamePiece], want: &[NamePiece], old: &str) -> bool {
     let prior = name_pieces(old, 0);
-    have.iter().any(|got| !known_word(got, &prior))
+    have.iter()
+        .any(|got| !known_word(got, &prior) && want.iter().any(|need| piece_eq(need, got)))
 }
 
 fn known_word(got: &NamePiece, prior: &[NamePiece]) -> bool {
@@ -1957,11 +2264,21 @@ fn negation_mismatch(clause: &str, new_value: &str) -> bool {
 }
 
 fn has_negation(text: &str) -> bool {
-    let words = raw_words(text);
+    let straight = straighten_quotes(text);
+    let words = raw_words(&straight);
     words
         .iter()
         .enumerate()
         .any(|(index, word)| lone_negation(&word.raw, next_raw(&words, index)))
+}
+
+fn straighten_quotes(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\u{2018}' | '\u{2019}' => '\'',
+            other => other,
+        })
+        .collect()
 }
 
 fn next_raw(words: &[RawWord], index: usize) -> Option<&str> {
@@ -1969,8 +2286,11 @@ fn next_raw(words: &[RawWord], index: usize) -> Option<&str> {
 }
 
 fn lone_negation(word: &str, next: Option<&str>) -> bool {
+    if word.ends_with("n't") {
+        return true;
+    }
     match word {
-        "not" | "no" | "never" | "without" | "don't" | "dont" => true,
+        "not" | "no" | "never" | "without" | "dont" => true,
         "do" => next == Some("not"),
         _ => false,
     }
@@ -2217,6 +2537,117 @@ fn replaces_match(anchor: &Anchor, partner: &Row) -> bool {
     }
 }
 
+/// A `uses` anchor with a non-empty `replaces`. The quote names the new value.
+fn uses_replaces_cue(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    quote: &str,
+) -> bool {
+    uses_ready(anchor, quote)
+        && uses_partner_match(anchor, partner)
+        && replaces_linked(anchor, partner, loaded)
+        && uses_unique(anchor, partner, loaded, area)
+}
+
+fn uses_ready(anchor: &Anchor, quote: &str) -> bool {
+    anchor.pred == "uses"
+        && !anchor.replaces.trim().is_empty()
+        && setting_named(quote, &anchor.new_value)
+}
+
+fn uses_partner_match(anchor: &Anchor, partner: &Row) -> bool {
+    let label = uses_label(partner);
+    match partner.pred.as_str() {
+        "uses" => uses_row_match(anchor, label),
+        "setting" => setting_uses_match(anchor, partner, label),
+        _ => false,
+    }
+}
+
+/// Edge object name when the target was outside the loaded set, otherwise `value`.
+fn uses_label(partner: &Row) -> &str {
+    match partner.object_name.as_deref() {
+        Some(name) if !name.is_empty() => name,
+        _ => partner.value.as_str(),
+    }
+}
+
+fn uses_row_match(anchor: &Anchor, label: &str) -> bool {
+    !covered_by_new(anchor, label) && uses_value_match(&anchor.replaces, label)
+}
+
+fn setting_uses_match(anchor: &Anchor, partner: &Row, label: &str) -> bool {
+    token_run(&anchor.replaces, label)
+        && !covered_by_new(anchor, label)
+        && (setting_key_related(anchor, partner) || !trivial_value(label))
+}
+
+/// Every token of the partner value is already a token of the new value.
+fn covered_by_new(anchor: &Anchor, label: &str) -> bool {
+    let fresh = alphanumeric_runs(&anchor.new_value);
+    let mine = alphanumeric_runs(label);
+    !mine.is_empty()
+        && mine
+            .iter()
+            .all(|token| fresh.iter().any(|item| item == token))
+}
+
+fn setting_key_related(anchor: &Anchor, partner: &Row) -> bool {
+    let names = tokens(&partner.subject);
+    keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
+}
+
+fn trivial_value(value: &str) -> bool {
+    let value = value.trim();
+    let folded = value.to_lowercase();
+    folded == "true" || folded == "false" || pure_number(value) || value.chars().count() <= 2
+}
+
+fn pure_number(value: &str) -> bool {
+    let mut chars = value.chars().peekable();
+    if matches!(chars.peek(), Some('+' | '-')) {
+        chars.next();
+    }
+    let mut digit = false;
+    let mut dot = false;
+    for ch in chars {
+        if ch.is_ascii_digit() {
+            digit = true;
+        } else if ch == '.' && !dot {
+            dot = true;
+        } else {
+            return false;
+        }
+    }
+    digit
+}
+
+fn uses_value_match(replaces: &str, value: &str) -> bool {
+    values_equal(value, replaces) || token_run(replaces, value)
+}
+
+/// `value` is one contiguous run of complete tokens inside `replaces`.
+fn token_run(replaces: &str, value: &str) -> bool {
+    !value.trim().is_empty() && !value_spans(replaces, value).is_empty()
+}
+
+fn uses_unique(anchor: &Anchor, partner: &Row, loaded: &Loaded, area: &BTreeSet<String>) -> bool {
+    let hits = loaded
+        .rows
+        .iter()
+        .filter(|row| uses_hit(anchor, row, loaded, area))
+        .count();
+    hits == 1 && uses_hit(anchor, partner, loaded, area)
+}
+
+fn uses_hit(anchor: &Anchor, row: &Row, loaded: &Loaded, area: &BTreeSet<String>) -> bool {
+    replaces_candidate(row, area)
+        && uses_partner_match(anchor, row)
+        && replaces_linked(anchor, row, loaded)
+}
+
 fn setting_replaces_match(anchor: &Anchor, partner: &Row) -> bool {
     values_equal(&anchor.replaces, &partner.value) && setting_keys(anchor, partner)
 }
@@ -2328,6 +2759,7 @@ fn kept_tally(links: &PairLinks, branch: Option<CueBranch>, made: bool) -> CueTa
         rename: None,
         replaces: false,
         replaces_floor: false,
+        uses: false,
     }
 }
 
@@ -3005,7 +3437,7 @@ async fn close_partner(
         subject: partner.subject.clone(),
         predicate: partner.pred.clone(),
         key: partner.key.clone(),
-        old_value: partner.value.clone(),
+        old_value: pair_old(pair, partner).to_string(),
         new_value: anchor.new_value.clone(),
     });
     None
@@ -3467,6 +3899,7 @@ fn decided_slot_row(session: &str, entity: &Entity, id: &str, index: usize, slot
             .into(),
         here: opened_here(slot.get("evidence"), session),
         pending: super::write::is_pending(slot),
+        object_name: None,
     }
 }
 
@@ -3495,6 +3928,37 @@ fn append_edge_rows(session: &str, edges: &[Value], built: &mut BuiltRows) {
     }
 }
 
+async fn fill_edge_object_names(gm: &GraphMemory, rows: &mut [Row]) {
+    for row in rows {
+        fill_one_edge(gm, row).await;
+    }
+}
+
+async fn fill_one_edge(gm: &GraphMemory, row: &mut Row) {
+    if !row.value.is_empty() || row.object_name.is_some() {
+        return;
+    }
+    let Some(id) = row.edge.clone() else {
+        return;
+    };
+    row.object_name = edge_target_name(gm, &id).await;
+}
+
+async fn edge_target_name(gm: &GraphMemory, id: &str) -> Option<String> {
+    let mut response = gm
+        .db()
+        .query("SELECT out.name AS name FROM type::record($id)")
+        .bind(("id", id.to_string()))
+        .await
+        .ok()?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0).ok()?;
+    let name = rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.get("name").and_then(Value::as_str).map(str::to_string))?;
+    (!name.is_empty()).then_some(name)
+}
+
 fn edge_row(
     session: &str,
     edge: &Value,
@@ -3517,6 +3981,7 @@ fn edge_row(
         here: opened_here(Some(&evidence), session),
         pending: edge.get("pending").is_some_and(Value::is_object),
         evidence,
+        object_name: None,
     }
 }
 
@@ -3818,6 +4283,7 @@ fn derived_anchor(
         live: Some(index),
         a2: false,
         closed_row: None,
+        earlier_turn: false,
     })
 }
 
@@ -3937,6 +4403,7 @@ fn slot_row(entity_id: &str, name: &str, index: usize, slot: &Value, session: &s
             .into(),
         here: opened_here(slot.get("evidence"), session),
         pending: super::write::is_pending(slot),
+        object_name: None,
     })
 }
 
@@ -4034,6 +4501,7 @@ fn push_capped_edge(
         here: opened_here(Some(&evidence), session),
         pending: edge.get("pending").is_some_and(Value::is_object),
         evidence,
+        object_name: None,
     });
 }
 
@@ -4112,11 +4580,21 @@ async fn cache_put(
     Ok(())
 }
 
-fn cache_key(anchor: &Anchor, partner: &Row, evidence: &str) -> String {
-    digest_key(
-        [&anchor.value, &anchor.new_value, &partner.value, evidence],
-        PROMPT,
-    )
+fn cache_key(anchor: &Anchor, old: &str, evidence: &str) -> String {
+    digest_key([&anchor.value, &anchor.new_value, old, evidence], PROMPT)
+}
+
+/// Stored value for a pair. Uses-arm and earlier-turn pairs read the edge
+/// object name when the loaded value is empty. Every other pair reads `value`.
+fn pair_old<'a>(pair: &Pair, partner: &'a Row) -> &'a str {
+    if pair.named_object && partner.value.is_empty() {
+        if let Some(name) = partner.object_name.as_deref() {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    partner.value.as_str()
 }
 
 fn digest_key(parts: [&str; 4], prompt: &str) -> String {
@@ -4137,7 +4615,7 @@ fn line(index: usize, pair: &Pair, anchors: &[Anchor], rows: &[Row], session: &s
         "{index} | {}:{} OLD=\"{}\" (stored {}) | NEW=\"{}\" ({session}, reason: {}) | EVIDENCE=\"{}\"",
         partner.subject,
         partner.key,
-        clip(&partner.value, 160),
+        clip(pair_old(pair, partner), 160),
         pair.stored,
         clip(&anchor.new_value, 160),
         anchor.reason,
@@ -4432,6 +4910,7 @@ fn attach_holds(
             live: Some(new_index),
             a2: false,
             closed_row: None,
+            earlier_turn: false,
         });
         waiting.push(Pair {
             anchor,
@@ -4441,6 +4920,7 @@ fn attach_holds(
             stored: stored_session(&loaded.rows[old_index].evidence),
             hold: true,
             via_replaces: false,
+            named_object: false,
         });
         report.hold.holds_ambiguous += 1;
         added += 1;
@@ -9658,6 +10138,7 @@ mod tests {
             live: None,
             a2: false,
             closed_row: None,
+            earlier_turn: false,
         }
     }
 
@@ -9675,6 +10156,7 @@ mod tests {
             from: String::new(),
             here: false,
             pending: false,
+            object_name: None,
         }
     }
 
@@ -9925,6 +10407,7 @@ mod tests {
                     rename: None,
                     replaces: false,
                     replaces_floor: false,
+                    uses: false,
                 },
                 false
             ),
@@ -9939,6 +10422,7 @@ mod tests {
                     rename: None,
                     replaces: false,
                     replaces_floor: false,
+                    uses: false,
                 },
                 false
             ),
@@ -10347,6 +10831,7 @@ mod tests {
             stored: String::new(),
             hold: false,
             via_replaces: false,
+            named_object: false,
         }
     }
 
@@ -12125,6 +12610,836 @@ mod tests {
         assert!(on.report.consolidate.replaces_cue.unwrap_or(0) >= 1);
         assert_eq!(on.report.consolidate.closes_sup, 1);
     }
+
+    fn component_uses(subject: &str, object: &str, quote: &str) -> Fact {
+        let mut fact = edge(
+            Predicate::Uses,
+            subject,
+            Kind::Component,
+            object,
+            Kind::Technology,
+        );
+        fact.quote = quote.into();
+        fact
+    }
+
+    fn part_of_component(child: &str, parent: &str) -> Fact {
+        edge(
+            Predicate::PartOf,
+            child,
+            Kind::Component,
+            parent,
+            Kind::Component,
+        )
+    }
+
+    fn spoken(index: usize, role: TurnRole, text: &str) -> Turn {
+        Turn {
+            index,
+            role,
+            text: text.into(),
+        }
+    }
+
+    fn uses_cue_for(replaces: &str, pred: &str, value: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("uses", "", "SQLite", replaces);
+        let partner = cue_row("ent", pred, "storage_format", value);
+        let loaded = cue_loaded(vec![partner]);
+        uses_replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    async fn sqlite_setting_case(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let stored = setting(
+            "acme",
+            Kind::Project,
+            "storage_format",
+            "JSON",
+            "storage_format is JSON",
+        );
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("storage_format is JSON")],
+            &[stored],
+        )
+        .await;
+        let quote = "Agreed, move to SQLite.";
+        let turn_text = format!("The shelf.json copy is the current file. {quote}");
+        let mut next = uses("acme", "SQLite", quote);
+        next.replaces = "shelf.json".into();
+        let turns = [turn(&turn_text)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats.replaces_unconsumed.contains(&0),
+            "writer closed a row: {:?}",
+            stats.retirements
+        );
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended = ended(live_any(
+            &slots(&gm, "acme").await,
+            "storage_format",
+            "JSON",
+        ))
+        .map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn ac1_uses_setting_partner_cues_only_when_the_flag_is_on() {
+        let off = sqlite_setting_case(false).await;
+        let on = sqlite_setting_case(true).await;
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_cue_uses.is_none());
+        assert!(off.report.consolidate.anchor_earlier_turn.is_none());
+        assert!(off.report.consolidate.pair_via_earlier_turn.is_none());
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.replaces_cue_uses, Some(1));
+    }
+
+    fn ended_uses(edges: &[Value], object: &str) -> usize {
+        edges
+            .iter()
+            .filter(|edge| {
+                edge.get("object").and_then(Value::as_str) == Some(object)
+                    && edge.get("ended_by").and_then(Value::as_str).is_some()
+            })
+            .count()
+    }
+
+    async fn httpx_case(second: bool, on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![
+            part_of_component("linkshelf", "fetch.py"),
+            component_uses("linkshelf", "requests", "linkshelf uses requests"),
+        ];
+        if second {
+            facts.push(part_of_component("parser", "fetch.py"));
+            facts.push(component_uses("parser", "requests", "parser uses requests"));
+        }
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("linkshelf uses requests")],
+            &facts,
+        )
+        .await;
+        let quote = "Fetch now calls httpx.";
+        let turn_text = format!("The requests library is still the one on linkshelf. {quote}");
+        let mut next = component_uses("fetch.py", "httpx", quote);
+        next.replaces = "requests".into();
+        let turns = [turn(&turn_text)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats.replaces_unconsumed.contains(&0),
+            "writer closed a row: {:?}",
+            stats.retirements
+        );
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", quote),
+            (2, "supersedes", quote),
+        ])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended =
+            (ended_uses(&uses_edges(&gm).await, "requests") > 0).then(|| "closed".to_string());
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn ac2_one_linked_uses_partner_cues_and_a_second_does_not() {
+        let one = httpx_case(false, true).await;
+        assert_eq!(one.calls, 1);
+        assert!(one.message.contains("requests"));
+        assert!(one.message.contains("OLD=\"requests\""));
+        assert!(!one.message.contains("OLD=\"\""));
+        assert_eq!(one.ended.as_deref(), Some("closed"));
+        assert_eq!(one.report.consolidate.closes_sup, 1);
+        assert_eq!(one.report.consolidate.replaces_cue_uses, Some(1));
+        let two = httpx_case(true, true).await;
+        assert!(two.calls >= 1);
+        assert!(two.report.consolidate.pairs >= 2);
+        assert_eq!(two.report.consolidate.closes_sup, 0);
+        assert!(two.ended.is_none());
+        assert!(two.report.consolidate.replaces_cue_uses.is_none());
+        assert!(dropped(&two.report, "no departure cue") >= 1);
+    }
+
+    fn verdicts_by_old(message: &str) -> String {
+        let quote = "Fetch now calls httpx.";
+        let pairs: Vec<Value> = message
+            .lines()
+            .filter_map(|line| {
+                let index = line.split(" | ").next()?.trim().parse::<usize>().ok()?;
+                let verdict = if line.contains("OLD=\"requests\"") {
+                    "duplicate"
+                } else if line.contains("OLD=\"urllib\"") {
+                    "unrelated"
+                } else {
+                    "unsure"
+                };
+                let quote = if verdict == "duplicate" { quote } else { "" };
+                Some(json!({"i": index, "verdict": verdict, "quote": quote}))
+            })
+            .collect();
+        serde_json::to_string(&json!({"pairs": pairs})).unwrap()
+    }
+
+    struct NamedVerdict {
+        message: Mutex<String>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for NamedVerdict {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            panic!("resolver called");
+        }
+
+        async fn complete_structured(
+            &self,
+            _: &str,
+            user_message: &str,
+            _: &Value,
+            _: u32,
+        ) -> Result<Completion, GraphError> {
+            *self.message.lock().expect("message") = user_message.to_string();
+            Ok(Completion::unmeasured(verdicts_by_old(user_message)))
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_set_uses_partners_keep_distinct_cache_keys() {
+        let (_tmp, gm) = open().await;
+        let facts = [
+            part_of_component("linkshelf", "fetch.py"),
+            part_of_component("parser", "fetch.py"),
+            component_uses("linkshelf", "requests", "linkshelf uses requests"),
+            component_uses("parser", "urllib", "parser uses urllib"),
+        ];
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("linkshelf uses requests. parser uses urllib")],
+            &facts,
+        )
+        .await;
+        let quote = "Fetch now calls httpx.";
+        let turn_text = format!("The requests library and urllib stay listed. {quote}");
+        let mut next = component_uses("fetch.py", "httpx", quote);
+        next.replaces = "requests urllib".into();
+        let turns = [turn(&turn_text)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats.replaces_unconsumed.contains(&0),
+            "{:?}",
+            stats.retirements
+        );
+        let stub = NamedVerdict {
+            message: Mutex::new(String::new()),
+        };
+        let project = project();
+        let mut ctx = WriteCtx::new(&stub, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_cue_on = true;
+        let mut report = IngestionReport::default();
+        run(
+            &gm,
+            &ctx,
+            std::slice::from_ref(&next),
+            &stats,
+            &stub,
+            &mut report,
+        )
+        .await;
+        let message = stub.message.lock().expect("message").clone();
+        assert!(message.contains("OLD=\"requests\""), "{message}");
+        assert!(message.contains("OLD=\"urllib\""), "{message}");
+        assert!(!message.contains("OLD=\"\""));
+        let mut response = gm
+            .db()
+            .query("SELECT key, verdict FROM consolidation_cache")
+            .await
+            .unwrap();
+        let cached: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        assert_eq!(cached.len(), 2, "{cached:?}");
+        assert_ne!(cached[0]["key"], cached[1]["key"]);
+        let verdicts: BTreeSet<_> = cached
+            .iter()
+            .filter_map(|row| row["verdict"].as_str())
+            .collect();
+        assert!(verdicts.contains("duplicate"), "{verdicts:?}");
+        assert!(verdicts.contains("unrelated"), "{verdicts:?}");
+        assert!(
+            report
+                .retirements
+                .iter()
+                .any(|row| row.old_value == "requests"),
+            "{:?}",
+            report.retirements
+        );
+        assert!(report
+            .retirements
+            .iter()
+            .all(|row| !row.old_value.is_empty()));
+    }
+
+    #[test]
+    fn ac3_token_runs_are_whole_tokens_only() {
+        let quote = "Agreed, move to SQLite.";
+        assert!(!uses_cue_for("shelf.jsonl", "setting", "JSON", quote));
+        assert!(!uses_cue_for("requests", "uses", "re", quote));
+        assert!(!uses_cue_for("requests", "setting", "re", quote));
+        assert!(uses_cue_for("shelf.json", "setting", "JSON", quote));
+    }
+
+    #[test]
+    fn ac4_the_quote_must_name_the_new_value_and_not_be_hedged() {
+        assert!(!uses_cue_for(
+            "shelf.json",
+            "setting",
+            "JSON",
+            "Agreed, move the file."
+        ));
+        assert!(!uses_cue_for(
+            "shelf.json",
+            "setting",
+            "JSON",
+            "maybe move to SQLite"
+        ));
+        assert!(uses_cue_for(
+            "shelf.json",
+            "setting",
+            "JSON",
+            "Agreed, move to SQLite."
+        ));
+    }
+
+    async fn earlier_json_case(on: bool, earlier: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let stored = setting("acme", Kind::Project, "store", "JSON", "store is JSON");
+        commit(&gm, "s1", "2026-03-01", &[turn("store is JSON")], &[stored]).await;
+        let quote = "Agreed, move to SQLite.";
+        let mut next = uses("acme", "SQLite", quote);
+        next.replaces = "JSON".into();
+        let turns = if earlier {
+            next.turn = 1;
+            vec![
+                spoken(0, TurnRole::Assistant, "The store was json last quarter."),
+                spoken(1, TurnRole::User, quote),
+            ]
+        } else {
+            vec![spoken(0, TurnRole::User, quote)]
+        };
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        assert!(
+            stats.replaces_unconsumed.is_empty(),
+            "writer consumed replaces: {:?}",
+            stats.retirements
+        );
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended = ended(live_any(&slots(&gm, "acme").await, "store", "JSON")).map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn ac5_earlier_turn_anchor_pairs_the_stored_row() {
+        let on = earlier_json_case(true, true).await;
+        assert_eq!(on.report.consolidate.anchor_earlier_turn, Some(1));
+        assert_eq!(on.report.consolidate.pair_via_earlier_turn, Some(1));
+        assert!(on.message.contains("JSON"), "{}", on.message);
+        assert_eq!(on.calls, 1);
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        let off = earlier_json_case(false, true).await;
+        assert_eq!(off.report.consolidate.anchors, 0);
+        assert_eq!(off.calls, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.anchor_earlier_turn.is_none());
+        assert!(off.report.consolidate.pair_via_earlier_turn.is_none());
+        let previous = earlier_json_case(true, false).await;
+        assert_eq!(previous.report.consolidate.anchors, 0);
+        assert_eq!(previous.calls, 0);
+        assert!(previous.report.consolidate.anchor_earlier_turn.is_none());
+        assert!(previous.ended.is_none());
+    }
+
+    fn indexed_row(index: usize, value: &str) -> Row {
+        let mut row = row_named("svc", "ent", "", value);
+        row.id = format!("s:ent:{index}");
+        row.slot = Some(index);
+        row
+    }
+
+    fn select_made(anchors: &[Anchor], loaded: &Loaded, on: bool) -> (Vec<Pair>, u32) {
+        let quiet = Quiet;
+        let project = ProjectIdentity {
+            name: "svc".into(),
+            aliases: Vec::new(),
+        };
+        let turns = [turn("noted today")];
+        let mut ctx = WriteCtx::new(&quiet, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_cue_on = on;
+        select(anchors, loaded, &ctx)
+    }
+
+    #[test]
+    fn ac6_earlier_turn_pair_overflows_without_reordering() {
+        let mut normal = anchor_named("svc", "pool", "alpha bravo charlie");
+        normal.id = "a3:0".into();
+        normal.text = "alpha bravo charlie".into();
+        normal.value = normal.new_value.clone();
+        let mut earlier = cue_anchor("uses", "", "SQLite", "shelf.json");
+        earlier.id = "a2:1".into();
+        earlier.a2 = true;
+        earlier.earlier_turn = true;
+        earlier.reason = "replaces";
+        earlier.value = earlier.new_value.clone();
+        earlier.text = format!("{} {}", earlier.new_value, earlier.replaces);
+        let base_rows = vec![
+            indexed_row(0, "alpha bravo nightly"),
+            indexed_row(1, "alpha bravo archive"),
+        ];
+        let base_loaded = Loaded {
+            rows: base_rows.clone(),
+            owners: vec![("ent".into(), "svc".into())],
+            part_of: Vec::new(),
+        };
+        let (base, base_overflow) = select_made(&[normal.clone()], &base_loaded, true);
+        assert_eq!(base.len(), 2);
+        assert_eq!(base_overflow, 0);
+        let mut rows = base_rows;
+        rows.push(indexed_row(2, "SQLite shelf copy"));
+        rows.push(indexed_row(3, "SQLite shelf archive"));
+        rows.push(indexed_row(4, "SQLite shelf nightly"));
+        let loaded = Loaded {
+            rows,
+            owners: vec![("ent".into(), "svc".into())],
+            part_of: Vec::new(),
+        };
+        let (kept, overflow) = select_made(&[normal, earlier], &loaded, true);
+        assert_eq!(overflow, 1);
+        assert_eq!(
+            kept.iter()
+                .take(base.len())
+                .map(|pair| (pair.anchor, pair.partner))
+                .collect::<Vec<_>>(),
+            base.iter()
+                .map(|pair| (pair.anchor, pair.partner))
+                .collect::<Vec<_>>()
+        );
+        let extra: Vec<_> = kept
+            .iter()
+            .filter(|pair| pair.anchor == 1)
+            .map(|pair| pair.partner)
+            .collect();
+        assert_eq!(extra, vec![2, 3]);
+        assert!(kept.iter().all(|pair| pair.partner != 4));
+    }
+
+    #[test]
+    fn ac7_filler_outside_both_rules_is_not_a_new_token() {
+        let old = "Squash merge pull requests";
+        let new_value = "Squash merge pull requests onto the trunk";
+        assert!(!ruled(
+            new_value,
+            old,
+            "Yes, squash merge pull requests as usual"
+        ));
+        assert!(ruled(new_value, old, new_value));
+    }
+
+    #[test]
+    fn ac8_curly_apostrophe_and_nt_forms_block_on_polarity() {
+        let old = "Skip the nightly suite";
+        let open = "Run tests on push";
+        let curly = "Don\u{2019}t run tests on push";
+        assert!(!ruled(open, old, curly));
+        assert!(!ruled(open, old, "We shouldn't run tests on push"));
+        assert!(!ruled(open, old, "We can't run tests on push"));
+        assert!(!ruled(open, old, "We won't run tests on push"));
+        assert!(ruled(open, old, open));
+        assert!(ruled(curly, old, curly));
+        assert!(ruled(
+            "Shouldn't run tests on push",
+            old,
+            "We shouldn't run tests on push"
+        ));
+    }
+
+    fn off_matches(left: &StoreSnap, right: &StoreSnap) {
+        assert_eq!(
+            consolidate_snapshot(&left.report),
+            consolidate_snapshot(&right.report)
+        );
+        assert_eq!(left.ended, right.ended);
+        assert_eq!(left.message, right.message);
+        assert_eq!(left.calls, right.calls);
+        let snapshot = consolidate_snapshot(&left.report);
+        assert!(!snapshot.contains("replaces_cue_uses"));
+        assert!(!snapshot.contains("anchor_earlier_turn"));
+        assert!(!snapshot.contains("pair_via_earlier_turn"));
+    }
+
+    #[tokio::test]
+    async fn ac9_flag_off_snapshots_match_for_uses_and_earlier_fixtures() {
+        let setting_off = sqlite_setting_case(false).await;
+        let setting_again = sqlite_setting_case(false).await;
+        let setting_on = sqlite_setting_case(true).await;
+        off_matches(&setting_off, &setting_again);
+        assert_eq!(setting_off.message, setting_on.message);
+        assert_eq!(setting_off.calls, setting_on.calls);
+
+        let uses_off = httpx_case(false, false).await;
+        let uses_again = httpx_case(false, false).await;
+        let uses_on = httpx_case(false, true).await;
+        off_matches(&uses_off, &uses_again);
+        assert_eq!(uses_off.calls, 0);
+        assert!(uses_off.message.is_empty());
+        assert_eq!(uses_on.calls, 1);
+        assert!(uses_on.message.contains("requests"));
+        assert_eq!(uses_on.report.consolidate.replaces_cue_uses, Some(1));
+
+        let early_off = earlier_json_case(false, true).await;
+        let early_again = earlier_json_case(false, true).await;
+        let early_on = earlier_json_case(true, true).await;
+        off_matches(&early_off, &early_again);
+        assert!(consolidate_snapshot(&early_on.report).contains("anchor_earlier_turn"));
+        assert!(!consolidate_snapshot(&early_off.report).contains("anchor_earlier_turn"));
+    }
+
+    #[test]
+    fn ac11_fixture_strings_stay_out_of_the_pass() {
+        let source = include_str!("consolidate.rs");
+        let production = source
+            .split("#[cfg(all(test, feature = \"embedded\"))]")
+            .next()
+            .expect("production half");
+        for needle in [
+            "shelf.json",
+            "SQLite",
+            "httpx",
+            "linkshelf",
+            "storage_format",
+            "Squash merge",
+        ] {
+            assert!(!production.contains(needle), "{needle}");
+        }
+    }
+
+    fn uses_named(new_value: &str, replaces: &str, pred: &str, value: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("uses", "", new_value, replaces);
+        let partner = cue_row("ent", pred, "storage_format", value);
+        let loaded = cue_loaded(vec![partner]);
+        uses_replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn uses_arm_skips_trivial_settings_and_a_partner_already_named_by_the_new_value() {
+        // `Docker` is the whole partner, and every token of it is in the new value.
+        assert!(!uses_named(
+            "Docker Compose v2",
+            "Docker Compose v1",
+            "uses",
+            "Docker",
+            "Move fetch to Docker Compose v2."
+        ));
+        // Every token of `Python` is already a token of `Python 3.12`.
+        assert!(!uses_named(
+            "Python 3.12",
+            "Python 3.8",
+            "uses",
+            "Python",
+            "Move the runtime to Python 3.12."
+        ));
+        assert!(!uses_named(
+            "Python 3.12",
+            "Python 3.8",
+            "setting",
+            "8",
+            "Move the runtime to Python 3.12."
+        ));
+        assert!(!uses_named(
+            "Keep going",
+            "flag true now",
+            "setting",
+            "true",
+            "Agreed, keep going."
+        ));
+        // The partner is only `json`, and the new value already says json.
+        // This is not the GraphQL residual, where the new value is GraphQL.
+        assert!(!uses_named(
+            "Adopt json",
+            "old json file",
+            "setting",
+            "json",
+            "Agreed, adopt json."
+        ));
+        assert!(!uses_named(
+            "Ship the api",
+            "endpoint v2 now",
+            "setting",
+            "v2",
+            "Agreed, ship the api."
+        ));
+        // `API` is the whole partner, and the new value is still `REST API`.
+        // This is not GraphQL replacing REST API.
+        assert!(!uses_named(
+            "REST API",
+            "legacy API",
+            "uses",
+            "API",
+            "Move the client to REST API."
+        ));
+    }
+
+    #[test]
+    fn a_partner_with_one_new_token_still_cues() {
+        assert!(uses_named(
+            "Python 3.12",
+            "Python 3.8",
+            "uses",
+            "Python 3.8",
+            "Move the runtime to Python 3.12."
+        ));
+        assert!(uses_named(
+            "Postgres 16",
+            "Postgres 14",
+            "uses",
+            "Postgres 14",
+            "Move the database to Postgres 16."
+        ));
+    }
+
+    #[test]
+    fn graphql_replacing_json_or_rest_still_cues() {
+        assert!(uses_named(
+            "GraphQL",
+            "the JSON API",
+            "setting",
+            "json",
+            "Move the endpoint to GraphQL."
+        ));
+        assert!(uses_named(
+            "GraphQL",
+            "REST API",
+            "uses",
+            "API",
+            "Move the endpoint to GraphQL."
+        ));
+    }
+
+    #[test]
+    fn a_fact_with_a_new_anchor_does_not_also_get_an_earlier_turn_anchor() {
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "store",
+            "SQLite",
+            "Agreed, move to SQLite.",
+        );
+        fact.replaces = "JSON".into();
+        fact.turn = 1;
+        let turns = [
+            spoken(0, TurnRole::User, "The store was json before."),
+            spoken(1, TurnRole::User, "Agreed, move to SQLite."),
+        ];
+        let quiet = Quiet;
+        let project = project();
+        let mut ctx = WriteCtx::new(&quiet, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_cue_on = true;
+        let stats = super::super::write::WriteStats::default();
+        let anchors = rough_anchors(std::slice::from_ref(&fact), &stats, false, &ctx);
+        assert_eq!(anchors.len(), 1);
+        assert!(!anchors[0].earlier_turn);
+        assert_eq!(anchors[0].reason, "new");
+    }
+
+    fn bare_edge(name: Option<&str>) -> Row {
+        let mut row = indexed_row(2, "");
+        row.pred = "uses".into();
+        row.slot = None;
+        row.edge = Some("relates_to:out".into());
+        row.id = "e:out".into();
+        row.value.clear();
+        row.object_name = name.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn an_out_of_set_edge_name_does_not_reorder_ordinary_pairs() {
+        let mut ordinary = anchor_named("svc", "pool", "alpha redis bravo");
+        ordinary.id = "a3:0".into();
+        ordinary.text = "alpha redis bravo".into();
+        ordinary.value = ordinary.new_value.clone();
+        let mut uses_anchor = cue_anchor("uses", "", "httpx", "redis");
+        uses_anchor.id = "a2:1".into();
+        uses_anchor.a2 = true;
+        uses_anchor.text = "httpx client".into();
+        uses_anchor.value = "httpx".into();
+        let settings = vec![
+            indexed_row(0, "alpha redis nightly"),
+            indexed_row(1, "alpha redis archive"),
+        ];
+        let owners = vec![("ent".into(), "svc".into())];
+        let mut off_rows = settings.clone();
+        off_rows.push(bare_edge(None));
+        let off_loaded = Loaded {
+            rows: off_rows,
+            owners: owners.clone(),
+            part_of: Vec::new(),
+        };
+        let mut on_rows = settings;
+        on_rows.push(bare_edge(Some("redis")));
+        assert!(on_rows[2].value.is_empty());
+        let on_loaded = Loaded {
+            rows: on_rows,
+            owners,
+            part_of: Vec::new(),
+        };
+        let anchors = vec![ordinary, uses_anchor];
+        let (off, _) = select_made(&anchors, &off_loaded, false);
+        let (on, _) = select_made(&anchors, &on_loaded, true);
+        assert!(!off.is_empty());
+        assert_eq!(
+            on.iter()
+                .take(off.len())
+                .map(|pair| (pair.anchor, pair.partner))
+                .collect::<Vec<_>>(),
+            off.iter()
+                .map(|pair| (pair.anchor, pair.partner))
+                .collect::<Vec<_>>()
+        );
+        assert!(on.iter().skip(off.len()).all(|pair| pair.anchor == 1));
+        assert!(on.len() > off.len());
+    }
+
+    async fn unloaded_subject_case(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let stored = setting(
+            "acme",
+            Kind::Project,
+            "retry_attempts",
+            "5",
+            "retry_attempts is 5",
+        );
+        let harbor = setting("harbor", Kind::Project, "store", "JSON", "store is JSON");
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("retry_attempts is 5. store is JSON")],
+            &[stored, harbor],
+        )
+        .await;
+        let quote = "Use 8 attempts from now on.";
+        let mut next = setting("acme", Kind::Project, "max_attempts", "8", quote);
+        next.replaces = "5".into();
+        next.turn = 1;
+        let mut elsewhere = uses("harbor", "SQLite", "Agreed, move to SQLite.");
+        elsewhere.replaces = "JSON".into();
+        elsewhere.turn = 1;
+        let turns = [
+            spoken(0, TurnRole::Assistant, "The store was json last quarter."),
+            spoken(1, TurnRole::User, quote),
+        ];
+        let facts = [next, elsewhere];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, &facts).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &facts,
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_earlier_subject_adds_no_anchor_and_no_pairs() {
+        let off = unloaded_subject_case(false).await;
+        let on = unloaded_subject_case(true).await;
+        assert_eq!(off.message, on.message);
+        assert_eq!(off.calls, on.calls);
+        assert!(on.calls >= 1);
+        assert!(!on.message.contains("harbor:"));
+        assert!(on.report.consolidate.anchor_earlier_turn.is_none());
+        assert_eq!(on.report.consolidate.anchor_earlier_turn_skipped, Some(1));
+        assert!(off.report.consolidate.anchor_earlier_turn_skipped.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -12242,6 +13557,7 @@ mod usable_anchor_tests {
             from: String::new(),
             here: false,
             pending,
+            object_name: None,
         }
     }
 
@@ -12292,6 +13608,7 @@ mod usable_anchor_tests {
             live: Some(0),
             a2: false,
             closed_row: None,
+            earlier_turn: false,
         }];
         let (kept, overflow) = capped_usable(&hits[1..2], &rows[..1], &bound, &stats);
         assert!(kept.is_empty());

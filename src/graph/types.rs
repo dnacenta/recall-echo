@@ -912,6 +912,22 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_via_replaces: Option<u32>,
+    /// Closes kept because a `uses` anchor supplied the `replaces` cue.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_cue_uses: Option<u32>,
+    /// Anchors added because `replaces` was named in an earlier turn.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_earlier_turn: Option<u32>,
+    /// Judged pairs whose anchor was one of [`Self::anchor_earlier_turn`].
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_via_earlier_turn: Option<u32>,
+    /// Earlier-turn anchors skipped because their subject was not already loaded.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_earlier_turn_skipped: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1071,6 +1087,10 @@ impl ConsolidateReport {
         self.replaces_cue.unwrap_or(0) == 0
             && self.replaces_floor.unwrap_or(0) == 0
             && self.pair_via_replaces.unwrap_or(0) == 0
+            && self.replaces_cue_uses.unwrap_or(0) == 0
+            && self.anchor_earlier_turn.unwrap_or(0) == 0
+            && self.pair_via_earlier_turn.unwrap_or(0) == 0
+            && self.anchor_earlier_turn_skipped.unwrap_or(0) == 0
     }
 }
 
@@ -1448,6 +1468,33 @@ mod tests {
         assert!(encoded.get("replaces_cue").is_none());
         assert!(encoded.get("replaces_floor").is_none());
         assert!(encoded.get("pair_via_replaces").is_none());
+    }
+
+    #[test]
+    fn ac10_new_counters_are_omitted_when_zero() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("replaces_cue_uses").is_none());
+        assert!(encoded.get("anchor_earlier_turn").is_none());
+        assert!(encoded.get("pair_via_earlier_turn").is_none());
+        let mut report = ConsolidateReport {
+            replaces_cue_uses: Some(1),
+            anchor_earlier_turn: Some(1),
+            pair_via_earlier_turn: Some(1),
+            ..ConsolidateReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["replaces_cue_uses"], 1);
+        assert_eq!(encoded["anchor_earlier_turn"], 1);
+        assert_eq!(encoded["pair_via_earlier_turn"], 1);
+        assert!(!report.is_blank());
+        report.replaces_cue_uses = None;
+        report.anchor_earlier_turn = None;
+        report.pair_via_earlier_turn = None;
+        assert!(report.is_blank());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(encoded.get("replaces_cue_uses").is_none());
+        assert!(encoded.get("anchor_earlier_turn").is_none());
+        assert!(encoded.get("pair_via_earlier_turn").is_none());
     }
 
     #[test]
