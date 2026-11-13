@@ -71,6 +71,9 @@ struct Row {
     from: String,
     here: bool,
     pending: bool,
+    /// Name of an edge object that was outside the loaded set.
+    /// The uses arm and earlier-turn scoring read this. `value` stays as loaded.
+    object_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -132,7 +135,6 @@ pub(crate) async fn run(
     report: &mut IngestionReport,
 ) {
     let rough = rough_anchors(facts, stats, ctx.components_on && ctx.links_on, ctx);
-    note_earlier_anchors(ctx, &rough, report);
     let ambiguous = if ctx.hold_on {
         match super::hold::settle(gm, ctx, facts, report).await {
             Ok(open) => open,
@@ -185,8 +187,10 @@ pub(crate) async fn run(
         return;
     };
     if ctx.replaces_cue_on {
-        fill_edge_values(gm, &mut loaded.rows).await;
+        fill_edge_object_names(gm, &mut loaded.rows).await;
     }
+    let (rough, skipped) = keep_loaded_earlier(rough, &loaded);
+    note_earlier_counts(ctx, &rough, skipped, report);
     let mut anchors = finish_anchors(rough, &loaded.rows);
     let (added, overflow) =
         push_derived_anchors(&mut anchors, &loaded.rows, &dependents, facts, stats);
@@ -478,7 +482,12 @@ fn rough_anchors(
     anchors
 }
 
-fn note_earlier_anchors(ctx: &WriteCtx<'_>, anchors: &[Anchor], report: &mut IngestionReport) {
+fn note_earlier_counts(
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    skipped: usize,
+    report: &mut IngestionReport,
+) {
     if !ctx.replaces_cue_on {
         return;
     }
@@ -486,6 +495,31 @@ fn note_earlier_anchors(ctx: &WriteCtx<'_>, anchors: &[Anchor], report: &mut Ing
     if made > 0 {
         report.consolidate.anchor_earlier_turn = Some(count(made));
     }
+    if skipped > 0 {
+        report.consolidate.anchor_earlier_turn_skipped = Some(count(skipped));
+    }
+}
+
+fn keep_loaded_earlier(anchors: Vec<Anchor>, loaded: &Loaded) -> (Vec<Anchor>, usize) {
+    let mut skipped = 0usize;
+    let kept = anchors
+        .into_iter()
+        .filter(|anchor| {
+            if !anchor.earlier_turn || subject_loaded(&anchor.subject, loaded) {
+                return true;
+            }
+            skipped += 1;
+            false
+        })
+        .collect();
+    (kept, skipped)
+}
+
+fn subject_loaded(subject: &str, loaded: &Loaded) -> bool {
+    loaded
+        .owners
+        .iter()
+        .any(|(_, name)| same_name(subject, name))
 }
 
 fn push_earlier_turn(
@@ -510,6 +544,7 @@ fn earlier_fact(
     fact.status == "decided"
         && !fact.replaces.trim().is_empty()
         && !stats.replaces_unconsumed.contains(&index)
+        && !new_anchor(fact, index, stats)
         && cited_lacks_replaces(fact, ctx)
         && earlier_has_replaces(fact, ctx)
 }
@@ -939,7 +974,67 @@ fn extend_replaces(
         return (kept, overflow);
     }
     let (kept, overflow) = append_replaces(anchors, loaded, ctx, kept, overflow);
+    let (kept, overflow) = append_uses(anchors, loaded, ctx, kept, overflow);
     append_earlier(anchors, loaded, ctx, kept, overflow)
+}
+
+fn append_uses(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    mut kept: Vec<Pair>,
+    mut overflow: u32,
+) -> (Vec<Pair>, u32) {
+    let neighbourhood = neighbourhood(anchors, loaded, ctx);
+    for (anchor_index, anchor) in anchors.iter().enumerate() {
+        if anchor.pred != "uses" || anchor.earlier_turn {
+            continue;
+        }
+        let turn = cited(ctx, anchor);
+        for (partner_index, partner) in loaded.rows.iter().enumerate() {
+            overflow += push_uses(
+                &mut kept,
+                anchor_index,
+                anchor,
+                partner_index,
+                partner,
+                turn,
+                &neighbourhood,
+            );
+        }
+    }
+    (kept, overflow)
+}
+
+fn push_uses(
+    kept: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    partner_index: usize,
+    partner: &Row,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> u32 {
+    if already_paired(kept, anchor_index, partner_index)
+        || skip_partner(anchor, partner, partner_index, turn, neighbourhood)
+        || score(anchor, partner).is_some()
+        || !uses_partner_match(anchor, partner)
+    {
+        return 0;
+    }
+    if !kept_room(kept, anchor_index) {
+        return 1;
+    }
+    kept.push(scored_pair(
+        anchor_index,
+        partner_index,
+        anchor,
+        partner,
+        turn,
+        1,
+        false,
+    ));
+    0
 }
 
 fn append_earlier(
@@ -1198,6 +1293,9 @@ fn neighbourhood(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> BTr
         names.insert(normalise(alias));
     }
     for anchor in anchors {
+        if anchor.earlier_turn {
+            continue;
+        }
         names.insert(normalise(&anchor.subject));
     }
     names.remove("");
@@ -1384,9 +1482,10 @@ fn wanted_names(anchors: &[Anchor], ctx: &WriteCtx<'_>) -> Vec<String> {
         }
     }
     for anchor in anchors {
-        if !anchor.subject.is_empty() {
-            names.insert(anchor.subject.clone());
+        if anchor.earlier_turn || anchor.subject.is_empty() {
+            continue;
         }
+        names.insert(anchor.subject.clone());
     }
     names.into_iter().take(NEIGHBOUR_CAP).collect()
 }
@@ -2453,11 +2552,67 @@ fn uses_ready(anchor: &Anchor, quote: &str) -> bool {
 }
 
 fn uses_partner_match(anchor: &Anchor, partner: &Row) -> bool {
+    let label = uses_label(partner);
     match partner.pred.as_str() {
-        "uses" => uses_value_match(&anchor.replaces, &partner.value),
-        "setting" => token_run(&anchor.replaces, &partner.value),
+        "uses" => uses_row_match(anchor, label),
+        "setting" => setting_uses_match(anchor, partner, label),
         _ => false,
     }
+}
+
+/// Edge object name when the target was outside the loaded set, otherwise `value`.
+fn uses_label(partner: &Row) -> &str {
+    match partner.object_name.as_deref() {
+        Some(name) if !name.is_empty() => name,
+        _ => partner.value.as_str(),
+    }
+}
+
+fn uses_row_match(anchor: &Anchor, label: &str) -> bool {
+    !shares_new_token(anchor, label) && uses_value_match(&anchor.replaces, label)
+}
+
+fn setting_uses_match(anchor: &Anchor, partner: &Row, label: &str) -> bool {
+    token_run(&anchor.replaces, label)
+        && !shares_new_token(anchor, label)
+        && (setting_key_related(anchor, partner) || !trivial_value(label))
+}
+
+fn shares_new_token(anchor: &Anchor, label: &str) -> bool {
+    let fresh = alphanumeric_runs(&anchor.new_value);
+    alphanumeric_runs(label)
+        .iter()
+        .any(|token| fresh.iter().any(|item| item == token))
+}
+
+fn setting_key_related(anchor: &Anchor, partner: &Row) -> bool {
+    let names = tokens(&partner.subject);
+    keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
+}
+
+fn trivial_value(value: &str) -> bool {
+    let value = value.trim();
+    let folded = value.to_lowercase();
+    folded == "true" || folded == "false" || pure_number(value) || value.chars().count() <= 2
+}
+
+fn pure_number(value: &str) -> bool {
+    let mut chars = value.chars().peekable();
+    if matches!(chars.peek(), Some('+' | '-')) {
+        chars.next();
+    }
+    let mut digit = false;
+    let mut dot = false;
+    for ch in chars {
+        if ch.is_ascii_digit() {
+            digit = true;
+        } else if ch == '.' && !dot {
+            dot = true;
+        } else {
+            return false;
+        }
+    }
+    digit
 }
 
 fn uses_value_match(replaces: &str, value: &str) -> bool {
@@ -3735,6 +3890,7 @@ fn decided_slot_row(session: &str, entity: &Entity, id: &str, index: usize, slot
             .into(),
         here: opened_here(slot.get("evidence"), session),
         pending: super::write::is_pending(slot),
+        object_name: None,
     }
 }
 
@@ -3763,22 +3919,20 @@ fn append_edge_rows(session: &str, edges: &[Value], built: &mut BuiltRows) {
     }
 }
 
-async fn fill_edge_values(gm: &GraphMemory, rows: &mut [Row]) {
+async fn fill_edge_object_names(gm: &GraphMemory, rows: &mut [Row]) {
     for row in rows {
         fill_one_edge(gm, row).await;
     }
 }
 
 async fn fill_one_edge(gm: &GraphMemory, row: &mut Row) {
-    if !row.value.is_empty() {
+    if !row.value.is_empty() || row.object_name.is_some() {
         return;
     }
     let Some(id) = row.edge.clone() else {
         return;
     };
-    if let Some(name) = edge_target_name(gm, &id).await {
-        row.value = name;
-    }
+    row.object_name = edge_target_name(gm, &id).await;
 }
 
 async fn edge_target_name(gm: &GraphMemory, id: &str) -> Option<String> {
@@ -3818,6 +3972,7 @@ fn edge_row(
         here: opened_here(Some(&evidence), session),
         pending: edge.get("pending").is_some_and(Value::is_object),
         evidence,
+        object_name: None,
     }
 }
 
@@ -4239,6 +4394,7 @@ fn slot_row(entity_id: &str, name: &str, index: usize, slot: &Value, session: &s
             .into(),
         here: opened_here(slot.get("evidence"), session),
         pending: super::write::is_pending(slot),
+        object_name: None,
     })
 }
 
@@ -4336,6 +4492,7 @@ fn push_capped_edge(
         here: opened_here(Some(&evidence), session),
         pending: edge.get("pending").is_some_and(Value::is_object),
         evidence,
+        object_name: None,
     });
 }
 
@@ -9979,6 +10136,7 @@ mod tests {
             from: String::new(),
             here: false,
             pending: false,
+            object_name: None,
         }
     }
 
@@ -12884,6 +13042,221 @@ mod tests {
             assert!(!production.contains(needle), "{needle}");
         }
     }
+
+    fn uses_named(new_value: &str, replaces: &str, pred: &str, value: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("uses", "", new_value, replaces);
+        let partner = cue_row("ent", pred, "storage_format", value);
+        let loaded = cue_loaded(vec![partner]);
+        uses_replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn uses_arm_skips_shared_tokens_and_trivial_settings() {
+        assert!(!uses_named(
+            "Docker Compose v2",
+            "Docker Compose v1",
+            "uses",
+            "Docker",
+            "Move fetch to Docker Compose v2."
+        ));
+        assert!(!uses_named(
+            "Python 3.12",
+            "Python 3.8",
+            "uses",
+            "Python",
+            "Move the runtime to Python 3.12."
+        ));
+        assert!(!uses_named(
+            "Python 3.12",
+            "Python 3.8",
+            "setting",
+            "8",
+            "Move the runtime to Python 3.12."
+        ));
+        assert!(!uses_named(
+            "Keep going",
+            "flag true now",
+            "setting",
+            "true",
+            "Agreed, keep going."
+        ));
+        assert!(!uses_named(
+            "Adopt json",
+            "old json file",
+            "setting",
+            "json",
+            "Agreed, adopt json."
+        ));
+        assert!(!uses_named(
+            "Ship the api",
+            "endpoint v2 now",
+            "setting",
+            "v2",
+            "Agreed, ship the api."
+        ));
+        assert!(!uses_named(
+            "REST API",
+            "legacy API",
+            "uses",
+            "API",
+            "Move the client to REST API."
+        ));
+    }
+
+    #[test]
+    fn a_fact_with_a_new_anchor_does_not_also_get_an_earlier_turn_anchor() {
+        let mut fact = setting(
+            "acme",
+            Kind::Project,
+            "store",
+            "SQLite",
+            "Agreed, move to SQLite.",
+        );
+        fact.replaces = "JSON".into();
+        fact.turn = 1;
+        let turns = [
+            spoken(0, TurnRole::User, "The store was json before."),
+            spoken(1, TurnRole::User, "Agreed, move to SQLite."),
+        ];
+        let quiet = Quiet;
+        let project = project();
+        let mut ctx = WriteCtx::new(&quiet, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_cue_on = true;
+        let stats = super::super::write::WriteStats::default();
+        let anchors = rough_anchors(std::slice::from_ref(&fact), &stats, false, &ctx);
+        assert_eq!(anchors.len(), 1);
+        assert!(!anchors[0].earlier_turn);
+        assert_eq!(anchors[0].reason, "new");
+    }
+
+    fn bare_edge(name: Option<&str>) -> Row {
+        let mut row = indexed_row(2, "");
+        row.pred = "uses".into();
+        row.slot = None;
+        row.edge = Some("relates_to:out".into());
+        row.id = "e:out".into();
+        row.value.clear();
+        row.object_name = name.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn an_out_of_set_edge_name_does_not_reorder_ordinary_pairs() {
+        let mut ordinary = anchor_named("svc", "pool", "alpha redis bravo");
+        ordinary.id = "a3:0".into();
+        ordinary.text = "alpha redis bravo".into();
+        ordinary.value = ordinary.new_value.clone();
+        let mut uses_anchor = cue_anchor("uses", "", "httpx", "redis");
+        uses_anchor.id = "a2:1".into();
+        uses_anchor.a2 = true;
+        uses_anchor.text = "httpx client".into();
+        uses_anchor.value = "httpx".into();
+        let settings = vec![
+            indexed_row(0, "alpha redis nightly"),
+            indexed_row(1, "alpha redis archive"),
+        ];
+        let owners = vec![("ent".into(), "svc".into())];
+        let mut off_rows = settings.clone();
+        off_rows.push(bare_edge(None));
+        let off_loaded = Loaded {
+            rows: off_rows,
+            owners: owners.clone(),
+            part_of: Vec::new(),
+        };
+        let mut on_rows = settings;
+        on_rows.push(bare_edge(Some("redis")));
+        assert!(on_rows[2].value.is_empty());
+        let on_loaded = Loaded {
+            rows: on_rows,
+            owners,
+            part_of: Vec::new(),
+        };
+        let anchors = vec![ordinary, uses_anchor];
+        let (off, _) = select_made(&anchors, &off_loaded, false);
+        let (on, _) = select_made(&anchors, &on_loaded, true);
+        assert!(!off.is_empty());
+        assert_eq!(
+            on.iter()
+                .take(off.len())
+                .map(|pair| (pair.anchor, pair.partner))
+                .collect::<Vec<_>>(),
+            off.iter()
+                .map(|pair| (pair.anchor, pair.partner))
+                .collect::<Vec<_>>()
+        );
+        assert!(on.iter().skip(off.len()).all(|pair| pair.anchor == 1));
+        assert!(on.len() > off.len());
+    }
+
+    async fn unloaded_subject_case(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let stored = setting(
+            "acme",
+            Kind::Project,
+            "retry_attempts",
+            "5",
+            "retry_attempts is 5",
+        );
+        let harbor = setting("harbor", Kind::Project, "store", "JSON", "store is JSON");
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn("retry_attempts is 5. store is JSON")],
+            &[stored, harbor],
+        )
+        .await;
+        let quote = "Use 8 attempts from now on.";
+        let mut next = setting("acme", Kind::Project, "max_attempts", "8", quote);
+        next.replaces = "5".into();
+        next.turn = 1;
+        let mut elsewhere = uses("harbor", "SQLite", "Agreed, move to SQLite.");
+        elsewhere.replaces = "JSON".into();
+        elsewhere.turn = 1;
+        let turns = [
+            spoken(0, TurnRole::Assistant, "The store was json last quarter."),
+            spoken(1, TurnRole::User, quote),
+        ];
+        let facts = [next, elsewhere];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, &facts).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &facts,
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_earlier_subject_adds_no_anchor_and_no_pairs() {
+        let off = unloaded_subject_case(false).await;
+        let on = unloaded_subject_case(true).await;
+        assert_eq!(off.message, on.message);
+        assert_eq!(off.calls, on.calls);
+        assert!(on.calls >= 1);
+        assert!(!on.message.contains("harbor:"));
+        assert!(on.report.consolidate.anchor_earlier_turn.is_none());
+        assert_eq!(on.report.consolidate.anchor_earlier_turn_skipped, Some(1));
+        assert!(off.report.consolidate.anchor_earlier_turn_skipped.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -13001,6 +13374,7 @@ mod usable_anchor_tests {
             from: String::new(),
             here: false,
             pending,
+            object_name: None,
         }
     }
 

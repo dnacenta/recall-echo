@@ -924,6 +924,10 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_via_earlier_turn: Option<u32>,
+    /// Earlier-turn anchors skipped because their subject was not already loaded.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_earlier_turn_skipped: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1086,6 +1090,7 @@ impl ConsolidateReport {
             && self.replaces_cue_uses.unwrap_or(0) == 0
             && self.anchor_earlier_turn.unwrap_or(0) == 0
             && self.pair_via_earlier_turn.unwrap_or(0) == 0
+            && self.anchor_earlier_turn_skipped.unwrap_or(0) == 0
     }
 }
 
