@@ -101,6 +101,8 @@ struct Pair {
     evidence: String,
     stored: String,
     hold: bool,
+    /// Added by scoring `tokens(replaces)` after the ordinary candidates.
+    via_replaces: bool,
 }
 
 struct Loaded {
@@ -241,7 +243,10 @@ pub(crate) async fn run(
                 }
             }
             Step::Drop => report.consolidate.prefilter.drop += 1,
-            Step::Judge => waiting.push(pair.clone()),
+            Step::Judge => {
+                note_replaces_pair(ctx, pair, report);
+                waiting.push(pair.clone());
+            }
         }
     }
     let added = attach_holds(ctx, &ambiguous, &mut anchors, &loaded, &mut waiting, report);
@@ -331,6 +336,11 @@ pub(crate) async fn run(
             &partner.value,
             &anchor.new_value,
             cue,
+            Floor {
+                relaxed: replaces_relaxed(ctx, &tally),
+                rule: anchor.pred == "rule",
+                old: &anchor.replaces,
+            },
         ) {
             Ok(verdict) => accepted.push((pair, verdict.to_string(), quote, tally)),
             Err(reason) => note_drop(report, reason, &anchors, &loaded.rows, &pair, &quote),
@@ -399,6 +409,7 @@ pub(crate) async fn run(
                 if ctx.rename_on {
                     count_rename(report, tally);
                 }
+                count_replaces_close(ctx, report, tally);
                 gone.insert(pair.partner);
                 if pair.hold {
                     report.hold.holds_confirmed += 1;
@@ -687,43 +698,114 @@ fn finish_anchors(mut anchors: Vec<Anchor>, rows: &[Row]) -> Vec<Anchor> {
 }
 
 fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>, u32) {
-    let rows = &loaded.rows;
+    let (kept, overflow) = cap_candidates(gather_candidates(anchors, loaded, ctx));
+    extend_replaces(anchors, loaded, ctx, kept, overflow)
+}
+
+fn gather_candidates(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> Vec<Pair> {
     let neighbourhood = neighbourhood(anchors, loaded, ctx);
     let mut pairs = Vec::new();
     for (anchor_index, anchor) in anchors.iter().enumerate() {
-        let turn = cited(ctx, anchor);
-        for (partner_index, partner) in rows.iter().enumerate() {
-            if partner.pending || partner.here || !neighbourhood.contains(&partner.entity) {
-                continue;
-            }
-            if anchor.live == Some(partner_index) {
-                continue;
-            }
-            if sentences(turn).any(|sentence| enumerated(&partner.value, sentence)) {
-                continue;
-            }
-            // Identical values are pre-filter (d), not a coexist pair: the same
-            // string occupies one span, so the coexist helper would always match.
-            if !anchor.new_value.is_empty()
-                && !values_equal(&partner.value, &anchor.new_value)
-                && sentences(turn)
-                    .any(|sentence| coexist(&partner.value, &anchor.new_value, sentence))
-            {
-                continue;
-            }
-            let Some(score) = score(anchor, partner) else {
-                continue;
-            };
-            pairs.push(Pair {
-                anchor: anchor_index,
-                partner: partner_index,
+        collect_anchor(
+            &mut pairs,
+            anchor_index,
+            anchor,
+            loaded,
+            ctx,
+            &neighbourhood,
+        );
+    }
+    sort_candidates(&mut pairs, anchors, &loaded.rows);
+    pairs
+}
+
+fn collect_anchor(
+    pairs: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    neighbourhood: &BTreeSet<String>,
+) {
+    let turn = cited(ctx, anchor);
+    for (partner_index, partner) in loaded.rows.iter().enumerate() {
+        if let Some(score) = open_score(anchor, partner, partner_index, turn, neighbourhood) {
+            pairs.push(scored_pair(
+                anchor_index,
+                partner_index,
+                anchor,
+                partner,
+                turn,
                 score,
-                evidence: cut_evidence(turn, &[&anchor.value, &anchor.replaces, &anchor.quote]),
-                stored: stored_session(&partner.evidence),
-                hold: false,
-            });
+                false,
+            ));
         }
     }
+}
+
+fn open_score(
+    anchor: &Anchor,
+    partner: &Row,
+    partner_index: usize,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> Option<i32> {
+    if skip_partner(anchor, partner, partner_index, turn, neighbourhood) {
+        return None;
+    }
+    score(anchor, partner)
+}
+
+fn skip_partner(
+    anchor: &Anchor,
+    partner: &Row,
+    partner_index: usize,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> bool {
+    blocked_partner(partner, neighbourhood)
+        || anchor.live == Some(partner_index)
+        || listed_partner(turn, &partner.value)
+        || coexist_partner(anchor, partner, turn)
+}
+
+fn blocked_partner(partner: &Row, neighbourhood: &BTreeSet<String>) -> bool {
+    partner.pending || partner.here || !neighbourhood.contains(&partner.entity)
+}
+
+fn listed_partner(turn: &str, value: &str) -> bool {
+    sentences(turn).any(|sentence| enumerated(value, sentence))
+}
+
+/// Identical values are pre-filter, not a coexist pair: one string occupies
+/// one span, so the coexist helper would always match.
+fn coexist_partner(anchor: &Anchor, partner: &Row, turn: &str) -> bool {
+    !anchor.new_value.is_empty()
+        && !values_equal(&partner.value, &anchor.new_value)
+        && sentences(turn).any(|sentence| coexist(&partner.value, &anchor.new_value, sentence))
+}
+
+fn scored_pair(
+    anchor_index: usize,
+    partner_index: usize,
+    anchor: &Anchor,
+    partner: &Row,
+    turn: &str,
+    score: i32,
+    via_replaces: bool,
+) -> Pair {
+    Pair {
+        anchor: anchor_index,
+        partner: partner_index,
+        score,
+        evidence: cut_evidence(turn, &[&anchor.value, &anchor.replaces, &anchor.quote]),
+        stored: stored_session(&partner.evidence),
+        hold: false,
+        via_replaces,
+    }
+}
+
+fn sort_candidates(pairs: &mut [Pair], anchors: &[Anchor], rows: &[Row]) {
     pairs.sort_by(|left, right| {
         right
             .score
@@ -731,19 +813,123 @@ fn select(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> (Vec<Pair>
             .then_with(|| anchors[left.anchor].id.cmp(&anchors[right.anchor].id))
             .then_with(|| rows[left.partner].id.cmp(&rows[right.partner].id))
     });
+}
+
+fn cap_candidates(pairs: Vec<Pair>) -> (Vec<Pair>, u32) {
     let mut kept = Vec::new();
     let mut used: BTreeMap<usize, usize> = BTreeMap::new();
     let mut overflow = 0u32;
     for pair in pairs {
-        let count = used.entry(pair.anchor).or_insert(0);
-        if *count >= PER_ANCHOR || kept.len() >= CAP {
+        if !anchor_room(&used, &kept, pair.anchor) {
             overflow += 1;
             continue;
         }
-        *count += 1;
+        *used.entry(pair.anchor).or_insert(0) += 1;
         kept.push(pair);
     }
     (kept, overflow)
+}
+
+fn anchor_room(used: &BTreeMap<usize, usize>, kept: &[Pair], anchor: usize) -> bool {
+    used.get(&anchor).copied().unwrap_or(0) < PER_ANCHOR && kept.len() < CAP
+}
+
+fn extend_replaces(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    kept: Vec<Pair>,
+    overflow: u32,
+) -> (Vec<Pair>, u32) {
+    if !ctx.replaces_cue_on {
+        return (kept, overflow);
+    }
+    append_replaces(anchors, loaded, ctx, kept, overflow)
+}
+
+fn append_replaces(
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    ctx: &WriteCtx<'_>,
+    mut kept: Vec<Pair>,
+    mut overflow: u32,
+) -> (Vec<Pair>, u32) {
+    let neighbourhood = neighbourhood(anchors, loaded, ctx);
+    for (anchor_index, anchor) in anchors.iter().enumerate() {
+        let turn = cited(ctx, anchor);
+        for (partner_index, partner) in loaded.rows.iter().enumerate() {
+            overflow += push_replaces(
+                &mut kept,
+                anchor_index,
+                anchor,
+                partner_index,
+                partner,
+                turn,
+                &neighbourhood,
+            );
+        }
+    }
+    (kept, overflow)
+}
+
+fn push_replaces(
+    kept: &mut Vec<Pair>,
+    anchor_index: usize,
+    anchor: &Anchor,
+    partner_index: usize,
+    partner: &Row,
+    turn: &str,
+    neighbourhood: &BTreeSet<String>,
+) -> u32 {
+    if skip_partner(anchor, partner, partner_index, turn, neighbourhood)
+        || score(anchor, partner).is_some()
+    {
+        return 0;
+    }
+    let Some(score) = score_replaces(anchor, partner) else {
+        return 0;
+    };
+    if !kept_room(kept, anchor_index) {
+        return 1;
+    }
+    kept.push(scored_pair(
+        anchor_index,
+        partner_index,
+        anchor,
+        partner,
+        turn,
+        score,
+        true,
+    ));
+    0
+}
+
+fn kept_room(kept: &[Pair], anchor: usize) -> bool {
+    let count = kept.iter().filter(|pair| pair.anchor == anchor).count();
+    count < PER_ANCHOR && kept.len() < CAP
+}
+
+fn score_replaces(anchor: &Anchor, partner: &Row) -> Option<i32> {
+    if !replaces_rule_pair(anchor, partner) {
+        return None;
+    }
+    let left = tokens(&anchor.replaces);
+    let right = tokens(&partner.value);
+    let shared = shared(&left, &right);
+    if !overlap_ok(shared, left.len(), right.len(), true) {
+        return None;
+    }
+    Some(2 + i32::from(same_name(&anchor.subject, &partner.subject)))
+}
+
+fn replaces_rule_pair(anchor: &Anchor, partner: &Row) -> bool {
+    anchor.pred == "rule" && partner.pred == "rule" && !anchor.replaces.trim().is_empty()
+}
+
+fn note_replaces_pair(ctx: &WriteCtx<'_>, pair: &Pair, report: &mut IngestionReport) {
+    if ctx.replaces_cue_on && pair.via_replaces {
+        add_count(&mut report.consolidate.pair_via_replaces);
+    }
 }
 
 fn classify(
@@ -849,6 +1035,12 @@ fn neighbourhood(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> BTr
     ids
 }
 
+struct Floor<'a> {
+    relaxed: bool,
+    rule: bool,
+    old: &'a str,
+}
+
 fn accept(
     verdict: &str,
     quote: &str,
@@ -856,27 +1048,86 @@ fn accept(
     old: &str,
     new_value: &str,
     cue: bool,
+    floor: Floor,
 ) -> Result<&'static str, &'static str> {
+    if let Some(kind) = pass_verdict(verdict) {
+        return Ok(kind);
+    }
     let duplicate = verdict == "duplicate";
-    if verdict != "supersedes" && !duplicate {
-        return Ok(if verdict == "unrelated" {
-            "unrelated"
-        } else {
-            "unsure"
-        });
-    }
-    if !quote_span(quote) {
-        return Err(DROP_QUOTE_SHORT);
-    }
-    let in_evidence = contains_folded(evidence, quote);
-    let in_value = duplicate && (contains_folded(old, quote) || contains_folded(new_value, quote));
-    if !(in_evidence || in_value) {
-        return Err(DROP_QUOTE_MISSING);
+    if let Some(reason) = block_quote(quote, evidence, old, new_value, duplicate, floor) {
+        return Err(reason);
     }
     if verdict == "supersedes" && !cue {
         return Err(DROP_NO_CUE);
     }
     Ok(if duplicate { "duplicate" } else { "supersedes" })
+}
+
+fn pass_verdict(verdict: &str) -> Option<&'static str> {
+    if verdict == "supersedes" || verdict == "duplicate" {
+        return None;
+    }
+    Some(if verdict == "unrelated" {
+        "unrelated"
+    } else {
+        "unsure"
+    })
+}
+
+fn block_quote(
+    quote: &str,
+    evidence: &str,
+    old: &str,
+    new_value: &str,
+    duplicate: bool,
+    floor: Floor,
+) -> Option<&'static str> {
+    if !quote_floor(quote, new_value, &floor) {
+        return Some(DROP_QUOTE_SHORT);
+    }
+    if !quote_supported(quote, evidence, old, new_value, duplicate) {
+        return Some(DROP_QUOTE_MISSING);
+    }
+    None
+}
+
+fn quote_floor(quote: &str, new_value: &str, floor: &Floor<'_>) -> bool {
+    if floor.relaxed {
+        relaxed_span(quote, new_value, floor)
+    } else {
+        quote_span(quote)
+    }
+}
+
+/// Two alphanumeric runs, and the quote names the new value.
+///
+/// A rule uses the same clause test as the replaces cue. A setting still
+/// needs the whole value as one span. Ignored unless the relaxed floor applies.
+fn relaxed_span(quote: &str, new_value: &str, floor: &Floor<'_>) -> bool {
+    let folded = fold_ws(quote);
+    alphanumeric_runs(&folded).len() >= 2 && named_for_floor(quote, new_value, floor)
+}
+
+fn named_for_floor(quote: &str, new_value: &str, floor: &Floor<'_>) -> bool {
+    if floor.rule {
+        rule_named(quote, new_value, floor.old)
+    } else {
+        names_value(new_value, quote)
+    }
+}
+
+fn quote_supported(
+    quote: &str,
+    evidence: &str,
+    old: &str,
+    new_value: &str,
+    duplicate: bool,
+) -> bool {
+    contains_folded(evidence, quote) || duplicate_quote(duplicate, old, new_value, quote)
+}
+
+fn duplicate_quote(duplicate: bool, old: &str, new_value: &str, quote: &str) -> bool {
+    duplicate && (contains_folded(old, quote) || contains_folded(new_value, quote))
 }
 
 /// Count one dropped verdict and print the drop line on stderr.
@@ -1488,6 +1739,8 @@ struct CueTally {
     derived: bool,
     trailing: bool,
     rename: Option<RenameKind>,
+    replaces: bool,
+    replaces_floor: bool,
 }
 
 impl CueTally {
@@ -1497,6 +1750,8 @@ impl CueTally {
             derived: false,
             trailing: false,
             rename: None,
+            replaces: false,
+            replaces_floor: false,
         }
     }
 }
@@ -1523,15 +1778,491 @@ fn accept_cue(
     } else {
         component_cue(ctx, anchor, partner, loaded, dependents, inputs)
     };
-    if !ctx.rename_on || cue {
+    if cue || !later_cue(ctx) {
         return (cue, tally);
     }
-    apply_rename(
-        tally,
-        rename_cue(&cue_of(
-            ctx, anchor, partner, loaded, dependents, text.quote, look,
-        )),
+    let (cue, tally) = if ctx.rename_on {
+        apply_rename(
+            tally,
+            rename_cue(&cue_of(
+                ctx, anchor, partner, loaded, dependents, text.quote, look,
+            )),
+        )
+    } else {
+        (false, tally)
+    };
+    if cue || !ctx.replaces_cue_on {
+        return (cue, tally);
+    }
+    mark_replaces(ctx, anchor, partner, loaded, text.quote, look, tally)
+}
+
+fn later_cue(ctx: &WriteCtx<'_>) -> bool {
+    ctx.rename_on || ctx.replaces_cue_on
+}
+
+fn mark_replaces(
+    ctx: &WriteCtx<'_>,
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    quote: &str,
+    look: &RenameLook<'_>,
+    mut tally: CueTally,
+) -> (bool, CueTally) {
+    let area = neighbourhood(look.anchors, loaded, ctx);
+    if !replaces_cue(anchor, partner, loaded, &area, quote) {
+        return (false, tally);
+    }
+    tally.replaces = true;
+    tally.replaces_floor = !quote_span(quote);
+    (true, tally)
+}
+
+fn replaces_relaxed(ctx: &WriteCtx<'_>, tally: &CueTally) -> bool {
+    ctx.replaces_cue_on && tally.replaces
+}
+
+fn count_replaces_close(ctx: &WriteCtx<'_>, report: &mut IngestionReport, tally: &CueTally) {
+    if !ctx.replaces_cue_on || !tally.replaces {
+        return;
+    }
+    add_count(&mut report.consolidate.replaces_cue);
+    if tally.replaces_floor {
+        add_count(&mut report.consolidate.replaces_floor);
+    }
+}
+
+/// A unique pass-1 `replaces` match is the departure cue.
+fn replaces_cue(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    quote: &str,
+) -> bool {
+    replaces_open(anchor, quote)
+        && replaces_match(anchor, partner)
+        && replaces_linked(anchor, partner, loaded)
+        && replaces_unique_row(anchor, partner, loaded, area)
+}
+
+fn replaces_open(anchor: &Anchor, quote: &str) -> bool {
+    !anchor.replaces.trim().is_empty()
+        && anchor.pred != "uses"
+        && value_unhedged(
+            quote,
+            &anchor.new_value,
+            anchor.pred == "rule",
+            &anchor.replaces,
+        )
+}
+
+const SCOPED_HEDGE: &[&str] = &[
+    "maybe",
+    "might",
+    "perhaps",
+    "possibly",
+    "probably",
+    "could",
+    "considering",
+    "consider",
+    "if",
+    "unless",
+];
+
+/// The new value is named, and that mention is not under a nearby hedge.
+///
+/// A setting still needs one contiguous [`names_value`] span. A rule is named
+/// when one clause holds enough of its content tokens. Contrastive `not` and
+/// conditional `would` elsewhere in the quote do not count. The ordinary cue
+/// still uses [`hedged`] and [`tentative`] on the whole quote.
+fn value_unhedged(quote: &str, new_value: &str, rule: bool, old: &str) -> bool {
+    if rule {
+        rule_named(quote, new_value, old)
+    } else {
+        setting_named(quote, new_value)
+    }
+}
+
+fn setting_named(quote: &str, new_value: &str) -> bool {
+    let spans = value_spans(quote, new_value);
+    !spans.is_empty() && spans.iter().any(|span| clean_span(quote, *span))
+}
+
+/// One clause holds the distinctive tokens, enough of the value, and a new word.
+fn rule_named(quote: &str, new_value: &str, old: &str) -> bool {
+    let want = name_pieces(new_value, 0);
+    !want.is_empty() && quote_names_rule(quote, &want, new_value, old)
+}
+
+fn quote_names_rule(quote: &str, want: &[NamePiece], new_value: &str, old: &str) -> bool {
+    split_clauses(quote)
+        .iter()
+        .any(|(base, clause)| named_clean(quote, *base, clause, want, new_value, old))
+}
+
+fn named_clean(
+    quote: &str,
+    base: usize,
+    clause: &str,
+    want: &[NamePiece],
+    new_value: &str,
+    old: &str,
+) -> bool {
+    let have = name_pieces(clause, base);
+    clause_ready(&have, want, clause, new_value, old) && hit_clean(quote, &have, want)
+}
+
+fn clause_ready(
+    have: &[NamePiece],
+    want: &[NamePiece],
+    clause: &str,
+    new_value: &str,
+    old: &str,
+) -> bool {
+    clause_covers(have, want) && adds_word(have, old) && !negation_mismatch(clause, new_value)
+}
+
+fn hit_clean(quote: &str, have: &[NamePiece], want: &[NamePiece]) -> bool {
+    match first_hit(have, want) {
+        Some(at) => clean_span(quote, (at, at)),
+        None => false,
+    }
+}
+
+fn first_hit(have: &[NamePiece], want: &[NamePiece]) -> Option<usize> {
+    have.iter()
+        .find(|got| want.iter().any(|need| piece_eq(need, got)))
+        .map(|got| got.at)
+}
+
+fn adds_word(have: &[NamePiece], old: &str) -> bool {
+    let prior = name_pieces(old, 0);
+    have.iter().any(|got| !known_word(got, &prior))
+}
+
+fn known_word(got: &NamePiece, prior: &[NamePiece]) -> bool {
+    if got.distinctive {
+        prior.iter().any(|old| old.raw == got.raw)
+    } else {
+        prior
+            .iter()
+            .any(|old| !old.distinctive && old.folded == got.folded)
+    }
+}
+
+fn negation_mismatch(clause: &str, new_value: &str) -> bool {
+    has_negation(clause) != has_negation(new_value)
+}
+
+fn has_negation(text: &str) -> bool {
+    let words = raw_words(text);
+    words
+        .iter()
+        .enumerate()
+        .any(|(index, word)| lone_negation(&word.raw, next_raw(&words, index)))
+}
+
+fn next_raw(words: &[RawWord], index: usize) -> Option<&str> {
+    words.get(index + 1).map(|word| word.raw.as_str())
+}
+
+fn lone_negation(word: &str, next: Option<&str>) -> bool {
+    match word {
+        "not" | "no" | "never" | "without" | "don't" | "dont" => true,
+        "do" => next == Some("not"),
+        _ => false,
+    }
+}
+
+fn raw_words(text: &str) -> Vec<RawWord> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut from = None;
+    for (index, ch) in text.char_indices() {
+        if name_char(text, index, ch) {
+            if from.is_none() {
+                from = Some(index);
+            }
+            buf.push(ch);
+        } else if from.take().is_some() {
+            push_raw(&mut out, &buf);
+            buf.clear();
+        }
+    }
+    if from.is_some() {
+        push_raw(&mut out, &buf);
+    }
+    out
+}
+
+struct RawWord {
+    raw: String,
+}
+
+fn push_raw(out: &mut Vec<RawWord>, buf: &str) {
+    let raw = buf.trim_matches('\'').to_lowercase();
+    if !raw.is_empty() {
+        out.push(RawWord { raw });
+    }
+}
+
+fn clause_covers(have: &[NamePiece], want: &[NamePiece]) -> bool {
+    marks_held(have, want) && shared_enough(have, want)
+}
+
+fn marks_held(have: &[NamePiece], want: &[NamePiece]) -> bool {
+    want.iter()
+        .filter(|tok| tok.distinctive)
+        .all(|tok| have.iter().any(|got| got.raw == tok.raw))
+}
+
+fn shared_enough(have: &[NamePiece], want: &[NamePiece]) -> bool {
+    let hit = want
+        .iter()
+        .filter(|need| have.iter().any(|got| piece_eq(need, got)))
+        .count();
+    hit >= name_quota(want.len())
+}
+
+fn name_quota(len: usize) -> usize {
+    (len * 3).div_ceil(5).max(2)
+}
+
+fn piece_eq(need: &NamePiece, got: &NamePiece) -> bool {
+    if need.distinctive {
+        need.raw == got.raw
+    } else {
+        !got.distinctive && need.folded == got.folded
+    }
+}
+
+struct NamePiece {
+    raw: String,
+    folded: String,
+    distinctive: bool,
+    at: usize,
+}
+
+fn name_pieces(text: &str, base: usize) -> Vec<NamePiece> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut from = None;
+    for (index, ch) in text.char_indices() {
+        if name_char(text, index, ch) {
+            if from.is_none() {
+                from = Some(index);
+            }
+            buf.push(ch);
+        } else if let Some(start) = from.take() {
+            keep_piece(&mut out, &buf, base + start);
+            buf.clear();
+        }
+    }
+    if let Some(start) = from {
+        keep_piece(&mut out, &buf, base + start);
+    }
+    out
+}
+
+fn name_char(text: &str, index: usize, ch: char) -> bool {
+    ch.is_alphanumeric()
+        || ch == '\''
+        || matches!(ch, '/' | '_' | '-')
+        || inner_dot(text, index, ch)
+}
+
+fn inner_dot(text: &str, index: usize, ch: char) -> bool {
+    ch == '.' && next_joins(text, index)
+}
+
+fn next_joins(text: &str, index: usize) -> bool {
+    matches!(
+        text[index + '.'.len_utf8()..].chars().next(),
+        Some(ch) if ch.is_alphanumeric()
     )
+}
+
+fn keep_piece(out: &mut Vec<NamePiece>, raw: &str, at: usize) {
+    if raw.is_empty() {
+        return;
+    }
+    let raw = raw.to_lowercase();
+    let distinctive = is_distinctive(&raw);
+    if distinctive || !is_stop_word(&raw) {
+        let folded = folded_piece(&raw, distinctive);
+        out.push(NamePiece {
+            raw,
+            folded,
+            distinctive,
+            at,
+        });
+    }
+}
+
+fn is_distinctive(token: &str) -> bool {
+    token
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || matches!(ch, '/' | '_' | '.' | '-'))
+}
+
+fn folded_piece(raw: &str, distinctive: bool) -> String {
+    if distinctive {
+        raw.to_string()
+    } else {
+        fold_suffix(raw)
+    }
+}
+
+/// Suffixes used only when a rule quote is compared with its new value.
+fn fold_suffix(word: &str) -> String {
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(stem) = word.strip_suffix(suffix) {
+            if stem.chars().count() >= 3 {
+                return stem.to_string();
+            }
+        }
+    }
+    word.to_string()
+}
+
+fn split_clauses(quote: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, ch) in quote.char_indices() {
+        if clause_break(quote, index, ch) {
+            out.push((start, &quote[start..index]));
+            start = index + ch.len_utf8();
+        }
+    }
+    if start < quote.len() {
+        out.push((start, &quote[start..]));
+    }
+    out
+}
+
+fn clause_break(text: &str, index: usize, ch: char) -> bool {
+    match ch {
+        '?' | '!' | ';' | '\n' => true,
+        '.' => dot_ends(text, index),
+        _ => false,
+    }
+}
+
+fn dot_ends(text: &str, index: usize) -> bool {
+    match text[index + 1..].chars().next() {
+        None => true,
+        Some(ch) => ch.is_whitespace(),
+    }
+}
+
+fn clean_span(quote: &str, span: (usize, usize)) -> bool {
+    !clause_conditional(quote, span.0) && !marker_near(quote, span.0)
+}
+
+fn clause_conditional(quote: &str, at: usize) -> bool {
+    let words = cue_words(clause_head(quote, at));
+    matches!(
+        words.first().map(|(word, _, _)| word.as_str()),
+        Some("if" | "unless")
+    )
+}
+
+fn clause_head(quote: &str, at: usize) -> &str {
+    let start = clause_start(&quote[..at]);
+    &quote[start..at]
+}
+
+fn clause_start(head: &str) -> usize {
+    let mut start = 0;
+    for (index, ch) in head.char_indices() {
+        if clause_break(head, index, ch) {
+            start = index + ch.len_utf8();
+        }
+    }
+    start
+}
+
+fn marker_near(quote: &str, at: usize) -> bool {
+    let words = cue_words(quote);
+    let mut before = Vec::new();
+    for (word, _, stop) in &words {
+        if *stop <= at {
+            before.push(word.as_str());
+        }
+    }
+    let start = before.len().saturating_sub(4);
+    scoped_in(&before[start..])
+}
+
+fn scoped_in(words: &[&str]) -> bool {
+    words.iter().any(|word| SCOPED_HEDGE.contains(word)) || hedge_phrase(words)
+}
+
+fn hedge_phrase(words: &[&str]) -> bool {
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0], pair[1]),
+            ("thinking", "about") | ("planning", "to")
+        )
+    })
+}
+
+fn replaces_match(anchor: &Anchor, partner: &Row) -> bool {
+    match partner.pred.as_str() {
+        "setting" => setting_replaces_match(anchor, partner),
+        "rule" => rule_replaces_match(anchor, partner),
+        _ => false,
+    }
+}
+
+fn setting_replaces_match(anchor: &Anchor, partner: &Row) -> bool {
+    values_equal(&anchor.replaces, &partner.value) && setting_keys(anchor, partner)
+}
+
+fn setting_keys(anchor: &Anchor, partner: &Row) -> bool {
+    let names = tokens(&partner.subject);
+    keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
+}
+
+fn rule_replaces_match(anchor: &Anchor, partner: &Row) -> bool {
+    let left = tokens(&anchor.replaces);
+    left.len() >= 2 && token_subset(&left, &tokens(&partner.value))
+}
+
+fn token_subset(left: &[String], right: &[String]) -> bool {
+    let right: BTreeSet<&str> = right.iter().map(String::as_str).collect();
+    left.iter().all(|token| right.contains(token.as_str()))
+}
+
+fn replaces_linked(anchor: &Anchor, partner: &Row, loaded: &Loaded) -> bool {
+    same_name(&anchor.subject, &partner.subject)
+        || component_link(anchor, partner, &loaded.part_of, &loaded.owners)
+}
+
+fn replaces_unique_row(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+) -> bool {
+    let hits = loaded
+        .rows
+        .iter()
+        .filter(|row| replaces_hit(anchor, row, loaded, area))
+        .count();
+    hits == 1 && replaces_hit(anchor, partner, loaded, area)
+}
+
+fn replaces_hit(anchor: &Anchor, row: &Row, loaded: &Loaded, area: &BTreeSet<String>) -> bool {
+    replaces_candidate(row, area)
+        && replaces_match(anchor, row)
+        && replaces_linked(anchor, row, loaded)
+}
+
+fn replaces_candidate(row: &Row, area: &BTreeSet<String>) -> bool {
+    !row.pending && !row.here && area.contains(&row.entity)
 }
 
 fn cue_of<'a>(
@@ -1595,6 +2326,8 @@ fn kept_tally(links: &PairLinks, branch: Option<CueBranch>, made: bool) -> CueTa
         sibling: sibling_branch(links, &branch),
         derived: derived_branch(links, &branch),
         rename: None,
+        replaces: false,
+        replaces_floor: false,
     }
 }
 
@@ -3707,6 +4440,7 @@ fn attach_holds(
             evidence: cut_evidence(&text, &[&hold.old_value, &hold.new_value]),
             stored: stored_session(&loaded.rows[old_index].evidence),
             hold: true,
+            via_replaces: false,
         });
         report.hold.holds_ambiguous += 1;
         added += 1;
@@ -8277,6 +9011,7 @@ mod tests {
         components_on: bool,
         hold_on: bool,
         rename_on: bool,
+        replaces_cue_on: bool,
     }
 
     async fn commit_mode(
@@ -8310,6 +9045,7 @@ mod tests {
         ctx.components_on = flags.components_on;
         ctx.hold_on = flags.hold_on;
         ctx.rename_on = flags.rename_on;
+        ctx.replaces_cue_on = flags.replaces_cue_on;
         let mut report = IngestionReport {
             links: stats.links,
             ..IngestionReport::default()
@@ -8324,6 +9060,7 @@ mod tests {
             components_on,
             hold_on: false,
             rename_on: false,
+            replaces_cue_on: false,
         }
     }
 
@@ -8385,6 +9122,7 @@ mod tests {
                 components_on,
                 hold_on: false,
                 rename_on,
+                replaces_cue_on: false,
             },
         )
         .await;
@@ -8801,6 +9539,7 @@ mod tests {
                 components_on: true,
                 hold_on: true,
                 rename_on: false,
+                replaces_cue_on: false,
             },
         )
         .await;
@@ -9184,6 +9923,8 @@ mod tests {
                     derived: true,
                     trailing: false,
                     rename: None,
+                    replaces: false,
+                    replaces_floor: false,
                 },
                 false
             ),
@@ -9196,6 +9937,8 @@ mod tests {
                     derived: false,
                     trailing: true,
                     rename: None,
+                    replaces: false,
+                    replaces_floor: false,
                 },
                 false
             ),
@@ -9547,6 +10290,7 @@ mod tests {
             components_on: false,
             hold_on: false,
             rename_on,
+            replaces_cue_on: false,
         }
     }
 
@@ -9602,6 +10346,7 @@ mod tests {
             evidence: String::new(),
             stored: String::new(),
             hold: false,
+            via_replaces: false,
         }
     }
 
@@ -10217,6 +10962,7 @@ mod tests {
                 components_on,
                 hold_on: false,
                 rename_on,
+                replaces_cue_on: false,
             },
         )
         .await;
@@ -10610,6 +11356,774 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
+    }
+
+    fn cue_flags(on: bool) -> PassFlags {
+        PassFlags {
+            links_on: false,
+            components_on: false,
+            hold_on: false,
+            rename_on: false,
+            replaces_cue_on: on,
+        }
+    }
+
+    fn cue_anchor(pred: &str, key: &str, new_value: &str, replaces: &str) -> Anchor {
+        let mut anchor = anchor_named("svc", key, new_value);
+        anchor.pred = pred.into();
+        anchor.replaces = replaces.into();
+        anchor
+    }
+
+    fn cue_row(entity: &str, pred: &str, key: &str, value: &str) -> Row {
+        let mut row = row_named("svc", entity, key, value);
+        row.pred = pred.into();
+        row
+    }
+
+    fn cue_area(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    fn cue_loaded(rows: Vec<Row>) -> Loaded {
+        Loaded {
+            rows,
+            owners: Vec::new(),
+            part_of: Vec::new(),
+        }
+    }
+
+    struct StoreSnap {
+        report: IngestionReport,
+        message: String,
+        calls: u32,
+        ended: Option<String>,
+    }
+
+    async fn run_setting_cue(
+        quote: &str,
+        old_key: &str,
+        old_value: &str,
+        extra: &[(&str, &str)],
+        on: bool,
+    ) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![setting(
+            "svc",
+            Kind::Project,
+            old_key,
+            old_value,
+            &format!("{old_key} is {old_value}"),
+        )];
+        for (key, value) in extra {
+            facts.push(setting(
+                "svc",
+                Kind::Project,
+                key,
+                value,
+                &format!("{key} is {value}"),
+            ));
+        }
+        commit(&gm, "s1", "2026-03-01", &[turn("stored limits")], &facts).await;
+        let mut next = setting("svc", Kind::Project, "max_attempts", "8", quote);
+        next.replaces = "5".into();
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended =
+            ended(live_any(&slots(&gm, "svc").await, old_key, old_value)).map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    fn consolidate_snapshot(report: &IngestionReport) -> String {
+        serde_json::to_string(&report.consolidate).unwrap()
+    }
+
+    fn open_floor(relaxed: bool) -> Floor<'static> {
+        Floor {
+            relaxed,
+            rule: false,
+            old: "",
+        }
+    }
+
+    #[test]
+    fn relaxed_floor_names_the_new_value_and_keeps_two_runs() {
+        assert!(quote_floor("8 attempts", "8", &open_floor(true)));
+        assert!(!quote_floor("8 attempts", "8", &open_floor(false)));
+        assert!(!quote_floor("the attempts", "8", &open_floor(true)));
+        assert!(quote_floor("the attempts", "8", &open_floor(false)));
+        assert!(!quote_floor("8", "8", &open_floor(true)));
+        assert!(quote_floor(
+            "Use 8 attempts from now on.",
+            "8",
+            &open_floor(true)
+        ));
+        assert!(quote_floor(
+            "Use 8 attempts from now on.",
+            "8",
+            &open_floor(false)
+        ));
+    }
+
+    #[test]
+    fn a_unique_setting_replaces_match_is_the_cue() {
+        let anchor = cue_anchor("setting", "max_attempts", "8", "5");
+        let partner = cue_row("ent", "setting", "retry_attempts", "5");
+        let loaded = cue_loaded(vec![partner]);
+        let area = cue_area(&["ent"]);
+        assert!(replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            "8 attempts"
+        ));
+        let exact = cue_row("ent", "setting", "max_attempts", "5");
+        let exact_loaded = cue_loaded(vec![exact]);
+        assert!(replaces_cue(
+            &anchor,
+            &exact_loaded.rows[0],
+            &exact_loaded,
+            &area,
+            "8 attempts"
+        ));
+    }
+
+    #[test]
+    fn a_rule_replaces_subset_of_at_least_two_tokens_is_the_cue() {
+        let anchor = cue_anchor(
+            "rule",
+            "",
+            "Move dupes into a holding folder",
+            "Only list dupes.",
+        );
+        let partner = cue_row(
+            "ent",
+            "rule",
+            "",
+            "Only report dupes, list them at the end, leave them alone.",
+        );
+        let loaded = cue_loaded(vec![partner]);
+        let area = cue_area(&["ent"]);
+        let quote = "Move dupes into a holding folder";
+        assert!(replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            quote
+        ));
+        let mut one = anchor.clone();
+        one.replaces = "dupes".into();
+        assert!(!replaces_cue(&one, &loaded.rows[0], &loaded, &area, quote));
+        let mut missing = anchor.clone();
+        missing.replaces = "Only list widgets.".into();
+        assert!(!replaces_cue(
+            &missing,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            quote
+        ));
+    }
+
+    #[test]
+    fn replaces_cue_guards_reject_a_second_row_a_disjoint_key_and_a_hedge() {
+        let anchor = cue_anchor("setting", "max_attempts", "8", "5");
+        let area = cue_area(&["ent"]);
+        let quote = "8 attempts";
+        let first = cue_row("ent", "setting", "retry_attempts", "5");
+        let second = cue_row("ent", "setting", "max_retries", "5");
+        let both = cue_loaded(vec![first, second]);
+        assert!(!replaces_cue(&anchor, &both.rows[0], &both, &area, quote));
+
+        let workers = cue_loaded(vec![cue_row("ent", "setting", "workers", "5")]);
+        assert!(!replaces_cue(
+            &anchor,
+            &workers.rows[0],
+            &workers,
+            &area,
+            quote
+        ));
+        assert!(!replaces_cue(
+            &anchor,
+            &both.rows[0],
+            &cue_loaded(vec![both.rows[0].clone()]),
+            &area,
+            "maybe 8 attempts"
+        ));
+        assert!(replaces_cue(
+            &anchor,
+            &both.rows[0],
+            &cue_loaded(vec![both.rows[0].clone()]),
+            &area,
+            "they said 8 attempts"
+        ));
+        assert!(replaces_cue(
+            &anchor,
+            &both.rows[0],
+            &cue_loaded(vec![both.rows[0].clone()]),
+            &area,
+            "8 attempts for now"
+        ));
+
+        let mut blank = anchor.clone();
+        blank.replaces = "  ".into();
+        let one = cue_loaded(vec![both.rows[0].clone()]);
+        assert!(!replaces_cue(&blank, &one.rows[0], &one, &area, quote));
+
+        let uses_anchor = cue_anchor("uses", "max_attempts", "8", "5");
+        assert!(!replaces_cue(
+            &uses_anchor,
+            &one.rows[0],
+            &one,
+            &area,
+            quote
+        ));
+        let uses_partner = cue_loaded(vec![cue_row("ent", "uses", "retry_attempts", "5")]);
+        assert!(!replaces_cue(
+            &anchor,
+            &uses_partner.rows[0],
+            &uses_partner,
+            &area,
+            quote
+        ));
+    }
+
+    #[test]
+    fn replaces_cue_counts_only_live_rows_in_the_neighbourhood() {
+        let anchor = cue_anchor("setting", "max_attempts", "8", "5");
+        let quote = "8 attempts";
+        let live = cue_row("ent", "setting", "retry_attempts", "5");
+        let mut echo = cue_row("ent", "setting", "max_retries", "5");
+        echo.here = true;
+        let mut pending = cue_row("ent", "setting", "max_retries", "5");
+        pending.pending = true;
+        let outside = cue_row("other", "setting", "max_retries", "5");
+        let loaded = cue_loaded(vec![live, echo, pending, outside]);
+        let area = cue_area(&["ent"]);
+        assert!(replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            quote
+        ));
+
+        let other = cue_row("ent", "setting", "workers", "9");
+        let hit = cue_row("ent", "setting", "retry_attempts", "5");
+        let mixed = cue_loaded(vec![hit, other]);
+        assert!(!replaces_cue(&anchor, &mixed.rows[1], &mixed, &area, quote));
+
+        let mut linked = cue_row("part", "setting", "retry_attempts", "5");
+        linked.subject = "part".into();
+        let owners = vec![("svc".into(), "svc".into()), ("part".into(), "part".into())];
+        let with_link = Loaded {
+            rows: vec![linked.clone()],
+            owners: owners.clone(),
+            part_of: vec![("part".into(), "svc".into())],
+        };
+        let part_area = cue_area(&["part"]);
+        assert!(replaces_cue(
+            &anchor,
+            &with_link.rows[0],
+            &with_link,
+            &part_area,
+            quote
+        ));
+        let unlinked = Loaded {
+            rows: vec![linked],
+            owners,
+            part_of: Vec::new(),
+        };
+        assert!(!replaces_cue(
+            &anchor,
+            &unlinked.rows[0],
+            &unlinked,
+            &part_area,
+            quote
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_unique_replaces_match_keeps_a_short_quote_only_when_the_flag_is_on() {
+        let quote = "8 attempts";
+        let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
+        let again = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
+        let on = run_setting_cue(quote, "retry_attempts", "5", &[], true).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&again.report)
+        );
+        assert_eq!(off.ended, again.ended);
+        assert_eq!(off.message, again.message);
+        assert_eq!(off.calls, 1);
+        assert_eq!(on.calls, off.calls);
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "quote too short"), 1);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert!(off.report.consolidate.replaces_floor.is_none());
+        assert!(!consolidate_snapshot(&off.report).contains("replaces_cue"));
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.replaces_cue, Some(1));
+        assert_eq!(on.report.consolidate.replaces_floor, Some(1));
+        assert_eq!(dropped(&on.report, "quote too short"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_long_quote_kept_by_replaces_does_not_count_the_relaxed_floor() {
+        let quote = "Use 8 attempts from now on.";
+        let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
+        let on = run_setting_cue(quote, "retry_attempts", "5", &[], true).await;
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert!(off.ended.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.replaces_cue, Some(1));
+        assert!(on.report.consolidate.replaces_floor.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_live_row_drops_the_replaces_pair_as_on_main() {
+        let quote = "8 attempts";
+        let extra = [("max_retries", "5")];
+        let off = run_setting_cue(quote, "retry_attempts", "5", &extra, false).await;
+        let on = run_setting_cue(quote, "retry_attempts", "5", &extra, true).await;
+        assert_eq!(on.message, off.message);
+        assert_eq!(
+            on.report.consolidate.dropped,
+            off.report.consolidate.dropped
+        );
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert!(on.ended.is_none());
+        assert!(off.ended.is_none());
+        assert!(on.report.consolidate.replaces_cue.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disjoint_key_does_not_take_the_replaces_cue() {
+        let quote = "Set the limit to 8 attempts total.";
+        let off = run_setting_cue(quote, "workers", "5", &[], false).await;
+        let on = run_setting_cue(quote, "workers", "5", &[], true).await;
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(dropped(&on.report, "no departure cue"), 1);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert!(on.report.consolidate.replaces_cue.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert!(on.ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hedged_quote_does_not_take_the_replaces_cue() {
+        let quote = "maybe 8 attempts";
+        let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
+        let on = run_setting_cue(quote, "retry_attempts", "5", &[], true).await;
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(dropped(&on.report, "no departure cue"), 1);
+        assert!(on.report.consolidate.replaces_cue.is_none());
+        assert!(off.ended.is_none());
+        assert!(on.ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_quote_that_misses_the_new_value_is_not_a_replaces_cue() {
+        let quote = "the attempts";
+        let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
+        let on = run_setting_cue(quote, "retry_attempts", "5", &[], true).await;
+        assert_eq!(on.message, off.message);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(dropped(&on.report, "no departure cue"), 1);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert!(on.report.consolidate.replaces_cue.is_none());
+        assert!(on.ended.is_none());
+        assert!(off.ended.is_none());
+    }
+
+    fn rule_anchor() -> Anchor {
+        let mut anchor = cue_anchor(
+            "rule",
+            "",
+            "Move dupes into a holding folder",
+            "Only list dupes.",
+        );
+        anchor.value = anchor.new_value.clone();
+        anchor.text = format!("{} {}", anchor.value, anchor.replaces);
+        anchor.id = "a2:0".into();
+        anchor
+    }
+
+    fn rule_rows(values: &[&str]) -> Loaded {
+        let rows = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let mut row = cue_row("ent", "rule", "", value);
+                row.id = format!("s:ent:{index}");
+                row
+            })
+            .collect();
+        Loaded {
+            rows,
+            owners: vec![("ent".into(), "svc".into())],
+            part_of: Vec::new(),
+        }
+    }
+
+    fn select_both(loaded: &Loaded, on: bool) -> (Vec<Pair>, u32) {
+        let quiet = Quiet;
+        let project = ProjectIdentity {
+            name: "svc".into(),
+            aliases: Vec::new(),
+        };
+        let turns = [turn("Move dupes into a holding folder")];
+        let mut ctx = WriteCtx::new(&quiet, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_cue_on = on;
+        let anchors = vec![rule_anchor()];
+        select(&anchors, loaded, &ctx)
+    }
+
+    #[test]
+    fn a_rule_replaces_pair_is_scored_only_when_the_flag_is_on() {
+        let stored = "Only report dupes, list them at the end, leave them alone.";
+        let loaded = rule_rows(&[stored]);
+        let anchor = rule_anchor();
+        assert!(score(&anchor, &loaded.rows[0]).is_none());
+        assert!(score_replaces(&anchor, &loaded.rows[0]).is_some());
+        let (off, off_overflow) = select_both(&loaded, false);
+        let (on, on_overflow) = select_both(&loaded, true);
+        assert!(off.is_empty());
+        assert_eq!(off_overflow, 0);
+        assert_eq!(on.len(), 1);
+        assert!(on[0].via_replaces);
+        assert_eq!(on[0].partner, 0);
+        assert_eq!(on_overflow, 0);
+    }
+
+    #[test]
+    fn replaces_pairs_append_after_main_candidates_and_do_not_evict_them() {
+        let stored = "Only report dupes, list them at the end, leave them alone.";
+        let loaded = rule_rows(&[
+            "Move dupes into a holding folder soon",
+            "Move dupes into a holding folder today",
+            stored,
+        ]);
+        let anchor = rule_anchor();
+        assert!(score(&anchor, &loaded.rows[0]).is_some());
+        assert!(score(&anchor, &loaded.rows[1]).is_some());
+        assert!(score(&anchor, &loaded.rows[2]).is_none());
+        let (off, off_overflow) = select_both(&loaded, false);
+        let (on, on_overflow) = select_both(&loaded, true);
+        assert_eq!(off.len(), 2);
+        assert!(off.iter().all(|pair| !pair.via_replaces));
+        assert_eq!(off_overflow, 0);
+        assert_eq!(on.len(), 2);
+        assert_eq!(
+            on.iter().map(|pair| pair.partner).collect::<Vec<_>>(),
+            off.iter().map(|pair| pair.partner).collect::<Vec<_>>()
+        );
+        assert!(on.iter().all(|pair| !pair.via_replaces));
+        assert_eq!(on_overflow, 1);
+    }
+
+    async fn run_rule_pair(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let old = "Only report dupes, list them at the end, leave them alone.";
+        let new_value = "Move dupes into a holding folder";
+        let stored = rule("svc", Kind::Project, old, old);
+        commit(&gm, "s1", "2026-03-01", &[turn(old)], &[stored]).await;
+        let mut next = rule("svc", Kind::Project, new_value, new_value);
+        next.replaces = "Only list dupes.".into();
+        let turns = [turn(new_value)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", new_value)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended = ended(live_any(&slots(&gm, "svc").await, "", old)).map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_replaces_pair_is_judged_and_closed_only_when_the_flag_is_on() {
+        let off = run_rule_pair(false).await;
+        let again = run_rule_pair(false).await;
+        let on = run_rule_pair(true).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&again.report)
+        );
+        assert_eq!(off.ended, again.ended);
+        assert_eq!(off.message, again.message);
+        assert_eq!(off.calls, 0);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert!(off.report.consolidate.pair_via_replaces.is_none());
+        assert!(!consolidate_snapshot(&off.report).contains("pair_via_replaces"));
+        assert_eq!(on.calls, 1);
+        assert!(on.message.contains("Only report dupes"));
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.replaces_cue, Some(1));
+        assert!(on.report.consolidate.replaces_floor.is_none());
+        assert_eq!(on.report.consolidate.pair_via_replaces, Some(1));
+    }
+
+    fn rule_cue(stored: &str, quote: &str) -> bool {
+        let anchor = cue_anchor(
+            "rule",
+            "",
+            "Move copies into a holding folder",
+            "Only list dupes.",
+        );
+        let partner = cue_row("ent", "rule", "", stored);
+        let loaded = cue_loaded(vec![partner]);
+        replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn contrastive_not_and_would_away_from_the_value_do_not_block() {
+        let stored = "Only report dupes, list them at the end, leave them alone.";
+        let open =
+            "Move copies into a holding folder, not just listed as the path they would have had";
+        let near = "might soon Move copies into a holding folder, not just listed as the path they would have had";
+        // `not` sits in the matched clause and the new value has none, so the cue is blocked.
+        assert!(!rule_cue(stored, open));
+        assert!(!rule_cue(stored, near));
+
+        let anchor = cue_anchor("setting", "max_attempts", "8", "5");
+        let partner = cue_row("ent", "setting", "retry_attempts", "5");
+        let loaded = cue_loaded(vec![partner]);
+        let area = cue_area(&["ent"]);
+        let holds = |quote: &str| replaces_cue(&anchor, &loaded.rows[0], &loaded, &area, quote);
+        assert!(holds(
+            "now 8 attempts, not just listed as the count they would have had"
+        ));
+        assert!(!holds("might take 8 attempts"));
+        assert!(!holds("If the saved count is later revised use 8 attempts"));
+        assert!(!holds("thinking about 8 attempts"));
+        assert!(!holds("planning to 8 attempts"));
+        assert!(!holds("perhaps 8 attempts"));
+        assert!(!holds("Unless revised, 8 attempts"));
+        assert!(holds("8 attempts?"));
+    }
+
+    #[test]
+    fn dupes_does_not_match_a_stored_rule_that_says_duplicates() {
+        let stored = "Only report duplicates, list them at the end, leave them alone.";
+        let quote = "Move copies into a holding folder";
+        assert!(!rule_cue(stored, quote));
+        assert!(rule_cue(
+            "Only report dupes, list them at the end, leave them alone.",
+            quote
+        ));
+    }
+
+    fn rule_shape_cue(new_value: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("rule", "", new_value, "Only list files.");
+        let partner = cue_row("ent", "rule", "", "Only list files at the end.");
+        let loaded = cue_loaded(vec![partner]);
+        replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn a_reworded_rule_clause_names_the_value_when_the_path_token_matches() {
+        let value = "Move files into _hold/ under the desk, keeping the path they would have had";
+        let named = "Move them into _hold/ under the desk, and keep the path they would have had";
+        let moved = "Move them into _other/ under the desk, and keep the path they would have had";
+        let thin = "Move them later.";
+        assert!(rule_shape_cue(value, named));
+        assert!(!rule_shape_cue(value, moved));
+        assert!(!rule_shape_cue(value, thin));
+    }
+
+    #[test]
+    fn the_recorded_rule_quote_names_the_new_value() {
+        let value = "Move duplicates into _dupes/ under the destination, keeping the path they would have had";
+        let quote = "I want duplicates handled now, not just listed. Move them into _dupes/ under the destination, and keep the path they would have had, so I can compare.";
+        let anchor = cue_anchor("rule", "", value, "Only list duplicates.");
+        let partner = cue_row("ent", "rule", "", "Only list duplicates.");
+        let loaded = cue_loaded(vec![partner]);
+        assert!(replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote
+        ));
+    }
+
+    fn ruled(new_value: &str, old: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("rule", "", new_value, old);
+        let partner = cue_row("ent", "rule", "", old);
+        let loaded = cue_loaded(vec![partner]);
+        replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn restating_the_old_rule_gives_no_cue() {
+        let old = "Squash merge pull requests";
+        assert!(!ruled(
+            "Do not squash merge pull requests",
+            old,
+            "Squash merge pull requests"
+        ));
+        assert!(!ruled(
+            "Squash merge pull requests onto the trunk",
+            old,
+            "Squash merge pull requests"
+        ));
+    }
+
+    #[test]
+    fn a_negation_flip_gives_no_cue() {
+        assert!(!ruled(
+            "Do not run tests on push",
+            "Skip the nightly suite",
+            "Run tests on push"
+        ));
+        assert!(!ruled(
+            "Never commit generated files",
+            "Leave the tree as it stands",
+            "We commit generated files to the repo"
+        ));
+    }
+
+    #[test]
+    fn a_clause_of_only_old_words_gives_no_cue() {
+        let old = "Squash merge pull requests on the trunk";
+        assert!(!ruled(
+            "Squash merge pull requests on the trunk after review",
+            old,
+            "Squash merge pull requests on the trunk"
+        ));
+    }
+
+    #[test]
+    fn a_dotted_token_stays_whole_and_must_match() {
+        assert!(ruled(
+            "Read README.md before the release",
+            "Read the notes",
+            "Read README.md before the release"
+        ));
+        assert!(ruled(
+            "Bump the tool to v1.2",
+            "Bump the tool",
+            "Bump the tool to v1.2"
+        ));
+        assert!(!ruled(
+            "Bump the tool to v1.2",
+            "Bump the tool",
+            "Bump the tool to v1.3"
+        ));
+    }
+
+    async fn run_exact_replaces(on: bool) -> StoreSnap {
+        let (_tmp, gm) = open().await;
+        let old = "Only list duplicates.";
+        let new_value =
+            "Move duplicates into _dupes/ under the destination, keeping the path they would have had";
+        let quote = "I want duplicates handled now, not just listed. Move them into _dupes/ under the destination, and keep the path they would have had, so I can compare.";
+        let stored = rule("svc", Kind::Project, old, old);
+        commit(&gm, "s1", "2026-03-01", &[turn(old)], &[stored]).await;
+        let mut next = rule("svc", Kind::Project, new_value, quote);
+        next.replaces = old.into();
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[(1, "supersedes", quote)])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            cue_flags(on),
+        )
+        .await;
+        let ended = ended(live_any(&slots(&gm, "svc").await, "", old)).map(str::to_string);
+        StoreSnap {
+            report,
+            message: stub.message(),
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exact_replaces_closes_when_not_and_would_sit_away_from_the_value() {
+        let off = run_exact_replaces(false).await;
+        let again = run_exact_replaces(false).await;
+        let on = run_exact_replaces(true).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&again.report)
+        );
+        assert_eq!(off.ended, again.ended);
+        assert_eq!(off.message, on.message);
+        assert_eq!(off.calls, 1);
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_cue.is_none());
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert!(on.report.consolidate.replaces_cue.unwrap_or(0) >= 1);
+        assert_eq!(on.report.consolidate.closes_sup, 1);
     }
 }
 

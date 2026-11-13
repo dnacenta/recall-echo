@@ -40,6 +40,7 @@ url = "ws://localhost:8787"   # server mode only
 # recover_turns = false       # list raw-turn values missing from the store; off by default; never writes
 # consolidate_components = false # close a sibling or derived-from partner after the judge; off by default, and ignored unless consolidate is also on
 # consolidate_key_rename = false # keep a judged rename, a "becomes" replacement, or a dropped-entity rule; off by default, and ignored unless consolidate is also on
+# consolidate_replaces_cue = false # count a unique pass-1 replaces match as the departure cue, and pair a rule on replaces alone; off by default, and ignored unless consolidate is also on
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

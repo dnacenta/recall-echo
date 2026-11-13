@@ -274,6 +274,12 @@ enum BenchCommands {
         /// and `--drop-restatements`.
         #[arg(long)]
         consolidate_key_rename: bool,
+        /// Count a unique pass-1 replaces match as the departure cue.
+        /// Implies `--consolidate`. Off unless set. Independent of
+        /// `--consolidate-hold`, `--consolidate-links`, `--consolidate-components`,
+        /// `--consolidate-key-rename`, and `--drop-restatements`.
+        #[arg(long)]
+        consolidate_replaces_cue: bool,
         /// Drop a decided rule that only restates a same-session setting.
         /// Off unless set.
         #[arg(long)]
@@ -1115,6 +1121,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_links,
             consolidate_components,
             consolidate_key_rename,
+            consolidate_replaces_cue,
             drop_restatements,
             ground_component_edges,
             recover_turns,
@@ -1172,6 +1179,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateKeyRename::Off
             },
+            if consolidate_replaces_cue {
+                recall_echo::bench::writes::ConsolidateReplacesCue::On
+            } else {
+                recall_echo::bench::writes::ConsolidateReplacesCue::Off
+            },
         ),
         BenchCommands::RecoverReplay { memory_dir } => {
             let rt =
@@ -1203,6 +1215,7 @@ fn run_writes(
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
     recover_turns: recall_echo::bench::writes::RecoverTurns,
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
+    consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1242,6 +1255,7 @@ fn run_writes(
             consolidate_components,
             recover_turns,
             consolidate_key_rename,
+            consolidate_replaces_cue,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1261,6 +1275,7 @@ fn run_writes(
             consolidate_components,
             recover_turns,
             consolidate_key_rename,
+            consolidate_replaces_cue,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1285,6 +1300,7 @@ async fn grade_once(
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
     recover_turns: recall_echo::bench::writes::RecoverTurns,
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
+    consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1307,6 +1323,7 @@ async fn grade_once(
                 consolidate_components,
                 recover_turns,
                 consolidate_key_rename,
+                consolidate_replaces_cue,
             )
             .await
         }
@@ -1325,6 +1342,7 @@ async fn grade_once(
                 consolidate_components,
                 recover_turns,
                 consolidate_key_rename,
+                consolidate_replaces_cue,
             )
             .await
         }
@@ -1349,6 +1367,7 @@ async fn grade_repeat(
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
     recover_turns: recall_echo::bench::writes::RecoverTurns,
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
+    consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1372,6 +1391,7 @@ async fn grade_repeat(
                 consolidate_components,
                 recover_turns,
                 consolidate_key_rename,
+                consolidate_replaces_cue,
             )
             .await
         }
@@ -1391,6 +1411,7 @@ async fn grade_repeat(
                 consolidate_components,
                 recover_turns,
                 consolidate_key_rename,
+                consolidate_replaces_cue,
             )
             .await
         }
@@ -1830,5 +1851,60 @@ mod tests {
             .expect("writes");
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--consolidate-key-rename"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_replaces_cue_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-replaces-cue",
+        ])
+        .expect("parse replaces cue");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        consolidate_components,
+                        consolidate_key_rename,
+                        consolidate_replaces_cue,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ground_component_edges,
+                        recover_turns,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_replaces_cue);
+                assert!(!consolidate_key_rename);
+                assert!(!recover_turns);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!consolidate_links);
+                assert!(!consolidate_components);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+                assert!(!ground_component_edges);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--consolidate-replaces-cue"), "{help}");
     }
 }

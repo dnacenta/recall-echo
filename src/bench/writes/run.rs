@@ -155,6 +155,20 @@ pub enum ConsolidateKeyRename {
     On,
 }
 
+/// Whether a bench run counts a unique pass-1 `replaces` match as the departure cue.
+///
+/// On implies consolidation: the scratch config sets both `consolidate` and
+/// `consolidate_replaces_cue`. It stays independent of [`DropRestatements`],
+/// [`ConsolidateLinks`], [`ConsolidateComponents`], [`ConsolidateKeyRename`],
+/// [`KnownMatch`], [`KnownFactsContext`], and the hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateReplacesCue {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `consolidate = true` and `consolidate_replaces_cue = true` for this run.
+    On,
+}
+
 /// Whether a bench run opts in to dropping same-session rule restatements.
 ///
 /// On is independent of [`KnownFactsContext`], [`KnownMatch`], and
@@ -212,6 +226,7 @@ pub async fn run(
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
+    consolidate_replaces_cue: ConsolidateReplacesCue,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -227,6 +242,7 @@ pub async fn run(
         consolidate_components,
         recover_turns,
         consolidate_key_rename,
+        consolidate_replaces_cue,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -462,6 +478,7 @@ pub async fn run_repeat(
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
+    consolidate_replaces_cue: ConsolidateReplacesCue,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -489,6 +506,7 @@ pub async fn run_repeat(
                 consolidate_components,
                 recover_turns,
                 consolidate_key_rename,
+                consolidate_replaces_cue,
             )
             .await?,
         );
@@ -509,6 +527,7 @@ fn apply_graph_switches(
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
+    consolidate_replaces_cue: ConsolidateReplacesCue,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
         known,
@@ -520,6 +539,7 @@ fn apply_graph_switches(
         consolidate_components,
         recover_turns,
         consolidate_key_rename,
+        consolidate_replaces_cue,
     );
     if lines.is_empty() {
         return Ok(());
@@ -544,6 +564,7 @@ fn switch_lines(
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
+    consolidate_replaces_cue: ConsolidateReplacesCue,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
     push_line(
@@ -559,6 +580,7 @@ fn switch_lines(
             consolidate_links,
             consolidate_components,
             consolidate_key_rename,
+            consolidate_replaces_cue,
         ),
         "consolidate = true",
     );
@@ -584,6 +606,11 @@ fn switch_lines(
     );
     push_line(
         &mut lines,
+        consolidate_replaces_cue == ConsolidateReplacesCue::On,
+        "consolidate_replaces_cue = true",
+    );
+    push_line(
+        &mut lines,
         drop_restatements == DropRestatements::On,
         "drop_restatements = true",
     );
@@ -605,11 +632,13 @@ fn writes_consolidate(
     consolidate_links: ConsolidateLinks,
     consolidate_components: ConsolidateComponents,
     consolidate_key_rename: ConsolidateKeyRename,
+    consolidate_replaces_cue: ConsolidateReplacesCue,
 ) -> bool {
     consolidate.writes_pass()
         || consolidate_links == ConsolidateLinks::On
         || consolidate_components == ConsolidateComponents::On
         || consolidate_key_rename == ConsolidateKeyRename::On
+        || consolidate_replaces_cue == ConsolidateReplacesCue::On
 }
 
 fn push_line(lines: &mut Vec<&'static str>, on: bool, line: &'static str) {
@@ -2002,6 +2031,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2016,6 +2046,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2034,6 +2065,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2059,6 +2091,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2074,6 +2107,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2105,6 +2139,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2133,6 +2168,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2158,6 +2194,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2192,6 +2229,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2207,6 +2245,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2239,6 +2278,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2254,6 +2294,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::On,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2359,6 +2400,7 @@ mod tests {
                 RecoverTurns::Off
             },
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -2543,6 +2585,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2558,6 +2601,7 @@ mod tests {
             ConsolidateComponents::On,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2588,6 +2632,7 @@ mod tests {
             ConsolidateComponents::On,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2615,6 +2660,7 @@ mod tests {
             ConsolidateComponents::On,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2649,6 +2695,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2664,11 +2711,13 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::On,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
         assert!(text.contains("consolidate = true\n"), "{text}");
         assert!(text.contains("consolidate_key_rename = true\n"), "{text}");
+        assert!(!text.contains("consolidate_replaces_cue"), "{text}");
         assert!(!text.contains("consolidate_hold"), "{text}");
         assert!(!text.contains("consolidate_links"), "{text}");
         assert!(!text.contains("consolidate_components"), "{text}");
@@ -2695,6 +2744,7 @@ mod tests {
             ConsolidateComponents::On,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2704,13 +2754,72 @@ mod tests {
         assert!(text.contains("drop_restatements = true\n"), "{text}");
         assert!(text.contains("ground_component_edges = true\n"), "{text}");
         assert!(!text.contains("consolidate_key_rename"), "{text}");
+        assert!(!text.contains("consolidate_replaces_cue"), "{text}");
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(!graph.consolidate_key_rename);
         assert!(!graph.rename_apply());
+        assert!(!graph.consolidate_replaces_cue);
+        assert!(!graph.replaces_cue_apply());
         assert!(graph.components_apply());
         assert!(graph.links_apply());
         assert!(graph.hold_applies());
+    }
+
+    #[test]
+    fn consolidate_replaces_cue_implies_consolidate_and_stays_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_replaces_cue = true\n"), "{text}");
+        assert!(!text.contains("consolidate_key_rename"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
+        assert!(!text.contains("consolidate_components"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.replaces_cue_apply());
+        assert!(!graph.rename_apply());
+        assert!(!graph.components_apply());
+        assert!(!graph.links_apply());
+        assert!(!graph.hold_applies());
+        assert!(!graph.drop_restatements);
     }
 
     #[test]
@@ -2762,6 +2871,7 @@ mod tests {
                 ConsolidateComponents::Off,
                 RecoverTurns::Off,
                 ConsolidateKeyRename::Off,
+                ConsolidateReplacesCue::Off,
             )
             .unwrap();
             let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2817,6 +2927,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap_err();
@@ -2978,6 +3089,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap();
@@ -3088,6 +3200,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap_err();
@@ -3116,6 +3229,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap_err();
@@ -3196,6 +3310,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap();
@@ -3506,6 +3621,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -3658,6 +3774,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap();
@@ -3876,6 +3993,7 @@ mod tests {
                 ConsolidateComponents::Off,
                 RecoverTurns::Off,
                 ConsolidateKeyRename::Off,
+                ConsolidateReplacesCue::Off,
             )
             .await
             .unwrap();
@@ -3917,6 +4035,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap()
@@ -4210,6 +4329,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap();
@@ -4346,6 +4466,7 @@ mod tests {
             ConsolidateComponents::Off,
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
         )
         .await
         .unwrap();

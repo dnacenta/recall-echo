@@ -731,6 +731,13 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_key_rename: bool,
+    /// Count a unique pass-1 `replaces` match as the departure cue.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_replaces_cue",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_replaces_cue: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// Off unless set.
     #[serde(
@@ -772,6 +779,7 @@ impl Default for GraphSection {
             consolidate_links: default_consolidate_links(),
             consolidate_components: default_consolidate_components(),
             consolidate_key_rename: default_consolidate_key_rename(),
+            consolidate_replaces_cue: default_consolidate_replaces_cue(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
@@ -809,6 +817,12 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn rename_apply(&self) -> bool {
         self.consolidate && self.consolidate_key_rename
+    }
+
+    /// A unique `replaces` match counts as the cue only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn replaces_cue_apply(&self) -> bool {
+        self.consolidate && self.consolidate_replaces_cue
     }
 }
 
@@ -1136,6 +1150,10 @@ fn default_consolidate_components() -> bool {
 }
 
 fn default_consolidate_key_rename() -> bool {
+    false
+}
+
+fn default_consolidate_replaces_cue() -> bool {
     false
 }
 
@@ -1476,6 +1494,12 @@ impl Config {
             }
             "graph.consolidate_key_rename" => {
                 self.graph_section().consolidate_key_rename = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_replaces_cue" => {
+                self.graph_section().consolidate_replaces_cue = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2578,6 +2602,64 @@ mod tests {
         assert!(cfg.graph.as_ref().expect("graph").consolidate_key_rename);
         assert!(cfg.set_key("graph.consolidate_key_rename", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").consolidate_key_rename);
+    }
+
+    #[test]
+    fn consolidate_replaces_cue_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_replaces_cue());
+        assert!(!GraphSection::default().consolidate_replaces_cue);
+        assert!(!GraphSection::default().replaces_cue_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().replaces_cue_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_replaces_cue"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_replaces_cue = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_replaces_cue);
+        assert!(!false_graph.replaces_cue_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_replaces_cue"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_replaces_cue", "true")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_replaces_cue);
+        assert!(!graph.replaces_cue_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.rename_apply());
+        assert!(!graph.components_apply());
+        let rendered = toml::to_string_pretty(&cfg).expect("render cue only");
+        assert!(rendered.contains("consolidate_replaces_cue = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_key_rename"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse cue only");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.consolidate_replaces_cue);
+        assert!(!parsed_graph.replaces_cue_apply());
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").replaces_cue_apply());
+        cfg.set_key("graph.consolidate_replaces_cue", "false")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(!graph.consolidate_replaces_cue);
+        assert!(!graph.replaces_cue_apply());
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_replaces_cue"));
+        cfg.set_key("graph.consolidate_replaces_cue", "true")
+            .unwrap();
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").replaces_cue_apply());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_replaces_cue);
+        assert!(cfg
+            .set_key("graph.consolidate_replaces_cue", "yes")
+            .is_err());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_replaces_cue);
     }
 
     #[test]
