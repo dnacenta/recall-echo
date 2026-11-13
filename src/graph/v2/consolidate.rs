@@ -336,7 +336,10 @@ pub(crate) async fn run(
             &partner.value,
             &anchor.new_value,
             cue,
-            replaces_relaxed(ctx, &tally),
+            Floor {
+                relaxed: replaces_relaxed(ctx, &tally),
+                rule: anchor.pred == "rule",
+            },
         ) {
             Ok(verdict) => accepted.push((pair, verdict.to_string(), quote, tally)),
             Err(reason) => note_drop(report, reason, &anchors, &loaded.rows, &pair, &quote),
@@ -1031,6 +1034,11 @@ fn neighbourhood(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> BTr
     ids
 }
 
+struct Floor {
+    relaxed: bool,
+    rule: bool,
+}
+
 fn accept(
     verdict: &str,
     quote: &str,
@@ -1038,13 +1046,13 @@ fn accept(
     old: &str,
     new_value: &str,
     cue: bool,
-    relaxed_floor: bool,
+    floor: Floor,
 ) -> Result<&'static str, &'static str> {
     if let Some(kind) = pass_verdict(verdict) {
         return Ok(kind);
     }
     let duplicate = verdict == "duplicate";
-    if let Some(reason) = block_quote(quote, evidence, old, new_value, duplicate, relaxed_floor) {
+    if let Some(reason) = block_quote(quote, evidence, old, new_value, duplicate, floor) {
         return Err(reason);
     }
     if verdict == "supersedes" && !cue {
@@ -1070,9 +1078,9 @@ fn block_quote(
     old: &str,
     new_value: &str,
     duplicate: bool,
-    relaxed_floor: bool,
+    floor: Floor,
 ) -> Option<&'static str> {
-    if !quote_floor(quote, new_value, relaxed_floor) {
+    if !quote_floor(quote, new_value, floor.relaxed, floor.rule) {
         return Some(DROP_QUOTE_SHORT);
     }
     if !quote_supported(quote, evidence, old, new_value, duplicate) {
@@ -1081,18 +1089,29 @@ fn block_quote(
     None
 }
 
-fn quote_floor(quote: &str, new_value: &str, relaxed_floor: bool) -> bool {
+fn quote_floor(quote: &str, new_value: &str, relaxed_floor: bool, rule_floor: bool) -> bool {
     if relaxed_floor {
-        relaxed_span(quote, new_value)
+        relaxed_span(quote, new_value, rule_floor)
     } else {
         quote_span(quote)
     }
 }
 
 /// Two alphanumeric runs, and the quote names the new value.
-fn relaxed_span(quote: &str, new_value: &str) -> bool {
+///
+/// A rule uses the same clause test as the replaces cue. A setting still
+/// needs the whole value as one span. Ignored unless the relaxed floor applies.
+fn relaxed_span(quote: &str, new_value: &str, rule_floor: bool) -> bool {
     let folded = fold_ws(quote);
-    alphanumeric_runs(&folded).len() >= 2 && names_value(new_value, quote)
+    alphanumeric_runs(&folded).len() >= 2 && named_for_floor(quote, new_value, rule_floor)
+}
+
+fn named_for_floor(quote: &str, new_value: &str, rule_floor: bool) -> bool {
+    if rule_floor {
+        rule_named(quote, new_value)
+    } else {
+        names_value(new_value, quote)
+    }
 }
 
 fn quote_supported(
@@ -1829,7 +1848,7 @@ fn replaces_cue(
 fn replaces_open(anchor: &Anchor, quote: &str) -> bool {
     !anchor.replaces.trim().is_empty()
         && anchor.pred != "uses"
-        && value_unhedged(quote, &anchor.new_value)
+        && value_unhedged(quote, &anchor.new_value, anchor.pred == "rule")
 }
 
 const SCOPED_HEDGE: &[&str] = &[
@@ -1845,13 +1864,183 @@ const SCOPED_HEDGE: &[&str] = &[
     "unless",
 ];
 
-/// The new value has a span, and that span is not under a nearby hedge.
+/// The new value is named, and that mention is not under a nearby hedge.
 ///
-/// Contrastive `not` and conditional `would` elsewhere in the quote do not count.
-/// The ordinary cue still uses [`hedged`] and [`tentative`] on the whole quote.
-fn value_unhedged(quote: &str, new_value: &str) -> bool {
+/// A setting still needs one contiguous [`names_value`] span. A rule is named
+/// when one clause holds enough of its content tokens. Contrastive `not` and
+/// conditional `would` elsewhere in the quote do not count. The ordinary cue
+/// still uses [`hedged`] and [`tentative`] on the whole quote.
+fn value_unhedged(quote: &str, new_value: &str, rule: bool) -> bool {
+    if rule {
+        rule_named(quote, new_value)
+    } else {
+        setting_named(quote, new_value)
+    }
+}
+
+fn setting_named(quote: &str, new_value: &str) -> bool {
     let spans = value_spans(quote, new_value);
     !spans.is_empty() && spans.iter().any(|span| clean_span(quote, *span))
+}
+
+/// One clause holds the distinctive tokens and at least 60% of the rest.
+fn rule_named(quote: &str, new_value: &str) -> bool {
+    let want = name_pieces(new_value, 0);
+    !want.is_empty() && quote_names_rule(quote, &want)
+}
+
+fn quote_names_rule(quote: &str, want: &[NamePiece]) -> bool {
+    split_clauses(quote)
+        .iter()
+        .any(|(base, clause)| named_clean(quote, *base, clause, want))
+}
+
+fn named_clean(quote: &str, base: usize, clause: &str, want: &[NamePiece]) -> bool {
+    match first_rule_hit(base, clause, want) {
+        Some(at) => clean_span(quote, (at, at)),
+        None => false,
+    }
+}
+
+fn first_rule_hit(base: usize, clause: &str, want: &[NamePiece]) -> Option<usize> {
+    let have = name_pieces(clause, base);
+    if !clause_covers(&have, want) {
+        return None;
+    }
+    have.into_iter()
+        .find(|got| want.iter().any(|need| piece_eq(need, got)))
+        .map(|got| got.at)
+}
+
+fn clause_covers(have: &[NamePiece], want: &[NamePiece]) -> bool {
+    marks_held(have, want) && shared_enough(have, want)
+}
+
+fn marks_held(have: &[NamePiece], want: &[NamePiece]) -> bool {
+    want.iter()
+        .filter(|tok| tok.distinctive)
+        .all(|tok| have.iter().any(|got| got.raw == tok.raw))
+}
+
+fn shared_enough(have: &[NamePiece], want: &[NamePiece]) -> bool {
+    let hit = want
+        .iter()
+        .filter(|need| have.iter().any(|got| piece_eq(need, got)))
+        .count();
+    hit >= name_quota(want.len())
+}
+
+fn name_quota(len: usize) -> usize {
+    (len * 3).div_ceil(5).max(2)
+}
+
+fn piece_eq(need: &NamePiece, got: &NamePiece) -> bool {
+    if need.distinctive {
+        need.raw == got.raw
+    } else {
+        !got.distinctive && need.folded == got.folded
+    }
+}
+
+struct NamePiece {
+    raw: String,
+    folded: String,
+    distinctive: bool,
+    at: usize,
+}
+
+fn name_pieces(text: &str, base: usize) -> Vec<NamePiece> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut from = None;
+    for (index, ch) in text.char_indices() {
+        if name_char(text, index, ch) {
+            if from.is_none() {
+                from = Some(index);
+            }
+            buf.push(ch);
+        } else if let Some(start) = from.take() {
+            keep_piece(&mut out, &buf, base + start);
+            buf.clear();
+        }
+    }
+    if let Some(start) = from {
+        keep_piece(&mut out, &buf, base + start);
+    }
+    out
+}
+
+fn name_char(text: &str, index: usize, ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '/' | '_' | '-') || inner_dot(text, index, ch)
+}
+
+fn inner_dot(text: &str, index: usize, ch: char) -> bool {
+    ch == '.' && next_joins(text, index)
+}
+
+fn next_joins(text: &str, index: usize) -> bool {
+    matches!(
+        text[index + '.'.len_utf8()..].chars().next(),
+        Some(ch) if ch.is_alphanumeric()
+    )
+}
+
+fn keep_piece(out: &mut Vec<NamePiece>, raw: &str, at: usize) {
+    if raw.is_empty() {
+        return;
+    }
+    let raw = raw.to_lowercase();
+    let distinctive = is_distinctive(&raw);
+    if distinctive || !is_stop_word(&raw) {
+        let folded = folded_piece(&raw, distinctive);
+        out.push(NamePiece {
+            raw,
+            folded,
+            distinctive,
+            at,
+        });
+    }
+}
+
+fn is_distinctive(token: &str) -> bool {
+    token
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || matches!(ch, '/' | '_' | '.' | '-'))
+}
+
+fn folded_piece(raw: &str, distinctive: bool) -> String {
+    if distinctive {
+        raw.to_string()
+    } else {
+        fold_suffix(raw)
+    }
+}
+
+/// Suffixes used only when a rule quote is compared with its new value.
+fn fold_suffix(word: &str) -> String {
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(stem) = word.strip_suffix(suffix) {
+            if stem.chars().count() >= 3 {
+                return stem.to_string();
+            }
+        }
+    }
+    word.to_string()
+}
+
+fn split_clauses(quote: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, ch) in quote.char_indices() {
+        if matches!(ch, '.' | '?' | '!' | ';' | '\n') {
+            out.push((start, &quote[start..index]));
+            start = index + ch.len_utf8();
+        }
+    }
+    if start < quote.len() {
+        out.push((start, &quote[start..]));
+    }
+    out
 }
 
 fn clean_span(quote: &str, span: (usize, usize)) -> bool {
@@ -11150,13 +11339,18 @@ mod tests {
 
     #[test]
     fn relaxed_floor_names_the_new_value_and_keeps_two_runs() {
-        assert!(quote_floor("8 attempts", "8", true));
-        assert!(!quote_floor("8 attempts", "8", false));
-        assert!(!quote_floor("the attempts", "8", true));
-        assert!(quote_floor("the attempts", "8", false));
-        assert!(!quote_floor("8", "8", true));
-        assert!(quote_floor("Use 8 attempts from now on.", "8", true));
-        assert!(quote_floor("Use 8 attempts from now on.", "8", false));
+        assert!(quote_floor("8 attempts", "8", true, false));
+        assert!(!quote_floor("8 attempts", "8", false, false));
+        assert!(!quote_floor("the attempts", "8", true, false));
+        assert!(quote_floor("the attempts", "8", false, false));
+        assert!(!quote_floor("8", "8", true, false));
+        assert!(quote_floor("Use 8 attempts from now on.", "8", true, false));
+        assert!(quote_floor(
+            "Use 8 attempts from now on.",
+            "8",
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -11638,12 +11832,52 @@ mod tests {
         ));
     }
 
+    fn rule_shape_cue(new_value: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("rule", "", new_value, "Only list files.");
+        let partner = cue_row("ent", "rule", "", "Only list files at the end.");
+        let loaded = cue_loaded(vec![partner]);
+        replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn a_reworded_rule_clause_names_the_value_when_the_path_token_matches() {
+        let value = "Move files into _hold/ under the desk, keeping the path they would have had";
+        let named = "Move them into _hold/ under the desk, and keep the path they would have had";
+        let moved = "Move them into _other/ under the desk, and keep the path they would have had";
+        let thin = "Move them later.";
+        assert!(rule_shape_cue(value, named));
+        assert!(!rule_shape_cue(value, moved));
+        assert!(!rule_shape_cue(value, thin));
+    }
+
+    #[test]
+    fn the_recorded_rule_quote_names_the_new_value() {
+        let value = "Move duplicates into _dupes/ under the destination, keeping the path they would have had";
+        let quote = "I want duplicates handled now, not just listed. Move them into _dupes/ under the destination, and keep the path they would have had, so I can compare.";
+        let anchor = cue_anchor("rule", "", value, "Only list duplicates.");
+        let partner = cue_row("ent", "rule", "", "Only list duplicates.");
+        let loaded = cue_loaded(vec![partner]);
+        assert!(replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote
+        ));
+    }
+
     async fn run_exact_replaces(on: bool) -> StoreSnap {
         let (_tmp, gm) = open().await;
-        let old = "Keep one copy and leave the rest.";
-        let new_value = "Move copies into a holding folder";
-        let quote =
-            "Move copies into a holding folder, not just listed as the path they would have had";
+        let old = "Only list duplicates.";
+        let new_value =
+            "Move duplicates into _dupes/ under the destination, keeping the path they would have had";
+        let quote = "I want duplicates handled now, not just listed. Move them into _dupes/ under the destination, and keep the path they would have had, so I can compare.";
         let stored = rule("svc", Kind::Project, old, old);
         commit(&gm, "s1", "2026-03-01", &[turn(old)], &[stored]).await;
         let mut next = rule("svc", Kind::Project, new_value, quote);
