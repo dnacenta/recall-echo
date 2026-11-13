@@ -339,6 +339,7 @@ pub(crate) async fn run(
             Floor {
                 relaxed: replaces_relaxed(ctx, &tally),
                 rule: anchor.pred == "rule",
+                old: &anchor.replaces,
             },
         ) {
             Ok(verdict) => accepted.push((pair, verdict.to_string(), quote, tally)),
@@ -1034,9 +1035,10 @@ fn neighbourhood(anchors: &[Anchor], loaded: &Loaded, ctx: &WriteCtx<'_>) -> BTr
     ids
 }
 
-struct Floor {
+struct Floor<'a> {
     relaxed: bool,
     rule: bool,
+    old: &'a str,
 }
 
 fn accept(
@@ -1080,7 +1082,7 @@ fn block_quote(
     duplicate: bool,
     floor: Floor,
 ) -> Option<&'static str> {
-    if !quote_floor(quote, new_value, floor.relaxed, floor.rule) {
+    if !quote_floor(quote, new_value, &floor) {
         return Some(DROP_QUOTE_SHORT);
     }
     if !quote_supported(quote, evidence, old, new_value, duplicate) {
@@ -1089,9 +1091,9 @@ fn block_quote(
     None
 }
 
-fn quote_floor(quote: &str, new_value: &str, relaxed_floor: bool, rule_floor: bool) -> bool {
-    if relaxed_floor {
-        relaxed_span(quote, new_value, rule_floor)
+fn quote_floor(quote: &str, new_value: &str, floor: &Floor<'_>) -> bool {
+    if floor.relaxed {
+        relaxed_span(quote, new_value, floor)
     } else {
         quote_span(quote)
     }
@@ -1101,14 +1103,14 @@ fn quote_floor(quote: &str, new_value: &str, relaxed_floor: bool, rule_floor: bo
 ///
 /// A rule uses the same clause test as the replaces cue. A setting still
 /// needs the whole value as one span. Ignored unless the relaxed floor applies.
-fn relaxed_span(quote: &str, new_value: &str, rule_floor: bool) -> bool {
+fn relaxed_span(quote: &str, new_value: &str, floor: &Floor<'_>) -> bool {
     let folded = fold_ws(quote);
-    alphanumeric_runs(&folded).len() >= 2 && named_for_floor(quote, new_value, rule_floor)
+    alphanumeric_runs(&folded).len() >= 2 && named_for_floor(quote, new_value, floor)
 }
 
-fn named_for_floor(quote: &str, new_value: &str, rule_floor: bool) -> bool {
-    if rule_floor {
-        rule_named(quote, new_value)
+fn named_for_floor(quote: &str, new_value: &str, floor: &Floor<'_>) -> bool {
+    if floor.rule {
+        rule_named(quote, new_value, floor.old)
     } else {
         names_value(new_value, quote)
     }
@@ -1848,7 +1850,12 @@ fn replaces_cue(
 fn replaces_open(anchor: &Anchor, quote: &str) -> bool {
     !anchor.replaces.trim().is_empty()
         && anchor.pred != "uses"
-        && value_unhedged(quote, &anchor.new_value, anchor.pred == "rule")
+        && value_unhedged(
+            quote,
+            &anchor.new_value,
+            anchor.pred == "rule",
+            &anchor.replaces,
+        )
 }
 
 const SCOPED_HEDGE: &[&str] = &[
@@ -1870,9 +1877,9 @@ const SCOPED_HEDGE: &[&str] = &[
 /// when one clause holds enough of its content tokens. Contrastive `not` and
 /// conditional `would` elsewhere in the quote do not count. The ordinary cue
 /// still uses [`hedged`] and [`tentative`] on the whole quote.
-fn value_unhedged(quote: &str, new_value: &str, rule: bool) -> bool {
+fn value_unhedged(quote: &str, new_value: &str, rule: bool, old: &str) -> bool {
     if rule {
-        rule_named(quote, new_value)
+        rule_named(quote, new_value, old)
     } else {
         setting_named(quote, new_value)
     }
@@ -1883,33 +1890,122 @@ fn setting_named(quote: &str, new_value: &str) -> bool {
     !spans.is_empty() && spans.iter().any(|span| clean_span(quote, *span))
 }
 
-/// One clause holds the distinctive tokens and at least 60% of the rest.
-fn rule_named(quote: &str, new_value: &str) -> bool {
+/// One clause holds the distinctive tokens, enough of the value, and a new word.
+fn rule_named(quote: &str, new_value: &str, old: &str) -> bool {
     let want = name_pieces(new_value, 0);
-    !want.is_empty() && quote_names_rule(quote, &want)
+    !want.is_empty() && quote_names_rule(quote, &want, new_value, old)
 }
 
-fn quote_names_rule(quote: &str, want: &[NamePiece]) -> bool {
+fn quote_names_rule(quote: &str, want: &[NamePiece], new_value: &str, old: &str) -> bool {
     split_clauses(quote)
         .iter()
-        .any(|(base, clause)| named_clean(quote, *base, clause, want))
+        .any(|(base, clause)| named_clean(quote, *base, clause, want, new_value, old))
 }
 
-fn named_clean(quote: &str, base: usize, clause: &str, want: &[NamePiece]) -> bool {
-    match first_rule_hit(base, clause, want) {
+fn named_clean(
+    quote: &str,
+    base: usize,
+    clause: &str,
+    want: &[NamePiece],
+    new_value: &str,
+    old: &str,
+) -> bool {
+    let have = name_pieces(clause, base);
+    clause_ready(&have, want, clause, new_value, old) && hit_clean(quote, &have, want)
+}
+
+fn clause_ready(
+    have: &[NamePiece],
+    want: &[NamePiece],
+    clause: &str,
+    new_value: &str,
+    old: &str,
+) -> bool {
+    clause_covers(have, want) && adds_word(have, old) && !negation_mismatch(clause, new_value)
+}
+
+fn hit_clean(quote: &str, have: &[NamePiece], want: &[NamePiece]) -> bool {
+    match first_hit(have, want) {
         Some(at) => clean_span(quote, (at, at)),
         None => false,
     }
 }
 
-fn first_rule_hit(base: usize, clause: &str, want: &[NamePiece]) -> Option<usize> {
-    let have = name_pieces(clause, base);
-    if !clause_covers(&have, want) {
-        return None;
-    }
-    have.into_iter()
+fn first_hit(have: &[NamePiece], want: &[NamePiece]) -> Option<usize> {
+    have.iter()
         .find(|got| want.iter().any(|need| piece_eq(need, got)))
         .map(|got| got.at)
+}
+
+fn adds_word(have: &[NamePiece], old: &str) -> bool {
+    let prior = name_pieces(old, 0);
+    have.iter().any(|got| !known_word(got, &prior))
+}
+
+fn known_word(got: &NamePiece, prior: &[NamePiece]) -> bool {
+    if got.distinctive {
+        prior.iter().any(|old| old.raw == got.raw)
+    } else {
+        prior
+            .iter()
+            .any(|old| !old.distinctive && old.folded == got.folded)
+    }
+}
+
+fn negation_mismatch(clause: &str, new_value: &str) -> bool {
+    has_negation(clause) != has_negation(new_value)
+}
+
+fn has_negation(text: &str) -> bool {
+    let words = raw_words(text);
+    words
+        .iter()
+        .enumerate()
+        .any(|(index, word)| lone_negation(&word.raw, next_raw(&words, index)))
+}
+
+fn next_raw(words: &[RawWord], index: usize) -> Option<&str> {
+    words.get(index + 1).map(|word| word.raw.as_str())
+}
+
+fn lone_negation(word: &str, next: Option<&str>) -> bool {
+    match word {
+        "not" | "no" | "never" | "without" | "don't" | "dont" => true,
+        "do" => next == Some("not"),
+        _ => false,
+    }
+}
+
+fn raw_words(text: &str) -> Vec<RawWord> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut from = None;
+    for (index, ch) in text.char_indices() {
+        if name_char(text, index, ch) {
+            if from.is_none() {
+                from = Some(index);
+            }
+            buf.push(ch);
+        } else if from.take().is_some() {
+            push_raw(&mut out, &buf);
+            buf.clear();
+        }
+    }
+    if from.is_some() {
+        push_raw(&mut out, &buf);
+    }
+    out
+}
+
+struct RawWord {
+    raw: String,
+}
+
+fn push_raw(out: &mut Vec<RawWord>, buf: &str) {
+    let raw = buf.trim_matches('\'').to_lowercase();
+    if !raw.is_empty() {
+        out.push(RawWord { raw });
+    }
 }
 
 fn clause_covers(have: &[NamePiece], want: &[NamePiece]) -> bool {
@@ -1971,7 +2067,10 @@ fn name_pieces(text: &str, base: usize) -> Vec<NamePiece> {
 }
 
 fn name_char(text: &str, index: usize, ch: char) -> bool {
-    ch.is_alphanumeric() || matches!(ch, '/' | '_' | '-') || inner_dot(text, index, ch)
+    ch.is_alphanumeric()
+        || ch == '\''
+        || matches!(ch, '/' | '_' | '-')
+        || inner_dot(text, index, ch)
 }
 
 fn inner_dot(text: &str, index: usize, ch: char) -> bool {
@@ -2032,7 +2131,7 @@ fn split_clauses(quote: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut start = 0;
     for (index, ch) in quote.char_indices() {
-        if matches!(ch, '.' | '?' | '!' | ';' | '\n') {
+        if clause_break(quote, index, ch) {
             out.push((start, &quote[start..index]));
             start = index + ch.len_utf8();
         }
@@ -2041,6 +2140,21 @@ fn split_clauses(quote: &str) -> Vec<(usize, &str)> {
         out.push((start, &quote[start..]));
     }
     out
+}
+
+fn clause_break(text: &str, index: usize, ch: char) -> bool {
+    match ch {
+        '?' | '!' | ';' | '\n' => true,
+        '.' => dot_ends(text, index),
+        _ => false,
+    }
+}
+
+fn dot_ends(text: &str, index: usize) -> bool {
+    match text[index + 1..].chars().next() {
+        None => true,
+        Some(ch) => ch.is_whitespace(),
+    }
 }
 
 fn clean_span(quote: &str, span: (usize, usize)) -> bool {
@@ -2061,9 +2175,13 @@ fn clause_head(quote: &str, at: usize) -> &str {
 }
 
 fn clause_start(head: &str) -> usize {
-    head.rfind(['.', '?', '!', ';', '\n'])
-        .map(|index| index + 1)
-        .unwrap_or(0)
+    let mut start = 0;
+    for (index, ch) in head.char_indices() {
+        if clause_break(head, index, ch) {
+            start = index + ch.len_utf8();
+        }
+    }
+    start
 }
 
 fn marker_near(quote: &str, at: usize) -> bool {
@@ -11337,19 +11455,30 @@ mod tests {
         serde_json::to_string(&report.consolidate).unwrap()
     }
 
+    fn open_floor(relaxed: bool) -> Floor<'static> {
+        Floor {
+            relaxed,
+            rule: false,
+            old: "",
+        }
+    }
+
     #[test]
     fn relaxed_floor_names_the_new_value_and_keeps_two_runs() {
-        assert!(quote_floor("8 attempts", "8", true, false));
-        assert!(!quote_floor("8 attempts", "8", false, false));
-        assert!(!quote_floor("the attempts", "8", true, false));
-        assert!(quote_floor("the attempts", "8", false, false));
-        assert!(!quote_floor("8", "8", true, false));
-        assert!(quote_floor("Use 8 attempts from now on.", "8", true, false));
+        assert!(quote_floor("8 attempts", "8", &open_floor(true)));
+        assert!(!quote_floor("8 attempts", "8", &open_floor(false)));
+        assert!(!quote_floor("the attempts", "8", &open_floor(true)));
+        assert!(quote_floor("the attempts", "8", &open_floor(false)));
+        assert!(!quote_floor("8", "8", &open_floor(true)));
         assert!(quote_floor(
             "Use 8 attempts from now on.",
             "8",
-            false,
-            false
+            &open_floor(true)
+        ));
+        assert!(quote_floor(
+            "Use 8 attempts from now on.",
+            "8",
+            &open_floor(false)
         ));
     }
 
@@ -11801,7 +11930,8 @@ mod tests {
         let open =
             "Move copies into a holding folder, not just listed as the path they would have had";
         let near = "might soon Move copies into a holding folder, not just listed as the path they would have had";
-        assert!(rule_cue(stored, open));
+        // `not` sits in the matched clause and the new value has none, so the cue is blocked.
+        assert!(!rule_cue(stored, open));
         assert!(!rule_cue(stored, near));
 
         let anchor = cue_anchor("setting", "max_attempts", "8", "5");
@@ -11869,6 +11999,77 @@ mod tests {
             &loaded,
             &cue_area(&["ent"]),
             quote
+        ));
+    }
+
+    fn ruled(new_value: &str, old: &str, quote: &str) -> bool {
+        let anchor = cue_anchor("rule", "", new_value, old);
+        let partner = cue_row("ent", "rule", "", old);
+        let loaded = cue_loaded(vec![partner]);
+        replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &cue_area(&["ent"]),
+            quote,
+        )
+    }
+
+    #[test]
+    fn restating_the_old_rule_gives_no_cue() {
+        let old = "Squash merge pull requests";
+        assert!(!ruled(
+            "Do not squash merge pull requests",
+            old,
+            "Squash merge pull requests"
+        ));
+        assert!(!ruled(
+            "Squash merge pull requests onto the trunk",
+            old,
+            "Squash merge pull requests"
+        ));
+    }
+
+    #[test]
+    fn a_negation_flip_gives_no_cue() {
+        assert!(!ruled(
+            "Do not run tests on push",
+            "Skip the nightly suite",
+            "Run tests on push"
+        ));
+        assert!(!ruled(
+            "Never commit generated files",
+            "Leave the tree as it stands",
+            "We commit generated files to the repo"
+        ));
+    }
+
+    #[test]
+    fn a_clause_of_only_old_words_gives_no_cue() {
+        let old = "Squash merge pull requests on the trunk";
+        assert!(!ruled(
+            "Squash merge pull requests on the trunk after review",
+            old,
+            "Squash merge pull requests on the trunk"
+        ));
+    }
+
+    #[test]
+    fn a_dotted_token_stays_whole_and_must_match() {
+        assert!(ruled(
+            "Read README.md before the release",
+            "Read the notes",
+            "Read README.md before the release"
+        ));
+        assert!(ruled(
+            "Bump the tool to v1.2",
+            "Bump the tool",
+            "Bump the tool to v1.2"
+        ));
+        assert!(!ruled(
+            "Bump the tool to v1.2",
+            "Bump the tool",
+            "Bump the tool to v1.3"
         ));
     }
 
