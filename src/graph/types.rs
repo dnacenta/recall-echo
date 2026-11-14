@@ -916,6 +916,10 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_cue_uses: Option<u32>,
+    /// Closes kept because an exact rule `replaces` plus a departure word supplied the cue.
+    /// Absent when zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_departure: Option<u32>,
     /// Anchors added because `replaces` was named in an earlier turn.
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1088,6 +1092,7 @@ impl ConsolidateReport {
             && self.replaces_floor.unwrap_or(0) == 0
             && self.pair_via_replaces.unwrap_or(0) == 0
             && self.replaces_cue_uses.unwrap_or(0) == 0
+            && self.replaces_departure.unwrap_or(0) == 0
             && self.anchor_earlier_turn.unwrap_or(0) == 0
             && self.pair_via_earlier_turn.unwrap_or(0) == 0
             && self.anchor_earlier_turn_skipped.unwrap_or(0) == 0
@@ -1164,6 +1169,10 @@ pub struct IngestionReport {
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
+    /// Decided settings kept at gate 3 because a shown known row has the same subject, key and `replaces` value.
+    /// Zero when the switch or the known block is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub known_key_bound: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,

@@ -169,6 +169,30 @@ pub enum ConsolidateReplacesCue {
     On,
 }
 
+/// Whether a bench run keeps an exact rule `replaces` that a departure word ends.
+///
+/// On implies consolidation: the scratch config sets both `consolidate` and
+/// `consolidate_replaces_departure`. It does not write `consolidate_replaces_cue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateReplacesDeparture {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `consolidate = true` and `consolidate_replaces_departure = true` for this run.
+    On,
+}
+
+/// Whether a bench run binds a decided setting key from a shown known row.
+///
+/// On writes `known_key_binding = true` only. It does not write
+/// `known_facts_context`; without that block the switch does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownKeyBinding {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `known_key_binding = true` for this run.
+    On,
+}
+
 /// Whether a bench run opts in to dropping same-session rule restatements.
 ///
 /// On is independent of [`KnownFactsContext`], [`KnownMatch`], and
@@ -227,6 +251,8 @@ pub async fn run(
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
+    consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    known_key_binding: KnownKeyBinding,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -243,6 +269,8 @@ pub async fn run(
         recover_turns,
         consolidate_key_rename,
         consolidate_replaces_cue,
+        consolidate_replaces_departure,
+        known_key_binding,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -305,6 +333,7 @@ async fn collect_sessions(
             candidates: report.candidates,
             kept: report.kept,
             drops: report.drops,
+            known_key_bound: report.known_key_bound,
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
@@ -377,6 +406,7 @@ async fn ingest_v2(
     report.candidates = extracted.candidates;
     report.kept = extracted.kept;
     report.drops = extracted.drops;
+    report.known_key_bound = extracted.known_key_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
     report.retirements_skipped = extracted.retirements_skipped;
@@ -479,6 +509,8 @@ pub async fn run_repeat(
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
+    consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    known_key_binding: KnownKeyBinding,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -507,6 +539,8 @@ pub async fn run_repeat(
                 recover_turns,
                 consolidate_key_rename,
                 consolidate_replaces_cue,
+                consolidate_replaces_departure,
+                known_key_binding,
             )
             .await?,
         );
@@ -528,6 +562,8 @@ fn apply_graph_switches(
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
+    consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    known_key_binding: KnownKeyBinding,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
         known,
@@ -540,6 +576,8 @@ fn apply_graph_switches(
         recover_turns,
         consolidate_key_rename,
         consolidate_replaces_cue,
+        consolidate_replaces_departure,
+        known_key_binding,
     );
     if lines.is_empty() {
         return Ok(());
@@ -565,6 +603,8 @@ fn switch_lines(
     recover_turns: RecoverTurns,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
+    consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    known_key_binding: KnownKeyBinding,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
     push_line(
@@ -581,6 +621,7 @@ fn switch_lines(
             consolidate_components,
             consolidate_key_rename,
             consolidate_replaces_cue,
+            consolidate_replaces_departure,
         ),
         "consolidate = true",
     );
@@ -611,6 +652,16 @@ fn switch_lines(
     );
     push_line(
         &mut lines,
+        consolidate_replaces_departure == ConsolidateReplacesDeparture::On,
+        "consolidate_replaces_departure = true",
+    );
+    push_line(
+        &mut lines,
+        known_key_binding == KnownKeyBinding::On,
+        "known_key_binding = true",
+    );
+    push_line(
+        &mut lines,
         drop_restatements == DropRestatements::On,
         "drop_restatements = true",
     );
@@ -633,12 +684,14 @@ fn writes_consolidate(
     consolidate_components: ConsolidateComponents,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
+    consolidate_replaces_departure: ConsolidateReplacesDeparture,
 ) -> bool {
     consolidate.writes_pass()
         || consolidate_links == ConsolidateLinks::On
         || consolidate_components == ConsolidateComponents::On
         || consolidate_key_rename == ConsolidateKeyRename::On
         || consolidate_replaces_cue == ConsolidateReplacesCue::On
+        || consolidate_replaces_departure == ConsolidateReplacesDeparture::On
 }
 
 fn push_line(lines: &mut Vec<&'static str>, on: bool, line: &'static str) {
@@ -2032,6 +2085,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2047,6 +2102,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2066,6 +2123,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2092,6 +2151,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2108,6 +2169,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2140,6 +2203,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2169,6 +2234,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2195,6 +2262,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2230,6 +2299,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2246,6 +2317,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2279,6 +2352,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2295,6 +2370,8 @@ mod tests {
             RecoverTurns::On,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2401,6 +2478,8 @@ mod tests {
             },
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -2586,6 +2665,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2602,6 +2683,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2633,6 +2716,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2661,6 +2746,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2696,6 +2783,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2712,6 +2801,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::On,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2745,6 +2836,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2783,6 +2876,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2799,6 +2894,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::On,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2820,6 +2917,119 @@ mod tests {
         assert!(!graph.links_apply());
         assert!(!graph.hold_applies());
         assert!(!graph.drop_restatements);
+    }
+
+    #[test]
+    fn consolidate_replaces_departure_implies_consolidate_and_stays_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::On,
+            KnownKeyBinding::Off,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_replaces_departure = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_replaces_cue"), "{text}");
+        assert!(!text.contains("consolidate_key_rename"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
+        assert!(!text.contains("consolidate_components"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.replaces_departure_apply());
+        assert!(!graph.replaces_cue_apply());
+        assert!(!graph.consolidate_replaces_cue);
+        assert!(!graph.known_facts_context);
+    }
+
+    #[test]
+    fn known_key_binding_writes_only_its_own_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::On,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("known_key_binding = true\n"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.known_key_binding);
+        assert!(!graph.known_key_binding_apply());
+        assert!(!graph.known_facts_context);
     }
 
     #[test]
@@ -2872,6 +3082,8 @@ mod tests {
                 RecoverTurns::Off,
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
+                ConsolidateReplacesDeparture::Off,
+                KnownKeyBinding::Off,
             )
             .unwrap();
             let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2928,6 +3140,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap_err();
@@ -3090,6 +3304,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap();
@@ -3201,6 +3417,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap_err();
@@ -3230,6 +3448,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap_err();
@@ -3311,6 +3531,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap();
@@ -3622,6 +3844,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -3775,6 +3999,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap();
@@ -3994,6 +4220,8 @@ mod tests {
                 RecoverTurns::Off,
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
+                ConsolidateReplacesDeparture::Off,
+                KnownKeyBinding::Off,
             )
             .await
             .unwrap();
@@ -4036,6 +4264,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap()
@@ -4330,6 +4560,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap();
@@ -4467,6 +4699,8 @@ mod tests {
             RecoverTurns::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            KnownKeyBinding::Off,
         )
         .await
         .unwrap();
@@ -4957,6 +5191,7 @@ mod tests {
             candidates: 0,
             kept: 0,
             drops: std::collections::HashMap::new(),
+            known_key_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,

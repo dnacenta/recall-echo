@@ -167,6 +167,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Count a unique pass-1 `replaces` match as the departure cue.
     /// Off leaves that cue unchanged.
     pub replaces_cue_on: bool,
+    /// Keep a judged supersede when an exact rule `replaces` and a departure
+    /// word supply the cue. Off leaves that cue unchanged.
+    pub replaces_departure_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -195,6 +198,7 @@ impl<'a> WriteCtx<'a> {
             components_on: false,
             rename_on: false,
             replaces_cue_on: false,
+            replaces_departure_on: false,
         }
     }
 }
@@ -3460,6 +3464,7 @@ mod tests {
                 components_on: false,
                 rename_on: false,
                 replaces_cue_on: false,
+                replaces_departure_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4729,6 +4734,7 @@ mod tests {
             components_on: false,
             rename_on: false,
             replaces_cue_on: false,
+            replaces_departure_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -6230,6 +6236,7 @@ mod tests {
             components_on: false,
             rename_on: false,
             replaces_cue_on: false,
+            replaces_departure_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -8116,6 +8123,7 @@ mod tests {
             components_on: false,
             rename_on: false,
             replaces_cue_on: false,
+            replaces_departure_on: false,
         };
         let result = write_facts(
             &gm,
