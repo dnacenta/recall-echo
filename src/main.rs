@@ -285,6 +285,11 @@ enum BenchCommands {
         /// Independent of `--consolidate-replaces-cue`.
         #[arg(long)]
         consolidate_replaces_departure: bool,
+        /// Close orphan copies of a rejected value after the session write.
+        /// Implies `--consolidate`. Off unless set. Does not turn on
+        /// `--ground-component-edges`.
+        #[arg(long)]
+        consolidate_orphan_sweep: bool,
         /// Bind a decided setting key from a shown known row. Off unless set.
         /// Does not turn on `--known-facts-context`.
         #[arg(long)]
@@ -1132,6 +1137,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            consolidate_orphan_sweep,
             known_key_binding,
             drop_restatements,
             ground_component_edges,
@@ -1200,6 +1206,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateReplacesDeparture::Off
             },
+            if consolidate_orphan_sweep {
+                recall_echo::bench::writes::ConsolidateOrphanSweep::On
+            } else {
+                recall_echo::bench::writes::ConsolidateOrphanSweep::Off
+            },
             if known_key_binding {
                 recall_echo::bench::writes::KnownKeyBinding::On
             } else {
@@ -1238,6 +1249,7 @@ fn run_writes(
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: recall_echo::bench::writes::ConsolidateOrphanSweep,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
@@ -1280,6 +1292,7 @@ fn run_writes(
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            consolidate_orphan_sweep,
             known_key_binding,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1302,6 +1315,7 @@ fn run_writes(
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            consolidate_orphan_sweep,
             known_key_binding,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1329,6 +1343,7 @@ async fn grade_once(
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: recall_echo::bench::writes::ConsolidateOrphanSweep,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1354,6 +1369,7 @@ async fn grade_once(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                consolidate_orphan_sweep,
                 known_key_binding,
             )
             .await
@@ -1375,6 +1391,7 @@ async fn grade_once(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                consolidate_orphan_sweep,
                 known_key_binding,
             )
             .await
@@ -1402,6 +1419,7 @@ async fn grade_repeat(
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: recall_echo::bench::writes::ConsolidateOrphanSweep,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1428,6 +1446,7 @@ async fn grade_repeat(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                consolidate_orphan_sweep,
                 known_key_binding,
             )
             .await
@@ -1450,6 +1469,7 @@ async fn grade_repeat(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                consolidate_orphan_sweep,
                 known_key_binding,
             )
             .await
@@ -2002,6 +2022,65 @@ mod tests {
             .expect("writes");
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--consolidate-replaces-departure"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_orphan_sweep_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-orphan-sweep",
+        ])
+        .expect("parse orphan sweep");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        consolidate_components,
+                        consolidate_key_rename,
+                        consolidate_replaces_cue,
+                        consolidate_replaces_departure,
+                        consolidate_orphan_sweep,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ground_component_edges,
+                        recover_turns,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_orphan_sweep);
+                assert!(!consolidate_replaces_departure);
+                assert!(!consolidate_replaces_cue);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!consolidate_links);
+                assert!(!consolidate_components);
+                assert!(!consolidate_key_rename);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+                assert!(!ground_component_edges);
+                assert!(!recover_turns);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--consolidate-orphan-sweep"), "{help}");
     }
 
     #[cfg(feature = "bench")]

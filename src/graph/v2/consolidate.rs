@@ -5,6 +5,7 @@
 //! Opt-in pass after a session's writes. It stamps a live row the writer
 //! could not see. It does not write evidence or edit a value.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -22,7 +23,7 @@ use super::ground::{is_stop_word, sentences};
 use super::known_match::{
     coexist, cue_words, departure_near, key_tokens, mention, value_spans, DEPARTURE,
 };
-use super::schema::{normalise, Kind, Predicate};
+use super::schema::{normalise, Fact, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
     WriteCtx, WriteStats, CLOSE_EDGE, REJECTED, REPLACED, SUPERSEDED,
@@ -129,9 +130,24 @@ enum Step {
     Judge,
 }
 
+/// One session, then the opt-in post-pass.
+///
+/// The post-pass reads nothing when its switches are off.
+pub(crate) async fn run(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[super::schema::Fact],
+    stats: &WriteStats,
+    llm: &dyn LlmProvider,
+    report: &mut IngestionReport,
+) {
+    run_main(gm, ctx, facts, stats, llm, report).await;
+    post_pass(gm, ctx, facts, report).await;
+}
+
 /// One session. No anchors means no read and no call. A provider or parse
 /// failure is counted and does not fail the session.
-pub(crate) async fn run(
+async fn run_main(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     facts: &[super::schema::Fact],
@@ -5123,6 +5139,600 @@ async fn confirm_held(
 
 fn count(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+const ORPHAN_CAP: usize = 48;
+const ORPHAN_TARGET_CAP: usize = 4;
+const ORPHAN_REASON: &str = "orphan_sweep";
+const COMPONENT_PAGE: &str = "\
+SELECT id, name, attributes FROM entity \
+WHERE attributes.v2.kind = 'component' \
+ORDER BY id LIMIT 48";
+const COMPONENT_PAGE_EXCLUDING: &str = "\
+SELECT id, name, attributes FROM entity \
+WHERE attributes.v2.kind = 'component' \
+AND type::string(id) NOTINSIDE $blocked \
+ORDER BY id LIMIT 48";
+
+thread_local! {
+    static POST_READS: Cell<u32> = const { Cell::new(0) };
+    static POST_LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+fn note_post_read() {
+    POST_READS.with(|slot| slot.set(slot.get().saturating_add(1)));
+}
+
+fn emit_post_line(line: String) {
+    eprintln!("{line}");
+    POST_LINES.with(|slot| {
+        if let Some(lines) = slot.borrow_mut().as_mut() {
+            lines.push(line);
+        }
+    });
+}
+
+#[cfg(test)]
+fn reset_post_reads() {
+    POST_READS.with(|slot| slot.set(0));
+}
+
+#[cfg(test)]
+fn post_reads() -> u32 {
+    POST_READS.with(|slot| slot.get())
+}
+
+#[cfg(test)]
+fn begin_post_lines() {
+    POST_LINES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+fn take_post_lines() -> Vec<String> {
+    POST_LINES.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+struct PostSnap {
+    orphan: Option<OrphanSnap>,
+}
+
+struct OrphanSnap {
+    live_uses: Vec<String>,
+    components: Vec<ComponentSlots>,
+    truncated: bool,
+}
+
+struct ComponentSlots {
+    id: String,
+    name: String,
+    slots: Vec<SlotView>,
+}
+
+struct SlotView {
+    index: usize,
+    predicate: String,
+    key: String,
+    value: String,
+    status: String,
+    pending: bool,
+    live: bool,
+    first_session: String,
+}
+
+#[derive(Clone)]
+struct SweepClose {
+    entity_id: String,
+    subject: String,
+    index: usize,
+    predicate: String,
+    key: String,
+    value: String,
+}
+
+struct OrphanPlan {
+    closes: Vec<SweepClose>,
+    overflows: Vec<usize>,
+}
+
+fn post_switches(ctx: &WriteCtx<'_>) -> bool {
+    ctx.orphan_sweep_on
+}
+
+async fn post_pass(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    report: &mut IngestionReport,
+) {
+    if !post_switches(ctx) {
+        return;
+    }
+    let snap = match read_post_snapshot(gm, ctx).await {
+        Ok(snap) => snap,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            return;
+        }
+    };
+    apply_post(gm, ctx, facts, &snap, report).await;
+}
+
+async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<PostSnap, GraphError> {
+    let orphan = if ctx.orphan_sweep_on {
+        Some(read_orphan_snap(gm, ctx).await?)
+    } else {
+        None
+    };
+    Ok(PostSnap { orphan })
+}
+
+async fn apply_post(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    snap: &PostSnap,
+    report: &mut IngestionReport,
+) {
+    if let Some(orphan) = &snap.orphan {
+        note_truncation(orphan, report);
+        let plan = plan_orphan(ctx, facts, orphan);
+        apply_orphan(gm, ctx, &plan, report).await;
+    }
+}
+
+fn note_truncation(snap: &OrphanSnap, report: &mut IngestionReport) {
+    if snap.truncated {
+        add_count(&mut report.consolidate.orphan_sweep_truncated);
+    }
+}
+
+async fn read_orphan_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<OrphanSnap, GraphError> {
+    let project_id = find_project_id(gm, ctx).await?;
+    let live_uses = load_live_uses(gm, project_id.as_deref()).await?;
+    let blocked = blocked_component_ids(gm, project_id.as_deref()).await?;
+    let page = load_component_page(gm, &blocked).await?;
+    Ok(orphan_snap(page, &blocked, live_uses))
+}
+
+fn orphan_snap(page: Vec<Value>, blocked: &BTreeSet<String>, live_uses: Vec<String>) -> OrphanSnap {
+    let truncated = hit_orphan_cap(page.len());
+    OrphanSnap {
+        live_uses,
+        components: parse_orphans(&page, blocked),
+        truncated,
+    }
+}
+
+fn hit_orphan_cap(len: usize) -> bool {
+    len >= ORPHAN_CAP
+}
+
+async fn find_project_id(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+) -> Result<Option<String>, GraphError> {
+    note_post_read();
+    let mut response = gm
+        .db()
+        .query("SELECT id, name, attributes FROM entity")
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(project_row_id(&rows, ctx))
+}
+
+fn project_row_id(rows: &[Value], ctx: &WriteCtx<'_>) -> Option<String> {
+    let mut fallback = None;
+    for row in rows {
+        let Some(id) = named_project_id(row, ctx) else {
+            continue;
+        };
+        if row_kind(row) == "project" {
+            return Some(id);
+        }
+        if fallback.is_none() {
+            fallback = Some(id);
+        }
+    }
+    fallback
+}
+
+fn named_project_id(row: &Value, ctx: &WriteCtx<'_>) -> Option<String> {
+    if !row_names_project(row, ctx) {
+        return None;
+    }
+    nonempty_id(row)
+}
+
+fn row_names_project(row: &Value, ctx: &WriteCtx<'_>) -> bool {
+    names_project(ctx, row.get("name").and_then(Value::as_str).unwrap_or(""))
+}
+
+fn row_kind(row: &Value) -> &str {
+    row.pointer("/attributes/v2/kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn nonempty_id(row: &Value) -> Option<String> {
+    let id = id_text(row.get("id"));
+    (!id.is_empty()).then_some(id)
+}
+
+async fn load_live_uses(
+    gm: &GraphMemory,
+    project_id: Option<&str>,
+) -> Result<Vec<String>, GraphError> {
+    let Some(id) = project_id else {
+        return Ok(Vec::new());
+    };
+    note_post_read();
+    let mut response = gm
+        .db()
+        .query(
+            "SELECT status, pending, out.name AS object FROM relates_to \
+             WHERE rel_type = 'uses' AND valid_until = NONE AND in = type::record($id)",
+        )
+        .bind(("id", id.to_string()))
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(decided_use_names(&rows))
+}
+
+fn decided_use_names(rows: &[Value]) -> Vec<String> {
+    rows.iter().filter_map(decided_use_name).collect()
+}
+
+fn decided_use_name(row: &Value) -> Option<String> {
+    if !decided_open_use(row) {
+        return None;
+    }
+    let name = row.get("object").and_then(Value::as_str).unwrap_or("");
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn decided_open_use(row: &Value) -> bool {
+    row.get("status").and_then(Value::as_str) == Some("decided") && !super::write::is_pending(row)
+}
+
+async fn blocked_component_ids(
+    gm: &GraphMemory,
+    project_id: Option<&str>,
+) -> Result<BTreeSet<String>, GraphError> {
+    note_post_read();
+    let mut response = gm
+        .db()
+        .query("SELECT in, out FROM relates_to WHERE rel_type = 'part_of' AND valid_until = NONE")
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(part_of_block(project_id, &rows))
+}
+
+fn part_of_block(project_id: Option<&str>, rows: &[Value]) -> BTreeSet<String> {
+    let mut ids = part_of_endpoints(rows);
+    if let Some(id) = project_id {
+        insert_text(&mut ids, id);
+    }
+    ids
+}
+
+fn part_of_endpoints(rows: &[Value]) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        insert_id(&mut ids, row.get("in"));
+        insert_id(&mut ids, row.get("out"));
+    }
+    ids
+}
+
+fn insert_id(ids: &mut BTreeSet<String>, value: Option<&Value>) {
+    insert_text(ids, &id_text(value));
+}
+
+fn insert_text(ids: &mut BTreeSet<String>, id: &str) {
+    if !id.is_empty() {
+        ids.insert(id.to_string());
+    }
+}
+
+async fn load_component_page(
+    gm: &GraphMemory,
+    blocked: &BTreeSet<String>,
+) -> Result<Vec<Value>, GraphError> {
+    note_post_read();
+    let listed: Vec<String> = blocked.iter().cloned().collect();
+    let mut response = if listed.is_empty() {
+        gm.db().query(COMPONENT_PAGE).await?
+    } else {
+        gm.db()
+            .query(COMPONENT_PAGE_EXCLUDING)
+            .bind(("blocked", listed))
+            .await?
+    };
+    deserialize_take(&mut response, 0)
+}
+
+fn parse_orphans(page: &[Value], blocked: &BTreeSet<String>) -> Vec<ComponentSlots> {
+    page.iter()
+        .filter_map(|row| component_slots(row, blocked))
+        .collect()
+}
+
+fn component_slots(row: &Value, blocked: &BTreeSet<String>) -> Option<ComponentSlots> {
+    let id = id_text(row.get("id"));
+    if id.is_empty() || blocked.contains(&id) || row_kind(row) != "component" {
+        return None;
+    }
+    Some(ComponentSlots {
+        name: json_text(row.get("name")),
+        slots: slot_views(row),
+        id,
+    })
+}
+
+fn slot_views(row: &Value) -> Vec<SlotView> {
+    row.pointer("/attributes/v2/slots")
+        .and_then(Value::as_array)
+        .map(|slots| parse_slot_views(slots))
+        .unwrap_or_default()
+}
+
+fn parse_slot_views(slots: &[Value]) -> Vec<SlotView> {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot_view(index, slot))
+        .collect()
+}
+
+fn slot_view(index: usize, slot: &Value) -> Option<SlotView> {
+    if !slot.is_object() {
+        return None;
+    }
+    Some(SlotView {
+        index,
+        predicate: json_text(slot.get("predicate")),
+        key: json_text(slot.get("key")),
+        value: json_text(slot.get("value")),
+        status: json_text(slot.get("status")),
+        pending: super::write::is_pending(slot),
+        live: !crud::edge_already_closed(slot.get("valid_until")),
+        first_session: first_evidence_session(slot),
+    })
+}
+
+fn first_evidence_session(slot: &Value) -> String {
+    slot.get("evidence")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .map(|item| json_text(item.get("session")))
+        .unwrap_or_default()
+}
+
+fn plan_orphan(ctx: &WriteCtx<'_>, facts: &[Fact], snap: &OrphanSnap) -> OrphanPlan {
+    let mut plan = OrphanPlan {
+        closes: Vec::new(),
+        overflows: Vec::new(),
+    };
+    for value in orphan_triggers(ctx, facts, &snap.live_uses) {
+        push_value_plan(&mut plan, &snap.components, ctx.session_id, &value);
+    }
+    sort_closes(&mut plan.closes);
+    plan
+}
+
+fn push_value_plan(
+    plan: &mut OrphanPlan,
+    components: &[ComponentSlots],
+    session: &str,
+    value: &str,
+) {
+    let targets = targets_for_value(components, session, value);
+    if overflowed(&targets) {
+        plan.overflows.push(targets.len());
+        return;
+    }
+    plan.closes.extend(targets);
+}
+
+fn orphan_triggers(ctx: &WriteCtx<'_>, facts: &[Fact], live_uses: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    for fact in facts {
+        if let Some(value) = trigger_value(ctx, fact, live_uses) {
+            push_unique_value(&mut found, value);
+        }
+    }
+    found
+}
+
+fn trigger_value<'a>(ctx: &WriteCtx<'_>, fact: &'a Fact, live_uses: &[String]) -> Option<&'a str> {
+    if !rejected_project_use(ctx, fact) {
+        return None;
+    }
+    let value = fact.object_name.as_str();
+    if !sweep_token(value) || use_still_live(value, live_uses) {
+        return None;
+    }
+    Some(value)
+}
+
+fn rejected_project_use(ctx: &WriteCtx<'_>, fact: &Fact) -> bool {
+    fact.status == "rejected"
+        && fact.predicate == Predicate::Uses
+        && names_project(ctx, &fact.subject_name)
+}
+
+fn names_project(ctx: &WriteCtx<'_>, name: &str) -> bool {
+    same_name(name, &ctx.project.name)
+        || ctx
+            .project
+            .aliases
+            .iter()
+            .any(|alias| same_name(name, alias))
+}
+
+fn sweep_token(value: &str) -> bool {
+    alphanumeric_count(value) >= 2
+}
+
+fn use_still_live(value: &str, live_uses: &[String]) -> bool {
+    live_uses.iter().any(|live| values_equal(live, value))
+}
+
+fn push_unique_value(found: &mut Vec<String>, value: &str) {
+    if found.iter().any(|kept| values_equal(kept, value)) {
+        return;
+    }
+    found.push(value.to_string());
+}
+
+fn targets_for_value(components: &[ComponentSlots], session: &str, value: &str) -> Vec<SweepClose> {
+    let mut targets = Vec::new();
+    for component in components {
+        collect_component_targets(&mut targets, component, session, value);
+    }
+    targets
+}
+
+fn collect_component_targets(
+    targets: &mut Vec<SweepClose>,
+    component: &ComponentSlots,
+    session: &str,
+    value: &str,
+) {
+    for slot in &component.slots {
+        if slot_is_orphan_target(slot, session, value) {
+            targets.push(sweep_close(component, slot));
+        }
+    }
+}
+
+fn slot_is_orphan_target(slot: &SlotView, session: &str, value: &str) -> bool {
+    decided_setting(slot) && earlier_evidence(slot, session) && names_value(value, &slot.value)
+}
+
+fn decided_setting(slot: &SlotView) -> bool {
+    slot.live && !slot.pending && slot.status == "decided" && slot.predicate == "setting"
+}
+
+fn earlier_evidence(slot: &SlotView, session: &str) -> bool {
+    let first = slot.first_session.as_str();
+    !first.is_empty() && first != session
+}
+
+fn overflowed(targets: &[SweepClose]) -> bool {
+    targets.len() > ORPHAN_TARGET_CAP
+}
+
+fn sweep_close(component: &ComponentSlots, slot: &SlotView) -> SweepClose {
+    SweepClose {
+        entity_id: component.id.clone(),
+        subject: component.name.clone(),
+        index: slot.index,
+        predicate: slot.predicate.clone(),
+        key: slot.key.clone(),
+        value: slot.value.clone(),
+    }
+}
+
+fn sort_closes(closes: &mut [SweepClose]) {
+    closes.sort_by(|left, right| {
+        left.entity_id
+            .cmp(&right.entity_id)
+            .then(left.index.cmp(&right.index))
+    });
+}
+
+async fn apply_orphan(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &OrphanPlan,
+    report: &mut IngestionReport,
+) {
+    note_overflows(ctx, plan, report);
+    for close in &plan.closes {
+        let line = orphan_close_line(&close.subject, &close.key, close.index);
+        if close_sweep_slot(gm, ctx, close, ORPHAN_REASON, &line, report).await {
+            add_count(&mut report.consolidate.orphan_sweep_closes);
+        }
+    }
+}
+
+fn note_overflows(ctx: &WriteCtx<'_>, plan: &OrphanPlan, report: &mut IngestionReport) {
+    for count in &plan.overflows {
+        add_count(&mut report.consolidate.orphan_sweep_overflow);
+        emit_post_line(orphan_overflow_line(&ctx.project.name, *count));
+    }
+}
+
+fn orphan_close_line(subject: &str, key: &str, index: usize) -> String {
+    format!(
+        "consolidate orphan: {}:{} | slot {index}",
+        quote_head(subject),
+        quote_head(key)
+    )
+}
+
+fn orphan_overflow_line(project: &str, count: usize) -> String {
+    format!(
+        "consolidate orphan overflow: {} | {count} targets",
+        quote_head(project)
+    )
+}
+
+async fn close_sweep_slot(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    close: &SweepClose,
+    reason: &str,
+    line: &str,
+    report: &mut IngestionReport,
+) -> bool {
+    let Some(until) = session_midnight(ctx.date) else {
+        return false;
+    };
+    let ended = format!("{}:{reason}", ctx.session_id);
+    let row = sweep_row(close);
+    match close_row(gm, &row, &until, &ended).await {
+        Ok(true) => {
+            report.retirements.push(sweep_retirement(close, reason));
+            emit_post_line(line.to_string());
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            false
+        }
+    }
+}
+
+fn sweep_row(close: &SweepClose) -> Row {
+    Row {
+        id: String::new(),
+        entity: close.entity_id.clone(),
+        slot: Some(close.index),
+        edge: None,
+        subject: close.subject.clone(),
+        pred: close.predicate.clone(),
+        key: close.key.clone(),
+        value: close.value.clone(),
+        evidence: Value::Null,
+        from: String::new(),
+        here: false,
+        pending: false,
+        object_name: None,
+    }
+}
+
+fn sweep_retirement(close: &SweepClose, reason: &str) -> Retirement {
+    Retirement {
+        reason: reason.to_string(),
+        subject: close.subject.clone(),
+        predicate: close.predicate.clone(),
+        key: close.key.clone(),
+        old_value: close.value.clone(),
+        new_value: String::new(),
+    }
 }
 
 #[cfg(all(test, feature = "embedded"))]
@@ -14072,6 +14682,809 @@ mod tests {
             drop_line("no departure cue", "acme:", "svc:", DEPARTURE_QUOTE),
             ACME_LINE
         );
+    }
+    fn app_project(aliases: &[&str]) -> ProjectIdentity {
+        ProjectIdentity {
+            name: "app".into(),
+            aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+        }
+    }
+
+    fn use_of(subject: &str, kind: Kind, object: &str, status: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: kind,
+            predicate: Predicate::Uses,
+            role: None,
+            key: String::new(),
+            object_name: object.into(),
+            object_kind: Some(Kind::Technology),
+            status: status.into(),
+            turn: 0,
+            quote: format!("{subject} uses {object}"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    fn setting_of(subject: &str, key: &str, value: &str, status: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::Setting,
+            role: None,
+            key: key.into(),
+            object_name: value.into(),
+            object_kind: None,
+            status: status.into(),
+            turn: 0,
+            quote: format!("{key} is set"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    fn rule_of(subject: &str, value: &str) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::Rule,
+            role: None,
+            key: String::new(),
+            object_name: value.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn: 0,
+            quote: value.into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    fn part_link(subject: &str, object: &str, object_kind: Kind) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: Kind::Component,
+            predicate: Predicate::PartOf,
+            role: None,
+            key: String::new(),
+            object_name: object.into(),
+            object_kind: Some(object_kind),
+            status: "decided".into(),
+            turn: 0,
+            quote: format!("{subject} is part of {object}"),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    async fn commit_app(gm: &GraphMemory, session: &str, date: &str, facts: &[Fact]) -> WriteStats {
+        let project = app_project(&[]);
+        let turns = [turn("stored")];
+        let ctx = WriteCtx::new(&Quiet, &project, session, date, &turns);
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    async fn sweep(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        facts: &[Fact],
+        stats: &WriteStats,
+        on: bool,
+        aliases: &[&str],
+    ) -> (IngestionReport, Vec<String>, u32) {
+        sweep_reply(gm, session, date, facts, stats, on, aliases, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sweep_reply(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        facts: &[Fact],
+        stats: &WriteStats,
+        on: bool,
+        aliases: &[&str],
+        reply: Option<&str>,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = app_project(aliases);
+        let turns = [turn("session")];
+        let answer = match reply {
+            Some(body) => Answer::Reply(body.to_string()),
+            None => Answer::Panic,
+        };
+        let stub = Stub::new(answer);
+        let mut ctx = WriteCtx::new(&stub, &project, session, date, &turns);
+        ctx.orphan_sweep_on = on;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, facts, stats, &stub, &mut report).await;
+        let lines = super::take_post_lines();
+        let reads = super::post_reads();
+        (report, lines, reads)
+    }
+
+    fn reject_blob() -> Fact {
+        use_of("app", Kind::Project, "Blobfmt", "rejected")
+    }
+
+    async fn seed_orphan_pair(gm: &GraphMemory) {
+        commit_app(
+            gm,
+            "s1",
+            "2026-04-01",
+            &[
+                use_of("app", Kind::Project, "Blobfmt", "decided"),
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+                setting_of("cache", "cache_path", "~/.app/data.blobfmt", "decided"),
+            ],
+        )
+        .await;
+    }
+
+    fn orphan_reasons(report: &IngestionReport) -> Vec<&str> {
+        report
+            .retirements
+            .iter()
+            .filter(|item| item.reason == "orphan_sweep")
+            .map(|item| item.key.as_str())
+            .collect()
+    }
+
+    fn ended_key<'a>(rows: &'a [Value], key: &str) -> Option<&'a str> {
+        rows.iter().find(|slot| slot["key"] == key).and_then(ended)
+    }
+
+    async fn mutate_named_slot(
+        gm: &GraphMemory,
+        name: &str,
+        key: &str,
+        mutate: impl FnOnce(&mut Value),
+    ) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let slot = slots.iter_mut().find(|slot| slot["key"] == key).unwrap();
+        mutate(slot);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    fn view(
+        status: &str,
+        predicate: &str,
+        value: &str,
+        session: &str,
+        pending: bool,
+        live: bool,
+    ) -> super::SlotView {
+        super::SlotView {
+            index: 0,
+            predicate: predicate.into(),
+            key: "cache_format".into(),
+            value: value.into(),
+            status: status.into(),
+            pending,
+            live,
+            first_session: session.into(),
+        }
+    }
+
+    #[test]
+    fn orphan_guards_reject_a_short_value_a_full_page_and_too_many_targets() {
+        assert!(!super::sweep_token(""));
+        assert!(!super::sweep_token("C"));
+        assert!(super::sweep_token("CC"));
+        assert!(!super::hit_orphan_cap(47));
+        assert!(super::hit_orphan_cap(48));
+        let one = super::SweepClose {
+            entity_id: "entity:a".into(),
+            subject: "cache".into(),
+            index: 0,
+            predicate: "setting".into(),
+            key: "cache_format".into(),
+            value: "Blobfmt".into(),
+        };
+        let four = vec![one.clone(), one.clone(), one.clone(), one.clone()];
+        assert!(!super::overflowed(&four));
+        let mut five = four.clone();
+        five.push(one);
+        assert!(super::overflowed(&five));
+    }
+
+    #[test]
+    fn orphan_lines_name_the_subject_and_key_and_drop_control_characters() {
+        let mut subject = String::from("cache");
+        subject.push('\n');
+        let line = super::orphan_close_line(&subject, "cache_format", 1);
+        assert_eq!(line, "consolidate orphan: cache :cache_format | slot 1");
+        assert!(!line.contains("Blobfmt"));
+        assert_eq!(line.lines().count(), 1);
+        let overflow = super::orphan_overflow_line("app", 5);
+        assert_eq!(overflow, "consolidate orphan overflow: app | 5 targets");
+        assert!(!overflow.contains("Blobfmt"));
+    }
+
+    #[test]
+    fn a_project_alias_is_a_sweep_subject_and_only_a_decided_use_is_still_live() {
+        let project = app_project(&["tool"]);
+        let turns = [turn("session")];
+        let quiet = Quiet;
+        let ctx = WriteCtx::new(&quiet, &project, "s2", "2026-04-02", &turns);
+        assert!(super::names_project(&ctx, "tool"));
+        assert!(super::names_project(&ctx, "app"));
+        assert!(!super::names_project(&ctx, "cache"));
+        assert!(super::decided_open_use(&json!({"status": "decided"})));
+        assert!(!super::decided_open_use(&json!({"status": "considered"})));
+        assert!(!super::decided_open_use(
+            &json!({"status": "decided", "pending": {"since": "s1", "conflicts": "edge"}})
+        ));
+        assert!(!super::earlier_evidence(
+            &view("decided", "setting", "Blobfmt", "", false, true),
+            "s2"
+        ));
+        assert!(!super::earlier_evidence(
+            &view("decided", "setting", "Blobfmt", "s2", false, true),
+            "s2"
+        ));
+        assert!(super::earlier_evidence(
+            &view("decided", "setting", "Blobfmt", "s1", false, true),
+            "s2"
+        ));
+        assert!(!super::slot_is_orphan_target(
+            &view("considered", "setting", "Blobfmt", "s1", false, true),
+            "s2",
+            "Blobfmt"
+        ));
+        assert!(!super::slot_is_orphan_target(
+            &view("decided", "rule", "Blobfmt", "s1", false, true),
+            "s2",
+            "Blobfmt"
+        ));
+        assert!(!super::slot_is_orphan_target(
+            &view("decided", "uses", "Blobfmt", "s1", false, true),
+            "s2",
+            "Blobfmt"
+        ));
+        assert!(!super::slot_is_orphan_target(
+            &view("decided", "setting", "Blobfmt", "s1", true, true),
+            "s2",
+            "Blobfmt"
+        ));
+        assert!(!super::names_value("json", "jsonl"));
+        assert!(!super::names_value("json", "jsonschema"));
+        assert!(!super::names_value("json", "myjson"));
+        assert!(super::names_value("json", "~/.app/data.json"));
+        assert!(super::names_value("json", "JSON"));
+        let ends = super::part_of_endpoints(&[json!({"in": "entity:cache", "out": "entity:app"})]);
+        assert!(ends.contains("entity:cache"));
+        assert!(ends.contains("entity:app"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o1_switch_off_reads_nothing_and_leaves_the_rows() {
+        let (_tmp, gm) = open().await;
+        seed_orphan_pair(&gm).await;
+        let before = slots(&gm, "cache").await;
+        let facts = [reject_blob()];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, lines, reads) =
+            sweep(&gm, "s2", "2026-04-02", &facts, &stats, false, &[]).await;
+        assert_eq!(reads, 0);
+        assert!(lines.is_empty());
+        assert_eq!(slots(&gm, "cache").await, before);
+        assert!(ended_key(&before, "cache_format").is_none());
+        let snap = consolidate_snapshot(&report);
+        assert!(!snap.contains("orphan_sweep"), "{snap}");
+        assert!(orphan_reasons(&report).is_empty());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o2_rejected_use_closes_both_orphan_settings() {
+        let (_tmp, gm) = open().await;
+        seed_orphan_pair(&gm).await;
+        let facts = [reject_blob()];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, lines, reads) =
+            sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert!(reads > 0);
+        let rows = slots(&gm, "cache").await;
+        assert_eq!(ended_key(&rows, "cache_format"), Some("s2:orphan_sweep"));
+        assert_eq!(ended_key(&rows, "cache_path"), Some("s2:orphan_sweep"));
+        assert_eq!(
+            rows.iter()
+                .find(|slot| slot["key"] == "cache_format")
+                .unwrap()["valid_until"],
+            "2026-04-02T00:00:00Z"
+        );
+        let mut reasons = orphan_reasons(&report);
+        reasons.sort_unstable();
+        assert_eq!(reasons, vec!["cache_format", "cache_path"]);
+        assert!(report
+            .retirements
+            .iter()
+            .filter(|item| item.reason == "orphan_sweep")
+            .all(|item| item.new_value.is_empty() && item.predicate == "setting"));
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(2));
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|line| {
+            !line.contains("Blobfmt") && !line.contains("blobfmt") && !line.contains("~/.app")
+        }));
+        assert!(lines.iter().any(|line| line.contains("cache:cache_format")));
+        assert!(lines.iter().any(|line| line.contains("cache:cache_path")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o3_open_part_of_either_way_any_status_or_pending_protects() {
+        for (incoming, status, pending) in [
+            (false, "decided", false),
+            (true, "decided", false),
+            (false, "considered", false),
+            (false, "decided", true),
+        ] {
+            let (_tmp, gm) = open().await;
+            let mut facts = vec![
+                use_of("app", Kind::Project, "Blobfmt", "decided"),
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+            ];
+            if incoming {
+                facts.push(part_link("extra", "cache", Kind::Component));
+            } else {
+                facts.push(part_link("cache", "app", Kind::Project));
+            }
+            commit_app(&gm, "s1", "2026-04-01", &facts).await;
+            if status != "decided" {
+                gm.db()
+                    .query("UPDATE relates_to SET status = $status WHERE rel_type = 'part_of'")
+                    .bind(("status", status.to_string()))
+                    .await
+                    .unwrap()
+                    .check()
+                    .unwrap();
+            }
+            if pending {
+                gm.db()
+                    .query("UPDATE relates_to SET pending = $pending WHERE rel_type = 'part_of'")
+                    .bind((
+                        "pending",
+                        json!({"since": "s1", "conflicts": "relates_to:none"}),
+                    ))
+                    .await
+                    .unwrap()
+                    .check()
+                    .unwrap();
+            }
+            let reject = [reject_blob()];
+            let stats = commit_app(&gm, "s2", "2026-04-02", &reject).await;
+            let reply = judged(&[(1, "unrelated", "")]);
+            let (report, _, _) = sweep_reply(
+                &gm,
+                "s2",
+                "2026-04-02",
+                &reject,
+                &stats,
+                true,
+                &[],
+                Some(&reply),
+            )
+            .await;
+            assert!(
+                ended_key(&slots(&gm, "cache").await, "cache_format").is_none(),
+                "incoming={incoming} status={status} pending={pending}"
+            );
+            assert!(orphan_reasons(&report).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o4_only_a_rejected_project_use_is_a_trigger() {
+        for status in ["considered", "decided"] {
+            let (_tmp, gm) = open().await;
+            commit_app(
+                &gm,
+                "s1",
+                "2026-04-01",
+                &[setting_of("cache", "cache_format", "Blobfmt", "decided")],
+            )
+            .await;
+            let facts = [use_of("app", Kind::Project, "Blobfmt", status)];
+            let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+            let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+            assert!(
+                ended_key(&slots(&gm, "cache").await, "cache_format").is_none(),
+                "{status}"
+            );
+            assert!(orphan_reasons(&report).is_empty(), "{status}");
+        }
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[setting_of("cache", "cache_format", "Blobfmt", "decided")],
+        )
+        .await;
+        let facts = [use_of("cache", Kind::Component, "Blobfmt", "rejected")];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_format").is_none());
+        assert!(orphan_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o5_a_slot_opened_this_session_stays_live() {
+        let (_tmp, gm) = open().await;
+        let facts = [
+            setting_of("cache", "cache_format", "Blobfmt", "decided"),
+            reject_blob(),
+        ];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_format").is_none());
+        assert!(orphan_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o6_a_one_character_or_empty_value_is_skipped() {
+        for object in ["C", ""] {
+            let (_tmp, gm) = open().await;
+            commit_app(
+                &gm,
+                "s1",
+                "2026-04-01",
+                &[setting_of("cache", "cache_format", "C", "decided")],
+            )
+            .await;
+            let facts = [use_of("app", Kind::Project, object, "rejected")];
+            let stats = WriteStats::default();
+            let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+            assert!(
+                ended_key(&slots(&gm, "cache").await, "cache_format").is_none(),
+                "{object:?}"
+            );
+            assert!(orphan_reasons(&report).is_empty(), "{object:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o7_json_matches_a_whole_token_and_not_a_longer_run() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                setting_of("cache", "cache_long", "jsonl", "decided"),
+                setting_of("cache", "cache_schema", "jsonschema", "decided"),
+                setting_of("cache", "cache_mine", "myjson", "decided"),
+                setting_of("cache", "cache_path", "~/.app/data.json", "decided"),
+                setting_of("cache", "cache_label", "JSON", "decided"),
+            ],
+        )
+        .await;
+        let facts = [use_of("app", Kind::Project, "json", "rejected")];
+        let stats = WriteStats::default();
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        let rows = slots(&gm, "cache").await;
+        assert!(ended_key(&rows, "cache_long").is_none());
+        assert!(ended_key(&rows, "cache_schema").is_none());
+        assert!(ended_key(&rows, "cache_mine").is_none());
+        assert_eq!(ended_key(&rows, "cache_path"), Some("s2:orphan_sweep"));
+        assert_eq!(ended_key(&rows, "cache_label"), Some("s2:orphan_sweep"));
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o8_a_live_decided_use_blocks_the_sweep() {
+        let (_tmp, gm) = open().await;
+        seed_orphan_pair(&gm).await;
+        let facts = [
+            reject_blob(),
+            use_of("app", Kind::Project, "Blobfmt", "decided"),
+        ];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_format").is_none());
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_path").is_none());
+        assert!(orphan_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_orphan_pair(&gm).await;
+        let stats = WriteStats::default();
+        let facts = [reject_blob()];
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_format").is_none());
+        assert!(orphan_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_considered_or_pending_use_does_not_keep_the_value_in_use() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                use_of("app", Kind::Project, "Blobfmt", "considered"),
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+            ],
+        )
+        .await;
+        let facts = [reject_blob()];
+        let (report, _, _) = sweep(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                use_of("app", Kind::Project, "Blobfmt", "decided"),
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+            ],
+        )
+        .await;
+        gm.db()
+            .query("UPDATE relates_to SET pending = $pending WHERE rel_type = 'uses'")
+            .bind((
+                "pending",
+                json!({"since": "s1", "conflicts": "relates_to:none"}),
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (report, _, _) = sweep(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o9_rules_uses_considered_and_pending_slots_stay_live() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                rule_of("cache", "Keep Blobfmt"),
+                setting_of("cache", "cache_considered", "Blobfmt", "considered"),
+                setting_of("cache", "cache_pending", "Blobfmt", "decided"),
+                setting_of("cache", "cache_uses", "Blobfmt", "decided"),
+            ],
+        )
+        .await;
+        mutate_named_slot(&gm, "cache", "cache_pending", |slot| {
+            slot["pending"] = json!({"since": "s1", "conflicts": "slot"});
+        })
+        .await;
+        mutate_named_slot(&gm, "cache", "cache_uses", |slot| {
+            slot["predicate"] = json!("uses");
+        })
+        .await;
+        let facts = [reject_blob()];
+        let (report, _, _) = sweep(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            &[],
+        )
+        .await;
+        let rows = slots(&gm, "cache").await;
+        assert!(rows.iter().all(|slot| ended(slot).is_none()), "{rows:?}");
+        assert!(orphan_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o10_five_targets_close_none_and_count_overflow() {
+        let (_tmp, gm) = open().await;
+        let mut facts = Vec::new();
+        for index in 0..5 {
+            facts.push(setting_of(
+                "cache",
+                &format!("cache_{index}"),
+                "Blobfmt",
+                "decided",
+            ));
+        }
+        commit_app(&gm, "s1", "2026-04-01", &facts).await;
+        let facts = [reject_blob()];
+        let (report, lines, _) = sweep(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            &[],
+        )
+        .await;
+        let rows = slots(&gm, "cache").await;
+        assert!(rows.iter().all(|slot| ended(slot).is_none()), "{rows:?}");
+        assert!(orphan_reasons(&report).is_empty());
+        assert_eq!(report.consolidate.orphan_sweep_overflow, Some(1));
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(
+            lines,
+            vec!["consolidate orphan overflow: app | 5 targets".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o11_ground_off_leaves_the_sweep_unread() {
+        let section = crate::config::GraphSection {
+            consolidate: true,
+            consolidate_orphan_sweep: true,
+            ground_component_edges: false,
+            ..crate::config::GraphSection::default()
+        };
+        assert!(!section.orphan_sweep_apply());
+        let (_tmp, gm) = open().await;
+        seed_orphan_pair(&gm).await;
+        let facts = [reject_blob()];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, lines, reads) =
+            sweep(&gm, "s2", "2026-04-02", &facts, &stats, false, &[]).await;
+        assert_eq!(reads, 0);
+        assert!(lines.is_empty());
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_format").is_none());
+        let snap = consolidate_snapshot(&report);
+        assert!(!snap.contains("orphan_sweep"), "{snap}");
+        assert!(report.consolidate.orphan_sweep_closes.is_none());
+        assert!(report.consolidate.orphan_sweep_overflow.is_none());
+        assert!(report.consolidate.orphan_sweep_truncated.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_o12_the_orphan_page_stops_at_forty_eight() {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![use_of("app", Kind::Project, "Blobfmt", "decided")];
+        for index in 0..49 {
+            facts.push(setting_of(
+                &format!("n{index:02}"),
+                "cache_format",
+                "plain",
+                "decided",
+            ));
+        }
+        commit_app(&gm, "s1", "2026-04-01", &facts).await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let mut components: Vec<(String, String)> = entities
+            .iter()
+            .filter(|entity| {
+                entity
+                    .attributes
+                    .as_ref()
+                    .and_then(|attrs| attrs.pointer("/v2/kind"))
+                    .and_then(Value::as_str)
+                    == Some("component")
+            })
+            .map(|entity| (entity.id_string(), entity.name.clone()))
+            .collect();
+        components.sort();
+        assert_eq!(components.len(), 49);
+        let first = components.first().unwrap().1.clone();
+        let last = components.last().unwrap().1.clone();
+        mutate_named_slot(&gm, &first, "cache_format", |slot| {
+            slot["value"] = json!("Blobfmt");
+        })
+        .await;
+        mutate_named_slot(&gm, &last, "cache_format", |slot| {
+            slot["value"] = json!("Blobfmt");
+        })
+        .await;
+        let facts = [reject_blob()];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert_eq!(
+            ended_key(&slots(&gm, &first).await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert!(ended_key(&slots(&gm, &last).await, "cache_format").is_none());
+        assert_eq!(report.consolidate.orphan_sweep_truncated, Some(1));
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_c2_the_post_pass_runs_when_the_main_pass_has_no_anchors() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[setting_of("cache", "cache_format", "Blobfmt", "decided")],
+        )
+        .await;
+        let facts = [reject_blob()];
+        let stats = WriteStats::default();
+        let (report, lines, reads) =
+            sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert_eq!(report.consolidate.anchors, 0);
+        assert!(reads > 0);
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(!cache_defined(&gm).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_project_alias_rejects_the_same_orphan_copy() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[setting_of("cache", "cache_format", "Blobfmt", "decided")],
+        )
+        .await;
+        let facts = [use_of("tool", Kind::Project, "Blobfmt", "rejected")];
+        let (report, _, _) = sweep(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            &["tool"],
+        )
+        .await;
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
     }
 }
 
