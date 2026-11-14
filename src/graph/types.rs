@@ -1169,6 +1169,10 @@ pub struct IngestionReport {
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
+    /// Decided settings kept at gate 3 because a shown known row has the same subject, key and `replaces` value.
+    /// Zero when the switch or the known block is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub known_key_bound: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,

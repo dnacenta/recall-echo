@@ -285,6 +285,10 @@ enum BenchCommands {
         /// Independent of `--consolidate-replaces-cue`.
         #[arg(long)]
         consolidate_replaces_departure: bool,
+        /// Bind a decided setting key from a shown known row. Off unless set.
+        /// Does not turn on `--known-facts-context`.
+        #[arg(long)]
+        known_key_binding: bool,
         /// Drop a decided rule that only restates a same-session setting.
         /// Off unless set.
         #[arg(long)]
@@ -1128,6 +1132,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            known_key_binding,
             drop_restatements,
             ground_component_edges,
             recover_turns,
@@ -1195,6 +1200,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateReplacesDeparture::Off
             },
+            if known_key_binding {
+                recall_echo::bench::writes::KnownKeyBinding::On
+            } else {
+                recall_echo::bench::writes::KnownKeyBinding::Off
+            },
         ),
         BenchCommands::RecoverReplay { memory_dir } => {
             let rt =
@@ -1228,6 +1238,7 @@ fn run_writes(
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
+    known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1269,6 +1280,7 @@ fn run_writes(
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            known_key_binding,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1290,6 +1302,7 @@ fn run_writes(
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            known_key_binding,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1316,6 +1329,7 @@ async fn grade_once(
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
+    known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1340,6 +1354,7 @@ async fn grade_once(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                known_key_binding,
             )
             .await
         }
@@ -1360,6 +1375,7 @@ async fn grade_once(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                known_key_binding,
             )
             .await
         }
@@ -1386,6 +1402,7 @@ async fn grade_repeat(
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
+    known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1411,6 +1428,7 @@ async fn grade_repeat(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                known_key_binding,
             )
             .await
         }
@@ -1432,6 +1450,7 @@ async fn grade_repeat(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                known_key_binding,
             )
             .await
         }
@@ -1982,6 +2001,50 @@ mod tests {
             .find_subcommand_mut("writes")
             .expect("writes");
         let help = bench.render_long_help().to_string();
+        assert!(help.contains("--consolidate-replaces-departure"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn known_key_binding_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--known-key-binding",
+        ])
+        .expect("parse known key binding");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        known_facts_context,
+                        known_key_binding,
+                        known_match,
+                        consolidate_replaces_departure,
+                        ..
+                    },
+            } => {
+                assert!(known_key_binding);
+                assert!(!known_facts_context);
+                assert!(!known_match);
+                assert!(!consolidate);
+                assert!(!consolidate_replaces_departure);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--known-key-binding"), "{help}");
         assert!(help.contains("--consolidate-replaces-departure"), "{help}");
     }
 }

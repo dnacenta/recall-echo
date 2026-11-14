@@ -92,6 +92,9 @@ pub struct SessionObservation {
     pub kept: u32,
     /// Drops by reason. Empty on v1, and when nothing was dropped.
     pub drops: HashMap<String, u32>,
+    /// Decided settings kept because a shown known row bound the key.
+    /// Zero when that switch or the known block is off.
+    pub known_key_bound: u32,
     /// Entity resolution for a v2 session. Blank on v1.
     pub resolve: crate::graph::types::ResolveStats,
     /// Facts this session closed. Empty on v1.
@@ -246,6 +249,10 @@ pub struct SessionReport {
     /// Drops by reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
+    /// Decided settings kept because a shown known row bound the key.
+    /// Zero, and omitted, when that switch or the known block is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub known_key_bound: u32,
     /// Entity resolution. Blank on v1, and omitted from the printed report then.
     #[serde(
         default,
@@ -645,6 +652,7 @@ pub fn grade_with_pipeline(
                 candidates: s.candidates,
                 kept: s.kept,
                 drops: s.drops.clone(),
+                known_key_bound: s.known_key_bound,
                 resolve: s.resolve.clone(),
                 retirements: s.retirements.clone(),
                 retirements_skipped: s.retirements_skipped,
@@ -2120,6 +2128,7 @@ mod tests {
             candidates: 0,
             kept: 0,
             drops: HashMap::new(),
+            known_key_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
@@ -2148,6 +2157,7 @@ mod tests {
             candidates: session.candidates,
             kept: session.kept,
             drops: session.drops.clone(),
+            known_key_bound: session.known_key_bound,
             resolve: session.resolve.clone(),
             retirements: session.retirements.clone(),
             retirements_skipped: session.retirements_skipped,

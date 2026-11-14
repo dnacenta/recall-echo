@@ -698,6 +698,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub known_facts_context: bool,
+    /// Keep a decided setting at gate 3 when a shown known row has the same
+    /// subject, key and `replaces` value. Off unless set, and ignored unless
+    /// [`Self::known_facts_context`] is also set.
+    #[serde(
+        default = "default_known_key_binding",
+        skip_serializing_if = "is_false"
+    )]
+    pub known_key_binding: bool,
     /// Match kept facts to stored rows after pass 1. Experimental, and off unless set.
     #[serde(default = "default_known_match", skip_serializing_if = "is_false")]
     pub known_match: bool,
@@ -781,6 +789,7 @@ impl Default for GraphSection {
             dedup: GraphDedupConfig::default(),
             pipeline: None,
             known_facts_context: default_known_facts_context(),
+            known_key_binding: default_known_key_binding(),
             known_match: default_known_match(),
             consolidate: default_consolidate(),
             consolidate_hold: default_consolidate_hold(),
@@ -839,6 +848,13 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn replaces_departure_apply(&self) -> bool {
         self.consolidate && self.consolidate_replaces_departure
+    }
+
+    /// A shown known row can bind a decided setting key only when the known
+    /// block is on as well.
+    #[must_use]
+    pub(crate) fn known_key_binding_apply(&self) -> bool {
+        self.known_facts_context && self.known_key_binding
     }
 }
 
@@ -1142,6 +1158,10 @@ fn default_graph_namespace() -> String {
 }
 
 fn default_known_facts_context() -> bool {
+    false
+}
+
+fn default_known_key_binding() -> bool {
     false
 }
 
@@ -1478,6 +1498,12 @@ impl Config {
             }
             "graph.known_facts_context" => {
                 self.graph_section().known_facts_context = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.known_key_binding" => {
+                self.graph_section().known_key_binding = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2763,6 +2789,56 @@ mod tests {
                 .expect("graph")
                 .consolidate_replaces_departure
         );
+    }
+
+    #[test]
+    fn known_key_binding_defaults_off_round_trips_and_needs_the_known_block() {
+        assert!(!default_known_key_binding());
+        assert!(!GraphSection::default().known_key_binding);
+        assert!(!GraphSection::default().known_key_binding_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().known_key_binding_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("known_key_binding"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nknown_key_binding = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.known_key_binding);
+        assert!(!false_graph.known_key_binding_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("known_key_binding"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.known_key_binding", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.known_key_binding);
+        assert!(!graph.known_key_binding_apply());
+        assert!(!graph.known_facts_context);
+        let rendered = toml::to_string_pretty(&cfg).expect("render binding only");
+        assert!(rendered.contains("known_key_binding = true"));
+        assert!(!rendered.contains("known_facts_context"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse binding only");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.known_key_binding);
+        assert!(!parsed_graph.known_key_binding_apply());
+
+        cfg.set_key("graph.known_facts_context", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").known_key_binding_apply());
+        cfg.set_key("graph.known_key_binding", "false").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(!graph.known_key_binding);
+        assert!(!graph.known_key_binding_apply());
+        assert!(graph.known_facts_context);
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("known_key_binding"));
+        cfg.set_key("graph.known_key_binding", "true").unwrap();
+        cfg.set_key("graph.known_facts_context", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").known_key_binding_apply());
+        assert!(cfg.graph.as_ref().expect("graph").known_key_binding);
+        assert!(cfg.set_key("graph.known_key_binding", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").known_key_binding);
     }
 
     #[test]

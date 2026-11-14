@@ -25,10 +25,11 @@ use super::ground::{FieldCredit, SessionGround, ValueShape};
 use super::input::{self, ProjectIdentity, SessionInput, Turn, TurnRole};
 use super::schema::{
     affects_target, component_of_project, component_project_candidate, component_subject_blocked,
-    filter_fact, key_is_empty, map_subject, over_long, project_object, release_name, remap,
-    restates_setting, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE, DROP_KEY_BINDING,
-    DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_REJECTED, DROP_RESTATEMENT, DROP_TOO_LONG,
-    DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
+    filter_fact, key_is_empty, map_subject, normalise, over_long, project_object, release_name,
+    remap, restates_setting, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE,
+    DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_REJECTED, DROP_RESTATEMENT,
+    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
+    MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -230,16 +231,22 @@ pub(crate) async fn extract_session(
     let session_text = super::known::turn_text(&session.turns);
     // One load when either switch is on. The block ranks that load. Matching
     // reuses the unranked rows, so a second read is not needed.
-    let (stored, known_block) = if known_on && match_on {
+    let (stored, shown, known_block) = if known_on && match_on {
         let rows = super::known::read_live(gm, &session.project, &session_text).await;
-        let block =
-            super::known::render_known(&super::known::rank_known(rows.clone(), &session_text));
-        (Some(rows), block)
+        let shown = super::known::rank_known(rows.clone(), &session_text);
+        let block = super::known::render_known(&shown);
+        (Some(rows), shown, block)
     } else if known_on {
         let rows = super::known::known_rows(gm, &session.project, &session_text).await?;
-        (None, super::known::render_known(&rows))
+        let block = super::known::render_known(&rows);
+        (None, rows, block)
     } else {
-        (None, String::new())
+        (None, Vec::new(), String::new())
+    };
+    let known = if known_key_binding_enabled(memory_dir) && !shown.is_empty() {
+        Some(shown.as_slice())
+    } else {
+        None
     };
     let mut facts = Vec::new();
     for window in &windows {
@@ -250,6 +257,7 @@ pub(crate) async fn extract_session(
                 &ground,
                 &mut report,
                 ground_edges,
+                known,
             )),
             Err(reason) => {
                 report.errors.push(reason);
@@ -455,6 +463,13 @@ fn replaces_departure_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .replaces_departure_apply()
+}
+
+fn known_key_binding_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .known_key_binding_apply()
 }
 
 fn drop_restatements_enabled(memory_dir: &Path) -> bool {
@@ -699,7 +714,7 @@ fn facts_with_ground(
     ground_on: bool,
 ) -> Vec<Fact> {
     let ground = SessionGround::prepare(&session.turns);
-    collect_facts(reply, session, &ground, report, ground_on)
+    collect_facts(reply, session, &ground, report, ground_on, None)
 }
 
 fn collect_facts(
@@ -708,6 +723,7 @@ fn collect_facts(
     ground: &SessionGround,
     report: &mut IngestionReport,
     ground_on: bool,
+    known: Option<&[super::known::KnownRow]>,
 ) -> Vec<Fact> {
     let mut facts = Vec::new();
     for section in ["facts", "bugs", "releases"] {
@@ -720,7 +736,7 @@ fn collect_facts(
                 count_drop(report, DROP_OVERFLOW);
                 continue;
             }
-            match accept_item(section, item, session, ground, report, ground_on) {
+            match accept_item(section, item, session, ground, report, ground_on, known) {
                 Ok(batch) => {
                     report.kept += 1;
                     facts.extend(batch);
@@ -739,13 +755,16 @@ fn accept_item(
     ground: &SessionGround,
     report: &mut IngestionReport,
     ground_on: bool,
+    known: Option<&[super::known::KnownRow]>,
 ) -> Result<Vec<Fact>, &'static str> {
     if !element_matches(section, item) {
         return Err(DROP_PARSE);
     }
     let object = item.as_object().ok_or(DROP_PARSE)?;
     match section {
-        "facts" => accept_fact(object, session, ground, ground_on, report).map(|fact| vec![fact]),
+        "facts" => {
+            accept_fact(object, session, ground, ground_on, known, report).map(|fact| vec![fact])
+        }
         "bugs" => expand_bug(object, session, ground, report),
         "releases" => expand_release(object, session, ground, report),
         _ => Err(DROP_PARSE),
@@ -771,6 +790,7 @@ fn accept_fact(
     session: &SessionInput,
     ground: &SessionGround,
     ground_on: bool,
+    known: Option<&[super::known::KnownRow]>,
     report: &mut IngestionReport,
 ) -> Result<Fact, &'static str> {
     let (mut fact, swapped) = open_fact(object, session, ground)?;
@@ -789,7 +809,7 @@ fn accept_fact(
     let value_ok = object_supported(swapped, &fact, ground);
     let grounded = recover_unsupported(&mut fact, &prior, value_ok, ground)?;
     let kept = kept_component_object(&fact, &prior, value_ok);
-    finish_fact(fact, ground, grounded, kept, report)
+    finish_fact(fact, ground, grounded, kept, known, report)
 }
 
 fn open_fact(
@@ -908,19 +928,76 @@ fn finish_fact(
     ground: &SessionGround,
     grounded: bool,
     kept_object: bool,
+    known: Option<&[super::known::KnownRow]>,
     report: &mut IngestionReport,
 ) -> Result<Fact, &'static str> {
-    if fact.predicate == Predicate::Setting
-        && !ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
-    {
-        return Err(DROP_KEY_BINDING);
-    }
+    bind_known_key(&fact, ground, known, report)?;
     if !ground.replaces_grounded(&fact.replaces, &fact.status, fact.turn) {
         fact.replaces.clear();
     }
     filter_fact(&fact)?;
     note_component_edge(grounded, kept_object, report);
     Ok(fact)
+}
+
+fn bind_known_key(
+    fact: &Fact,
+    ground: &SessionGround,
+    known: Option<&[super::known::KnownRow]>,
+    report: &mut IngestionReport,
+) -> Result<(), &'static str> {
+    if fact.predicate != Predicate::Setting
+        || ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
+    {
+        return Ok(());
+    }
+    if !known_binds(fact, known) {
+        return Err(DROP_KEY_BINDING);
+    }
+    report.known_key_bound += 1;
+    eprintln!(
+        "{}",
+        known_key_line(&fact.subject_name, &fact.key, fact.turn)
+    );
+    Ok(())
+}
+
+fn known_key_line(subject: &str, key: &str, turn: usize) -> String {
+    format!("pass1 known key: {subject}:{key} | turn {turn}")
+}
+
+fn known_binds(fact: &Fact, known: Option<&[super::known::KnownRow]>) -> bool {
+    let Some(rows) = known else {
+        return false;
+    };
+    fact_bindable(fact) && rows.iter().any(|row| row_binds(fact, row))
+}
+
+fn fact_bindable(fact: &Fact) -> bool {
+    fact.status == "decided" && !fact.replaces.trim().is_empty()
+}
+
+fn row_binds(fact: &Fact, row: &super::known::KnownRow) -> bool {
+    setting_row(row)
+        && normalise(&row.subject) == normalise(&fact.subject_name)
+        && key_fold(&row.key) == key_fold(&fact.key)
+        && write::values_equal(&row.value, &fact.replaces)
+}
+
+fn setting_row(row: &super::known::KnownRow) -> bool {
+    row.predicate == "setting" && !row.key.trim().is_empty()
+}
+
+fn key_fold(key: &str) -> String {
+    let mut folded = String::new();
+    for ch in key.trim().chars() {
+        if ch == '-' || ch == ' ' {
+            folded.push('_');
+        } else {
+            folded.extend(ch.to_lowercase());
+        }
+    }
+    folded
 }
 
 fn note_component_edge(grounded: bool, kept_object: bool, report: &mut IngestionReport) {
@@ -5745,5 +5822,334 @@ mod tests {
             slot["key"] == "timeout" && slot["value"] == "10s" && slot["status"] == "decided"
         }));
         assert!(stored.iter().all(|slot| slot["predicate"] != "rule"));
+    }
+
+    const MARKER: &str = "sig=ab12";
+    const NEXT_VALUE: &str = "t=3,v1=ab12";
+    const MARKER_QUOTE: &str = "Switched the marker to t=3,v1=ab12.";
+    const MARKER_TURN: &str = "Switched the marker to t=3,v1=ab12. The old marker was sig=ab12.";
+
+    fn marker_fact(key: &str, status: &str, replaces: &str, quote: &str) -> Fact {
+        Fact {
+            subject_name: "svc".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Setting,
+            role: None,
+            key: key.into(),
+            object_name: NEXT_VALUE.into(),
+            object_kind: None,
+            status: status.into(),
+            turn: 0,
+            quote: quote.into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: replaces.into(),
+        }
+    }
+
+    fn marker_row(
+        predicate: &str,
+        subject: &str,
+        key: &str,
+        value: &str,
+    ) -> super::super::known::KnownRow {
+        super::super::known::KnownRow {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            key: key.into(),
+            value: value.into(),
+            role: String::new(),
+            id: "row".into(),
+            status: "considered".into(),
+        }
+    }
+
+    fn marker_ground(text: &str) -> SessionGround {
+        SessionGround::prepare(&[Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: text.into(),
+        }])
+    }
+
+    fn finish_marker(
+        fact: Fact,
+        rows: Option<&[super::super::known::KnownRow]>,
+        turn: &str,
+    ) -> (Result<Fact, &'static str>, IngestionReport) {
+        let ground = marker_ground(turn);
+        let mut report = IngestionReport::default();
+        let result = finish_fact(fact, &ground, false, false, rows, &mut report);
+        (result, report)
+    }
+
+    #[test]
+    fn ac_k1_a_shown_known_row_keeps_a_decided_setting_at_gate_3() {
+        let row = marker_row("setting", "svc", "header_format", MARKER);
+        let fact = marker_fact("header_format", "decided", MARKER, MARKER_QUOTE);
+        let (kept, report) = finish_marker(fact, Some(std::slice::from_ref(&row)), MARKER_TURN);
+        assert!(kept.is_ok(), "{:?}", kept.err());
+        assert_eq!(report.known_key_bound, 1);
+        assert!(!report.drops.contains_key(DROP_KEY_BINDING));
+        let encoded = serde_json::to_string(&report).expect("report");
+        assert!(encoded.contains("\"known_key_bound\":1"), "{encoded}");
+        assert_eq!(
+            known_key_line("svc", "header_format", 0),
+            "pass1 known key: svc:header_format | turn 0"
+        );
+        let folded = marker_row("setting", "svc", "Header Format", MARKER);
+        let hyphen = marker_row("setting", "svc", "Header-Format", MARKER);
+        let padded = marker_row("setting", "svc", " header_format ", MARKER);
+        let fact = marker_fact("header_format", "decided", MARKER, MARKER_QUOTE);
+        for row in [&folded, &hyphen, &padded] {
+            assert!(
+                known_binds(&fact, Some(std::slice::from_ref(row))),
+                "{}",
+                row.key
+            );
+        }
+    }
+
+    #[test]
+    fn ac_k2_a_different_key_or_an_affix_stem_stays_dropped() {
+        let row = marker_row("setting", "svc", "header_format", MARKER);
+        for key in ["header_style", "header_format_value"] {
+            let fact = marker_fact(key, "decided", MARKER, MARKER_QUOTE);
+            let (dropped, report) =
+                finish_marker(fact, Some(std::slice::from_ref(&row)), MARKER_TURN);
+            assert_eq!(dropped, Err(DROP_KEY_BINDING), "{key}");
+            assert_eq!(report.known_key_bound, 0, "{key}");
+        }
+    }
+
+    #[test]
+    fn ac_k3_a_different_or_empty_replaces_stays_dropped() {
+        let row = marker_row("setting", "svc", "header_format", MARKER);
+        for replaces in ["sig=cd34", "", "  "] {
+            let fact = marker_fact("header_format", "decided", replaces, MARKER_QUOTE);
+            let (dropped, report) =
+                finish_marker(fact, Some(std::slice::from_ref(&row)), MARKER_TURN);
+            assert_eq!(dropped, Err(DROP_KEY_BINDING), "{replaces:?}");
+            assert_eq!(report.known_key_bound, 0, "{replaces:?}");
+        }
+    }
+
+    #[test]
+    fn ac_k4_a_row_on_another_subject_stays_dropped() {
+        let row = marker_row("setting", "other", "header_format", MARKER);
+        let fact = marker_fact("header_format", "decided", MARKER, MARKER_QUOTE);
+        let (dropped, report) = finish_marker(fact, Some(std::slice::from_ref(&row)), MARKER_TURN);
+        assert_eq!(dropped, Err(DROP_KEY_BINDING));
+        assert_eq!(report.known_key_bound, 0);
+    }
+
+    #[test]
+    fn ac_k6_a_rejected_fact_stays_dropped() {
+        let row = marker_row("setting", "svc", "header_format", MARKER);
+        let fact = marker_fact("header_format", "rejected", MARKER, MARKER_QUOTE);
+        let (dropped, report) = finish_marker(fact, Some(std::slice::from_ref(&row)), MARKER_TURN);
+        assert_eq!(dropped, Err(DROP_KEY_BINDING));
+        assert_eq!(report.known_key_bound, 0);
+    }
+
+    #[test]
+    fn ac_k7_a_rule_or_uses_row_stays_dropped() {
+        let fact = marker_fact("header_format", "decided", MARKER, MARKER_QUOTE);
+        for predicate in ["rule", "uses"] {
+            let row = marker_row(predicate, "svc", "header_format", MARKER);
+            let (dropped, report) =
+                finish_marker(fact.clone(), Some(std::slice::from_ref(&row)), MARKER_TURN);
+            assert_eq!(dropped, Err(DROP_KEY_BINDING), "{predicate}");
+            assert_eq!(report.known_key_bound, 0, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn ac_k10_a_fact_that_already_binds_its_key_is_not_counted() {
+        let row = marker_row("setting", "svc", "header_format", MARKER);
+        let quote = "The header is t=3,v1=ab12.";
+        let turn = "The header is t=3,v1=ab12. The old marker was sig=ab12.";
+        let fact = marker_fact("header_format", "decided", MARKER, quote);
+        let (kept, report) = finish_marker(fact, Some(std::slice::from_ref(&row)), turn);
+        assert!(kept.is_ok(), "{:?}", kept.err());
+        assert_eq!(report.known_key_bound, 0);
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("known_key_bound"));
+    }
+
+    #[test]
+    fn known_binds_is_false_without_rows() {
+        let fact = marker_fact("header_format", "decided", MARKER, MARKER_QUOTE);
+        assert!(!known_binds(&fact, None));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_k5_k8_k9_known_key_binding_follows_the_shown_rows_and_the_prompt() {
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        const REPLY: &str = r#"{"facts":[{"subject":"svc","subject_type":"project","predicate":"setting","role":"none","key":"header_format","object":"t=3,v1=ab12","object_type":"literal","status":"decided","replaces":"sig=ab12","turn":0,"quote":"Switched the marker to t=3,v1=ab12.","confidence":0.9}],"bugs":[],"releases":[]}"#;
+
+        struct Scripted {
+            system: Mutex<String>,
+            user: Mutex<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl super::super::super::llm::LlmProvider for Scripted {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured(
+                &self,
+                _: &str,
+                _: &str,
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                Ok(Completion::unmeasured(
+                    r#"{"decision":"create","reason":"distinct"}"#,
+                ))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                messages: &[super::super::super::llm::Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                if system.starts_with(PASS1_SYSTEM_BARE) {
+                    *self.system.lock().expect("system") = system.to_string();
+                    if let Some(message) = messages.last() {
+                        *self.user.lock().expect("user") = message.content.clone();
+                    }
+                    return Ok(Completion::unmeasured(REPLY));
+                }
+                Ok(Completion::unmeasured(
+                    r#"{"decision":"create","reason":"distinct"}"#,
+                ))
+            }
+        }
+
+        fn plant(memory: &std::path::Path, config: &str) {
+            let cwd = memory.join("svc");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                memory,
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    MARKER_TURN.into(),
+                )],
+            )
+            .unwrap();
+            if !config.is_empty() {
+                std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+            }
+        }
+
+        async fn seed(gm: &GraphMemory, close: bool) {
+            let project = ProjectIdentity {
+                name: "svc".into(),
+                aliases: Vec::new(),
+            };
+            let llm = PanicProvider;
+            let turns = [Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "header_format is sig=ab12".into(),
+            }];
+            write::ensure_v2_store(gm).await.unwrap();
+            let ctx = write::WriteCtx::new(&llm, &project, "s0", "2026-01-01", &turns);
+            let mut fact = marker_fact("header_format", "decided", "", "header_format is sig=ab12");
+            fact.object_name = MARKER.into();
+            write::write_facts(gm, &ctx, &[fact]).await.unwrap();
+            if !close {
+                return;
+            }
+            let entities = crate::graph::crud::list_entities(gm.db(), None)
+                .await
+                .unwrap();
+            let entity = entities.iter().find(|entity| entity.name == "svc").unwrap();
+            let mut attributes = entity.attributes.clone().unwrap();
+            attributes["v2"]["slots"][0]["valid_until"] = serde_json::json!("2020-01-01T00:00:00Z");
+            gm.db()
+                .query("UPDATE type::record($id) SET attributes = $attributes")
+                .bind(("id", entity.id_string()))
+                .bind(("attributes", attributes))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+
+        async fn run(config: &str, close: bool) -> (IngestionReport, String, String, u32) {
+            let dir = tempfile::tempdir().unwrap();
+            plant(dir.path(), config);
+            let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+                .await
+                .unwrap();
+            seed(&gm, close).await;
+            super::super::known::reset_lookups();
+            let before = super::super::known::lookup_count();
+            let provider = Scripted {
+                system: Mutex::new(String::new()),
+                user: Mutex::new(String::new()),
+            };
+            let report = extract_session(
+                &gm,
+                dir.path(),
+                1,
+                &IngestContext::new("s", Some(1)),
+                &provider,
+            )
+            .await
+            .unwrap();
+            let system = provider.system.lock().expect("system").clone();
+            let user = provider.user.lock().expect("user").clone();
+            (
+                report,
+                system,
+                user,
+                super::super::known::lookup_count().saturating_sub(before),
+            )
+        }
+
+        let bare = "[graph]\nknown_key_binding = true\nknown_facts_context = false\n";
+        let (bare_report, bare_system, _, bare_lookups) = run(bare, false).await;
+        assert_eq!(bare_system, PASS1_SYSTEM_BARE);
+        assert_eq!(bare_lookups, 0);
+        assert_eq!(bare_report.known_key_bound, 0);
+        assert!(!serde_json::to_string(&bare_report)
+            .unwrap()
+            .contains("known_key_bound"));
+        assert_eq!(
+            bare_report.drops.get(DROP_KEY_BINDING).copied(),
+            Some(1),
+            "{:?}",
+            bare_report.drops
+        );
+
+        let off = "[graph]\nknown_facts_context = true\n";
+        let on = "[graph]\nknown_facts_context = true\nknown_key_binding = true\n";
+        let (off_report, off_system, off_user, _) = run(off, false).await;
+        let (on_report, on_system, on_user, _) = run(on, false).await;
+        assert_eq!(off_system.as_bytes(), on_system.as_bytes());
+        assert_eq!(off_user.as_bytes(), on_user.as_bytes());
+        assert_eq!(off_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(off_report.known_key_bound, 0);
+        assert_eq!(on_report.known_key_bound, 1, "{:?}", on_report.drops);
+        assert!(!on_report.drops.contains_key(DROP_KEY_BINDING));
+
+        let (closed, _, _, _) = run(on, true).await;
+        assert_eq!(closed.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(closed.known_key_bound, 0);
     }
 }
