@@ -14029,54 +14029,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac_t11_departure_off_matches_itself_for_the_same_inputs() {
-        let cases = [
-            ("svc", &[][..]),
-            ("svc", &[LONGER_RULE][..]),
-            ("acme", &[][..]),
-        ];
-        for (subject, extras) in cases {
-            let first =
-                run_rule_departure(subject, extras, DEPARTURE_QUOTE, "supersedes", false, false)
-                    .await;
-            let again =
-                run_rule_departure(subject, extras, DEPARTURE_QUOTE, "supersedes", false, false)
-                    .await;
-            assert_eq!(
-                consolidate_snapshot(&first.report),
-                consolidate_snapshot(&again.report),
-                "{subject}"
-            );
-            assert_eq!(
-                first.report.consolidate.pairs, again.report.consolidate.pairs,
-                "{subject}"
-            );
-            assert_eq!(
-                first.report.consolidate.dropped, again.report.consolidate.dropped,
-                "{subject}"
-            );
-            assert!(
-                first.report.consolidate.replaces_departure.is_none(),
-                "{subject}"
-            );
-            assert!(!consolidate_snapshot(&first.report).contains("replaces_departure"));
-            assert_eq!(first.ended, again.ended, "{subject}");
-            let drops = dropped(&first.report, "no departure cue");
-            assert!(drops >= 1, "{subject}");
-            if extras.is_empty() {
-                assert_eq!(drops, 1, "{subject}");
-            }
-            let line = drop_line(
-                "no departure cue",
-                &format!("{subject}:"),
-                "svc:",
-                DEPARTURE_QUOTE,
-            );
-            assert!(
-                line.starts_with("consolidate drop: no departure cue |"),
-                "{line}"
-            );
-        }
+    async fn ac_t11_departure_off_matches_main_for_the_same_inputs() {
+        const ONE_PAIR: &str = r#"{"anchors":1,"pairs":1,"overflow":0,"prefilter":{"dup":0,"sup":0,"drop":0},"judged":1,"cache_hits":0,"closes_sup":0,"closes_dup":0,"dropped":{"no departure cue":1},"calls":1,"errors":0}"#;
+        const TWO_PAIRS: &str = r#"{"anchors":1,"pairs":2,"overflow":0,"prefilter":{"dup":0,"sup":0,"drop":0},"judged":2,"cache_hits":0,"closes_sup":0,"closes_dup":0,"dropped":{"no departure cue":2},"calls":1,"errors":0}"#;
+        const SVC_LINE: &str =
+            "consolidate drop: no departure cue | svc: | svc: | No timestamp guessing anymore.";
+        const ACME_LINE: &str =
+            "consolidate drop: no departure cue | acme: | svc: | No timestamp guessing anymore.";
+
+        let svc = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
+        assert_eq!(consolidate_snapshot(&svc.report), ONE_PAIR);
+        assert_eq!(svc.report.consolidate.pairs, 1);
+        assert_eq!(dropped(&svc.report, "no departure cue"), 1);
+        assert_eq!(
+            drop_line("no departure cue", "svc:", "svc:", DEPARTURE_QUOTE),
+            SVC_LINE
+        );
+
+        let longer = run_rule_departure(
+            "svc",
+            &[LONGER_RULE],
+            DEPARTURE_QUOTE,
+            "supersedes",
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(consolidate_snapshot(&longer.report), TWO_PAIRS);
+        assert_eq!(longer.report.consolidate.pairs, 2);
+        assert_eq!(dropped(&longer.report, "no departure cue"), 2);
+        assert_eq!(
+            drop_line("no departure cue", "svc:", "svc:", DEPARTURE_QUOTE),
+            SVC_LINE
+        );
+
+        let acme =
+            run_rule_departure("acme", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
+        assert_eq!(consolidate_snapshot(&acme.report), ONE_PAIR);
+        assert_eq!(acme.report.consolidate.pairs, 1);
+        assert_eq!(dropped(&acme.report, "no departure cue"), 1);
+        assert_eq!(
+            drop_line("no departure cue", "acme:", "svc:", DEPARTURE_QUOTE),
+            ACME_LINE
+        );
     }
 }
 

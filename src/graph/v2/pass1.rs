@@ -231,26 +231,28 @@ pub(crate) async fn extract_session(
     let session_text = super::known::turn_text(&session.turns);
     // One load when either switch is on. The block ranks that load. Matching
     // reuses the unranked rows, so a second read is not needed.
-    let (stored, shown, known_block) = if known_on && match_on {
-        let rows = super::known::read_live(gm, &session.project, &session_text).await;
-        let shown = super::known::rank_known(rows.clone(), &session_text);
-        let block = super::known::render_known(&shown);
-        (Some(rows), shown, block)
-    } else if known_on {
-        let rows = super::known::known_rows(gm, &session.project, &session_text).await?;
-        let block = super::known::render_known(&rows);
-        (None, rows, block)
-    } else {
-        (None, Vec::new(), String::new())
-    };
-    let known = if known_key_binding_enabled(memory_dir) && !shown.is_empty() {
-        Some(shown.as_slice())
-    } else {
-        None
-    };
+    let shown_known = load_shown_known(
+        gm,
+        memory_dir,
+        &session.project,
+        &session_text,
+        known_on,
+        match_on,
+    )
+    .await?;
+    let known = shown_known.bind.then_some(shown_known.shown.as_slice());
     let mut facts = Vec::new();
     for window in &windows {
-        match call_window(llm, &session, window, &known_block, system, &mut report).await {
+        match call_window(
+            llm,
+            &session,
+            window,
+            &shown_known.block,
+            system,
+            &mut report,
+        )
+        .await
+        {
             Ok(reply) => facts.extend(collect_facts(
                 &reply,
                 &session,
@@ -268,6 +270,7 @@ pub(crate) async fn extract_session(
     // Overlap repeats the last two turns. The same fact, session, turn and
     // quote is one write: a second copy must not corroborate the fact in the
     // session that created it.
+    let stored = shown_known.stored;
     let facts = dedupe_facts(facts);
     // Decide against this list, then drop. Reconcile below indexes targets by
     // the facts it receives, so the list must not shrink after that.
@@ -396,6 +399,45 @@ pub(crate) async fn extract_session(
     )
     .await;
     Ok(report)
+}
+
+struct ShownKnown {
+    stored: Option<Vec<super::known::KnownRow>>,
+    shown: Vec<super::known::KnownRow>,
+    block: String,
+    bind: bool,
+}
+
+/// The known block, the ranked rows it was rendered from, and whether gate 3
+/// may bind from those rows. `stored` stays the unranked load when matching
+/// reuses it.
+async fn load_shown_known(
+    gm: &GraphMemory,
+    memory_dir: &Path,
+    project: &ProjectIdentity,
+    session_text: &str,
+    known_on: bool,
+    match_on: bool,
+) -> Result<ShownKnown, GraphError> {
+    let (stored, shown, block) = if known_on && match_on {
+        let rows = super::known::read_live(gm, project, session_text).await;
+        let shown = super::known::rank_known(rows.clone(), session_text);
+        let block = super::known::render_known(&shown);
+        (Some(rows), shown, block)
+    } else if known_on {
+        let rows = super::known::known_rows(gm, project, session_text).await?;
+        let block = super::known::render_known(&rows);
+        (None, rows, block)
+    } else {
+        (None, Vec::new(), String::new())
+    };
+    let bind = known_key_binding_enabled(memory_dir) && !shown.is_empty();
+    Ok(ShownKnown {
+        stored,
+        shown,
+        block,
+        bind,
+    })
 }
 
 fn elapsed_ms(started: std::time::Instant) -> u64 {
@@ -963,7 +1005,15 @@ fn bind_known_key(
 }
 
 fn known_key_line(subject: &str, key: &str, turn: usize) -> String {
-    format!("pass1 known key: {subject}:{key} | turn {turn}")
+    format!(
+        "pass1 known key: {}:{} | turn {turn}",
+        log_plain(subject),
+        log_plain(key)
+    )
+}
+
+fn log_plain(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_control()).collect()
 }
 
 fn known_binds(fact: &Fact, known: Option<&[super::known::KnownRow]>) -> bool {
@@ -6151,5 +6201,119 @@ mod tests {
         let (closed, _, _, _) = run(on, true).await;
         assert_eq!(closed.drops.get(DROP_KEY_BINDING).copied(), Some(1));
         assert_eq!(closed.known_key_bound, 0);
+    }
+
+    #[test]
+    fn a_newline_in_the_known_key_does_not_break_the_log_line() {
+        let line = known_key_line("svc", "header\nformat", 0);
+        assert_eq!(line, "pass1 known key: svc:headerformat | turn 0");
+        assert!(!line.chars().any(char::is_control));
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shown_rows_are_ranked_when_known_context_and_match_are_on() {
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        const REPLY: &str = r#"{"facts":[{"subject":"svc","subject_type":"project","predicate":"setting","role":"none","key":"header_format","object":"t=3,v1=ab12","object_type":"literal","status":"decided","replaces":"sig=ab12","turn":0,"quote":"Switched the marker to t=3,v1=ab12.","confidence":0.9}],"bugs":[],"releases":[]}"#;
+
+        struct Scripted {
+            user: Mutex<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl super::super::super::llm::LlmProvider for Scripted {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                messages: &[super::super::super::llm::Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                if system.starts_with(PASS1_SYSTEM_BARE) {
+                    if let Some(message) = messages.last() {
+                        *self.user.lock().expect("user") = message.content.clone();
+                    }
+                    return Ok(Completion::unmeasured(REPLY));
+                }
+                Ok(Completion::unmeasured(
+                    r#"{"decision":"create","reason":"distinct"}"#,
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("svc");
+        std::fs::create_dir_all(&cwd).unwrap();
+        input::write_turns_sidecar(
+            dir.path(),
+            1,
+            "s",
+            "2026-01-02",
+            Some(cwd.to_str().unwrap()),
+            &[crate::conversation::ConversationEntry::UserMessage(
+                MARKER_TURN.into(),
+            )],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nknown_facts_context = true\nknown_match = true\nknown_key_binding = true\n",
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+            .await
+            .unwrap();
+        write::ensure_v2_store(&gm).await.unwrap();
+        let project = ProjectIdentity {
+            name: "svc".into(),
+            aliases: Vec::new(),
+        };
+        let llm = PanicProvider;
+        let turns = [Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "stored keys".into(),
+        }];
+        let ctx = write::WriteCtx::new(&llm, &project, "s0", "2026-01-01", &turns);
+        let mut zebra = marker_fact("zebra_key", "decided", "", "zebra_key is sig=zz99");
+        zebra.object_name = "sig=zz99".into();
+        zebra.quote = "zebra_key is sig=zz99".into();
+        let mut header = marker_fact("header_format", "decided", "", "header_format is sig=ab12");
+        header.object_name = MARKER.into();
+        write::write_facts(&gm, &ctx, &[zebra, header])
+            .await
+            .unwrap();
+
+        let provider = Scripted {
+            user: Mutex::new(String::new()),
+        };
+        let report = extract_session(
+            &gm,
+            dir.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.known_key_bound, 1, "{:?}", report.drops);
+        assert!(!report.drops.contains_key(DROP_KEY_BINDING));
+
+        let unranked = super::super::known::read_live(&gm, &project, MARKER_TURN).await;
+        let ranked = super::super::known::rank_known(unranked.clone(), MARKER_TURN);
+        let ranked_block = super::super::known::render_known(&ranked);
+        let unranked_block = super::super::known::render_known(&unranked);
+        assert_ne!(ranked_block, unranked_block);
+        let user = provider.user.lock().expect("user").clone();
+        assert!(user.contains(&ranked_block), "{user}");
+        assert!(!user.contains(&unranked_block), "{user}");
     }
 }
