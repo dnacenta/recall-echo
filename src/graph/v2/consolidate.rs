@@ -5194,6 +5194,7 @@ fn take_post_lines() -> Vec<String> {
 
 struct PostSnap {
     orphan: Option<OrphanSnap>,
+    fragments: Option<FragmentSnap>,
 }
 
 struct OrphanSnap {
@@ -5235,7 +5236,7 @@ struct OrphanPlan {
 }
 
 fn post_switches(ctx: &WriteCtx<'_>) -> bool {
-    ctx.orphan_sweep_on
+    ctx.orphan_sweep_on || ctx.rule_fragments_on
 }
 
 async fn post_pass(
@@ -5263,7 +5264,12 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
     } else {
         None
     };
-    Ok(PostSnap { orphan })
+    let fragments = if ctx.rule_fragments_on {
+        Some(read_fragment_snap(gm).await?)
+    } else {
+        None
+    };
+    Ok(PostSnap { orphan, fragments })
 }
 
 async fn apply_post(
@@ -5277,6 +5283,10 @@ async fn apply_post(
         note_truncation(orphan, report);
         let plan = plan_orphan(ctx, facts, orphan);
         apply_orphan(gm, ctx, &plan, report).await;
+    }
+    if let Some(fragments) = &snap.fragments {
+        let plan = plan_fragments(ctx, fragments);
+        apply_fragments(gm, ctx, &plan, report).await;
     }
 }
 
@@ -5733,6 +5743,311 @@ fn sweep_retirement(close: &SweepClose, reason: &str) -> Retirement {
         old_value: close.value.clone(),
         new_value: String::new(),
     }
+}
+
+const FRAGMENT_REASON: &str = "rule_fragment";
+const FRAGMENT_MIN_TOKENS: usize = 3;
+
+struct FragmentSnap {
+    entities: Vec<FragmentEntity>,
+}
+
+struct FragmentEntity {
+    id: String,
+    name: String,
+    slots: Vec<FragmentSlot>,
+}
+
+struct FragmentSlot {
+    index: usize,
+    predicate: String,
+    key: String,
+    value: String,
+    status: String,
+    pending: bool,
+    live: bool,
+    ended_by: String,
+    first_session: String,
+    first_turn: Option<u64>,
+    first_quote: String,
+}
+
+struct FragmentClose {
+    slot: SweepClose,
+    with_slot: usize,
+}
+
+struct FragmentPlan {
+    closes: Vec<FragmentClose>,
+    ambiguous: Vec<(String, usize)>,
+}
+
+async fn read_fragment_snap(gm: &GraphMemory) -> Result<FragmentSnap, GraphError> {
+    note_post_read();
+    let mut response = gm
+        .db()
+        .query("SELECT id, name, attributes FROM entity")
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(FragmentSnap {
+        entities: parse_fragment_entities(&rows),
+    })
+}
+
+fn parse_fragment_entities(rows: &[Value]) -> Vec<FragmentEntity> {
+    rows.iter().filter_map(fragment_entity).collect()
+}
+
+fn fragment_entity(row: &Value) -> Option<FragmentEntity> {
+    let id = id_text(row.get("id"));
+    if id.is_empty() {
+        return None;
+    }
+    let slots = fragment_slots(row);
+    if slots.is_empty() {
+        return None;
+    }
+    Some(FragmentEntity {
+        id,
+        name: json_text(row.get("name")),
+        slots,
+    })
+}
+
+fn fragment_slots(row: &Value) -> Vec<FragmentSlot> {
+    row.pointer("/attributes/v2/slots")
+        .and_then(Value::as_array)
+        .map(|slots| {
+            slots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, slot)| fragment_slot(index, slot))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn fragment_slot(index: usize, slot: &Value) -> Option<FragmentSlot> {
+    if !slot.is_object() {
+        return None;
+    }
+    let evidence = evidence_head(slot);
+    Some(FragmentSlot {
+        index,
+        predicate: json_text(slot.get("predicate")),
+        key: json_text(slot.get("key")),
+        value: json_text(slot.get("value")),
+        status: json_text(slot.get("status")),
+        pending: super::write::is_pending(slot),
+        live: !crud::edge_already_closed(slot.get("valid_until")),
+        ended_by: json_text(slot.get("ended_by")),
+        first_session: evidence.session,
+        first_turn: evidence.turn,
+        first_quote: evidence.quote,
+    })
+}
+
+struct EvidenceHead {
+    session: String,
+    turn: Option<u64>,
+    quote: String,
+}
+
+fn evidence_head(slot: &Value) -> EvidenceHead {
+    let Some(item) = slot
+        .get("evidence")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    else {
+        return EvidenceHead {
+            session: String::new(),
+            turn: None,
+            quote: String::new(),
+        };
+    };
+    EvidenceHead {
+        session: json_text(item.get("session")),
+        turn: item.get("turn").and_then(Value::as_u64),
+        quote: json_text(item.get("quote")),
+    }
+}
+
+fn plan_fragments(ctx: &WriteCtx<'_>, snap: &FragmentSnap) -> FragmentPlan {
+    let mut plan = FragmentPlan {
+        closes: Vec::new(),
+        ambiguous: Vec::new(),
+    };
+    for entity in &snap.entities {
+        for slot in &entity.slots {
+            if fragment_trigger(slot, ctx.session_id) {
+                push_fragment(&mut plan, entity, slot, ctx.session_id);
+            }
+        }
+    }
+    sort_fragment_closes(&mut plan.closes);
+    plan
+}
+
+fn push_fragment(
+    plan: &mut FragmentPlan,
+    entity: &FragmentEntity,
+    trigger: &FragmentSlot,
+    session: &str,
+) {
+    let siblings = siblings_of(entity, trigger, session);
+    if siblings.len() > 1 {
+        plan.ambiguous.push((entity.name.clone(), siblings.len()));
+        return;
+    }
+    if let Some(sibling) = siblings.first() {
+        plan.closes
+            .push(fragment_close(entity, sibling, trigger.index));
+    }
+}
+
+fn siblings_of<'a>(
+    entity: &'a FragmentEntity,
+    trigger: &FragmentSlot,
+    session: &str,
+) -> Vec<&'a FragmentSlot> {
+    entity
+        .slots
+        .iter()
+        .filter(|slot| is_sibling(slot, trigger, session))
+        .collect()
+}
+
+fn fragment_trigger(slot: &FragmentSlot, session: &str) -> bool {
+    closed_rule_reason(slot, session) && evidence_complete(slot)
+}
+
+fn closed_rule_reason(slot: &FragmentSlot, session: &str) -> bool {
+    slot.predicate == "rule" && fragment_reason(&slot.ended_by, session)
+}
+
+fn fragment_reason(ended_by: &str, session: &str) -> bool {
+    matches!(
+        reason_after(ended_by, session),
+        Some("superseded" | "replaced" | "consolidated")
+    )
+}
+
+fn reason_after<'a>(ended_by: &'a str, session: &str) -> Option<&'a str> {
+    ended_by.strip_prefix(session)?.strip_prefix(':')
+}
+
+fn evidence_complete(slot: &FragmentSlot) -> bool {
+    !slot.first_session.is_empty() && slot.first_turn.is_some() && !slot.first_quote.is_empty()
+}
+
+fn is_sibling(slot: &FragmentSlot, trigger: &FragmentSlot, session: &str) -> bool {
+    slot.index != trigger.index
+        && live_decided_rule(slot)
+        && earlier_fragment(slot, session)
+        && same_sighting(slot, trigger)
+        && nested_quotes(&slot.first_quote, &trigger.first_quote)
+}
+
+fn live_decided_rule(slot: &FragmentSlot) -> bool {
+    slot.live && !slot.pending && slot.status == "decided" && slot.predicate == "rule"
+}
+
+fn earlier_fragment(slot: &FragmentSlot, session: &str) -> bool {
+    !slot.first_session.is_empty() && slot.first_session != session
+}
+
+fn same_sighting(slot: &FragmentSlot, trigger: &FragmentSlot) -> bool {
+    slot.first_session == trigger.first_session
+        && slot.first_turn.is_some()
+        && slot.first_turn == trigger.first_turn
+}
+
+fn nested_quotes(left: &str, right: &str) -> bool {
+    strictly_nested(&alphanumeric_runs(left), &alphanumeric_runs(right))
+}
+
+fn strictly_nested(left: &[String], right: &[String]) -> bool {
+    if left == right {
+        return false;
+    }
+    let (short, long) = if left.len() < right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    short.len() >= FRAGMENT_MIN_TOKENS && token_subrun(long, short)
+}
+
+fn token_subrun(long: &[String], short: &[String]) -> bool {
+    if short.is_empty() || long.len() < short.len() {
+        return false;
+    }
+    long.windows(short.len()).any(|window| window == short)
+}
+
+fn fragment_close(entity: &FragmentEntity, slot: &FragmentSlot, with_slot: usize) -> FragmentClose {
+    FragmentClose {
+        slot: SweepClose {
+            entity_id: entity.id.clone(),
+            subject: entity.name.clone(),
+            index: slot.index,
+            predicate: slot.predicate.clone(),
+            key: slot.key.clone(),
+            value: slot.value.clone(),
+        },
+        with_slot,
+    }
+}
+
+fn sort_fragment_closes(closes: &mut [FragmentClose]) {
+    closes.sort_by(|left, right| {
+        left.slot
+            .entity_id
+            .cmp(&right.slot.entity_id)
+            .then(left.slot.index.cmp(&right.slot.index))
+    });
+}
+
+async fn apply_fragments(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &FragmentPlan,
+    report: &mut IngestionReport,
+) {
+    note_ambiguous(plan, report);
+    for close in &plan.closes {
+        let line = fragment_close_line(
+            &close.slot.subject,
+            &close.slot.key,
+            close.slot.index,
+            close.with_slot,
+        );
+        if close_sweep_slot(gm, ctx, &close.slot, FRAGMENT_REASON, &line, report).await {
+            add_count(&mut report.consolidate.rule_fragment_closes);
+        }
+    }
+}
+
+fn note_ambiguous(plan: &FragmentPlan, report: &mut IngestionReport) {
+    for (subject, count) in &plan.ambiguous {
+        add_count(&mut report.consolidate.rule_fragment_ambiguous);
+        emit_post_line(fragment_ambiguous_line(subject, *count));
+    }
+}
+
+fn fragment_close_line(subject: &str, key: &str, index: usize, closed_index: usize) -> String {
+    format!(
+        "consolidate fragment: {}:{} | slot {index} | with slot {closed_index}",
+        quote_head(subject),
+        quote_head(key)
+    )
+}
+
+fn fragment_ambiguous_line(subject: &str, count: usize) -> String {
+    format!(
+        "consolidate fragment ambiguous: {} | {count} siblings",
+        quote_head(subject)
+    )
 }
 
 #[cfg(all(test, feature = "embedded"))]
@@ -14778,7 +15093,30 @@ mod tests {
         on: bool,
         aliases: &[&str],
     ) -> (IngestionReport, Vec<String>, u32) {
-        sweep_reply(gm, session, date, facts, stats, on, aliases, None).await
+        sweep_reply(gm, session, date, facts, stats, on, false, aliases, None).await
+    }
+
+    async fn sweep_parts(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        facts: &[Fact],
+        stats: &WriteStats,
+        orphan: bool,
+        fragments: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        sweep_reply(
+            gm,
+            session,
+            date,
+            facts,
+            stats,
+            orphan,
+            fragments,
+            &[],
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14789,6 +15127,7 @@ mod tests {
         facts: &[Fact],
         stats: &WriteStats,
         on: bool,
+        fragments: bool,
         aliases: &[&str],
         reply: Option<&str>,
     ) -> (IngestionReport, Vec<String>, u32) {
@@ -14803,6 +15142,7 @@ mod tests {
         let stub = Stub::new(answer);
         let mut ctx = WriteCtx::new(&stub, &project, session, date, &turns);
         ctx.orphan_sweep_on = on;
+        ctx.rule_fragments_on = fragments;
         let mut report = IngestionReport::default();
         run(gm, &ctx, facts, stats, &stub, &mut report).await;
         let lines = super::take_post_lines();
@@ -15083,6 +15423,7 @@ mod tests {
                 &reject,
                 &stats,
                 true,
+                false,
                 &[],
                 Some(&reply),
             )
@@ -15485,6 +15826,666 @@ mod tests {
             Some("s2:orphan_sweep")
         );
         assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+    }
+
+    const LONG_QUOTE: &str = "Only report them for now. List them at the end, leave them alone.";
+    const SHORT_QUOTE: &str = "List them at the end, leave them alone.";
+
+    fn quoted_rule(key: &str, value: &str, quote: &str, turn: usize) -> Fact {
+        Fact {
+            subject_name: "app".into(),
+            subject_kind: Kind::Project,
+            predicate: Predicate::Rule,
+            role: None,
+            key: key.into(),
+            object_name: value.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn,
+            quote: quote.into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    async fn close_named(gm: &GraphMemory, name: &str, key: &str, reason: &str) {
+        mutate_named_slot(gm, name, key, |slot| {
+            slot["valid_until"] = json!("2026-04-02T00:00:00Z");
+            slot["ended_by"] = json!(format!("s2:{reason}"));
+        })
+        .await;
+    }
+
+    fn fragment_reasons(report: &IngestionReport) -> Vec<&str> {
+        report
+            .retirements
+            .iter()
+            .filter(|item| item.reason == "rule_fragment")
+            .map(|item| item.key.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn fragment_guards_use_whole_token_runs_and_only_three_reasons() {
+        assert!(super::nested_quotes(SHORT_QUOTE, LONG_QUOTE));
+        assert!(super::nested_quotes(LONG_QUOTE, SHORT_QUOTE));
+        assert!(!super::nested_quotes(LONG_QUOTE, LONG_QUOTE));
+        assert!(!super::nested_quotes("hem at the", "them at the end"));
+        assert!(!super::nested_quotes(
+            "them at",
+            "List them at the end, leave them alone."
+        ));
+        assert!(!super::nested_quotes(
+            "Keep the cache warm overnight.",
+            LONG_QUOTE
+        ));
+        for reason in ["superseded", "replaced", "consolidated"] {
+            assert!(super::fragment_reason(&format!("s2:{reason}"), "s2"));
+        }
+        for reason in [
+            "rejected",
+            "promoted",
+            "hold_dropped",
+            "duplicate",
+            "orphan_sweep",
+            "rule_fragment",
+        ] {
+            assert!(
+                !super::fragment_reason(&format!("s2:{reason}"), "s2"),
+                "{reason}"
+            );
+        }
+        assert!(!super::fragment_reason("s20:consolidated", "s2"));
+        let line = super::fragment_close_line("app", "list", 1, 0);
+        assert_eq!(
+            line,
+            "consolidate fragment: app:list | slot 1 | with slot 0"
+        );
+        assert!(!line.contains("alone"));
+        let ambiguous = super::fragment_ambiguous_line("app", 2);
+        assert_eq!(
+            ambiguous,
+            "consolidate fragment ambiguous: app | 2 siblings"
+        );
+    }
+
+    async fn seed_pair(gm: &GraphMemory, sibling_quote: &str, sibling_turn: usize) {
+        commit_app(
+            gm,
+            "s1",
+            "2026-04-01",
+            &[
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule(
+                    "list",
+                    "List dupes at the end.",
+                    sibling_quote,
+                    sibling_turn,
+                ),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f1_a_nested_same_turn_rule_closes_for_three_reasons() {
+        for reason in ["consolidated", "superseded", "replaced"] {
+            let (_tmp, gm) = open().await;
+            seed_pair(&gm, SHORT_QUOTE, 4).await;
+            close_named(&gm, "app", "main", reason).await;
+            let (report, lines, _) = sweep_parts(
+                &gm,
+                "s2",
+                "2026-04-02",
+                &[],
+                &WriteStats::default(),
+                false,
+                true,
+            )
+            .await;
+            let rows = slots(&gm, "app").await;
+            assert_eq!(ended_key(&rows, "main"), Some(&*format!("s2:{reason}")));
+            assert_eq!(
+                ended_key(&rows, "list"),
+                Some("s2:rule_fragment"),
+                "{reason}"
+            );
+            assert_eq!(fragment_reasons(&report), vec!["list"]);
+            assert!(report
+                .retirements
+                .iter()
+                .any(|item| item.reason == "rule_fragment" && item.new_value.is_empty()));
+            assert_eq!(report.consolidate.rule_fragment_closes, Some(1));
+            assert_eq!(report.consolidate.closes_sup, 0);
+            assert_eq!(report.consolidate.closes_dup, 0);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("app:list"));
+            assert!(lines[0].contains("with slot"));
+            assert!(!lines[0].contains("dupes") && !lines[0].contains("alone"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f2_same_turn_quotes_that_are_not_nested_stay_live() {
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, "Keep the cache warm overnight.", 4).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f3_a_different_turn_or_session_stays_live() {
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 5).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        mutate_named_slot(&gm, "app", "list", |slot| {
+            slot["evidence"][0]["session"] = json!("s0");
+        })
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f4_a_sibling_opened_this_session_stays_live() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[quoted_rule(
+                "main",
+                "Only report dupes and leave them alone.",
+                LONG_QUOTE,
+                4,
+            )],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[quoted_rule(
+                "list",
+                "List dupes at the end.",
+                SHORT_QUOTE,
+                4,
+            )],
+        )
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f5_equal_quotes_stay_live() {
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, LONG_QUOTE, 4).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f6_a_character_substring_or_a_short_quote_stays_live() {
+        for quote in ["hem at the", "them at"] {
+            let (_tmp, gm) = open().await;
+            commit_app(
+                &gm,
+                "s1",
+                "2026-04-01",
+                &[
+                    quoted_rule("main", "Keep them at the end.", "them at the end", 4),
+                    quoted_rule("list", "List dupes at the end.", quote, 4),
+                ],
+            )
+            .await;
+            close_named(&gm, "app", "main", "consolidated").await;
+            let (report, _, _) = sweep_parts(
+                &gm,
+                "s2",
+                "2026-04-02",
+                &[],
+                &WriteStats::default(),
+                false,
+                true,
+            )
+            .await;
+            assert!(
+                ended_key(&slots(&gm, "app").await, "list").is_none(),
+                "{quote}"
+            );
+            assert!(fragment_reasons(&report).is_empty(), "{quote}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f7_two_siblings_close_none_and_count_ambiguous() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+                quoted_rule("tail", "Leave them alone.", "leave them alone", 4),
+            ],
+        )
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, lines, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "app").await;
+        assert!(ended_key(&rows, "list").is_none());
+        assert!(ended_key(&rows, "tail").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+        assert_eq!(report.consolidate.rule_fragment_ambiguous, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate fragment ambiguous: app | 2 siblings".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f8_other_close_reasons_and_a_closed_edge_are_not_triggers() {
+        for reason in ["rejected", "hold_dropped", "duplicate", "orphan_sweep"] {
+            let (_tmp, gm) = open().await;
+            seed_pair(&gm, SHORT_QUOTE, 4).await;
+            close_named(&gm, "app", "main", reason).await;
+            let (report, _, _) = sweep_parts(
+                &gm,
+                "s2",
+                "2026-04-02",
+                &[],
+                &WriteStats::default(),
+                false,
+                true,
+            )
+            .await;
+            assert!(
+                ended_key(&slots(&gm, "app").await, "list").is_none(),
+                "{reason}"
+            );
+            assert!(fragment_reasons(&report).is_empty(), "{reason}");
+        }
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                use_of("app", Kind::Project, "Blobfmt", "decided"),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+            ],
+        )
+        .await;
+        gm.db()
+            .query(
+                "UPDATE relates_to SET ended_by = $ended, valid_until = type::datetime($until) \
+                 WHERE rel_type = 'uses'",
+            )
+            .bind(("ended", "s2:consolidated".to_string()))
+            .bind(("until", "2026-04-02T00:00:00Z".to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f9_another_entity_or_a_setting_stays_live() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                {
+                    let mut setting = setting_of("app", "cache_format", SHORT_QUOTE, "decided");
+                    setting.subject_kind = Kind::Project;
+                    setting.turn = 4;
+                    setting.quote = SHORT_QUOTE.into();
+                    setting
+                },
+            ],
+        )
+        .await;
+        let mut other = quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4);
+        other.subject_name = "cache".into();
+        other.subject_kind = Kind::Component;
+        commit_app(&gm, "s1b", "2026-04-01", &[other]).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "cache_format").is_none());
+        assert!(ended_key(&slots(&gm, "cache").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f10_missing_evidence_or_an_empty_quote_stays_live() {
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        mutate_named_slot(&gm, "app", "main", |slot| {
+            slot["evidence"] = json!([]);
+        })
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        mutate_named_slot(&gm, "app", "main", |slot| {
+            slot["evidence"][0]["quote"] = json!("");
+        })
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        mutate_named_slot(&gm, "app", "list", |slot| {
+            slot["evidence"] = json!([]);
+        })
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, "", 4).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_f11_switch_off_reads_nothing_and_leaves_the_rows() {
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let before = slots(&gm, "app").await;
+        let (report, lines, reads) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(reads, 0);
+        assert!(lines.is_empty());
+        assert_eq!(slots(&gm, "app").await, before);
+        let snap = consolidate_snapshot(&report);
+        assert!(!snap.contains("rule_fragment"), "{snap}");
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_c3_each_switch_closes_only_its_own_rows() {
+        async fn seed_both(gm: &GraphMemory) {
+            commit_app(
+                gm,
+                "s1",
+                "2026-04-01",
+                &[
+                    setting_of("cache", "cache_format", "Blobfmt", "decided"),
+                    quoted_rule(
+                        "main",
+                        "Only report dupes and leave them alone.",
+                        LONG_QUOTE,
+                        4,
+                    ),
+                    quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+                ],
+            )
+            .await;
+            close_named(gm, "app", "main", "consolidated").await;
+        }
+        let facts = [reject_blob()];
+        let (_tmp, gm) = open().await;
+        seed_both(&gm).await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+        assert!(report.consolidate.rule_fragment_closes.is_none());
+        assert!(report.consolidate.replaces_cue.is_none());
+        assert!(report.consolidate.closes_component.is_none());
+
+        let (_tmp, gm) = open().await;
+        seed_both(&gm).await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "cache").await, "cache_format").is_none());
+        assert_eq!(
+            ended_key(&slots(&gm, "app").await, "list"),
+            Some("s2:rule_fragment")
+        );
+        assert!(report.consolidate.orphan_sweep_closes.is_none());
+        assert_eq!(report.consolidate.rule_fragment_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_c4_orphan_closes_precede_fragments_and_do_not_chain() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+                setting_of("cache", "cache_path", "~/.app/data.blobfmt", "decided"),
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+                quoted_rule("later", "List dupes at the end.", SHORT_QUOTE, 5),
+            ],
+        )
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let facts = [reject_blob()];
+        let (report, lines, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &facts,
+            &WriteStats::default(),
+            true,
+            true,
+        )
+        .await;
+        let reasons: Vec<&str> = report
+            .retirements
+            .iter()
+            .map(|item| item.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["orphan_sweep", "orphan_sweep", "rule_fragment"]
+        );
+        assert!(lines.len() >= 3, "{lines:?}");
+        assert!(lines[0].starts_with("consolidate orphan:"));
+        assert!(lines[1].starts_with("consolidate orphan:"));
+        assert!(lines[2].starts_with("consolidate fragment:"));
+        assert!(ended_key(&slots(&gm, "app").await, "later").is_none());
+        assert_eq!(
+            ended_key(&slots(&gm, "app").await, "list"),
+            Some("s2:rule_fragment")
+        );
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
     }
 }
 

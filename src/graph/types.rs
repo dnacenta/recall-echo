@@ -944,6 +944,14 @@ pub struct ConsolidateReport {
     /// Absent when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_sweep_truncated: Option<u32>,
+    /// Live rule fragments closed after a same-turn rule was closed.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_fragment_closes: Option<u32>,
+    /// Closed rules with two or more nested same-turn siblings. None of those siblings close.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_fragment_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1115,6 +1123,8 @@ impl ConsolidateReport {
         self.orphan_sweep_closes.unwrap_or(0) == 0
             && self.orphan_sweep_overflow.unwrap_or(0) == 0
             && self.orphan_sweep_truncated.unwrap_or(0) == 0
+            && self.rule_fragment_closes.unwrap_or(0) == 0
+            && self.rule_fragment_ambiguous.unwrap_or(0) == 0
     }
 }
 
