@@ -738,6 +738,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_replaces_cue: bool,
+    /// Keep a judged supersede when an exact rule `replaces` and a departure
+    /// word supply the cue. Off unless set, and ignored unless
+    /// [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_replaces_departure",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_replaces_departure: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// Off unless set.
     #[serde(
@@ -780,6 +788,7 @@ impl Default for GraphSection {
             consolidate_components: default_consolidate_components(),
             consolidate_key_rename: default_consolidate_key_rename(),
             consolidate_replaces_cue: default_consolidate_replaces_cue(),
+            consolidate_replaces_departure: default_consolidate_replaces_departure(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
@@ -823,6 +832,13 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn replaces_cue_apply(&self) -> bool {
         self.consolidate && self.consolidate_replaces_cue
+    }
+
+    /// An exact rule `replaces` plus a departure word counts as the cue only
+    /// when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn replaces_departure_apply(&self) -> bool {
+        self.consolidate && self.consolidate_replaces_departure
     }
 }
 
@@ -1154,6 +1170,10 @@ fn default_consolidate_key_rename() -> bool {
 }
 
 fn default_consolidate_replaces_cue() -> bool {
+    false
+}
+
+fn default_consolidate_replaces_departure() -> bool {
     false
 }
 
@@ -1500,6 +1520,12 @@ impl Config {
             }
             "graph.consolidate_replaces_cue" => {
                 self.graph_section().consolidate_replaces_cue = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_replaces_departure" => {
+                self.graph_section().consolidate_replaces_departure = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2660,6 +2686,83 @@ mod tests {
             .set_key("graph.consolidate_replaces_cue", "yes")
             .is_err());
         assert!(cfg.graph.as_ref().expect("graph").consolidate_replaces_cue);
+    }
+
+    #[test]
+    fn consolidate_replaces_departure_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_replaces_departure());
+        assert!(!GraphSection::default().consolidate_replaces_departure);
+        assert!(!GraphSection::default().replaces_departure_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().replaces_departure_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_replaces_departure"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_replaces_departure = false\n")
+                .expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_replaces_departure);
+        assert!(!false_graph.replaces_departure_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_replaces_departure"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_replaces_departure", "true")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_replaces_departure);
+        assert!(!graph.replaces_departure_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.replaces_cue_apply());
+        assert!(!graph.consolidate_replaces_cue);
+        let rendered = toml::to_string_pretty(&cfg).expect("render departure only");
+        assert!(rendered.contains("consolidate_replaces_departure = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_replaces_cue"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse departure only");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.consolidate_replaces_departure);
+        assert!(!parsed_graph.replaces_departure_apply());
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .replaces_departure_apply());
+        cfg.set_key("graph.consolidate_replaces_departure", "false")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(!graph.consolidate_replaces_departure);
+        assert!(!graph.replaces_departure_apply());
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_replaces_departure"));
+        cfg.set_key("graph.consolidate_replaces_departure", "true")
+            .unwrap();
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .replaces_departure_apply());
+        assert!(
+            cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_replaces_departure
+        );
+        assert!(cfg
+            .set_key("graph.consolidate_replaces_departure", "yes")
+            .is_err());
+        assert!(
+            cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_replaces_departure
+        );
     }
 
     #[test]

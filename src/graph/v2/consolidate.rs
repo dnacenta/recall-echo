@@ -19,7 +19,9 @@ use super::super::types::{Entity, IngestionReport, Retirement};
 use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
 use super::ground::{is_stop_word, sentences};
-use super::known_match::{coexist, cue_words, departure_near, key_tokens, mention, value_spans};
+use super::known_match::{
+    coexist, cue_words, departure_near, key_tokens, mention, value_spans, DEPARTURE,
+};
 use super::schema::{normalise, Kind, Predicate};
 use super::write::{
     alphanumeric_runs, keys_match, opened_here, session_midnight, stamp_slot, values_equal,
@@ -429,6 +431,7 @@ pub(crate) async fn run(
                     count_rename(report, tally);
                 }
                 count_replaces_close(ctx, report, tally);
+                count_departure_close(ctx, &anchors, &loaded.rows, pair, quote, tally, report);
                 gone.insert(pair.partner);
                 if pair.hold {
                     report.hold.holds_confirmed += 1;
@@ -2028,6 +2031,7 @@ struct CueTally {
     replaces: bool,
     replaces_floor: bool,
     uses: bool,
+    departure: bool,
 }
 
 impl CueTally {
@@ -2040,6 +2044,7 @@ impl CueTally {
             replaces: false,
             replaces_floor: false,
             uses: false,
+            departure: false,
         }
     }
 }
@@ -2079,14 +2084,35 @@ fn accept_cue(
     } else {
         (false, tally)
     };
-    if cue || !ctx.replaces_cue_on {
-        return (cue, tally);
-    }
-    mark_replaces(ctx, anchor, partner, loaded, text.quote, look, tally)
+    cues_after_rename(ctx, anchor, partner, loaded, text.quote, look, (cue, tally))
 }
 
 fn later_cue(ctx: &WriteCtx<'_>) -> bool {
-    ctx.rename_on || ctx.replaces_cue_on
+    ctx.rename_on || ctx.replaces_cue_on || ctx.replaces_departure_on
+}
+
+/// The replaces cue, then the exact-rule departure cue. Each stays behind its switch.
+fn cues_after_rename(
+    ctx: &WriteCtx<'_>,
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    quote: &str,
+    look: &RenameLook<'_>,
+    found: (bool, CueTally),
+) -> (bool, CueTally) {
+    if found.0 {
+        return found;
+    }
+    let (cue, tally) = if ctx.replaces_cue_on {
+        mark_replaces(ctx, anchor, partner, loaded, quote, look, found.1)
+    } else {
+        (false, found.1)
+    };
+    if cue || !ctx.replaces_departure_on {
+        return (cue, tally);
+    }
+    mark_departure(ctx, anchor, partner, loaded, quote, look, tally)
 }
 
 fn mark_replaces(
@@ -2137,6 +2163,119 @@ fn count_replaces_close(ctx: &WriteCtx<'_>, report: &mut IngestionReport, tally:
     if tally.uses {
         add_count(&mut report.consolidate.replaces_cue_uses);
     }
+}
+
+fn count_departure_close(
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    rows: &[Row],
+    pair: &Pair,
+    quote: &str,
+    tally: &CueTally,
+    report: &mut IngestionReport,
+) {
+    if !ctx.replaces_departure_on || !tally.departure {
+        return;
+    }
+    add_count(&mut report.consolidate.replaces_departure);
+    let partner = &rows[pair.partner];
+    let anchor = &anchors[pair.anchor];
+    eprintln!(
+        "{}",
+        departure_line(
+            &format!("{}:{}", partner.subject, partner.key),
+            &format!("{}:{}", anchor.subject, anchor.key),
+            quote,
+        )
+    );
+}
+
+fn departure_line(old_key: &str, new_key: &str, quote: &str) -> String {
+    format!(
+        "consolidate departure: {old_key} | {new_key} | {}",
+        quote_head(quote)
+    )
+}
+
+fn mark_departure(
+    ctx: &WriteCtx<'_>,
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    quote: &str,
+    look: &RenameLook<'_>,
+    mut tally: CueTally,
+) -> (bool, CueTally) {
+    let area = neighbourhood(look.anchors, loaded, ctx);
+    if !departure_cue(anchor, partner, loaded, &area, quote) {
+        return (false, tally);
+    }
+    tally.departure = true;
+    (true, tally)
+}
+
+/// Words that mark a rule as ended, besides the shared departure list.
+const DEPARTURE_STATE: &[&str] = &["anymore", "gone", "stop", "stopped"];
+
+/// An exact rule `replaces`, one linked row, and a departure word in a clean quote.
+fn departure_cue(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    quote: &str,
+) -> bool {
+    departure_rule_pair(anchor, partner, loaded, area)
+        && quote_span(quote)
+        && departure_quote_clear(quote)
+        && departure_word_in(quote)
+}
+
+fn departure_rule_pair(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+) -> bool {
+    exact_rule_replaces(anchor, partner)
+        && replaces_linked(anchor, partner, loaded)
+        && replaces_unique_row(anchor, partner, loaded, area)
+}
+
+fn exact_rule_replaces(anchor: &Anchor, partner: &Row) -> bool {
+    anchor.pred == "rule"
+        && partner.pred == "rule"
+        && !anchor.replaces.trim().is_empty()
+        && values_equal(&anchor.replaces, &partner.value)
+}
+
+fn departure_quote_clear(quote: &str) -> bool {
+    !quote.contains('?') && !tentative(&cue_words(quote)) && !whole_quote_scoped(quote)
+}
+
+fn whole_quote_scoped(quote: &str) -> bool {
+    let owned = cue_words(quote);
+    let words: Vec<&str> = owned.iter().map(|(word, _, _)| word.as_str()).collect();
+    scoped_in(&words)
+}
+
+fn departure_word_in(quote: &str) -> bool {
+    let words = cue_words(quote);
+    words.iter().any(|(word, _, _)| departure_token(word)) || departure_pairs(&words)
+}
+
+fn departure_token(word: &str) -> bool {
+    DEPARTURE.contains(&word) || DEPARTURE_STATE.contains(&word)
+}
+
+fn departure_pairs(words: &[(String, usize, usize)]) -> bool {
+    words
+        .windows(2)
+        .any(|pair| departure_pair(&pair[0].0, &pair[1].0))
+}
+
+fn departure_pair(left: &str, right: &str) -> bool {
+    matches!((left, right), ("no", "longer") | ("any", "more"))
 }
 
 /// A unique pass-1 `replaces` match is the departure cue.
@@ -2760,6 +2899,7 @@ fn kept_tally(links: &PairLinks, branch: Option<CueBranch>, made: bool) -> CueTa
         replaces: false,
         replaces_floor: false,
         uses: false,
+        departure: false,
     }
 }
 
@@ -9492,6 +9632,7 @@ mod tests {
         hold_on: bool,
         rename_on: bool,
         replaces_cue_on: bool,
+        replaces_departure_on: bool,
     }
 
     async fn commit_mode(
@@ -9526,6 +9667,7 @@ mod tests {
         ctx.hold_on = flags.hold_on;
         ctx.rename_on = flags.rename_on;
         ctx.replaces_cue_on = flags.replaces_cue_on;
+        ctx.replaces_departure_on = flags.replaces_departure_on;
         let mut report = IngestionReport {
             links: stats.links,
             ..IngestionReport::default()
@@ -9541,6 +9683,7 @@ mod tests {
             hold_on: false,
             rename_on: false,
             replaces_cue_on: false,
+            replaces_departure_on: false,
         }
     }
 
@@ -9603,6 +9746,7 @@ mod tests {
                 hold_on: false,
                 rename_on,
                 replaces_cue_on: false,
+                replaces_departure_on: false,
             },
         )
         .await;
@@ -10020,6 +10164,7 @@ mod tests {
                 hold_on: true,
                 rename_on: false,
                 replaces_cue_on: false,
+                replaces_departure_on: false,
             },
         )
         .await;
@@ -10408,6 +10553,7 @@ mod tests {
                     replaces: false,
                     replaces_floor: false,
                     uses: false,
+                    departure: false,
                 },
                 false
             ),
@@ -10423,6 +10569,7 @@ mod tests {
                     replaces: false,
                     replaces_floor: false,
                     uses: false,
+                    departure: false,
                 },
                 false
             ),
@@ -10775,6 +10922,7 @@ mod tests {
             hold_on: false,
             rename_on,
             replaces_cue_on: false,
+            replaces_departure_on: false,
         }
     }
 
@@ -11448,6 +11596,7 @@ mod tests {
                 hold_on: false,
                 rename_on,
                 replaces_cue_on: false,
+                replaces_departure_on: false,
             },
         )
         .await;
@@ -11850,6 +11999,7 @@ mod tests {
             hold_on: false,
             rename_on: false,
             replaces_cue_on: on,
+            replaces_departure_on: false,
         }
     }
 
@@ -13439,6 +13589,494 @@ mod tests {
         assert!(on.report.consolidate.anchor_earlier_turn.is_none());
         assert_eq!(on.report.consolidate.anchor_earlier_turn_skipped, Some(1));
         assert!(off.report.consolidate.anchor_earlier_turn_skipped.is_none());
+    }
+
+    const OLD_RULE: &str = "When the date is missing, use the file timestamp.";
+    const NEW_RULE: &str = "Put files without a date into a holding folder.";
+    const DEPARTURE_QUOTE: &str = "No timestamp guessing anymore.";
+    const LONGER_RULE: &str =
+        "When the date is missing, use the file timestamp and keep the original name.";
+
+    fn departure_anchor(replaces: &str) -> Anchor {
+        cue_anchor("rule", "", NEW_RULE, replaces)
+    }
+
+    fn departure_row(value: &str) -> Row {
+        cue_row("ent", "rule", "", value)
+    }
+
+    fn departure_loaded(rows: Vec<Row>) -> (Loaded, BTreeSet<String>) {
+        (cue_loaded(rows), cue_area(&["ent"]))
+    }
+
+    fn departure_flags(departure_on: bool, replaces_cue_on: bool) -> PassFlags {
+        PassFlags {
+            links_on: false,
+            components_on: false,
+            hold_on: false,
+            rename_on: false,
+            replaces_cue_on,
+            replaces_departure_on: departure_on,
+        }
+    }
+
+    struct DepartureRun {
+        report: IngestionReport,
+        calls: u32,
+        ended: Option<String>,
+    }
+
+    async fn run_rule_departure(
+        partner_subject: &str,
+        extras: &[&str],
+        quote: &str,
+        verdict: &str,
+        departure_on: bool,
+        replaces_cue_on: bool,
+    ) -> DepartureRun {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![rule(partner_subject, Kind::Project, OLD_RULE, OLD_RULE)];
+        for value in extras {
+            facts.push(rule(partner_subject, Kind::Project, value, value));
+        }
+        let spoken = facts
+            .iter()
+            .map(|fact| fact.object_name.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        commit(&gm, "s1", "2026-03-01", &[turn(&spoken)], &facts).await;
+        let mut next = rule("svc", Kind::Project, NEW_RULE, quote);
+        next.replaces = OLD_RULE.into();
+        let turns = [turn(quote)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, verdict, quote),
+            (2, verdict, quote),
+        ])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            departure_flags(departure_on, replaces_cue_on),
+        )
+        .await;
+        let rows = slots(&gm, partner_subject).await;
+        let ended = rows
+            .iter()
+            .find(|slot| slot["key"] == "" && slot["value"] == OLD_RULE)
+            .and_then(ended)
+            .map(str::to_string);
+        DepartureRun {
+            report,
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    fn departure_closed(run: &DepartureRun) -> bool {
+        run.ended.as_deref() == Some("s2:consolidated")
+    }
+
+    #[test]
+    fn ac_t1_exact_rule_replaces_and_a_departure_word_is_the_cue() {
+        let anchor = departure_anchor(OLD_RULE);
+        let (loaded, area) = departure_loaded(vec![departure_row(OLD_RULE)]);
+        assert!(departure_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            DEPARTURE_QUOTE
+        ));
+        let phrases = [
+            "The old way is gone now.",
+            "That path is no longer used.",
+            "Then we stopped doing that.",
+            "We will not do it any more.",
+            "The old path was dropped today.",
+            "no longer used",
+            "we stopped doing that",
+        ];
+        for quote in phrases {
+            assert!(
+                departure_cue(&anchor, &loaded.rows[0], &loaded, &area, quote),
+                "{quote}"
+            );
+        }
+        for phrase in [
+            "is gone now",
+            "no longer used",
+            "we stopped doing that",
+            "any more",
+            "dropped",
+        ] {
+            assert!(departure_word_in(phrase), "{phrase}");
+        }
+        let mut blank = anchor.clone();
+        blank.replaces = "  ".into();
+        assert!(!departure_cue(
+            &blank,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            DEPARTURE_QUOTE
+        ));
+    }
+
+    #[test]
+    fn ac_t1_mark_departure_sets_only_the_departure_flag() {
+        let anchor = departure_anchor(OLD_RULE);
+        let loaded = Loaded {
+            rows: vec![departure_row(OLD_RULE)],
+            owners: vec![("ent".into(), "svc".into())],
+            part_of: Vec::new(),
+        };
+        let quiet = Quiet;
+        let project = project();
+        let turns = [turn(DEPARTURE_QUOTE)];
+        let mut ctx = WriteCtx::new(&quiet, &project, "s2", "2026-03-02", &turns);
+        ctx.replaces_departure_on = true;
+        let look = RenameLook {
+            anchors: std::slice::from_ref(&anchor),
+            supersedes: &[],
+            anchor_index: 0,
+        };
+        let (cue, tally) = mark_departure(
+            &ctx,
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            DEPARTURE_QUOTE,
+            &look,
+            CueTally::none(),
+        );
+        assert!(cue);
+        assert!(tally.departure);
+        assert!(!tally.replaces);
+        assert!(!tally.replaces_floor);
+        assert!(!tally.uses);
+        assert!(tally.rename.is_none());
+        assert_eq!(
+            departure_line("svc:", "svc:", DEPARTURE_QUOTE),
+            "consolidate departure: svc: | svc: | No timestamp guessing anymore."
+        );
+        let noisy = format!("No timestamp guessing anymore.\n{}", "q".repeat(90));
+        let line = departure_line("svc:", "svc:", &noisy);
+        assert!(!line.contains('\n'));
+        assert!(line
+            .starts_with("consolidate departure: svc: | svc: | No timestamp guessing anymore. "));
+    }
+
+    #[tokio::test]
+    async fn ac_t1_exact_replaces_departure_closes_without_relaxing_the_floor() {
+        let off = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
+        let on = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", true, false).await;
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(!departure_closed(&off));
+        assert!(off.report.consolidate.replaces_departure.is_none());
+        assert!(!consolidate_snapshot(&off.report).contains("replaces_departure"));
+        assert!(departure_closed(&on));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.replaces_departure, Some(1));
+        assert!(on.report.consolidate.replaces_cue.is_none());
+        assert!(on.report.consolidate.replaces_floor.is_none());
+        let snapshot = consolidate_snapshot(&on.report);
+        assert!(snapshot.contains("\"replaces_departure\":1"), "{snapshot}");
+        assert!(!snapshot.contains("replaces_cue"), "{snapshot}");
+        assert!(!snapshot.contains("replaces_floor"), "{snapshot}");
+        assert_eq!(on.calls, 1);
+        assert_eq!(off.calls, 1);
+    }
+
+    #[test]
+    fn ac_t2_a_second_token_superset_row_is_not_a_departure_cue() {
+        let anchor = departure_anchor(OLD_RULE);
+        let (loaded, area) =
+            departure_loaded(vec![departure_row(OLD_RULE), departure_row(LONGER_RULE)]);
+        assert!(!departure_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            DEPARTURE_QUOTE
+        ));
+        assert!(!departure_cue(
+            &anchor,
+            &loaded.rows[1],
+            &loaded,
+            &area,
+            DEPARTURE_QUOTE
+        ));
+    }
+
+    #[tokio::test]
+    async fn ac_t2_a_second_linked_rule_drops_as_on_main() {
+        let off = run_rule_departure(
+            "svc",
+            &[LONGER_RULE],
+            DEPARTURE_QUOTE,
+            "supersedes",
+            false,
+            false,
+        )
+        .await;
+        let on = run_rule_departure(
+            "svc",
+            &[LONGER_RULE],
+            DEPARTURE_QUOTE,
+            "supersedes",
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&on.report)
+        );
+        assert_eq!(
+            dropped(&off.report, "no departure cue"),
+            dropped(&on.report, "no departure cue")
+        );
+        assert!(dropped(&on.report, "no departure cue") >= 1);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert!(!departure_closed(&on));
+        assert!(on.report.consolidate.replaces_departure.is_none());
+    }
+
+    #[test]
+    fn ac_t3_an_unlinked_other_subject_is_not_a_departure_cue() {
+        let anchor = departure_anchor(OLD_RULE);
+        let mut partner = departure_row(OLD_RULE);
+        partner.subject = "other".into();
+        let (loaded, area) = departure_loaded(vec![partner]);
+        assert!(!departure_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            DEPARTURE_QUOTE
+        ));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_another_subject_without_part_of_drops_as_on_main() {
+        let off =
+            run_rule_departure("acme", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
+        let on = run_rule_departure("acme", &[], DEPARTURE_QUOTE, "supersedes", true, false).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&on.report)
+        );
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert_eq!(dropped(&on.report, "no departure cue"), 1);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert!(on.report.consolidate.replaces_departure.is_none());
+        assert!(!departure_closed(&on));
+    }
+
+    #[tokio::test]
+    async fn ac_t4_unrelated_and_unsure_do_not_count_and_duplicate_matches_main() {
+        for verdict in ["unrelated", "unsure"] {
+            let on = run_rule_departure("svc", &[], DEPARTURE_QUOTE, verdict, true, false).await;
+            assert_eq!(on.report.consolidate.closes_sup, 0, "{verdict}");
+            assert_eq!(on.report.consolidate.closes_dup, 0, "{verdict}");
+            assert!(
+                on.report.consolidate.replaces_departure.is_none(),
+                "{verdict}"
+            );
+            assert!(!departure_closed(&on), "{verdict}");
+        }
+        let off = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "duplicate", false, false).await;
+        let on = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "duplicate", true, false).await;
+        assert_eq!(
+            consolidate_snapshot(&off.report),
+            consolidate_snapshot(&on.report)
+        );
+        assert!(on.report.consolidate.replaces_departure.is_none());
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+    }
+
+    #[test]
+    fn ac_t5_a_quote_without_a_departure_word_is_not_the_cue() {
+        let anchor = departure_anchor(OLD_RULE);
+        let (loaded, area) = departure_loaded(vec![departure_row(OLD_RULE)]);
+        for quote in [
+            "The timestamp rule is different.",
+            "The timestamp rule is now settled.",
+            "The timestamp rule is new today.",
+            "The timestamp rule is changed today.",
+        ] {
+            assert!(
+                !departure_cue(&anchor, &loaded.rows[0], &loaded, &area, quote),
+                "{quote}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac_t6_a_hedged_tentative_or_question_departure_is_not_the_cue() {
+        let anchor = departure_anchor(OLD_RULE);
+        let (loaded, area) = departure_loaded(vec![departure_row(OLD_RULE)]);
+        for quote in [
+            "No timestamp guessing anymore for now.",
+            "We tried no timestamp guessing anymore.",
+            "No timestamp guessing anymore?",
+            "Maybe no timestamp guessing anymore.",
+        ] {
+            assert!(
+                !departure_cue(&anchor, &loaded.rows[0], &loaded, &area, quote),
+                "{quote}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t7_a_short_departure_quote_is_dropped_as_too_short() {
+        let quote = "Gone now.";
+        let on = run_rule_departure("svc", &[], quote, "supersedes", true, false).await;
+        assert_eq!(dropped(&on.report, "quote too short"), 1);
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert!(on.report.consolidate.replaces_departure.is_none());
+        assert!(!departure_closed(&on));
+    }
+
+    #[test]
+    fn ac_t8_a_token_subset_is_not_the_departure_cue() {
+        let anchor = cue_anchor(
+            "rule",
+            "",
+            "Move dupes into a holding folder",
+            "Only list dupes.",
+        );
+        let partner = cue_row(
+            "ent",
+            "rule",
+            "",
+            "Only report dupes, list them at the end, leave them alone.",
+        );
+        let (loaded, area) = departure_loaded(vec![partner]);
+        let quote = "Move dupes into a holding folder";
+        assert!(replaces_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            quote
+        ));
+        assert!(!departure_cue(
+            &anchor,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            quote
+        ));
+    }
+
+    #[test]
+    fn ac_t9_a_setting_or_uses_pair_is_not_the_departure_cue() {
+        let (loaded, area) = departure_loaded(vec![departure_row(OLD_RULE)]);
+        let setting = cue_anchor("setting", "header_format", "t=<n>", OLD_RULE);
+        let setting_row = cue_row("ent", "setting", "header_format", OLD_RULE);
+        let (settings, setting_area) = departure_loaded(vec![setting_row]);
+        assert!(!departure_cue(
+            &setting,
+            &settings.rows[0],
+            &settings,
+            &setting_area,
+            DEPARTURE_QUOTE
+        ));
+        let uses = cue_anchor("uses", "", NEW_RULE, OLD_RULE);
+        assert!(!departure_cue(
+            &uses,
+            &loaded.rows[0],
+            &loaded,
+            &area,
+            DEPARTURE_QUOTE
+        ));
+    }
+
+    #[tokio::test]
+    async fn ac_t10_departure_closes_without_the_replaces_cue() {
+        let both_off =
+            run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
+        let cue_only =
+            run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", false, true).await;
+        let departure_only =
+            run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", true, false).await;
+        let both_on =
+            run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", true, true).await;
+        assert_eq!(
+            consolidate_snapshot(&both_off.report),
+            consolidate_snapshot(&cue_only.report)
+        );
+        assert_eq!(cue_only.report.consolidate.closes_sup, 0);
+        assert!(!departure_closed(&cue_only));
+        assert!(cue_only.report.consolidate.replaces_cue.is_none());
+        assert!(departure_closed(&departure_only));
+        assert_eq!(
+            departure_only.report.consolidate.replaces_departure,
+            Some(1)
+        );
+        assert!(departure_only.report.consolidate.replaces_cue.is_none());
+        assert!(departure_closed(&both_on));
+        assert_eq!(both_on.report.consolidate.replaces_departure, Some(1));
+        assert!(both_on.report.consolidate.replaces_cue.is_none());
+        assert!(both_on.report.consolidate.replaces_floor.is_none());
+    }
+
+    #[tokio::test]
+    async fn ac_t11_departure_off_matches_itself_for_the_same_inputs() {
+        let cases = [
+            ("svc", &[][..]),
+            ("svc", &[LONGER_RULE][..]),
+            ("acme", &[][..]),
+        ];
+        for (subject, extras) in cases {
+            let first =
+                run_rule_departure(subject, extras, DEPARTURE_QUOTE, "supersedes", false, false)
+                    .await;
+            let again =
+                run_rule_departure(subject, extras, DEPARTURE_QUOTE, "supersedes", false, false)
+                    .await;
+            assert_eq!(
+                consolidate_snapshot(&first.report),
+                consolidate_snapshot(&again.report),
+                "{subject}"
+            );
+            assert_eq!(
+                first.report.consolidate.pairs, again.report.consolidate.pairs,
+                "{subject}"
+            );
+            assert_eq!(
+                first.report.consolidate.dropped, again.report.consolidate.dropped,
+                "{subject}"
+            );
+            assert!(
+                first.report.consolidate.replaces_departure.is_none(),
+                "{subject}"
+            );
+            assert!(!consolidate_snapshot(&first.report).contains("replaces_departure"));
+            assert_eq!(first.ended, again.ended, "{subject}");
+            let drops = dropped(&first.report, "no departure cue");
+            assert!(drops >= 1, "{subject}");
+            if extras.is_empty() {
+                assert_eq!(drops, 1, "{subject}");
+            }
+            let line = drop_line(
+                "no departure cue",
+                &format!("{subject}:"),
+                "svc:",
+                DEPARTURE_QUOTE,
+            );
+            assert!(
+                line.starts_with("consolidate drop: no departure cue |"),
+                "{line}"
+            );
+        }
     }
 }
 

@@ -310,6 +310,7 @@ pub(crate) async fn extract_session(
         write_ctx.components_on = components_enabled(memory_dir);
         write_ctx.rename_on = rename_enabled(memory_dir);
         write_ctx.replaces_cue_on = replaces_cue_enabled(memory_dir);
+        write_ctx.replaces_departure_on = replaces_departure_enabled(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -447,6 +448,13 @@ fn replaces_cue_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .replaces_cue_apply()
+}
+
+fn replaces_departure_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .replaces_departure_apply()
 }
 
 fn drop_restatements_enabled(memory_dir: &Path) -> bool {
