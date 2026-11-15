@@ -18309,6 +18309,15 @@ mod tests {
             assert_eq!(from_entities.as_deref(), Some(want), "{want}");
             assert_eq!(from_values, from_entities);
         }
+        // Pins an empty id: skip it and keep the later project.
+        let skipped = [
+            project_value("", "app", "project"),
+            project_value("beta", "app", "project"),
+        ];
+        assert_eq!(
+            super::preferred_project_id(&skipped, &ctx).as_deref(),
+            Some("beta")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
