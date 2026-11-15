@@ -769,6 +769,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_rule_fragments: bool,
+    /// Retire a dropped component's decided settings and uses edges.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// Does not require [`Self::ground_component_edges`].
+    #[serde(
+        default = "default_consolidate_retire_component",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_retire_component: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// Off unless set.
     #[serde(
@@ -815,6 +823,7 @@ impl Default for GraphSection {
             consolidate_replaces_departure: default_consolidate_replaces_departure(),
             consolidate_orphan_sweep: default_consolidate_orphan_sweep(),
             consolidate_rule_fragments: default_consolidate_rule_fragments(),
+            consolidate_retire_component: default_consolidate_retire_component(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
@@ -877,6 +886,13 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn rule_fragments_apply(&self) -> bool {
         self.consolidate && self.consolidate_rule_fragments
+    }
+
+    /// A dropped component's settings close only when consolidation is on as well.
+    /// Component grounding is not required.
+    #[must_use]
+    pub(crate) fn retire_component_apply(&self) -> bool {
+        self.consolidate && self.consolidate_retire_component
     }
 
     /// A shown known row can bind a decided setting key only when the known
@@ -1231,6 +1247,10 @@ fn default_consolidate_orphan_sweep() -> bool {
 }
 
 fn default_consolidate_rule_fragments() -> bool {
+    false
+}
+
+fn default_consolidate_retire_component() -> bool {
     false
 }
 
@@ -1601,6 +1621,12 @@ impl Config {
             }
             "graph.consolidate_rule_fragments" => {
                 self.graph_section().consolidate_rule_fragments = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_retire_component" => {
+                self.graph_section().consolidate_retire_component = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2956,6 +2982,62 @@ mod tests {
                 .as_ref()
                 .expect("graph")
                 .consolidate_rule_fragments
+        );
+    }
+
+    #[test]
+    fn consolidate_retire_component_defaults_off_and_needs_only_consolidate() {
+        assert!(!default_consolidate_retire_component());
+        assert!(!GraphSection::default().consolidate_retire_component);
+        assert!(!GraphSection::default().retire_component_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().retire_component_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_retire_component"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_retire_component = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_retire_component);
+        assert!(!false_graph.retire_component_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_retire_component"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_retire_component", "true")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_retire_component);
+        assert!(!graph.retire_component_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.ground_component_edges);
+        let rendered = toml::to_string_pretty(&cfg).expect("render retire only");
+        assert!(rendered.contains("consolidate_retire_component = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("ground_component_edges"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse retire only");
+        assert!(parsed.graph.expect("graph").consolidate_retire_component);
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").retire_component_apply());
+        assert!(!cfg.graph.as_ref().expect("graph").ground_component_edges);
+        cfg.set_key("graph.consolidate_retire_component", "false")
+            .unwrap();
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_retire_component"));
+        cfg.set_key("graph.consolidate_retire_component", "true")
+            .unwrap();
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").retire_component_apply());
+        assert!(cfg
+            .set_key("graph.consolidate_retire_component", "yes")
+            .is_err());
+        assert!(
+            cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_retire_component
         );
     }
 

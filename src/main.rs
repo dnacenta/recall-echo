@@ -295,6 +295,11 @@ enum BenchCommands {
         /// `--ground-component-edges`.
         #[arg(long)]
         consolidate_rule_fragments: bool,
+        /// Retire a dropped component's settings after the session write.
+        /// Implies `--consolidate`. Off unless set. Does not turn on
+        /// `--ground-component-edges`.
+        #[arg(long)]
+        consolidate_retire_component: bool,
         /// Bind a decided setting key from a shown known row. Off unless set.
         /// Does not turn on `--known-facts-context`.
         #[arg(long)]
@@ -1144,6 +1149,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_replaces_departure,
             consolidate_orphan_sweep,
             consolidate_rule_fragments,
+            consolidate_retire_component,
             known_key_binding,
             drop_restatements,
             ground_component_edges,
@@ -1222,6 +1228,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             } else {
                 recall_echo::bench::writes::ConsolidateRuleFragments::Off
             },
+            if consolidate_retire_component {
+                recall_echo::bench::writes::ConsolidateRetireComponent::On
+            } else {
+                recall_echo::bench::writes::ConsolidateRetireComponent::Off
+            },
             if known_key_binding {
                 recall_echo::bench::writes::KnownKeyBinding::On
             } else {
@@ -1262,6 +1273,7 @@ fn run_writes(
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
     consolidate_orphan_sweep: recall_echo::bench::writes::ConsolidateOrphanSweep,
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
+    consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
@@ -1306,6 +1318,7 @@ fn run_writes(
             consolidate_replaces_departure,
             consolidate_orphan_sweep,
             consolidate_rule_fragments,
+            consolidate_retire_component,
             known_key_binding,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1330,6 +1343,7 @@ fn run_writes(
             consolidate_replaces_departure,
             consolidate_orphan_sweep,
             consolidate_rule_fragments,
+            consolidate_retire_component,
             known_key_binding,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1359,6 +1373,7 @@ async fn grade_once(
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
     consolidate_orphan_sweep: recall_echo::bench::writes::ConsolidateOrphanSweep,
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
+    consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1386,6 +1401,7 @@ async fn grade_once(
                 consolidate_replaces_departure,
                 consolidate_orphan_sweep,
                 consolidate_rule_fragments,
+                consolidate_retire_component,
                 known_key_binding,
             )
             .await
@@ -1409,6 +1425,7 @@ async fn grade_once(
                 consolidate_replaces_departure,
                 consolidate_orphan_sweep,
                 consolidate_rule_fragments,
+                consolidate_retire_component,
                 known_key_binding,
             )
             .await
@@ -1438,6 +1455,7 @@ async fn grade_repeat(
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
     consolidate_orphan_sweep: recall_echo::bench::writes::ConsolidateOrphanSweep,
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
+    consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1466,6 +1484,7 @@ async fn grade_repeat(
                 consolidate_replaces_departure,
                 consolidate_orphan_sweep,
                 consolidate_rule_fragments,
+                consolidate_retire_component,
                 known_key_binding,
             )
             .await
@@ -1490,6 +1509,7 @@ async fn grade_repeat(
                 consolidate_replaces_departure,
                 consolidate_orphan_sweep,
                 consolidate_rule_fragments,
+                consolidate_retire_component,
                 known_key_binding,
             )
             .await
@@ -2147,6 +2167,51 @@ mod tests {
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--consolidate-rule-fragments"), "{help}");
         assert!(help.contains("--consolidate-orphan-sweep"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_retire_component_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-retire-component",
+        ])
+        .expect("parse retire component");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_orphan_sweep,
+                        consolidate_rule_fragments,
+                        consolidate_retire_component,
+                        ground_component_edges,
+                        known_facts_context,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_retire_component);
+                assert!(!consolidate_rule_fragments);
+                assert!(!consolidate_orphan_sweep);
+                assert!(!consolidate);
+                assert!(!ground_component_edges);
+                assert!(!known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--consolidate-retire-component"), "{help}");
     }
 
     #[cfg(feature = "bench")]

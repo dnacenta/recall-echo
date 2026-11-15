@@ -5195,6 +5195,7 @@ fn take_post_lines() -> Vec<String> {
 struct PostSnap {
     orphan: Option<OrphanSnap>,
     fragments: Option<FragmentSnap>,
+    retire: Option<RetireSnap>,
 }
 
 struct OrphanSnap {
@@ -5236,7 +5237,7 @@ struct OrphanPlan {
 }
 
 fn post_switches(ctx: &WriteCtx<'_>) -> bool {
-    ctx.orphan_sweep_on || ctx.rule_fragments_on
+    ctx.orphan_sweep_on || ctx.rule_fragments_on || ctx.retire_component_on
 }
 
 async fn post_pass(
@@ -5269,7 +5270,16 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
     } else {
         None
     };
-    Ok(PostSnap { orphan, fragments })
+    let retire = if ctx.retire_component_on {
+        Some(read_retire_snap(gm, ctx).await?)
+    } else {
+        None
+    };
+    Ok(PostSnap {
+        orphan,
+        fragments,
+        retire,
+    })
 }
 
 async fn apply_post(
@@ -5287,6 +5297,10 @@ async fn apply_post(
     if let Some(fragments) = &snap.fragments {
         let plan = plan_fragments(ctx, fragments);
         apply_fragments(gm, ctx, &plan, report).await;
+    }
+    if let Some(retire) = &snap.retire {
+        let plan = plan_retire(ctx, retire);
+        apply_retire(gm, ctx, &plan, report).await;
     }
 }
 
@@ -6050,6 +6064,634 @@ fn fragment_ambiguous_line(subject: &str, count: usize) -> String {
     format!(
         "consolidate fragment ambiguous: {} | {count} siblings",
         quote_head(subject)
+    )
+}
+
+const RETIRE_CAP: usize = 8;
+const RETIRE_REASON: &str = "component_dropped";
+const OPEN_PARTS: &str = "\
+SELECT in, out, status, pending FROM relates_to \
+WHERE rel_type = 'part_of' AND valid_until = NONE";
+const OPEN_USES: &str = "\
+SELECT id, in, out.name AS object, status, pending, evidence FROM relates_to \
+WHERE rel_type = 'uses' AND valid_until = NONE";
+
+struct RetireSnap {
+    project_id: Option<String>,
+    entities: Vec<RetireEntity>,
+    parts: Vec<PartLink>,
+    uses: Vec<UseLink>,
+}
+
+struct RetireEntity {
+    id: String,
+    name: String,
+    kind: String,
+    slots: Vec<RetireSlot>,
+}
+
+struct RetireSlot {
+    index: usize,
+    predicate: String,
+    key: String,
+    value: String,
+    status: String,
+    pending: bool,
+    live: bool,
+    ended_by: String,
+    first_session: String,
+}
+
+struct PartLink {
+    from_id: String,
+    to_id: String,
+    status: String,
+    pending: bool,
+}
+
+struct UseLink {
+    id: String,
+    from_id: String,
+    object: String,
+    status: String,
+    pending: bool,
+    first_session: String,
+}
+
+struct RetireNote {
+    subject: String,
+    key: String,
+    index: usize,
+}
+
+struct RetireEdge {
+    id: String,
+    subject: String,
+    object: String,
+}
+
+struct RetireOverflow {
+    subject: String,
+    count: usize,
+}
+
+struct RetirePlan {
+    slots: Vec<SweepClose>,
+    edges: Vec<RetireEdge>,
+    nosucc: Vec<RetireNote>,
+    overflows: Vec<RetireOverflow>,
+    ambiguous: Vec<RetireNote>,
+}
+
+struct TriggerMarks {
+    planned: BTreeSet<String>,
+    nosucc: Vec<RetireNote>,
+    ambiguous: Vec<RetireNote>,
+}
+
+enum NameHit<'a> {
+    None,
+    One(&'a RetireEntity),
+    Many,
+}
+
+async fn read_retire_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<RetireSnap, GraphError> {
+    let entities = read_retire_entities(gm).await?;
+    let project_id = project_id_from_entities(&entities, ctx);
+    let parts = read_retire_parts(gm).await?;
+    let uses = read_retire_uses(gm).await?;
+    Ok(RetireSnap {
+        project_id,
+        entities,
+        parts,
+        uses,
+    })
+}
+
+fn project_id_from_entities(entities: &[RetireEntity], ctx: &WriteCtx<'_>) -> Option<String> {
+    let mut fallback = None;
+    for entity in entities {
+        if !names_project(ctx, &entity.name) {
+            continue;
+        }
+        if entity.kind == "project" {
+            return Some(entity.id.clone());
+        }
+        if fallback.is_none() {
+            fallback = Some(entity.id.clone());
+        }
+    }
+    fallback
+}
+
+async fn read_retire_entities(gm: &GraphMemory) -> Result<Vec<RetireEntity>, GraphError> {
+    note_post_read();
+    let mut response = gm
+        .db()
+        .query("SELECT id, name, attributes FROM entity")
+        .await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(parse_retire_entities(&rows))
+}
+
+async fn read_retire_parts(gm: &GraphMemory) -> Result<Vec<PartLink>, GraphError> {
+    note_post_read();
+    let mut response = gm.db().query(OPEN_PARTS).await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(parse_part_links(&rows))
+}
+
+async fn read_retire_uses(gm: &GraphMemory) -> Result<Vec<UseLink>, GraphError> {
+    note_post_read();
+    let mut response = gm.db().query(OPEN_USES).await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(parse_use_links(&rows))
+}
+
+fn parse_retire_entities(rows: &[Value]) -> Vec<RetireEntity> {
+    rows.iter().filter_map(retire_entity).collect()
+}
+
+fn retire_entity(row: &Value) -> Option<RetireEntity> {
+    let id = id_text(row.get("id"));
+    if id.is_empty() {
+        return None;
+    }
+    Some(RetireEntity {
+        name: json_text(row.get("name")),
+        kind: row_kind(row).to_string(),
+        slots: retire_slots(row),
+        id,
+    })
+}
+
+fn retire_slots(row: &Value) -> Vec<RetireSlot> {
+    let raw = row
+        .pointer("/attributes/v2/slots")
+        .and_then(Value::as_array);
+    slot_views(row)
+        .into_iter()
+        .map(|view| retire_slot(raw, view))
+        .collect()
+}
+
+fn retire_slot(raw: Option<&Vec<Value>>, view: SlotView) -> RetireSlot {
+    RetireSlot {
+        ended_by: slot_ended_by(raw, view.index),
+        index: view.index,
+        predicate: view.predicate,
+        key: view.key,
+        value: view.value,
+        status: view.status,
+        pending: view.pending,
+        live: view.live,
+        first_session: view.first_session,
+    }
+}
+
+fn slot_ended_by(raw: Option<&Vec<Value>>, index: usize) -> String {
+    let Some(slot) = raw.and_then(|slots| slots.get(index)) else {
+        return String::new();
+    };
+    json_text(slot.get("ended_by"))
+}
+
+fn parse_part_links(rows: &[Value]) -> Vec<PartLink> {
+    rows.iter().filter_map(part_link_view).collect()
+}
+
+fn part_link_view(row: &Value) -> Option<PartLink> {
+    let from_id = id_text(row.get("in"));
+    let to_id = id_text(row.get("out"));
+    if from_id.is_empty() || to_id.is_empty() {
+        return None;
+    }
+    Some(PartLink {
+        from_id,
+        to_id,
+        status: json_text(row.get("status")),
+        pending: super::write::is_pending(row),
+    })
+}
+
+fn parse_use_links(rows: &[Value]) -> Vec<UseLink> {
+    rows.iter().filter_map(use_link_view).collect()
+}
+
+fn use_link_view(row: &Value) -> Option<UseLink> {
+    let id = id_text(row.get("id"));
+    let from_id = id_text(row.get("in"));
+    if id.is_empty() || from_id.is_empty() {
+        return None;
+    }
+    Some(UseLink {
+        id,
+        from_id,
+        object: json_text(row.get("object")),
+        status: json_text(row.get("status")),
+        pending: super::write::is_pending(row),
+        first_session: first_evidence_session(row),
+    })
+}
+
+fn plan_retire(ctx: &WriteCtx<'_>, snap: &RetireSnap) -> RetirePlan {
+    let marks = mark_triggers(ctx, snap);
+    let mut plan = RetirePlan {
+        slots: Vec::new(),
+        edges: Vec::new(),
+        nosucc: marks.nosucc,
+        overflows: Vec::new(),
+        ambiguous: marks.ambiguous,
+    };
+    push_planned(&mut plan, snap, &marks.planned, ctx.session_id);
+    sort_retire_closes(&mut plan);
+    plan
+}
+
+fn mark_triggers(ctx: &WriteCtx<'_>, snap: &RetireSnap) -> TriggerMarks {
+    let mut marks = TriggerMarks {
+        planned: BTreeSet::new(),
+        nosucc: Vec::new(),
+        ambiguous: Vec::new(),
+    };
+    let Some(project) = project_entity(snap) else {
+        return marks;
+    };
+    for slot in &project.slots {
+        mark_trigger(&mut marks, snap, project, slot, ctx.session_id);
+    }
+    marks
+}
+
+fn project_entity(snap: &RetireSnap) -> Option<&RetireEntity> {
+    let id = snap.project_id.as_deref()?;
+    snap.entities.iter().find(|entity| entity.id == id)
+}
+
+fn mark_trigger(
+    marks: &mut TriggerMarks,
+    snap: &RetireSnap,
+    project: &RetireEntity,
+    slot: &RetireSlot,
+    session: &str,
+) {
+    if !retire_trigger(slot, session) {
+        return;
+    }
+    match component_hit(&snap.entities, &slot.value) {
+        NameHit::Many => marks.ambiguous.push(retire_note(project, slot)),
+        NameHit::One(component) if linked(component, snap) => {
+            note_successor(marks, snap, project, slot, &component.id);
+        }
+        NameHit::None | NameHit::One(_) => {}
+    }
+}
+
+fn retire_trigger(slot: &RetireSlot, session: &str) -> bool {
+    decided_closed_setting(slot) && ended_this_session(&slot.ended_by, session)
+}
+
+fn decided_closed_setting(slot: &RetireSlot) -> bool {
+    slot.predicate == "setting" && slot.status == "decided" && !slot.live
+}
+
+fn ended_this_session(ended_by: &str, session: &str) -> bool {
+    let mut prefix = String::from(session);
+    prefix.push(':');
+    ended_by.starts_with(&prefix)
+}
+
+fn component_hit<'a>(entities: &'a [RetireEntity], value: &str) -> NameHit<'a> {
+    let mut matched = entities
+        .iter()
+        .filter(|entity| component_named(entity, value));
+    let Some(first) = matched.next() else {
+        return NameHit::None;
+    };
+    if matched.next().is_some() {
+        NameHit::Many
+    } else {
+        NameHit::One(first)
+    }
+}
+
+fn component_named(entity: &RetireEntity, value: &str) -> bool {
+    is_component(entity) && same_name(&entity.name, value)
+}
+
+fn is_component(entity: &RetireEntity) -> bool {
+    entity.kind == "component"
+}
+
+fn linked(entity: &RetireEntity, snap: &RetireSnap) -> bool {
+    is_component(entity) && decided_part(entity, snap)
+}
+
+fn decided_part(entity: &RetireEntity, snap: &RetireSnap) -> bool {
+    let Some(project) = snap.project_id.as_deref() else {
+        return false;
+    };
+    snap.parts
+        .iter()
+        .any(|link| part_links(link, &entity.id, project))
+}
+
+fn part_links(link: &PartLink, from: &str, project: &str) -> bool {
+    link.from_id == from && link.to_id == project && decided_link(link)
+}
+
+fn decided_link(link: &PartLink) -> bool {
+    link.status == "decided" && !link.pending
+}
+
+fn note_successor(
+    marks: &mut TriggerMarks,
+    snap: &RetireSnap,
+    project: &RetireEntity,
+    slot: &RetireSlot,
+    dropped: &str,
+) {
+    if has_successor(snap, project, slot, dropped) {
+        marks.planned.insert(dropped.to_string());
+        return;
+    }
+    marks.nosucc.push(retire_note(project, slot));
+}
+
+fn has_successor(
+    snap: &RetireSnap,
+    project: &RetireEntity,
+    trigger: &RetireSlot,
+    dropped: &str,
+) -> bool {
+    project
+        .slots
+        .iter()
+        .any(|slot| successor_slot(slot, trigger, snap, dropped))
+}
+
+fn successor_slot(
+    slot: &RetireSlot,
+    trigger: &RetireSlot,
+    snap: &RetireSnap,
+    dropped: &str,
+) -> bool {
+    open_successor(slot, trigger) && successor_names(snap, &slot.value, dropped)
+}
+
+fn open_successor(slot: &RetireSlot, trigger: &RetireSlot) -> bool {
+    slot.live
+        && !slot.pending
+        && slot.predicate == "setting"
+        && slot.status == "decided"
+        && retire_keys_match(&slot.key, &trigger.key)
+}
+
+fn successor_names(snap: &RetireSnap, value: &str, dropped: &str) -> bool {
+    match component_hit(&snap.entities, value) {
+        NameHit::One(entity) => entity.id != dropped && linked(entity, snap),
+        NameHit::None | NameHit::Many => false,
+    }
+}
+
+fn retire_keys_match(left: &str, right: &str) -> bool {
+    retire_key(left) == retire_key(right)
+}
+
+fn retire_key(key: &str) -> String {
+    key.trim().to_lowercase()
+}
+
+fn retire_note(project: &RetireEntity, slot: &RetireSlot) -> RetireNote {
+    RetireNote {
+        subject: project.name.clone(),
+        key: slot.key.clone(),
+        index: slot.index,
+    }
+}
+
+fn push_planned(
+    plan: &mut RetirePlan,
+    snap: &RetireSnap,
+    planned: &BTreeSet<String>,
+    session: &str,
+) {
+    for id in planned {
+        if let Some(entity) = snap.entities.iter().find(|entity| &entity.id == id) {
+            push_component(plan, entity, snap, session);
+        }
+    }
+}
+
+fn push_component(plan: &mut RetirePlan, entity: &RetireEntity, snap: &RetireSnap, session: &str) {
+    let slots = setting_targets(entity, session);
+    let edges = use_targets(entity, snap, session);
+    let count = slots.len().saturating_add(edges.len());
+    if over_retire_cap(count) {
+        plan.overflows.push(RetireOverflow {
+            subject: entity.name.clone(),
+            count,
+        });
+        return;
+    }
+    plan.slots.extend(slots);
+    plan.edges.extend(edges);
+}
+
+fn setting_targets(entity: &RetireEntity, session: &str) -> Vec<SweepClose> {
+    entity
+        .slots
+        .iter()
+        .filter(|slot| retire_setting(slot, session))
+        .map(|slot| retire_sweep(entity, slot))
+        .collect()
+}
+
+fn retire_setting(slot: &RetireSlot, session: &str) -> bool {
+    slot.predicate == "setting"
+        && open_decided(slot)
+        && earlier_session(&slot.first_session, session)
+}
+
+fn open_decided(slot: &RetireSlot) -> bool {
+    slot.live && !slot.pending && slot.status == "decided"
+}
+
+fn earlier_session(first: &str, session: &str) -> bool {
+    !first.is_empty() && first != session
+}
+
+fn use_targets(entity: &RetireEntity, snap: &RetireSnap, session: &str) -> Vec<RetireEdge> {
+    snap.uses
+        .iter()
+        .filter(|edge| use_target(edge, &entity.id, session))
+        .map(|edge| RetireEdge {
+            id: edge.id.clone(),
+            subject: entity.name.clone(),
+            object: edge.object.clone(),
+        })
+        .collect()
+}
+
+fn use_target(edge: &UseLink, entity: &str, session: &str) -> bool {
+    edge.from_id == entity
+        && edge.status == "decided"
+        && !edge.pending
+        && earlier_session(&edge.first_session, session)
+}
+
+fn over_retire_cap(count: usize) -> bool {
+    count > RETIRE_CAP
+}
+
+fn retire_sweep(entity: &RetireEntity, slot: &RetireSlot) -> SweepClose {
+    SweepClose {
+        entity_id: entity.id.clone(),
+        subject: entity.name.clone(),
+        index: slot.index,
+        predicate: slot.predicate.clone(),
+        key: slot.key.clone(),
+        value: slot.value.clone(),
+    }
+}
+
+fn sort_retire_closes(plan: &mut RetirePlan) {
+    plan.slots.sort_by(|left, right| {
+        left.entity_id
+            .cmp(&right.entity_id)
+            .then(left.index.cmp(&right.index))
+    });
+    plan.edges.sort_by(|left, right| left.id.cmp(&right.id));
+}
+
+async fn apply_retire(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &RetirePlan,
+    report: &mut IngestionReport,
+) {
+    note_retire_ambiguous(&plan.ambiguous, report);
+    note_retire_nosucc(&plan.nosucc, report);
+    note_retire_overflows(&plan.overflows, report);
+    for close in &plan.slots {
+        let line = retire_slot_line(&close.subject, &close.key, close.index);
+        if close_sweep_slot(gm, ctx, close, RETIRE_REASON, &line, report).await {
+            add_count(&mut report.consolidate.component_retire_closes);
+        }
+    }
+    for edge in &plan.edges {
+        if close_retire_edge(gm, ctx, edge, report).await {
+            add_count(&mut report.consolidate.component_retire_closes);
+        }
+    }
+}
+
+fn note_retire_ambiguous(notes: &[RetireNote], report: &mut IngestionReport) {
+    for note in notes {
+        add_count(&mut report.consolidate.component_retire_ambiguous);
+        emit_post_line(retire_ambiguous_line(&note.subject, &note.key, note.index));
+    }
+}
+
+fn note_retire_nosucc(notes: &[RetireNote], report: &mut IngestionReport) {
+    for note in notes {
+        add_count(&mut report.consolidate.component_retire_nosucc);
+        emit_post_line(retire_nosucc_line(&note.subject, &note.key, note.index));
+    }
+}
+
+fn note_retire_overflows(overflows: &[RetireOverflow], report: &mut IngestionReport) {
+    for overflow in overflows {
+        add_count(&mut report.consolidate.component_retire_overflow);
+        emit_post_line(retire_overflow_line(&overflow.subject, overflow.count));
+    }
+}
+
+async fn close_retire_edge(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    edge: &RetireEdge,
+    report: &mut IngestionReport,
+) -> bool {
+    let Some(until) = session_midnight(ctx.date) else {
+        return false;
+    };
+    let ended = format!("{}:{RETIRE_REASON}", ctx.session_id);
+    match close_row(gm, &retire_edge_row(edge), &until, &ended).await {
+        Ok(true) => {
+            report.retirements.push(retire_edge_retirement(edge));
+            emit_post_line(retire_edge_line(&edge.subject));
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            false
+        }
+    }
+}
+
+fn retire_edge_row(edge: &RetireEdge) -> Row {
+    Row {
+        id: String::new(),
+        entity: String::new(),
+        slot: None,
+        edge: Some(edge.id.clone()),
+        subject: edge.subject.clone(),
+        pred: "uses".into(),
+        key: String::new(),
+        value: edge.object.clone(),
+        evidence: Value::Null,
+        from: String::new(),
+        here: false,
+        pending: false,
+        object_name: Some(edge.object.clone()),
+    }
+}
+
+fn retire_edge_retirement(edge: &RetireEdge) -> Retirement {
+    Retirement {
+        reason: RETIRE_REASON.to_string(),
+        subject: edge.subject.clone(),
+        predicate: "uses".into(),
+        key: String::new(),
+        old_value: edge.object.clone(),
+        new_value: String::new(),
+    }
+}
+
+fn retire_slot_line(subject: &str, key: &str, index: usize) -> String {
+    format!(
+        "consolidate retire: {}:{} | slot {index}",
+        quote_head(subject),
+        quote_head(key)
+    )
+}
+
+fn retire_edge_line(subject: &str) -> String {
+    format!("consolidate retire: {}:uses | edge", quote_head(subject))
+}
+
+fn retire_nosucc_line(project: &str, key: &str, index: usize) -> String {
+    format!(
+        "consolidate retire nosucc: {}:{} | slot {index}",
+        quote_head(project),
+        quote_head(key)
+    )
+}
+
+fn retire_overflow_line(subject: &str, count: usize) -> String {
+    format!(
+        "consolidate retire overflow: {} | {count} targets",
+        quote_head(subject)
+    )
+}
+
+fn retire_ambiguous_line(project: &str, key: &str, index: usize) -> String {
+    format!(
+        "consolidate retire ambiguous: {}:{} | slot {index}",
+        quote_head(project),
+        quote_head(key)
     )
 }
 
@@ -16664,6 +17306,1219 @@ mod tests {
         );
         assert_eq!(report.consolidate.closes_sup, 0);
         assert_eq!(report.consolidate.closes_dup, 0);
+    }
+
+    fn project_setting(key: &str, value: &str, status: &str) -> Fact {
+        let mut fact = setting_of("app", key, value, status);
+        fact.subject_kind = Kind::Project;
+        fact
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_run(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        facts: &[Fact],
+        orphan: bool,
+        fragments: bool,
+        retire: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let stub = Stub::new(Answer::Panic);
+        let mut ctx = WriteCtx::new(&stub, &project, session, date, &turns);
+        ctx.orphan_sweep_on = orphan;
+        ctx.rule_fragments_on = fragments;
+        ctx.retire_component_on = retire;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, facts, &WriteStats::default(), &stub, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    async fn run_retire(gm: &GraphMemory) -> (IngestionReport, Vec<String>, u32) {
+        post_run(gm, "s3", "2026-04-03", &[], false, false, true).await
+    }
+
+    async fn seed_base(gm: &GraphMemory) {
+        commit_app(
+            gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+                setting_of("alpha", "font", "serif", "decided"),
+                use_of("alpha", Kind::Component, "Tinylib", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("skin", "beta", "decided")],
+        )
+        .await;
+    }
+
+    fn assert_idle(report: &IngestionReport) {
+        assert!(report.consolidate.component_retire_closes.is_none());
+        assert!(report.consolidate.component_retire_nosucc.is_none());
+        assert!(report.consolidate.component_retire_overflow.is_none());
+        assert!(report.consolidate.component_retire_ambiguous.is_none());
+        assert!(report
+            .retirements
+            .iter()
+            .all(|item| item.reason != "component_dropped"));
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
+    }
+
+    fn ended_value<'a>(rows: &'a [Value], key: &str, value: &str) -> Option<&'a str> {
+        rows.iter()
+            .find(|slot| slot["key"] == key && slot["value"] == value)
+            .and_then(ended)
+    }
+
+    async fn entity_id(gm: &GraphMemory, name: &str) -> String {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        entities
+            .iter()
+            .find(|entity| entity.name == name)
+            .unwrap()
+            .id_string()
+    }
+
+    async fn mutate_slot(
+        gm: &GraphMemory,
+        name: &str,
+        key: &str,
+        value: &str,
+        mutate: impl FnOnce(&mut Value),
+    ) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        let slots = attributes["v2"]["slots"].as_array_mut().unwrap();
+        let slot = slots
+            .iter_mut()
+            .find(|slot| slot["key"] == key && slot["value"] == value)
+            .unwrap();
+        mutate(slot);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    async fn set_kind(gm: &GraphMemory, name: &str, kind: &str) {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let entity = entities.iter().find(|entity| entity.name == name).unwrap();
+        let mut attributes = entity.attributes.clone().unwrap();
+        attributes["v2"]["kind"] = json!(kind);
+        gm.db()
+            .query("UPDATE type::record($id) SET attributes = $attributes")
+            .bind(("id", entity.id_string()))
+            .bind(("attributes", attributes))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    async fn rename_entity(gm: &GraphMemory, name: &str, new_name: &str) {
+        let id = entity_id(gm, name).await;
+        gm.db()
+            .query("UPDATE type::record($id) SET name = $name")
+            .bind(("id", id))
+            .bind(("name", new_name.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    async fn part_edges(gm: &GraphMemory, name: &str) -> Vec<Value> {
+        let id = entity_id(gm, name).await;
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, in, out, status, pending, valid_until, ended_by FROM relates_to \
+                 WHERE rel_type = 'part_of' AND in = type::record($id)",
+            )
+            .bind(("id", id))
+            .await
+            .unwrap();
+        deserialize_take(&mut response, 0).unwrap()
+    }
+
+    async fn update_part(gm: &GraphMemory, name: &str, query: &str, pending: Option<Value>) {
+        let edges = part_edges(gm, name).await;
+        let id = id_text(edges[0].get("id"));
+        let mut request = gm.db().query(query).bind(("id", id));
+        if let Some(pending) = pending {
+            request = request.bind(("pending", pending));
+        }
+        request.await.unwrap().check().unwrap();
+    }
+
+    async fn use_ended(gm: &GraphMemory, object: &str) -> Option<String> {
+        let mut response = gm
+            .db()
+            .query("SELECT ended_by, out.name AS object FROM relates_to WHERE rel_type = 'uses'")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        rows.into_iter()
+            .find(|row| row["object"] == object)
+            .and_then(|row| {
+                row.get("ended_by")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    }
+
+    fn bg_open(rows: &[Value]) -> bool {
+        ended_key(rows, "bg").is_none()
+    }
+
+    #[test]
+    fn retire_guards_use_whole_names_a_session_colon_and_a_cap_of_eight() {
+        // T2 and T3: whole-value equality after normalise, never containment.
+        assert!(super::same_name("Alpha!", "alpha"));
+        assert!(!super::same_name("alp", "alpha"));
+        assert!(!super::same_name("alpha theme", "alpha"));
+        // T1: ended_by starts with `<session>:`, any reason.
+        assert!(super::ended_this_session("s3:other", "s3"));
+        assert!(super::ended_this_session("s3:superseded", "s3"));
+        assert!(!super::ended_this_session("s30:superseded", "s3"));
+        assert!(!super::ended_this_session("s3superseded", "s3"));
+        assert!(!super::ended_this_session("s2:superseded", "s3"));
+        // T3 key: trim + lowercase, not normalise.
+        assert!(super::retire_keys_match(" Skin ", "skin"));
+        assert!(!super::retire_keys_match("skin!", "skin"));
+        assert!(!super::retire_keys_match("skin_name", "skin"));
+        assert!(!super::over_retire_cap(8));
+        assert!(super::over_retire_cap(9));
+        let slot_line = super::retire_slot_line("alpha\n", "bg", 0);
+        assert_eq!(slot_line, "consolidate retire: alpha :bg | slot 0");
+        assert!(!slot_line.contains("light"));
+        let edge_line = super::retire_edge_line("alpha");
+        assert_eq!(edge_line, "consolidate retire: alpha:uses | edge");
+        assert!(!edge_line.contains("Tinylib"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_u1_base_records_component_dropped_without_values_in_the_lines() {
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        let app = slots(&gm, "app").await;
+        assert_eq!(
+            ended_value(&app, "skin", "alpha"),
+            Some("s3:superseded"),
+            "{app:?}"
+        );
+        let alpha = slots(&gm, "alpha").await;
+        let mut expected = Vec::new();
+        for key in ["bg", "font"] {
+            let index = alpha.iter().position(|slot| slot["key"] == key).unwrap();
+            expected.push((
+                index,
+                format!("consolidate retire: alpha:{key} | slot {index}"),
+            ));
+        }
+        expected.sort_by_key(|(index, _)| *index);
+        let mut expected: Vec<String> = expected.into_iter().map(|(_, line)| line).collect();
+        expected.push("consolidate retire: alpha:uses | edge".to_string());
+
+        let (report, lines, _) = run_retire(&gm).await;
+        assert_eq!(lines, expected);
+        assert!(lines.iter().all(|line| {
+            !line.contains("light") && !line.contains("serif") && !line.contains("Tinylib")
+        }));
+        assert_eq!(
+            ended_key(&slots(&gm, "alpha").await, "bg"),
+            Some("s3:component_dropped")
+        );
+        assert_eq!(
+            ended_key(&slots(&gm, "alpha").await, "font"),
+            Some("s3:component_dropped")
+        );
+        assert_eq!(
+            use_ended(&gm, "Tinylib").await.as_deref(),
+            Some("s3:component_dropped")
+        );
+        let dropped: Vec<_> = report
+            .retirements
+            .iter()
+            .filter(|item| item.reason == "component_dropped")
+            .collect();
+        assert_eq!(dropped.len(), 3);
+        assert!(dropped.iter().all(|item| item.new_value.is_empty()));
+        let edge = dropped
+            .iter()
+            .find(|item| item.predicate == "uses")
+            .unwrap();
+        assert_eq!(edge.subject, "alpha");
+        assert_eq!(edge.key, "");
+        assert_eq!(edge.old_value, "Tinylib");
+        assert!(dropped
+            .iter()
+            .any(|item| item.key == "bg" && item.old_value == "light"));
+        assert!(dropped
+            .iter()
+            .any(|item| item.key == "font" && item.old_value == "serif"));
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+        assert!(report.consolidate.component_retire_nosucc.is_none());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
+        let snap = consolidate_snapshot(&report);
+        assert!(snap.contains("component_retire_closes"), "{snap}");
+        assert!(!snap.contains("component_retire_nosucc"), "{snap}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_u5_a_session_with_no_anchors_still_runs_retire() {
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        let (report, lines, reads) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.anchors, 0);
+        assert!(reads > 0);
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g1_trigger_must_be_a_decided_setting_closed_this_session() {
+        // T1 (a): the old setting is still open.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+            ],
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T1 (b): closed in an earlier session.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[project_setting("skin", "beta", "decided")],
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T1 (c): closed this session but considered.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["status"] = json!("considered");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T1: a longer session prefix is not this session.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["ended_by"] = json!("s30:superseded");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+
+        // T1: the colon is part of the prefix.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["ended_by"] = json!("s3superseded");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+
+        // T1: open, even with this session's ended_by, is not a trigger.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot.as_object_mut().unwrap().remove("valid_until");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T1: only a setting is a trigger.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["predicate"] = json!("rule");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T1: any reason after the session prefix, not only superseded.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["ended_by"] = json!("s3:other");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g2_exactly_one_linked_component() {
+        // T2: a technology is not a component candidate, even with a decided part_of.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        set_kind(&gm, "alpha", "technology").await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // Linked: no part_of.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("skin", "beta", "decided")],
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // Linked: a pending part_of does not link.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        update_part(
+            &gm,
+            "alpha",
+            "UPDATE type::record($id) SET pending = $pending",
+            Some(json!({"since": "s1", "conflicts": "relates_to:none"})),
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // Linked: a considered part_of does not link.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        update_part(
+            &gm,
+            "alpha",
+            "UPDATE type::record($id) SET status = 'considered'",
+            None,
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // Linked: part_of must run from the component to the project.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        let edges = part_edges(&gm, "alpha").await;
+        let edge = id_text(edges[0].get("id"));
+        let alpha = entity_id(&gm, "alpha").await;
+        let app = entity_id(&gm, "app").await;
+        gm.db()
+            .query("DELETE type::record($id)")
+            .bind(("id", edge))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        gm.db()
+            .query(
+                "LET $from = type::record($from_id); \
+                 LET $to = type::record($to_id); \
+                 RELATE $from->relates_to->$to SET rel_type = 'part_of', status = 'decided'",
+            )
+            .bind(("from_id", app))
+            .bind(("to_id", alpha))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // part_links: to_id must be the project. part_of skinpack does not link.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "skinpack", Kind::Component),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("skin", "beta", "decided")],
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T2: two component entities normalise to the old value.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[part_link("gamma", "app", Kind::Project)],
+        )
+        .await;
+        rename_entity(&gm, "gamma", "Alpha!").await;
+        let (report, lines, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_ambiguous, Some(1));
+        assert!(report.consolidate.component_retire_closes.is_none());
+        assert!(report.consolidate.component_retire_nosucc.is_none());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("consolidate retire ambiguous: app:skin | slot "));
+        assert!(!lines[0].contains("light"));
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // component_named: a technology named Alpha! is not a second candidate.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[use_of("skinpack", Kind::Component, "Othertech", "decided")],
+        )
+        .await;
+        rename_entity(&gm, "Othertech", "Alpha!").await;
+        set_kind(&gm, "Alpha!", "technology").await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+        assert!(report.consolidate.component_retire_ambiguous.is_none());
+        assert_eq!(
+            ended_key(&slots(&gm, "alpha").await, "bg"),
+            Some("s3:component_dropped")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g3_successor_must_name_one_other_linked_component() {
+        // (a) no open project skin.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+            ],
+        )
+        .await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["valid_until"] = json!("2026-04-03T00:00:00Z");
+            slot["ended_by"] = json!("s3:superseded");
+        })
+        .await;
+        let (report, lines, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(lines[0].starts_with("consolidate retire nosucc:"));
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // (b) successor key skin_name.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["key"] = json!("skin_name");
+        })
+        .await;
+        let (report, lines, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(lines[0].contains("app:skin"));
+        assert!(!lines[0].contains("skin_name"));
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // (c) successor value names the dropped component.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["value"] = json!("alpha");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(report.consolidate.component_retire_closes.is_none());
+
+        // (d) successor names beta, and beta is unlinked.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        update_part(
+            &gm,
+            "beta",
+            "UPDATE type::record($id) SET status = 'considered'",
+            None,
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // (e) successor pending.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["pending"] = json!({"since": "s3", "conflicts": "entity:none"});
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T3: a closed successor slot is not a successor.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["valid_until"] = json!("2026-04-03T00:00:00Z");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(report.consolidate.component_retire_closes.is_none());
+
+        // T3: the successor itself has to be a setting.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["predicate"] = json!("rule");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(report.consolidate.component_retire_closes.is_none());
+
+        // (f) successor considered.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["status"] = json!("considered");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // T3: two components normalise to the successor value, so there is no successor.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[part_link("gamma", "app", Kind::Project)],
+        )
+        .await;
+        rename_entity(&gm, "gamma", "Beta!").await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+        assert!(report.consolidate.component_retire_closes.is_none());
+
+        // Successor key ` Skin ` still matches.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "beta", |slot| {
+            slot["key"] = json!(" Skin ");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g4_only_eligible_rows_on_the_dropped_component_close() {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![
+            project_setting("skin", "alpha", "decided"),
+            project_setting("bg", "light", "decided"),
+            part_link("alpha", "app", Kind::Project),
+            part_link("beta", "app", Kind::Project),
+            setting_of("alpha", "bg", "light", "decided"),
+            setting_of("alpha", "font", "serif", "decided"),
+            setting_of("alpha", "accent", "red", "considered"),
+            setting_of("alpha", "pad", "4", "decided"),
+            setting_of("alpha", "gap", "wide", "decided"),
+            setting_of("beta", "bg", "dark", "decided"),
+            rule_of("alpha", "Use light colours."),
+            use_of("alpha", Kind::Component, "Tinylib", "decided"),
+            use_of("alpha", Kind::Component, "Otherlib", "considered"),
+            use_of("alpha", Kind::Component, "Pendlib", "decided"),
+            use_of("beta", Kind::Component, "Betalib", "decided"),
+            use_of("app", Kind::Project, "Applib", "decided"),
+        ];
+        for index in 0..6 {
+            facts.push(setting_of(
+                "alpha",
+                &format!("old{index}"),
+                "gone",
+                "decided",
+            ));
+        }
+        commit_app(&gm, "s1", "2026-04-01", &facts).await;
+        for index in 0..6 {
+            mutate_named_slot(&gm, "alpha", &format!("old{index}"), |slot| {
+                slot["valid_until"] = json!("2026-04-01T00:00:00Z");
+                slot["ended_by"] = json!("s1:superseded");
+            })
+            .await;
+        }
+        mutate_named_slot(&gm, "alpha", "pad", |slot| {
+            slot["pending"] = json!({"since": "s1", "conflicts": "entity:none"});
+        })
+        .await;
+        mutate_named_slot(&gm, "alpha", "gap", |slot| {
+            slot.as_object_mut().unwrap().remove("evidence");
+        })
+        .await;
+        // Pending uses are not targets.
+        gm.db()
+            .query(
+                "UPDATE relates_to SET pending = $pending \
+                 WHERE rel_type = 'uses' AND out.name = $object",
+            )
+            .bind((
+                "pending",
+                json!({"since": "s1", "conflicts": "relates_to:none"}),
+            ))
+            .bind(("object", "Pendlib".to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[
+                project_setting("skin", "beta", "decided"),
+                setting_of("alpha", "margin", "2", "decided"),
+                use_of("alpha", Kind::Component, "Newlib", "decided"),
+            ],
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+        assert!(report.consolidate.component_retire_overflow.is_none());
+        let alpha = slots(&gm, "alpha").await;
+        assert_eq!(ended_key(&alpha, "bg"), Some("s3:component_dropped"));
+        assert_eq!(ended_key(&alpha, "font"), Some("s3:component_dropped"));
+        assert_eq!(
+            use_ended(&gm, "Tinylib").await.as_deref(),
+            Some("s3:component_dropped")
+        );
+        assert!(ended_key(&alpha, "accent").is_none());
+        assert!(ended_key(&alpha, "pad").is_none());
+        assert!(ended_key(&alpha, "gap").is_none());
+        assert!(ended_key(&alpha, "margin").is_none());
+        assert!(ended_key(&alpha, "").is_none());
+        for index in 0..6 {
+            assert_eq!(
+                ended_key(&alpha, &format!("old{index}")),
+                Some("s1:superseded")
+            );
+        }
+        assert!(ended_key(&slots(&gm, "beta").await, "bg").is_none());
+        assert!(ended_key(&slots(&gm, "app").await, "bg").is_none());
+        assert!(use_ended(&gm, "Otherlib").await.is_none());
+        assert!(use_ended(&gm, "Newlib").await.is_none());
+        assert!(use_ended(&gm, "Pendlib").await.is_none());
+        // use_target: from_id must be the dropped component.
+        assert!(use_ended(&gm, "Betalib").await.is_none());
+        assert!(use_ended(&gm, "Applib").await.is_none());
+        let parts = part_edges(&gm, "alpha").await;
+        assert!(
+            parts.iter().all(|edge| {
+                edge.get("ended_by").is_none_or(Value::is_null)
+                    && edge.get("valid_until").is_none_or(Value::is_null)
+            }),
+            "{parts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g5_component_names_match_the_whole_normalised_value() {
+        for value in ["alp", "alpha theme"] {
+            let (_tmp, gm) = open().await;
+            seed_base(&gm).await;
+            mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+                slot["value"] = json!(value);
+            })
+            .await;
+            let (report, _, _) = run_retire(&gm).await;
+            assert_idle(&report);
+            assert!(bg_open(&slots(&gm, "alpha").await), "{value}");
+        }
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        mutate_slot(&gm, "app", "skin", "alpha", |slot| {
+            slot["value"] = json!("Alpha!");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g6_more_than_eight_targets_close_none() {
+        async fn seed_cap(extra_use: bool) -> (tempfile::TempDir, GraphMemory) {
+            let (tmp, gm) = open().await;
+            let mut facts = vec![
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+            ];
+            for index in 0..8 {
+                facts.push(setting_of("alpha", &format!("k{index}"), "v", "decided"));
+            }
+            if extra_use {
+                facts.push(use_of("alpha", Kind::Component, "Tinylib", "decided"));
+            }
+            commit_app(&gm, "s1", "2026-04-01", &facts).await;
+            commit_app(
+                &gm,
+                "s3",
+                "2026-04-03",
+                &[project_setting("skin", "beta", "decided")],
+            )
+            .await;
+            (tmp, gm)
+        }
+        let (_tmp, gm) = seed_cap(false).await;
+        let (report, lines, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(8));
+        assert!(report.consolidate.component_retire_overflow.is_none());
+        assert_eq!(lines.len(), 8);
+        let alpha = slots(&gm, "alpha").await;
+        for index in 0..8 {
+            assert_eq!(
+                ended_key(&alpha, &format!("k{index}")),
+                Some("s3:component_dropped")
+            );
+        }
+
+        let (_tmp, gm) = seed_cap(true).await;
+        let (report, lines, _) = run_retire(&gm).await;
+        assert!(report.consolidate.component_retire_closes.is_none());
+        assert_eq!(report.consolidate.component_retire_overflow, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate retire overflow: alpha | 9 targets".to_string()]
+        );
+        assert!(!lines[0].contains("Tinylib"));
+        let alpha = slots(&gm, "alpha").await;
+        for index in 0..8 {
+            assert!(ended_key(&alpha, &format!("k{index}")).is_none());
+        }
+        assert!(use_ended(&gm, "Tinylib").await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g7_retire_off_adds_no_read_and_no_report_key() {
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        let before = slots(&gm, "alpha").await;
+        let (report, lines, reads) =
+            post_run(&gm, "s3", "2026-04-03", &[], false, false, false).await;
+        assert_eq!(reads, 0);
+        assert!(lines.is_empty());
+        assert_eq!(slots(&gm, "alpha").await, before);
+        let snap = consolidate_snapshot(&report);
+        assert!(!snap.contains("component_retire"), "{snap}");
+        assert!(!snap.contains("orphan_sweep"), "{snap}");
+        assert!(!snap.contains("rule_fragment"), "{snap}");
+
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+            ],
+        )
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, reads) =
+            post_run(&gm, "s2", "2026-04-02", &[reject_blob()], true, true, false).await;
+        // O reads the project, uses, part_of and the component page. F reads entities. R adds none.
+        assert_eq!(reads, 5);
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert_eq!(
+            ended_key(&slots(&gm, "app").await, "list"),
+            Some("s2:rule_fragment")
+        );
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+        assert_eq!(report.consolidate.rule_fragment_closes, Some(1));
+        let snap = consolidate_snapshot(&report);
+        assert!(!snap.contains("component_retire"), "{snap}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_g8_one_snapshot_orders_closes_and_a_shared_row_closes_once() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+                setting_of("alpha", "font", "serif", "decided"),
+                use_of("alpha", Kind::Component, "Tinylib", "decided"),
+                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("skin", "beta", "decided")],
+        )
+        .await;
+        mutate_named_slot(&gm, "app", "main", |slot| {
+            slot["valid_until"] = json!("2026-04-03T00:00:00Z");
+            slot["ended_by"] = json!("s3:consolidated");
+        })
+        .await;
+
+        super::reset_post_reads();
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let stub = Stub::new(Answer::Panic);
+        let mut ctx = WriteCtx::new(&stub, &project, "s3", "2026-04-03", &turns);
+        ctx.orphan_sweep_on = true;
+        ctx.rule_fragments_on = true;
+        ctx.retire_component_on = true;
+        let snap = super::read_post_snapshot(&gm, &ctx).await.unwrap();
+        let after_read = super::post_reads();
+        // O reads four times, F once, R three: entities, part_of, and uses.
+        assert_eq!(after_read, 8);
+        super::begin_post_lines();
+        let mut report = IngestionReport::default();
+        super::apply_post(&gm, &ctx, &[reject_blob()], &snap, &mut report).await;
+        assert_eq!(super::post_reads(), after_read);
+        let lines = super::take_post_lines();
+        let orphan_at = lines
+            .iter()
+            .position(|line| line.starts_with("consolidate orphan:"))
+            .unwrap();
+        let fragment_at = lines
+            .iter()
+            .position(|line| line.starts_with("consolidate fragment:"))
+            .unwrap();
+        let retire_at = lines
+            .iter()
+            .position(|line| line.starts_with("consolidate retire:"))
+            .unwrap();
+        assert!(
+            orphan_at < fragment_at && fragment_at < retire_at,
+            "{lines:?}"
+        );
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s3:orphan_sweep")
+        );
+        assert_eq!(
+            ended_key(&slots(&gm, "app").await, "list"),
+            Some("s3:rule_fragment")
+        );
+        assert_eq!(
+            ended_key(&slots(&gm, "alpha").await, "bg"),
+            Some("s3:component_dropped")
+        );
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
+
+        // A row in both plans closes once: the second close returns false.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[setting_of("alpha", "bg", "light", "decided")],
+        )
+        .await;
+        let id = entity_id(&gm, "alpha").await;
+        let close = || super::SweepClose {
+            entity_id: id.clone(),
+            subject: "alpha".into(),
+            index: 0,
+            predicate: "setting".into(),
+            key: "bg".into(),
+            value: "light".into(),
+        };
+        let orphan = super::OrphanPlan {
+            closes: vec![close()],
+            overflows: Vec::new(),
+        };
+        let retire = super::RetirePlan {
+            slots: vec![close()],
+            edges: Vec::new(),
+            nosucc: Vec::new(),
+            overflows: Vec::new(),
+            ambiguous: Vec::new(),
+        };
+        let quiet = Quiet;
+        let ctx = WriteCtx::new(&quiet, &project, "s3", "2026-04-03", &turns);
+        let mut report = IngestionReport::default();
+        super::apply_orphan(&gm, &ctx, &orphan, &mut report).await;
+        super::apply_retire(&gm, &ctx, &retire, &mut report).await;
+        assert_eq!(report.retirements.len(), 1);
+        assert_eq!(report.retirements[0].reason, "orphan_sweep");
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+        assert!(report.consolidate.component_retire_closes.is_none());
+        assert_eq!(report.consolidate.closes_sup, 0);
+        assert_eq!(report.consolidate.closes_dup, 0);
+        assert_eq!(
+            ended_key(&slots(&gm, "alpha").await, "bg"),
+            Some("s3:orphan_sweep")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_u2_one_component_is_planned_once() {
+        async fn seed_two(gm: &GraphMemory) {
+            let mut facts = vec![
+                project_setting("skin", "alpha", "decided"),
+                project_setting("tone", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                part_link("beta", "app", Kind::Project),
+            ];
+            for key in ["bg", "font", "k0", "k1", "k2"] {
+                facts.push(setting_of("alpha", key, "v", "decided"));
+            }
+            commit_app(gm, "s1", "2026-04-01", &facts).await;
+            commit_app(
+                gm,
+                "s3",
+                "2026-04-03",
+                &[
+                    project_setting("skin", "beta", "decided"),
+                    project_setting("tone", "beta", "decided"),
+                ],
+            )
+            .await;
+        }
+        let (_tmp, gm) = open().await;
+        seed_two(&gm).await;
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let stub = Stub::new(Answer::Panic);
+        let mut ctx = WriteCtx::new(&stub, &project, "s3", "2026-04-03", &turns);
+        ctx.retire_component_on = true;
+        let snap = super::read_retire_snap(&gm, &ctx).await.unwrap();
+        let plan = super::plan_retire(&ctx, &snap);
+        // Dedup: two triggers name one component, so its rows are planned once.
+        assert_eq!(plan.slots.len(), 5);
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(5));
+        assert!(report.consolidate.component_retire_overflow.is_none());
+        assert!(report.consolidate.component_retire_nosucc.is_none());
+        let alpha = slots(&gm, "alpha").await;
+        for key in ["bg", "font", "k0", "k1", "k2"] {
+            assert_eq!(ended_key(&alpha, key), Some("s3:component_dropped"));
+        }
+
+        let (_tmp, gm) = open().await;
+        seed_two(&gm).await;
+        mutate_slot(&gm, "app", "tone", "beta", |slot| {
+            slot["key"] = json!("tone_name");
+        })
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(5));
+        assert_eq!(report.consolidate.component_retire_nosucc, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_missing_midnight_closes_nothing() {
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        let (report, lines, _) = post_run(&gm, "s3", "nope", &[], false, false, true).await;
+        assert_idle(&report);
+        assert!(lines.is_empty());
+        assert_eq!(report.consolidate.errors, 0);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ac_u4_hold_only_context_runs_retire_with_nothing_to_close() {
+        async fn plant(memory: &std::path::Path, config: &str, text: &str) -> GraphMemory {
+            std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+            std::fs::create_dir_all(memory.join("conversations")).unwrap();
+            std::fs::write(
+                memory.join("conversations/conversation-001.md"),
+                format!(
+                    "---\nlog: 1\ndate: \"2026-04-03T00:00:00Z\"\nsession_id: \"s3\"\n---\n\n\
+                     ### User\n\n{text}\n"
+                ),
+            )
+            .unwrap();
+            let gm = GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            gm
+        }
+        struct Empty;
+        #[async_trait]
+        impl LlmProvider for Empty {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string())
+            }
+        }
+        struct OneFact;
+        #[async_trait]
+        impl LlmProvider for OneFact {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(
+                    r#"{"facts":[{"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"the port is 9000","confidence":0.9}],"bugs":[],"releases":[]}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        let held = tempfile::tempdir().unwrap();
+        let gm = plant(
+            held.path(),
+            "[graph]\nconsolidate = true\nconsolidate_hold = true\nconsolidate_retire_component = true\n",
+            "Noted the shelf.",
+        )
+        .await;
+        super::reset_post_reads();
+        let report = crate::graph::v2::pass1::extract_session(
+            &gm,
+            held.path(),
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &Empty,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.slots_written, 0);
+        assert!(super::post_reads() > 0, "hold-only context did not run R");
+        assert_idle(&report);
+
+        let wrote = tempfile::tempdir().unwrap();
+        let gm = plant(
+            wrote.path(),
+            "[graph]\nconsolidate = true\nconsolidate_retire_component = true\n",
+            "the port is 9000",
+        )
+        .await;
+        super::reset_post_reads();
+        let report = crate::graph::v2::pass1::extract_session(
+            &gm,
+            wrote.path(),
+            1,
+            &IngestContext::new("s3", Some(1)),
+            &OneFact,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.slots_written >= 1, "{:?}", report.drops);
+        assert!(super::post_reads() > 0, "write path did not set R");
+        assert!(report.consolidate.component_retire_closes.is_none());
     }
 }
 
