@@ -952,6 +952,22 @@ pub struct ConsolidateReport {
     /// Absent when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_fragment_ambiguous: Option<u32>,
+    /// Settings and uses edges closed because their component was dropped.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_retire_closes: Option<u32>,
+    /// Dropped-component triggers with no successor in this snapshot.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_retire_nosucc: Option<u32>,
+    /// Dropped components with more than eight targets. None of those targets close.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_retire_overflow: Option<u32>,
+    /// Triggers whose old value names two or more components. Nothing closes for that trigger.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_retire_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1125,6 +1141,10 @@ impl ConsolidateReport {
             && self.orphan_sweep_truncated.unwrap_or(0) == 0
             && self.rule_fragment_closes.unwrap_or(0) == 0
             && self.rule_fragment_ambiguous.unwrap_or(0) == 0
+            && self.component_retire_closes.unwrap_or(0) == 0
+            && self.component_retire_nosucc.unwrap_or(0) == 0
+            && self.component_retire_overflow.unwrap_or(0) == 0
+            && self.component_retire_ambiguous.unwrap_or(0) == 0
     }
 }
 
