@@ -1112,40 +1112,52 @@ impl ConsolidateReport {
     }
 
     fn component_counts_blank(&self) -> bool {
-        self.link_sibling.unwrap_or(0) == 0
-            && self.link_derived.unwrap_or(0) == 0
-            && self.quote_trailing.unwrap_or(0) == 0
-            && self.closes_component.unwrap_or(0) == 0
+        all_zero(&[
+            self.link_sibling,
+            self.link_derived,
+            self.quote_trailing,
+            self.closes_component,
+        ])
     }
 
     fn rename_counts_blank(&self) -> bool {
-        self.rename_key.unwrap_or(0) == 0
-            && self.rename_becomes.unwrap_or(0) == 0
-            && self.rename_entity_drop.unwrap_or(0) == 0
+        all_zero(&[
+            self.rename_key,
+            self.rename_becomes,
+            self.rename_entity_drop,
+        ])
     }
 
     fn replaces_counts_blank(&self) -> bool {
-        self.replaces_cue.unwrap_or(0) == 0
-            && self.replaces_floor.unwrap_or(0) == 0
-            && self.pair_via_replaces.unwrap_or(0) == 0
-            && self.replaces_cue_uses.unwrap_or(0) == 0
-            && self.replaces_departure.unwrap_or(0) == 0
-            && self.anchor_earlier_turn.unwrap_or(0) == 0
-            && self.pair_via_earlier_turn.unwrap_or(0) == 0
-            && self.anchor_earlier_turn_skipped.unwrap_or(0) == 0
+        all_zero(&[
+            self.replaces_cue,
+            self.replaces_floor,
+            self.pair_via_replaces,
+            self.replaces_cue_uses,
+            self.replaces_departure,
+            self.anchor_earlier_turn,
+            self.pair_via_earlier_turn,
+            self.anchor_earlier_turn_skipped,
+        ])
     }
 
     fn post_counts_blank(&self) -> bool {
-        self.orphan_sweep_closes.unwrap_or(0) == 0
-            && self.orphan_sweep_overflow.unwrap_or(0) == 0
-            && self.orphan_sweep_truncated.unwrap_or(0) == 0
-            && self.rule_fragment_closes.unwrap_or(0) == 0
-            && self.rule_fragment_ambiguous.unwrap_or(0) == 0
-            && self.component_retire_closes.unwrap_or(0) == 0
-            && self.component_retire_nosucc.unwrap_or(0) == 0
-            && self.component_retire_overflow.unwrap_or(0) == 0
-            && self.component_retire_ambiguous.unwrap_or(0) == 0
+        all_zero(&[
+            self.orphan_sweep_closes,
+            self.orphan_sweep_overflow,
+            self.orphan_sweep_truncated,
+            self.rule_fragment_closes,
+            self.rule_fragment_ambiguous,
+            self.component_retire_closes,
+            self.component_retire_nosucc,
+            self.component_retire_overflow,
+            self.component_retire_ambiguous,
+        ])
     }
+}
+
+fn all_zero(counts: &[Option<u32>]) -> bool {
+    counts.iter().all(|count| count.unwrap_or(0) == 0)
 }
 
 /// Result of a full ingestion run.
@@ -1553,6 +1565,69 @@ mod tests {
         assert!(encoded.get("replaces_cue_uses").is_none());
         assert!(encoded.get("anchor_earlier_turn").is_none());
         assert!(encoded.get("pair_via_earlier_turn").is_none());
+    }
+
+    #[test]
+    fn each_optional_counter_marks_the_consolidate_report() {
+        let setters: &[fn(&mut ConsolidateReport)] = &[
+            |report| report.link_sibling = Some(1),
+            |report| report.link_derived = Some(1),
+            |report| report.quote_trailing = Some(1),
+            |report| report.closes_component = Some(1),
+            |report| report.rename_key = Some(1),
+            |report| report.rename_becomes = Some(1),
+            |report| report.rename_entity_drop = Some(1),
+            |report| report.replaces_cue = Some(1),
+            |report| report.replaces_floor = Some(1),
+            |report| report.pair_via_replaces = Some(1),
+            |report| report.replaces_cue_uses = Some(1),
+            |report| report.replaces_departure = Some(1),
+            |report| report.anchor_earlier_turn = Some(1),
+            |report| report.pair_via_earlier_turn = Some(1),
+            |report| report.anchor_earlier_turn_skipped = Some(1),
+            |report| report.orphan_sweep_closes = Some(1),
+            |report| report.orphan_sweep_overflow = Some(1),
+            |report| report.orphan_sweep_truncated = Some(1),
+            |report| report.rule_fragment_closes = Some(1),
+            |report| report.rule_fragment_ambiguous = Some(1),
+            |report| report.component_retire_closes = Some(1),
+            |report| report.component_retire_nosucc = Some(1),
+            |report| report.component_retire_overflow = Some(1),
+            |report| report.component_retire_ambiguous = Some(1),
+        ];
+        for set in setters {
+            let mut report = ConsolidateReport::default();
+            set(&mut report);
+            assert!(!report.is_blank());
+        }
+        let zeros = ConsolidateReport {
+            link_sibling: Some(0),
+            link_derived: Some(0),
+            quote_trailing: Some(0),
+            closes_component: Some(0),
+            rename_key: Some(0),
+            rename_becomes: Some(0),
+            rename_entity_drop: Some(0),
+            replaces_cue: Some(0),
+            replaces_floor: Some(0),
+            pair_via_replaces: Some(0),
+            replaces_cue_uses: Some(0),
+            replaces_departure: Some(0),
+            anchor_earlier_turn: Some(0),
+            pair_via_earlier_turn: Some(0),
+            anchor_earlier_turn_skipped: Some(0),
+            orphan_sweep_closes: Some(0),
+            orphan_sweep_overflow: Some(0),
+            orphan_sweep_truncated: Some(0),
+            rule_fragment_closes: Some(0),
+            rule_fragment_ambiguous: Some(0),
+            component_retire_closes: Some(0),
+            component_retire_nosucc: Some(0),
+            component_retire_overflow: Some(0),
+            component_retire_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
     }
 
     #[test]
