@@ -578,7 +578,11 @@ fn earlier_fact(
 
 /// Support failed because the cited turn has none of the content tokens.
 ///
-/// A `replaces` value with no content token failed for a different reason.
+/// Mirrors `write::replaces_supported`: the same alphanumeric tokens of at
+/// least three characters, and the same cited-turn lookup with the quote as
+/// fallback. True exactly when that check fails and the token set is not
+/// empty. A `replaces` value with no content token failed for a different
+/// reason. Keep the two in step.
 fn cited_lacks_replaces(fact: &super::schema::Fact, ctx: &WriteCtx<'_>) -> bool {
     let need = support_tokens(fact.replaces.trim());
     if need.is_empty() {
@@ -2736,7 +2740,7 @@ fn uses_row_match(anchor: &Anchor, label: &str) -> bool {
 fn setting_uses_match(anchor: &Anchor, partner: &Row, label: &str) -> bool {
     token_run(&anchor.replaces, label)
         && !covered_by_new(anchor, label)
-        && (setting_key_related(anchor, partner) || !trivial_value(label))
+        && (setting_keys(anchor, partner) || !trivial_value(label))
 }
 
 /// Every token of the partner value is already a token of the new value.
@@ -2747,11 +2751,6 @@ fn covered_by_new(anchor: &Anchor, label: &str) -> bool {
         && mine
             .iter()
             .all(|token| fresh.iter().any(|item| item == token))
-}
-
-fn setting_key_related(anchor: &Anchor, partner: &Row) -> bool {
-    let names = tokens(&partner.subject);
-    keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
 }
 
 fn trivial_value(value: &str) -> bool {
@@ -2807,6 +2806,7 @@ fn setting_replaces_match(anchor: &Anchor, partner: &Row) -> bool {
     values_equal(&anchor.replaces, &partner.value) && setting_keys(anchor, partner)
 }
 
+/// Shared by [`setting_uses_match`] and [`setting_replaces_match`].
 fn setting_keys(anchor: &Anchor, partner: &Row) -> bool {
     let names = tokens(&partner.subject);
     keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
@@ -13608,6 +13608,22 @@ mod tests {
         row
     }
 
+    #[test]
+    fn setting_keys_matches_equal_keys_overlap_and_rejects_unrelated() {
+        let equal = cue_anchor("setting", "svc", "8", "5");
+        let equal_row = cue_row("ent", "setting", "svc", "5");
+        assert!(super::setting_keys(&equal, &equal_row));
+
+        // Overlap only after the partner subject token `svc` is set aside.
+        let overlap = cue_anchor("setting", "svc_ttl", "8", "5");
+        let overlap_row = cue_row("ent", "setting", "ttl_budget", "5");
+        assert!(super::setting_keys(&overlap, &overlap_row));
+
+        let unrelated = cue_anchor("setting", "timeout", "8", "5");
+        let unrelated_row = cue_row("ent", "setting", "retries", "5");
+        assert!(!super::setting_keys(&unrelated, &unrelated_row));
+    }
+
     fn cue_area(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
     }
@@ -14229,6 +14245,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cited_lacks_replaces_follows_the_writer_support_check() {
+        let project = project();
+        let quiet = Quiet;
+        let cases = [
+            ("re", 0, "re is short", "re is short", false),
+            ("alpha beta", 0, "see Beta now", "see Beta now", false),
+            ("alpha beta", 0, "nothing stored", "nothing stored", true),
+            ("alpha", 4, "nothing stored", "keep alpha please", false),
+            ("alpha", 4, "alpha is here", "nothing stored", true),
+        ];
+        for (replaces, index, spoken, quote, want) in cases {
+            let turns = [turn(spoken)];
+            let ctx = WriteCtx::new(&quiet, &project, "s1", "2026-04-01", &turns);
+            let mut fact = setting("app", Kind::Project, "k", "v", quote);
+            fact.replaces = replaces.into();
+            fact.turn = index;
+            assert_eq!(
+                super::cited_lacks_replaces(&fact, &ctx),
+                want,
+                "{replaces} @ {index}"
+            );
+        }
+    }
+
     fn ruled(new_value: &str, old: &str, quote: &str) -> bool {
         let anchor = cue_anchor("rule", "", new_value, old);
         let partner = cue_row("ent", "rule", "", old);
@@ -14240,6 +14281,14 @@ mod tests {
             &cue_area(&["ent"]),
             quote,
         )
+    }
+
+    #[test]
+    fn the_recorded_rule_strings_name_the_new_value() {
+        let new_value = "Move duplicates into _dupes/ under the destination and keep the path they would have had.";
+        let old = "Only report duplicates: list them at the end and do not touch the files.";
+        let quote = "I want duplicates handled now, not just listed. Move them into _dupes/ under the destination, and keep the path they would have had, so I can compare.";
+        assert!(ruled(new_value, old, quote));
     }
 
     #[test]
