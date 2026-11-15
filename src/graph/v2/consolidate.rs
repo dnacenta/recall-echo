@@ -17832,6 +17832,26 @@ mod tests {
         assert!(lines[0].starts_with("consolidate retire ambiguous: app:skin | slot "));
         assert!(!lines[0].contains("light"));
         assert!(bg_open(&slots(&gm, "alpha").await));
+
+        // component_named: a technology named Alpha! is not a second candidate.
+        let (_tmp, gm) = open().await;
+        seed_base(&gm).await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[use_of("skinpack", Kind::Component, "Othertech", "decided")],
+        )
+        .await;
+        rename_entity(&gm, "Othertech", "Alpha!").await;
+        set_kind(&gm, "Alpha!", "technology").await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_eq!(report.consolidate.component_retire_closes, Some(3));
+        assert!(report.consolidate.component_retire_ambiguous.is_none());
+        assert_eq!(
+            ended_key(&slots(&gm, "alpha").await, "bg"),
+            Some("s3:component_dropped")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
