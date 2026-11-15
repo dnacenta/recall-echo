@@ -6156,8 +6156,8 @@ enum NameHit<'a> {
 }
 
 async fn read_retire_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<RetireSnap, GraphError> {
-    let project_id = find_project_id(gm, ctx).await?;
     let entities = read_retire_entities(gm).await?;
+    let project_id = project_id_from_entities(&entities, ctx);
     let parts = read_retire_parts(gm).await?;
     let uses = read_retire_uses(gm).await?;
     Ok(RetireSnap {
@@ -6166,6 +6166,22 @@ async fn read_retire_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Retire
         parts,
         uses,
     })
+}
+
+fn project_id_from_entities(entities: &[RetireEntity], ctx: &WriteCtx<'_>) -> Option<String> {
+    let mut fallback = None;
+    for entity in entities {
+        if !names_project(ctx, &entity.name) {
+            continue;
+        }
+        if entity.kind == "project" {
+            return Some(entity.id.clone());
+        }
+        if fallback.is_none() {
+            fallback = Some(entity.id.clone());
+        }
+    }
+    fallback
 }
 
 async fn read_retire_entities(gm: &GraphMemory) -> Result<Vec<RetireEntity>, GraphError> {
@@ -18274,7 +18290,8 @@ mod tests {
         ctx.retire_component_on = true;
         let snap = super::read_post_snapshot(&gm, &ctx).await.unwrap();
         let after_read = super::post_reads();
-        assert_eq!(after_read, 9);
+        // O reads four times, F once, R three: entities, part_of, and uses.
+        assert_eq!(after_read, 8);
         super::begin_post_lines();
         let mut report = IngestionReport::default();
         super::apply_post(&gm, &ctx, &[reject_blob()], &snap, &mut report).await;
