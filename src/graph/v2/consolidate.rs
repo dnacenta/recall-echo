@@ -5349,13 +5349,40 @@ async fn find_project_id(
     Ok(project_row_id(&rows, ctx))
 }
 
-fn project_row_id(rows: &[Value], ctx: &WriteCtx<'_>) -> Option<String> {
+/// A stored row the project preference can read.
+trait ProjectRow {
+    fn project_name(&self) -> &str;
+    fn project_kind(&self) -> &str;
+    fn project_id(&self) -> Option<String>;
+}
+
+impl ProjectRow for Value {
+    fn project_name(&self) -> &str {
+        self.get("name").and_then(Value::as_str).unwrap_or("")
+    }
+
+    fn project_kind(&self) -> &str {
+        row_kind(self)
+    }
+
+    fn project_id(&self) -> Option<String> {
+        nonempty_id(self)
+    }
+}
+
+/// First v2 `project` that names the session project, otherwise the first name match.
+///
+/// Name check, then a present id, then kind `project`, then the first fallback.
+fn preferred_project_id<R: ProjectRow>(rows: &[R], ctx: &WriteCtx<'_>) -> Option<String> {
     let mut fallback = None;
     for row in rows {
-        let Some(id) = named_project_id(row, ctx) else {
+        if !names_project(ctx, row.project_name()) {
+            continue;
+        }
+        let Some(id) = row.project_id() else {
             continue;
         };
-        if row_kind(row) == "project" {
+        if row.project_kind() == "project" {
             return Some(id);
         }
         if fallback.is_none() {
@@ -5365,15 +5392,8 @@ fn project_row_id(rows: &[Value], ctx: &WriteCtx<'_>) -> Option<String> {
     fallback
 }
 
-fn named_project_id(row: &Value, ctx: &WriteCtx<'_>) -> Option<String> {
-    if !row_names_project(row, ctx) {
-        return None;
-    }
-    nonempty_id(row)
-}
-
-fn row_names_project(row: &Value, ctx: &WriteCtx<'_>) -> bool {
-    names_project(ctx, row.get("name").and_then(Value::as_str).unwrap_or(""))
+fn project_row_id(rows: &[Value], ctx: &WriteCtx<'_>) -> Option<String> {
+    preferred_project_id(rows, ctx)
 }
 
 fn row_kind(row: &Value) -> &str {
@@ -6090,6 +6110,20 @@ struct RetireEntity {
     slots: Vec<RetireSlot>,
 }
 
+impl ProjectRow for RetireEntity {
+    fn project_name(&self) -> &str {
+        &self.name
+    }
+
+    fn project_kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn project_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+}
+
 struct RetireSlot {
     index: usize,
     predicate: String,
@@ -6169,19 +6203,7 @@ async fn read_retire_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Retire
 }
 
 fn project_id_from_entities(entities: &[RetireEntity], ctx: &WriteCtx<'_>) -> Option<String> {
-    let mut fallback = None;
-    for entity in entities {
-        if !names_project(ctx, &entity.name) {
-            continue;
-        }
-        if entity.kind == "project" {
-            return Some(entity.id.clone());
-        }
-        if fallback.is_none() {
-            fallback = Some(entity.id.clone());
-        }
-    }
-    fallback
+    preferred_project_id(entities, ctx)
 }
 
 async fn read_retire_entities(gm: &GraphMemory) -> Result<Vec<RetireEntity>, GraphError> {
@@ -18189,6 +18211,65 @@ mod tests {
             assert!(ended_key(&alpha, &format!("k{index}")).is_none());
         }
         assert!(use_ended(&gm, "Tinylib").await.is_none());
+    }
+
+    fn project_value(id: &str, name: &str, kind: &str) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "attributes": {"v2": {"kind": kind}},
+        })
+    }
+
+    fn project_retire(id: &str, name: &str, kind: &str) -> super::RetireEntity {
+        super::RetireEntity {
+            id: id.into(),
+            name: name.into(),
+            kind: kind.into(),
+            slots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preferred_project_id_agrees_for_value_rows_and_retire_entities() {
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let ctx = WriteCtx::new(&Quiet, &project, "s1", "2026-04-01", &turns);
+        let cases = [
+            // Pins the kind preference: technology App before project-kind app.
+            (
+                [("alpha", "App", "technology"), ("beta", "app", "project")],
+                "beta",
+            ),
+            // Pins the first fallback: component app, then technology App!.
+            (
+                [
+                    ("alpha", "app", "component"),
+                    ("beta", "App!", "technology"),
+                ],
+                "alpha",
+            ),
+            // Pins the name check: project-kind other is ignored.
+            (
+                [("alpha", "other", "project"), ("beta", "App", "technology")],
+                "beta",
+            ),
+        ];
+        for (rows, want) in cases {
+            let values: Vec<Value> = rows
+                .iter()
+                .map(|(id, name, kind)| project_value(id, name, kind))
+                .collect();
+            let entities: Vec<super::RetireEntity> = rows
+                .iter()
+                .map(|(id, name, kind)| project_retire(id, name, kind))
+                .collect();
+            let from_values = super::project_row_id(&values, &ctx);
+            let from_entities = super::project_id_from_entities(&entities, &ctx);
+            assert_eq!(from_values.as_deref(), Some(want), "{want}");
+            assert_eq!(from_entities.as_deref(), Some(want), "{want}");
+            assert_eq!(from_values, from_entities);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
