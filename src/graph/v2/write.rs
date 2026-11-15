@@ -170,6 +170,12 @@ pub(crate) struct WriteCtx<'a> {
     /// Keep a judged supersede when an exact rule `replaces` and a departure
     /// word supply the cue. Off leaves that cue unchanged.
     pub replaces_departure_on: bool,
+    /// Close orphan setting copies of a rejected project use.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub orphan_sweep_on: bool,
+    /// Close a same-turn rule fragment after its longer rule is closed.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub rule_fragments_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -199,6 +205,8 @@ impl<'a> WriteCtx<'a> {
             rename_on: false,
             replaces_cue_on: false,
             replaces_departure_on: false,
+            orphan_sweep_on: false,
+            rule_fragments_on: false,
         }
     }
 }
@@ -3465,6 +3473,8 @@ mod tests {
                 rename_on: false,
                 replaces_cue_on: false,
                 replaces_departure_on: false,
+                orphan_sweep_on: false,
+                rule_fragments_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4735,6 +4745,8 @@ mod tests {
             rename_on: false,
             replaces_cue_on: false,
             replaces_departure_on: false,
+            orphan_sweep_on: false,
+            rule_fragments_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -6237,6 +6249,8 @@ mod tests {
             rename_on: false,
             replaces_cue_on: false,
             replaces_departure_on: false,
+            orphan_sweep_on: false,
+            rule_fragments_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -8124,6 +8138,8 @@ mod tests {
             rename_on: false,
             replaces_cue_on: false,
             replaces_departure_on: false,
+            orphan_sweep_on: false,
+            rule_fragments_on: false,
         };
         let result = write_facts(
             &gm,

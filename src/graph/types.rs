@@ -932,6 +932,26 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_earlier_turn_skipped: Option<u32>,
+    /// Orphan setting rows closed after a rejected project use.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_sweep_closes: Option<u32>,
+    /// Rejected values with more than four orphan targets. None of those targets close.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_sweep_overflow: Option<u32>,
+    /// The orphan-component page came back full.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_sweep_truncated: Option<u32>,
+    /// Live rule fragments closed after a same-turn rule was closed.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_fragment_closes: Option<u32>,
+    /// Closed rules with two or more nested same-turn siblings. None of those siblings close.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_fragment_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1054,6 +1074,7 @@ impl ConsolidateReport {
             && self.component_counts_blank()
             && self.rename_counts_blank()
             && self.replaces_counts_blank()
+            && self.post_counts_blank()
     }
 
     fn pass_blank(&self) -> bool {
@@ -1096,6 +1117,14 @@ impl ConsolidateReport {
             && self.anchor_earlier_turn.unwrap_or(0) == 0
             && self.pair_via_earlier_turn.unwrap_or(0) == 0
             && self.anchor_earlier_turn_skipped.unwrap_or(0) == 0
+    }
+
+    fn post_counts_blank(&self) -> bool {
+        self.orphan_sweep_closes.unwrap_or(0) == 0
+            && self.orphan_sweep_overflow.unwrap_or(0) == 0
+            && self.orphan_sweep_truncated.unwrap_or(0) == 0
+            && self.rule_fragment_closes.unwrap_or(0) == 0
+            && self.rule_fragment_ambiguous.unwrap_or(0) == 0
     }
 }
 

@@ -181,6 +181,30 @@ pub enum ConsolidateReplacesDeparture {
     On,
 }
 
+/// Whether a bench run closes orphan copies of a rejected project use.
+///
+/// On implies consolidation: the scratch config sets both `consolidate` and
+/// `consolidate_orphan_sweep`. It does not write `ground_component_edges`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateOrphanSweep {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `consolidate = true` and `consolidate_orphan_sweep = true` for this run.
+    On,
+}
+
+/// Whether a bench run closes a same-turn rule fragment after its rule is closed.
+///
+/// On implies consolidation: the scratch config sets both `consolidate` and
+/// `consolidate_rule_fragments`. It does not write `ground_component_edges`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidateRuleFragments {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `consolidate = true` and `consolidate_rule_fragments = true` for this run.
+    On,
+}
+
 /// Whether a bench run binds a decided setting key from a shown known row.
 ///
 /// On writes `known_key_binding = true` only. It does not write
@@ -252,6 +276,8 @@ pub async fn run(
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: ConsolidateOrphanSweep,
+    consolidate_rule_fragments: ConsolidateRuleFragments,
     known_key_binding: KnownKeyBinding,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
@@ -270,6 +296,8 @@ pub async fn run(
         consolidate_key_rename,
         consolidate_replaces_cue,
         consolidate_replaces_departure,
+        consolidate_orphan_sweep,
+        consolidate_rule_fragments,
         known_key_binding,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
@@ -510,6 +538,8 @@ pub async fn run_repeat(
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: ConsolidateOrphanSweep,
+    consolidate_rule_fragments: ConsolidateRuleFragments,
     known_key_binding: KnownKeyBinding,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
@@ -540,6 +570,8 @@ pub async fn run_repeat(
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
+                consolidate_orphan_sweep,
+                consolidate_rule_fragments,
                 known_key_binding,
             )
             .await?,
@@ -563,6 +595,8 @@ fn apply_graph_switches(
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: ConsolidateOrphanSweep,
+    consolidate_rule_fragments: ConsolidateRuleFragments,
     known_key_binding: KnownKeyBinding,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
@@ -577,6 +611,8 @@ fn apply_graph_switches(
         consolidate_key_rename,
         consolidate_replaces_cue,
         consolidate_replaces_departure,
+        consolidate_orphan_sweep,
+        consolidate_rule_fragments,
         known_key_binding,
     );
     if lines.is_empty() {
@@ -604,6 +640,8 @@ fn switch_lines(
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: ConsolidateOrphanSweep,
+    consolidate_rule_fragments: ConsolidateRuleFragments,
     known_key_binding: KnownKeyBinding,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
@@ -622,6 +660,8 @@ fn switch_lines(
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
+            consolidate_orphan_sweep,
+            consolidate_rule_fragments,
         ),
         "consolidate = true",
     );
@@ -657,6 +697,16 @@ fn switch_lines(
     );
     push_line(
         &mut lines,
+        consolidate_orphan_sweep == ConsolidateOrphanSweep::On,
+        "consolidate_orphan_sweep = true",
+    );
+    push_line(
+        &mut lines,
+        consolidate_rule_fragments == ConsolidateRuleFragments::On,
+        "consolidate_rule_fragments = true",
+    );
+    push_line(
+        &mut lines,
         known_key_binding == KnownKeyBinding::On,
         "known_key_binding = true",
     );
@@ -678,6 +728,7 @@ fn switch_lines(
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn writes_consolidate(
     consolidate: Consolidate,
     consolidate_links: ConsolidateLinks,
@@ -685,6 +736,8 @@ fn writes_consolidate(
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
+    consolidate_orphan_sweep: ConsolidateOrphanSweep,
+    consolidate_rule_fragments: ConsolidateRuleFragments,
 ) -> bool {
     consolidate.writes_pass()
         || consolidate_links == ConsolidateLinks::On
@@ -692,6 +745,8 @@ fn writes_consolidate(
         || consolidate_key_rename == ConsolidateKeyRename::On
         || consolidate_replaces_cue == ConsolidateReplacesCue::On
         || consolidate_replaces_departure == ConsolidateReplacesDeparture::On
+        || consolidate_orphan_sweep == ConsolidateOrphanSweep::On
+        || consolidate_rule_fragments == ConsolidateRuleFragments::On
 }
 
 fn push_line(lines: &mut Vec<&'static str>, on: bool, line: &'static str) {
@@ -2086,6 +2141,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2103,6 +2160,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2124,6 +2183,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2152,6 +2213,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2170,6 +2233,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2204,6 +2269,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2235,6 +2302,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2263,6 +2332,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2300,6 +2371,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2318,6 +2391,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2353,6 +2428,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2371,6 +2448,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2479,6 +2558,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2666,6 +2747,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2684,6 +2767,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2717,6 +2802,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2747,6 +2834,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2784,6 +2873,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2802,6 +2893,8 @@ mod tests {
             ConsolidateKeyRename::On,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2837,6 +2930,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2877,6 +2972,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2895,6 +2992,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::On,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2937,6 +3036,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2955,6 +3056,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::On,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -2982,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn known_key_binding_writes_only_its_own_key() {
+    fn consolidate_orphan_sweep_implies_consolidate_and_skips_grounding() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
         fs::create_dir_all(&memory).unwrap();
@@ -2999,6 +3102,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -3017,6 +3122,118 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::On,
+            ConsolidateRuleFragments::Off,
+            KnownKeyBinding::Off,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_orphan_sweep = true\n"), "{text}");
+        assert!(!text.contains("consolidate_rule_fragments"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        assert!(!text.contains("consolidate_replaces_cue"), "{text}");
+        assert!(!text.contains("consolidate_replaces_departure"), "{text}");
+        assert!(!text.contains("consolidate_key_rename"), "{text}");
+        assert!(!text.contains("consolidate_hold"), "{text}");
+        assert!(!text.contains("consolidate_links"), "{text}");
+        assert!(!text.contains("consolidate_components"), "{text}");
+        assert!(!text.contains("drop_restatements"), "{text}");
+        assert!(!text.contains("known_match"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.consolidate);
+        assert!(graph.consolidate_orphan_sweep);
+        assert!(!graph.ground_component_edges);
+        assert!(!graph.orphan_sweep_apply());
+        assert!(!graph.replaces_cue_apply());
+        assert!(!graph.replaces_departure_apply());
+    }
+
+    #[test]
+    fn consolidate_rule_fragments_implies_consolidate_and_skips_grounding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::On,
+            KnownKeyBinding::Off,
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_rule_fragments = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_orphan_sweep"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        assert!(!text.contains("consolidate_replaces_cue"), "{text}");
+        assert!(!text.contains("consolidate_components"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.rule_fragments_apply());
+        assert!(!graph.orphan_sweep_apply());
+        assert!(!graph.ground_component_edges);
+        assert!(!graph.replaces_cue_apply());
+        assert!(!graph.components_apply());
+    }
+
+    #[test]
+    fn known_key_binding_writes_only_its_own_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            KnownKeyBinding::Off,
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::On,
         )
         .unwrap();
@@ -3083,6 +3300,8 @@ mod tests {
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
                 ConsolidateReplacesDeparture::Off,
+                ConsolidateOrphanSweep::Off,
+                ConsolidateRuleFragments::Off,
                 KnownKeyBinding::Off,
             )
             .unwrap();
@@ -3141,6 +3360,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -3305,6 +3526,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -3418,6 +3641,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -3449,6 +3674,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -3532,6 +3759,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -3845,6 +4074,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .unwrap();
@@ -4000,6 +4231,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -4221,6 +4454,8 @@ mod tests {
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
                 ConsolidateReplacesDeparture::Off,
+                ConsolidateOrphanSweep::Off,
+                ConsolidateRuleFragments::Off,
                 KnownKeyBinding::Off,
             )
             .await
@@ -4265,6 +4500,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -4561,6 +4798,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await
@@ -4700,6 +4939,8 @@ mod tests {
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
             KnownKeyBinding::Off,
         )
         .await

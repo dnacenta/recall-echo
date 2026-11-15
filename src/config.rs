@@ -754,6 +754,21 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_replaces_departure: bool,
+    /// Close orphan setting copies of a rejected project use.
+    /// Off unless set, and ignored unless [`Self::consolidate`] and
+    /// [`Self::ground_component_edges`] are also set.
+    #[serde(
+        default = "default_consolidate_orphan_sweep",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_orphan_sweep: bool,
+    /// Close a same-turn rule fragment after its longer rule is closed.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_rule_fragments",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_rule_fragments: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// Off unless set.
     #[serde(
@@ -798,6 +813,8 @@ impl Default for GraphSection {
             consolidate_key_rename: default_consolidate_key_rename(),
             consolidate_replaces_cue: default_consolidate_replaces_cue(),
             consolidate_replaces_departure: default_consolidate_replaces_departure(),
+            consolidate_orphan_sweep: default_consolidate_orphan_sweep(),
+            consolidate_rule_fragments: default_consolidate_rule_fragments(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
@@ -848,6 +865,18 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn replaces_departure_apply(&self) -> bool {
         self.consolidate && self.consolidate_replaces_departure
+    }
+
+    /// Orphan copies close only when consolidation and component grounding are on as well.
+    #[must_use]
+    pub(crate) fn orphan_sweep_apply(&self) -> bool {
+        self.consolidate && self.consolidate_orphan_sweep && self.ground_component_edges
+    }
+
+    /// Same-turn rule fragments close only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn rule_fragments_apply(&self) -> bool {
+        self.consolidate && self.consolidate_rule_fragments
     }
 
     /// A shown known row can bind a decided setting key only when the known
@@ -1194,6 +1223,14 @@ fn default_consolidate_replaces_cue() -> bool {
 }
 
 fn default_consolidate_replaces_departure() -> bool {
+    false
+}
+
+fn default_consolidate_orphan_sweep() -> bool {
+    false
+}
+
+fn default_consolidate_rule_fragments() -> bool {
     false
 }
 
@@ -1552,6 +1589,18 @@ impl Config {
             }
             "graph.consolidate_replaces_departure" => {
                 self.graph_section().consolidate_replaces_departure = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_orphan_sweep" => {
+                self.graph_section().consolidate_orphan_sweep = value
+                    .parse()
+                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
+                Ok(())
+            }
+            "graph.consolidate_rule_fragments" => {
+                self.graph_section().consolidate_rule_fragments = value
                     .parse()
                     .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
                 Ok(())
@@ -2788,6 +2837,125 @@ mod tests {
                 .as_ref()
                 .expect("graph")
                 .consolidate_replaces_departure
+        );
+    }
+
+    #[test]
+    fn consolidate_orphan_sweep_defaults_off_round_trips_and_needs_grounding() {
+        assert!(!default_consolidate_orphan_sweep());
+        assert!(!GraphSection::default().consolidate_orphan_sweep);
+        assert!(!GraphSection::default().orphan_sweep_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().orphan_sweep_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_orphan_sweep"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_orphan_sweep = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_orphan_sweep);
+        assert!(!false_graph.orphan_sweep_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_orphan_sweep"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_orphan_sweep", "true")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_orphan_sweep);
+        assert!(!graph.orphan_sweep_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.ground_component_edges);
+        let rendered = toml::to_string_pretty(&cfg).expect("render sweep only");
+        assert!(rendered.contains("consolidate_orphan_sweep = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("ground_component_edges"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse sweep only");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.consolidate_orphan_sweep);
+        assert!(!parsed_graph.orphan_sweep_apply());
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").orphan_sweep_apply());
+        cfg.set_key("graph.ground_component_edges", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").orphan_sweep_apply());
+        cfg.set_key("graph.consolidate_orphan_sweep", "false")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(!graph.consolidate_orphan_sweep);
+        assert!(!graph.orphan_sweep_apply());
+        assert!(graph.consolidate);
+        assert!(graph.ground_component_edges);
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_orphan_sweep"));
+        cfg.set_key("graph.consolidate_orphan_sweep", "true")
+            .unwrap();
+        cfg.set_key("graph.ground_component_edges", "false")
+            .unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").orphan_sweep_apply());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_orphan_sweep);
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        cfg.set_key("graph.ground_component_edges", "true").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").orphan_sweep_apply());
+        assert!(cfg
+            .set_key("graph.consolidate_orphan_sweep", "yes")
+            .is_err());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_orphan_sweep);
+    }
+
+    #[test]
+    fn consolidate_rule_fragments_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_rule_fragments());
+        assert!(!GraphSection::default().consolidate_rule_fragments);
+        assert!(!GraphSection::default().rule_fragments_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().rule_fragments_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_rule_fragments"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_rule_fragments = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_rule_fragments);
+        assert!(!false_graph.rule_fragments_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_rule_fragments"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_rule_fragments", "true")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_rule_fragments);
+        assert!(!graph.rule_fragments_apply());
+        assert!(!graph.consolidate);
+        assert!(!graph.ground_component_edges);
+        let rendered = toml::to_string_pretty(&cfg).expect("render fragments only");
+        assert!(rendered.contains("consolidate_rule_fragments = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("ground_component_edges"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse fragments only");
+        assert!(parsed.graph.expect("graph").consolidate_rule_fragments);
+
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").rule_fragments_apply());
+        cfg.set_key("graph.consolidate_rule_fragments", "false")
+            .unwrap();
+        let rendered = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!rendered.contains("consolidate_rule_fragments"));
+        cfg.set_key("graph.consolidate_rule_fragments", "true")
+            .unwrap();
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").rule_fragments_apply());
+        assert!(cfg
+            .set_key("graph.consolidate_rule_fragments", "yes")
+            .is_err());
+        assert!(
+            cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_rule_fragments
         );
     }
 

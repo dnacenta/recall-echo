@@ -322,6 +322,8 @@ pub(crate) async fn extract_session(
         write_ctx.rename_on = rename_enabled(memory_dir);
         write_ctx.replaces_cue_on = replaces_cue_enabled(memory_dir);
         write_ctx.replaces_departure_on = replaces_departure_enabled(memory_dir);
+        write_ctx.orphan_sweep_on = orphan_sweep_enabled(memory_dir);
+        write_ctx.rule_fragments_on = rule_fragments_enabled(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -372,6 +374,8 @@ pub(crate) async fn extract_session(
         );
         write_ctx.hold_on = true;
         write_ctx.ground_on = ground_edges;
+        write_ctx.orphan_sweep_on = orphan_sweep_enabled(memory_dir);
+        write_ctx.rule_fragments_on = rule_fragments_enabled(memory_dir);
         let started = std::time::Instant::now();
         let stats = write::WriteStats::default();
         super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -505,6 +509,20 @@ fn replaces_departure_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .replaces_departure_apply()
+}
+
+fn orphan_sweep_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .orphan_sweep_apply()
+}
+
+fn rule_fragments_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .rule_fragments_apply()
 }
 
 fn known_key_binding_enabled(memory_dir: &Path) -> bool {
