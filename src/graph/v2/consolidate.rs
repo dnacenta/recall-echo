@@ -17788,6 +17788,31 @@ mod tests {
         assert_idle(&report);
         assert!(bg_open(&slots(&gm, "alpha").await));
 
+        // part_links: to_id must be the project. part_of skinpack does not link.
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "skinpack", Kind::Component),
+                part_link("beta", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("skin", "beta", "decided")],
+        )
+        .await;
+        let (report, _, _) = run_retire(&gm).await;
+        assert_idle(&report);
+        assert!(bg_open(&slots(&gm, "alpha").await));
+
         // T2: two component entities normalise to the old value.
         let (_tmp, gm) = open().await;
         seed_base(&gm).await;
@@ -17961,6 +17986,8 @@ mod tests {
             use_of("alpha", Kind::Component, "Tinylib", "decided"),
             use_of("alpha", Kind::Component, "Otherlib", "considered"),
             use_of("alpha", Kind::Component, "Pendlib", "decided"),
+            use_of("beta", Kind::Component, "Betalib", "decided"),
+            use_of("app", Kind::Project, "Applib", "decided"),
         ];
         for index in 0..6 {
             facts.push(setting_of(
@@ -18038,6 +18065,9 @@ mod tests {
         assert!(use_ended(&gm, "Otherlib").await.is_none());
         assert!(use_ended(&gm, "Newlib").await.is_none());
         assert!(use_ended(&gm, "Pendlib").await.is_none());
+        // use_target: from_id must be the dropped component.
+        assert!(use_ended(&gm, "Betalib").await.is_none());
+        assert!(use_ended(&gm, "Applib").await.is_none());
         let parts = part_edges(&gm, "alpha").await;
         assert!(
             parts.iter().all(|edge| {
