@@ -5147,12 +5147,12 @@ const ORPHAN_REASON: &str = "orphan_sweep";
 const COMPONENT_PAGE: &str = "\
 SELECT id, name, attributes FROM entity \
 WHERE attributes.v2.kind = 'component' \
-ORDER BY id LIMIT 48";
+ORDER BY id LIMIT 49";
 const COMPONENT_PAGE_EXCLUDING: &str = "\
 SELECT id, name, attributes FROM entity \
 WHERE attributes.v2.kind = 'component' \
 AND type::string(id) NOTINSIDE $blocked \
-ORDER BY id LIMIT 48";
+ORDER BY id LIMIT 49";
 
 thread_local! {
     static POST_READS: Cell<u32> = const { Cell::new(0) };
@@ -5304,8 +5304,13 @@ async fn read_orphan_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Orphan
     Ok(orphan_snap(page, &blocked, live_uses))
 }
 
-fn orphan_snap(page: Vec<Value>, blocked: &BTreeSet<String>, live_uses: Vec<String>) -> OrphanSnap {
+fn orphan_snap(
+    mut page: Vec<Value>,
+    blocked: &BTreeSet<String>,
+    live_uses: Vec<String>,
+) -> OrphanSnap {
     let truncated = hit_orphan_cap(page.len());
+    page.truncate(ORPHAN_CAP);
     OrphanSnap {
         live_uses,
         components: parse_orphans(&page, blocked),
@@ -5314,7 +5319,7 @@ fn orphan_snap(page: Vec<Value>, blocked: &BTreeSet<String>, live_uses: Vec<Stri
 }
 
 fn hit_orphan_cap(len: usize) -> bool {
-    len >= ORPHAN_CAP
+    len > ORPHAN_CAP
 }
 
 async fn find_project_id(
@@ -5957,9 +5962,7 @@ fn earlier_fragment(slot: &FragmentSlot, session: &str) -> bool {
 }
 
 fn same_sighting(slot: &FragmentSlot, trigger: &FragmentSlot) -> bool {
-    slot.first_session == trigger.first_session
-        && slot.first_turn.is_some()
-        && slot.first_turn == trigger.first_turn
+    slot.first_session == trigger.first_session && slot.first_turn == trigger.first_turn
 }
 
 fn nested_quotes(left: &str, right: &str) -> bool {
@@ -15230,8 +15233,8 @@ mod tests {
         assert!(!super::sweep_token(""));
         assert!(!super::sweep_token("C"));
         assert!(super::sweep_token("CC"));
-        assert!(!super::hit_orphan_cap(47));
-        assert!(super::hit_orphan_cap(48));
+        assert!(!super::hit_orphan_cap(48));
+        assert!(super::hit_orphan_cap(49));
         let one = super::SweepClose {
             entity_id: "entity:a".into(),
             subject: "cache".into(),
@@ -15777,6 +15780,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn exactly_forty_eight_orphans_are_not_truncated() {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![use_of("app", Kind::Project, "Blobfmt", "decided")];
+        for index in 0..48 {
+            facts.push(setting_of(
+                &format!("n{index:02}"),
+                "cache_format",
+                "plain",
+                "decided",
+            ));
+        }
+        commit_app(&gm, "s1", "2026-04-01", &facts).await;
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let mut components: Vec<String> = entities
+            .iter()
+            .filter(|entity| {
+                entity
+                    .attributes
+                    .as_ref()
+                    .and_then(|attrs| attrs.pointer("/v2/kind"))
+                    .and_then(Value::as_str)
+                    == Some("component")
+            })
+            .map(|entity| entity.name.clone())
+            .collect();
+        components.sort();
+        assert_eq!(components.len(), 48);
+        let name = components[0].clone();
+        mutate_named_slot(&gm, &name, "cache_format", |slot| {
+            slot["value"] = json!("Blobfmt");
+        })
+        .await;
+        let facts = [reject_blob()];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert_eq!(
+            ended_key(&slots(&gm, &name).await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert!(report.consolidate.orphan_sweep_truncated.is_none());
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn linked_components_do_not_fill_the_orphan_page() {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![use_of("app", Kind::Project, "Blobfmt", "decided")];
+        for index in 0..48 {
+            facts.push(part_link(&format!("p{index:02}"), "app", Kind::Project));
+        }
+        facts.push(setting_of("cache", "cache_format", "Blobfmt", "decided"));
+        commit_app(&gm, "s1", "2026-04-01", &facts).await;
+        let facts = [reject_blob()];
+        let stats = commit_app(&gm, "s2", "2026-04-02", &facts).await;
+        let (report, _, _) = sweep(&gm, "s2", "2026-04-02", &facts, &stats, true, &[]).await;
+        assert_eq!(
+            ended_key(&slots(&gm, "cache").await, "cache_format"),
+            Some("s2:orphan_sweep")
+        );
+        assert!(report.consolidate.orphan_sweep_truncated.is_none());
+        assert_eq!(report.consolidate.orphan_sweep_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn ac_c2_the_post_pass_runs_when_the_main_pass_has_no_anchors() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -16034,26 +16103,17 @@ mod tests {
         let (_tmp, gm) = open().await;
         commit_app(
             &gm,
-            "s1",
-            "2026-04-01",
-            &[quoted_rule(
-                "main",
-                "Only report dupes and leave them alone.",
-                LONG_QUOTE,
-                4,
-            )],
-        )
-        .await;
-        commit_app(
-            &gm,
             "s2",
             "2026-04-02",
-            &[quoted_rule(
-                "list",
-                "List dupes at the end.",
-                SHORT_QUOTE,
-                4,
-            )],
+            &[
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+            ],
         )
         .await;
         close_named(&gm, "app", "main", "consolidated").await;
@@ -16166,7 +16226,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn ac_f8_other_close_reasons_and_a_closed_edge_are_not_triggers() {
-        for reason in ["rejected", "hold_dropped", "duplicate", "orphan_sweep"] {
+        for reason in [
+            "rejected",
+            "promoted",
+            "hold_dropped",
+            "duplicate",
+            "orphan_sweep",
+            "rule_fragment",
+        ] {
             let (_tmp, gm) = open().await;
             seed_pair(&gm, SHORT_QUOTE, 4).await;
             close_named(&gm, "app", "main", reason).await;
@@ -16187,12 +16254,15 @@ mod tests {
             assert!(fragment_reasons(&report).is_empty(), "{reason}");
         }
         let (_tmp, gm) = open().await;
+        let mut edge = use_of("app", Kind::Project, "Blobfmt", "decided");
+        edge.turn = 4;
+        edge.quote = LONG_QUOTE.into();
         commit_app(
             &gm,
             "s1",
             "2026-04-01",
             &[
-                use_of("app", Kind::Project, "Blobfmt", "decided"),
+                edge,
                 quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
             ],
         )
@@ -16264,6 +16334,35 @@ mod tests {
         assert!(ended_key(&slots(&gm, "app").await, "cache_format").is_none());
         assert!(ended_key(&slots(&gm, "cache").await, "list").is_none());
         assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        let mut closed = setting_of("app", "cache_format", "Blobfmt", "decided");
+        closed.subject_kind = Kind::Project;
+        closed.turn = 4;
+        closed.quote = LONG_QUOTE.into();
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                closed,
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+            ],
+        )
+        .await;
+        close_named(&gm, "app", "cache_format", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16329,6 +16428,74 @@ mod tests {
 
         let (_tmp, gm) = open().await;
         seed_pair(&gm, "", 4).await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        for key in ["main", "list"] {
+            mutate_named_slot(&gm, "app", key, |slot| {
+                slot["evidence"][0]
+                    .as_object_mut()
+                    .expect("evidence")
+                    .remove("turn");
+            })
+            .await;
+        }
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_or_considered_partner_rule_stays_live() {
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        mutate_named_slot(&gm, "app", "list", |slot| {
+            slot["pending"] = json!({"since": "s1", "conflicts": "slot"});
+        })
+        .await;
+        close_named(&gm, "app", "main", "consolidated").await;
+        let (report, _, _) = sweep_parts(
+            &gm,
+            "s2",
+            "2026-04-02",
+            &[],
+            &WriteStats::default(),
+            false,
+            true,
+        )
+        .await;
+        assert!(ended_key(&slots(&gm, "app").await, "list").is_none());
+        assert!(fragment_reasons(&report).is_empty());
+
+        let (_tmp, gm) = open().await;
+        seed_pair(&gm, SHORT_QUOTE, 4).await;
+        mutate_named_slot(&gm, "app", "list", |slot| {
+            slot["status"] = json!("considered");
+        })
+        .await;
         close_named(&gm, "app", "main", "consolidated").await;
         let (report, _, _) = sweep_parts(
             &gm,
@@ -16441,8 +16608,20 @@ mod tests {
             "s1",
             "2026-04-01",
             &[
-                setting_of("cache", "cache_format", "Blobfmt", "decided"),
+                {
+                    let mut setting = setting_of("cache", "cache_format", "Blobfmt", "decided");
+                    setting.turn = 4;
+                    setting.quote = "Keep the cache warm overnight please.".into();
+                    setting
+                },
                 setting_of("cache", "cache_path", "~/.app/data.blobfmt", "decided"),
+                {
+                    let mut warm =
+                        quoted_rule("warm", "Keep the cache warm.", "cache warm overnight", 4);
+                    warm.subject_name = "cache".into();
+                    warm.subject_kind = Kind::Component;
+                    warm
+                },
                 quoted_rule(
                     "main",
                     "Only report dupes and leave them alone.",
@@ -16450,7 +16629,6 @@ mod tests {
                     4,
                 ),
                 quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
-                quoted_rule("later", "List dupes at the end.", SHORT_QUOTE, 5),
             ],
         )
         .await;
@@ -16479,7 +16657,7 @@ mod tests {
         assert!(lines[0].starts_with("consolidate orphan:"));
         assert!(lines[1].starts_with("consolidate orphan:"));
         assert!(lines[2].starts_with("consolidate fragment:"));
-        assert!(ended_key(&slots(&gm, "app").await, "later").is_none());
+        assert!(ended_key(&slots(&gm, "cache").await, "warm").is_none());
         assert_eq!(
             ended_key(&slots(&gm, "app").await, "list"),
             Some("s2:rule_fragment")
