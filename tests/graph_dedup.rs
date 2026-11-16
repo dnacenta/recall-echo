@@ -481,6 +481,38 @@ async fn ingest_reports_dedup_resolved_without_a_model() {
     assert_eq!(model.dedup_calls(), 0, "no dedup decision needed a model");
 }
 
+/// A second ingest that is given a model still extracts, and does not store
+/// another copy of a chunk that is already there.
+#[tokio::test]
+async fn a_second_ingest_with_a_model_extracts_without_a_second_copy() {
+    let fixture = Fixture::new().await;
+    let model = ScriptedModel::new(EXTRACTION, r#"{"decision": "skip", "reason": "dup"}"#);
+    let context = IngestContext::new(SESSION, Some(1));
+
+    let first = fixture
+        .graph
+        .ingest_archive(ARCHIVE, &context, Some(&model))
+        .await
+        .expect("first ingest");
+    assert_eq!(first.episodes_created, 1);
+    assert_eq!(first.entities_created, 1);
+
+    let second = fixture
+        .graph
+        .ingest_archive(ARCHIVE, &context, Some(&model))
+        .await
+        .expect("second ingest");
+    assert_eq!(second.episodes_created, 0);
+    assert_eq!(second.entities_skipped, 1);
+    assert_eq!(second.dedup_fast_path, 1);
+    let episodes = fixture
+        .graph
+        .get_episodes_by_session(SESSION)
+        .await
+        .expect("episodes");
+    assert_eq!(episodes.len(), 1);
+}
+
 /// A provider that reports usage is believed instead of guessed at: the run's
 /// bill is measured, and the length heuristic contributes nothing.
 #[tokio::test]

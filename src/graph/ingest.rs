@@ -25,6 +25,15 @@ const LLM_CONCURRENCY: usize = 10;
 /// Chunk size `ingest_archive` uses. Rebuild compares episode rows to this.
 pub(crate) const INGEST_CHUNK_TOKENS: usize = 500;
 
+/// Episode writes for a numbered log skip chunks already stored.
+///
+/// Always on. Callers branch on this so a later default-off
+/// `graph.episode_ingest_dedupe` can replace the body without a rewrite.
+#[must_use]
+pub(crate) fn episode_ingest_dedupe() -> bool {
+    true
+}
+
 /// Role headings written by the archive pipeline, lower-cased.
 const USER_TURN_HEADING: &str = "### user";
 const ASSISTANT_TURN_HEADING: &str = "### assistant";
@@ -151,10 +160,11 @@ pub async fn ingest_archive(
     }
 
     // Create episodes for each chunk, each stamped with its own authorship —
-    // one archive can hold both the human's words and the agent's.
-    write_episodes(gm, &chunks, context, 0, &mut report).await;
+    // one archive can hold both the human's words and the agent's. A numbered
+    // log writes only chunks that are not already stored. Extraction, when a
+    // model is passed, still runs on every chunk.
+    write_log_episodes(gm, &chunks, context, &mut report).await?;
 
-    // If LLM provided, run extraction on all chunks
     if let Some(llm) = llm {
         process_extraction(gm, &chunks, context, llm, &mut report).await?;
     }
@@ -198,6 +208,118 @@ pub(crate) async fn ingest_remaining_episodes(
     let mut report = IngestionReport::default();
     write_episodes(gm, chunks, context, index_base, &mut report).await;
     Ok(report)
+}
+
+/// Chunks in `chunks` that `stored_content` does not already hold.
+///
+/// `stored_content` is a bag of exact strings. `None` is not a chunk: it is
+/// never consumed. Each walk step takes one matching copy when the bag still
+/// has one, and otherwise emits `(index, chunk)`. Comparison is the trimmed
+/// `chunk_conversation` string, with no normalisation.
+#[must_use]
+pub(crate) fn missing_chunks(
+    stored_content: &[Option<String>],
+    chunks: &[String],
+) -> Vec<(usize, String)> {
+    let mut available: HashMap<&str, usize> = HashMap::new();
+    for content in stored_content.iter().flatten() {
+        *available.entry(content.as_str()).or_default() += 1;
+    }
+    let mut missing = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        if !take_stored(&mut available, chunk) {
+            missing.push((index, chunk.clone()));
+        }
+    }
+    missing
+}
+
+/// Stored rows the walk did not consume, including `content = None`.
+#[must_use]
+pub(crate) fn leftover_count(stored_content: &[Option<String>], chunks: &[String]) -> usize {
+    let missing = missing_chunks(stored_content, chunks).len();
+    let consumed = chunks.len().saturating_sub(missing);
+    stored_content.len().saturating_sub(consumed)
+}
+
+fn take_stored(available: &mut HashMap<&str, usize>, chunk: &str) -> bool {
+    let Some(count) = available.get_mut(chunk) else {
+        return false;
+    };
+    if *count == 0 {
+        return false;
+    }
+    *count -= 1;
+    true
+}
+
+/// Write each missing chunk at its index in the full archive.
+///
+/// A hole need not be a tail. The index is that chunk's position, not an
+/// offset from how many rows are stored.
+pub(crate) async fn ingest_missing_episodes(
+    gm: &GraphMemory,
+    missing: &[(usize, String)],
+    context: &IngestContext,
+) -> Result<IngestionReport, GraphError> {
+    let mut report = IngestionReport::default();
+    for (index, chunk) in missing {
+        let written =
+            ingest_remaining_episodes(gm, std::slice::from_ref(chunk), context, *index).await?;
+        report.episodes_created = report
+            .episodes_created
+            .saturating_add(written.episodes_created);
+        report.errors.extend(written.errors);
+    }
+    Ok(report)
+}
+
+/// `content` of every episode stored for `log`, in store order.
+///
+/// `None` is a row whose content is absent. Callers treat that as a leftover,
+/// not as a chunk.
+pub(crate) async fn stored_log_content(
+    gm: &GraphMemory,
+    log: u32,
+) -> Result<Vec<Option<String>>, GraphError> {
+    let mut response = gm
+        .db()
+        .query("SELECT content FROM episode WHERE log_number = $ln")
+        .bind(("ln", i64::from(log)))
+        .await?;
+    let rows: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .iter()
+        .map(|row| json_content(row.get("content")))
+        .collect())
+}
+
+fn json_content(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+async fn write_log_episodes(
+    gm: &GraphMemory,
+    chunks: &[String],
+    context: &IngestContext,
+    report: &mut IngestionReport,
+) -> Result<(), GraphError> {
+    if episode_ingest_dedupe() {
+        if let Some(log) = context.log_number() {
+            let stored = stored_log_content(gm, log).await?;
+            let missing = missing_chunks(&stored, chunks);
+            let written = ingest_missing_episodes(gm, &missing, context).await?;
+            report.episodes_created = report
+                .episodes_created
+                .saturating_add(written.episodes_created);
+            report.errors.extend(written.errors);
+            return Ok(());
+        }
+    }
+    write_episodes(gm, chunks, context, 0, report).await;
+    Ok(())
 }
 
 async fn write_episodes(
@@ -912,5 +1034,74 @@ mod tests {
         let after = gm.stats().await.unwrap();
         assert_eq!(after.entity_count, 0);
         assert_eq!(after.relationship_count, 0);
+    }
+
+    fn owned(values: &[&str]) -> Vec<Option<String>> {
+        values
+            .iter()
+            .copied()
+            .map(|value| Some(value.to_string()))
+            .collect()
+    }
+
+    fn chunks_of(values: &[&str]) -> Vec<String> {
+        values.iter().copied().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn missing_chunks_returns_the_unstored_tail() {
+        let stored = owned(&["a", "b"]);
+        let chunks = chunks_of(&["a", "b", "c"]);
+        assert_eq!(missing_chunks(&stored, &chunks), vec![(2, "c".to_string())]);
+        assert_eq!(leftover_count(&stored, &chunks), 0);
+    }
+
+    #[test]
+    fn missing_chunks_fills_a_middle_hole() {
+        let stored = owned(&["a", "c"]);
+        let chunks = chunks_of(&["a", "b", "c"]);
+        assert_eq!(missing_chunks(&stored, &chunks), vec![(1, "b".to_string())]);
+        assert_eq!(leftover_count(&stored, &chunks), 0);
+    }
+
+    #[test]
+    fn missing_chunks_counts_identical_copies() {
+        let chunks = chunks_of(&["a", "a"]);
+        let one = owned(&["a"]);
+        assert_eq!(missing_chunks(&one, &chunks), vec![(1, "a".to_string())]);
+        let both = owned(&["a", "a"]);
+        assert!(missing_chunks(&both, &chunks).is_empty());
+        assert_eq!(leftover_count(&both, &chunks), 0);
+    }
+
+    #[test]
+    fn missing_chunks_does_not_consume_a_leftover_string() {
+        let stored = owned(&["a", "old"]);
+        let chunks = chunks_of(&["a"]);
+        assert!(missing_chunks(&stored, &chunks).is_empty());
+        assert_eq!(leftover_count(&stored, &chunks), 1);
+    }
+
+    #[test]
+    fn missing_chunks_of_an_empty_archive_consumes_nothing() {
+        let stored = owned(&["a"]);
+        assert!(missing_chunks(&stored, &[]).is_empty());
+        assert_eq!(leftover_count(&stored, &[]), 1);
+        assert!(missing_chunks(&[], &[]).is_empty());
+        assert_eq!(leftover_count(&[], &[]), 0);
+        let chunks = chunks_of(&["a"]);
+        assert_eq!(missing_chunks(&[], &chunks), vec![(0, "a".to_string())]);
+        assert_eq!(leftover_count(&[], &chunks), 0);
+    }
+
+    #[test]
+    fn missing_chunks_treats_absent_content_as_unmatched() {
+        let chunks = chunks_of(&["a"]);
+        let with_copy = vec![None, Some("a".to_string())];
+        assert!(missing_chunks(&with_copy, &chunks).is_empty());
+        assert_eq!(leftover_count(&with_copy, &chunks), 1);
+        let absent = vec![None];
+        assert_eq!(missing_chunks(&absent, &chunks), vec![(0, "a".to_string())]);
+        assert_eq!(leftover_count(&absent, &chunks), 1);
     }
 }
