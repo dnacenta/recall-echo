@@ -3972,6 +3972,7 @@ mod tests {
 
     fn apply_set_key(cfg: &mut Config, key: &str, value: &str) -> Result<String, String> {
         let before = config_lines(cfg);
+        let base_toml = toml::to_string(cfg).unwrap();
         match cfg.set_key(key, value) {
             Ok(()) => {
                 assert_config_round_trip(cfg);
@@ -3979,6 +3980,11 @@ mod tests {
             }
             Err(err) => {
                 assert_eq!(before, config_lines(cfg), "error changed {key}");
+                assert_eq!(
+                    toml::to_string(cfg).unwrap(),
+                    base_toml,
+                    "error changed {key}"
+                );
                 Err(err.to_string())
             }
         }
