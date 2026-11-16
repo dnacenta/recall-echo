@@ -501,40 +501,158 @@ impl CliSection {
 
     /// Set one `llm.cli.*` key, given the part after `llm.cli.`.
     pub fn set_key(&mut self, key: &str, value: &str) -> Result<(), crate::error::RecallError> {
-        use crate::error::RecallError;
-        match key {
-            "preset" => self.preset = Some(CliPreset::from_str_loose(value)?),
-            "command" => self.command = Some(value.to_string()),
-            "args" => self.args = Some(split_args(value)),
-            "prompt_delivery" => {
-                self.prompt_delivery = Some(PromptDelivery::from_str_loose(value)?)
-            }
-            "prompt_flag" => self.prompt_flag = Some(value.to_string()),
-            "model_flag" => self.model_flag = Some(value.to_string()),
-            "output_format_flag" => self.output_format_flag = Some(value.to_string()),
-            "output_format_value" => self.output_format_value = Some(value.to_string()),
-            "output_mode" => self.output_mode = Some(OutputMode::from_str_loose(value)?),
-            "ndjson_match" => self.ndjson_match = Some(LineMatchers::parse(value)),
-            "system_prompt_flag" => self.system_prompt_flag = Some(value.to_string()),
-            "result_json_path" => self.result_json_path = Some(JsonPaths::parse(value)),
-            "usage_input_path" => self.usage_input_path = Some(JsonPaths::parse(value)),
-            "usage_output_path" => self.usage_output_path = Some(JsonPaths::parse(value)),
-            "extra_args" => self.extra_args = Some(split_args(value)),
-            "timeout_secs" => {
-                self.timeout_secs = Some(
-                    value
-                        .parse()
-                        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?,
-                );
-            }
-            other => {
-                return Err(RecallError::Config(format!(
-                    "unknown config key: llm.cli.{other}"
-                )))
-            }
+        match cli_setter(key) {
+            Some(setter) => setter(self, value),
+            None => Err(crate::error::RecallError::Config(format!(
+                "unknown config key: llm.cli.{key}"
+            ))),
         }
-        Ok(())
     }
+}
+
+type CliSetter = fn(&mut CliSection, &str) -> Result<(), crate::error::RecallError>;
+
+const CLI_SETTERS: &[(&str, CliSetter)] = &[
+    ("preset", set_cli_preset),
+    ("command", set_cli_command),
+    ("args", set_cli_args),
+    ("prompt_delivery", set_cli_prompt_delivery),
+    ("prompt_flag", set_cli_prompt_flag),
+    ("model_flag", set_cli_model_flag),
+    ("output_format_flag", set_cli_output_format_flag),
+    ("output_format_value", set_cli_output_format_value),
+    ("output_mode", set_cli_output_mode),
+    ("ndjson_match", set_cli_ndjson_match),
+    ("system_prompt_flag", set_cli_system_prompt_flag),
+    ("result_json_path", set_cli_result_json_path),
+    ("usage_input_path", set_cli_usage_input_path),
+    ("usage_output_path", set_cli_usage_output_path),
+    ("extra_args", set_cli_extra_args),
+    ("timeout_secs", set_cli_timeout_secs),
+];
+
+fn cli_setter(key: &str) -> Option<CliSetter> {
+    CLI_SETTERS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, setter)| *setter)
+}
+
+fn set_cli_preset(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    cli.preset = Some(CliPreset::from_str_loose(value)?);
+    Ok(())
+}
+
+fn set_cli_command(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    set_cli_string(&mut cli.command, value)
+}
+
+fn set_cli_args(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    set_cli_words(&mut cli.args, value)
+}
+
+fn set_cli_prompt_delivery(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    cli.prompt_delivery = Some(PromptDelivery::from_str_loose(value)?);
+    Ok(())
+}
+
+fn set_cli_prompt_flag(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    set_cli_string(&mut cli.prompt_flag, value)
+}
+
+fn set_cli_model_flag(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    set_cli_string(&mut cli.model_flag, value)
+}
+
+fn set_cli_output_format_flag(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    set_cli_string(&mut cli.output_format_flag, value)
+}
+
+fn set_cli_output_format_value(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    set_cli_string(&mut cli.output_format_value, value)
+}
+
+fn set_cli_output_mode(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    cli.output_mode = Some(OutputMode::from_str_loose(value)?);
+    Ok(())
+}
+
+fn set_cli_ndjson_match(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    cli.ndjson_match = Some(LineMatchers::parse(value));
+    Ok(())
+}
+
+fn set_cli_system_prompt_flag(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    set_cli_string(&mut cli.system_prompt_flag, value)
+}
+
+fn set_cli_result_json_path(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    set_cli_json_paths(&mut cli.result_json_path, value)
+}
+
+fn set_cli_usage_input_path(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    set_cli_json_paths(&mut cli.usage_input_path, value)
+}
+
+fn set_cli_usage_output_path(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    set_cli_json_paths(&mut cli.usage_output_path, value)
+}
+
+fn set_cli_extra_args(cli: &mut CliSection, value: &str) -> Result<(), crate::error::RecallError> {
+    set_cli_words(&mut cli.extra_args, value)
+}
+
+fn set_cli_timeout_secs(
+    cli: &mut CliSection,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    cli.timeout_secs = Some(parse_number(value)?);
+    Ok(())
+}
+
+fn set_cli_string(slot: &mut Option<String>, value: &str) -> Result<(), crate::error::RecallError> {
+    *slot = Some(value.to_string());
+    Ok(())
+}
+
+fn set_cli_words(
+    slot: &mut Option<Vec<String>>,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    *slot = Some(split_args(value));
+    Ok(())
+}
+
+fn set_cli_json_paths(
+    slot: &mut Option<JsonPaths>,
+    value: &str,
+) -> Result<(), crate::error::RecallError> {
+    *slot = Some(JsonPaths::parse(value));
+    Ok(())
 }
 
 /// Split a whitespace-separated argument list from `config set`.
@@ -1412,263 +1530,351 @@ fn validate(mut cfg: Config) -> Result<Config, crate::error::RecallError> {
 impl Config {
     /// Set a dotted config key (e.g. "llm.provider", "ephemeral.max_entries").
     pub fn set_key(&mut self, key: &str, value: &str) -> Result<(), crate::error::RecallError> {
-        use crate::error::RecallError;
-        match key {
-            "llm.provider" | "provider" => {
-                let provider = Provider::from_str_loose(value)?;
-                // When switching provider, reset model, api_base and the CLI
-                // overrides to defaults: all three describe the old vendor.
-                self.llm.model = String::new();
-                self.llm.api_base = String::new();
-                self.llm.cli = CliSection::default();
-                self.llm.provider = provider;
-                Ok(())
-            }
-            _ if key.starts_with("llm.cli.") => {
-                self.llm.cli.set_key(&key["llm.cli.".len()..], value)
-            }
-            "llm.model" | "model" => {
-                self.llm.model = value.to_string();
-                Ok(())
-            }
-            "llm.api_base" | "api_base" => {
-                self.llm.api_base = value.to_string();
-                Ok(())
-            }
-            key if is_dropped_llm_key(key) => Err(dropped_key_error(key)),
-            "ephemeral.max_entries" => {
-                let n: usize = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                if !(1..=50).contains(&n) {
-                    return Err(RecallError::Config(
-                        "max_entries must be between 1 and 50".into(),
-                    ));
-                }
-                self.ephemeral.max_entries = n;
-                Ok(())
-            }
-            "pipeline.docs_dir" => {
-                let section = self.pipeline.get_or_insert(PipelineSection {
-                    docs_dir: None,
-                    auto_sync: None,
-                });
-                section.docs_dir = Some(value.to_string());
-                Ok(())
-            }
-            "pipeline.auto_sync" => {
-                let b: bool = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                let section = self.pipeline.get_or_insert(PipelineSection {
-                    docs_dir: None,
-                    auto_sync: None,
-                });
-                section.auto_sync = Some(b);
-                Ok(())
-            }
-            "serve.idle_timeout_secs" => {
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                self.serve.idle_timeout_secs = secs;
-                Ok(())
-            }
-            "serve.socket_path" => {
-                self.serve.socket_path = if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value.to_string())
-                };
-                Ok(())
-            }
-            "extraction.background_enabled" => {
-                self.extraction.background_enabled = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "extraction.idle_after_secs" => {
-                self.extraction.idle_after_secs = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                Ok(())
-            }
-            "extraction.batch_size" => {
-                let size: usize = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                if size == 0 {
-                    return Err(RecallError::Config("batch_size must be at least 1".into()));
-                }
-                self.extraction.batch_size = size;
-                Ok(())
-            }
-            "capture.enabled" => {
-                self.capture.enabled = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "capture.settle_secs" => {
-                self.capture.settle_secs = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                Ok(())
-            }
-            "capture.sources" => {
-                self.capture.sources = parse_sources(value)?;
-                Ok(())
-            }
-            "graph.provenance.weight_external" => {
-                self.graph_section().provenance.weight_external = parse_weight(value)?;
-                Ok(())
-            }
-            "graph.provenance.weight_user" => {
-                self.graph_section().provenance.weight_user = parse_weight(value)?;
-                Ok(())
-            }
-            "graph.provenance.weight_assistant" => {
-                self.graph_section().provenance.weight_assistant = parse_weight(value)?;
-                Ok(())
-            }
-            "graph.provenance.weight_self" => {
-                self.graph_section().provenance.weight_self = parse_weight(value)?;
-                Ok(())
-            }
-            "graph.dedup.certain_similarity" => {
-                self.graph_section().dedup.certain_similarity = parse_similarity(value)?;
-                Ok(())
-            }
-            "graph.dedup.review_similarity" => {
-                self.graph_section().dedup.review_similarity = parse_similarity(value)?;
-                Ok(())
-            }
-            "graph.pipeline" => {
-                if value != "v1" && value != "v2" {
-                    return Err(RecallError::Config(
-                        "graph.pipeline must be \"v1\" or \"v2\"".into(),
-                    ));
-                }
-                self.graph_section().pipeline = Some(value.to_string());
-                Ok(())
-            }
-            "graph.known_facts_context" => {
-                self.graph_section().known_facts_context = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.known_key_binding" => {
-                self.graph_section().known_key_binding = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.known_match" => {
-                self.graph_section().known_match = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate" => {
-                self.graph_section().consolidate = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_hold" => {
-                self.graph_section().consolidate_hold = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_links" => {
-                self.graph_section().consolidate_links = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_components" => {
-                self.graph_section().consolidate_components = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_key_rename" => {
-                self.graph_section().consolidate_key_rename = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_replaces_cue" => {
-                self.graph_section().consolidate_replaces_cue = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_replaces_departure" => {
-                self.graph_section().consolidate_replaces_departure = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_orphan_sweep" => {
-                self.graph_section().consolidate_orphan_sweep = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_rule_fragments" => {
-                self.graph_section().consolidate_rule_fragments = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.consolidate_retire_component" => {
-                self.graph_section().consolidate_retire_component = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.drop_restatements" => {
-                self.graph_section().drop_restatements = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.ground_component_edges" => {
-                self.graph_section().ground_component_edges = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.recover_turns" => {
-                self.graph_section().recover_turns = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid boolean: {value}")))?;
-                Ok(())
-            }
-            "graph.dedup.max_candidates" => {
-                let n: usize = value
-                    .parse()
-                    .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
-                if n == 0 {
-                    return Err(RecallError::Config(
-                        "max_candidates must be at least 1".into(),
-                    ));
-                }
-                self.graph_section().dedup.max_candidates = n;
-                Ok(())
-            }
-            other => Err(RecallError::Config(format!("unknown config key: {other}"))),
+        if let Some(setter) = config_setter(key) {
+            return setter(self, value);
         }
+        if let Some(field) = graph_bool_field(key) {
+            return assign_graph_bool(self, value, field);
+        }
+        if let Some(rest) = key.strip_prefix("llm.cli.") {
+            return self.llm.cli.set_key(rest, value);
+        }
+        if is_dropped_llm_key(key) {
+            return Err(dropped_key_error(key));
+        }
+        Err(crate::error::RecallError::Config(format!(
+            "unknown config key: {key}"
+        )))
     }
 
     /// The `[graph]` section, created at its defaults if the config has none.
     fn graph_section(&mut self) -> &mut GraphSection {
         self.graph.get_or_insert_with(GraphSection::default)
     }
+}
+
+type ConfigSetter = fn(&mut Config, &str) -> Result<(), crate::error::RecallError>;
+
+const CONFIG_SETTERS: &[(&str, ConfigSetter)] = &[
+    ("llm.provider", set_provider),
+    ("provider", set_provider),
+    ("llm.model", set_model),
+    ("model", set_model),
+    ("llm.api_base", set_api_base),
+    ("api_base", set_api_base),
+    ("ephemeral.max_entries", set_max_entries),
+    ("pipeline.docs_dir", set_docs_dir),
+    ("pipeline.auto_sync", set_auto_sync),
+    ("serve.idle_timeout_secs", set_idle_timeout),
+    ("serve.socket_path", set_socket_path),
+    ("extraction.background_enabled", set_background_enabled),
+    ("extraction.idle_after_secs", set_idle_after),
+    ("extraction.batch_size", set_batch_size),
+    ("capture.enabled", set_capture_enabled),
+    ("capture.settle_secs", set_settle_secs),
+    ("capture.sources", set_capture_sources),
+    ("graph.provenance.weight_external", set_weight_external),
+    ("graph.provenance.weight_user", set_weight_user),
+    ("graph.provenance.weight_assistant", set_weight_assistant),
+    ("graph.provenance.weight_self", set_weight_self),
+    ("graph.dedup.certain_similarity", set_certain_similarity),
+    ("graph.dedup.review_similarity", set_review_similarity),
+    ("graph.pipeline", set_pipeline_version),
+    ("graph.dedup.max_candidates", set_max_candidates),
+];
+
+fn config_setter(key: &str) -> Option<ConfigSetter> {
+    CONFIG_SETTERS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, setter)| *setter)
+}
+
+fn set_provider(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let provider = Provider::from_str_loose(value)?;
+    // When switching provider, reset model, api_base and the CLI
+    // overrides to defaults: all three describe the old vendor.
+    cfg.llm.model = String::new();
+    cfg.llm.api_base = String::new();
+    cfg.llm.cli = CliSection::default();
+    cfg.llm.provider = provider;
+    Ok(())
+}
+
+fn set_model(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.llm.model = value.to_string();
+    Ok(())
+}
+
+fn set_api_base(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.llm.api_base = value.to_string();
+    Ok(())
+}
+
+fn set_max_entries(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let n: usize = parse_number(value)?;
+    if !(1..=50).contains(&n) {
+        return Err(crate::error::RecallError::Config(
+            "max_entries must be between 1 and 50".into(),
+        ));
+    }
+    cfg.ephemeral.max_entries = n;
+    Ok(())
+}
+
+fn set_docs_dir(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let docs_dir = value.to_string();
+    pipeline_section(cfg).docs_dir = Some(docs_dir);
+    Ok(())
+}
+
+fn set_auto_sync(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let enabled = parse_bool(value)?;
+    pipeline_section(cfg).auto_sync = Some(enabled);
+    Ok(())
+}
+
+fn pipeline_section(cfg: &mut Config) -> &mut PipelineSection {
+    cfg.pipeline.get_or_insert(PipelineSection {
+        docs_dir: None,
+        auto_sync: None,
+    })
+}
+
+fn set_idle_timeout(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.serve.idle_timeout_secs = parse_number(value)?;
+    Ok(())
+}
+
+fn set_socket_path(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.serve.socket_path = if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    };
+    Ok(())
+}
+
+fn set_background_enabled(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.extraction.background_enabled = parse_bool(value)?;
+    Ok(())
+}
+
+fn set_idle_after(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.extraction.idle_after_secs = parse_number(value)?;
+    Ok(())
+}
+
+fn set_batch_size(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let size: usize = parse_number(value)?;
+    if size == 0 {
+        return Err(crate::error::RecallError::Config(
+            "batch_size must be at least 1".into(),
+        ));
+    }
+    cfg.extraction.batch_size = size;
+    Ok(())
+}
+
+fn set_capture_enabled(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.capture.enabled = parse_bool(value)?;
+    Ok(())
+}
+
+fn set_settle_secs(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.capture.settle_secs = parse_number(value)?;
+    Ok(())
+}
+
+fn set_capture_sources(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    cfg.capture.sources = parse_sources(value)?;
+    Ok(())
+}
+
+fn set_weight_external(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let weight = parse_weight(value)?;
+    cfg.graph_section().provenance.weight_external = weight;
+    Ok(())
+}
+
+fn set_weight_user(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let weight = parse_weight(value)?;
+    cfg.graph_section().provenance.weight_user = weight;
+    Ok(())
+}
+
+fn set_weight_assistant(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let weight = parse_weight(value)?;
+    cfg.graph_section().provenance.weight_assistant = weight;
+    Ok(())
+}
+
+fn set_weight_self(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let weight = parse_weight(value)?;
+    cfg.graph_section().provenance.weight_self = weight;
+    Ok(())
+}
+
+fn set_certain_similarity(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let similarity = parse_similarity(value)?;
+    cfg.graph_section().dedup.certain_similarity = similarity;
+    Ok(())
+}
+
+fn set_review_similarity(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let similarity = parse_similarity(value)?;
+    cfg.graph_section().dedup.review_similarity = similarity;
+    Ok(())
+}
+
+fn set_pipeline_version(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    if value != "v1" && value != "v2" {
+        return Err(crate::error::RecallError::Config(
+            "graph.pipeline must be \"v1\" or \"v2\"".into(),
+        ));
+    }
+    cfg.graph_section().pipeline = Some(value.to_string());
+    Ok(())
+}
+
+fn set_max_candidates(cfg: &mut Config, value: &str) -> Result<(), crate::error::RecallError> {
+    let count: usize = parse_number(value)?;
+    if count == 0 {
+        return Err(crate::error::RecallError::Config(
+            "max_candidates must be at least 1".into(),
+        ));
+    }
+    cfg.graph_section().dedup.max_candidates = count;
+    Ok(())
+}
+
+type GraphBoolField = fn(&mut GraphSection) -> &mut bool;
+
+const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
+    ("graph.known_facts_context", flag_known_facts_context),
+    ("graph.known_key_binding", flag_known_key_binding),
+    ("graph.known_match", flag_known_match),
+    ("graph.consolidate", flag_consolidate),
+    ("graph.consolidate_hold", flag_consolidate_hold),
+    ("graph.consolidate_links", flag_consolidate_links),
+    ("graph.consolidate_components", flag_consolidate_components),
+    ("graph.consolidate_key_rename", flag_consolidate_key_rename),
+    (
+        "graph.consolidate_replaces_cue",
+        flag_consolidate_replaces_cue,
+    ),
+    (
+        "graph.consolidate_replaces_departure",
+        flag_consolidate_replaces_departure,
+    ),
+    (
+        "graph.consolidate_orphan_sweep",
+        flag_consolidate_orphan_sweep,
+    ),
+    (
+        "graph.consolidate_rule_fragments",
+        flag_consolidate_rule_fragments,
+    ),
+    (
+        "graph.consolidate_retire_component",
+        flag_consolidate_retire_component,
+    ),
+    ("graph.drop_restatements", flag_drop_restatements),
+    ("graph.ground_component_edges", flag_ground_component_edges),
+    ("graph.recover_turns", flag_recover_turns),
+];
+
+fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
+    GRAPH_BOOLS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, field)| *field)
+}
+
+fn assign_graph_bool(
+    cfg: &mut Config,
+    value: &str,
+    field: GraphBoolField,
+) -> Result<(), crate::error::RecallError> {
+    let flag = parse_bool(value)?;
+    *field(cfg.graph_section()) = flag;
+    Ok(())
+}
+
+fn flag_known_facts_context(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.known_facts_context
+}
+
+fn flag_known_key_binding(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.known_key_binding
+}
+
+fn flag_known_match(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.known_match
+}
+
+fn flag_consolidate(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate
+}
+
+fn flag_consolidate_hold(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_hold
+}
+
+fn flag_consolidate_links(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_links
+}
+
+fn flag_consolidate_components(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_components
+}
+
+fn flag_consolidate_key_rename(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_key_rename
+}
+
+fn flag_consolidate_replaces_cue(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_replaces_cue
+}
+
+fn flag_consolidate_replaces_departure(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_replaces_departure
+}
+
+fn flag_consolidate_orphan_sweep(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_orphan_sweep
+}
+
+fn flag_consolidate_rule_fragments(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_rule_fragments
+}
+
+fn flag_consolidate_retire_component(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_retire_component
+}
+
+fn flag_drop_restatements(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.drop_restatements
+}
+
+fn flag_ground_component_edges(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.ground_component_edges
+}
+
+fn flag_recover_turns(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.recover_turns
+}
+
+fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
+    value
+        .parse()
+        .map_err(|_| crate::error::RecallError::Config(format!("invalid boolean: {value}")))
+}
+
+fn parse_number<T: std::str::FromStr>(value: &str) -> Result<T, crate::error::RecallError> {
+    value
+        .parse()
+        .map_err(|_| crate::error::RecallError::Config(format!("invalid number: {value}")))
 }
 
 /// Parse a comma-separated CLI list. Empty means "auto-detect".
@@ -1698,9 +1904,7 @@ fn parse_sources(
 /// Zero is allowed — it is how a class is switched off entirely.
 fn parse_weight(value: &str) -> Result<f64, crate::error::RecallError> {
     use crate::error::RecallError;
-    let weight: f64 = value
-        .parse()
-        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+    let weight: f64 = parse_number(value)?;
     if !weight.is_finite() || weight < 0.0 {
         return Err(RecallError::Config(format!(
             "evidence weight must be finite and non-negative, got {value}"
@@ -1712,9 +1916,7 @@ fn parse_weight(value: &str) -> Result<f64, crate::error::RecallError> {
 /// Parse a cosine-similarity threshold: a finite number in `0.0..=1.0`.
 fn parse_similarity(value: &str) -> Result<f64, crate::error::RecallError> {
     use crate::error::RecallError;
-    let similarity: f64 = value
-        .parse()
-        .map_err(|_| RecallError::Config(format!("invalid number: {value}")))?;
+    let similarity: f64 = parse_number(value)?;
     if !similarity.is_finite() || !(0.0..=1.0).contains(&similarity) {
         return Err(RecallError::Config(format!(
             "similarity threshold must be between 0.0 and 1.0, got {value}"
