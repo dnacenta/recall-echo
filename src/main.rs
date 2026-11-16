@@ -1265,9 +1265,18 @@ fn bench_question(
     question: Option<String>,
     question_stdin: bool,
 ) -> Result<String, recall_echo::error::RecallError> {
-    match (question, question_stdin) {
+    bench_question_with(question, question_stdin, read_stdin_to_string)
+}
+
+#[cfg(feature = "bench")]
+fn bench_question_with(
+    question: Option<String>,
+    stdin: bool,
+    read: impl FnOnce() -> Result<String, recall_echo::error::RecallError>,
+) -> Result<String, recall_echo::error::RecallError> {
+    match (question, stdin) {
         (Some(text), false) => Ok(text),
-        (None, true) => read_stdin_to_string(),
+        (None, true) => read(),
         _ => Err(recall_echo::error::RecallError::Config(
             "exactly one of --question or --question-stdin is required".into(),
         )),
@@ -2605,6 +2614,17 @@ mod tests {
     fn bench_question_returns_the_given_question() {
         let text = bench_question(Some("alpha".to_string()), false).expect("question");
         assert_eq!(text, "alpha");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_question_reads_stdin_only_when_asked() {
+        let from_stdin =
+            bench_question_with(None, true, || Ok("alpha".to_string())).expect("stdin");
+        assert_eq!(from_stdin, "alpha");
+        let from_flag =
+            bench_question_with(Some("alpha".to_string()), false, || panic!("read")).expect("flag");
+        assert_eq!(from_flag, "alpha");
     }
 
     #[cfg(feature = "bench")]
