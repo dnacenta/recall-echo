@@ -3335,4 +3335,572 @@ mod tests {
         assert!((scoring.weight_hotness - 0.30).abs() < f64::EPSILON);
         assert!((scoring.weight_utility - 0.5).abs() < f64::EPSILON);
     }
+
+    /// Pins every `config set` spelling, alias, boundary and error text.
+    ///
+    /// `RECALL_ECHO_BLESS=1` rewrites the fixture from the current code. The
+    /// fixture is generated once and then compared byte for byte.
+    #[test]
+    fn set_key_golden_pins_every_key_and_error() {
+        let cases = set_key_cases();
+        assert_set_key_coverage(&cases);
+        let rendered = render_set_key_golden(&cases);
+        let path = set_key_golden_path();
+        if std::env::var_os("RECALL_ECHO_BLESS").is_some() {
+            write_golden(&path, &rendered);
+        }
+        let expected = fs::read_to_string(&path).expect("set_key golden");
+        assert_eq!(rendered, expected);
+    }
+
+    fn write_golden(path: &std::path::Path, rendered: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture directory");
+        }
+        fs::write(path, rendered).expect("write golden");
+    }
+
+    fn set_key_golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/config/set_key.golden")
+    }
+
+    fn set_key_cases() -> Vec<(&'static str, &'static str)> {
+        let mut cases = Vec::new();
+        push_provider_cases(&mut cases);
+        push_cli_cases(&mut cases);
+        push_llm_string_cases(&mut cases);
+        push_removed_cases(&mut cases);
+        push_ephemeral_cases(&mut cases);
+        push_pipeline_cases(&mut cases);
+        push_serve_cases(&mut cases);
+        push_extraction_cases(&mut cases);
+        push_capture_cases(&mut cases);
+        push_weight_cases(&mut cases);
+        push_similarity_cases(&mut cases);
+        push_graph_pipeline_cases(&mut cases);
+        push_max_candidates_cases(&mut cases);
+        push_bool_cases(&mut cases);
+        push_unknown_cases(&mut cases);
+        cases
+    }
+
+    fn push_pairs(
+        cases: &mut Vec<(&'static str, &'static str)>,
+        key: &'static str,
+        values: &[&'static str],
+    ) {
+        for value in values {
+            cases.push((key, value));
+        }
+    }
+
+    fn push_provider_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "llm.provider", &["cli", "nonesuch"]);
+        push_pairs(cases, "provider", &["cli", "nonesuch"]);
+    }
+
+    fn push_cli_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "llm.cli.preset", &["custom", "nonesuch"]);
+        push_pairs(cases, "llm.cli.command", &["alpha"]);
+        push_pairs(cases, "llm.cli.args", &["alpha"]);
+        push_pairs(cases, "llm.cli.prompt_delivery", &["stdin", "nonesuch"]);
+        push_pairs(cases, "llm.cli.prompt_flag", &["alpha"]);
+        push_pairs(cases, "llm.cli.model_flag", &["alpha"]);
+        push_pairs(cases, "llm.cli.output_format_flag", &["alpha"]);
+        push_pairs(cases, "llm.cli.output_format_value", &["alpha"]);
+        push_pairs(cases, "llm.cli.output_mode", &["raw", "nonesuch"]);
+        push_pairs(cases, "llm.cli.ndjson_match", &["alpha"]);
+        push_pairs(cases, "llm.cli.system_prompt_flag", &["alpha"]);
+        push_pairs(cases, "llm.cli.result_json_path", &["alpha"]);
+        push_pairs(cases, "llm.cli.usage_input_path", &["alpha"]);
+        push_pairs(cases, "llm.cli.usage_output_path", &["alpha"]);
+        push_pairs(cases, "llm.cli.extra_args", &["alpha"]);
+        push_pairs(cases, "llm.cli.timeout_secs", &["1", "0", "alpha", ""]);
+    }
+
+    fn push_llm_string_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "llm.model", &["alpha"]);
+        push_pairs(cases, "model", &["alpha"]);
+        push_pairs(cases, "llm.api_base", &["/x"]);
+        push_pairs(cases, "api_base", &["/x"]);
+    }
+
+    fn push_removed_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        for key in [
+            "num_ctx",
+            "llm.num_ctx",
+            "api_style",
+            "llm.api_style",
+            "llm.cli.num_ctx",
+        ] {
+            cases.push((key, "1"));
+        }
+    }
+
+    fn push_ephemeral_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(
+            cases,
+            "ephemeral.max_entries",
+            &["10", "0", "1", "50", "51", "alpha", ""],
+        );
+    }
+
+    fn push_pipeline_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "pipeline.docs_dir", &["/x"]);
+    }
+
+    fn push_serve_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "serve.idle_timeout_secs", &["1", "0", "alpha", ""]);
+        push_pairs(cases, "serve.socket_path", &["/x", "", "   ", "  /x  "]);
+    }
+
+    fn push_extraction_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(
+            cases,
+            "extraction.idle_after_secs",
+            &["1", "0", "alpha", ""],
+        );
+        push_pairs(cases, "extraction.batch_size", &["1", "0", "alpha", ""]);
+    }
+
+    fn push_capture_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "capture.settle_secs", &["1", "0", "alpha", ""]);
+        push_pairs(
+            cases,
+            "capture.sources",
+            &["codex", "", "codex,codex", "nonesuch"],
+        );
+    }
+
+    fn push_weight_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        for key in WEIGHT_KEYS {
+            push_pairs(cases, key, WEIGHT_VALUES);
+        }
+    }
+
+    fn push_similarity_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        for key in SIMILARITY_KEYS {
+            push_pairs(cases, key, SIMILARITY_VALUES);
+        }
+    }
+
+    fn push_graph_pipeline_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(cases, "graph.pipeline", &["v1", "v2", "v3"]);
+    }
+
+    fn push_max_candidates_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        push_pairs(
+            cases,
+            "graph.dedup.max_candidates",
+            &["1", "0", "alpha", ""],
+        );
+    }
+
+    fn push_bool_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        for key in BOOL_KEYS {
+            push_pairs(cases, key, BOOL_SPELLINGS);
+        }
+    }
+
+    fn push_unknown_cases(cases: &mut Vec<(&'static str, &'static str)>) {
+        for key in UNKNOWN_KEYS {
+            cases.push((key, "alpha"));
+        }
+    }
+
+    const BOOL_SPELLINGS: &[&str] = &["true", "false", "yes", "True", "1"];
+
+    const BOOL_KEYS: &[&str] = &[
+        "pipeline.auto_sync",
+        "extraction.background_enabled",
+        "capture.enabled",
+        "graph.known_facts_context",
+        "graph.known_key_binding",
+        "graph.known_match",
+        "graph.consolidate",
+        "graph.consolidate_hold",
+        "graph.consolidate_links",
+        "graph.consolidate_components",
+        "graph.consolidate_key_rename",
+        "graph.consolidate_replaces_cue",
+        "graph.consolidate_replaces_departure",
+        "graph.consolidate_orphan_sweep",
+        "graph.consolidate_rule_fragments",
+        "graph.consolidate_retire_component",
+        "graph.drop_restatements",
+        "graph.ground_component_edges",
+        "graph.recover_turns",
+    ];
+
+    const WEIGHT_KEYS: &[&str] = &[
+        "graph.provenance.weight_external",
+        "graph.provenance.weight_user",
+        "graph.provenance.weight_assistant",
+        "graph.provenance.weight_self",
+    ];
+
+    const WEIGHT_VALUES: &[&str] = &["1", "0", "-1", "inf", "NaN", "alpha", ""];
+
+    const SIMILARITY_KEYS: &[&str] = &[
+        "graph.dedup.certain_similarity",
+        "graph.dedup.review_similarity",
+    ];
+
+    const SIMILARITY_VALUES: &[&str] = &["0.0", "1.0", "1.5", "-0.1", "NaN", "alpha", ""];
+
+    const UNKNOWN_KEYS: &[&str] = &[
+        "nonexistent.key",
+        "",
+        "llm.cli.",
+        "llm.cli",
+        "llm.cli.nonexistent",
+        "LLM.MODEL",
+        "llm.model ",
+    ];
+
+    const ACCEPTED_SPELLINGS: &[&str] = &[
+        "llm.provider",
+        "provider",
+        "llm.model",
+        "model",
+        "llm.api_base",
+        "api_base",
+        "llm.cli.preset",
+        "llm.cli.command",
+        "llm.cli.args",
+        "llm.cli.prompt_delivery",
+        "llm.cli.prompt_flag",
+        "llm.cli.model_flag",
+        "llm.cli.output_format_flag",
+        "llm.cli.output_format_value",
+        "llm.cli.output_mode",
+        "llm.cli.ndjson_match",
+        "llm.cli.system_prompt_flag",
+        "llm.cli.result_json_path",
+        "llm.cli.usage_input_path",
+        "llm.cli.usage_output_path",
+        "llm.cli.extra_args",
+        "llm.cli.timeout_secs",
+        "ephemeral.max_entries",
+        "pipeline.docs_dir",
+        "pipeline.auto_sync",
+        "serve.idle_timeout_secs",
+        "serve.socket_path",
+        "extraction.background_enabled",
+        "extraction.idle_after_secs",
+        "extraction.batch_size",
+        "capture.enabled",
+        "capture.settle_secs",
+        "capture.sources",
+        "graph.provenance.weight_external",
+        "graph.provenance.weight_user",
+        "graph.provenance.weight_assistant",
+        "graph.provenance.weight_self",
+        "graph.dedup.certain_similarity",
+        "graph.dedup.review_similarity",
+        "graph.pipeline",
+        "graph.dedup.max_candidates",
+        "graph.known_facts_context",
+        "graph.known_key_binding",
+        "graph.known_match",
+        "graph.consolidate",
+        "graph.consolidate_hold",
+        "graph.consolidate_links",
+        "graph.consolidate_components",
+        "graph.consolidate_key_rename",
+        "graph.consolidate_replaces_cue",
+        "graph.consolidate_replaces_departure",
+        "graph.consolidate_orphan_sweep",
+        "graph.consolidate_rule_fragments",
+        "graph.consolidate_retire_component",
+        "graph.drop_restatements",
+        "graph.ground_component_edges",
+        "graph.recover_turns",
+    ];
+
+    fn assert_set_key_coverage(cases: &[(&str, &str)]) {
+        assert_eq!(ACCEPTED_SPELLINGS.len(), 57);
+        assert_eq!(BOOL_KEYS.len(), 19);
+        assert_eq!(BOOL_SPELLINGS, ["true", "false", "yes", "True", "1"]);
+        for key in ACCEPTED_SPELLINGS {
+            assert!(case_has_key(cases, key), "missing {key}");
+        }
+        assert_has_values(
+            cases,
+            "ephemeral.max_entries",
+            &["10", "0", "1", "50", "51", "alpha", ""],
+        );
+        assert_has_values(cases, "extraction.batch_size", &["1", "0", "alpha", ""]);
+        assert_has_values(
+            cases,
+            "graph.dedup.max_candidates",
+            &["1", "0", "alpha", ""],
+        );
+        assert_has_values(cases, "serve.socket_path", &["/x", "", "   ", "  /x  "]);
+        assert_has_values(
+            cases,
+            "capture.sources",
+            &["codex", "", "codex,codex", "nonesuch"],
+        );
+        assert_has_values(cases, "graph.pipeline", &["v1", "v2", "v3"]);
+        assert_has_values(cases, "llm.provider", &["cli", "nonesuch"]);
+        assert_has_values(cases, "provider", &["cli", "nonesuch"]);
+        for key in WEIGHT_KEYS {
+            assert_has_values(cases, key, WEIGHT_VALUES);
+        }
+        for key in SIMILARITY_KEYS {
+            assert_has_values(cases, key, SIMILARITY_VALUES);
+        }
+        for key in BOOL_KEYS {
+            assert_has_values(cases, key, BOOL_SPELLINGS);
+        }
+        for key in [
+            "num_ctx",
+            "llm.num_ctx",
+            "api_style",
+            "llm.api_style",
+            "llm.cli.num_ctx",
+        ] {
+            assert!(case_has_key(cases, key), "missing {key}");
+        }
+        for key in UNKNOWN_KEYS {
+            assert!(case_has_key(cases, key), "missing {key}");
+        }
+    }
+
+    fn case_has_key(cases: &[(&str, &str)], key: &str) -> bool {
+        cases.iter().any(|(case_key, _)| *case_key == key)
+    }
+
+    fn assert_has_values(cases: &[(&str, &str)], key: &str, values: &[&str]) {
+        for value in values {
+            assert!(
+                cases
+                    .iter()
+                    .any(|(case_key, case_value)| { *case_key == key && *case_value == *value }),
+                "missing {key}={value}"
+            );
+        }
+    }
+
+    fn render_set_key_golden(cases: &[(&str, &str)]) -> String {
+        let mut out = String::new();
+        for (name, base) in set_key_bases() {
+            assert_config_round_trip(&base);
+            for (key, value) in cases {
+                out.push_str(&render_set_key_case(name, &base, key, value));
+                out.push('\n');
+            }
+        }
+        out.push_str(&render_pipeline_sequence());
+        out.push_str(&render_provider_reset_sequence());
+        out
+    }
+
+    fn set_key_bases() -> Vec<(&'static str, Config)> {
+        vec![
+            ("default", Config::default()),
+            ("populated", populated_config()),
+        ]
+    }
+
+    fn populated_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.llm.model = "alpha".to_string();
+        cfg.llm.api_base = "/x".to_string();
+        cfg.llm.cli.command = Some("alpha".to_string());
+        cfg.pipeline = Some(PipelineSection {
+            docs_dir: Some("/x".to_string()),
+            auto_sync: Some(true),
+        });
+        cfg.graph = Some(populated_graph());
+        cfg.serve.socket_path = Some("/x".to_string());
+        cfg.serve.idle_timeout_secs = 9;
+        cfg.extraction.background_enabled = false;
+        cfg.extraction.idle_after_secs = 9;
+        cfg.extraction.batch_size = 9;
+        cfg.capture.enabled = false;
+        cfg.capture.sources = Some(vec![crate::transcript::Source::Codex]);
+        cfg.capture.settle_secs = 9;
+        cfg
+    }
+
+    fn populated_graph() -> GraphSection {
+        let mut graph = GraphSection::default();
+        enable_graph_flags(&mut graph);
+        graph.provenance.weight_external = 2.0;
+        graph.provenance.weight_user = 3.0;
+        graph.provenance.weight_assistant = 4.0;
+        graph.provenance.weight_self = 5.0;
+        graph.dedup.certain_similarity = 0.5;
+        graph.dedup.review_similarity = 0.25;
+        graph.dedup.max_candidates = 7;
+        graph.pipeline = Some("v2".to_string());
+        graph
+    }
+
+    fn enable_graph_flags(graph: &mut GraphSection) {
+        graph.known_facts_context = true;
+        graph.known_key_binding = true;
+        graph.known_match = true;
+        graph.consolidate = true;
+        graph.consolidate_hold = true;
+        graph.consolidate_links = true;
+        graph.consolidate_components = true;
+        graph.consolidate_key_rename = true;
+        graph.consolidate_replaces_cue = true;
+        graph.consolidate_replaces_departure = true;
+        graph.consolidate_orphan_sweep = true;
+        graph.consolidate_rule_fragments = true;
+        graph.consolidate_retire_component = true;
+        graph.drop_restatements = true;
+        graph.ground_component_edges = true;
+        graph.recover_turns = true;
+    }
+
+    fn render_set_key_case(base_name: &str, base: &Config, key: &str, value: &str) -> String {
+        let mut cfg = clone_config(base);
+        let header = format!("{base_name} {key} = {value}\n");
+        match apply_set_key(&mut cfg, key, value) {
+            Ok(diff) => format!("{header}ok\n{diff}"),
+            Err(err) => format!("{header}err {err}\n"),
+        }
+    }
+
+    fn apply_set_key(cfg: &mut Config, key: &str, value: &str) -> Result<String, String> {
+        let before = config_lines(cfg);
+        match cfg.set_key(key, value) {
+            Ok(()) => {
+                assert_config_round_trip(cfg);
+                Ok(diff_lines(&before, &config_lines(cfg)))
+            }
+            Err(err) => {
+                assert_eq!(before, config_lines(cfg), "error changed {key}");
+                Err(err.to_string())
+            }
+        }
+    }
+
+    fn render_pipeline_sequence() -> String {
+        let mut cfg = Config::default();
+        let before = config_lines(&cfg);
+        cfg.set_key("pipeline.docs_dir", "/x").expect("docs_dir");
+        cfg.set_key("pipeline.auto_sync", "true")
+            .expect("auto_sync");
+        let section = cfg.pipeline.as_ref().expect("pipeline");
+        assert_eq!(section.docs_dir.as_deref(), Some("/x"));
+        assert_eq!(section.auto_sync, Some(true));
+        assert_config_round_trip(&cfg);
+        let diff = diff_lines(&before, &config_lines(&cfg));
+        format!("seq default pipeline.docs_dir = /x then pipeline.auto_sync = true\nok\n{diff}\n")
+    }
+
+    fn render_provider_reset_sequence() -> String {
+        let mut cfg = Config::default();
+        let before = config_lines(&cfg);
+        cfg.set_key("llm.model", "alpha").expect("model");
+        cfg.set_key("provider", "cli").expect("provider");
+        assert!(cfg.llm.model.is_empty());
+        assert!(cfg.llm.api_base.is_empty());
+        assert!(cfg.llm.cli.is_empty());
+        assert_eq!(cfg.llm.provider, Provider::Cli);
+        assert_config_round_trip(&cfg);
+        let diff = diff_lines(&before, &config_lines(&cfg));
+        format!("seq default llm.model = alpha then provider = cli\nok\n{diff}\n")
+    }
+
+    fn clone_config(cfg: &Config) -> Config {
+        let text = toml::to_string(cfg).expect("config serializes");
+        toml::from_str(&text).expect("config parses")
+    }
+
+    fn assert_config_round_trip(cfg: &Config) {
+        let once = toml::to_string(cfg).expect("config serializes");
+        let parsed: Config = toml::from_str(&once).expect("config parses");
+        let twice = toml::to_string(&parsed).expect("config serializes again");
+        assert_eq!(once, twice, "config serialization is not a round trip");
+    }
+
+    fn config_lines(cfg: &Config) -> Vec<String> {
+        let text = toml::to_string(cfg).expect("config serializes");
+        let value: toml::Value = toml::from_str(&text).expect("config toml parses");
+        let mut lines = Vec::new();
+        flatten_toml("", &value, &mut lines);
+        lines
+    }
+
+    fn flatten_toml(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
+        if let toml::Value::Table(table) = value {
+            for (key, child) in table {
+                flatten_toml(&join_toml_path(prefix, key), child, out);
+            }
+            return;
+        }
+        out.push(format!("{prefix} = {}", toml_leaf(value)));
+    }
+
+    fn join_toml_path(prefix: &str, key: &str) -> String {
+        if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{prefix}.{key}")
+        }
+    }
+
+    fn toml_leaf(value: &toml::Value) -> String {
+        let mut table = toml::map::Map::new();
+        table.insert("v".to_string(), value.clone());
+        let text = toml::to_string(&table).expect("leaf serializes");
+        text.trim_start_matches("v = ")
+            .trim_end_matches(['\r', '\n'])
+            .to_string()
+    }
+
+    fn diff_lines(before: &[String], after: &[String]) -> String {
+        let mut out = String::new();
+        for path in flat_paths(before, after) {
+            push_changed(
+                &mut out,
+                path,
+                flat_get(before, path),
+                flat_get(after, path),
+            );
+        }
+        out
+    }
+
+    fn flat_paths<'a>(
+        before: &'a [String],
+        after: &'a [String],
+    ) -> std::collections::BTreeSet<&'a str> {
+        before
+            .iter()
+            .chain(after.iter())
+            .map(|line| split_flat(line).0)
+            .collect()
+    }
+
+    fn flat_get<'a>(lines: &'a [String], path: &str) -> Option<&'a str> {
+        lines.iter().find_map(|line| {
+            let (key, value) = split_flat(line);
+            (key == path).then_some(value)
+        })
+    }
+
+    fn split_flat(line: &str) -> (&str, &str) {
+        line.split_once(" = ").unwrap_or((line, ""))
+    }
+
+    fn push_changed(out: &mut String, path: &str, old: Option<&str>, new: Option<&str>) {
+        if old == new {
+            return;
+        }
+        if let Some(value) = old {
+            out.push_str(&format!("-{path} = {value}\n"));
+        }
+        if let Some(value) = new {
+            out.push_str(&format!("+{path} = {value}\n"));
+        }
+    }
 }

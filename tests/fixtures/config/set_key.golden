@@ -1,0 +1,2300 @@
+default llm.provider = cli
+ok
+-llm.provider = "claude-code"
++llm.provider = "cli"
+
+default llm.provider = nonesuch
+err config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code', 'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)
+
+default provider = cli
+ok
+-llm.provider = "claude-code"
++llm.provider = "cli"
+
+default provider = nonesuch
+err config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code', 'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)
+
+default llm.cli.preset = custom
+ok
++llm.cli.preset = "custom"
+
+default llm.cli.preset = nonesuch
+err config: unknown CLI preset: nonesuch (use 'claude-code', 'gemini', 'grok', 'codex', or 'custom')
+
+default llm.cli.command = alpha
+ok
++llm.cli.command = "alpha"
+
+default llm.cli.args = alpha
+ok
++llm.cli.args = ["alpha"]
+
+default llm.cli.prompt_delivery = stdin
+ok
++llm.cli.prompt_delivery = "stdin"
+
+default llm.cli.prompt_delivery = nonesuch
+err config: unknown prompt delivery: nonesuch (use 'stdin', 'flag', or 'arg')
+
+default llm.cli.prompt_flag = alpha
+ok
++llm.cli.prompt_flag = "alpha"
+
+default llm.cli.model_flag = alpha
+ok
++llm.cli.model_flag = "alpha"
+
+default llm.cli.output_format_flag = alpha
+ok
++llm.cli.output_format_flag = "alpha"
+
+default llm.cli.output_format_value = alpha
+ok
++llm.cli.output_format_value = "alpha"
+
+default llm.cli.output_mode = raw
+ok
++llm.cli.output_mode = "raw"
+
+default llm.cli.output_mode = nonesuch
+err config: unknown output mode: nonesuch (use 'raw', 'single-json', or 'ndjson')
+
+default llm.cli.ndjson_match = alpha
+ok
++llm.cli.ndjson_match = ["alpha"]
+
+default llm.cli.system_prompt_flag = alpha
+ok
++llm.cli.system_prompt_flag = "alpha"
+
+default llm.cli.result_json_path = alpha
+ok
++llm.cli.result_json_path = "alpha"
+
+default llm.cli.usage_input_path = alpha
+ok
++llm.cli.usage_input_path = "alpha"
+
+default llm.cli.usage_output_path = alpha
+ok
++llm.cli.usage_output_path = "alpha"
+
+default llm.cli.extra_args = alpha
+ok
++llm.cli.extra_args = ["alpha"]
+
+default llm.cli.timeout_secs = 1
+ok
++llm.cli.timeout_secs = 1
+
+default llm.cli.timeout_secs = 0
+ok
++llm.cli.timeout_secs = 0
+
+default llm.cli.timeout_secs = alpha
+err config: invalid number: alpha
+
+default llm.cli.timeout_secs = 
+err config: invalid number: 
+
+default llm.model = alpha
+ok
+-llm.model = ""
++llm.model = "alpha"
+
+default model = alpha
+ok
+-llm.model = ""
++llm.model = "alpha"
+
+default llm.api_base = /x
+ok
+-llm.api_base = ""
++llm.api_base = "/x"
+
+default api_base = /x
+ok
+-llm.api_base = ""
++llm.api_base = "/x"
+
+default num_ctx = 1
+err config: num_ctx was removed in this version; delete the key
+
+default llm.num_ctx = 1
+err config: llm.num_ctx was removed in this version; delete the key
+
+default api_style = 1
+err config: api_style was removed in this version; delete the key
+
+default llm.api_style = 1
+err config: llm.api_style was removed in this version; delete the key
+
+default llm.cli.num_ctx = 1
+err config: unknown config key: llm.cli.num_ctx
+
+default ephemeral.max_entries = 10
+ok
+-ephemeral.max_entries = 5
++ephemeral.max_entries = 10
+
+default ephemeral.max_entries = 0
+err config: max_entries must be between 1 and 50
+
+default ephemeral.max_entries = 1
+ok
+-ephemeral.max_entries = 5
++ephemeral.max_entries = 1
+
+default ephemeral.max_entries = 50
+ok
+-ephemeral.max_entries = 5
++ephemeral.max_entries = 50
+
+default ephemeral.max_entries = 51
+err config: max_entries must be between 1 and 50
+
+default ephemeral.max_entries = alpha
+err config: invalid number: alpha
+
+default ephemeral.max_entries = 
+err config: invalid number: 
+
+default pipeline.docs_dir = /x
+ok
++pipeline.docs_dir = "/x"
+
+default serve.idle_timeout_secs = 1
+ok
+-serve.idle_timeout_secs = 3600
++serve.idle_timeout_secs = 1
+
+default serve.idle_timeout_secs = 0
+ok
+-serve.idle_timeout_secs = 3600
++serve.idle_timeout_secs = 0
+
+default serve.idle_timeout_secs = alpha
+err config: invalid number: alpha
+
+default serve.idle_timeout_secs = 
+err config: invalid number: 
+
+default serve.socket_path = /x
+ok
++serve.socket_path = "/x"
+
+default serve.socket_path = 
+ok
+
+default serve.socket_path =    
+ok
+
+default serve.socket_path =   /x  
+ok
++serve.socket_path = "  /x  "
+
+default extraction.idle_after_secs = 1
+ok
+-extraction.idle_after_secs = 120
++extraction.idle_after_secs = 1
+
+default extraction.idle_after_secs = 0
+ok
+-extraction.idle_after_secs = 120
++extraction.idle_after_secs = 0
+
+default extraction.idle_after_secs = alpha
+err config: invalid number: alpha
+
+default extraction.idle_after_secs = 
+err config: invalid number: 
+
+default extraction.batch_size = 1
+ok
+-extraction.batch_size = 3
++extraction.batch_size = 1
+
+default extraction.batch_size = 0
+err config: batch_size must be at least 1
+
+default extraction.batch_size = alpha
+err config: invalid number: alpha
+
+default extraction.batch_size = 
+err config: invalid number: 
+
+default capture.settle_secs = 1
+ok
+-capture.settle_secs = 300
++capture.settle_secs = 1
+
+default capture.settle_secs = 0
+ok
+-capture.settle_secs = 300
++capture.settle_secs = 0
+
+default capture.settle_secs = alpha
+err config: invalid number: alpha
+
+default capture.settle_secs = 
+err config: invalid number: 
+
+default capture.sources = codex
+ok
++capture.sources = ["codex"]
+
+default capture.sources = 
+ok
+
+default capture.sources = codex,codex
+ok
++capture.sources = ["codex"]
+
+default capture.sources = nonesuch
+err config: unknown transcript source: nonesuch (use 'claude-code', 'codex', or 'grok')
+
+default graph.provenance.weight_external = 1
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_external = 0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 0.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_external = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+default graph.provenance.weight_external = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+default graph.provenance.weight_external = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+default graph.provenance.weight_external = alpha
+err config: invalid number: alpha
+
+default graph.provenance.weight_external = 
+err config: invalid number: 
+
+default graph.provenance.weight_user = 1
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 1.0
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_user = 0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.0
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_user = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+default graph.provenance.weight_user = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+default graph.provenance.weight_user = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+default graph.provenance.weight_user = alpha
+err config: invalid number: alpha
+
+default graph.provenance.weight_user = 
+err config: invalid number: 
+
+default graph.provenance.weight_assistant = 1
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 1.0
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_assistant = 0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.0
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_assistant = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+default graph.provenance.weight_assistant = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+default graph.provenance.weight_assistant = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+default graph.provenance.weight_assistant = alpha
+err config: invalid number: alpha
+
+default graph.provenance.weight_assistant = 
+err config: invalid number: 
+
+default graph.provenance.weight_self = 1
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 1.0
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_self = 0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.0
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.provenance.weight_self = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+default graph.provenance.weight_self = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+default graph.provenance.weight_self = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+default graph.provenance.weight_self = alpha
+err config: invalid number: alpha
+
+default graph.provenance.weight_self = 
+err config: invalid number: 
+
+default graph.dedup.certain_similarity = 0.0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.0
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.dedup.certain_similarity = 1.0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 1.0
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.dedup.certain_similarity = 1.5
+err config: similarity threshold must be between 0.0 and 1.0, got 1.5
+
+default graph.dedup.certain_similarity = -0.1
+err config: similarity threshold must be between 0.0 and 1.0, got -0.1
+
+default graph.dedup.certain_similarity = NaN
+err config: similarity threshold must be between 0.0 and 1.0, got NaN
+
+default graph.dedup.certain_similarity = alpha
+err config: invalid number: alpha
+
+default graph.dedup.certain_similarity = 
+err config: invalid number: 
+
+default graph.dedup.review_similarity = 0.0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.0
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.dedup.review_similarity = 1.0
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 1.0
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.dedup.review_similarity = 1.5
+err config: similarity threshold must be between 0.0 and 1.0, got 1.5
+
+default graph.dedup.review_similarity = -0.1
+err config: similarity threshold must be between 0.0 and 1.0, got -0.1
+
+default graph.dedup.review_similarity = NaN
+err config: similarity threshold must be between 0.0 and 1.0, got NaN
+
+default graph.dedup.review_similarity = alpha
+err config: invalid number: alpha
+
+default graph.dedup.review_similarity = 
+err config: invalid number: 
+
+default graph.pipeline = v1
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.pipeline = "v1"
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.pipeline = v2
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.pipeline = "v2"
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.pipeline = v3
+err config: graph.pipeline must be "v1" or "v2"
+
+default graph.dedup.max_candidates = 1
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 1
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.dedup.max_candidates = 0
+err config: max_candidates must be at least 1
+
+default graph.dedup.max_candidates = alpha
+err config: invalid number: alpha
+
+default graph.dedup.max_candidates = 
+err config: invalid number: 
+
+default pipeline.auto_sync = true
+ok
++pipeline.auto_sync = true
+
+default pipeline.auto_sync = false
+ok
++pipeline.auto_sync = false
+
+default pipeline.auto_sync = yes
+err config: invalid boolean: yes
+
+default pipeline.auto_sync = True
+err config: invalid boolean: True
+
+default pipeline.auto_sync = 1
+err config: invalid boolean: 1
+
+default extraction.background_enabled = true
+ok
+
+default extraction.background_enabled = false
+ok
+-extraction.background_enabled = true
++extraction.background_enabled = false
+
+default extraction.background_enabled = yes
+err config: invalid boolean: yes
+
+default extraction.background_enabled = True
+err config: invalid boolean: True
+
+default extraction.background_enabled = 1
+err config: invalid boolean: 1
+
+default capture.enabled = true
+ok
+
+default capture.enabled = false
+ok
+-capture.enabled = true
++capture.enabled = false
+
+default capture.enabled = yes
+err config: invalid boolean: yes
+
+default capture.enabled = True
+err config: invalid boolean: True
+
+default capture.enabled = 1
+err config: invalid boolean: 1
+
+default graph.known_facts_context = true
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.known_facts_context = true
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.known_facts_context = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.known_facts_context = yes
+err config: invalid boolean: yes
+
+default graph.known_facts_context = True
+err config: invalid boolean: True
+
+default graph.known_facts_context = 1
+err config: invalid boolean: 1
+
+default graph.known_key_binding = true
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.known_key_binding = true
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.known_key_binding = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.known_key_binding = yes
+err config: invalid boolean: yes
+
+default graph.known_key_binding = True
+err config: invalid boolean: True
+
+default graph.known_key_binding = 1
+err config: invalid boolean: 1
+
+default graph.known_match = true
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.known_match = true
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.known_match = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.known_match = yes
+err config: invalid boolean: yes
+
+default graph.known_match = True
+err config: invalid boolean: True
+
+default graph.known_match = 1
+err config: invalid boolean: 1
+
+default graph.consolidate = true
+ok
++graph.consolidate = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate = yes
+err config: invalid boolean: yes
+
+default graph.consolidate = True
+err config: invalid boolean: True
+
+default graph.consolidate = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_hold = true
+ok
++graph.consolidate_hold = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_hold = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_hold = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_hold = True
+err config: invalid boolean: True
+
+default graph.consolidate_hold = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_links = true
+ok
++graph.consolidate_links = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_links = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_links = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_links = True
+err config: invalid boolean: True
+
+default graph.consolidate_links = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_components = true
+ok
++graph.consolidate_components = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_components = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_components = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_components = True
+err config: invalid boolean: True
+
+default graph.consolidate_components = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_key_rename = true
+ok
++graph.consolidate_key_rename = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_key_rename = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_key_rename = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_key_rename = True
+err config: invalid boolean: True
+
+default graph.consolidate_key_rename = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_replaces_cue = true
+ok
++graph.consolidate_replaces_cue = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_replaces_cue = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_replaces_cue = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_replaces_cue = True
+err config: invalid boolean: True
+
+default graph.consolidate_replaces_cue = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_replaces_departure = true
+ok
++graph.consolidate_replaces_departure = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_replaces_departure = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_replaces_departure = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_replaces_departure = True
+err config: invalid boolean: True
+
+default graph.consolidate_replaces_departure = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_orphan_sweep = true
+ok
++graph.consolidate_orphan_sweep = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_orphan_sweep = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_orphan_sweep = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_orphan_sweep = True
+err config: invalid boolean: True
+
+default graph.consolidate_orphan_sweep = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_rule_fragments = true
+ok
++graph.consolidate_rule_fragments = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_rule_fragments = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_rule_fragments = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_rule_fragments = True
+err config: invalid boolean: True
+
+default graph.consolidate_rule_fragments = 1
+err config: invalid boolean: 1
+
+default graph.consolidate_retire_component = true
+ok
++graph.consolidate_retire_component = true
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_retire_component = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.consolidate_retire_component = yes
+err config: invalid boolean: yes
+
+default graph.consolidate_retire_component = True
+err config: invalid boolean: True
+
+default graph.consolidate_retire_component = 1
+err config: invalid boolean: 1
+
+default graph.drop_restatements = true
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.drop_restatements = true
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.drop_restatements = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.drop_restatements = yes
+err config: invalid boolean: yes
+
+default graph.drop_restatements = True
+err config: invalid boolean: True
+
+default graph.drop_restatements = 1
+err config: invalid boolean: 1
+
+default graph.ground_component_edges = true
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.ground_component_edges = true
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.ground_component_edges = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.ground_component_edges = yes
+err config: invalid boolean: yes
+
+default graph.ground_component_edges = True
+err config: invalid boolean: True
+
+default graph.ground_component_edges = 1
+err config: invalid boolean: 1
+
+default graph.recover_turns = true
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.recover_turns = true
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.recover_turns = false
+ok
++graph.database = ""
++graph.dedup.certain_similarity = 0.92
++graph.dedup.max_candidates = 3
++graph.dedup.review_similarity = 0.82
++graph.mode = "embedded"
++graph.namespace = "nullarc"
++graph.password_file = ""
++graph.provenance.weight_assistant = 0.3
++graph.provenance.weight_external = 1.0
++graph.provenance.weight_self = 0.05
++graph.provenance.weight_user = 0.8
++graph.scoring.corroboration_boost = 0.05
++graph.scoring.weight_hotness = 0.3
++graph.scoring.weight_semantic = 0.45
++graph.scoring.weight_utility = 0.25
++graph.url = "ws://localhost:8787"
++graph.username = ""
+
+default graph.recover_turns = yes
+err config: invalid boolean: yes
+
+default graph.recover_turns = True
+err config: invalid boolean: True
+
+default graph.recover_turns = 1
+err config: invalid boolean: 1
+
+default nonexistent.key = alpha
+err config: unknown config key: nonexistent.key
+
+default  = alpha
+err config: unknown config key: 
+
+default llm.cli. = alpha
+err config: unknown config key: llm.cli.
+
+default llm.cli = alpha
+err config: unknown config key: llm.cli
+
+default llm.cli.nonexistent = alpha
+err config: unknown config key: llm.cli.nonexistent
+
+default LLM.MODEL = alpha
+err config: unknown config key: LLM.MODEL
+
+default llm.model  = alpha
+err config: unknown config key: llm.model 
+
+populated llm.provider = cli
+ok
+-llm.api_base = "/x"
++llm.api_base = ""
+-llm.cli.command = "alpha"
+-llm.model = "alpha"
++llm.model = ""
+-llm.provider = "claude-code"
++llm.provider = "cli"
+
+populated llm.provider = nonesuch
+err config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code', 'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)
+
+populated provider = cli
+ok
+-llm.api_base = "/x"
++llm.api_base = ""
+-llm.cli.command = "alpha"
+-llm.model = "alpha"
++llm.model = ""
+-llm.provider = "claude-code"
++llm.provider = "cli"
+
+populated provider = nonesuch
+err config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code', 'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)
+
+populated llm.cli.preset = custom
+ok
++llm.cli.preset = "custom"
+
+populated llm.cli.preset = nonesuch
+err config: unknown CLI preset: nonesuch (use 'claude-code', 'gemini', 'grok', 'codex', or 'custom')
+
+populated llm.cli.command = alpha
+ok
+
+populated llm.cli.args = alpha
+ok
++llm.cli.args = ["alpha"]
+
+populated llm.cli.prompt_delivery = stdin
+ok
++llm.cli.prompt_delivery = "stdin"
+
+populated llm.cli.prompt_delivery = nonesuch
+err config: unknown prompt delivery: nonesuch (use 'stdin', 'flag', or 'arg')
+
+populated llm.cli.prompt_flag = alpha
+ok
++llm.cli.prompt_flag = "alpha"
+
+populated llm.cli.model_flag = alpha
+ok
++llm.cli.model_flag = "alpha"
+
+populated llm.cli.output_format_flag = alpha
+ok
++llm.cli.output_format_flag = "alpha"
+
+populated llm.cli.output_format_value = alpha
+ok
++llm.cli.output_format_value = "alpha"
+
+populated llm.cli.output_mode = raw
+ok
++llm.cli.output_mode = "raw"
+
+populated llm.cli.output_mode = nonesuch
+err config: unknown output mode: nonesuch (use 'raw', 'single-json', or 'ndjson')
+
+populated llm.cli.ndjson_match = alpha
+ok
++llm.cli.ndjson_match = ["alpha"]
+
+populated llm.cli.system_prompt_flag = alpha
+ok
++llm.cli.system_prompt_flag = "alpha"
+
+populated llm.cli.result_json_path = alpha
+ok
++llm.cli.result_json_path = "alpha"
+
+populated llm.cli.usage_input_path = alpha
+ok
++llm.cli.usage_input_path = "alpha"
+
+populated llm.cli.usage_output_path = alpha
+ok
++llm.cli.usage_output_path = "alpha"
+
+populated llm.cli.extra_args = alpha
+ok
++llm.cli.extra_args = ["alpha"]
+
+populated llm.cli.timeout_secs = 1
+ok
++llm.cli.timeout_secs = 1
+
+populated llm.cli.timeout_secs = 0
+ok
++llm.cli.timeout_secs = 0
+
+populated llm.cli.timeout_secs = alpha
+err config: invalid number: alpha
+
+populated llm.cli.timeout_secs = 
+err config: invalid number: 
+
+populated llm.model = alpha
+ok
+
+populated model = alpha
+ok
+
+populated llm.api_base = /x
+ok
+
+populated api_base = /x
+ok
+
+populated num_ctx = 1
+err config: num_ctx was removed in this version; delete the key
+
+populated llm.num_ctx = 1
+err config: llm.num_ctx was removed in this version; delete the key
+
+populated api_style = 1
+err config: api_style was removed in this version; delete the key
+
+populated llm.api_style = 1
+err config: llm.api_style was removed in this version; delete the key
+
+populated llm.cli.num_ctx = 1
+err config: unknown config key: llm.cli.num_ctx
+
+populated ephemeral.max_entries = 10
+ok
+-ephemeral.max_entries = 5
++ephemeral.max_entries = 10
+
+populated ephemeral.max_entries = 0
+err config: max_entries must be between 1 and 50
+
+populated ephemeral.max_entries = 1
+ok
+-ephemeral.max_entries = 5
++ephemeral.max_entries = 1
+
+populated ephemeral.max_entries = 50
+ok
+-ephemeral.max_entries = 5
++ephemeral.max_entries = 50
+
+populated ephemeral.max_entries = 51
+err config: max_entries must be between 1 and 50
+
+populated ephemeral.max_entries = alpha
+err config: invalid number: alpha
+
+populated ephemeral.max_entries = 
+err config: invalid number: 
+
+populated pipeline.docs_dir = /x
+ok
+
+populated serve.idle_timeout_secs = 1
+ok
+-serve.idle_timeout_secs = 9
++serve.idle_timeout_secs = 1
+
+populated serve.idle_timeout_secs = 0
+ok
+-serve.idle_timeout_secs = 9
++serve.idle_timeout_secs = 0
+
+populated serve.idle_timeout_secs = alpha
+err config: invalid number: alpha
+
+populated serve.idle_timeout_secs = 
+err config: invalid number: 
+
+populated serve.socket_path = /x
+ok
+
+populated serve.socket_path = 
+ok
+-serve.socket_path = "/x"
+
+populated serve.socket_path =    
+ok
+-serve.socket_path = "/x"
+
+populated serve.socket_path =   /x  
+ok
+-serve.socket_path = "/x"
++serve.socket_path = "  /x  "
+
+populated extraction.idle_after_secs = 1
+ok
+-extraction.idle_after_secs = 9
++extraction.idle_after_secs = 1
+
+populated extraction.idle_after_secs = 0
+ok
+-extraction.idle_after_secs = 9
++extraction.idle_after_secs = 0
+
+populated extraction.idle_after_secs = alpha
+err config: invalid number: alpha
+
+populated extraction.idle_after_secs = 
+err config: invalid number: 
+
+populated extraction.batch_size = 1
+ok
+-extraction.batch_size = 9
++extraction.batch_size = 1
+
+populated extraction.batch_size = 0
+err config: batch_size must be at least 1
+
+populated extraction.batch_size = alpha
+err config: invalid number: alpha
+
+populated extraction.batch_size = 
+err config: invalid number: 
+
+populated capture.settle_secs = 1
+ok
+-capture.settle_secs = 9
++capture.settle_secs = 1
+
+populated capture.settle_secs = 0
+ok
+-capture.settle_secs = 9
++capture.settle_secs = 0
+
+populated capture.settle_secs = alpha
+err config: invalid number: alpha
+
+populated capture.settle_secs = 
+err config: invalid number: 
+
+populated capture.sources = codex
+ok
+
+populated capture.sources = 
+ok
+-capture.sources = ["codex"]
+
+populated capture.sources = codex,codex
+ok
+
+populated capture.sources = nonesuch
+err config: unknown transcript source: nonesuch (use 'claude-code', 'codex', or 'grok')
+
+populated graph.provenance.weight_external = 1
+ok
+-graph.provenance.weight_external = 2.0
++graph.provenance.weight_external = 1.0
+
+populated graph.provenance.weight_external = 0
+ok
+-graph.provenance.weight_external = 2.0
++graph.provenance.weight_external = 0.0
+
+populated graph.provenance.weight_external = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+populated graph.provenance.weight_external = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+populated graph.provenance.weight_external = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+populated graph.provenance.weight_external = alpha
+err config: invalid number: alpha
+
+populated graph.provenance.weight_external = 
+err config: invalid number: 
+
+populated graph.provenance.weight_user = 1
+ok
+-graph.provenance.weight_user = 3.0
++graph.provenance.weight_user = 1.0
+
+populated graph.provenance.weight_user = 0
+ok
+-graph.provenance.weight_user = 3.0
++graph.provenance.weight_user = 0.0
+
+populated graph.provenance.weight_user = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+populated graph.provenance.weight_user = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+populated graph.provenance.weight_user = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+populated graph.provenance.weight_user = alpha
+err config: invalid number: alpha
+
+populated graph.provenance.weight_user = 
+err config: invalid number: 
+
+populated graph.provenance.weight_assistant = 1
+ok
+-graph.provenance.weight_assistant = 4.0
++graph.provenance.weight_assistant = 1.0
+
+populated graph.provenance.weight_assistant = 0
+ok
+-graph.provenance.weight_assistant = 4.0
++graph.provenance.weight_assistant = 0.0
+
+populated graph.provenance.weight_assistant = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+populated graph.provenance.weight_assistant = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+populated graph.provenance.weight_assistant = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+populated graph.provenance.weight_assistant = alpha
+err config: invalid number: alpha
+
+populated graph.provenance.weight_assistant = 
+err config: invalid number: 
+
+populated graph.provenance.weight_self = 1
+ok
+-graph.provenance.weight_self = 5.0
++graph.provenance.weight_self = 1.0
+
+populated graph.provenance.weight_self = 0
+ok
+-graph.provenance.weight_self = 5.0
++graph.provenance.weight_self = 0.0
+
+populated graph.provenance.weight_self = -1
+err config: evidence weight must be finite and non-negative, got -1
+
+populated graph.provenance.weight_self = inf
+err config: evidence weight must be finite and non-negative, got inf
+
+populated graph.provenance.weight_self = NaN
+err config: evidence weight must be finite and non-negative, got NaN
+
+populated graph.provenance.weight_self = alpha
+err config: invalid number: alpha
+
+populated graph.provenance.weight_self = 
+err config: invalid number: 
+
+populated graph.dedup.certain_similarity = 0.0
+ok
+-graph.dedup.certain_similarity = 0.5
++graph.dedup.certain_similarity = 0.0
+
+populated graph.dedup.certain_similarity = 1.0
+ok
+-graph.dedup.certain_similarity = 0.5
++graph.dedup.certain_similarity = 1.0
+
+populated graph.dedup.certain_similarity = 1.5
+err config: similarity threshold must be between 0.0 and 1.0, got 1.5
+
+populated graph.dedup.certain_similarity = -0.1
+err config: similarity threshold must be between 0.0 and 1.0, got -0.1
+
+populated graph.dedup.certain_similarity = NaN
+err config: similarity threshold must be between 0.0 and 1.0, got NaN
+
+populated graph.dedup.certain_similarity = alpha
+err config: invalid number: alpha
+
+populated graph.dedup.certain_similarity = 
+err config: invalid number: 
+
+populated graph.dedup.review_similarity = 0.0
+ok
+-graph.dedup.review_similarity = 0.25
++graph.dedup.review_similarity = 0.0
+
+populated graph.dedup.review_similarity = 1.0
+ok
+-graph.dedup.review_similarity = 0.25
++graph.dedup.review_similarity = 1.0
+
+populated graph.dedup.review_similarity = 1.5
+err config: similarity threshold must be between 0.0 and 1.0, got 1.5
+
+populated graph.dedup.review_similarity = -0.1
+err config: similarity threshold must be between 0.0 and 1.0, got -0.1
+
+populated graph.dedup.review_similarity = NaN
+err config: similarity threshold must be between 0.0 and 1.0, got NaN
+
+populated graph.dedup.review_similarity = alpha
+err config: invalid number: alpha
+
+populated graph.dedup.review_similarity = 
+err config: invalid number: 
+
+populated graph.pipeline = v1
+ok
+-graph.pipeline = "v2"
++graph.pipeline = "v1"
+
+populated graph.pipeline = v2
+ok
+
+populated graph.pipeline = v3
+err config: graph.pipeline must be "v1" or "v2"
+
+populated graph.dedup.max_candidates = 1
+ok
+-graph.dedup.max_candidates = 7
++graph.dedup.max_candidates = 1
+
+populated graph.dedup.max_candidates = 0
+err config: max_candidates must be at least 1
+
+populated graph.dedup.max_candidates = alpha
+err config: invalid number: alpha
+
+populated graph.dedup.max_candidates = 
+err config: invalid number: 
+
+populated pipeline.auto_sync = true
+ok
+
+populated pipeline.auto_sync = false
+ok
+-pipeline.auto_sync = true
++pipeline.auto_sync = false
+
+populated pipeline.auto_sync = yes
+err config: invalid boolean: yes
+
+populated pipeline.auto_sync = True
+err config: invalid boolean: True
+
+populated pipeline.auto_sync = 1
+err config: invalid boolean: 1
+
+populated extraction.background_enabled = true
+ok
+-extraction.background_enabled = false
++extraction.background_enabled = true
+
+populated extraction.background_enabled = false
+ok
+
+populated extraction.background_enabled = yes
+err config: invalid boolean: yes
+
+populated extraction.background_enabled = True
+err config: invalid boolean: True
+
+populated extraction.background_enabled = 1
+err config: invalid boolean: 1
+
+populated capture.enabled = true
+ok
+-capture.enabled = false
++capture.enabled = true
+
+populated capture.enabled = false
+ok
+
+populated capture.enabled = yes
+err config: invalid boolean: yes
+
+populated capture.enabled = True
+err config: invalid boolean: True
+
+populated capture.enabled = 1
+err config: invalid boolean: 1
+
+populated graph.known_facts_context = true
+ok
+
+populated graph.known_facts_context = false
+ok
+-graph.known_facts_context = true
+
+populated graph.known_facts_context = yes
+err config: invalid boolean: yes
+
+populated graph.known_facts_context = True
+err config: invalid boolean: True
+
+populated graph.known_facts_context = 1
+err config: invalid boolean: 1
+
+populated graph.known_key_binding = true
+ok
+
+populated graph.known_key_binding = false
+ok
+-graph.known_key_binding = true
+
+populated graph.known_key_binding = yes
+err config: invalid boolean: yes
+
+populated graph.known_key_binding = True
+err config: invalid boolean: True
+
+populated graph.known_key_binding = 1
+err config: invalid boolean: 1
+
+populated graph.known_match = true
+ok
+
+populated graph.known_match = false
+ok
+-graph.known_match = true
+
+populated graph.known_match = yes
+err config: invalid boolean: yes
+
+populated graph.known_match = True
+err config: invalid boolean: True
+
+populated graph.known_match = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate = true
+ok
+
+populated graph.consolidate = false
+ok
+-graph.consolidate = true
+
+populated graph.consolidate = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate = True
+err config: invalid boolean: True
+
+populated graph.consolidate = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_hold = true
+ok
+
+populated graph.consolidate_hold = false
+ok
+-graph.consolidate_hold = true
+
+populated graph.consolidate_hold = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_hold = True
+err config: invalid boolean: True
+
+populated graph.consolidate_hold = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_links = true
+ok
+
+populated graph.consolidate_links = false
+ok
+-graph.consolidate_links = true
+
+populated graph.consolidate_links = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_links = True
+err config: invalid boolean: True
+
+populated graph.consolidate_links = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_components = true
+ok
+
+populated graph.consolidate_components = false
+ok
+-graph.consolidate_components = true
+
+populated graph.consolidate_components = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_components = True
+err config: invalid boolean: True
+
+populated graph.consolidate_components = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_key_rename = true
+ok
+
+populated graph.consolidate_key_rename = false
+ok
+-graph.consolidate_key_rename = true
+
+populated graph.consolidate_key_rename = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_key_rename = True
+err config: invalid boolean: True
+
+populated graph.consolidate_key_rename = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_replaces_cue = true
+ok
+
+populated graph.consolidate_replaces_cue = false
+ok
+-graph.consolidate_replaces_cue = true
+
+populated graph.consolidate_replaces_cue = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_replaces_cue = True
+err config: invalid boolean: True
+
+populated graph.consolidate_replaces_cue = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_replaces_departure = true
+ok
+
+populated graph.consolidate_replaces_departure = false
+ok
+-graph.consolidate_replaces_departure = true
+
+populated graph.consolidate_replaces_departure = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_replaces_departure = True
+err config: invalid boolean: True
+
+populated graph.consolidate_replaces_departure = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_orphan_sweep = true
+ok
+
+populated graph.consolidate_orphan_sweep = false
+ok
+-graph.consolidate_orphan_sweep = true
+
+populated graph.consolidate_orphan_sweep = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_orphan_sweep = True
+err config: invalid boolean: True
+
+populated graph.consolidate_orphan_sweep = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_rule_fragments = true
+ok
+
+populated graph.consolidate_rule_fragments = false
+ok
+-graph.consolidate_rule_fragments = true
+
+populated graph.consolidate_rule_fragments = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_rule_fragments = True
+err config: invalid boolean: True
+
+populated graph.consolidate_rule_fragments = 1
+err config: invalid boolean: 1
+
+populated graph.consolidate_retire_component = true
+ok
+
+populated graph.consolidate_retire_component = false
+ok
+-graph.consolidate_retire_component = true
+
+populated graph.consolidate_retire_component = yes
+err config: invalid boolean: yes
+
+populated graph.consolidate_retire_component = True
+err config: invalid boolean: True
+
+populated graph.consolidate_retire_component = 1
+err config: invalid boolean: 1
+
+populated graph.drop_restatements = true
+ok
+
+populated graph.drop_restatements = false
+ok
+-graph.drop_restatements = true
+
+populated graph.drop_restatements = yes
+err config: invalid boolean: yes
+
+populated graph.drop_restatements = True
+err config: invalid boolean: True
+
+populated graph.drop_restatements = 1
+err config: invalid boolean: 1
+
+populated graph.ground_component_edges = true
+ok
+
+populated graph.ground_component_edges = false
+ok
+-graph.ground_component_edges = true
+
+populated graph.ground_component_edges = yes
+err config: invalid boolean: yes
+
+populated graph.ground_component_edges = True
+err config: invalid boolean: True
+
+populated graph.ground_component_edges = 1
+err config: invalid boolean: 1
+
+populated graph.recover_turns = true
+ok
+
+populated graph.recover_turns = false
+ok
+-graph.recover_turns = true
+
+populated graph.recover_turns = yes
+err config: invalid boolean: yes
+
+populated graph.recover_turns = True
+err config: invalid boolean: True
+
+populated graph.recover_turns = 1
+err config: invalid boolean: 1
+
+populated nonexistent.key = alpha
+err config: unknown config key: nonexistent.key
+
+populated  = alpha
+err config: unknown config key: 
+
+populated llm.cli. = alpha
+err config: unknown config key: llm.cli.
+
+populated llm.cli = alpha
+err config: unknown config key: llm.cli
+
+populated llm.cli.nonexistent = alpha
+err config: unknown config key: llm.cli.nonexistent
+
+populated LLM.MODEL = alpha
+err config: unknown config key: LLM.MODEL
+
+populated llm.model  = alpha
+err config: unknown config key: llm.model 
+
+seq default pipeline.docs_dir = /x then pipeline.auto_sync = true
+ok
++pipeline.auto_sync = true
++pipeline.docs_dir = "/x"
+
+seq default llm.model = alpha then provider = cli
+ok
+-llm.provider = "claude-code"
++llm.provider = "cli"
+
