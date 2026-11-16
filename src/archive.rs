@@ -168,6 +168,91 @@ pub fn archive_pulse_conversation(
     write_archive(memory_dir, conv, summary, source, pulse, None)
 }
 
+/// The `## Summary` block, or nothing when the caller has no summary text.
+fn summary_section(summary: &summarize::ConversationSummary) -> String {
+    if summary.summary.is_empty() {
+        return String::new();
+    }
+
+    let mut section = format!("## Summary\n\n{}\n\n", summary.summary);
+    if !summary.decisions.is_empty() {
+        section.push_str("**Decisions**:\n");
+        for decision in &summary.decisions {
+            let _ = writeln!(section, "- {decision}");
+        }
+        section.push('\n');
+    }
+    if !summary.action_items.is_empty() {
+        section.push_str("**Action Items**:\n");
+        for item in &summary.action_items {
+            let _ = writeln!(section, "- {item}");
+        }
+        section.push('\n');
+    }
+    section
+}
+
+/// Paths and fields the archive record is written from.
+struct ArchiveTail<'a> {
+    memory_dir: &'a Path,
+    conversations_dir: &'a Path,
+    archive_index: &'a Path,
+    ephemeral_path: &'a Path,
+    next_num: u32,
+    date: &'a str,
+    timestamp: String,
+    duration: String,
+    total_messages: u32,
+    conv: &'a Conversation,
+    summary: &'a summarize::ConversationSummary,
+    cwd: Option<&'a str>,
+    full_content: &'a str,
+}
+
+/// Write the archive file, the turns sidecar, the ARCHIVE.md row and the
+/// EPHEMERAL entry, in that order.
+fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
+    let conv_file = tail
+        .conversations_dir
+        .join(format!("conversation-{:03}.md", tail.next_num));
+    fs::write(&conv_file, tail.full_content)?;
+    // The sidecar is a second record. A failure here must not throw away the
+    // archive that was just written.
+    write_sidecar_best_effort(
+        tail.memory_dir,
+        tail.next_num,
+        &tail.conv.session_id,
+        tail.date,
+        tail.cwd,
+        &tail.conv.entries,
+    );
+
+    // Append to ARCHIVE.md index
+    append_index(
+        tail.archive_index,
+        tail.next_num,
+        tail.date,
+        &tail.conv.session_id,
+        &tail.summary.topics,
+        tail.total_messages,
+        &tail.duration,
+    )?;
+
+    // Append to EPHEMERAL.md
+    let entry = EphemeralEntry {
+        session_id: tail.conv.session_id.clone(),
+        date: tail.timestamp,
+        duration: tail.duration,
+        message_count: tail.total_messages,
+        archive_file: format!("conversation-{:03}.md", tail.next_num),
+        summary: tail.summary.summary.clone(),
+    };
+    ephemeral::append_entry(tail.ephemeral_path, &entry)?;
+    let cfg = config::load_from_dir(tail.memory_dir);
+    ephemeral::trim_to_limit(tail.ephemeral_path, cfg.ephemeral.max_entries)?;
+    Ok(())
+}
+
 fn write_archive(
     memory_dir: &Path,
     conv: &Conversation,
@@ -224,26 +309,7 @@ fn write_archive(
     let tags_section = tags::format_tags_section(&conv_tags);
 
     // Add summary section if available
-    let summary_section = if !summary.summary.is_empty() {
-        let mut s = format!("## Summary\n\n{}\n\n", summary.summary);
-        if !summary.decisions.is_empty() {
-            s.push_str("**Decisions**:\n");
-            for d in &summary.decisions {
-                let _ = writeln!(s, "- {d}");
-            }
-            s.push('\n');
-        }
-        if !summary.action_items.is_empty() {
-            s.push_str("**Action Items**:\n");
-            for a in &summary.action_items {
-                let _ = writeln!(s, "- {a}");
-            }
-            s.push('\n');
-        }
-        s
-    } else {
-        String::new()
-    };
+    let summary_section = summary_section(summary);
 
     let full_content = format!(
         "{}\n\n{}{}\n{}",
@@ -253,43 +319,21 @@ fn write_archive(
         tags_section
     );
 
-    // Write conversation file
-    let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&conv_file, &full_content)?;
-    // The sidecar is a second record. A failure here must not throw away the
-    // archive that was just written.
-    write_sidecar_best_effort(
+    record_archive(ArchiveTail {
         memory_dir,
+        conversations_dir: &conversations_dir,
+        archive_index: &archive_index,
+        ephemeral_path: &ephemeral_path,
         next_num,
-        &conv.session_id,
-        &date,
-        cwd,
-        &conv.entries,
-    );
-
-    // Append to ARCHIVE.md index
-    append_index(
-        &archive_index,
-        next_num,
-        &date,
-        &conv.session_id,
-        &summary.topics,
-        total_messages,
-        &duration,
-    )?;
-
-    // Append to EPHEMERAL.md
-    let entry = EphemeralEntry {
-        session_id: conv.session_id.clone(),
-        date: timestamp,
+        date: &date,
+        timestamp,
         duration,
-        message_count: total_messages,
-        archive_file: format!("conversation-{next_num:03}.md"),
-        summary: summary.summary.clone(),
-    };
-    ephemeral::append_entry(&ephemeral_path, &entry)?;
-    let cfg = config::load_from_dir(memory_dir);
-    ephemeral::trim_to_limit(&ephemeral_path, cfg.ephemeral.max_entries)?;
+        total_messages,
+        conv,
+        summary,
+        cwd,
+        full_content: &full_content,
+    })?;
 
     eprintln!("recall-echo: archived conversation-{next_num:03}.md ({total_messages} messages)");
 
