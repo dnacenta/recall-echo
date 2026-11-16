@@ -15,6 +15,24 @@ changes a user has to know about before upgrading.
 - Default provider is the CLI login (`claude-code`). `num_ctx`, `api_style`, and `provider = "ollama"` are refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.
 - Rust API: `ApiStyle` is removed. `LlmSection` and `HttpConfig` lost `num_ctx`, `api_style`, and the local-model fields.
 
+### Changed
+
+- The measured consolidation stack is on unless a key is set to false. That false is kept when the config is rewritten. `recover_turns` stays off, because it makes extra model calls. A config that omits a key picks up the new default.
+  - `consolidate` (`--no-consolidate`)
+  - `consolidate_hold` (`--no-consolidate-hold`)
+  - `drop_restatements` (`--no-drop-restatements`)
+  - `consolidate_links` (`--no-consolidate-links`)
+  - `consolidate_components` (`--no-consolidate-components`)
+  - `ground_component_edges` (`--no-ground-component-edges`)
+  - `consolidate_key_rename` (`--no-consolidate-key-rename`)
+  - `consolidate_replaces_cue` (`--no-consolidate-replaces-cue`)
+  - `known_facts_context` (`--no-known-facts-context`)
+  - `consolidate_replaces_departure` (`--no-consolidate-replaces-departure`)
+  - `known_key_binding` (`--no-known-key-binding`)
+  - `consolidate_orphan_sweep` (`--no-consolidate-orphan-sweep`)
+  - `consolidate_rule_fragments` (`--no-consolidate-rule-fragments`)
+  - `consolidate_retire_component` (`--no-consolidate-retire-component`)
+
 ### Fixed
 
 - The grok preset passes `--reasoning-effort low --no-subagents --disable-web-search --max-turns 1` and runs in an empty directory, because the default reasoning effort is too slow for extraction (#180).
