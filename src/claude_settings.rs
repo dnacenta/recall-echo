@@ -425,7 +425,7 @@ pub(crate) fn atomic_replace(
 /// backticks, `;`, `|`, spaces — and an embedded `'` is closed, escaped, and
 /// reopened. Quoting only "when needed" is how metacharacters slip through.
 fn shell_path(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    crate::shell::quote(&path.display().to_string())
 }
 
 /// Whether a binary path is safe to interpolate bare into a hook command.
@@ -437,10 +437,7 @@ fn shell_path(path: &Path) -> String {
 /// every real install and anything outside it is refused with a message
 /// rather than baked into a broken or dangerous command line.
 fn is_shell_safe_bin(path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c))
+    crate::shell::is_plain(path)
 }
 
 /// Shell operators (scanned outside single-quoted spans) whose presence marks

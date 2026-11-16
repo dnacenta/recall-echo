@@ -54,6 +54,7 @@ pub mod serve_client;
 #[cfg(feature = "llm")]
 pub mod serve_extract;
 mod serve_security;
+mod shell;
 pub mod status;
 pub mod summarize;
 pub mod tags;

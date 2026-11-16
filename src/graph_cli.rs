@@ -1143,7 +1143,7 @@ fn half_swap_message(graph: &Path, build: &Path, backup: &Path) -> String {
 
 #[cfg(feature = "llm")]
 fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    crate::shell::quote(&path.to_string_lossy())
 }
 
 #[cfg(feature = "llm")]
