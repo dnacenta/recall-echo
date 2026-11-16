@@ -346,10 +346,21 @@ pub(crate) fn apply_hooks(
     pulse_root: &Path,
     recall_bin: &str,
 ) -> Result<HookChange, String> {
-    let root = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
+    let canonical = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
+    // `display()` would substitute U+FFFD and the hook would name a directory
+    // that does not exist. Refuse before any byte of settings changes.
+    let root = match canonical.to_str() {
+        Some(text) => text,
+        None => {
+            return Err(
+                "Pulse root is not valid UTF-8 — refusing to write it into a shell hook"
+                    .to_string(),
+            );
+        }
+    };
     // A control character (a newline especially) inside a shell command line
     // is unrecoverable for the user reading settings.json later.
-    if root.display().to_string().chars().any(char::is_control) {
+    if root.chars().any(char::is_control) {
         return Err(
             "Pulse root contains control characters — refusing to write it into a shell hook"
                 .to_string(),
@@ -373,7 +384,7 @@ pub(crate) fn apply_hooks(
     }
 
     let mut notes: Vec<String> = Vec::new();
-    let changed = upsert_recall_hooks(settings, recall_bin, &root, &mut notes)
+    let changed = upsert_recall_hooks(settings, recall_bin, Path::new(root), &mut notes)
         .map_err(|why| format!("settings.json: {why} — hooks not configured"))?;
     Ok(HookChange { changed, notes })
 }
@@ -1221,5 +1232,23 @@ mod tests {
             settings,
             serde_json::json!({"model": "opus", "autoMemoryEnabled": false})
         );
+    }
+
+    /// A non-UTF-8 root must not be lossily rewritten into a hook command.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_root_is_refused_and_settings_stay() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut settings = serde_json::json!({"keep": true});
+        let before = settings.clone();
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/alpha\xff".to_vec()));
+        let err = match apply_hooks(&mut settings, &path, "/usr/local/bin/recall-echo") {
+            Err(err) => err,
+            Ok(_) => panic!("a non-UTF-8 root was accepted"),
+        };
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert_eq!(settings, before);
     }
 }
