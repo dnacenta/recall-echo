@@ -914,6 +914,9 @@ struct RebuildPlan {
     conversations: PathBuf,
     pending: Vec<u32>,
     resume: bool,
+    /// Leftover episodes already counted by the completeness scan.
+    /// `None` when that scan did not run.
+    leftovers: Option<usize>,
 }
 
 #[cfg(feature = "llm")]
@@ -921,6 +924,8 @@ struct BuildTotals {
     finished: bool,
     facts: u32,
     archives: u32,
+    /// Leftover episodes from the last completeness scan, when that scan ran.
+    leftovers: Option<usize>,
 }
 
 /// One archive after its episodes were brought up to the chunk count.
@@ -933,11 +938,42 @@ enum BuiltArchive {
     NoChunks,
 }
 
+/// One stored episode from the completeness scan.
+#[cfg(feature = "llm")]
+struct StoredEpisode {
+    content: Option<String>,
+    extracted: bool,
+}
+
 /// Episode rows for one log, grouped once from the scan.
 #[cfg(feature = "llm")]
 struct EpisodeRows {
-    count: usize,
-    all_extracted: bool,
+    episodes: Vec<StoredEpisode>,
+}
+
+#[cfg(feature = "llm")]
+impl EpisodeRows {
+    fn contents(&self) -> Vec<Option<String>> {
+        self.episodes
+            .iter()
+            .map(|row| row.content.clone())
+            .collect()
+    }
+
+    /// Content of rows already marked extracted. Unextracted rows are omitted
+    /// so a leftover that was never extracted does not cover a current chunk.
+    fn extracted_contents(&self) -> Vec<Option<String>> {
+        self.episodes
+            .iter()
+            .filter(|row| row.extracted)
+            .map(|row| row.content.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn all_extracted(&self) -> bool {
+        self.episodes.iter().all(|row| row.extracted)
+    }
 }
 
 /// Re-extract every archive into `graph.v2-build/` and swap it over `graph/`.
@@ -994,7 +1030,7 @@ async fn finish_rebuild(
     if !totals.finished {
         return Ok(());
     }
-    swap_and_record(memory_dir, totals.archives, totals.facts)
+    swap_and_record(memory_dir, totals.archives, totals.facts, totals.leftovers)
 }
 
 #[cfg(feature = "llm")]
@@ -1053,12 +1089,12 @@ async fn prepare_rebuild(
             "Graph store not initialized. Run `recall-echo graph init` first.".into(),
         ));
     }
-    let (resume, pending) =
-        pending_in_build(&memory_dir.join(V2_BUILD_DIR), &conversations, &logs).await?;
+    let built = pending_in_build(&memory_dir.join(V2_BUILD_DIR), &conversations, &logs).await?;
     Ok(RebuildPlan {
         conversations,
-        pending,
-        resume,
+        pending: built.pending,
+        resume: built.resume,
+        leftovers: built.leftovers,
     })
 }
 
@@ -1118,8 +1154,8 @@ async fn build_is_complete(
     if stamp.as_deref() != Some("v2") {
         return Ok(false);
     }
-    let pending = pending_logs(&db, conversations, logs).await?;
-    Ok(pending.is_empty())
+    let scan = pending_logs(&db, conversations, logs).await?;
+    Ok(scan.pending.is_empty())
 }
 
 #[cfg(feature = "llm")]
@@ -1155,14 +1191,28 @@ fn shell_quote(path: &Path) -> String {
     crate::shell::quote(&path.to_string_lossy())
 }
 
+/// What a build directory already holds, before any new writes.
+#[cfg(feature = "llm")]
+struct PendingBuild {
+    resume: bool,
+    pending: Vec<u32>,
+    /// `None` when no episode scan ran. A fresh build directory has no rows
+    /// to count, and a second scan just to print zero is not worth taking.
+    leftovers: Option<usize>,
+}
+
 #[cfg(feature = "llm")]
 async fn pending_in_build(
     build: &Path,
     conversations: &Path,
     logs: &[u32],
-) -> Result<(bool, Vec<u32>), RecallError> {
+) -> Result<PendingBuild, RecallError> {
     if !build.exists() {
-        return Ok((false, logs_with_chunks(conversations, logs)?));
+        return Ok(PendingBuild {
+            resume: false,
+            pending: logs_with_chunks(conversations, logs)?,
+            leftovers: None,
+        });
     }
     if !build.join("surreal").is_dir() || !crate::graph::store::has_kv_manifest(build) {
         return Err(RecallError::Other(removal_hint(build)));
@@ -1180,8 +1230,12 @@ async fn pending_in_build(
     if stamp.as_deref() != Some("v2") {
         return Err(RecallError::Other(removal_hint(build)));
     }
-    let pending = pending_logs(&db, conversations, logs).await?;
-    Ok((true, pending))
+    let scan = pending_logs(&db, conversations, logs).await?;
+    Ok(PendingBuild {
+        resume: true,
+        pending: scan.pending,
+        leftovers: Some(scan.leftovers),
+    })
 }
 
 /// Logs that have at least one chunk. A zero-chunk log is not pending work.
@@ -1189,11 +1243,18 @@ async fn pending_in_build(
 fn logs_with_chunks(conversations: &Path, logs: &[u32]) -> Result<Vec<u32>, RecallError> {
     let mut pending = Vec::new();
     for log in logs {
-        if expected_chunks(conversations, *log)? > 0 {
+        if !archive_chunks(conversations, *log)?.is_empty() {
             pending.push(*log);
         }
     }
     Ok(pending)
+}
+
+/// Pending logs plus leftover rows already counted while deciding that.
+#[cfg(feature = "llm")]
+struct EpisodeScan {
+    pending: Vec<u32>,
+    leftovers: usize,
 }
 
 #[cfg(feature = "llm")]
@@ -1201,21 +1262,27 @@ async fn pending_logs(
     db: &surrealdb::Surreal<crate::graph::store::Db>,
     conversations: &Path,
     logs: &[u32],
-) -> Result<Vec<u32>, RecallError> {
+) -> Result<EpisodeScan, RecallError> {
     let mut response = db
-        .query("SELECT log_number, extracted FROM episode")
+        .query("SELECT log_number, extracted, content FROM episode")
         .await
         .map_err(crate::graph::error::GraphError::from)?;
     let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
     let grouped = group_episodes(&rows);
     let mut pending = Vec::new();
+    let mut leftovers = 0usize;
     for log in logs {
-        let expected = expected_chunks(conversations, *log)?;
-        if !log_is_complete(grouped.get(log), expected) {
+        let chunks = archive_chunks(conversations, *log)?;
+        let stored = grouped
+            .get(log)
+            .map(EpisodeRows::contents)
+            .unwrap_or_default();
+        leftovers += crate::graph::ingest::leftover_count(&stored, &chunks);
+        if !log_is_complete(grouped.get(log), &chunks) {
             pending.push(*log);
         }
     }
-    Ok(pending)
+    Ok(EpisodeScan { pending, leftovers })
 }
 
 #[cfg(feature = "llm")]
@@ -1225,40 +1292,47 @@ fn group_episodes(rows: &[serde_json::Value]) -> std::collections::HashMap<u32, 
         let Some(log) = json_u32(row.get("log_number")) else {
             continue;
         };
-        let entry = grouped.entry(log).or_insert(EpisodeRows {
-            count: 0,
-            all_extracted: true,
+        let entry = grouped.entry(log).or_insert_with(|| EpisodeRows {
+            episodes: Vec::new(),
         });
-        entry.count += 1;
-        if row.get("extracted").and_then(serde_json::Value::as_bool) != Some(true) {
-            entry.all_extracted = false;
-        }
+        entry.episodes.push(StoredEpisode {
+            content: row
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            extracted: row.get("extracted").and_then(serde_json::Value::as_bool) == Some(true),
+        });
     }
     grouped
 }
 
-/// `expected == 0` is complete: there is nothing to extract, and a resume
-/// must not call the provider for that log again.
+/// A log with no current chunks is complete: there is nothing to extract, and
+/// a resume must not call the provider for it again. Otherwise every current
+/// chunk must be stored, by exact content and counting copies, and extracted.
+/// A leftover row does not make the log incomplete.
 #[cfg(feature = "llm")]
-fn log_is_complete(rows: Option<&EpisodeRows>, expected: usize) -> bool {
-    if expected == 0 {
+fn log_is_complete(rows: Option<&EpisodeRows>, chunks: &[String]) -> bool {
+    if chunks.is_empty() {
         return true;
     }
-    match rows {
-        Some(rows) => rows.count >= expected && rows.all_extracted,
-        None => false,
+    let Some(rows) = rows else {
+        return false;
+    };
+    let stored = rows.contents();
+    if !crate::graph::ingest::missing_chunks(&stored, chunks).is_empty() {
+        return false;
     }
+    crate::graph::ingest::missing_chunks(&rows.extracted_contents(), chunks).is_empty()
 }
 
 #[cfg(feature = "llm")]
-fn expected_chunks(conversations: &Path, log: u32) -> Result<usize, RecallError> {
+fn archive_chunks(conversations: &Path, log: u32) -> Result<Vec<String>, RecallError> {
     let archive = find_archive_file(conversations, log)?;
     let content = std::fs::read_to_string(&archive)?;
     Ok(crate::graph::extract::chunk_conversation(
         &content,
         crate::graph::ingest::INGEST_CHUNK_TOKENS,
-    )
-    .len())
+    ))
 }
 
 #[cfg(feature = "llm")]
@@ -1329,6 +1403,9 @@ fn print_rebuild_dry_run(memory_dir: &Path, plan: &RebuildPlan) -> Result<(), Re
         "Estimated provider calls: {total_calls} (windows × 1 + resolver bound {})",
         crate::graph::v2::RESOLVER_CALL_BOUND
     );
+    if let Some(count) = plan.leftovers {
+        println!("{}", leftover_sentence(count));
+    }
     Ok(())
 }
 
@@ -1391,17 +1468,20 @@ async fn drive_rebuild(
     let mut facts = 0u32;
     let mut batch = plan.pending.clone();
     let mut processed = false;
+    let leftovers;
     loop {
         if batch.is_empty() {
-            batch = pending_logs(
+            let scan = pending_logs(
                 gm.db(),
                 &plan.conversations,
                 &conversation_logs(&plan.conversations)?,
             )
             .await?;
-            if batch.is_empty() {
+            if scan.pending.is_empty() {
+                leftovers = Some(scan.leftovers);
                 break;
             }
+            batch = scan.pending;
             if options.delay_ms > 0 && processed {
                 tokio::time::sleep(std::time::Duration::from_millis(options.delay_ms)).await;
             }
@@ -1424,6 +1504,7 @@ async fn drive_rebuild(
                     finished: false,
                     facts,
                     archives: 0,
+                    leftovers: None,
                 });
             }
             let built =
@@ -1468,6 +1549,7 @@ async fn drive_rebuild(
         finished: true,
         facts,
         archives: u32::try_from(archives.len()).unwrap_or(u32::MAX),
+        leftovers,
     })
 }
 
@@ -1514,7 +1596,7 @@ async fn rebuild_archive(
     }
     let (session_id, _) = extract_archive_metadata(&content, &archive);
     let context = IngestContext::new(session_id, Some(log));
-    ensure_episodes(gm, log, &content, &chunks, &context).await?;
+    ensure_episodes(gm, log, &chunks, &context).await?;
     let report = crate::graph::v2::extract_log(
         gm,
         memory_dir,
@@ -1528,45 +1610,28 @@ async fn rebuild_archive(
     Ok(BuiltArchive::Done(Box::new(report)))
 }
 
-/// Bring the log's episode count up to `chunks.len()`. A short prefix is
-/// extended; a full set is left alone. Ingest errors stop the archive.
+/// Write current chunks that are not already stored for this log.
+///
+/// Matching is exact content, counting copies. A missing middle chunk is
+/// written at its own index. Leftover rows stay. Ingest errors stop the archive.
 #[cfg(feature = "llm")]
 async fn ensure_episodes(
     gm: &crate::graph::GraphMemory,
     log: u32,
-    content: &str,
     chunks: &[String],
     context: &IngestContext,
 ) -> Result<(), RecallError> {
-    let have = episode_count(gm, log).await?;
-    if have >= chunks.len() {
+    let stored = crate::graph::ingest::stored_log_content(gm, log).await?;
+    let missing = crate::graph::ingest::missing_chunks(&stored, chunks);
+    if missing.is_empty() {
         return Ok(());
     }
-    let report = if have == 0 {
-        gm.ingest_archive(content, context, None).await?
-    } else {
-        crate::graph::ingest::ingest_remaining_episodes(gm, &chunks[have..], context, have).await?
-    };
+    let report = crate::graph::ingest::ingest_missing_episodes(gm, &missing, context).await?;
     if report.errors.is_empty() {
         Ok(())
     } else {
         Err(RecallError::Other(report.errors.join("; ")))
     }
-}
-
-#[cfg(feature = "llm")]
-async fn episode_count(gm: &crate::graph::GraphMemory, log: u32) -> Result<usize, RecallError> {
-    let mut response = gm
-        .db()
-        .query("SELECT count() AS count FROM episode WHERE log_number = $ln GROUP ALL")
-        .bind(("ln", i64::from(log)))
-        .await
-        .map_err(crate::graph::error::GraphError::from)?;
-    let rows: Vec<serde_json::Value> = crate::graph::deserialize_take(&mut response, 0)?;
-    Ok(rows
-        .first()
-        .and_then(|row| json_u32(row.get("count")))
-        .unwrap_or(0) as usize)
 }
 
 #[cfg(feature = "llm")]
@@ -1595,7 +1660,12 @@ fn unfinished(memory_dir: &Path, log: Option<u32>, detail: &str) -> RecallError 
 }
 
 #[cfg(feature = "llm")]
-fn swap_and_record(memory_dir: &Path, archives: u32, facts: u32) -> Result<(), RecallError> {
+fn swap_and_record(
+    memory_dir: &Path,
+    archives: u32,
+    facts: u32,
+    leftovers: Option<usize>,
+) -> Result<(), RecallError> {
     let backup = swap_store(memory_dir)?;
     if let Err(err) = crate::config::set_graph_pipeline(memory_dir, "v2") {
         let config = crate::config::config_path(memory_dir);
@@ -1606,7 +1676,7 @@ fn swap_and_record(memory_dir: &Path, archives: u32, facts: u32) -> Result<(), R
             shell_quote(&config)
         )));
     }
-    print_swapped(memory_dir, &backup, archives, facts);
+    print_swapped(memory_dir, &backup, archives, facts, leftovers);
     Ok(())
 }
 
@@ -1672,8 +1742,43 @@ fn io_msg(message: String) -> RecallError {
 }
 
 #[cfg(feature = "llm")]
-fn print_swapped(memory_dir: &Path, backup: &Path, archives: u32, facts: u32) {
-    print!("{}", swap_report(memory_dir, backup, archives, facts));
+fn print_swapped(
+    memory_dir: &Path,
+    backup: &Path,
+    archives: u32,
+    facts: u32,
+    leftovers: Option<usize>,
+) {
+    print!(
+        "{}",
+        report_with_leftovers(swap_report(memory_dir, backup, archives, facts), leftovers)
+    );
+}
+
+/// One sentence for a leftover count the completeness scan already produced.
+#[cfg(feature = "llm")]
+fn leftover_sentence(count: usize) -> String {
+    let episodes = if count == 1 { "episode" } else { "episodes" };
+    format!("{count} leftover {episodes} left in place.")
+}
+
+/// Insert the leftover sentence after the rebuilt line when the scan knew it.
+#[cfg(feature = "llm")]
+fn report_with_leftovers(report: String, leftovers: Option<usize>) -> String {
+    let Some(count) = leftovers else {
+        return report;
+    };
+    let addition = format!("{}\n", leftover_sentence(count));
+    let needle = "facts written.\n";
+    let Some(at) = report.find(needle) else {
+        return format!("{report}{addition}");
+    };
+    let pos = at + needle.len();
+    let mut out = String::with_capacity(report.len() + addition.len());
+    out.push_str(&report[..pos]);
+    out.push_str(&addition);
+    out.push_str(&report[pos..]);
+    out
 }
 
 #[cfg(feature = "llm")]
@@ -3426,6 +3531,25 @@ mod tests {
     }
 
     #[test]
+    fn a_known_leftover_count_is_part_of_the_swap_report() {
+        let memory = PathBuf::from("/tmp/memory");
+        let backup = memory.join("graph.v1-backup-20261025-1200");
+        let plain = swap_report(&memory, &backup, 3, 4);
+        let text = report_with_leftovers(plain.clone(), Some(2));
+        assert!(
+            text.contains("2 leftover episodes left in place."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Rebuilt 3 archives, 4 facts written."),
+            "{text}"
+        );
+        assert!(text.contains("pipeline = \"v1\""), "{text}");
+        assert_eq!(report_with_leftovers(plain.clone(), None), plain);
+        assert_eq!(leftover_sentence(1), "1 leftover episode left in place.");
+    }
+
+    #[test]
     fn a_half_swap_message_quotes_both_renames_and_both_pipeline_lines() {
         let graph = PathBuf::from("/tmp/memory/graph");
         let build = PathBuf::from("/tmp/memory/graph.v2-build");
@@ -3474,38 +3598,59 @@ mod tests {
         }
     }
 
+    fn episode(content: Option<&str>, extracted: bool) -> StoredEpisode {
+        StoredEpisode {
+            content: content.map(str::to_string),
+            extracted,
+        }
+    }
+
     #[test]
     fn a_zero_chunk_log_is_complete_and_a_short_log_is_not() {
-        assert!(log_is_complete(None, 0));
-        assert!(!log_is_complete(None, 2));
+        let no_chunks: &[String] = &[];
+        assert!(log_is_complete(None, no_chunks));
+        let expected = vec!["alpha".to_string(), "beta".to_string()];
+        assert!(!log_is_complete(None, &expected));
         let short = EpisodeRows {
-            count: 1,
-            all_extracted: true,
+            episodes: vec![episode(Some("alpha"), true)],
         };
-        assert!(!log_is_complete(Some(&short), 2));
+        assert!(!log_is_complete(Some(&short), &expected));
         let full = EpisodeRows {
-            count: 2,
-            all_extracted: true,
+            episodes: vec![episode(Some("alpha"), true), episode(Some("beta"), true)],
         };
-        assert!(log_is_complete(Some(&full), 2));
+        assert!(log_is_complete(Some(&full), &expected));
         let pending = EpisodeRows {
-            count: 2,
-            all_extracted: false,
+            episodes: vec![episode(Some("alpha"), true), episode(Some("beta"), false)],
         };
-        assert!(!log_is_complete(Some(&pending), 2));
+        assert!(!log_is_complete(Some(&pending), &expected));
+        let leftover = EpisodeRows {
+            episodes: vec![
+                episode(Some("alpha"), true),
+                episode(Some("beta"), true),
+                episode(None, false),
+            ],
+        };
+        assert!(log_is_complete(Some(&leftover), &expected));
+        let absent = EpisodeRows {
+            episodes: vec![episode(None, true)],
+        };
+        assert!(!log_is_complete(Some(&absent), &expected));
     }
 
     #[test]
     fn episode_rows_are_grouped_once() {
         let rows = [
-            serde_json::json!({"log_number": 1, "extracted": true}),
-            serde_json::json!({"log_number": 1, "extracted": false}),
-            serde_json::json!({"log_number": 2, "extracted": true}),
+            serde_json::json!({"log_number": 1, "extracted": true, "content": "alpha"}),
+            serde_json::json!({"log_number": 1, "extracted": false, "content": null}),
+            serde_json::json!({"log_number": 2, "extracted": true, "content": "beta"}),
         ];
         let grouped = group_episodes(&rows);
-        assert_eq!(grouped.get(&1).expect("log 1").count, 2);
-        assert!(!grouped.get(&1).expect("log 1").all_extracted);
-        assert!(grouped.get(&2).expect("log 2").all_extracted);
+        let log1 = grouped.get(&1).expect("log 1");
+        assert_eq!(log1.contents(), vec![Some("alpha".to_string()), None]);
+        assert!(!log1.all_extracted());
+        let log2 = grouped.get(&2).expect("log 2");
+        assert_eq!(log2.contents(), vec![Some("beta".to_string())]);
+        assert!(log2.all_extracted());
         assert_eq!(grouped.len(), 2);
     }
 

@@ -305,6 +305,11 @@ fn strings(rows: &[serde_json::Value], field: &str) -> Vec<String> {
         .collect()
 }
 
+fn sorted(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values
+}
+
 fn backups(memory: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(memory)
         .expect("memory")
@@ -863,7 +868,7 @@ async fn a_short_episode_count_is_filled_on_resume() {
             session_id: "s1".into(),
             abstract_text: "partial".into(),
             overview: None,
-            content: Some("partial".into()),
+            content: Some(chunks[0].clone()),
             log_number: Some(1),
         })
         .await
@@ -897,6 +902,15 @@ async fn a_short_episode_count_is_filled_on_resume() {
         .collect();
     assert_eq!(mine.len(), chunks.len(), "{episodes:?}");
     assert!(mine.iter().all(|row| extracted(row)), "{mine:?}");
+    let stored = strings(
+        &query(&memory.join("graph"), "SELECT content FROM episode").await,
+        "content",
+    );
+    assert_eq!(
+        sorted(stored),
+        sorted(chunks),
+        "prefix resume rewrote a chunk"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -980,4 +994,169 @@ async fn an_unrelated_surreal_directory_is_not_opened() {
     names.sort();
     assert_eq!(names, vec![std::ffi::OsString::from("note.txt")]);
     assert_unchanged(&memory.join("graph"), &before_graph);
+}
+
+fn wide_turn(sentence: &str) -> String {
+    format!("### User\n\n{sentence}\n{}", "detail ".repeat(450))
+}
+
+fn numbered_archive(body: &str) -> String {
+    format!("---\nlog: 1\ndate: \"2026-03-01T00:00:00Z\"\nsession_id: \"s1\"\n---\n\n{body}")
+}
+
+async fn prepare_resume(memory: &Path) -> PathBuf {
+    write_config(memory, false);
+    {
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .expect("v1 store");
+        drop(gm);
+    }
+    std::fs::write(memory.join("graph/KEEP"), b"keep").expect("sentinel");
+    let conversations = memory.join("conversations");
+    std::fs::create_dir_all(&conversations).expect("conversations");
+    conversations
+}
+
+async fn stamp_v2(build: &Path) {
+    let db = store::open(build).await.expect("stamp");
+    db.query("UPSERT meta:pipeline SET pipeline = $pipeline")
+        .bind(("pipeline", "v2"))
+        .await
+        .expect("upsert")
+        .check()
+        .expect("stamp check");
+}
+
+async fn plant_episode(build: &Path, content: Option<&str>) {
+    let gm = GraphMemory::open_embedded(build).await.expect("build");
+    gm.add_episode(recall_echo::graph::types::NewEpisode {
+        session_id: "s1".into(),
+        abstract_text: "planted".into(),
+        overview: None,
+        content: content.map(str::to_string),
+        log_number: Some(1),
+    })
+    .await
+    .expect("plant episode");
+}
+
+fn assert_contents(stored: &[String], expected: &[String]) {
+    assert_eq!(sorted(stored.to_vec()), sorted(expected.to_vec()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_missing_middle_chunk_is_filled_on_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    let conversations = prepare_resume(memory).await;
+    let text =
+        numbered_archive(&[wide_turn(RUST), wide_turn(PYTHON), wide_turn(GO)].join("\n---\n"));
+    std::fs::write(conversations.join("conversation-001.md"), &text).expect("archive");
+    let chunks = recall_echo::graph::extract::chunk_conversation(&text, 500);
+    assert!(chunks.len() >= 3, "{}", chunks.len());
+    let middle = chunks.len() / 2;
+    let build = memory.join("graph.v2-build");
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index != middle {
+            plant_episode(&build, Some(chunk)).await;
+        }
+    }
+    stamp_v2(&build).await;
+
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("resume fills the middle chunk");
+
+    let graph = memory.join("graph");
+    let rows = query(&graph, "SELECT content, extracted FROM episode").await;
+    assert!(rows.iter().all(extracted), "{rows:?}");
+    assert_contents(&strings(&rows, "content"), &chunks);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn identical_chunks_stay_two_episodes_on_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    let conversations = prepare_resume(memory).await;
+    let segment = wide_turn(RUST);
+    let text = numbered_archive(&format!("{segment}\n---\n{segment}"));
+    std::fs::write(conversations.join("conversation-001.md"), &text).expect("archive");
+    let chunks = recall_echo::graph::extract::chunk_conversation(&text, 500);
+    let copies = chunks.iter().filter(|chunk| chunk.contains(RUST)).count();
+    assert_eq!(copies, 2, "{chunks:?}");
+    let build = memory.join("graph.v2-build");
+    for chunk in &chunks {
+        plant_episode(&build, Some(chunk)).await;
+    }
+    stamp_v2(&build).await;
+
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("resume keeps both copies");
+
+    let rows = query(
+        &memory.join("graph"),
+        "SELECT content, extracted FROM episode",
+    )
+    .await;
+    assert_eq!(rows.len(), chunks.len(), "{rows:?}");
+    assert!(rows.iter().all(extracted), "{rows:?}");
+    assert_contents(&strings(&rows, "content"), &chunks);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_leftover_episode_remains_when_resume_fills_current_chunks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    let conversations = prepare_resume(memory).await;
+    let text = numbered_archive(&[wide_turn(RUST), wide_turn(PYTHON)].join("\n---\n"));
+    std::fs::write(conversations.join("conversation-001.md"), &text).expect("archive");
+    let chunks = recall_echo::graph::extract::chunk_conversation(&text, 500);
+    assert!(chunks.len() >= 2, "{}", chunks.len());
+    let build = memory.join("graph.v2-build");
+    plant_episode(&build, Some(&chunks[0])).await;
+    plant_episode(&build, Some("not a current chunk")).await;
+    stamp_v2(&build).await;
+
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("resume keeps the leftover");
+
+    let rows = query(
+        &memory.join("graph"),
+        "SELECT content, extracted FROM episode",
+    )
+    .await;
+    let stored = strings(&rows, "content");
+    assert!(
+        stored
+            .iter()
+            .any(|content| content == "not a current chunk"),
+        "{stored:?}"
+    );
+    for chunk in &chunks {
+        assert_eq!(
+            stored.iter().filter(|content| *content == chunk).count(),
+            1,
+            "{stored:?}"
+        );
+    }
+    assert_eq!(stored.len(), chunks.len() + 1, "{stored:?}");
+    assert!(rows.iter().all(extracted), "{rows:?}");
 }
