@@ -298,6 +298,24 @@ async fn query(path: &Path, sql: &str) -> Vec<serde_json::Value> {
     response.take(0).expect("rows")
 }
 
+/// The rebuild thread's store can still be compacting when this test opens it.
+async fn query_when_free(path: &Path, sql: &str) -> Vec<serde_json::Value> {
+    let mut last = String::new();
+    for _ in 0..6 {
+        match store::open(path).await {
+            Ok(db) => {
+                let mut response = db.query(sql).await.expect("query");
+                return response.take(0).expect("rows");
+            }
+            Err(err) => {
+                last = err.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+    panic!("open {}: {last}", path.display());
+}
+
 fn strings(rows: &[serde_json::Value], field: &str) -> Vec<String> {
     rows.iter()
         .filter_map(|row| row.get(field).and_then(serde_json::Value::as_str))
@@ -1159,4 +1177,138 @@ async fn a_leftover_episode_remains_when_resume_fills_current_chunks() {
     }
     assert_eq!(stored.len(), chunks.len() + 1, "{stored:?}");
     assert!(rows.iter().all(extracted), "{rows:?}");
+}
+
+fn admin_lock_path(memory: &Path) -> PathBuf {
+    let mut path = memory.join("run/graph.sock").into_os_string();
+    path.push(".admin");
+    PathBuf::from(path)
+}
+
+fn hold_admin_lock(memory: &Path) -> PathBuf {
+    let path = admin_lock_path(memory);
+    std::fs::write(&path, format!("{}\n", std::process::id())).expect("admin lock");
+    path
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_dry_run_does_not_take_the_admin_lock() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    let lock = hold_admin_lock(memory);
+    let stop = IdleStop::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rebuild(
+            memory,
+            options(PipelineVersion::V2, true),
+            &stop,
+            Some(&Scripted::answering()),
+        ),
+    )
+    .await;
+    assert!(result.is_ok(), "dry run waited on the admin lock");
+    result.expect("join").expect("dry run");
+    assert!(!stop.called());
+    assert!(lock.is_file(), "dry run removed the admin lock");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_stop_releases_the_admin_lock() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &FailStop,
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect_err("daemon");
+    assert!(err.to_string().contains("cannot stop"), "{err}");
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recall_echo::serve_client::exclusive(memory, |_graph| async { Ok::<(), RecallError>(()) }),
+    )
+    .await;
+    assert!(outcome.is_ok(), "admin lock was still held");
+    outcome.expect("join").expect("lock acquired");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_rebuild_plans_after_it_takes_the_lock() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path().to_path_buf();
+    write_config(&memory, false);
+    {
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .expect("v1 store");
+        drop(gm);
+    }
+    let conversations = memory.join("conversations");
+    std::fs::create_dir_all(&conversations).expect("conversations");
+    std::fs::write(conversations.join("conversation-001.md"), markdown(1, RUST)).expect("log 1");
+    let lock = hold_admin_lock(&memory);
+
+    let memory_thread = memory.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let result = rebuild(
+                &memory_thread,
+                options(PipelineVersion::V2, false),
+                &IdleStop::new(),
+                Some(&Scripted::answering()),
+            )
+            .await;
+            let _ = tx.send(result);
+            // Stay alive so the store can finish closing before this process
+            // opens it again.
+            let release = release_rx;
+            let _ = tokio::task::spawn_blocking(move || release.recv()).await;
+        });
+    });
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        rx.try_recv().is_err(),
+        "rebuild finished before the lock was released"
+    );
+    std::fs::remove_file(conversations.join("conversation-001.md")).expect("remove log 1");
+    std::fs::write(
+        conversations.join("conversation-002.md"),
+        markdown(2, PYTHON),
+    )
+    .expect("log 2");
+    std::fs::remove_file(&lock).expect("release lock");
+
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("rebuild finished");
+    result.expect("rebuild planned after the lock");
+
+    let names = strings(
+        &query_when_free(&memory.join("graph"), "SELECT name FROM entity").await,
+        "name",
+    );
+    assert!(names.iter().any(|name| name == "Python"), "{names:?}");
+    assert!(names.iter().all(|name| name != "Rust"), "{names:?}");
+    let episodes = query_when_free(&memory.join("graph"), "SELECT log_number FROM episode").await;
+    assert!(
+        episodes.iter().any(|row| log_number(row) == Some(2)),
+        "{episodes:?}"
+    );
+    assert!(
+        episodes.iter().all(|row| log_number(row) != Some(1)),
+        "{episodes:?}"
+    );
+    let _ = release_tx.send(());
 }

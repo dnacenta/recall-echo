@@ -988,8 +988,10 @@ impl EpisodeRows {
 /// and estimated calls and does not stop the daemon.
 ///
 /// The build, the catch-up of logs that appear while it runs, the swap, and
-/// the config write all hold the admin lock. `stop` runs under that lock;
-/// the CLI's stop is `stop_daemon_for_admin`.
+/// the config write all hold the admin lock. A live run plans after that lock
+/// is held and before the daemon is stopped, so a refusal still leaves the
+/// daemon running. `--dry-run` plans without the lock. `stop` runs under the
+/// lock; the CLI's stop is `stop_daemon_for_admin`.
 #[cfg(feature = "llm")]
 pub async fn rebuild(
     memory_dir: &Path,
@@ -997,16 +999,33 @@ pub async fn rebuild(
     stop: &impl RebuildStop,
     llm: Option<&dyn crate::graph::llm::LlmProvider>,
 ) -> Result<(), RecallError> {
-    let plan = prepare_rebuild(memory_dir, &options).await?;
+    preflight_rebuild(memory_dir, &options)?;
     if options.dry_run {
+        let plan = plan_rebuild(memory_dir).await?;
         return print_rebuild_dry_run(memory_dir, &plan);
     }
+    let planned = std::sync::Mutex::new(None);
     serve_client::exclusive_without_store(
         memory_dir,
-        || stop_for_rebuild(memory_dir, stop),
-        || finish_rebuild(memory_dir, &plan, &options, llm),
+        || async {
+            let plan = plan_rebuild(memory_dir).await?;
+            *planned.lock().unwrap_or_else(|err| err.into_inner()) = Some(plan);
+            stop_for_rebuild(memory_dir, stop).await
+        },
+        || async {
+            let plan = take_plan(&planned)?;
+            finish_rebuild(memory_dir, &plan, &options, llm).await
+        },
     )
     .await
+}
+
+#[cfg(feature = "llm")]
+fn take_plan(slot: &std::sync::Mutex<Option<RebuildPlan>>) -> Result<RebuildPlan, RecallError> {
+    slot.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+        .ok_or_else(|| RecallError::Other("rebuild plan was not ready".into()))
 }
 
 #[cfg(feature = "llm")]
@@ -1032,13 +1051,10 @@ async fn finish_rebuild(
     swap_and_record(memory_dir, totals.archives, totals.facts, totals.leftovers)
 }
 
+/// Config, pipeline, server mode, and rewrite validation. No store is opened,
+/// and the admin lock is not taken.
 #[cfg(feature = "llm")]
-async fn prepare_rebuild(
-    memory_dir: &Path,
-    options: &ExtractOptions,
-) -> Result<RebuildPlan, RecallError> {
-    // Flag and config only. A stamp read would open the store, and a refused
-    // rebuild must leave `graph/` byte-identical.
+fn preflight_rebuild(memory_dir: &Path, options: &ExtractOptions) -> Result<(), RecallError> {
     let configured = crate::config::load_from_dir(memory_dir)
         .graph
         .and_then(|section| section.pipeline);
@@ -1053,25 +1069,42 @@ async fn prepare_rebuild(
     // stops or any directory is opened. `mode` is read from that parse:
     // `load` drops a file it cannot validate, which would hide `mode = "server"`.
     if let Some(parsed) = crate::config::read_config_file(memory_dir)? {
-        let mode = parsed
-            .graph
-            .as_ref()
-            .map(|graph| graph.mode.clone())
-            .unwrap_or_else(|| "embedded".to_string());
-        let mut problems = Vec::new();
-        if mode == "server" {
-            problems.push(
-                "rebuild refuses [graph] mode = \"server\": there is no embedded directory to swap, so nothing was changed"
-                    .to_string(),
-            );
-        }
-        if let Err(err) = crate::config::validate_for_rewrite(memory_dir, parsed) {
-            problems.push(err.to_string());
-        }
-        if !problems.is_empty() {
-            return Err(RecallError::Config(problems.join("; ")));
-        }
+        refuse_unusable_config(memory_dir, parsed)?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "llm")]
+fn refuse_unusable_config(
+    memory_dir: &Path,
+    parsed: crate::config::Config,
+) -> Result<(), RecallError> {
+    let mode = parsed
+        .graph
+        .as_ref()
+        .map(|graph| graph.mode.clone())
+        .unwrap_or_else(|| "embedded".to_string());
+    let mut problems = Vec::new();
+    if mode == "server" {
+        problems.push(
+            "rebuild refuses [graph] mode = \"server\": there is no embedded directory to swap, so nothing was changed"
+                .to_string(),
+        );
+    }
+    if let Err(err) = crate::config::validate_for_rewrite(memory_dir, parsed) {
+        problems.push(err.to_string());
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(RecallError::Config(problems.join("; ")))
+    }
+}
+
+/// Log list, half-swap check, and the pending build. A live rebuild calls
+/// this only after the admin lock is held.
+#[cfg(feature = "llm")]
+async fn plan_rebuild(memory_dir: &Path) -> Result<RebuildPlan, RecallError> {
     let conversations = find_conversations_dir(memory_dir)?;
     let logs = conversation_logs(&conversations)?;
     if logs.is_empty() {
