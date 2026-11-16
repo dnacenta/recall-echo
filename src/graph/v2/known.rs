@@ -1500,6 +1500,21 @@ mod tests {
             }
         }
 
+        fn pin_stack_off(memory: &std::path::Path) {
+            std::fs::write(
+                memory.join(".recall-echo.toml"),
+                "[graph]\nknown_facts_context = false\nconsolidate = false\n\
+                 consolidate_hold = false\ndrop_restatements = false\n\
+                 consolidate_links = false\nconsolidate_components = false\n\
+                 ground_component_edges = false\nconsolidate_key_rename = false\n\
+                 consolidate_replaces_cue = false\n\
+                 consolidate_replaces_departure = false\nknown_key_binding = false\n\
+                 consolidate_orphan_sweep = false\nconsolidate_rule_fragments = false\n\
+                 consolidate_retire_component = false\n",
+            )
+            .unwrap();
+        }
+
         fn sidecar(memory: &std::path::Path, text: &str) {
             let cwd = memory.join("tidepool");
             std::fs::create_dir_all(&cwd).unwrap();
@@ -1698,6 +1713,7 @@ mod tests {
             let memory = tmp.path();
             let turn = "Ship the shelf today.";
             sidecar(memory, turn);
+            pin_stack_off(memory);
             let gm = GraphMemory::open_embedded(&memory.join("graph"))
                 .await
                 .unwrap();
@@ -1745,6 +1761,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let memory = tmp.path();
             sidecar(memory, "Ship the shelf today.");
+            pin_stack_off(memory);
             let gm = GraphMemory::open_embedded(&memory.join("graph"))
                 .await
                 .unwrap();

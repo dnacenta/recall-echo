@@ -244,78 +244,139 @@ enum BenchCommands {
         /// unless the memory directory's config says otherwise.
         #[arg(long, value_parser = parse_pipeline)]
         pipeline: Option<recall_echo::graph::PipelineVersion>,
-        /// Show stored facts to pass 1. Experimental, and off unless set.
+        /// Show stored facts to pass 1. On unless `--no-known-facts-context`.
         #[arg(long)]
         known_facts_context: bool,
         /// Match kept facts to stored rows after pass 1. Off unless set.
         #[arg(long)]
         known_match: bool,
-        /// Close drifted copies after the session write. Off unless set.
+        /// Close drifted copies after the session write. On unless `--no-consolidate`.
         #[arg(long)]
         consolidate: bool,
         /// Hold a conflicting write the retirement guard would skip.
-        /// Implies `--consolidate`. Off unless set. Pending rows stay out of
-        /// live reads if this is later turned off; see docs/grounding.md.
+        /// Implies `--consolidate`. On unless `--no-consolidate-hold`. Pending
+        /// rows stay out of live reads if this is later turned off; see
+        /// docs/grounding.md.
         #[arg(long)]
         consolidate_hold: bool,
         /// Record derived-from links that feed consolidation.
-        /// Implies `--consolidate`. Off unless set. Independent of
-        /// `--consolidate-hold` and `--drop-restatements`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-links`.
+        /// Independent of `--consolidate-hold` and `--drop-restatements`.
         #[arg(long)]
         consolidate_links: bool,
         /// Close a sibling or derived-from partner after the judge.
-        /// Implies `--consolidate`. Off unless set. Independent of
-        /// `--consolidate-hold`, `--consolidate-links`, and `--drop-restatements`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-components`.
+        /// Independent of `--consolidate-hold`, `--consolidate-links`, and
+        /// `--drop-restatements`.
         #[arg(long)]
         consolidate_components: bool,
         /// Keep a judged rename, a "becomes" replacement, or a dropped-entity rule.
-        /// Implies `--consolidate`. Off unless set. Independent of
-        /// `--consolidate-hold`, `--consolidate-links`, `--consolidate-components`,
-        /// and `--drop-restatements`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-key-rename`.
+        /// Independent of `--consolidate-hold`, `--consolidate-links`,
+        /// `--consolidate-components`, and `--drop-restatements`.
         #[arg(long)]
         consolidate_key_rename: bool,
         /// Count a unique pass-1 replaces match as the departure cue.
-        /// Implies `--consolidate`. Off unless set. Independent of
-        /// `--consolidate-hold`, `--consolidate-links`, `--consolidate-components`,
-        /// `--consolidate-key-rename`, and `--drop-restatements`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-replaces-cue`.
+        /// Independent of `--consolidate-hold`, `--consolidate-links`,
+        /// `--consolidate-components`, `--consolidate-key-rename`, and
+        /// `--drop-restatements`.
         #[arg(long)]
         consolidate_replaces_cue: bool,
         /// Keep a judged supersede when an exact rule replaces and a departure
-        /// word supply the cue. Implies `--consolidate`. Off unless set.
-        /// Independent of `--consolidate-replaces-cue`.
+        /// word supply the cue. Implies `--consolidate`. On unless
+        /// `--no-consolidate-replaces-departure`. Independent of
+        /// `--consolidate-replaces-cue`.
         #[arg(long)]
         consolidate_replaces_departure: bool,
         /// Close orphan copies of a rejected value after the session write.
-        /// Implies `--consolidate`. Off unless set. Does not turn on
-        /// `--ground-component-edges`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-orphan-sweep`.
+        /// Does not turn on `--ground-component-edges`.
         #[arg(long)]
         consolidate_orphan_sweep: bool,
         /// Close a same-turn rule fragment after its rule is closed.
-        /// Implies `--consolidate`. Off unless set. Does not turn on
-        /// `--ground-component-edges`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-rule-fragments`.
+        /// Does not turn on `--ground-component-edges`.
         #[arg(long)]
         consolidate_rule_fragments: bool,
         /// Retire a dropped component's settings after the session write.
-        /// Implies `--consolidate`. Off unless set. Does not turn on
-        /// `--ground-component-edges`.
+        /// Implies `--consolidate`. On unless `--no-consolidate-retire-component`.
+        /// Does not turn on `--ground-component-edges`.
         #[arg(long)]
         consolidate_retire_component: bool,
-        /// Bind a decided setting key from a shown known row. Off unless set.
-        /// Does not turn on `--known-facts-context`.
+        /// Bind a decided setting key from a shown known row. On unless
+        /// `--no-known-key-binding`. Does not turn on `--known-facts-context`.
         #[arg(long)]
         known_key_binding: bool,
         /// Drop a decided rule that only restates a same-session setting.
-        /// Off unless set.
+        /// On unless `--no-drop-restatements`.
         #[arg(long)]
         drop_restatements: bool,
         /// Accept a decided component part_of the session project when the
-        /// turn names the component. Off unless set. Implies nothing.
+        /// turn names the component. On unless `--no-ground-component-edges`.
+        /// Implies nothing.
         #[arg(long)]
         ground_component_edges: bool,
         /// List raw-turn values missing from the store. Off unless set.
         /// Implies nothing. The list is not stored.
         #[arg(long)]
         recover_turns: bool,
+        /// Turn the known-facts block off for this run.
+        #[arg(long, conflicts_with = "known_facts_context")]
+        no_known_facts_context: bool,
+        /// Turn consolidation off for this run.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "consolidate",
+                "consolidate_hold",
+                "consolidate_links",
+                "consolidate_components",
+                "consolidate_key_rename",
+                "consolidate_replaces_cue",
+                "consolidate_replaces_departure",
+                "consolidate_orphan_sweep",
+                "consolidate_rule_fragments",
+                "consolidate_retire_component",
+            ]
+        )]
+        no_consolidate: bool,
+        /// Turn the contradiction hold off for this run.
+        #[arg(long, conflicts_with = "consolidate_hold")]
+        no_consolidate_hold: bool,
+        /// Turn derived-from links off for this run.
+        #[arg(long, conflicts_with = "consolidate_links")]
+        no_consolidate_links: bool,
+        /// Turn sibling and derived-from cues off for this run.
+        #[arg(long, conflicts_with = "consolidate_components")]
+        no_consolidate_components: bool,
+        /// Turn judged renames off for this run.
+        #[arg(long, conflicts_with = "consolidate_key_rename")]
+        no_consolidate_key_rename: bool,
+        /// Turn the replaces departure cue off for this run.
+        #[arg(long, conflicts_with = "consolidate_replaces_cue")]
+        no_consolidate_replaces_cue: bool,
+        /// Turn the exact-replaces departure cue off for this run.
+        #[arg(long, conflicts_with = "consolidate_replaces_departure")]
+        no_consolidate_replaces_departure: bool,
+        /// Turn the orphan sweep off for this run.
+        #[arg(long, conflicts_with = "consolidate_orphan_sweep")]
+        no_consolidate_orphan_sweep: bool,
+        /// Turn same-turn rule-fragment closes off for this run.
+        #[arg(long, conflicts_with = "consolidate_rule_fragments")]
+        no_consolidate_rule_fragments: bool,
+        /// Turn dropped-component retirement off for this run.
+        #[arg(long, conflicts_with = "consolidate_retire_component")]
+        no_consolidate_retire_component: bool,
+        /// Turn known-row key binding off for this run.
+        #[arg(long, conflicts_with = "known_key_binding")]
+        no_known_key_binding: bool,
+        /// Turn restatement dropping off for this run.
+        #[arg(long, conflicts_with = "drop_restatements")]
+        no_drop_restatements: bool,
+        /// Turn component-edge grounding off for this run.
+        #[arg(long, conflicts_with = "ground_component_edges")]
+        no_ground_component_edges: bool,
     },
     /// List raw-turn values missing from a store. Writes nothing.
     RecoverReplay {
@@ -329,7 +390,7 @@ enum BenchCommands {
 enum ConfigCommands {
     /// Show current configuration
     Show,
-    /// Set a config value (e.g., `config set provider claude-code`)
+    /// Set a config value (e.g., `config set provider grok`)
     Set {
         /// Config key (provider, model, api_base, llm.cli.*, ephemeral.max_entries)
         key: String,
@@ -1086,6 +1147,20 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             drop_restatements,
             ground_component_edges,
             recover_turns,
+            no_known_facts_context,
+            no_consolidate,
+            no_consolidate_hold,
+            no_consolidate_links,
+            no_consolidate_components,
+            no_consolidate_key_rename,
+            no_consolidate_replaces_cue,
+            no_consolidate_replaces_departure,
+            no_consolidate_orphan_sweep,
+            no_consolidate_rule_fragments,
+            no_consolidate_retire_component,
+            no_known_key_binding,
+            no_drop_restatements,
+            no_ground_component_edges,
         } => run_writes(
             script,
             work_dir,
@@ -1164,6 +1239,22 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 recall_echo::bench::writes::KnownKeyBinding::On,
                 recall_echo::bench::writes::KnownKeyBinding::Off,
             ),
+            recall_echo::bench::writes::OptOuts {
+                known_facts_context: no_known_facts_context,
+                consolidate: no_consolidate,
+                consolidate_hold: no_consolidate_hold,
+                drop_restatements: no_drop_restatements,
+                consolidate_links: no_consolidate_links,
+                consolidate_components: no_consolidate_components,
+                ground_component_edges: no_ground_component_edges,
+                consolidate_key_rename: no_consolidate_key_rename,
+                consolidate_replaces_cue: no_consolidate_replaces_cue,
+                consolidate_replaces_departure: no_consolidate_replaces_departure,
+                known_key_binding: no_known_key_binding,
+                consolidate_orphan_sweep: no_consolidate_orphan_sweep,
+                consolidate_rule_fragments: no_consolidate_rule_fragments,
+                consolidate_retire_component: no_consolidate_retire_component,
+            },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
     }
@@ -1347,6 +1438,7 @@ fn run_writes(
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
     consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
+    opt_outs: recall_echo::bench::writes::OptOuts,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
 
@@ -1392,6 +1484,7 @@ fn run_writes(
             consolidate_rule_fragments,
             consolidate_retire_component,
             known_key_binding,
+            opt_outs,
         ))?;
         serde_json::to_string_pretty(&report)?
     } else {
@@ -1417,6 +1510,7 @@ fn run_writes(
             consolidate_rule_fragments,
             consolidate_retire_component,
             known_key_binding,
+            opt_outs,
         ))?;
         serde_json::to_string_pretty(&report)?
     };
@@ -1447,6 +1541,7 @@ async fn grade_once(
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
     consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
+    opt_outs: recall_echo::bench::writes::OptOuts,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1475,6 +1570,7 @@ async fn grade_once(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                opt_outs,
             )
             .await
         }
@@ -1499,6 +1595,7 @@ async fn grade_once(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                opt_outs,
             )
             .await
         }
@@ -1529,6 +1626,7 @@ async fn grade_repeat(
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
     consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
+    opt_outs: recall_echo::bench::writes::OptOuts,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
 
@@ -1558,6 +1656,7 @@ async fn grade_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                opt_outs,
             )
             .await
         }
@@ -1583,6 +1682,7 @@ async fn grade_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                opt_outs,
             )
             .await
         }
@@ -2401,7 +2501,7 @@ mod tests {
     #[test]
     fn bench_writes_switches_match_the_golden() {
         let cases = switch_cases();
-        assert_eq!(cases.len(), 19);
+        assert_eq!(cases.len(), 34);
         let rendered = render_switch_cases(&cases);
         let path = switch_golden_path();
         if std::env::var_os("RECALL_ECHO_BLESS").is_some() {
@@ -2446,6 +2546,25 @@ mod tests {
             .join("tests/fixtures/bench/writes_switches.golden")
     }
 
+    /// Opt-outs for the measured stack, in the order the run config writes them.
+    #[cfg(feature = "bench")]
+    const OPT_OUT_NAMES: [&str; 14] = [
+        "no-known-facts-context",
+        "no-consolidate",
+        "no-consolidate-hold",
+        "no-drop-restatements",
+        "no-consolidate-links",
+        "no-consolidate-components",
+        "no-ground-component-edges",
+        "no-consolidate-key-rename",
+        "no-consolidate-replaces-cue",
+        "no-consolidate-replaces-departure",
+        "no-known-key-binding",
+        "no-consolidate-orphan-sweep",
+        "no-consolidate-rule-fragments",
+        "no-consolidate-retire-component",
+    ];
+
     /// Sixteen switches, in the order `run_bench` forwards them.
     #[cfg(feature = "bench")]
     const SWITCH_NAMES: [&str; 16] = [
@@ -2471,22 +2590,48 @@ mod tests {
     #[derive(Clone, Copy)]
     struct BenchSwitch {
         flags: [bool; 16],
+        opt_outs: [bool; 14],
     }
 
     #[cfg(feature = "bench")]
     impl BenchSwitch {
         fn none() -> Self {
-            Self { flags: [false; 16] }
+            Self {
+                flags: [false; 16],
+                opt_outs: [false; 14],
+            }
         }
 
         fn only(index: usize) -> Self {
             let mut flags = [false; 16];
             flags[index] = true;
-            Self { flags }
+            Self {
+                flags,
+                opt_outs: [false; 14],
+            }
         }
 
         fn all() -> Self {
-            Self { flags: [true; 16] }
+            Self {
+                flags: [true; 16],
+                opt_outs: [false; 14],
+            }
+        }
+
+        fn opt_out(index: usize) -> Self {
+            let mut opt_outs = [false; 14];
+            opt_outs[index] = true;
+            Self {
+                flags: [false; 16],
+                opt_outs,
+            }
+        }
+
+        fn all_opt_out() -> Self {
+            Self {
+                flags: [false; 16],
+                opt_outs: [true; 14],
+            }
         }
     }
 
@@ -2501,6 +2646,10 @@ mod tests {
         both.flags[3] = true;
         cases.push(("consolidate+consolidate_hold", both));
         cases.push(("all", BenchSwitch::all()));
+        for (index, name) in OPT_OUT_NAMES.iter().enumerate() {
+            cases.push((name, BenchSwitch::opt_out(index)));
+        }
+        cases.push(("all-off", BenchSwitch::all_opt_out()));
         cases
     }
 
@@ -2536,6 +2685,7 @@ mod tests {
         flags: BenchSwitch,
     ) -> BenchCommands {
         let f = flags.flags;
+        let o = flags.opt_outs;
         BenchCommands::Writes {
             script: script.to_path_buf(),
             work_dir: work_dir.map(std::path::Path::to_path_buf),
@@ -2559,6 +2709,81 @@ mod tests {
             drop_restatements: f[13],
             ground_component_edges: f[14],
             recover_turns: f[15],
+            no_known_facts_context: o[0],
+            no_consolidate: o[1],
+            no_consolidate_hold: o[2],
+            no_drop_restatements: o[3],
+            no_consolidate_links: o[4],
+            no_consolidate_components: o[5],
+            no_ground_component_edges: o[6],
+            no_consolidate_key_rename: o[7],
+            no_consolidate_replaces_cue: o[8],
+            no_consolidate_replaces_departure: o[9],
+            no_known_key_binding: o[10],
+            no_consolidate_orphan_sweep: o[11],
+            no_consolidate_rule_fragments: o[12],
+            no_consolidate_retire_component: o[13],
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn an_opt_out_is_its_own_flag_and_rejects_the_matching_on_flag() {
+        let err = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate",
+            "--no-consolidate",
+        ]);
+        assert!(err.is_err(), "on and opt-out together should be rejected");
+
+        let parsed = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--no-drop-restatements",
+        ])
+        .expect("parse opt-outs");
+        match parsed.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        no_consolidate,
+                        drop_restatements,
+                        no_drop_restatements,
+                        no_known_facts_context,
+                        ..
+                    },
+            } => {
+                assert!(!consolidate);
+                assert!(no_consolidate);
+                assert!(!drop_restatements);
+                assert!(no_drop_restatements);
+                assert!(!no_known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        for flag in OPT_OUT_NAMES {
+            assert!(
+                help.contains(&format!("--{flag}")),
+                "{flag} missing from {help}"
+            );
         }
     }
 

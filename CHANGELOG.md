@@ -3,7 +3,7 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
-## [Unreleased]
+## [5.0.0] — Unreleased
 
 ### Added
 
@@ -12,8 +12,27 @@ changes a user has to know about before upgrading.
 
 ### Breaking
 
-- Default provider is the CLI login (`claude-code`). `num_ctx`, `api_style`, and `provider = "ollama"` are refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.
+- The local-model path is removed. `num_ctx` and `api_style` are refused, and `provider = "ollama"` is refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.
 - Rust API: `ApiStyle` is removed. `LlmSection` and `HttpConfig` lost `num_ctx`, `api_style`, and the local-model fields.
+- The default extraction provider is grok. A config with no `provider` key uses grok. Set `provider = "claude-code"` to keep the previous default.
+
+### Changed
+
+- The measured consolidation stack is on unless `<key> = false`. A rewrite keeps that false and leaves a true value out. `recover_turns` stays off, because it makes extra model calls. A config that omits a key picks up the new default. The `--no-*` opt-outs are `bench writes` flags.
+  - `consolidate` (`bench writes --no-consolidate`)
+  - `consolidate_hold` (`bench writes --no-consolidate-hold`)
+  - `drop_restatements` (`bench writes --no-drop-restatements`)
+  - `consolidate_links` (`bench writes --no-consolidate-links`)
+  - `consolidate_components` (`bench writes --no-consolidate-components`)
+  - `ground_component_edges` (`bench writes --no-ground-component-edges`)
+  - `consolidate_key_rename` (`bench writes --no-consolidate-key-rename`)
+  - `consolidate_replaces_cue` (`bench writes --no-consolidate-replaces-cue`)
+  - `known_facts_context` (`bench writes --no-known-facts-context`)
+  - `consolidate_replaces_departure` (`bench writes --no-consolidate-replaces-departure`)
+  - `known_key_binding` (`bench writes --no-known-key-binding`)
+  - `consolidate_orphan_sweep` (`bench writes --no-consolidate-orphan-sweep`)
+  - `consolidate_rule_fragments` (`bench writes --no-consolidate-rule-fragments`)
+  - `consolidate_retire_component` (`bench writes --no-consolidate-retire-component`)
 
 ### Fixed
 

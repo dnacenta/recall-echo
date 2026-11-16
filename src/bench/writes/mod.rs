@@ -29,7 +29,7 @@ pub use run::{
     ConsolidateKeyRename, ConsolidateLinks, ConsolidateOrphanSweep, ConsolidateReplacesCue,
     ConsolidateReplacesDeparture, ConsolidateRetireComponent, ConsolidateRuleFragments,
     DropRestatements, Extractor, GroundComponentEdges, KnownFactsContext, KnownKeyBinding,
-    KnownMatch, MetricRange, MetricSet, MetricSpan, RecoverTurns, RepeatReport,
+    KnownMatch, MetricRange, MetricSet, MetricSpan, OptOuts, RecoverTurns, RepeatReport,
 };
 pub use script::{
     load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState,

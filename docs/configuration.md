@@ -8,7 +8,7 @@ optional; a missing file or an invalid value falls back to the default, silently
 max_entries = 5               # rolling window of session summaries, 1-50
 
 [llm]
-provider = "claude-code"      # default when unset; `init` writes the CLI it found
+provider = "grok"             # default when the key is missing; `init` writes the CLI it found
 model = ""                    # empty = the provider's default, except openai (no default)
 api_base = ""                 # HTTP only; required for openai, no default endpoint
 
@@ -32,15 +32,22 @@ timeout_secs = 300            # per call; 0 waits forever
 [graph]
 mode = "embedded"             # embedded (single-process SurrealKV) | server (shared SurrealDB)
 url = "ws://localhost:8787"   # server mode only
-# known_facts_context = false # experimental: show stored facts to pass 1; off by default
+# consolidate = true          # post-write consolidation; on by default; set false to opt out
+# consolidate_hold = true     # hold a conflicting write; on by default, ignored unless consolidate is on
+# drop_restatements = true    # drop a decided rule that only restates a same-session setting; on by default
+# consolidate_links = true    # record derived_from on new settings and rules; on by default, ignored unless consolidate is on
+# ground_component_edges = true # accept a decided component part_of the session project when the turn names the component; on by default
+# consolidate_components = true # close a sibling or derived-from partner after the judge; on by default, ignored unless consolidate is on
+# consolidate_key_rename = true # keep a judged rename, a "becomes" replacement, or a dropped-entity rule; on by default, ignored unless consolidate is on
+# consolidate_replaces_cue = true # count a unique pass-1 replaces match as the departure cue; on by default, ignored unless consolidate is on
+# known_facts_context = true  # experimental: show stored facts to pass 1; on by default
+# consolidate_replaces_departure = true # exact rule replaces plus a departure word; on by default, ignored unless consolidate is on
+# known_key_binding = true    # bind a decided setting key from a shown known row; on by default, ignored unless known_facts_context is on
+# consolidate_orphan_sweep = true # close orphan copies of a rejected project use; on by default, also needs consolidate and ground_component_edges
+# consolidate_rule_fragments = true # close a same-turn rule fragment; on by default, ignored unless consolidate is on
+# consolidate_retire_component = true # retire a dropped component's settings; on by default, ignored unless consolidate is on
 # known_match = false         # experimental: match new facts to stored rows after pass 1; off by default
-# drop_restatements = false   # drop a decided rule that only restates a same-session setting; off by default
-# consolidate_links = false   # record derived_from on new settings and rules; off by default, and ignored unless consolidate is also on
-# ground_component_edges = false # accept a decided component part_of the session project when the turn names the component; off by default
-# recover_turns = false       # list raw-turn values missing from the store; off by default; never writes
-# consolidate_components = false # close a sibling or derived-from partner after the judge; off by default, and ignored unless consolidate is also on
-# consolidate_key_rename = false # keep a judged rename, a "becomes" replacement, or a dropped-entity rule; off by default, and ignored unless consolidate is also on
-# consolidate_replaces_cue = false # count a unique pass-1 replaces match as the departure cue, and pair a rule on replaces alone; off by default, and ignored unless consolidate is also on
+# recover_turns = false       # list raw-turn values missing from the store; off by default, because it makes extra model calls; never writes
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call
@@ -84,9 +91,9 @@ provider will run. `recall-echo config set KEY VALUE` changes one (`provider`, `
 
 | `provider` | How it runs | What it costs |
 |---|---|---|
-| `claude-code` | spawns `claude` | the user's own CLI login (the default) |
+| `claude-code` | spawns `claude` | the user's own CLI login |
 | `gemini` | spawns `gemini` | Gemini subscription or free tier |
-| `grok` | spawns `grok` | Grok subscription |
+| `grok` | spawns `grok` | Grok subscription (the default) |
 | `codex` | spawns `codex exec` | ChatGPT/Codex subscription |
 | `cli` | spawns whatever `[llm.cli]` describes | whatever that CLI costs |
 | `openai` | HTTP to the OpenAI-compatible endpoint in `api_base` | per token; `api_base` and `OPENAI_API_KEY` are both required |

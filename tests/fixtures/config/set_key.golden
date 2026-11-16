@@ -1,6 +1,6 @@
 default llm.provider = cli
 ok
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 default llm.provider = nonesuch
@@ -8,7 +8,7 @@ err config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code'
 
 default provider = cli
 ok
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 default provider = nonesuch
@@ -714,7 +714,6 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.known_facts_context = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -735,6 +734,7 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
++graph.known_facts_context = false
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -764,7 +764,6 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -785,6 +784,7 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
++graph.known_key_binding = false
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -860,7 +860,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate = true
 ok
-+graph.consolidate = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -881,6 +880,7 @@ ok
 
 default graph.consolidate = false
 ok
++graph.consolidate = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -910,7 +910,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_hold = true
 ok
-+graph.consolidate_hold = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -931,6 +930,7 @@ ok
 
 default graph.consolidate_hold = false
 ok
++graph.consolidate_hold = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -960,7 +960,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_links = true
 ok
-+graph.consolidate_links = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -981,6 +980,7 @@ ok
 
 default graph.consolidate_links = false
 ok
++graph.consolidate_links = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1010,7 +1010,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_components = true
 ok
-+graph.consolidate_components = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1031,6 +1030,7 @@ ok
 
 default graph.consolidate_components = false
 ok
++graph.consolidate_components = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1060,7 +1060,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_key_rename = true
 ok
-+graph.consolidate_key_rename = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1081,6 +1080,7 @@ ok
 
 default graph.consolidate_key_rename = false
 ok
++graph.consolidate_key_rename = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1110,7 +1110,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_replaces_cue = true
 ok
-+graph.consolidate_replaces_cue = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1131,6 +1130,7 @@ ok
 
 default graph.consolidate_replaces_cue = false
 ok
++graph.consolidate_replaces_cue = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1160,7 +1160,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_replaces_departure = true
 ok
-+graph.consolidate_replaces_departure = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1181,6 +1180,7 @@ ok
 
 default graph.consolidate_replaces_departure = false
 ok
++graph.consolidate_replaces_departure = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1210,7 +1210,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_orphan_sweep = true
 ok
-+graph.consolidate_orphan_sweep = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1231,6 +1230,7 @@ ok
 
 default graph.consolidate_orphan_sweep = false
 ok
++graph.consolidate_orphan_sweep = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1260,7 +1260,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_rule_fragments = true
 ok
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1281,6 +1280,7 @@ ok
 
 default graph.consolidate_rule_fragments = false
 ok
++graph.consolidate_rule_fragments = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1310,7 +1310,6 @@ err config: invalid boolean: 1
 
 default graph.consolidate_retire_component = true
 ok
-+graph.consolidate_retire_component = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1331,6 +1330,7 @@ ok
 
 default graph.consolidate_retire_component = false
 ok
++graph.consolidate_retire_component = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
@@ -1364,7 +1364,6 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1385,6 +1384,7 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
++graph.drop_restatements = false
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1414,7 +1414,6 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.ground_component_edges = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1435,6 +1434,7 @@ ok
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
++graph.ground_component_edges = false
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1536,7 +1536,7 @@ ok
 -llm.cli.command = "alpha"
 -llm.model = "alpha"
 +llm.model = ""
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 populated llm.provider = nonesuch
@@ -1549,7 +1549,7 @@ ok
 -llm.cli.command = "alpha"
 -llm.model = "alpha"
 +llm.model = ""
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 populated provider = nonesuch
@@ -2016,7 +2016,7 @@ ok
 
 populated graph.known_facts_context = false
 ok
--graph.known_facts_context = true
++graph.known_facts_context = false
 
 populated graph.known_facts_context = yes
 err config: invalid boolean: yes
@@ -2032,7 +2032,7 @@ ok
 
 populated graph.known_key_binding = false
 ok
--graph.known_key_binding = true
++graph.known_key_binding = false
 
 populated graph.known_key_binding = yes
 err config: invalid boolean: yes
@@ -2064,7 +2064,7 @@ ok
 
 populated graph.consolidate = false
 ok
--graph.consolidate = true
++graph.consolidate = false
 
 populated graph.consolidate = yes
 err config: invalid boolean: yes
@@ -2080,7 +2080,7 @@ ok
 
 populated graph.consolidate_hold = false
 ok
--graph.consolidate_hold = true
++graph.consolidate_hold = false
 
 populated graph.consolidate_hold = yes
 err config: invalid boolean: yes
@@ -2096,7 +2096,7 @@ ok
 
 populated graph.consolidate_links = false
 ok
--graph.consolidate_links = true
++graph.consolidate_links = false
 
 populated graph.consolidate_links = yes
 err config: invalid boolean: yes
@@ -2112,7 +2112,7 @@ ok
 
 populated graph.consolidate_components = false
 ok
--graph.consolidate_components = true
++graph.consolidate_components = false
 
 populated graph.consolidate_components = yes
 err config: invalid boolean: yes
@@ -2128,7 +2128,7 @@ ok
 
 populated graph.consolidate_key_rename = false
 ok
--graph.consolidate_key_rename = true
++graph.consolidate_key_rename = false
 
 populated graph.consolidate_key_rename = yes
 err config: invalid boolean: yes
@@ -2144,7 +2144,7 @@ ok
 
 populated graph.consolidate_replaces_cue = false
 ok
--graph.consolidate_replaces_cue = true
++graph.consolidate_replaces_cue = false
 
 populated graph.consolidate_replaces_cue = yes
 err config: invalid boolean: yes
@@ -2160,7 +2160,7 @@ ok
 
 populated graph.consolidate_replaces_departure = false
 ok
--graph.consolidate_replaces_departure = true
++graph.consolidate_replaces_departure = false
 
 populated graph.consolidate_replaces_departure = yes
 err config: invalid boolean: yes
@@ -2176,7 +2176,7 @@ ok
 
 populated graph.consolidate_orphan_sweep = false
 ok
--graph.consolidate_orphan_sweep = true
++graph.consolidate_orphan_sweep = false
 
 populated graph.consolidate_orphan_sweep = yes
 err config: invalid boolean: yes
@@ -2192,7 +2192,7 @@ ok
 
 populated graph.consolidate_rule_fragments = false
 ok
--graph.consolidate_rule_fragments = true
++graph.consolidate_rule_fragments = false
 
 populated graph.consolidate_rule_fragments = yes
 err config: invalid boolean: yes
@@ -2208,7 +2208,7 @@ ok
 
 populated graph.consolidate_retire_component = false
 ok
--graph.consolidate_retire_component = true
++graph.consolidate_retire_component = false
 
 populated graph.consolidate_retire_component = yes
 err config: invalid boolean: yes
@@ -2224,7 +2224,7 @@ ok
 
 populated graph.drop_restatements = false
 ok
--graph.drop_restatements = true
++graph.drop_restatements = false
 
 populated graph.drop_restatements = yes
 err config: invalid boolean: yes
@@ -2240,7 +2240,7 @@ ok
 
 populated graph.ground_component_edges = false
 ok
--graph.ground_component_edges = true
++graph.ground_component_edges = false
 
 populated graph.ground_component_edges = yes
 err config: invalid boolean: yes
@@ -2295,6 +2295,6 @@ ok
 
 seq default llm.model = alpha then provider = cli
 ok
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 

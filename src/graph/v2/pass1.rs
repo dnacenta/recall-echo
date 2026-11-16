@@ -4648,7 +4648,7 @@ mod tests {
         plant(matched.path());
         std::fs::write(
             matched.path().join(".recall-echo.toml"),
-            "[graph]\nknown_match = true\n",
+            stack_off_except(&["known_match"]),
         )
         .unwrap();
         let gm = GraphMemory::open_embedded(&matched.path().join("graph"))
@@ -4675,6 +4675,7 @@ mod tests {
 
         let off = tempfile::tempdir().unwrap();
         plant(off.path());
+        std::fs::write(off.path().join(".recall-echo.toml"), stack_off_except(&[])).unwrap();
         let gm = GraphMemory::open_embedded(&off.path().join("graph"))
             .await
             .unwrap();
@@ -4699,9 +4700,45 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     fn hold_config(drop_restatements: bool) -> String {
-        let mut body = String::from("[graph]\nconsolidate = true\nconsolidate_hold = true\n");
+        let mut on = vec!["consolidate", "consolidate_hold"];
         if drop_restatements {
-            body.push_str("drop_restatements = true\n");
+            on.push("drop_restatements");
+        }
+        stack_off_except(&on)
+    }
+
+    /// Every measured switch written out, except the ones this fixture turns on.
+    #[cfg(feature = "embedded")]
+    fn stack_off_except(on: &[&str]) -> String {
+        const KEYS: &[&str] = &[
+            "consolidate",
+            "consolidate_hold",
+            "drop_restatements",
+            "consolidate_links",
+            "consolidate_components",
+            "ground_component_edges",
+            "consolidate_key_rename",
+            "consolidate_replaces_cue",
+            "known_facts_context",
+            "consolidate_replaces_departure",
+            "known_key_binding",
+            "consolidate_orphan_sweep",
+            "consolidate_rule_fragments",
+            "consolidate_retire_component",
+        ];
+        let mut body = String::from("[graph]\n");
+        for key in KEYS {
+            let value = if on.contains(key) { "true" } else { "false" };
+            body.push_str(key);
+            body.push_str(" = ");
+            body.push_str(value);
+            body.push('\n');
+        }
+        for key in on {
+            if !KEYS.contains(key) {
+                body.push_str(key);
+                body.push_str(" = true\n");
+            }
         }
         body
     }
@@ -5079,7 +5116,7 @@ mod tests {
         let memory = tmp.path();
         std::fs::write(
             memory.join(".recall-echo.toml"),
-            "[graph]\nconsolidate = true\nconsolidate_links = true\ndrop_restatements = true\n",
+            stack_off_except(&["consolidate", "consolidate_links", "drop_restatements"]),
         )
         .unwrap();
         write_archive(memory, "The timeout is 10s. Use 10s.");
@@ -5607,7 +5644,7 @@ mod tests {
     #[test]
     fn drop_restatements_reads_only_its_own_flag() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!drop_restatements_enabled(dir.path()));
+        assert!(drop_restatements_enabled(dir.path()));
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
             "[graph]\ndrop_restatements = false\n",
@@ -5619,7 +5656,7 @@ mod tests {
             "[graph]\nknown_match = true\nconsolidate = true\nknown_facts_context = true\nconsolidate_hold = true\n",
         )
         .unwrap();
-        assert!(!drop_restatements_enabled(dir.path()));
+        assert!(drop_restatements_enabled(dir.path()));
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
             "[graph]\ndrop_restatements = true\n",
@@ -5704,7 +5741,7 @@ mod tests {
         }
 
         let on_dir = tempfile::tempdir().unwrap();
-        plant(on_dir.path(), "[graph]\ndrop_restatements = true\n");
+        plant(on_dir.path(), &stack_off_except(&["drop_restatements"]));
         let on_gm = GraphMemory::open_embedded(&on_dir.path().join("graph"))
             .await
             .unwrap();
@@ -5749,7 +5786,7 @@ mod tests {
         );
 
         let off_dir = tempfile::tempdir().unwrap();
-        plant(off_dir.path(), "");
+        plant(off_dir.path(), &stack_off_except(&[]));
         let off_gm = GraphMemory::open_embedded(&off_dir.path().join("graph"))
             .await
             .unwrap();
@@ -5822,7 +5859,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
-            "[graph]\ndrop_restatements = true\nknown_match = true\n",
+            stack_off_except(&["drop_restatements", "known_match"]),
         )
         .unwrap();
         input::write_turns_sidecar(
@@ -6199,8 +6236,8 @@ mod tests {
             )
         }
 
-        let bare = "[graph]\nknown_key_binding = true\nknown_facts_context = false\n";
-        let (bare_report, bare_system, _, bare_lookups) = run(bare, false).await;
+        let bare = stack_off_except(&["known_key_binding"]);
+        let (bare_report, bare_system, _, bare_lookups) = run(&bare, false).await;
         assert_eq!(bare_system, PASS1_SYSTEM_BARE);
         assert_eq!(bare_lookups, 0);
         assert_eq!(bare_report.known_key_bound, 0);
@@ -6214,10 +6251,10 @@ mod tests {
             bare_report.drops
         );
 
-        let off = "[graph]\nknown_facts_context = true\n";
-        let on = "[graph]\nknown_facts_context = true\nknown_key_binding = true\n";
-        let (off_report, off_system, off_user, _) = run(off, false).await;
-        let (on_report, on_system, on_user, _) = run(on, false).await;
+        let off = stack_off_except(&["known_facts_context"]);
+        let on = stack_off_except(&["known_facts_context", "known_key_binding"]);
+        let (off_report, off_system, off_user, _) = run(&off, false).await;
+        let (on_report, on_system, on_user, _) = run(&on, false).await;
         assert_eq!(off_system.as_bytes(), on_system.as_bytes());
         assert_eq!(off_user.as_bytes(), on_user.as_bytes());
         assert_eq!(off_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
@@ -6225,7 +6262,7 @@ mod tests {
         assert_eq!(on_report.known_key_bound, 1, "{:?}", on_report.drops);
         assert!(!on_report.drops.contains_key(DROP_KEY_BINDING));
 
-        let (closed, _, _, _) = run(on, true).await;
+        let (closed, _, _, _) = run(&on, true).await;
         assert_eq!(closed.drops.get(DROP_KEY_BINDING).copied(), Some(1));
         assert_eq!(closed.known_key_bound, 0);
     }

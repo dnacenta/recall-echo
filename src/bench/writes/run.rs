@@ -263,6 +263,52 @@ pub enum RecoverTurns {
     On,
 }
 
+/// Explicit `<key> = false` lines for the consolidation stack.
+///
+/// A `false` field leaves that key out of the run config. A `true` field
+/// writes the opt-out, unless the matching on flag is also set: the on flag
+/// wins and the line is `<key> = true`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OptOuts {
+    pub known_facts_context: bool,
+    pub consolidate: bool,
+    pub consolidate_hold: bool,
+    pub drop_restatements: bool,
+    pub consolidate_links: bool,
+    pub consolidate_components: bool,
+    pub ground_component_edges: bool,
+    pub consolidate_key_rename: bool,
+    pub consolidate_replaces_cue: bool,
+    pub consolidate_replaces_departure: bool,
+    pub known_key_binding: bool,
+    pub consolidate_orphan_sweep: bool,
+    pub consolidate_rule_fragments: bool,
+    pub consolidate_retire_component: bool,
+}
+
+impl OptOuts {
+    /// Write every flipped setting off. On flags still write their own `true`.
+    #[must_use]
+    pub fn stack_off() -> Self {
+        Self {
+            known_facts_context: true,
+            consolidate: true,
+            consolidate_hold: true,
+            drop_restatements: true,
+            consolidate_links: true,
+            consolidate_components: true,
+            ground_component_edges: true,
+            consolidate_key_rename: true,
+            consolidate_replaces_cue: true,
+            consolidate_replaces_departure: true,
+            known_key_binding: true,
+            consolidate_orphan_sweep: true,
+            consolidate_rule_fragments: true,
+            consolidate_retire_component: true,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
@@ -292,6 +338,7 @@ pub async fn run(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    opt_outs: OptOuts,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
     let memory_dir = work_dir.join("memory");
@@ -313,6 +360,7 @@ pub async fn run(
         consolidate_rule_fragments,
         consolidate_retire_component,
         known_key_binding,
+        opt_outs,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
     let weights = *gm.provenance_weights();
@@ -332,7 +380,12 @@ pub async fn run(
         .collect::<Result<Vec<_>, _>>()?;
     let mut report =
         grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
-    report.consolidate_hold = consolidate.writes_hold();
+    // The JSON field follows the config this run resolved, not the CLI on-flag.
+    // A missing key stays the default, so a flagless run reports the hold.
+    report.consolidate_hold = crate::config::load_from_dir(&memory_dir)
+        .graph
+        .unwrap_or_default()
+        .hold_applies();
     report.setup_millis = setup_millis;
     Ok(report)
 }
@@ -556,6 +609,7 @@ pub async fn run_repeat(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    opt_outs: OptOuts,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
         return Err(RecallError::Config("repeat must be at least 1".to_string()));
@@ -589,6 +643,7 @@ pub async fn run_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                opt_outs,
             )
             .await?,
         );
@@ -615,6 +670,7 @@ fn apply_graph_switches(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    opt_outs: OptOuts,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
         known,
@@ -632,6 +688,7 @@ fn apply_graph_switches(
         consolidate_rule_fragments,
         consolidate_retire_component,
         known_key_binding,
+        opt_outs,
     );
     if lines.is_empty() {
         return Ok(());
@@ -662,15 +719,18 @@ fn switch_lines(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    opt_outs: OptOuts,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
-    push_line(
+    push_switch(
         &mut lines,
         known == KnownFactsContext::On,
+        opt_outs.known_facts_context,
         "known_facts_context = true",
+        "known_facts_context = false",
     );
     push_line(&mut lines, matched == KnownMatch::On, "known_match = true");
-    push_line(
+    push_switch(
         &mut lines,
         writes_consolidate(
             consolidate,
@@ -683,67 +743,93 @@ fn switch_lines(
             consolidate_rule_fragments,
             consolidate_retire_component,
         ),
+        opt_outs.consolidate,
         "consolidate = true",
+        "consolidate = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate.writes_hold(),
+        opt_outs.consolidate_hold,
         "consolidate_hold = true",
+        "consolidate_hold = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_links == ConsolidateLinks::On,
+        opt_outs.consolidate_links,
         "consolidate_links = true",
+        "consolidate_links = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_components == ConsolidateComponents::On,
+        opt_outs.consolidate_components,
         "consolidate_components = true",
+        "consolidate_components = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_key_rename == ConsolidateKeyRename::On,
+        opt_outs.consolidate_key_rename,
         "consolidate_key_rename = true",
+        "consolidate_key_rename = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_replaces_cue == ConsolidateReplacesCue::On,
+        opt_outs.consolidate_replaces_cue,
         "consolidate_replaces_cue = true",
+        "consolidate_replaces_cue = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_replaces_departure == ConsolidateReplacesDeparture::On,
+        opt_outs.consolidate_replaces_departure,
         "consolidate_replaces_departure = true",
+        "consolidate_replaces_departure = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_orphan_sweep == ConsolidateOrphanSweep::On,
+        opt_outs.consolidate_orphan_sweep,
         "consolidate_orphan_sweep = true",
+        "consolidate_orphan_sweep = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_rule_fragments == ConsolidateRuleFragments::On,
+        opt_outs.consolidate_rule_fragments,
         "consolidate_rule_fragments = true",
+        "consolidate_rule_fragments = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         consolidate_retire_component == ConsolidateRetireComponent::On,
+        opt_outs.consolidate_retire_component,
         "consolidate_retire_component = true",
+        "consolidate_retire_component = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         known_key_binding == KnownKeyBinding::On,
+        opt_outs.known_key_binding,
         "known_key_binding = true",
+        "known_key_binding = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         drop_restatements == DropRestatements::On,
+        opt_outs.drop_restatements,
         "drop_restatements = true",
+        "drop_restatements = false",
     );
-    push_line(
+    push_switch(
         &mut lines,
         ground_component_edges == GroundComponentEdges::On,
+        opt_outs.ground_component_edges,
         "ground_component_edges = true",
+        "ground_component_edges = false",
     );
     push_line(
         &mut lines,
@@ -779,6 +865,20 @@ fn writes_consolidate(
 fn push_line(lines: &mut Vec<&'static str>, on: bool, line: &'static str) {
     if on {
         lines.push(line);
+    }
+}
+
+fn push_switch(
+    lines: &mut Vec<&'static str>,
+    on: bool,
+    opt_out: bool,
+    on_line: &'static str,
+    off_line: &'static str,
+) {
+    if on {
+        lines.push(on_line);
+    } else if opt_out {
+        lines.push(off_line);
     }
 }
 
@@ -2172,6 +2272,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2192,6 +2293,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2216,6 +2318,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2247,6 +2350,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2268,6 +2372,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2275,11 +2380,11 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.drop_restatements);
-        assert!(!graph.known_facts_context);
+        assert!(graph.known_facts_context);
         assert!(!graph.known_match);
-        assert!(!graph.consolidate);
-        assert!(!graph.consolidate_hold);
-        assert!(!graph.consolidate_links);
+        assert!(graph.consolidate);
+        assert!(graph.consolidate_hold);
+        assert!(graph.consolidate_links);
         assert!(!text.contains("consolidate_links"));
     }
 
@@ -2305,6 +2410,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2317,10 +2423,10 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.links_apply());
-        assert!(!graph.hold_applies());
-        assert!(!graph.drop_restatements);
+        assert!(graph.hold_applies());
+        assert!(graph.drop_restatements);
         assert!(!graph.known_match);
-        assert!(!graph.known_facts_context);
+        assert!(graph.known_facts_context);
 
         apply_graph_switches(
             &memory,
@@ -2339,6 +2445,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2351,7 +2458,7 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.links_apply());
         assert!(graph.hold_applies());
-        assert!(!graph.drop_restatements);
+        assert!(graph.drop_restatements);
 
         apply_graph_switches(
             &memory,
@@ -2370,6 +2477,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2381,10 +2489,10 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.drop_restatements);
         assert!(graph.links_apply());
-        assert!(!graph.hold_applies());
+        assert!(graph.hold_applies());
         assert!(!graph.known_match);
-        assert!(!graph.known_facts_context);
-        assert!(!graph.ground_component_edges);
+        assert!(graph.known_facts_context);
+        assert!(graph.ground_component_edges);
         assert!(!text.contains("ground_component_edges"), "{text}");
     }
 
@@ -2410,6 +2518,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2431,6 +2540,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2438,11 +2548,11 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.ground_component_edges);
-        assert!(!graph.consolidate);
-        assert!(!graph.consolidate_links);
-        assert!(!graph.consolidate_hold);
-        assert!(!graph.drop_restatements);
-        assert!(!graph.known_facts_context);
+        assert!(graph.consolidate);
+        assert!(graph.consolidate_links);
+        assert!(graph.consolidate_hold);
+        assert!(graph.drop_restatements);
+        assert!(graph.known_facts_context);
         assert!(!graph.known_match);
         assert!(!text.contains("consolidate"));
     }
@@ -2469,6 +2579,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2490,6 +2601,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2497,11 +2609,11 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.recover_applies());
-        assert!(!graph.ground_component_edges);
-        assert!(!graph.consolidate);
-        assert!(!graph.known_facts_context);
+        assert!(graph.ground_component_edges);
+        assert!(graph.consolidate);
+        assert!(graph.known_facts_context);
         assert!(!graph.known_match);
-        assert!(!graph.drop_restatements);
+        assert!(graph.drop_restatements);
         assert!(!text.contains("consolidate"));
         assert!(!text.contains("ground_component_edges"));
     }
@@ -2601,6 +2713,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -2791,6 +2904,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2812,6 +2926,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2825,11 +2940,11 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.components_apply());
-        assert!(!graph.links_apply());
-        assert!(!graph.hold_applies());
-        assert!(!graph.drop_restatements);
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        assert!(graph.drop_restatements);
         assert!(!graph.known_match);
-        assert!(!graph.known_facts_context);
+        assert!(graph.known_facts_context);
 
         apply_graph_switches(
             &memory,
@@ -2848,6 +2963,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2862,7 +2978,7 @@ mod tests {
         assert!(graph.components_apply());
         assert!(graph.links_apply());
         assert!(graph.hold_applies());
-        assert!(!graph.drop_restatements);
+        assert!(graph.drop_restatements);
 
         apply_graph_switches(
             &memory,
@@ -2881,6 +2997,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2893,10 +3010,10 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.drop_restatements);
         assert!(graph.components_apply());
-        assert!(!graph.links_apply());
-        assert!(!graph.hold_applies());
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
         assert!(!graph.known_match);
-        assert!(!graph.known_facts_context);
+        assert!(graph.known_facts_context);
     }
 
     #[test]
@@ -2921,6 +3038,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -2942,6 +3060,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2958,10 +3077,10 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.rename_apply());
-        assert!(!graph.components_apply());
-        assert!(!graph.links_apply());
-        assert!(!graph.hold_applies());
-        assert!(!graph.drop_restatements);
+        assert!(graph.components_apply());
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        assert!(graph.drop_restatements);
 
         apply_graph_switches(
             &memory,
@@ -2980,6 +3099,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -2992,10 +3112,10 @@ mod tests {
         assert!(!text.contains("consolidate_replaces_cue"), "{text}");
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
-        assert!(!graph.consolidate_key_rename);
-        assert!(!graph.rename_apply());
-        assert!(!graph.consolidate_replaces_cue);
-        assert!(!graph.replaces_cue_apply());
+        assert!(graph.consolidate_key_rename);
+        assert!(graph.rename_apply());
+        assert!(graph.consolidate_replaces_cue);
+        assert!(graph.replaces_cue_apply());
         assert!(graph.components_apply());
         assert!(graph.links_apply());
         assert!(graph.hold_applies());
@@ -3023,6 +3143,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -3044,6 +3165,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -3060,11 +3182,11 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.replaces_cue_apply());
-        assert!(!graph.rename_apply());
-        assert!(!graph.components_apply());
-        assert!(!graph.links_apply());
-        assert!(!graph.hold_applies());
-        assert!(!graph.drop_restatements);
+        assert!(graph.rename_apply());
+        assert!(graph.components_apply());
+        assert!(graph.links_apply());
+        assert!(graph.hold_applies());
+        assert!(graph.drop_restatements);
     }
 
     #[test]
@@ -3089,6 +3211,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -3110,6 +3233,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -3130,9 +3254,9 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.replaces_departure_apply());
-        assert!(!graph.replaces_cue_apply());
-        assert!(!graph.consolidate_replaces_cue);
-        assert!(!graph.known_facts_context);
+        assert!(graph.replaces_cue_apply());
+        assert!(graph.consolidate_replaces_cue);
+        assert!(graph.known_facts_context);
     }
 
     #[test]
@@ -3157,6 +3281,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -3178,6 +3303,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -3198,10 +3324,10 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.consolidate);
         assert!(graph.consolidate_orphan_sweep);
-        assert!(!graph.ground_component_edges);
-        assert!(!graph.orphan_sweep_apply());
-        assert!(!graph.replaces_cue_apply());
-        assert!(!graph.replaces_departure_apply());
+        assert!(graph.ground_component_edges);
+        assert!(graph.orphan_sweep_apply());
+        assert!(graph.replaces_cue_apply());
+        assert!(graph.replaces_departure_apply());
     }
 
     #[test]
@@ -3226,6 +3352,7 @@ mod tests {
             ConsolidateRuleFragments::On,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -3242,10 +3369,10 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.rule_fragments_apply());
-        assert!(!graph.orphan_sweep_apply());
-        assert!(!graph.ground_component_edges);
-        assert!(!graph.replaces_cue_apply());
-        assert!(!graph.components_apply());
+        assert!(graph.orphan_sweep_apply());
+        assert!(graph.ground_component_edges);
+        assert!(graph.replaces_cue_apply());
+        assert!(graph.components_apply());
     }
 
     #[test]
@@ -3270,6 +3397,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::On,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -3286,9 +3414,9 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.retire_component_apply());
-        assert!(!graph.ground_component_edges);
-        assert!(!graph.rule_fragments_apply());
-        assert!(!graph.orphan_sweep_apply());
+        assert!(graph.ground_component_edges);
+        assert!(graph.rule_fragments_apply());
+        assert!(graph.orphan_sweep_apply());
     }
 
     #[test]
@@ -3313,6 +3441,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::default(),
         )
         .unwrap();
         assert!(!crate::config::config_path(&memory).exists());
@@ -3334,6 +3463,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::On,
+            OptOuts::default(),
         )
         .unwrap();
         let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
@@ -3344,8 +3474,8 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.known_key_binding);
-        assert!(!graph.known_key_binding_apply());
-        assert!(!graph.known_facts_context);
+        assert!(graph.known_key_binding_apply());
+        assert!(graph.known_facts_context);
     }
 
     #[test]
@@ -3403,28 +3533,36 @@ mod tests {
                 ConsolidateRuleFragments::Off,
                 ConsolidateRetireComponent::Off,
                 KnownKeyBinding::Off,
+                OptOuts::default(),
             )
             .unwrap();
             let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
             let loaded: crate::config::Config = toml::from_str(&text).unwrap();
             let graph = loaded.graph.expect("graph");
-            assert_eq!(
-                graph.known_facts_context,
-                known == KnownFactsContext::On,
-                "{text}"
-            );
+            assert!(graph.known_facts_context, "{text}");
+            if known == KnownFactsContext::On {
+                assert!(text.contains("known_facts_context = true\n"), "{text}");
+            } else {
+                assert!(!text.contains("known_facts_context"), "{text}");
+            }
             assert_eq!(graph.known_match, matched == KnownMatch::On, "{text}");
-            assert_eq!(graph.consolidate, consolidate.writes_pass(), "{text}");
-            assert_eq!(graph.consolidate_hold, consolidate.writes_hold(), "{text}");
-            assert!(!graph.consolidate_links, "{text}");
+            assert!(graph.consolidate, "{text}");
+            if consolidate.writes_pass() {
+                assert!(text.contains("consolidate = true\n"), "{text}");
+            } else {
+                assert!(!text.contains("consolidate ="), "{text}");
+            }
+            assert!(graph.consolidate_hold, "{text}");
+            if consolidate.writes_hold() {
+                assert!(text.contains("consolidate_hold = true\n"), "{text}");
+            } else {
+                assert!(!text.contains("consolidate_hold"), "{text}");
+            }
+            assert!(graph.consolidate_links, "{text}");
             assert!(!text.contains("consolidate_links"), "{text}");
-            assert!(!graph.ground_component_edges, "{text}");
+            assert!(graph.ground_component_edges, "{text}");
             assert!(!text.contains("ground_component_edges"), "{text}");
-            assert_eq!(
-                graph.drop_restatements,
-                drop_restatements == DropRestatements::On,
-                "{text}"
-            );
+            assert!(graph.drop_restatements, "{text}");
             if drop_restatements == DropRestatements::On {
                 assert!(text.contains("drop_restatements = true\n"), "{text}");
             } else {
@@ -3464,6 +3602,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap_err();
@@ -3631,6 +3770,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap();
@@ -3747,6 +3887,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap_err();
@@ -3781,6 +3922,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap_err();
@@ -3867,6 +4009,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap();
@@ -4183,6 +4326,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .unwrap();
         let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
@@ -4341,6 +4485,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap();
@@ -4565,6 +4710,7 @@ mod tests {
                 ConsolidateRuleFragments::Off,
                 ConsolidateRetireComponent::Off,
                 KnownKeyBinding::Off,
+                OptOuts::stack_off(),
             )
             .await
             .unwrap();
@@ -4612,6 +4758,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap()
@@ -4886,6 +5033,61 @@ mod tests {
         assert_eq!((nope.input_tokens, nope.output_tokens), (Some(7), Some(2)));
     }
 
+    /// A flagless run reports the hold. Opting out of the hold, or of
+    /// consolidation, omits the field. The on-flag is not what decides it.
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn consolidate_hold_in_the_report_follows_the_resolved_config() {
+        const SCRIPT: &str = "name = \"hold\"\nfacts = []\n\
+             [[sessions]]\nid = \"s1\"\ndate = \"2026-03-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Keep the shelf label as cedar.\"\n";
+
+        async fn reported(opt_outs: OptOuts) -> Option<bool> {
+            let script = crate::bench::writes::parse_script(SCRIPT).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let report = run(
+                &script,
+                tmp.path(),
+                Extractor::Scripted,
+                PipelineVersion::V1,
+                KnownFactsContext::Off,
+                KnownMatch::Off,
+                Consolidate::Off,
+                DropRestatements::Off,
+                ConsolidateLinks::Off,
+                GroundComponentEdges::Off,
+                ConsolidateComponents::Off,
+                RecoverTurns::Off,
+                ConsolidateKeyRename::Off,
+                ConsolidateReplacesCue::Off,
+                ConsolidateReplacesDeparture::Off,
+                ConsolidateOrphanSweep::Off,
+                ConsolidateRuleFragments::Off,
+                ConsolidateRetireComponent::Off,
+                KnownKeyBinding::Off,
+                opt_outs,
+            )
+            .await
+            .unwrap();
+            serde_json::to_value(&report)
+                .unwrap()
+                .get("consolidate_hold")
+                .map(|value| value.as_bool().expect("consolidate_hold is a bool"))
+        }
+
+        assert_eq!(reported(OptOuts::default()).await, Some(true));
+        let no_hold = OptOuts {
+            consolidate_hold: true,
+            ..OptOuts::default()
+        };
+        assert_eq!(reported(no_hold).await, None);
+        let no_consolidate = OptOuts {
+            consolidate: true,
+            ..OptOuts::default()
+        };
+        assert_eq!(reported(no_consolidate).await, None);
+    }
+
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     async fn history_scripted_v2() {
@@ -4911,6 +5113,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap();
@@ -5053,6 +5256,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            OptOuts::stack_off(),
         )
         .await
         .unwrap();
