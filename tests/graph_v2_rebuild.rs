@@ -298,24 +298,6 @@ async fn query(path: &Path, sql: &str) -> Vec<serde_json::Value> {
     response.take(0).expect("rows")
 }
 
-/// The rebuild thread's store can still be compacting when this test opens it.
-async fn query_when_free(path: &Path, sql: &str) -> Vec<serde_json::Value> {
-    let mut last = String::new();
-    for _ in 0..6 {
-        match store::open(path).await {
-            Ok(db) => {
-                let mut response = db.query(sql).await.expect("query");
-                return response.take(0).expect("rows");
-            }
-            Err(err) => {
-                last = err.to_string();
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        }
-    }
-    panic!("open {}: {last}", path.display());
-}
-
 fn strings(rows: &[serde_json::Value], field: &str) -> Vec<String> {
     rows.iter()
         .filter_map(|row| row.get(field).and_then(serde_json::Value::as_str))
@@ -1255,13 +1237,12 @@ async fn a_second_rebuild_plans_after_it_takes_the_lock() {
 
     let memory_thread = memory.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        runtime.block_on(async move {
+        let outcome = runtime.block_on(async move {
             let result = rebuild(
                 &memory_thread,
                 options(PipelineVersion::V2, false),
@@ -1269,12 +1250,15 @@ async fn a_second_rebuild_plans_after_it_takes_the_lock() {
                 Some(&Scripted::answering()),
             )
             .await;
-            let _ = tx.send(result);
-            // Stay alive so the store can finish closing before this process
-            // opens it again.
-            let release = release_rx;
-            let _ = tokio::task::spawn_blocking(move || release.recv()).await;
+            if result.is_err() {
+                return (result, Vec::new(), Vec::new());
+            }
+            let graph = memory_thread.join("graph");
+            let names = strings(&query(&graph, "SELECT name FROM entity").await, "name");
+            let episodes = query(&graph, "SELECT log_number FROM episode").await;
+            (result, names, episodes)
         });
+        let _ = tx.send(outcome);
     });
 
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1290,18 +1274,12 @@ async fn a_second_rebuild_plans_after_it_takes_the_lock() {
     .expect("log 2");
     std::fs::remove_file(&lock).expect("release lock");
 
-    let result = rx
+    let (result, names, episodes) = rx
         .recv_timeout(std::time::Duration::from_secs(120))
         .expect("rebuild finished");
     result.expect("rebuild planned after the lock");
-
-    let names = strings(
-        &query_when_free(&memory.join("graph"), "SELECT name FROM entity").await,
-        "name",
-    );
     assert!(names.iter().any(|name| name == "Python"), "{names:?}");
     assert!(names.iter().all(|name| name != "Rust"), "{names:?}");
-    let episodes = query_when_free(&memory.join("graph"), "SELECT log_number FROM episode").await;
     assert!(
         episodes.iter().any(|row| log_number(row) == Some(2)),
         "{episodes:?}"
@@ -1310,5 +1288,4 @@ async fn a_second_rebuild_plans_after_it_takes_the_lock() {
         episodes.iter().all(|row| log_number(row) != Some(1)),
         "{episodes:?}"
     );
-    let _ = release_tx.send(());
 }
