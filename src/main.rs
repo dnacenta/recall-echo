@@ -1059,32 +1059,10 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             model,
             no_llm,
         } => bench_ingest(&rt, pulse_root, conv_json, provider, model, no_llm),
-        BenchCommands::Answer {
-            pulse_root,
-            question,
-            question_stdin,
-            provider,
-            model,
-            graph_depth,
-            graph_limit,
-            archive_top_k,
-            episode_top_k,
-            episode_char_budget,
-            no_episodes,
-        } => bench_answer(
-            &rt,
-            pulse_root,
-            question,
-            question_stdin,
-            provider,
-            model,
-            graph_depth,
-            graph_limit,
-            archive_top_k,
-            episode_top_k,
-            episode_char_budget,
-            no_episodes,
-        ),
+        command @ BenchCommands::Answer { .. } => {
+            let (root, question, opts) = answer_request(command)?;
+            bench_answer(&rt, &root, &question, opts)
+        }
         BenchCommands::Writes {
             script,
             work_dir,
@@ -1227,23 +1205,29 @@ fn bench_ingest(
 }
 
 #[cfg(feature = "bench")]
-#[allow(clippy::too_many_arguments)]
-fn bench_answer(
-    rt: &tokio::runtime::Runtime,
-    pulse_root: PathBuf,
-    question: Option<String>,
-    question_stdin: bool,
-    provider: Option<String>,
-    model: Option<String>,
-    graph_depth: usize,
-    graph_limit: usize,
-    archive_top_k: usize,
-    episode_top_k: usize,
-    episode_char_budget: usize,
-    no_episodes: bool,
-) -> Result<(), recall_echo::error::RecallError> {
-    use recall_echo::bench::{answer_question, AnswerOpts};
+fn answer_request(
+    command: BenchCommands,
+) -> Result<(PathBuf, String, recall_echo::bench::AnswerOpts), recall_echo::error::RecallError> {
+    use recall_echo::bench::AnswerOpts;
 
+    let BenchCommands::Answer {
+        pulse_root,
+        question,
+        question_stdin,
+        provider,
+        model,
+        graph_depth,
+        graph_limit,
+        archive_top_k,
+        episode_top_k,
+        episode_char_budget,
+        no_episodes,
+    } = command
+    else {
+        return Err(recall_echo::error::RecallError::Config(
+            "expected bench answer".into(),
+        ));
+    };
     let question_text = bench_question(question, question_stdin)?;
     let provider_override = bench_provider(provider.as_deref())?;
     let opts = AnswerOpts {
@@ -1257,9 +1241,20 @@ fn bench_answer(
         model_override: model,
         ..AnswerOpts::default()
     };
+    Ok((pulse_root, question_text, opts))
+}
+
+#[cfg(feature = "bench")]
+fn bench_answer(
+    rt: &tokio::runtime::Runtime,
+    root: &std::path::Path,
+    question: &str,
+    opts: recall_echo::bench::AnswerOpts,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::bench::answer_question;
 
     rt.block_on(async {
-        let answer = answer_question(&pulse_root, &question_text, opts).await?;
+        let answer = answer_question(root, question, opts).await?;
         println!("{}", serde_json::to_string(&answer)?);
         Ok::<_, recall_echo::error::RecallError>(())
     })
@@ -2610,5 +2605,83 @@ mod tests {
     fn bench_question_returns_the_given_question() {
         let text = bench_question(Some("alpha".to_string()), false).expect("question");
         assert_eq!(text, "alpha");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn answer_request_maps_every_flag() -> Result<(), recall_echo::error::RecallError> {
+        use recall_echo::bench::AnswerOpts;
+        use recall_echo::config::Provider;
+
+        let full = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "answer",
+            "--pulse-root",
+            "/x",
+            "--question",
+            "alpha",
+            "--provider",
+            "cli",
+            "--model",
+            "alpha",
+            "--graph-depth",
+            "1",
+            "--graph-limit",
+            "2",
+            "--archive-top-k",
+            "3",
+            "--episode-top-k",
+            "4",
+            "--episode-char-budget",
+            "5",
+            "--no-episodes",
+        ])
+        .expect("parse full");
+        let (root, question, opts) = answer_request(bench_subcommand(full))?;
+        assert_eq!(root, PathBuf::from("/x"));
+        assert_eq!(question, "alpha");
+        assert_eq!(opts.graph_depth, 1);
+        assert_eq!(opts.graph_limit, 2);
+        assert_eq!(opts.archive_top_k, 3);
+        assert_eq!(opts.episode_top_k, 4);
+        assert_eq!(opts.episode_char_budget, 5);
+        assert!(!opts.include_episodes);
+        assert_eq!(
+            opts.provider_override,
+            Some(Provider::from_str_loose("cli")?)
+        );
+        assert_eq!(opts.model_override.as_deref(), Some("alpha"));
+        assert_eq!(opts.max_tokens, AnswerOpts::default().max_tokens);
+
+        let bare = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "answer",
+            "--pulse-root",
+            "/x",
+            "--question",
+            "alpha",
+        ])
+        .expect("parse bare");
+        let (_root, question, opts) = answer_request(bench_subcommand(bare))?;
+        assert_eq!(question, "alpha");
+        assert_eq!(opts.graph_depth, 2);
+        assert_eq!(opts.graph_limit, 20);
+        assert_eq!(opts.archive_top_k, 5);
+        assert_eq!(opts.episode_top_k, 20);
+        assert_eq!(opts.episode_char_budget, 28000);
+        assert!(opts.include_episodes);
+        assert!(opts.provider_override.is_none());
+        assert!(opts.model_override.is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn bench_subcommand(cli: Cli) -> BenchCommands {
+        match cli.command.expect("command") {
+            Commands::Bench { command } => command,
+            _ => panic!("bench"),
+        }
     }
 }
