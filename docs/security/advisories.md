@@ -26,7 +26,7 @@ past `RUSTSEC-2018-0002`, `RUSTSEC-2021-0080`, `RUSTSEC-2026-0067` and
 `RUSTSEC-2026-0452`, `RUSTSEC-2026-0453` and `RUSTSEC-2026-0454` come first.
 They are open and pending a later decision. The embedded path can reach them.
 This record does not upgrade the store, does not edit `Cargo.lock`, and does
-not add a CI job.
+not add a CI job. An automated advisory scan is tracked in #56.
 
 ## Open: store majors, embedded path reachable
 
@@ -104,8 +104,8 @@ crate being unmaintained. `core2` is also fully yanked.
 
 | ID | Crate | Version | How it is reached | Can our use hit the weak function? | Action |
 |---|---|---|---|---|---|
-| RUSTSEC-2026-0105 | core2 | 0.4.0 | image's optional `avif` feature → `ravif` → `rav1e` → `bitstream-io` → `core2`. fastembed depends on image with default features, which are `rayon` and `default-formats`, not `avif`. The default graph does not compile it. The lock still contains it. | No vulnerable function is named. The crate is unmaintained and every published version is yanked. | No patched version. |
-| RUSTSEC-2024-0436 | paste | 1.0.15 | fastembed → `tokenizers` → `paste`, and `macro_rules_attribute` → `paste`. The `rav1e` edge is the optional avif stack above and is not compiled by default. | No vulnerable function is named. The crate is unmaintained. Tokenizers uses it as a compile-time helper. | No patched version. |
+| RUSTSEC-2026-0105 | core2 | 0.4.0 | Default graph: `fastembed` → `image` (default features; `default-formats` includes `avif`) → `ravif` → `rav1e` → `bitstream-io` → `core2`. | The advisory names no weak function. The crate is unmaintained and every published version is yanked. We embed text only (`TextEmbedding` in `src/graph/embed.rs`) and never decode or encode AVIF, so our calls do not enter the AVIF codec that compiles `core2`. | No patched version. |
+| RUSTSEC-2024-0436 | paste | 1.0.15 | `fastembed` → `tokenizers` → `paste`, and `macro_rules_attribute` → `paste`. `rav1e` is on the default image AVIF path above and also depends on `paste`. | No vulnerable function is named. The crate is unmaintained. Tokenizers uses it as a compile-time helper. | No patched version. |
 | RUSTSEC-2025-0119 | number_prefix | 0.4.0 | fastembed → `hf-hub`. The `ureq` and `tokio` features of hf-hub both pull `indicatif`, which depends on `number_prefix`. | No vulnerable function is named. The crate is unmaintained. It formats the numeric prefix on the download progress bar. | No patched version. |
 | RUSTSEC-2023-0089 | atomic-polyfill | 1.0.3 | `heapless` 0.7.17, which rstar 0.9.3, 0.10.0 and 0.11.0 list. Those versions are recorded on `geo-types`. The store compiles `geo` 0.32.0, which uses rstar 0.12.2 and `heapless` 0.8.0. The default graph does not compile atomic-polyfill. | No vulnerable function is named. The crate is unmaintained. | No patched version. |
 | RUSTSEC-2026-0441 | pin-utils | 0.1.0 | `wasmtimer`, a dependency of `surrealdb` and `surrealdb-core` under `cfg(target_family = "wasm")`. The default native graph does not compile it. | No vulnerable function is named. The crate is unmaintained. | No patched version. |
