@@ -1,0 +1,100 @@
+none
+absent
+
+known_facts_context
+[graph]
+known_facts_context = true
+
+known_match
+[graph]
+known_match = true
+
+consolidate
+[graph]
+consolidate = true
+
+consolidate_hold
+[graph]
+consolidate = true
+consolidate_hold = true
+
+consolidate_links
+[graph]
+consolidate = true
+consolidate_links = true
+
+consolidate_components
+[graph]
+consolidate = true
+consolidate_components = true
+
+consolidate_key_rename
+[graph]
+consolidate = true
+consolidate_key_rename = true
+
+consolidate_replaces_cue
+[graph]
+consolidate = true
+consolidate_replaces_cue = true
+
+consolidate_replaces_departure
+[graph]
+consolidate = true
+consolidate_replaces_departure = true
+
+consolidate_orphan_sweep
+[graph]
+consolidate = true
+consolidate_orphan_sweep = true
+
+consolidate_rule_fragments
+[graph]
+consolidate = true
+consolidate_rule_fragments = true
+
+consolidate_retire_component
+[graph]
+consolidate = true
+consolidate_retire_component = true
+
+known_key_binding
+[graph]
+known_key_binding = true
+
+drop_restatements
+[graph]
+drop_restatements = true
+
+ground_component_edges
+[graph]
+ground_component_edges = true
+
+recover_turns
+[graph]
+recover_turns = true
+
+consolidate+consolidate_hold
+[graph]
+consolidate = true
+consolidate_hold = true
+
+all
+[graph]
+known_facts_context = true
+known_match = true
+consolidate = true
+consolidate_hold = true
+consolidate_links = true
+consolidate_components = true
+consolidate_key_rename = true
+consolidate_replaces_cue = true
+consolidate_replaces_departure = true
+consolidate_orphan_sweep = true
+consolidate_rule_fragments = true
+consolidate_retire_component = true
+known_key_binding = true
+drop_restatements = true
+ground_component_edges = true
+recover_turns = true
+

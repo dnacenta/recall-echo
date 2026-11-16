@@ -2257,4 +2257,236 @@ mod tests {
         assert!(help.contains("--known-key-binding"), "{help}");
         assert!(help.contains("--consolidate-replaces-departure"), "{help}");
     }
+    #[cfg(feature = "bench")]
+    const QUESTION_REQUIRED: &str =
+        "config: exactly one of --question or --question-stdin is required";
+
+    #[cfg(feature = "bench")]
+    const UNKNOWN_PROVIDER: &str = concat!(
+        "config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code', ",
+        "'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)"
+    );
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_answer_rejects_neither_and_both_question_sources() {
+        let neither = run_bench(answer_command(None, false, None)).expect_err("neither");
+        assert_eq!(neither.to_string(), QUESTION_REQUIRED);
+        let both = run_bench(answer_command(Some("alpha"), true, None)).expect_err("both");
+        assert_eq!(both.to_string(), QUESTION_REQUIRED);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_answer_rejects_an_unknown_provider() {
+        let err = run_bench(answer_command(Some("alpha"), false, Some("nonesuch")))
+            .expect_err("provider");
+        assert_eq!(err.to_string(), UNKNOWN_PROVIDER);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_answer_reports_the_question_error_before_the_provider() {
+        let err = run_bench(answer_command(None, false, Some("nonesuch"))).expect_err("order");
+        assert_eq!(err.to_string(), QUESTION_REQUIRED);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_writes_rejects_repeat_zero() {
+        let err = run_bench(writes_command(
+            history_script().as_path(),
+            None,
+            0,
+            BenchSwitch::none(),
+        ))
+        .expect_err("repeat");
+        assert_eq!(err.to_string(), "config: repeat must be at least 1");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_ingest_missing_conversation_is_an_io_error() {
+        let err = run_bench(BenchCommands::Ingest {
+            pulse_root: PathBuf::from("/x"),
+            conv_json: Some(PathBuf::from("/x/nonesuch.json")),
+            provider: None,
+            model: None,
+            no_llm: true,
+        })
+        .expect_err("missing conversation");
+        assert_eq!(
+            err.to_string(),
+            "io: No such file or directory (os error 2)"
+        );
+    }
+
+    /// Pins the scratch config each bench `writes` switch produces.
+    ///
+    /// `RECALL_ECHO_BLESS=1` rewrites the fixture from the current code. The
+    /// fixture is generated once and then compared byte for byte.
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_writes_switches_match_the_golden() {
+        let cases = switch_cases();
+        assert_eq!(cases.len(), 19);
+        let rendered = render_switch_cases(&cases);
+        let path = switch_golden_path();
+        if std::env::var_os("RECALL_ECHO_BLESS").is_some() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("fixture directory");
+            }
+            std::fs::write(&path, &rendered).expect("write golden");
+        }
+        let expected = std::fs::read_to_string(&path).expect("writes switch golden");
+        assert_eq!(rendered, expected);
+    }
+
+    #[cfg(feature = "bench")]
+    fn answer_command(
+        question: Option<&str>,
+        question_stdin: bool,
+        provider: Option<&str>,
+    ) -> BenchCommands {
+        BenchCommands::Answer {
+            pulse_root: PathBuf::from("/x"),
+            question: question.map(str::to_string),
+            question_stdin,
+            provider: provider.map(str::to_string),
+            model: None,
+            graph_depth: 2,
+            graph_limit: 20,
+            archive_top_k: 5,
+            episode_top_k: 20,
+            episode_char_budget: 28000,
+            no_episodes: false,
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn history_script() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.toml")
+    }
+
+    #[cfg(feature = "bench")]
+    fn switch_golden_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bench/writes_switches.golden")
+    }
+
+    /// Sixteen switches, in the order `run_bench` forwards them.
+    #[cfg(feature = "bench")]
+    const SWITCH_NAMES: [&str; 16] = [
+        "known_facts_context",
+        "known_match",
+        "consolidate",
+        "consolidate_hold",
+        "consolidate_links",
+        "consolidate_components",
+        "consolidate_key_rename",
+        "consolidate_replaces_cue",
+        "consolidate_replaces_departure",
+        "consolidate_orphan_sweep",
+        "consolidate_rule_fragments",
+        "consolidate_retire_component",
+        "known_key_binding",
+        "drop_restatements",
+        "ground_component_edges",
+        "recover_turns",
+    ];
+
+    #[cfg(feature = "bench")]
+    #[derive(Clone, Copy)]
+    struct BenchSwitch {
+        flags: [bool; 16],
+    }
+
+    #[cfg(feature = "bench")]
+    impl BenchSwitch {
+        fn none() -> Self {
+            Self { flags: [false; 16] }
+        }
+
+        fn only(index: usize) -> Self {
+            let mut flags = [false; 16];
+            flags[index] = true;
+            Self { flags }
+        }
+
+        fn all() -> Self {
+            Self { flags: [true; 16] }
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn switch_cases() -> Vec<(&'static str, BenchSwitch)> {
+        let mut cases = vec![("none", BenchSwitch::none())];
+        for (index, name) in SWITCH_NAMES.iter().enumerate() {
+            cases.push((name, BenchSwitch::only(index)));
+        }
+        let mut both = BenchSwitch::none();
+        both.flags[2] = true;
+        both.flags[3] = true;
+        cases.push(("consolidate+consolidate_hold", both));
+        cases.push(("all", BenchSwitch::all()));
+        cases
+    }
+
+    #[cfg(feature = "bench")]
+    fn render_switch_cases(cases: &[(&str, BenchSwitch)]) -> String {
+        let script = history_script();
+        let mut out = String::new();
+        for (name, flags) in cases {
+            out.push_str(&render_switch_case(&script, name, *flags));
+            out.push('\n');
+        }
+        out
+    }
+
+    #[cfg(feature = "bench")]
+    fn render_switch_case(script: &std::path::Path, name: &str, flags: BenchSwitch) -> String {
+        let work = tempfile::tempdir().expect("work dir");
+        run_bench(writes_command(script, Some(work.path()), 1, flags)).expect(name);
+        let config = work.path().join("memory").join(".recall-echo.toml");
+        let body = match std::fs::read_to_string(&config) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent\n".to_string(),
+            Err(err) => panic!("read {name} config: {err}"),
+        };
+        format!("{name}\n{body}")
+    }
+
+    #[cfg(feature = "bench")]
+    fn writes_command(
+        script: &std::path::Path,
+        work_dir: Option<&std::path::Path>,
+        repeat: usize,
+        flags: BenchSwitch,
+    ) -> BenchCommands {
+        let f = flags.flags;
+        BenchCommands::Writes {
+            script: script.to_path_buf(),
+            work_dir: work_dir.map(std::path::Path::to_path_buf),
+            provider: None,
+            model: None,
+            repeat,
+            pipeline: None,
+            known_facts_context: f[0],
+            known_match: f[1],
+            consolidate: f[2],
+            consolidate_hold: f[3],
+            consolidate_links: f[4],
+            consolidate_components: f[5],
+            consolidate_key_rename: f[6],
+            consolidate_replaces_cue: f[7],
+            consolidate_replaces_departure: f[8],
+            consolidate_orphan_sweep: f[9],
+            consolidate_rule_fragments: f[10],
+            consolidate_retire_component: f[11],
+            known_key_binding: f[12],
+            drop_restatements: f[13],
+            ground_component_edges: f[14],
+            recover_turns: f[15],
+        }
+    }
 }
