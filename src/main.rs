@@ -1049,9 +1049,6 @@ fn external_provenance(external: bool) -> Option<recall_echo::graph::Provenance>
 
 #[cfg(feature = "bench")]
 fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallError> {
-    use recall_echo::bench::{answer_question, ingest_conversation, AnswerOpts, BenchConversation};
-    use recall_echo::config::Provider;
-
     let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
 
     match command {
@@ -1061,75 +1058,10 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             provider,
             model,
             no_llm,
-        } => {
-            let raw = read_json_input(conv_json.as_deref())?;
-            let conv: BenchConversation = serde_json::from_str(&raw)?;
-
-            rt.block_on(async {
-                let memory_dir = pulse_root.join("memory");
-                let llm_pair = if no_llm {
-                    None
-                } else {
-                    Some(recall_echo::llm_provider::create_provider(
-                        &memory_dir,
-                        provider.as_deref(),
-                        model.as_deref(),
-                    )?)
-                };
-                let llm_ref: Option<&dyn recall_echo::graph::llm::LlmProvider> = llm_pair
-                    .as_ref()
-                    .map(|(p, _)| p.as_ref() as &dyn recall_echo::graph::llm::LlmProvider);
-
-                let stats = ingest_conversation(&pulse_root, &conv, llm_ref).await?;
-                println!("{}", serde_json::to_string(&stats)?);
-                Ok::<_, recall_echo::error::RecallError>(())
-            })
-        }
-        BenchCommands::Answer {
-            pulse_root,
-            question,
-            question_stdin,
-            provider,
-            model,
-            graph_depth,
-            graph_limit,
-            archive_top_k,
-            episode_top_k,
-            episode_char_budget,
-            no_episodes,
-        } => {
-            let question_text = match (question, question_stdin) {
-                (Some(q), false) => q,
-                (None, true) => read_stdin_to_string()?,
-                _ => {
-                    return Err(recall_echo::error::RecallError::Config(
-                        "exactly one of --question or --question-stdin is required".into(),
-                    ))
-                }
-            };
-
-            let provider_override = match provider.as_deref() {
-                Some(p) => Some(Provider::from_str_loose(p)?),
-                None => None,
-            };
-
-            let opts = AnswerOpts {
-                graph_depth,
-                graph_limit,
-                archive_top_k,
-                episode_top_k,
-                episode_char_budget,
-                include_episodes: !no_episodes,
-                provider_override,
-                model_override: model,
-                ..AnswerOpts::default()
-            };
-
-            rt.block_on(async {
-                let answer = answer_question(&pulse_root, &question_text, opts).await?;
-                println!("{}", serde_json::to_string(&answer)?);
-                Ok::<_, recall_echo::error::RecallError>(())
-            })
+        } => bench_ingest(&rt, pulse_root, conv_json, provider, model, no_llm),
+        command @ BenchCommands::Answer { .. } => {
+            let (root, question, opts) = answer_request(command)?;
+            bench_answer(&rt, &root, &question, opts)
         }
         BenchCommands::Writes {
             script,
@@ -1161,93 +1093,233 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             model,
             repeat,
             pipeline,
-            if known_facts_context {
-                recall_echo::bench::writes::KnownFactsContext::On
-            } else {
-                recall_echo::bench::writes::KnownFactsContext::Off
-            },
-            if known_match {
-                recall_echo::bench::writes::KnownMatch::On
-            } else {
-                recall_echo::bench::writes::KnownMatch::Off
-            },
-            if consolidate_hold {
-                recall_echo::bench::writes::Consolidate::Hold
-            } else if consolidate {
-                recall_echo::bench::writes::Consolidate::On
-            } else {
-                recall_echo::bench::writes::Consolidate::Off
-            },
-            if drop_restatements {
-                recall_echo::bench::writes::DropRestatements::On
-            } else {
-                recall_echo::bench::writes::DropRestatements::Off
-            },
-            if consolidate_links {
-                recall_echo::bench::writes::ConsolidateLinks::On
-            } else {
-                recall_echo::bench::writes::ConsolidateLinks::Off
-            },
-            if ground_component_edges {
-                recall_echo::bench::writes::GroundComponentEdges::On
-            } else {
-                recall_echo::bench::writes::GroundComponentEdges::Off
-            },
-            if consolidate_components {
-                recall_echo::bench::writes::ConsolidateComponents::On
-            } else {
-                recall_echo::bench::writes::ConsolidateComponents::Off
-            },
-            if recover_turns {
-                recall_echo::bench::writes::RecoverTurns::On
-            } else {
-                recall_echo::bench::writes::RecoverTurns::Off
-            },
-            if consolidate_key_rename {
-                recall_echo::bench::writes::ConsolidateKeyRename::On
-            } else {
-                recall_echo::bench::writes::ConsolidateKeyRename::Off
-            },
-            if consolidate_replaces_cue {
-                recall_echo::bench::writes::ConsolidateReplacesCue::On
-            } else {
-                recall_echo::bench::writes::ConsolidateReplacesCue::Off
-            },
-            if consolidate_replaces_departure {
-                recall_echo::bench::writes::ConsolidateReplacesDeparture::On
-            } else {
-                recall_echo::bench::writes::ConsolidateReplacesDeparture::Off
-            },
-            if consolidate_orphan_sweep {
-                recall_echo::bench::writes::ConsolidateOrphanSweep::On
-            } else {
-                recall_echo::bench::writes::ConsolidateOrphanSweep::Off
-            },
-            if consolidate_rule_fragments {
-                recall_echo::bench::writes::ConsolidateRuleFragments::On
-            } else {
-                recall_echo::bench::writes::ConsolidateRuleFragments::Off
-            },
-            if consolidate_retire_component {
-                recall_echo::bench::writes::ConsolidateRetireComponent::On
-            } else {
-                recall_echo::bench::writes::ConsolidateRetireComponent::Off
-            },
-            if known_key_binding {
-                recall_echo::bench::writes::KnownKeyBinding::On
-            } else {
-                recall_echo::bench::writes::KnownKeyBinding::Off
-            },
+            on_off(
+                known_facts_context,
+                recall_echo::bench::writes::KnownFactsContext::On,
+                recall_echo::bench::writes::KnownFactsContext::Off,
+            ),
+            on_off(
+                known_match,
+                recall_echo::bench::writes::KnownMatch::On,
+                recall_echo::bench::writes::KnownMatch::Off,
+            ),
+            consolidate_mode(consolidate_hold, consolidate),
+            on_off(
+                drop_restatements,
+                recall_echo::bench::writes::DropRestatements::On,
+                recall_echo::bench::writes::DropRestatements::Off,
+            ),
+            on_off(
+                consolidate_links,
+                recall_echo::bench::writes::ConsolidateLinks::On,
+                recall_echo::bench::writes::ConsolidateLinks::Off,
+            ),
+            on_off(
+                ground_component_edges,
+                recall_echo::bench::writes::GroundComponentEdges::On,
+                recall_echo::bench::writes::GroundComponentEdges::Off,
+            ),
+            on_off(
+                consolidate_components,
+                recall_echo::bench::writes::ConsolidateComponents::On,
+                recall_echo::bench::writes::ConsolidateComponents::Off,
+            ),
+            on_off(
+                recover_turns,
+                recall_echo::bench::writes::RecoverTurns::On,
+                recall_echo::bench::writes::RecoverTurns::Off,
+            ),
+            on_off(
+                consolidate_key_rename,
+                recall_echo::bench::writes::ConsolidateKeyRename::On,
+                recall_echo::bench::writes::ConsolidateKeyRename::Off,
+            ),
+            on_off(
+                consolidate_replaces_cue,
+                recall_echo::bench::writes::ConsolidateReplacesCue::On,
+                recall_echo::bench::writes::ConsolidateReplacesCue::Off,
+            ),
+            on_off(
+                consolidate_replaces_departure,
+                recall_echo::bench::writes::ConsolidateReplacesDeparture::On,
+                recall_echo::bench::writes::ConsolidateReplacesDeparture::Off,
+            ),
+            on_off(
+                consolidate_orphan_sweep,
+                recall_echo::bench::writes::ConsolidateOrphanSweep::On,
+                recall_echo::bench::writes::ConsolidateOrphanSweep::Off,
+            ),
+            on_off(
+                consolidate_rule_fragments,
+                recall_echo::bench::writes::ConsolidateRuleFragments::On,
+                recall_echo::bench::writes::ConsolidateRuleFragments::Off,
+            ),
+            on_off(
+                consolidate_retire_component,
+                recall_echo::bench::writes::ConsolidateRetireComponent::On,
+                recall_echo::bench::writes::ConsolidateRetireComponent::Off,
+            ),
+            on_off(
+                known_key_binding,
+                recall_echo::bench::writes::KnownKeyBinding::On,
+                recall_echo::bench::writes::KnownKeyBinding::Off,
+            ),
         ),
-        BenchCommands::RecoverReplay { memory_dir } => {
-            let rt =
-                tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
-            let lines = rt.block_on(recall_echo::bench::writes::recover_replay(&memory_dir))?;
-            for line in lines {
-                println!("{line}");
-            }
-            Ok(())
-        }
+        BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn bench_ingest(
+    rt: &tokio::runtime::Runtime,
+    pulse_root: PathBuf,
+    conv_json: Option<PathBuf>,
+    provider: Option<String>,
+    model: Option<String>,
+    no_llm: bool,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::bench::{ingest_conversation, BenchConversation};
+
+    let raw = read_json_input(conv_json.as_deref())?;
+    let conv: BenchConversation = serde_json::from_str(&raw)?;
+
+    rt.block_on(async {
+        let memory_dir = pulse_root.join("memory");
+        let llm_pair = if no_llm {
+            None
+        } else {
+            Some(recall_echo::llm_provider::create_provider(
+                &memory_dir,
+                provider.as_deref(),
+                model.as_deref(),
+            )?)
+        };
+        let llm_ref: Option<&dyn recall_echo::graph::llm::LlmProvider> = llm_pair
+            .as_ref()
+            .map(|(p, _)| p.as_ref() as &dyn recall_echo::graph::llm::LlmProvider);
+
+        let stats = ingest_conversation(&pulse_root, &conv, llm_ref).await?;
+        println!("{}", serde_json::to_string(&stats)?);
+        Ok::<_, recall_echo::error::RecallError>(())
+    })
+}
+
+#[cfg(feature = "bench")]
+fn answer_request(
+    command: BenchCommands,
+) -> Result<(PathBuf, String, recall_echo::bench::AnswerOpts), recall_echo::error::RecallError> {
+    use recall_echo::bench::AnswerOpts;
+
+    let BenchCommands::Answer {
+        pulse_root,
+        question,
+        question_stdin,
+        provider,
+        model,
+        graph_depth,
+        graph_limit,
+        archive_top_k,
+        episode_top_k,
+        episode_char_budget,
+        no_episodes,
+    } = command
+    else {
+        return Err(recall_echo::error::RecallError::Config(
+            "expected bench answer".into(),
+        ));
+    };
+    let question_text = bench_question(question, question_stdin)?;
+    let provider_override = bench_provider(provider.as_deref())?;
+    let opts = AnswerOpts {
+        graph_depth,
+        graph_limit,
+        archive_top_k,
+        episode_top_k,
+        episode_char_budget,
+        include_episodes: !no_episodes,
+        provider_override,
+        model_override: model,
+        ..AnswerOpts::default()
+    };
+    Ok((pulse_root, question_text, opts))
+}
+
+#[cfg(feature = "bench")]
+fn bench_answer(
+    rt: &tokio::runtime::Runtime,
+    root: &std::path::Path,
+    question: &str,
+    opts: recall_echo::bench::AnswerOpts,
+) -> Result<(), recall_echo::error::RecallError> {
+    use recall_echo::bench::answer_question;
+
+    rt.block_on(async {
+        let answer = answer_question(root, question, opts).await?;
+        println!("{}", serde_json::to_string(&answer)?);
+        Ok::<_, recall_echo::error::RecallError>(())
+    })
+}
+
+#[cfg(feature = "bench")]
+fn bench_question(
+    question: Option<String>,
+    question_stdin: bool,
+) -> Result<String, recall_echo::error::RecallError> {
+    bench_question_with(question, question_stdin, read_stdin_to_string)
+}
+
+#[cfg(feature = "bench")]
+fn bench_question_with(
+    question: Option<String>,
+    stdin: bool,
+    read: impl FnOnce() -> Result<String, recall_echo::error::RecallError>,
+) -> Result<String, recall_echo::error::RecallError> {
+    match (question, stdin) {
+        (Some(text), false) => Ok(text),
+        (None, true) => read(),
+        _ => Err(recall_echo::error::RecallError::Config(
+            "exactly one of --question or --question-stdin is required".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn bench_provider(
+    provider: Option<&str>,
+) -> Result<Option<recall_echo::config::Provider>, recall_echo::error::RecallError> {
+    match provider {
+        Some(name) => Ok(Some(recall_echo::config::Provider::from_str_loose(name)?)),
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "bench")]
+fn bench_recover_replay(memory_dir: PathBuf) -> Result<(), recall_echo::error::RecallError> {
+    let rt = tokio::runtime::Runtime::new().map_err(recall_echo::error::RecallError::from)?;
+    let lines = rt.block_on(recall_echo::bench::writes::recover_replay(&memory_dir))?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bench")]
+fn on_off<T>(flag: bool, on: T, off: T) -> T {
+    if flag {
+        on
+    } else {
+        off
+    }
+}
+
+#[cfg(feature = "bench")]
+fn consolidate_mode(hold: bool, consolidate: bool) -> recall_echo::bench::writes::Consolidate {
+    if hold {
+        recall_echo::bench::writes::Consolidate::Hold
+    } else if consolidate {
+        recall_echo::bench::writes::Consolidate::On
+    } else {
+        recall_echo::bench::writes::Consolidate::Off
     }
 }
 
@@ -2256,5 +2328,410 @@ mod tests {
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--known-key-binding"), "{help}");
         assert!(help.contains("--consolidate-replaces-departure"), "{help}");
+    }
+    #[cfg(feature = "bench")]
+    const QUESTION_REQUIRED: &str =
+        "config: exactly one of --question or --question-stdin is required";
+
+    #[cfg(feature = "bench")]
+    const UNKNOWN_PROVIDER: &str = concat!(
+        "config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code', ",
+        "'gemini', 'grok', 'codex', or 'cli' with a [llm.cli] section)"
+    );
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_answer_rejects_neither_and_both_question_sources() {
+        let neither = run_bench(answer_command(None, false, None)).expect_err("neither");
+        assert_eq!(neither.to_string(), QUESTION_REQUIRED);
+        let both = run_bench(answer_command(Some("alpha"), true, None)).expect_err("both");
+        assert_eq!(both.to_string(), QUESTION_REQUIRED);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_answer_rejects_an_unknown_provider() {
+        let err = run_bench(answer_command(Some("alpha"), false, Some("nonesuch")))
+            .expect_err("provider");
+        assert_eq!(err.to_string(), UNKNOWN_PROVIDER);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_answer_reports_the_question_error_before_the_provider() {
+        let err = run_bench(answer_command(None, false, Some("nonesuch"))).expect_err("order");
+        assert_eq!(err.to_string(), QUESTION_REQUIRED);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_writes_rejects_repeat_zero() {
+        let err = run_bench(writes_command(
+            history_script().as_path(),
+            None,
+            0,
+            BenchSwitch::none(),
+        ))
+        .expect_err("repeat");
+        assert_eq!(err.to_string(), "config: repeat must be at least 1");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_ingest_missing_conversation_is_an_io_error() {
+        let err = run_bench(BenchCommands::Ingest {
+            pulse_root: PathBuf::from("/x"),
+            conv_json: Some(PathBuf::from("/x/nonesuch.json")),
+            provider: None,
+            model: None,
+            no_llm: true,
+        })
+        .expect_err("missing conversation");
+        assert_eq!(
+            err.to_string(),
+            "io: No such file or directory (os error 2)"
+        );
+    }
+
+    /// Pins the scratch config each bench `writes` switch produces.
+    ///
+    /// `RECALL_ECHO_BLESS=1` rewrites the fixture from the current code. The
+    /// fixture is generated once and then compared byte for byte.
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_writes_switches_match_the_golden() {
+        let cases = switch_cases();
+        assert_eq!(cases.len(), 19);
+        let rendered = render_switch_cases(&cases);
+        let path = switch_golden_path();
+        if std::env::var_os("RECALL_ECHO_BLESS").is_some() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("fixture directory");
+            }
+            std::fs::write(&path, &rendered).expect("write golden");
+        }
+        let expected = std::fs::read_to_string(&path).expect("writes switch golden");
+        assert_eq!(rendered, expected);
+    }
+
+    #[cfg(feature = "bench")]
+    fn answer_command(
+        question: Option<&str>,
+        question_stdin: bool,
+        provider: Option<&str>,
+    ) -> BenchCommands {
+        BenchCommands::Answer {
+            pulse_root: PathBuf::from("/x"),
+            question: question.map(str::to_string),
+            question_stdin,
+            provider: provider.map(str::to_string),
+            model: None,
+            graph_depth: 2,
+            graph_limit: 20,
+            archive_top_k: 5,
+            episode_top_k: 20,
+            episode_char_budget: 28000,
+            no_episodes: false,
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn history_script() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/writes/history.toml")
+    }
+
+    #[cfg(feature = "bench")]
+    fn switch_golden_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bench/writes_switches.golden")
+    }
+
+    /// Sixteen switches, in the order `run_bench` forwards them.
+    #[cfg(feature = "bench")]
+    const SWITCH_NAMES: [&str; 16] = [
+        "known_facts_context",
+        "known_match",
+        "consolidate",
+        "consolidate_hold",
+        "consolidate_links",
+        "consolidate_components",
+        "consolidate_key_rename",
+        "consolidate_replaces_cue",
+        "consolidate_replaces_departure",
+        "consolidate_orphan_sweep",
+        "consolidate_rule_fragments",
+        "consolidate_retire_component",
+        "known_key_binding",
+        "drop_restatements",
+        "ground_component_edges",
+        "recover_turns",
+    ];
+
+    #[cfg(feature = "bench")]
+    #[derive(Clone, Copy)]
+    struct BenchSwitch {
+        flags: [bool; 16],
+    }
+
+    #[cfg(feature = "bench")]
+    impl BenchSwitch {
+        fn none() -> Self {
+            Self { flags: [false; 16] }
+        }
+
+        fn only(index: usize) -> Self {
+            let mut flags = [false; 16];
+            flags[index] = true;
+            Self { flags }
+        }
+
+        fn all() -> Self {
+            Self { flags: [true; 16] }
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    fn switch_cases() -> Vec<(&'static str, BenchSwitch)> {
+        let mut cases = vec![("none", BenchSwitch::none())];
+        for (index, name) in SWITCH_NAMES.iter().enumerate() {
+            cases.push((name, BenchSwitch::only(index)));
+        }
+        let mut both = BenchSwitch::none();
+        both.flags[2] = true;
+        both.flags[3] = true;
+        cases.push(("consolidate+consolidate_hold", both));
+        cases.push(("all", BenchSwitch::all()));
+        cases
+    }
+
+    #[cfg(feature = "bench")]
+    fn render_switch_cases(cases: &[(&str, BenchSwitch)]) -> String {
+        let script = history_script();
+        let mut out = String::new();
+        for (name, flags) in cases {
+            out.push_str(&render_switch_case(&script, name, *flags));
+            out.push('\n');
+        }
+        out
+    }
+
+    #[cfg(feature = "bench")]
+    fn render_switch_case(script: &std::path::Path, name: &str, flags: BenchSwitch) -> String {
+        let work = tempfile::tempdir().expect("work dir");
+        run_bench(writes_command(script, Some(work.path()), 1, flags)).expect(name);
+        let config = work.path().join("memory").join(".recall-echo.toml");
+        let body = match std::fs::read_to_string(&config) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent\n".to_string(),
+            Err(err) => panic!("read {name} config: {err}"),
+        };
+        format!("{name}\n{body}")
+    }
+
+    #[cfg(feature = "bench")]
+    fn writes_command(
+        script: &std::path::Path,
+        work_dir: Option<&std::path::Path>,
+        repeat: usize,
+        flags: BenchSwitch,
+    ) -> BenchCommands {
+        let f = flags.flags;
+        BenchCommands::Writes {
+            script: script.to_path_buf(),
+            work_dir: work_dir.map(std::path::Path::to_path_buf),
+            provider: None,
+            model: None,
+            repeat,
+            pipeline: None,
+            known_facts_context: f[0],
+            known_match: f[1],
+            consolidate: f[2],
+            consolidate_hold: f[3],
+            consolidate_links: f[4],
+            consolidate_components: f[5],
+            consolidate_key_rename: f[6],
+            consolidate_replaces_cue: f[7],
+            consolidate_replaces_departure: f[8],
+            consolidate_orphan_sweep: f[9],
+            consolidate_rule_fragments: f[10],
+            consolidate_retire_component: f[11],
+            known_key_binding: f[12],
+            drop_restatements: f[13],
+            ground_component_edges: f[14],
+            recover_turns: f[15],
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn on_off_selects_each_switch_enum() {
+        use recall_echo::bench::writes::{
+            ConsolidateComponents, ConsolidateKeyRename, ConsolidateLinks, ConsolidateOrphanSweep,
+            ConsolidateReplacesCue, ConsolidateReplacesDeparture, ConsolidateRetireComponent,
+            ConsolidateRuleFragments, DropRestatements, GroundComponentEdges, KnownFactsContext,
+            KnownKeyBinding, KnownMatch, RecoverTurns,
+        };
+        assert_on_off(KnownFactsContext::On, KnownFactsContext::Off);
+        assert_on_off(KnownMatch::On, KnownMatch::Off);
+        assert_on_off(DropRestatements::On, DropRestatements::Off);
+        assert_on_off(ConsolidateLinks::On, ConsolidateLinks::Off);
+        assert_on_off(GroundComponentEdges::On, GroundComponentEdges::Off);
+        assert_on_off(ConsolidateComponents::On, ConsolidateComponents::Off);
+        assert_on_off(RecoverTurns::On, RecoverTurns::Off);
+        assert_on_off(ConsolidateKeyRename::On, ConsolidateKeyRename::Off);
+        assert_on_off(ConsolidateReplacesCue::On, ConsolidateReplacesCue::Off);
+        assert_on_off(
+            ConsolidateReplacesDeparture::On,
+            ConsolidateReplacesDeparture::Off,
+        );
+        assert_on_off(ConsolidateOrphanSweep::On, ConsolidateOrphanSweep::Off);
+        assert_on_off(ConsolidateRuleFragments::On, ConsolidateRuleFragments::Off);
+        assert_on_off(
+            ConsolidateRetireComponent::On,
+            ConsolidateRetireComponent::Off,
+        );
+        assert_on_off(KnownKeyBinding::On, KnownKeyBinding::Off);
+    }
+
+    #[cfg(feature = "bench")]
+    fn assert_on_off<T: Copy + PartialEq + std::fmt::Debug>(on: T, off: T) {
+        assert_eq!(on_off(true, on, off), on);
+        assert_eq!(on_off(false, on, off), off);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_mode_lets_hold_win() {
+        use recall_echo::bench::writes::Consolidate;
+        assert_eq!(consolidate_mode(true, false), Consolidate::Hold);
+        assert_eq!(consolidate_mode(false, true), Consolidate::On);
+        assert_eq!(consolidate_mode(true, true), Consolidate::Hold);
+        assert_eq!(consolidate_mode(false, false), Consolidate::Off);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_question_returns_the_given_question() {
+        let text = bench_question(Some("alpha".to_string()), false).expect("question");
+        assert_eq!(text, "alpha");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_question_reads_stdin_only_when_asked() {
+        let from_stdin =
+            bench_question_with(None, true, || Ok("alpha".to_string())).expect("stdin");
+        assert_eq!(from_stdin, "alpha");
+        let from_flag =
+            bench_question_with(Some("alpha".to_string()), false, || panic!("read")).expect("flag");
+        assert_eq!(from_flag, "alpha");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn answer_request_maps_every_flag() -> Result<(), recall_echo::error::RecallError> {
+        use recall_echo::bench::AnswerOpts;
+        use recall_echo::config::Provider;
+
+        let full = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "answer",
+            "--pulse-root",
+            "/x",
+            "--question",
+            "alpha",
+            "--provider",
+            "cli",
+            "--model",
+            "alpha",
+            "--graph-depth",
+            "1",
+            "--graph-limit",
+            "2",
+            "--archive-top-k",
+            "3",
+            "--episode-top-k",
+            "4",
+            "--episode-char-budget",
+            "5",
+            "--no-episodes",
+        ])
+        .expect("parse full");
+        let (root, question, opts) = answer_request(bench_subcommand(full))?;
+        assert_eq!(root, PathBuf::from("/x"));
+        assert_eq!(question, "alpha");
+        assert_eq!(opts.graph_depth, 1);
+        assert_eq!(opts.graph_limit, 2);
+        assert_eq!(opts.archive_top_k, 3);
+        assert_eq!(opts.episode_top_k, 4);
+        assert_eq!(opts.episode_char_budget, 5);
+        assert!(!opts.include_episodes);
+        assert_eq!(
+            opts.provider_override,
+            Some(Provider::from_str_loose("cli")?)
+        );
+        assert_eq!(opts.model_override.as_deref(), Some("alpha"));
+        assert_eq!(opts.max_tokens, AnswerOpts::default().max_tokens);
+
+        let bare = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "answer",
+            "--pulse-root",
+            "/x",
+            "--question",
+            "alpha",
+        ])
+        .expect("parse bare");
+        let (_root, question, opts) = answer_request(bench_subcommand(bare))?;
+        assert_eq!(question, "alpha");
+        assert_eq!(opts.graph_depth, 2);
+        assert_eq!(opts.graph_limit, 20);
+        assert_eq!(opts.archive_top_k, 5);
+        assert_eq!(opts.episode_top_k, 20);
+        assert_eq!(opts.episode_char_budget, 28000);
+        assert!(opts.include_episodes);
+        assert!(opts.provider_override.is_none());
+        assert!(opts.model_override.is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "bench")]
+    fn bench_subcommand(cli: Cli) -> BenchCommands {
+        match cli.command.expect("command") {
+            Commands::Bench { command } => command,
+            _ => panic!("bench"),
+        }
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_recover_replay_reports_an_unopenable_store() {
+        let dir = tempfile::tempdir().expect("temp");
+        let memory = dir.path().join("store");
+        std::fs::write(&memory, "alpha").expect("file");
+        assert!(bench_recover_replay(memory).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_ingest_builds_the_provider_unless_no_llm() {
+        let dir = tempfile::tempdir().expect("temp");
+        let conv = dir.path().join("conv.json");
+        std::fs::write(
+            &conv,
+            r#"{"sample_id":"alpha","speaker_a":"alpha","speaker_b":"alpha","sessions":[]}"#,
+        )
+        .expect("conversation");
+        let err = run_bench(BenchCommands::Ingest {
+            pulse_root: dir.path().to_path_buf(),
+            conv_json: Some(conv),
+            provider: Some("nonesuch".into()),
+            model: None,
+            no_llm: false,
+        })
+        .expect_err("provider");
+        assert_eq!(err.to_string(), UNKNOWN_PROVIDER);
     }
 }
