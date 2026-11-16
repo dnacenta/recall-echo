@@ -1465,7 +1465,7 @@ fn print_rebuild_dry_run(memory_dir: &Path, plan: &RebuildPlan) -> Result<(), Re
         "Estimated provider calls: {total_calls} (windows × 1 + resolver bound {})",
         crate::graph::v2::RESOLVER_CALL_BOUND
     );
-    if let Some(count) = plan.leftovers {
+    if let Some(count) = plan.leftovers.filter(|count| *count > 0) {
         println!("{}", leftover_sentence(count));
     }
     Ok(())
@@ -1870,10 +1870,10 @@ fn leftover_sentence(count: usize) -> String {
     format!("{count} leftover {episodes} left in place.")
 }
 
-/// Insert the leftover sentence after the rebuilt line when the scan knew it.
+/// Insert the leftover sentence after the rebuilt line when the scan found some.
 #[cfg(feature = "llm")]
 fn report_with_leftovers(report: String, leftovers: Option<usize>) -> String {
-    let Some(count) = leftovers else {
+    let Some(count) = leftovers.filter(|count| *count > 0) else {
         return report;
     };
     let addition = format!("{}\n", leftover_sentence(count));
@@ -3654,6 +3654,9 @@ mod tests {
         );
         assert!(text.contains("pipeline = \"v1\""), "{text}");
         assert_eq!(report_with_leftovers(plain.clone(), None), plain);
+        let zero = report_with_leftovers(plain.clone(), Some(0));
+        assert_eq!(zero, plain);
+        assert!(!zero.contains("leftover"), "{zero}");
         assert_eq!(leftover_sentence(1), "1 leftover episode left in place.");
     }
 
