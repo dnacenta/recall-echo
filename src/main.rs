@@ -2684,4 +2684,34 @@ mod tests {
             _ => panic!("bench"),
         }
     }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_recover_replay_reports_an_unopenable_store() {
+        let dir = tempfile::tempdir().expect("temp");
+        let memory = dir.path().join("store");
+        std::fs::write(&memory, "alpha").expect("file");
+        assert!(bench_recover_replay(memory).is_err());
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn bench_ingest_builds_the_provider_unless_no_llm() {
+        let dir = tempfile::tempdir().expect("temp");
+        let conv = dir.path().join("conv.json");
+        std::fs::write(
+            &conv,
+            r#"{"sample_id":"alpha","speaker_a":"alpha","speaker_b":"alpha","sessions":[]}"#,
+        )
+        .expect("conversation");
+        let err = run_bench(BenchCommands::Ingest {
+            pulse_root: dir.path().to_path_buf(),
+            conv_json: Some(conv),
+            provider: Some("nonesuch".into()),
+            model: None,
+            no_llm: false,
+        })
+        .expect_err("provider");
+        assert_eq!(err.to_string(), UNKNOWN_PROVIDER);
+    }
 }
