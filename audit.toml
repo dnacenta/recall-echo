@@ -1,5 +1,5 @@
 # Reviewed advisories for Cargo.lock
-# sha256 70695675c4134e66b73e563aee2ec73064f29a3353401b13988d4ce042c90071
+# sha256 97863af872bb1b9a548fe979a0544972df989d5aa9f61968c5a2492b0d2d850e
 # Recorded 2026-11-16. Reasons are in docs/security/advisories.md.
 
 [advisories]
@@ -17,53 +17,6 @@ ignore = [
     "RUSTSEC-2026-0235",
     # crypto-bigint 0.5.5: major bump, not a lockfile edit and not accepted (2026-11-16)
     "RUSTSEC-2026-0387",
-
-    # rustls 0.23.37: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0285",
-    # rustls 0.23.37: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0346",
-    # rustls 0.23.37: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0348",
-    # rustls 0.23.37: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0349",
-    # rustls-webpki 0.103.10: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0098",
-    # rustls-webpki 0.103.10: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0099",
-    # rustls-webpki 0.103.10: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0104",
-    # rustls-webpki 0.103.10: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0382",
-    # webpki-roots 1.0.6: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0381",
-    # h2 0.4.13: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0258",
-    # tar 0.4.45: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "GHSA-3pv8-6f4r-ffg2",
-    # tokio 1.53.1: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0386",
-    # crossbeam-epoch 0.9.18: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0204",
-    # anyhow 1.0.102: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0190",
-    # event-listener 5.4.1: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0221",
-    # rand 0.8.5: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0097",
-    # rustix 1.1.4: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0486",
-    # ammonia 4.1.2: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2021-0157",
-    # ammonia 4.1.2: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2021-0158",
-    # ammonia 4.1.2: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0193",
-    # ammonia 4.1.2: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0213",
-    # ammonia 4.1.2: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0373",
-    # ammonia 4.1.2: bump is the next PR, not a permanent acceptance (2026-11-16)
-    "RUSTSEC-2026-0533",
 
     # quinn-proto 0.11.14: HTTP/3 feature is off (2026-11-16)
     "RUSTSEC-2026-0185",
