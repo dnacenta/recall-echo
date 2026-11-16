@@ -14240,7 +14240,7 @@ mod tests {
         let project = project();
         let quiet = Quiet;
         let cases = [
-            ("re", 0, "re is short", "re is short", false),
+            ("re", 0, "nothing stored", "re is short", false),
             ("alpha beta", 0, "see Beta now", "see Beta now", false),
             ("alpha beta", 0, "nothing stored", "nothing stored", true),
             ("alpha", 4, "nothing stored", "keep alpha please", false),
