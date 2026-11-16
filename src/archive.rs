@@ -2232,4 +2232,56 @@ mod tests {
         let checkpoint_production = checkpoint.split("mod tests").next().expect("tests");
         assert!(checkpoint_production.contains("if result.is_new_archive()"));
     }
+
+    /// The summary block is byte-identical to the inline block on `main`.
+    #[test]
+    fn summary_section_renders_decisions_and_action_items() {
+        let full = summarize::ConversationSummary {
+            summary: "alpha".into(),
+            decisions: vec!["hello".into()],
+            action_items: vec!["sess".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            summary_section(&full),
+            "## Summary\n\nalpha\n\n**Decisions**:\n- hello\n\n**Action Items**:\n- sess\n\n"
+        );
+        let only = summarize::ConversationSummary {
+            summary: "alpha".into(),
+            ..Default::default()
+        };
+        assert_eq!(summary_section(&only), "## Summary\n\nalpha\n\n");
+        let no_text = summarize::ConversationSummary {
+            decisions: vec!["hello".into()],
+            ..Default::default()
+        };
+        assert_eq!(summary_section(&no_text), "");
+    }
+
+    /// A log number of 0 is never a new archive, whatever the body holds.
+    #[test]
+    fn log_zero_is_never_a_new_archive() {
+        let result = ArchiveResult {
+            log_number: 0,
+            full_content: "x".into(),
+            session_id: "sess".into(),
+        };
+        assert!(!result.is_new_archive());
+    }
+
+    /// The header read stops at the closing marker, so the body is never read.
+    #[test]
+    fn read_header_stops_at_the_closing_marker() {
+        let tmp = memory_with_conversations();
+        let path = tmp.path().join("conversations/conversation-001.md");
+        let mut bytes = b"---\nlog: 1\ndate: \"2026-01-01T00:00:00Z\"\nsession_id: \"sess\"\nsource: \"jsonl\"\n---\n".to_vec();
+        bytes.extend_from_slice(b"\xff\xfe not utf-8\n");
+        fs::write(&path, bytes).unwrap();
+        let header = read_header(&path).expect("header");
+        assert_eq!(header.session_id, "sess");
+        assert_eq!(
+            prior_capture(&tmp.path().join("conversations"), "sess"),
+            Some(1)
+        );
+    }
 }
