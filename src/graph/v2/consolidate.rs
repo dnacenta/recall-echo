@@ -578,7 +578,11 @@ fn earlier_fact(
 
 /// Support failed because the cited turn has none of the content tokens.
 ///
-/// A `replaces` value with no content token failed for a different reason.
+/// Mirrors `write::replaces_supported`: the same alphanumeric tokens of at
+/// least three characters, and the same cited-turn lookup with the quote as
+/// fallback. True exactly when that check fails and the token set is not
+/// empty. A `replaces` value with no content token failed for a different
+/// reason. Keep the two in step.
 fn cited_lacks_replaces(fact: &super::schema::Fact, ctx: &WriteCtx<'_>) -> bool {
     let need = support_tokens(fact.replaces.trim());
     if need.is_empty() {
@@ -2736,7 +2740,7 @@ fn uses_row_match(anchor: &Anchor, label: &str) -> bool {
 fn setting_uses_match(anchor: &Anchor, partner: &Row, label: &str) -> bool {
     token_run(&anchor.replaces, label)
         && !covered_by_new(anchor, label)
-        && (setting_key_related(anchor, partner) || !trivial_value(label))
+        && (setting_keys(anchor, partner) || !trivial_value(label))
 }
 
 /// Every token of the partner value is already a token of the new value.
@@ -2747,11 +2751,6 @@ fn covered_by_new(anchor: &Anchor, label: &str) -> bool {
         && mine
             .iter()
             .all(|token| fresh.iter().any(|item| item == token))
-}
-
-fn setting_key_related(anchor: &Anchor, partner: &Row) -> bool {
-    let names = tokens(&partner.subject);
-    keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
 }
 
 fn trivial_value(value: &str) -> bool {
@@ -2807,6 +2806,7 @@ fn setting_replaces_match(anchor: &Anchor, partner: &Row) -> bool {
     values_equal(&anchor.replaces, &partner.value) && setting_keys(anchor, partner)
 }
 
+/// Shared by [`setting_uses_match`] and [`setting_replaces_match`].
 fn setting_keys(anchor: &Anchor, partner: &Row) -> bool {
     let names = tokens(&partner.subject);
     keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
@@ -5260,18 +5260,28 @@ async fn post_pass(
 }
 
 async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<PostSnap, GraphError> {
+    if !post_switches(ctx) {
+        return Ok(PostSnap {
+            orphan: None,
+            fragments: None,
+            retire: None,
+        });
+    }
+    let rows = read_entity_rows(gm).await?;
     let orphan = if ctx.orphan_sweep_on {
-        Some(read_orphan_snap(gm, ctx).await?)
+        Some(read_orphan_snap(gm, ctx, &rows).await?)
     } else {
         None
     };
     let fragments = if ctx.rule_fragments_on {
-        Some(read_fragment_snap(gm).await?)
+        Some(FragmentSnap {
+            entities: parse_fragment_entities(&rows),
+        })
     } else {
         None
     };
     let retire = if ctx.retire_component_on {
-        Some(read_retire_snap(gm, ctx).await?)
+        Some(retire_snap(gm, ctx, &rows).await?)
     } else {
         None
     };
@@ -5310,8 +5320,12 @@ fn note_truncation(snap: &OrphanSnap, report: &mut IngestionReport) {
     }
 }
 
-async fn read_orphan_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<OrphanSnap, GraphError> {
-    let project_id = find_project_id(gm, ctx).await?;
+async fn read_orphan_snap(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<OrphanSnap, GraphError> {
+    let project_id = preferred_project_id(rows, ctx);
     let live_uses = load_live_uses(gm, project_id.as_deref()).await?;
     let blocked = blocked_component_ids(gm, project_id.as_deref()).await?;
     let page = load_component_page(gm, &blocked).await?;
@@ -5336,26 +5350,49 @@ fn hit_orphan_cap(len: usize) -> bool {
     len > ORPHAN_CAP
 }
 
-async fn find_project_id(
-    gm: &GraphMemory,
-    ctx: &WriteCtx<'_>,
-) -> Result<Option<String>, GraphError> {
+async fn read_entity_rows(gm: &GraphMemory) -> Result<Vec<Value>, GraphError> {
     note_post_read();
     let mut response = gm
         .db()
         .query("SELECT id, name, attributes FROM entity")
         .await?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-    Ok(project_row_id(&rows, ctx))
+    deserialize_take(&mut response, 0)
 }
 
-fn project_row_id(rows: &[Value], ctx: &WriteCtx<'_>) -> Option<String> {
+/// A stored row the project preference can read.
+trait ProjectRow {
+    fn project_name(&self) -> &str;
+    fn project_kind(&self) -> &str;
+    fn project_id(&self) -> Option<String>;
+}
+
+impl ProjectRow for Value {
+    fn project_name(&self) -> &str {
+        self.get("name").and_then(Value::as_str).unwrap_or("")
+    }
+
+    fn project_kind(&self) -> &str {
+        row_kind(self)
+    }
+
+    fn project_id(&self) -> Option<String> {
+        nonempty_id(self)
+    }
+}
+
+/// First v2 `project` that names the session project, otherwise the first name match.
+///
+/// Name check, then a present id, then kind `project`, then the first fallback.
+fn preferred_project_id<R: ProjectRow>(rows: &[R], ctx: &WriteCtx<'_>) -> Option<String> {
     let mut fallback = None;
     for row in rows {
-        let Some(id) = named_project_id(row, ctx) else {
+        if !names_project(ctx, row.project_name()) {
+            continue;
+        }
+        let Some(id) = row.project_id() else {
             continue;
         };
-        if row_kind(row) == "project" {
+        if row.project_kind() == "project" {
             return Some(id);
         }
         if fallback.is_none() {
@@ -5363,17 +5400,6 @@ fn project_row_id(rows: &[Value], ctx: &WriteCtx<'_>) -> Option<String> {
         }
     }
     fallback
-}
-
-fn named_project_id(row: &Value, ctx: &WriteCtx<'_>) -> Option<String> {
-    if !row_names_project(row, ctx) {
-        return None;
-    }
-    nonempty_id(row)
-}
-
-fn row_names_project(row: &Value, ctx: &WriteCtx<'_>) -> bool {
-    names_project(ctx, row.get("name").and_then(Value::as_str).unwrap_or(""))
 }
 
 fn row_kind(row: &Value) -> &str {
@@ -5801,18 +5827,6 @@ struct FragmentPlan {
     ambiguous: Vec<(String, usize)>,
 }
 
-async fn read_fragment_snap(gm: &GraphMemory) -> Result<FragmentSnap, GraphError> {
-    note_post_read();
-    let mut response = gm
-        .db()
-        .query("SELECT id, name, attributes FROM entity")
-        .await?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-    Ok(FragmentSnap {
-        entities: parse_fragment_entities(&rows),
-    })
-}
-
 fn parse_fragment_entities(rows: &[Value]) -> Vec<FragmentEntity> {
     rows.iter().filter_map(fragment_entity).collect()
 }
@@ -6090,6 +6104,20 @@ struct RetireEntity {
     slots: Vec<RetireSlot>,
 }
 
+impl ProjectRow for RetireEntity {
+    fn project_name(&self) -> &str {
+        &self.name
+    }
+
+    fn project_kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn project_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+}
+
 struct RetireSlot {
     index: usize,
     predicate: String,
@@ -6155,9 +6183,19 @@ enum NameHit<'a> {
     Many,
 }
 
+#[cfg(test)]
 async fn read_retire_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<RetireSnap, GraphError> {
-    let entities = read_retire_entities(gm).await?;
-    let project_id = project_id_from_entities(&entities, ctx);
+    let rows = read_entity_rows(gm).await?;
+    retire_snap(gm, ctx, &rows).await
+}
+
+async fn retire_snap(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<RetireSnap, GraphError> {
+    let entities = parse_retire_entities(rows);
+    let project_id = preferred_project_id(&entities, ctx);
     let parts = read_retire_parts(gm).await?;
     let uses = read_retire_uses(gm).await?;
     Ok(RetireSnap {
@@ -6166,32 +6204,6 @@ async fn read_retire_snap(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Retire
         parts,
         uses,
     })
-}
-
-fn project_id_from_entities(entities: &[RetireEntity], ctx: &WriteCtx<'_>) -> Option<String> {
-    let mut fallback = None;
-    for entity in entities {
-        if !names_project(ctx, &entity.name) {
-            continue;
-        }
-        if entity.kind == "project" {
-            return Some(entity.id.clone());
-        }
-        if fallback.is_none() {
-            fallback = Some(entity.id.clone());
-        }
-    }
-    fallback
-}
-
-async fn read_retire_entities(gm: &GraphMemory) -> Result<Vec<RetireEntity>, GraphError> {
-    note_post_read();
-    let mut response = gm
-        .db()
-        .query("SELECT id, name, attributes FROM entity")
-        .await?;
-    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-    Ok(parse_retire_entities(&rows))
 }
 
 async fn read_retire_parts(gm: &GraphMemory) -> Result<Vec<PartLink>, GraphError> {
@@ -13586,6 +13598,22 @@ mod tests {
         row
     }
 
+    #[test]
+    fn setting_keys_matches_equal_keys_overlap_and_rejects_unrelated() {
+        let equal = cue_anchor("setting", "svc", "8", "5");
+        let equal_row = cue_row("ent", "setting", "svc", "5");
+        assert!(super::setting_keys(&equal, &equal_row));
+
+        // Overlap only after the partner subject token `svc` is set aside.
+        let overlap = cue_anchor("setting", "svc_ttl", "8", "5");
+        let overlap_row = cue_row("ent", "setting", "ttl_budget", "5");
+        assert!(super::setting_keys(&overlap, &overlap_row));
+
+        let unrelated = cue_anchor("setting", "timeout", "8", "5");
+        let unrelated_row = cue_row("ent", "setting", "retries", "5");
+        assert!(!super::setting_keys(&unrelated, &unrelated_row));
+    }
+
     fn cue_area(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
     }
@@ -14207,6 +14235,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cited_lacks_replaces_follows_the_writer_support_check() {
+        let project = project();
+        let quiet = Quiet;
+        let cases = [
+            ("re", 0, "nothing stored", "re is short", false),
+            ("alpha beta", 0, "see Beta now", "see Beta now", false),
+            ("alpha beta", 0, "nothing stored", "nothing stored", true),
+            ("alpha", 4, "nothing stored", "keep alpha please", false),
+            ("alpha", 4, "alpha is here", "nothing stored", true),
+        ];
+        for (replaces, index, spoken, quote, want) in cases {
+            let turns = [turn(spoken)];
+            let ctx = WriteCtx::new(&quiet, &project, "s1", "2026-04-01", &turns);
+            let mut fact = setting("app", Kind::Project, "k", "v", quote);
+            fact.replaces = replaces.into();
+            fact.turn = index;
+            assert_eq!(
+                super::cited_lacks_replaces(&fact, &ctx),
+                want,
+                "{replaces} @ {index}"
+            );
+        }
+    }
+
     fn ruled(new_value: &str, old: &str, quote: &str) -> bool {
         let anchor = cue_anchor("rule", "", new_value, old);
         let partner = cue_row("ent", "rule", "", old);
@@ -14218,6 +14271,14 @@ mod tests {
             &cue_area(&["ent"]),
             quote,
         )
+    }
+
+    #[test]
+    fn the_recorded_rule_strings_name_the_new_value() {
+        let new_value = "Move duplicates into _dupes/ under the destination and keep the path they would have had.";
+        let old = "Only report duplicates: list them at the end and do not touch the files.";
+        let quote = "I want duplicates handled now, not just listed. Move them into _dupes/ under the destination, and keep the path they would have had, so I can compare.";
+        assert!(ruled(new_value, old, quote));
     }
 
     #[test]
@@ -18191,6 +18252,74 @@ mod tests {
         assert!(use_ended(&gm, "Tinylib").await.is_none());
     }
 
+    fn project_value(id: &str, name: &str, kind: &str) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "attributes": {"v2": {"kind": kind}},
+        })
+    }
+
+    fn project_retire(id: &str, name: &str, kind: &str) -> super::RetireEntity {
+        super::RetireEntity {
+            id: id.into(),
+            name: name.into(),
+            kind: kind.into(),
+            slots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preferred_project_id_agrees_for_value_rows_and_retire_entities() {
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let ctx = WriteCtx::new(&Quiet, &project, "s1", "2026-04-01", &turns);
+        let cases = [
+            // Pins the kind preference: technology App before project-kind app.
+            (
+                [("alpha", "App", "technology"), ("beta", "app", "project")],
+                "beta",
+            ),
+            // Pins the first fallback: component app, then technology App!.
+            (
+                [
+                    ("alpha", "app", "component"),
+                    ("beta", "App!", "technology"),
+                ],
+                "alpha",
+            ),
+            // Pins the name check: project-kind other is ignored.
+            (
+                [("alpha", "other", "project"), ("beta", "App", "technology")],
+                "beta",
+            ),
+        ];
+        for (rows, want) in cases {
+            let values: Vec<Value> = rows
+                .iter()
+                .map(|(id, name, kind)| project_value(id, name, kind))
+                .collect();
+            let entities: Vec<super::RetireEntity> = rows
+                .iter()
+                .map(|(id, name, kind)| project_retire(id, name, kind))
+                .collect();
+            let from_values = super::preferred_project_id(&values, &ctx);
+            let from_entities = super::preferred_project_id(&entities, &ctx);
+            assert_eq!(from_values.as_deref(), Some(want), "{want}");
+            assert_eq!(from_entities.as_deref(), Some(want), "{want}");
+            assert_eq!(from_values, from_entities);
+        }
+        // Pins an empty id: skip it and keep the later project.
+        let skipped = [
+            project_value("", "app", "project"),
+            project_value("beta", "app", "project"),
+        ];
+        assert_eq!(
+            super::preferred_project_id(&skipped, &ctx).as_deref(),
+            Some("beta")
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn ac_g7_retire_off_adds_no_read_and_no_report_key() {
         let (_tmp, gm) = open().await;
@@ -18226,8 +18355,8 @@ mod tests {
         close_named(&gm, "app", "main", "consolidated").await;
         let (report, _, reads) =
             post_run(&gm, "s2", "2026-04-02", &[reject_blob()], true, true, false).await;
-        // O reads the project, uses, part_of and the component page. F reads entities. R adds none.
-        assert_eq!(reads, 5);
+        // One shared entity read, then O reads uses, part_of and the component page.
+        assert_eq!(reads, 4);
         assert_eq!(
             ended_key(&slots(&gm, "cache").await, "cache_format"),
             Some("s2:orphan_sweep")
@@ -18290,8 +18419,8 @@ mod tests {
         ctx.retire_component_on = true;
         let snap = super::read_post_snapshot(&gm, &ctx).await.unwrap();
         let after_read = super::post_reads();
-        // O reads four times, F once, R three: entities, part_of, and uses.
-        assert_eq!(after_read, 8);
+        // One shared entity read, then O reads uses, part_of and the page, and R reads part_of and uses.
+        assert_eq!(after_read, 6);
         super::begin_post_lines();
         let mut report = IngestionReport::default();
         super::apply_post(&gm, &ctx, &[reject_blob()], &snap, &mut report).await;
@@ -18372,6 +18501,106 @@ mod tests {
             ended_key(&slots(&gm, "alpha").await, "bg"),
             Some("s3:orphan_sweep")
         );
+    }
+
+    fn fragment_views(entities: &[super::FragmentEntity]) -> Vec<(String, String, usize)> {
+        let mut views: Vec<_> = entities
+            .iter()
+            .map(|entity| (entity.id.clone(), entity.name.clone(), entity.slots.len()))
+            .collect();
+        views.sort();
+        views
+    }
+
+    fn retire_views(entities: &[super::RetireEntity]) -> Vec<(String, String, usize)> {
+        let mut views: Vec<_> = entities
+            .iter()
+            .map(|entity| (entity.id.clone(), entity.name.clone(), entity.slots.len()))
+            .collect();
+        views.sort();
+        views
+    }
+
+    async fn post_read_count(
+        gm: &GraphMemory,
+        project: &ProjectIdentity,
+        orphan: bool,
+        fragments: bool,
+        retire: bool,
+    ) -> u32 {
+        super::reset_post_reads();
+        let turns = [turn("session")];
+        let quiet = Quiet;
+        let mut ctx = WriteCtx::new(&quiet, project, "s3", "2026-04-03", &turns);
+        ctx.orphan_sweep_on = orphan;
+        ctx.rule_fragments_on = fragments;
+        ctx.retire_component_on = retire;
+        super::read_post_snapshot(gm, &ctx).await.unwrap();
+        super::post_reads()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_entity_read_serves_o_f_and_r() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("skin", "alpha", "decided"),
+                part_link("alpha", "app", Kind::Project),
+                setting_of("alpha", "bg", "light", "decided"),
+                quoted_rule(
+                    "main",
+                    "Only report dupes and leave them alone.",
+                    LONG_QUOTE,
+                    4,
+                ),
+                quoted_rule("list", "List dupes at the end.", SHORT_QUOTE, 4),
+            ],
+        )
+        .await;
+        let mut response = gm
+            .db()
+            .query("SELECT id, name, attributes FROM entity")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = crate::graph::deserialize_take(&mut response, 0).unwrap();
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let quiet = Quiet;
+        let mut ctx = WriteCtx::new(&quiet, &project, "s3", "2026-04-03", &turns);
+        ctx.orphan_sweep_on = true;
+        ctx.rule_fragments_on = true;
+        ctx.retire_component_on = true;
+        let from_values = super::preferred_project_id(&rows, &ctx);
+        let old_fragments = super::parse_fragment_entities(&rows);
+        let old_retire = super::parse_retire_entities(&rows);
+        let from_retire = super::preferred_project_id(&old_retire, &ctx);
+        let app_id = entity_id(&gm, "app").await;
+        assert_eq!(from_values.as_deref(), Some(app_id.as_str()));
+        assert_eq!(from_values, from_retire);
+        assert!(!old_fragments.is_empty());
+        assert!(!old_retire.is_empty());
+
+        super::reset_post_reads();
+        let snap = super::read_post_snapshot(&gm, &ctx).await.unwrap();
+        assert_eq!(super::post_reads(), 6);
+        let retire = snap.retire.as_ref().unwrap();
+        let fragments = snap.fragments.as_ref().unwrap();
+        assert!(snap.orphan.is_some());
+        assert_eq!(retire.project_id, from_retire);
+        assert_eq!(
+            fragment_views(&fragments.entities),
+            fragment_views(&old_fragments)
+        );
+        assert_eq!(retire_views(&retire.entities), retire_views(&old_retire));
+
+        assert_eq!(post_read_count(&gm, &project, false, false, false).await, 0);
+        assert_eq!(post_read_count(&gm, &project, true, false, false).await, 4);
+        assert_eq!(post_read_count(&gm, &project, false, true, false).await, 1);
+        assert_eq!(post_read_count(&gm, &project, false, false, true).await, 3);
+        assert_eq!(post_read_count(&gm, &project, true, true, false).await, 4);
     }
 
     #[tokio::test(flavor = "current_thread")]
