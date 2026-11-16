@@ -18,21 +18,21 @@ changes a user has to know about before upgrading.
 
 ### Changed
 
-- The measured consolidation stack is on unless a key is set to false. That false is kept when the config is rewritten. `recover_turns` stays off, because it makes extra model calls. A config that omits a key picks up the new default.
-  - `consolidate` (`--no-consolidate`)
-  - `consolidate_hold` (`--no-consolidate-hold`)
-  - `drop_restatements` (`--no-drop-restatements`)
-  - `consolidate_links` (`--no-consolidate-links`)
-  - `consolidate_components` (`--no-consolidate-components`)
-  - `ground_component_edges` (`--no-ground-component-edges`)
-  - `consolidate_key_rename` (`--no-consolidate-key-rename`)
-  - `consolidate_replaces_cue` (`--no-consolidate-replaces-cue`)
-  - `known_facts_context` (`--no-known-facts-context`)
-  - `consolidate_replaces_departure` (`--no-consolidate-replaces-departure`)
-  - `known_key_binding` (`--no-known-key-binding`)
-  - `consolidate_orphan_sweep` (`--no-consolidate-orphan-sweep`)
-  - `consolidate_rule_fragments` (`--no-consolidate-rule-fragments`)
-  - `consolidate_retire_component` (`--no-consolidate-retire-component`)
+- The measured consolidation stack is on unless `<key> = false`. A rewrite keeps that false and leaves a true value out. `recover_turns` stays off, because it makes extra model calls. A config that omits a key picks up the new default. The `--no-*` opt-outs are `bench writes` flags.
+  - `consolidate` (`bench writes --no-consolidate`)
+  - `consolidate_hold` (`bench writes --no-consolidate-hold`)
+  - `drop_restatements` (`bench writes --no-drop-restatements`)
+  - `consolidate_links` (`bench writes --no-consolidate-links`)
+  - `consolidate_components` (`bench writes --no-consolidate-components`)
+  - `ground_component_edges` (`bench writes --no-ground-component-edges`)
+  - `consolidate_key_rename` (`bench writes --no-consolidate-key-rename`)
+  - `consolidate_replaces_cue` (`bench writes --no-consolidate-replaces-cue`)
+  - `known_facts_context` (`bench writes --no-known-facts-context`)
+  - `consolidate_replaces_departure` (`bench writes --no-consolidate-replaces-departure`)
+  - `known_key_binding` (`bench writes --no-known-key-binding`)
+  - `consolidate_orphan_sweep` (`bench writes --no-consolidate-orphan-sweep`)
+  - `consolidate_rule_fragments` (`bench writes --no-consolidate-rule-fragments`)
+  - `consolidate_retire_component` (`bench writes --no-consolidate-retire-component`)
 
 ### Fixed
 

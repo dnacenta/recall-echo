@@ -189,11 +189,16 @@ fn select_provider(
 }
 
 /// The CLI a menu should default to: the one this session is running under,
-/// else grok, else the first installed.
+/// else grok, else claude-code, else the first installed, else grok.
 fn default_cli(detected: &[AgentCli]) -> AgentCli {
     let running_under = agent_cli::current().filter(|cli| detected.contains(cli));
     running_under
         .or_else(|| detected.contains(&AgentCli::Grok).then_some(AgentCli::Grok))
+        .or_else(|| {
+            detected
+                .contains(&AgentCli::ClaudeCode)
+                .then_some(AgentCli::ClaudeCode)
+        })
         .or_else(|| detected.first().copied())
         .unwrap_or(AgentCli::Grok)
 }
@@ -1218,11 +1223,15 @@ mod tests {
     fn the_default_prefers_grok_over_install_order() {
         assert_eq!(
             default_cli(&[AgentCli::Codex, AgentCli::ClaudeCode]),
-            AgentCli::Codex
+            AgentCli::ClaudeCode
         );
         assert_eq!(
             default_cli(&[AgentCli::Gemini, AgentCli::Grok]),
             AgentCli::Grok
+        );
+        assert_eq!(
+            default_cli(&[AgentCli::Gemini, AgentCli::Codex]),
+            AgentCli::Gemini
         );
         assert_eq!(default_cli(&[]), AgentCli::Grok);
     }

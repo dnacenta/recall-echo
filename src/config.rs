@@ -810,69 +810,96 @@ pub struct GraphSection {
     /// wipe the rest of the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
-    /// Show live stored facts to pass 1. Experimental, and on unless set.
-    #[serde(default = "default_known_facts_context")]
+    /// Show live stored facts to pass 1. Experimental, and on unless set to false.
+    #[serde(
+        default = "default_known_facts_context",
+        skip_serializing_if = "is_true"
+    )]
     pub known_facts_context: bool,
     /// Keep a decided setting at gate 3 when a shown known row has the same
-    /// subject, key and `replaces` value. On unless set, and ignored unless
+    /// subject, key and `replaces` value. On unless set to false, and ignored unless
     /// [`Self::known_facts_context`] is also set.
-    #[serde(default = "default_known_key_binding")]
+    #[serde(default = "default_known_key_binding", skip_serializing_if = "is_true")]
     pub known_key_binding: bool,
     /// Match kept facts to stored rows after pass 1. Experimental, and off unless set.
     #[serde(default = "default_known_match", skip_serializing_if = "is_false")]
     pub known_match: bool,
-    /// Look across subjects and keys after a session's writes. On unless set.
-    #[serde(default = "default_consolidate")]
+    /// Look across subjects and keys after a session's writes. On unless set to false.
+    #[serde(default = "default_consolidate", skip_serializing_if = "is_true")]
     pub consolidate: bool,
     /// Hold a conflicting write that the retirement guard would skip.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
     /// A pending row stays out of live reads if this is later turned off.
-    #[serde(default = "default_consolidate_hold")]
+    #[serde(default = "default_consolidate_hold", skip_serializing_if = "is_true")]
     pub consolidate_hold: bool,
     /// Record a derived-from list on a new setting or rule.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
-    #[serde(default = "default_consolidate_links")]
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(default = "default_consolidate_links", skip_serializing_if = "is_true")]
     pub consolidate_links: bool,
     /// Let the post-judge cue accept a sibling or a derived-from partner.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
-    #[serde(default = "default_consolidate_components")]
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_components",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_components: bool,
     /// Keep a judged supersede that renames a key, says "becomes", or drops
     /// a rule that names an entity the writer just rejected.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
-    #[serde(default = "default_consolidate_key_rename")]
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_key_rename",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_key_rename: bool,
     /// Count a unique pass-1 `replaces` match as the departure cue.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
-    #[serde(default = "default_consolidate_replaces_cue")]
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_replaces_cue",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_replaces_cue: bool,
     /// Keep a judged supersede when an exact rule `replaces` and a departure
-    /// word supply the cue. On unless set, and ignored unless
+    /// word supply the cue. On unless set to false, and ignored unless
     /// [`Self::consolidate`] is also set.
-    #[serde(default = "default_consolidate_replaces_departure")]
+    #[serde(
+        default = "default_consolidate_replaces_departure",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_replaces_departure: bool,
     /// Close orphan setting copies of a rejected project use.
-    /// On unless set, and ignored unless [`Self::consolidate`] and
+    /// On unless set to false, and ignored unless [`Self::consolidate`] and
     /// [`Self::ground_component_edges`] are also set.
-    #[serde(default = "default_consolidate_orphan_sweep")]
+    #[serde(
+        default = "default_consolidate_orphan_sweep",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_orphan_sweep: bool,
     /// Close a same-turn rule fragment after its longer rule is closed.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
-    #[serde(default = "default_consolidate_rule_fragments")]
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_rule_fragments",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_rule_fragments: bool,
     /// Retire a dropped component's decided settings and uses edges.
-    /// On unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// On unless set to false, and ignored unless [`Self::consolidate`] is also set.
     /// Does not require [`Self::ground_component_edges`].
-    #[serde(default = "default_consolidate_retire_component")]
+    #[serde(
+        default = "default_consolidate_retire_component",
+        skip_serializing_if = "is_true"
+    )]
     pub consolidate_retire_component: bool,
     /// Drop a decided rule that only restates a same-session setting.
-    /// On unless set.
-    #[serde(default = "default_drop_restatements")]
+    /// On unless set to false.
+    #[serde(default = "default_drop_restatements", skip_serializing_if = "is_true")]
     pub drop_restatements: bool,
     /// Accept a decided component `part_of` the session project when the
-    /// component name is supported in the cited turn. On unless set.
+    /// component name is supported in the cited turn. On unless set to false.
     /// Stands alone: it does not turn any other switch on.
-    #[serde(default = "default_ground_component_edges")]
+    #[serde(
+        default = "default_ground_component_edges",
+        skip_serializing_if = "is_true"
+    )]
     pub ground_component_edges: bool,
     /// List raw-turn values that never reached the store. Off unless set.
     /// Stands alone: it does not turn any other switch on, and it never writes.
@@ -1350,6 +1377,10 @@ fn default_recover_turns() -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn default_provider() -> Provider {
@@ -2605,16 +2636,18 @@ mod tests {
     }
 
     /// The measured consolidation stack is on when the key is missing, and an
-    /// explicit false survives a serialize-and-parse. `Default` matches that
-    /// empty decode. `known_match` and `recover_turns` stay off.
+    /// explicit false survives a serialize-and-parse. A true value is left out
+    /// of the render, so a rewrite does not pin today's default. `Default`
+    /// matches that empty decode. `known_match` and `recover_turns` stay off.
     #[test]
     fn measured_stack_defaults_on_and_false_round_trips() {
         let from_default = GraphSection::default();
         let from_empty: GraphSection = toml::from_str("").expect("empty section");
         let absent: Config = toml::from_str("").expect("empty config");
         let absent_graph = absent.graph.unwrap_or_default();
+        let rendered_default = toml::to_string(&from_default).expect("render default");
         assert_eq!(
-            toml::to_string(&from_default).expect("render default"),
+            rendered_default,
             toml::to_string(&from_empty).expect("render empty"),
         );
 
@@ -2635,6 +2668,10 @@ mod tests {
             "consolidate_retire_component",
         ];
         for key in keys {
+            assert!(
+                !rendered_default.contains(&format!("{key} =")),
+                "{key} pinned in {rendered_default}"
+            );
             assert!(stack_flag(&from_default, key), "{key} default");
             assert!(stack_flag(&from_empty, key), "{key} empty");
             assert!(stack_flag(&absent_graph, key), "{key} absent config");
@@ -2645,8 +2682,22 @@ mod tests {
             let rendered = toml::to_string(&graph).expect("render false");
             let line = format!("{key} = false");
             assert!(rendered.contains(&line), "{key} missing from {rendered}");
+            for other in keys {
+                if other == key {
+                    continue;
+                }
+                assert!(
+                    !rendered.contains(&format!("{other} =")),
+                    "{other} pinned beside {key}: {rendered}"
+                );
+            }
             let again: GraphSection = toml::from_str(&rendered).expect("reparse false");
             assert!(!stack_flag(&again, key), "{key} round trip");
+            for other in keys {
+                if other != key {
+                    assert!(stack_flag(&again, other), "{other} dropped beside {key}");
+                }
+            }
         }
 
         assert!(!from_default.known_match);
@@ -2744,7 +2795,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().links_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_links = true"));
+        assert!(!rendered_default.contains("consolidate_links ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_links = false\n").expect("parse false");
@@ -2770,12 +2821,12 @@ mod tests {
         assert!(!graph.known_match);
         assert!(graph.known_facts_context);
         let rendered = toml::to_string_pretty(&cfg).expect("render links only");
-        assert!(rendered.contains("consolidate_links = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("consolidate_hold = true"));
-        assert!(rendered.contains("drop_restatements = true"));
+        assert!(!rendered.contains("consolidate_links ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_hold ="));
+        assert!(!rendered.contains("drop_restatements ="));
         assert!(!rendered.contains("known_match"));
-        assert!(rendered.contains("known_facts_context = true"));
+        assert!(!rendered.contains("known_facts_context ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse links only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.consolidate_links);
@@ -2832,7 +2883,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().components_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_components = true"));
+        assert!(!rendered_default.contains("consolidate_components ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_components = false\n").expect("parse false");
@@ -2860,13 +2911,13 @@ mod tests {
         assert!(!graph.known_match);
         assert!(graph.known_facts_context);
         let rendered = toml::to_string_pretty(&cfg).expect("render components only");
-        assert!(rendered.contains("consolidate_components = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("consolidate_hold = true"));
-        assert!(rendered.contains("consolidate_links = true"));
-        assert!(rendered.contains("drop_restatements = true"));
+        assert!(!rendered.contains("consolidate_components ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_hold ="));
+        assert!(!rendered.contains("consolidate_links ="));
+        assert!(!rendered.contains("drop_restatements ="));
         assert!(!rendered.contains("known_match"));
-        assert!(rendered.contains("known_facts_context = true"));
+        assert!(!rendered.contains("known_facts_context ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse components only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.consolidate_components);
@@ -2925,7 +2976,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().rename_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_key_rename = true"));
+        assert!(!rendered_default.contains("consolidate_key_rename ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_key_rename = false\n").expect("parse false");
@@ -2946,9 +2997,9 @@ mod tests {
         assert!(graph.consolidate_hold);
         assert!(graph.consolidate_links);
         let rendered = toml::to_string_pretty(&cfg).expect("render rename only");
-        assert!(rendered.contains("consolidate_key_rename = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("consolidate_components = true"));
+        assert!(!rendered.contains("consolidate_key_rename ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_components ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse rename only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.consolidate_key_rename);
@@ -2981,7 +3032,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().replaces_cue_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_replaces_cue = true"));
+        assert!(!rendered_default.contains("consolidate_replaces_cue ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_replaces_cue = false\n").expect("parse false");
@@ -3001,9 +3052,9 @@ mod tests {
         assert!(graph.rename_apply());
         assert!(graph.components_apply());
         let rendered = toml::to_string_pretty(&cfg).expect("render cue only");
-        assert!(rendered.contains("consolidate_replaces_cue = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("consolidate_key_rename = true"));
+        assert!(!rendered.contains("consolidate_replaces_cue ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_key_rename ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse cue only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.consolidate_replaces_cue);
@@ -3039,7 +3090,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().replaces_departure_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_replaces_departure = true"));
+        assert!(!rendered_default.contains("consolidate_replaces_departure ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_replaces_departure = false\n")
@@ -3060,9 +3111,9 @@ mod tests {
         assert!(graph.replaces_cue_apply());
         assert!(graph.consolidate_replaces_cue);
         let rendered = toml::to_string_pretty(&cfg).expect("render departure only");
-        assert!(rendered.contains("consolidate_replaces_departure = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("consolidate_replaces_cue = true"));
+        assert!(!rendered.contains("consolidate_replaces_departure ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_replaces_cue ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse departure only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.consolidate_replaces_departure);
@@ -3116,7 +3167,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().orphan_sweep_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_orphan_sweep = true"));
+        assert!(!rendered_default.contains("consolidate_orphan_sweep ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_orphan_sweep = false\n").expect("parse false");
@@ -3135,9 +3186,9 @@ mod tests {
         assert!(graph.consolidate);
         assert!(graph.ground_component_edges);
         let rendered = toml::to_string_pretty(&cfg).expect("render sweep only");
-        assert!(rendered.contains("consolidate_orphan_sweep = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("ground_component_edges = true"));
+        assert!(!rendered.contains("consolidate_orphan_sweep ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("ground_component_edges ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse sweep only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.consolidate_orphan_sweep);
@@ -3184,7 +3235,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().rule_fragments_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_rule_fragments = true"));
+        assert!(!rendered_default.contains("consolidate_rule_fragments ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_rule_fragments = false\n").expect("parse false");
@@ -3203,9 +3254,9 @@ mod tests {
         assert!(graph.consolidate);
         assert!(graph.ground_component_edges);
         let rendered = toml::to_string_pretty(&cfg).expect("render fragments only");
-        assert!(rendered.contains("consolidate_rule_fragments = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("ground_component_edges = true"));
+        assert!(!rendered.contains("consolidate_rule_fragments ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("ground_component_edges ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse fragments only");
         assert!(parsed.graph.expect("graph").consolidate_rule_fragments);
 
@@ -3239,7 +3290,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().retire_component_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("consolidate_retire_component = true"));
+        assert!(!rendered_default.contains("consolidate_retire_component ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nconsolidate_retire_component = false\n").expect("parse false");
@@ -3258,9 +3309,9 @@ mod tests {
         assert!(graph.consolidate);
         assert!(graph.ground_component_edges);
         let rendered = toml::to_string_pretty(&cfg).expect("render retire only");
-        assert!(rendered.contains("consolidate_retire_component = true"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("ground_component_edges = true"));
+        assert!(!rendered.contains("consolidate_retire_component ="));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("ground_component_edges ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse retire only");
         assert!(parsed.graph.expect("graph").consolidate_retire_component);
 
@@ -3298,7 +3349,7 @@ mod tests {
         let absent: Config = toml::from_str("").expect("empty config");
         assert!(absent.graph.unwrap_or_default().known_key_binding_apply());
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("known_key_binding = true"));
+        assert!(!rendered_default.contains("known_key_binding ="));
 
         let explicit_false: Config =
             toml::from_str("[graph]\nknown_key_binding = false\n").expect("parse false");
@@ -3315,8 +3366,8 @@ mod tests {
         assert!(graph.known_key_binding_apply());
         assert!(graph.known_facts_context);
         let rendered = toml::to_string_pretty(&cfg).expect("render binding only");
-        assert!(rendered.contains("known_key_binding = true"));
-        assert!(rendered.contains("known_facts_context = true"));
+        assert!(!rendered.contains("known_key_binding ="));
+        assert!(!rendered.contains("known_facts_context ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse binding only");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.known_key_binding);
@@ -3366,7 +3417,7 @@ mod tests {
         assert!(true_graph.consolidate_hold);
 
         let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
-        assert!(rendered_default.contains("drop_restatements = true"));
+        assert!(!rendered_default.contains("drop_restatements ="));
         let rendered_false = toml::to_string(&false_graph).expect("render false");
         assert!(rendered_false.contains("drop_restatements = false"));
 
@@ -3379,11 +3430,11 @@ mod tests {
         assert!(graph.consolidate);
         assert!(graph.consolidate_hold);
         let rendered = toml::to_string_pretty(&cfg).expect("render true");
-        assert!(rendered.contains("drop_restatements = true"));
-        assert!(rendered.contains("known_facts_context = true"));
+        assert!(!rendered.contains("drop_restatements ="));
+        assert!(!rendered.contains("known_facts_context ="));
         assert!(!rendered.contains("known_match"));
-        assert!(rendered.contains("consolidate = true"));
-        assert!(rendered.contains("consolidate_hold = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("consolidate_hold ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse true");
         let parsed_graph = parsed.graph.expect("graph");
         assert!(parsed_graph.drop_restatements);
@@ -3446,8 +3497,8 @@ mod tests {
         assert!(graph.ground_component_edges);
         assert!(graph.consolidate);
         let rendered = toml::to_string_pretty(&cfg).expect("render true");
-        assert!(rendered.contains("ground_component_edges = true"));
-        assert!(rendered.contains("consolidate = true"));
+        assert!(!rendered.contains("ground_component_edges ="));
+        assert!(!rendered.contains("consolidate ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse true");
         assert!(parsed.graph.expect("graph").ground_component_edges);
 
@@ -3493,7 +3544,7 @@ mod tests {
         assert!(graph.consolidate);
         let rendered = toml::to_string_pretty(&cfg).expect("render true");
         assert!(rendered.contains("recover_turns = true"));
-        assert!(rendered.contains("consolidate = true"));
+        assert!(!rendered.contains("consolidate ="));
         let parsed: Config = toml::from_str(&rendered).expect("reparse true");
         assert!(parsed.graph.expect("graph").recover_turns);
 

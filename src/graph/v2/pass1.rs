@@ -5653,10 +5653,10 @@ mod tests {
         assert!(!drop_restatements_enabled(dir.path()));
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
-            "[graph]\nknown_match = true\nconsolidate = true\nknown_facts_context = true\nconsolidate_hold = true\ndrop_restatements = false\n",
+            "[graph]\nknown_match = true\nconsolidate = true\nknown_facts_context = true\nconsolidate_hold = true\n",
         )
         .unwrap();
-        assert!(!drop_restatements_enabled(dir.path()));
+        assert!(drop_restatements_enabled(dir.path()));
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
             "[graph]\ndrop_restatements = true\n",

@@ -255,24 +255,10 @@ err config: unknown transcript source: nonesuch (use 'claude-code', 'codex', or 
 
 default graph.provenance.weight_external = 1
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -289,24 +275,10 @@ ok
 
 default graph.provenance.weight_external = 0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -338,24 +310,10 @@ err config: invalid number:
 
 default graph.provenance.weight_user = 1
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -372,24 +330,10 @@ ok
 
 default graph.provenance.weight_user = 0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -421,24 +365,10 @@ err config: invalid number:
 
 default graph.provenance.weight_assistant = 1
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -455,24 +385,10 @@ ok
 
 default graph.provenance.weight_assistant = 0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -504,24 +420,10 @@ err config: invalid number:
 
 default graph.provenance.weight_self = 1
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -538,24 +440,10 @@ ok
 
 default graph.provenance.weight_self = 0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -587,24 +475,10 @@ err config: invalid number:
 
 default graph.dedup.certain_similarity = 0.0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.0
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -621,24 +495,10 @@ ok
 
 default graph.dedup.certain_similarity = 1.0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 1.0
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -670,24 +530,10 @@ err config: invalid number:
 
 default graph.dedup.review_similarity = 0.0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.0
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -704,24 +550,10 @@ ok
 
 default graph.dedup.review_similarity = 1.0
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 1.0
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -753,24 +585,10 @@ err config: invalid number:
 
 default graph.pipeline = v1
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -788,24 +606,10 @@ ok
 
 default graph.pipeline = v2
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -826,24 +630,10 @@ err config: graph.pipeline must be "v1" or "v2"
 
 default graph.dedup.max_candidates = 1
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 1
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -920,24 +710,10 @@ err config: invalid boolean: 1
 
 default graph.known_facts_context = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -954,24 +730,11 @@ ok
 
 default graph.known_facts_context = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
 +graph.known_facts_context = false
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -997,24 +760,10 @@ err config: invalid boolean: 1
 
 default graph.known_key_binding = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1031,23 +780,10 @@ ok
 
 default graph.known_key_binding = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
 +graph.known_key_binding = false
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
@@ -1074,24 +810,10 @@ err config: invalid boolean: 1
 
 default graph.known_match = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.known_match = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
@@ -1109,24 +831,10 @@ ok
 
 default graph.known_match = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1152,24 +860,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1187,23 +881,10 @@ ok
 default graph.consolidate = false
 ok
 +graph.consolidate = false
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1229,24 +910,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_hold = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1263,24 +930,11 @@ ok
 
 default graph.consolidate_hold = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
 +graph.consolidate_hold = false
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1306,24 +960,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_links = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1340,24 +980,11 @@ ok
 
 default graph.consolidate_links = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
 +graph.consolidate_links = false
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1383,24 +1010,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_components = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1417,24 +1030,11 @@ ok
 
 default graph.consolidate_components = false
 ok
-+graph.consolidate = true
 +graph.consolidate_components = false
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1460,24 +1060,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_key_rename = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1494,24 +1080,11 @@ ok
 
 default graph.consolidate_key_rename = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
 +graph.consolidate_key_rename = false
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1537,24 +1110,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_replaces_cue = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1571,24 +1130,11 @@ ok
 
 default graph.consolidate_replaces_cue = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
 +graph.consolidate_replaces_cue = false
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1614,24 +1160,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_replaces_departure = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1648,24 +1180,11 @@ ok
 
 default graph.consolidate_replaces_departure = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
 +graph.consolidate_replaces_departure = false
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1691,24 +1210,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_orphan_sweep = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1725,24 +1230,11 @@ ok
 
 default graph.consolidate_orphan_sweep = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
 +graph.consolidate_orphan_sweep = false
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1768,24 +1260,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_rule_fragments = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1802,24 +1280,11 @@ ok
 
 default graph.consolidate_rule_fragments = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
 +graph.consolidate_rule_fragments = false
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1845,24 +1310,10 @@ err config: invalid boolean: 1
 
 default graph.consolidate_retire_component = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1879,24 +1330,11 @@ ok
 
 default graph.consolidate_retire_component = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
 +graph.consolidate_retire_component = false
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1922,24 +1360,10 @@ err config: invalid boolean: 1
 
 default graph.drop_restatements = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1956,24 +1380,11 @@ ok
 
 default graph.drop_restatements = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
 +graph.drop_restatements = false
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -1999,24 +1410,10 @@ err config: invalid boolean: 1
 
 default graph.ground_component_edges = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -2033,24 +1430,11 @@ ok
 
 default graph.ground_component_edges = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
 +graph.ground_component_edges = false
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -2076,24 +1460,10 @@ err config: invalid boolean: 1
 
 default graph.recover_turns = true
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -2111,24 +1481,10 @@ ok
 
 default graph.recover_turns = false
 ok
-+graph.consolidate = true
-+graph.consolidate_components = true
-+graph.consolidate_hold = true
-+graph.consolidate_key_rename = true
-+graph.consolidate_links = true
-+graph.consolidate_orphan_sweep = true
-+graph.consolidate_replaces_cue = true
-+graph.consolidate_replaces_departure = true
-+graph.consolidate_retire_component = true
-+graph.consolidate_rule_fragments = true
 +graph.database = ""
 +graph.dedup.certain_similarity = 0.92
 +graph.dedup.max_candidates = 3
 +graph.dedup.review_similarity = 0.82
-+graph.drop_restatements = true
-+graph.ground_component_edges = true
-+graph.known_facts_context = true
-+graph.known_key_binding = true
 +graph.mode = "embedded"
 +graph.namespace = "nullarc"
 +graph.password_file = ""
@@ -2660,7 +2016,6 @@ ok
 
 populated graph.known_facts_context = false
 ok
--graph.known_facts_context = true
 +graph.known_facts_context = false
 
 populated graph.known_facts_context = yes
@@ -2677,7 +2032,6 @@ ok
 
 populated graph.known_key_binding = false
 ok
--graph.known_key_binding = true
 +graph.known_key_binding = false
 
 populated graph.known_key_binding = yes
@@ -2710,7 +2064,6 @@ ok
 
 populated graph.consolidate = false
 ok
--graph.consolidate = true
 +graph.consolidate = false
 
 populated graph.consolidate = yes
@@ -2727,7 +2080,6 @@ ok
 
 populated graph.consolidate_hold = false
 ok
--graph.consolidate_hold = true
 +graph.consolidate_hold = false
 
 populated graph.consolidate_hold = yes
@@ -2744,7 +2096,6 @@ ok
 
 populated graph.consolidate_links = false
 ok
--graph.consolidate_links = true
 +graph.consolidate_links = false
 
 populated graph.consolidate_links = yes
@@ -2761,7 +2112,6 @@ ok
 
 populated graph.consolidate_components = false
 ok
--graph.consolidate_components = true
 +graph.consolidate_components = false
 
 populated graph.consolidate_components = yes
@@ -2778,7 +2128,6 @@ ok
 
 populated graph.consolidate_key_rename = false
 ok
--graph.consolidate_key_rename = true
 +graph.consolidate_key_rename = false
 
 populated graph.consolidate_key_rename = yes
@@ -2795,7 +2144,6 @@ ok
 
 populated graph.consolidate_replaces_cue = false
 ok
--graph.consolidate_replaces_cue = true
 +graph.consolidate_replaces_cue = false
 
 populated graph.consolidate_replaces_cue = yes
@@ -2812,7 +2160,6 @@ ok
 
 populated graph.consolidate_replaces_departure = false
 ok
--graph.consolidate_replaces_departure = true
 +graph.consolidate_replaces_departure = false
 
 populated graph.consolidate_replaces_departure = yes
@@ -2829,7 +2176,6 @@ ok
 
 populated graph.consolidate_orphan_sweep = false
 ok
--graph.consolidate_orphan_sweep = true
 +graph.consolidate_orphan_sweep = false
 
 populated graph.consolidate_orphan_sweep = yes
@@ -2846,7 +2192,6 @@ ok
 
 populated graph.consolidate_rule_fragments = false
 ok
--graph.consolidate_rule_fragments = true
 +graph.consolidate_rule_fragments = false
 
 populated graph.consolidate_rule_fragments = yes
@@ -2863,7 +2208,6 @@ ok
 
 populated graph.consolidate_retire_component = false
 ok
--graph.consolidate_retire_component = true
 +graph.consolidate_retire_component = false
 
 populated graph.consolidate_retire_component = yes
@@ -2880,7 +2224,6 @@ ok
 
 populated graph.drop_restatements = false
 ok
--graph.drop_restatements = true
 +graph.drop_restatements = false
 
 populated graph.drop_restatements = yes
@@ -2897,7 +2240,6 @@ ok
 
 populated graph.ground_component_edges = false
 ok
--graph.ground_component_edges = true
 +graph.ground_component_edges = false
 
 populated graph.ground_component_edges = yes
