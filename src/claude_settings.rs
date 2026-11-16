@@ -346,10 +346,21 @@ pub(crate) fn apply_hooks(
     pulse_root: &Path,
     recall_bin: &str,
 ) -> Result<HookChange, String> {
-    let root = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
+    let canonical = fs::canonicalize(pulse_root).unwrap_or_else(|_| pulse_root.to_path_buf());
+    // `display()` would substitute U+FFFD and the hook would name a directory
+    // that does not exist. Refuse before any byte of settings changes.
+    let root = match canonical.to_str() {
+        Some(text) => text,
+        None => {
+            return Err(
+                "Pulse root is not valid UTF-8 — refusing to write it into a shell hook"
+                    .to_string(),
+            );
+        }
+    };
     // A control character (a newline especially) inside a shell command line
     // is unrecoverable for the user reading settings.json later.
-    if root.display().to_string().chars().any(char::is_control) {
+    if root.chars().any(char::is_control) {
         return Err(
             "Pulse root contains control characters — refusing to write it into a shell hook"
                 .to_string(),
@@ -373,7 +384,7 @@ pub(crate) fn apply_hooks(
     }
 
     let mut notes: Vec<String> = Vec::new();
-    let changed = upsert_recall_hooks(settings, recall_bin, &root, &mut notes)
+    let changed = upsert_recall_hooks(settings, recall_bin, Path::new(root), &mut notes)
         .map_err(|why| format!("settings.json: {why} — hooks not configured"))?;
     Ok(HookChange { changed, notes })
 }
@@ -425,7 +436,7 @@ pub(crate) fn atomic_replace(
 /// backticks, `;`, `|`, spaces — and an embedded `'` is closed, escaped, and
 /// reopened. Quoting only "when needed" is how metacharacters slip through.
 fn shell_path(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    crate::shell::quote(&path.display().to_string())
 }
 
 /// Whether a binary path is safe to interpolate bare into a hook command.
@@ -437,10 +448,7 @@ fn shell_path(path: &Path) -> String {
 /// every real install and anything outside it is refused with a message
 /// rather than baked into a broken or dangerous command line.
 fn is_shell_safe_bin(path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c))
+    crate::shell::is_plain(path)
 }
 
 /// Shell operators (scanned outside single-quoted spans) whose presence marks
@@ -1224,5 +1232,61 @@ mod tests {
             settings,
             serde_json::json!({"model": "opus", "autoMemoryEnabled": false})
         );
+    }
+
+    /// A non-UTF-8 root must not be lossily rewritten into a hook command.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_root_is_refused_and_settings_stay() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut settings = serde_json::json!({"keep": true});
+        let before = settings.clone();
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/alpha\xff".to_vec()));
+        let err = match apply_hooks(&mut settings, &path, "/usr/local/bin/recall-echo") {
+            Err(err) => err,
+            Ok(_) => panic!("a non-UTF-8 root was accepted"),
+        };
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert_eq!(settings, before);
+    }
+
+    /// The binary is interpolated bare, so anything outside the plain
+    /// alphabet is refused and settings stay as they were.
+    #[test]
+    fn an_unsafe_binary_path_is_refused_and_settings_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = serde_json::json!({"keep": true});
+        let before = settings.clone();
+        let err = match apply_hooks(&mut settings, dir.path(), "/opt/alpha beta/recall-echo") {
+            Err(err) => err,
+            Ok(_) => panic!("an unsafe binary path was accepted"),
+        };
+        assert!(err.contains("unsafe in a shell command"), "{err}");
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn a_plain_binary_path_installs_the_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = serde_json::json!({});
+        let change = apply_hooks(&mut settings, dir.path(), "/usr/local/bin/recall-echo")
+            .expect("a plain binary path is accepted");
+        assert!(change.changed);
+    }
+
+    /// A newline in the root would split the hook command line.
+    #[test]
+    fn a_root_with_a_control_character_is_refused_and_settings_stay() {
+        let mut settings = serde_json::json!({"keep": true});
+        let before = settings.clone();
+        let root = Path::new("/tmp/alpha\nbeta");
+        let err = match apply_hooks(&mut settings, root, "/usr/local/bin/recall-echo") {
+            Err(err) => err,
+            Ok(_) => panic!("a root with a newline was accepted"),
+        };
+        assert!(err.contains("control characters"), "{err}");
+        assert_eq!(settings, before);
     }
 }

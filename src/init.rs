@@ -897,33 +897,34 @@ pub fn run_with_reader(pulse_root: &Path, reader: &mut dyn BufRead) -> Result<()
     run_with(pulse_root, reader, &paths::ConfigRoots::from_env())
 }
 
-/// Init with both the reader and the global destinations injected.
+/// Refuse a root the hooks, the MCP registration and the persisted pointer
+/// could not name. Checked before anything is created.
 ///
-/// `roots` decides where the hook file, the persisted pulse root and any
-/// agent-CLI config land. Pass [`paths::ConfigRoots::sandboxed`] and nothing
-/// outside that directory can be written, whatever this binary's path is (#59).
-pub fn run_with(
-    pulse_root: &Path,
-    reader: &mut dyn BufRead,
-    roots: &paths::ConfigRoots,
-) -> Result<(), RecallError> {
-    if !pulse_root.exists() {
-        return Err(RecallError::NotInitialized(format!(
-            "Directory not found: {}\n  Create the directory first, or run from a valid path.",
-            pulse_root.display()
-        )));
+/// A path that is itself UTF-8 can still canonicalise to one that is not,
+/// and that form is what later steps would write.
+fn check_root(pulse_root: &Path) -> Result<(), RecallError> {
+    if pulse_root.to_str().is_none() {
+        return Err(non_utf8_root(pulse_root));
     }
+    if let Ok(canonical) = fs::canonicalize(pulse_root) {
+        if canonical.to_str().is_none() {
+            return Err(non_utf8_root(&canonical));
+        }
+    }
+    Ok(())
+}
 
-    eprintln!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");
+fn non_utf8_root(path: &Path) -> RecallError {
+    RecallError::Config(format!(
+        "Pulse root {} is not valid UTF-8 — refusing to initialise it: the hooks, \
+         the MCP registration and the persisted root could not name it. Use a UTF-8 path.",
+        path.to_string_lossy()
+    ))
+}
 
-    let memory_dir = pulse_root.join("memory");
-    let conversations_dir = memory_dir.join("conversations");
-    ensure_dir(&memory_dir);
-    ensure_dir(&conversations_dir);
-    notice_legacy_conversations(pulse_root, &conversations_dir);
-
-    // Pin this root for flagless hook invocations (#46): capture must land in
-    // the store the MCP server serves, not wherever the session's cwd is.
+/// Pin this root for flagless hook invocations (#46): capture must land in
+/// the store the MCP server serves, not wherever the session's cwd is.
+fn persist_root(roots: &paths::ConfigRoots, pulse_root: &Path) {
     match roots.persist_pulse_root(pulse_root) {
         Ok(paths::PersistOutcome::Written(file)) => print_status(
             Status::Created,
@@ -935,11 +936,13 @@ pub fn run_with(
         ),
         Err(e) => print_status(Status::Error, &format!("Could not persist pulse root: {e}")),
     }
+}
 
-    // Write MEMORY.md (never overwrite)
-    write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
+/// Report the MEMORY.md that was just written, or the one already there.
+///
+/// Only a regular file: a FIFO there would block the read forever.
+fn report_memory_file(memory_dir: &Path) {
     let memory_md = memory_dir.join("MEMORY.md");
-    // Only a regular file: a FIFO there would block the read forever.
     if let Some(content) = fs::metadata(&memory_md)
         .is_ok_and(|meta| meta.is_file())
         .then(|| fs::read_to_string(&memory_md).ok())
@@ -957,6 +960,52 @@ pub fn run_with(
             print_status(Status::Exists, &warning);
         }
     }
+}
+
+fn start_runtime() -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => Some(runtime),
+        Err(e) => {
+            print_status(Status::Error, &format!("Failed to start runtime: {e}"));
+            None
+        }
+    }
+}
+
+/// Init with both the reader and the global destinations injected.
+///
+/// `roots` decides where the hook file, the persisted pulse root and any
+/// agent-CLI config land. Pass [`paths::ConfigRoots::sandboxed`] and nothing
+/// outside that directory can be written, whatever this binary's path is (#59).
+pub fn run_with(
+    pulse_root: &Path,
+    reader: &mut dyn BufRead,
+    roots: &paths::ConfigRoots,
+) -> Result<(), RecallError> {
+    check_root(pulse_root)?;
+    if !pulse_root.exists() {
+        return Err(RecallError::NotInitialized(format!(
+            "Directory not found: {}\n  Create the directory first, or run from a valid path.",
+            pulse_root.display()
+        )));
+    }
+
+    eprintln!("\n{BOLD}recall-echo{RESET} — initializing memory system\n");
+
+    let memory_dir = pulse_root.join("memory");
+    let conversations_dir = memory_dir.join("conversations");
+    ensure_dir(&memory_dir);
+    ensure_dir(&conversations_dir);
+    notice_legacy_conversations(pulse_root, &conversations_dir);
+
+    persist_root(roots, pulse_root);
+
+    // Write MEMORY.md (never overwrite)
+    write_if_not_exists(&memory_dir.join("MEMORY.md"), MEMORY_TEMPLATE, "MEMORY.md");
+    report_memory_file(&memory_dir);
 
     // Write EPHEMERAL.md (never overwrite)
     write_if_not_exists(&memory_dir.join("EPHEMERAL.md"), "", "EPHEMERAL.md");
@@ -968,16 +1017,7 @@ pub fn run_with(
         "ARCHIVE.md",
     );
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build();
-    let runtime = match runtime {
-        Ok(runtime) => Some(runtime),
-        Err(e) => {
-            print_status(Status::Error, &format!("Failed to start runtime: {e}"));
-            None
-        }
-    };
+    let runtime = start_runtime();
 
     if let Some(runtime) = &runtime {
         init_graph(runtime, &memory_dir);
@@ -2051,6 +2091,77 @@ mod tests {
         let content = fs::read_to_string(sandbox.pulse_root().join("memory/ARCHIVE.md")).unwrap();
         assert!(content.contains("# Conversation Archive"));
         assert!(content.contains("| # | Date"));
+    }
+
+    #[cfg(unix)]
+    fn path_ending_in_0xff(prefix: &str) -> PathBuf {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.push(0xFF);
+        PathBuf::from(OsString::from_vec(bytes))
+    }
+
+    /// No directory is required: the path itself is not UTF-8, so init
+    /// returns before creating the store or touching the sandbox.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_pulse_root_is_refused_before_anything_is_written() {
+        let sandbox = Sandbox::new();
+        let root = path_ending_in_0xff("/tmp/alpha");
+        let mut reader = Cursor::new(b"");
+        let err = run_with(&root, &mut reader, &sandbox.roots).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        let persisted = sandbox.roots.pulse_root_file().expect("destination");
+        assert!(!persisted.exists(), "the pulse root was persisted");
+        let settings = sandbox
+            .roots
+            .claude_dir()
+            .expect("claude dir")
+            .join("settings.json");
+        assert!(!settings.exists(), "settings.json was written");
+    }
+
+    /// A real directory whose name is not UTF-8 is refused, and `memory/`
+    /// is not created inside it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_non_utf8_directory_is_not_initialised() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let sandbox = Sandbox::new();
+        let mut name = OsString::from("alpha");
+        name.push(OsString::from_vec(vec![0xFF]));
+        let root = sandbox.dir.path().join(name);
+        fs::create_dir(&root).unwrap();
+        let mut reader = Cursor::new(b"");
+        let err = run_with(&root, &mut reader, &sandbox.roots).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        assert!(!root.join("memory").exists(), "memory/ was created");
+    }
+
+    /// The name is UTF-8; the directory it resolves to is not. Both forms
+    /// have to be refused, or the canonical path is what gets written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_utf8_link_to_a_non_utf8_directory_is_refused() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let sandbox = Sandbox::new();
+        let mut name = OsString::from("alpha");
+        name.push(OsString::from_vec(vec![0xFF]));
+        let target = sandbox.dir.path().join(name);
+        fs::create_dir(&target).unwrap();
+        let link = sandbox.dir.path().join("alpha");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut reader = Cursor::new(b"");
+        let err = run_with(&link, &mut reader, &sandbox.roots).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        assert!(!target.join("memory").exists(), "memory/ was created");
+        assert!(!link.join("memory").exists(), "memory/ was created");
     }
 }
 

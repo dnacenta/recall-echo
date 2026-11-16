@@ -435,16 +435,7 @@ fn truncate(text: &str, max: usize) -> String {
 /// An argv as a line a user can paste back into a shell.
 #[must_use]
 pub fn shell_line(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| {
-            if arg.chars().any(char::is_whitespace) {
-                format!("\"{arg}\"")
-            } else {
-                arg.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::shell::line(argv)
 }
 
 #[cfg(test)]
@@ -708,6 +699,43 @@ mod tests {
     #[test]
     fn a_shell_line_quotes_only_what_needs_it() {
         let argv = vec!["claude".into(), "mcp".into(), "/a path/bin".into()];
-        assert_eq!(shell_line(&argv), "claude mcp \"/a path/bin\"");
+        assert_eq!(shell_line(&argv), "claude mcp '/a path/bin'");
+    }
+
+    /// A root that is not a plain path is single-quoted, with `'` written as
+    /// `'\''`. Plain arguments stay bare, and an empty argument is `''`.
+    #[test]
+    fn a_shell_line_single_quotes_a_root_that_is_not_plain() {
+        let roots = [
+            ("quote", "/tmp/alpha\"beta", "'/tmp/alpha\"beta'"),
+            ("command", "/tmp/$(x)", "'/tmp/$(x)'"),
+            ("backtick", "/tmp/`x`", "'/tmp/`x`'"),
+            ("semicolon", "/tmp/alpha;beta", "'/tmp/alpha;beta'"),
+            ("space", "/tmp/alpha beta", "'/tmp/alpha beta'"),
+            ("apostrophe", "/tmp/o'brien", r"'/tmp/o'\''brien'"),
+        ];
+        for (name, root, quoted) in roots {
+            let argv = [
+                "claude",
+                "mcp",
+                "add",
+                "recall-echo",
+                "-s",
+                "user",
+                "--",
+                "/usr/local/bin/recall-echo",
+                "mcp",
+                "--pulse-root",
+                root,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            let expected = format!(
+                "claude mcp add recall-echo -s user -- /usr/local/bin/recall-echo mcp --pulse-root {quoted}"
+            );
+            assert_eq!(shell_line(&argv), expected, "{name}");
+        }
+        assert_eq!(shell_line(&[String::new()]), "''");
     }
 }

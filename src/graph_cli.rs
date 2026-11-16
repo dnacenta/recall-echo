@@ -1124,26 +1124,35 @@ async fn build_is_complete(
 
 #[cfg(feature = "llm")]
 fn half_swap_message(graph: &Path, build: &Path, backup: &Path) -> String {
+    // `graph` is `<memory>/graph`, so its parent is the directory whose
+    // config file the pipeline lines belong in.
+    let config = {
+        let memory_dir = graph.parent().unwrap_or(graph);
+        shell_quote(&crate::config::config_path(memory_dir))
+    };
     let graph = shell_quote(graph);
     let build = shell_quote(build);
     let backup = shell_quote(backup);
     format!(
         "rebuild stopped between the two renames, so nothing was finished automatically. \
          {graph} is missing, {backup} holds the previous store, and {build} is a complete v2 build.\n\
-         To finish the swap:\n  \
-         mv {build} {graph}\n  \
-         [graph]\n  \
+         Stop the daemon first: recall-echo graph daemon stop\n\
+         To finish the swap, run:\n  \
+         mv {build} {graph}\n\
+         then set in {config}:\n\
+         [graph]\n\
          pipeline = \"v2\"\n\
-         To roll back:\n  \
-         mv {backup} {graph}\n  \
-         [graph]\n  \
+         To roll back, run:\n  \
+         mv {backup} {graph}\n\
+         then set in {config}:\n\
+         [graph]\n\
          pipeline = \"v1\""
     )
 }
 
 #[cfg(feature = "llm")]
 fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    crate::shell::quote(&path.to_string_lossy())
 }
 
 #[cfg(feature = "llm")]
@@ -3436,6 +3445,33 @@ mod tests {
             text.contains("nothing was finished automatically"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_half_swap_message_indents_only_the_mv_commands() {
+        let graph = PathBuf::from("/tmp/alpha/graph");
+        let build = PathBuf::from("/tmp/alpha/graph.v2-build");
+        let backup = PathBuf::from("/tmp/alpha/graph.v1-backup-20261025-1200");
+        let text = half_swap_message(&graph, &build, &backup);
+        for line in text.lines() {
+            if line.chars().next().is_some_and(char::is_whitespace) {
+                assert!(line.starts_with("  mv "), "{line:?}\n{text}");
+            }
+        }
+        assert!(text.contains("recall-echo graph daemon stop"), "{text}");
+        let config = shell_quote(&crate::config::config_path(Path::new("/tmp/alpha")));
+        let target = format!("then set in {config}:");
+        assert_eq!(
+            text.lines().filter(|got| *got == target).count(),
+            2,
+            "{text}"
+        );
+        for line in ["[graph]", "pipeline = \"v2\"", "pipeline = \"v1\""] {
+            assert!(
+                text.lines().any(|got| got == line),
+                "missing unindented {line:?} in {text}"
+            );
+        }
     }
 
     #[test]
