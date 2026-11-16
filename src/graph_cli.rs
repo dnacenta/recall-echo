@@ -970,7 +970,6 @@ impl EpisodeRows {
             .collect()
     }
 
-    #[cfg(test)]
     fn all_extracted(&self) -> bool {
         self.episodes.iter().all(|row| row.extracted)
     }
@@ -1234,8 +1233,20 @@ async fn pending_in_build(
     Ok(PendingBuild {
         resume: true,
         pending: scan.pending,
-        leftovers: Some(scan.leftovers),
+        leftovers: reported_leftovers(scan.leftovers),
     })
+}
+
+/// The completeness scan's leftover total, when episode dedupe is on.
+///
+/// The count is already in hand. Flag-off rebuilds keep today's report.
+#[cfg(feature = "llm")]
+fn reported_leftovers(count: usize) -> Option<usize> {
+    if crate::graph::ingest::episode_ingest_dedupe() {
+        Some(count)
+    } else {
+        None
+    }
 }
 
 /// Logs that have at least one chunk. A zero-chunk log is not pending work.
@@ -1315,6 +1326,15 @@ fn log_is_complete(rows: Option<&EpisodeRows>, chunks: &[String]) -> bool {
     if chunks.is_empty() {
         return true;
     }
+    if crate::graph::ingest::episode_ingest_dedupe() {
+        complete_by_content(rows, chunks)
+    } else {
+        complete_by_count(rows, chunks.len())
+    }
+}
+
+#[cfg(feature = "llm")]
+fn complete_by_content(rows: Option<&EpisodeRows>, chunks: &[String]) -> bool {
     let Some(rows) = rows else {
         return false;
     };
@@ -1323,6 +1343,15 @@ fn log_is_complete(rows: Option<&EpisodeRows>, chunks: &[String]) -> bool {
         return false;
     }
     crate::graph::ingest::missing_chunks(&rows.extracted_contents(), chunks).is_empty()
+}
+
+/// Count against the chunk list. The path used when episode dedupe is off.
+#[cfg(feature = "llm")]
+fn complete_by_count(rows: Option<&EpisodeRows>, expected: usize) -> bool {
+    match rows {
+        Some(rows) => rows.episodes.len() >= expected && rows.all_extracted(),
+        None => false,
+    }
 }
 
 #[cfg(feature = "llm")]
@@ -1478,7 +1507,7 @@ async fn drive_rebuild(
             )
             .await?;
             if scan.pending.is_empty() {
-                leftovers = Some(scan.leftovers);
+                leftovers = reported_leftovers(scan.leftovers);
                 break;
             }
             batch = scan.pending;
@@ -1596,7 +1625,7 @@ async fn rebuild_archive(
     }
     let (session_id, _) = extract_archive_metadata(&content, &archive);
     let context = IngestContext::new(session_id, Some(log));
-    ensure_episodes(gm, log, &chunks, &context).await?;
+    ensure_episodes(gm, log, &content, &chunks, &context).await?;
     let report = crate::graph::v2::extract_log(
         gm,
         memory_dir,
@@ -1618,6 +1647,22 @@ async fn rebuild_archive(
 async fn ensure_episodes(
     gm: &crate::graph::GraphMemory,
     log: u32,
+    content: &str,
+    chunks: &[String],
+    context: &IngestContext,
+) -> Result<(), RecallError> {
+    if crate::graph::ingest::episode_ingest_dedupe() {
+        write_missing_chunks(gm, log, chunks, context).await
+    } else {
+        write_episode_prefix(gm, log, content, chunks, context).await
+    }
+}
+
+/// Write current chunks that are not already stored for this log.
+#[cfg(feature = "llm")]
+async fn write_missing_chunks(
+    gm: &crate::graph::GraphMemory,
+    log: u32,
     chunks: &[String],
     context: &IngestContext,
 ) -> Result<(), RecallError> {
@@ -1626,7 +1671,37 @@ async fn ensure_episodes(
     if missing.is_empty() {
         return Ok(());
     }
-    let report = crate::graph::ingest::ingest_missing_episodes(gm, &missing, context).await?;
+    finish_episode_write(
+        crate::graph::ingest::ingest_missing_episodes(gm, &missing, context).await?,
+    )
+}
+
+/// Extend a short prefix. `have == 0` ingests the archive; a later prefix
+/// writes `chunks[have..]` at that index.
+#[cfg(feature = "llm")]
+async fn write_episode_prefix(
+    gm: &crate::graph::GraphMemory,
+    log: u32,
+    content: &str,
+    chunks: &[String],
+    context: &IngestContext,
+) -> Result<(), RecallError> {
+    let have = crate::graph::ingest::stored_log_content(gm, log)
+        .await?
+        .len();
+    if have >= chunks.len() {
+        return Ok(());
+    }
+    let report = if have == 0 {
+        gm.ingest_archive(content, context, None).await?
+    } else {
+        crate::graph::ingest::ingest_remaining_episodes(gm, &chunks[have..], context, have).await?
+    };
+    finish_episode_write(report)
+}
+
+#[cfg(feature = "llm")]
+fn finish_episode_write(report: IngestionReport) -> Result<(), RecallError> {
     if report.errors.is_empty() {
         Ok(())
     } else {

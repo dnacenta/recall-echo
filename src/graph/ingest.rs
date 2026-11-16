@@ -25,6 +25,15 @@ const LLM_CONCURRENCY: usize = 10;
 /// Chunk size `ingest_archive` uses. Rebuild compares episode rows to this.
 pub(crate) const INGEST_CHUNK_TOKENS: usize = 500;
 
+/// Episode writes for a numbered log skip chunks already stored.
+///
+/// Always on. Callers branch on this so a later default-off
+/// `graph.episode_ingest_dedupe` can replace the body without a rewrite.
+#[must_use]
+pub(crate) fn episode_ingest_dedupe() -> bool {
+    true
+}
+
 /// Role headings written by the archive pipeline, lower-cased.
 const USER_TURN_HEADING: &str = "### user";
 const ASSISTANT_TURN_HEADING: &str = "### assistant";
@@ -151,10 +160,11 @@ pub async fn ingest_archive(
     }
 
     // Create episodes for each chunk, each stamped with its own authorship —
-    // one archive can hold both the human's words and the agent's.
-    write_episodes(gm, &chunks, context, 0, &mut report).await;
+    // one archive can hold both the human's words and the agent's. A numbered
+    // log writes only chunks that are not already stored. Extraction, when a
+    // model is passed, still runs on every chunk.
+    write_log_episodes(gm, &chunks, context, &mut report).await?;
 
-    // If LLM provided, run extraction on all chunks
     if let Some(llm) = llm {
         process_extraction(gm, &chunks, context, llm, &mut report).await?;
     }
@@ -288,6 +298,28 @@ fn json_content(value: Option<&serde_json::Value>) -> Option<String> {
     value
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+async fn write_log_episodes(
+    gm: &GraphMemory,
+    chunks: &[String],
+    context: &IngestContext,
+    report: &mut IngestionReport,
+) -> Result<(), GraphError> {
+    if episode_ingest_dedupe() {
+        if let Some(log) = context.log_number() {
+            let stored = stored_log_content(gm, log).await?;
+            let missing = missing_chunks(&stored, chunks);
+            let written = ingest_missing_episodes(gm, &missing, context).await?;
+            report.episodes_created = report
+                .episodes_created
+                .saturating_add(written.episodes_created);
+            report.errors.extend(written.errors);
+            return Ok(());
+        }
+    }
+    write_episodes(gm, chunks, context, 0, report).await;
+    Ok(())
 }
 
 async fn write_episodes(
