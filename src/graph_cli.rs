@@ -3460,7 +3460,12 @@ mod tests {
         }
         assert!(text.contains("recall-echo graph daemon stop"), "{text}");
         let config = shell_quote(&crate::config::config_path(Path::new("/tmp/alpha")));
-        assert!(text.contains(&config), "{config} missing from {text}");
+        let target = format!("then set in {config}:");
+        assert_eq!(
+            text.lines().filter(|got| *got == target).count(),
+            2,
+            "{text}"
+        );
         for line in ["[graph]", "pipeline = \"v2\"", "pipeline = \"v1\""] {
             assert!(
                 text.lines().any(|got| got == line),

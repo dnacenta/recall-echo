@@ -1251,4 +1251,42 @@ mod tests {
         assert!(err.contains("not valid UTF-8"), "{err}");
         assert_eq!(settings, before);
     }
+
+    /// The binary is interpolated bare, so anything outside the plain
+    /// alphabet is refused and settings stay as they were.
+    #[test]
+    fn an_unsafe_binary_path_is_refused_and_settings_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = serde_json::json!({"keep": true});
+        let before = settings.clone();
+        let err = match apply_hooks(&mut settings, dir.path(), "/opt/alpha beta/recall-echo") {
+            Err(err) => err,
+            Ok(_) => panic!("an unsafe binary path was accepted"),
+        };
+        assert!(err.contains("unsafe in a shell command"), "{err}");
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn a_plain_binary_path_installs_the_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = serde_json::json!({});
+        let change = apply_hooks(&mut settings, dir.path(), "/usr/local/bin/recall-echo")
+            .expect("a plain binary path is accepted");
+        assert!(change.changed);
+    }
+
+    /// A newline in the root would split the hook command line.
+    #[test]
+    fn a_root_with_a_control_character_is_refused_and_settings_stay() {
+        let mut settings = serde_json::json!({"keep": true});
+        let before = settings.clone();
+        let root = Path::new("/tmp/alpha\nbeta");
+        let err = match apply_hooks(&mut settings, root, "/usr/local/bin/recall-echo") {
+            Err(err) => err,
+            Ok(_) => panic!("a root with a newline was accepted"),
+        };
+        assert!(err.contains("control characters"), "{err}");
+        assert_eq!(settings, before);
+    }
 }
