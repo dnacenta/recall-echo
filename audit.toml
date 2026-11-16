@@ -1,5 +1,5 @@
 # Reviewed advisories for Cargo.lock
-# sha256 97863af872bb1b9a548fe979a0544972df989d5aa9f61968c5a2492b0d2d850e
+# sha256 dc3e95e7433540d17c9637a40ff5fd63be3ab425ddc74c9fa66dcd5e0bd0e6ea
 # Recorded 2026-11-16. Reasons are in docs/security/advisories.md.
 
 [advisories]

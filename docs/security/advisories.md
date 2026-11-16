@@ -1,14 +1,14 @@
 # Advisory triage
 
 Recorded 2026-11-16 against `Cargo.lock` SHA-256
-`97863af872bb1b9a548fe979a0544972df989d5aa9f61968c5a2492b0d2d850e`.
+`dc3e95e7433540d17c9637a40ff5fd63be3ab425ddc74c9fa66dcd5e0bd0e6ea`.
 That is the hash of this lock. The open tables below are a scan of this file.
 The previous record, on main `f8743d9` (commit `21edd0f`), hashed
 `70695675c4134e66b73e563aee2ec73064f29a3353401b13988d4ce042c90071`.
 
 Scan source:
 
-- OSV `querybatch` on 2026-11-16 for the 639 locked package versions. The
+- OSV `querybatch` on 2026-11-16 for the 636 locked package versions. The
   semver-compatible ids from the previous record are absent. The one GHSA
   alias still returned is named on its RustSec row: `GHSA-4w2j-m93h-cj5j`
   (`RUSTSEC-2026-0185`).
@@ -60,13 +60,13 @@ stayed on their existing lines. `surrealdb` 3.2.4, `surrealdb-core` 3.2.4,
 `surrealkv` 0.21.3, `rsa` 0.9.10, `rkyv` 0.7.46 and `crypto-bigint` 0.5.5 did
 not move.
 
-`ammonia` 4.2.5 is inside `surrealdb-core` 3.2.4's `^4.1.2`. That bump carries
-the HTML stack it requires: `cssparser` 0.35.0 to 0.38.0, `html5ever` 0.35.0
-to 0.40.1, `markup5ever` 0.35.0 to 0.40.0, `phf` 0.11.3 to 0.14.0 (0.13.1
-stays), `phf_codegen` 0.11.3 to 0.14.0, `phf_generator` 0.11.3 to 0.14.0,
-`phf_shared` 0.11.3 to 0.14.0 (0.13.1 stays), `string_cache` 0.8.9 to 0.11.0,
-`string_cache_codegen` 0.5.4 to 0.11.2, `tendril` 0.4.3 to 0.5.1 and
-`web_atoms` 0.1.3 to 0.3.0. `cssparser-macros` 0.6.1, `futf` 0.1.5, `mac`
+`ammonia` 4.1.9 is inside `surrealdb-core` 3.2.4's `^4.1.2`. That bump carries
+the HTML stack it requires: `cssparser` 0.35.0 to 0.37.0, `html5ever` 0.35.0
+to 0.39.0, `markup5ever` 0.35.0 to 0.39.0, `phf` 0.11.3 leaves (0.13.1 stays),
+`phf_codegen` 0.11.3 to 0.13.1, `phf_generator` 0.11.3 leaves (0.13.1 stays),
+`phf_shared` 0.11.3 leaves (0.13.1 stays), `string_cache` 0.8.9 to 0.9.0,
+`string_cache_codegen` 0.5.4 to 0.6.1, `tendril` 0.4.3 to 0.5.1 and
+`web_atoms` 0.1.3 to 0.2.6. `cssparser-macros` 0.6.1, `futf` 0.1.5, `mac`
 0.1.1, `match_token` 0.35.0 and `phf_macros` 0.11.3 left the lock with the old
 parser. `phf_macros` 0.13.1 stays.
 
@@ -83,7 +83,7 @@ parser. `phf_macros` 0.13.1 stays.
 | event-listener | 5.4.1 | 5.4.2 | RUSTSEC-2026-0221 |
 | rand | 0.8.5 | 0.8.8 | RUSTSEC-2026-0097 (GHSA-cq8v-f236-94qc) |
 | rustix | 1.1.4 | 1.1.6 | RUSTSEC-2026-0486 |
-| ammonia | 4.1.2 | 4.2.5 | RUSTSEC-2021-0157, RUSTSEC-2021-0158, RUSTSEC-2026-0193 (GHSA-9jh8-v38h-cvhr), RUSTSEC-2026-0213 (GHSA-m6mh-2hw2-555x), RUSTSEC-2026-0373, RUSTSEC-2026-0533 |
+| ammonia | 4.1.2 | 4.1.9 | RUSTSEC-2021-0157, RUSTSEC-2021-0158, RUSTSEC-2026-0193 (GHSA-9jh8-v38h-cvhr), RUSTSEC-2026-0213 (GHSA-m6mh-2hw2-555x), RUSTSEC-2026-0373, RUSTSEC-2026-0533 |
 
 ## In the lock, HTTP/3 off
 
