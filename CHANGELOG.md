@@ -3,7 +3,7 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
-## [5.0.0] — Unreleased
+## [5.0.0] — 2026-11-16
 
 ### Added
 
