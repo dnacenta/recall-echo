@@ -98,3 +98,76 @@ drop_restatements = true
 ground_component_edges = true
 recover_turns = true
 
+no-known-facts-context
+[graph]
+known_facts_context = false
+
+no-consolidate
+[graph]
+consolidate = false
+
+no-consolidate-hold
+[graph]
+consolidate_hold = false
+
+no-drop-restatements
+[graph]
+drop_restatements = false
+
+no-consolidate-links
+[graph]
+consolidate_links = false
+
+no-consolidate-components
+[graph]
+consolidate_components = false
+
+no-ground-component-edges
+[graph]
+ground_component_edges = false
+
+no-consolidate-key-rename
+[graph]
+consolidate_key_rename = false
+
+no-consolidate-replaces-cue
+[graph]
+consolidate_replaces_cue = false
+
+no-consolidate-replaces-departure
+[graph]
+consolidate_replaces_departure = false
+
+no-known-key-binding
+[graph]
+known_key_binding = false
+
+no-consolidate-orphan-sweep
+[graph]
+consolidate_orphan_sweep = false
+
+no-consolidate-rule-fragments
+[graph]
+consolidate_rule_fragments = false
+
+no-consolidate-retire-component
+[graph]
+consolidate_retire_component = false
+
+all-off
+[graph]
+known_facts_context = false
+consolidate = false
+consolidate_hold = false
+consolidate_links = false
+consolidate_components = false
+consolidate_key_rename = false
+consolidate_replaces_cue = false
+consolidate_replaces_departure = false
+consolidate_orphan_sweep = false
+consolidate_rule_fragments = false
+consolidate_retire_component = false
+known_key_binding = false
+drop_restatements = false
+ground_component_edges = false
+
