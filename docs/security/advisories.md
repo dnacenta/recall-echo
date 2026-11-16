@@ -1,32 +1,36 @@
 # Advisory triage
 
 Recorded 2026-11-16 against `Cargo.lock` SHA-256
-`70695675c4134e66b73e563aee2ec73064f29a3353401b13988d4ce042c90071`
-on main `f8743d9`. That is the hash of this lock. The table below is a scan of
-this file, not a copy of an older lock.
+`dc3e95e7433540d17c9637a40ff5fd63be3ab425ddc74c9fa66dcd5e0bd0e6ea`.
+That is the hash of this lock. The open tables below are a scan of this file.
+The previous record, on main `f8743d9` (commit `21edd0f`), hashed
+`70695675c4134e66b73e563aee2ec73064f29a3353401b13988d4ce042c90071`.
 
 Scan source:
 
-- RustSec advisory-db `02e2517f457a359fc6d3440ea4560c8ea188fee8` (committed
-  2026-11-15). Every locked crate name and version was matched against
-  non-withdrawn advisories. A version is affected when it matches neither a
-  `patched` nor an `unaffected` requirement.
-- OSV `querybatch` on 2026-11-16 for the same 644 locked package versions.
-  OSV returned those RustSec advisories, GHSA aliases of eleven of them, and
-  one id that this RustSec snapshot does not contain: `GHSA-3pv8-6f4r-ffg2`
-  (`tar` 0.4.45, fixed in 0.4.46).
+- OSV `querybatch` on 2026-11-16 for the 636 locked package versions. The
+  semver-compatible ids from the previous record are absent. The one GHSA
+  alias still returned is named on its RustSec row: `GHSA-4w2j-m93h-cj5j`
+  (`RUSTSEC-2026-0185`).
+- `cargo audit` 0.23.0 against RustSec advisory-db
+  `02e2517f457a359fc6d3440ea4560c8ea188fee8` (committed 2026-11-15), the same
+  snapshot as the previous record. It reports the same 19 ids. It also warns
+  that `core2` 0.4.0 and `spin` 0.9.8 are yanked. `core2` is the unmaintained
+  row below. `spin` 0.9.8 has no advisory id. `lazy_static` 1.5.0 and
+  `heapless` 0.7.17 depend on it, and the version is unchanged from the
+  previous lock.
 
-42 advisories. Each one is listed once. A GHSA that is only an alias is named
-on the RustSec row, and `audit.toml` ignores the RustSec id. `audit.toml`
-ignores `GHSA-3pv8-6f4r-ffg2` on its own row. `webpki-roots` 0.26.11 (ureq's
-tls feature) is in the lock and has no open advisory. `tar` 0.4.45 is already
-past `RUSTSEC-2018-0002`, `RUSTSEC-2021-0080`, `RUSTSEC-2026-0067` and
+19 advisories. Each one is listed once. A GHSA that is only an alias is named
+on the RustSec row, and `audit.toml` ignores the RustSec id. `webpki-roots`
+0.26.11 (ureq's tls feature) is in the lock and has no open advisory. The 1.0
+line is 1.0.12. `tar` 0.4.46 is past `GHSA-3pv8-6f4r-ffg2` and past
+`RUSTSEC-2018-0002`, `RUSTSEC-2021-0080`, `RUSTSEC-2026-0067` and
 `RUSTSEC-2026-0068` (each patched in `>= 0.4.45`).
 
 `RUSTSEC-2026-0452`, `RUSTSEC-2026-0453` and `RUSTSEC-2026-0454` come first.
 They are open and pending a later decision. The embedded path can reach them.
-This record does not upgrade the store, does not edit `Cargo.lock`, and does
-not add a CI job. An automated advisory scan is tracked in #56.
+This record does not upgrade the store and does not add a CI job. An automated
+advisory scan is tracked in #56.
 
 ## Open: store majors, embedded path reachable
 
@@ -47,37 +51,39 @@ the semver PR. The risk is not accepted.
 | RUSTSEC-2026-0235 | rkyv | 0.7.46 | Optional `rkyv` feature of `rust_decimal` 1.42.1 (`^0.7.46`). `surrealdb-core` enables `maths` and `serde-str` on `rust_decimal`, not `rkyv`. | No. The archive validator is not in the default compile graph. The bug is an out-of-bounds read when an archive's `Rc` or `Arc` pointers share an address and differ in metadata. | Major bump to rkyv >= 0.8.17. Not a lockfile edit. Pending a later decision. |
 | RUSTSEC-2026-0387 | crypto-bigint | 0.5.5 | `jsonwebtoken` → `p256` / `p384` → `elliptic-curve` 0.13.8 → `crypto-bigint` 0.5.5. | The variable-time paths are subtraction, division, zero-count and Montgomery multiplication that are meant to be constant-time. This crate does not run those secret-dependent operations. They are compiled into the store's JWT stack. | Major bump to crypto-bigint >= 0.7.6. Not a lockfile edit. Pending a later decision. |
 
-## Semver-compatible fixes, next PR
+## Fixed by this PR
 
-The bump is the next PR. Ignoring these ids records the review. It does not
-accept the risk for good. `surrealdb-core` 3.2.4 depends on `ammonia` `^4.1.2`,
-which allows >= 4.1.9 and >= 4.2.5, so ammonia is in this group.
+These ids were in the previous record. This lock bumps each package inside the
+requirement already in `Cargo.toml`, and the rescan does not report them.
+`audit.toml` no longer ignores them. `webpki-roots` 0.26.11 and `rand` 0.9.5
+stayed on their existing lines. `surrealdb` 3.2.4, `surrealdb-core` 3.2.4,
+`surrealkv` 0.21.3, `rsa` 0.9.10, `rkyv` 0.7.46 and `crypto-bigint` 0.5.5 did
+not move.
 
-| ID | Crate | Version | How it is reached | Can our use hit the weak function? | Action |
-|---|---|---|---|---|---|
-| RUSTSEC-2026-0285 (GHSA-2mjx-qc3c-rqvc) | rustls | 0.23.37 | `reqwest` feature `rustls-tls` (default features `llm` and `self-update`) and fastembed feature `hf-hub-rustls-tls`. | Yes. A TLS 1.3 peer can place a handshake message in the wrong encryption level inside the same record as a key-changing message. Our HTTPS clients accept that record. | Bump rustls to >= 0.23.46 in the next PR. This id is fixed in >= 0.23.45. |
-| RUSTSEC-2026-0346 (GHSA-c8m5-c952-6cm4) | rustls | 0.23.37 | Same rustls 0.23.37 stack as RUSTSEC-2026-0285. | Only if client session values are debug-formatted. `Debug` on `Tls12ClientSessionValue` and `Tls13ClientSessionValue` prints the master secret or the resumption PSK. This crate does not format those values. | Bump rustls to >= 0.23.46 in the next PR. |
-| RUSTSEC-2026-0348 (GHSA-h2v8-394m-p7vv) | rustls | 0.23.37 | Same rustls 0.23.37 stack as RUSTSEC-2026-0285. | No. Brotli certificate decompression is rustls feature `brotli`, which this stack leaves off, so the decompressor is not compiled. | Bump rustls to >= 0.23.46 in the next PR. |
-| RUSTSEC-2026-0349 (GHSA-w44r-93j7-qv28) | rustls | 0.23.37 | Same rustls 0.23.37 stack as RUSTSEC-2026-0285. | Yes. The client stores the server-selected key-exchange group from the ServerHello before the server is authenticated, and a later ClientHello to that name can drop the hybrid share. | Bump rustls to >= 0.23.46 in the next PR. |
-| RUSTSEC-2026-0098 (GHSA-965h-392x-2mh5) | rustls-webpki | 0.103.10 | `rustls` 0.23.37 uses `rustls-webpki` for certificate verification on the HTTPS paths above. | Yes, when a verified chain carries a URI name constraint. Those constraints were ignored and therefore accepted. | Bump rustls-webpki to >= 0.103.16 in the next PR. This id is fixed in >= 0.103.12. |
-| RUSTSEC-2026-0099 (GHSA-xgp8-3hg3-c2mh) | rustls-webpki | 0.103.10 | Same `rustls-webpki` 0.103.10 as RUSTSEC-2026-0098. | Yes, when a verified chain combines a permitted DNS name constraint with a wildcard name. That pair was accepted. | Bump rustls-webpki to >= 0.103.16 in the next PR. This id is fixed in >= 0.103.12. |
-| RUSTSEC-2026-0104 (GHSA-82j2-j2ch-gfr8) | rustls-webpki | 0.103.10 | Same `rustls-webpki` 0.103.10 as RUSTSEC-2026-0098. | Only if a certificate revocation list is parsed. An empty `BIT STRING` in `onlySomeReasons` panics in `BorrowedCertRevocationList::from_der` and `OwnedCertRevocationList::from_der`. Our HTTP client does not configure a CRL. | Bump rustls-webpki to >= 0.103.16 in the next PR. This id is fixed in >= 0.103.13. |
-| RUSTSEC-2026-0382 | rustls-webpki | 0.103.10 | Same `rustls-webpki` 0.103.10 as RUSTSEC-2026-0098, with trust anchors from `webpki-roots` 1.0.6. | Yes. Verification can accept a path through distrusted emSign intermediates when the configured roots allow it, and 1.0.6 still bundles `emSign ECC Root CA - G3`. | Bump rustls-webpki to >= 0.103.16 in the next PR, together with the webpki-roots bump below. |
-| RUSTSEC-2026-0381 | webpki-roots | 1.0.6 | `reqwest` feature `rustls-tls` enables `rustls-tls-webpki-roots`, which depends on `webpki-roots` 1.0.6. ureq's tls feature uses the separate 0.26.11 line, which is already fixed. | Yes. The bundled roots include `emSign ECC Root CA - G3`, so an HTTPS connection can trust a chain through the distrusted intermediates. | Bump the 1.0 line to webpki-roots >= 1.0.10 in the next PR. |
-| RUSTSEC-2026-0258 | h2 | 0.4.13 | `reqwest` feature `http2` (enabled on our dependency, and again by hf-hub) → `hyper` → `h2`. | Yes. A peer can queue empty DATA frames without a bound while a stream is not drained, which grows memory or panics on overflow. | Bump h2 to >= 0.4.16 in the next PR. |
-| GHSA-3pv8-6f4r-ffg2 | tar | 0.4.45 | Direct dependency of the default `self-update` feature. `extract_binary` in `src/update.rs` parses the release archive with `Archive::entries`. Also a build dependency of `ort-sys` feature `download-binaries`, which fastembed's default `ort-download-binaries` turns on. | Yes, on a crafted archive. `extract_binary` copies only a regular file named `recall-echo` and writes it with our own exclusive-create. It does not call `unpack` or `unpack_in`. A PAX header is applied to the next header instead of the file, so `entries()` can desynchronize and yield the wrong bytes under that name. The name filter limits the older unpack bugs and leaves this parser bug in place. | Bump tar to >= 0.4.46 in the next PR. |
-| RUSTSEC-2026-0386 | tokio | 1.53.1 | Direct dependency. Enabled features include `net`. | The unsound constructors are `AsyncFd::new`, `with_interest`, `try_new` and `try_with_interest`, which accept any `AsRawFd`. This crate does not call them. | Bump tokio to >= 1.53.3 in the next PR. |
-| RUSTSEC-2026-0204 | crossbeam-epoch | 0.9.18 | `crossbeam-deque` (rayon-core and affinitypool) and `crossbeam-skiplist` (surrealkv). | `Display` for `Atomic` and `Shared` dereferences the pointer, including a null pointer. `Debug` does not. This crate does not display those pointers. | Bump crossbeam-epoch to >= 0.9.20 in the next PR. |
-| RUSTSEC-2026-0190 | anyhow | 1.0.102 | `surrealdb` and `surrealdb-core` depend on anyhow `^1.0.102`. | `Error::downcast_mut` after `Error::context` is unsound. This crate uses `thiserror` and does not call `downcast_mut`. | Bump anyhow to >= 1.0.103 in the next PR. |
-| RUSTSEC-2026-0221 | event-listener | 5.4.1 | `surrealdb-core` → `async-channel` → `event-listener-strategy` → `event-listener`. | `StackSlot` is unconditionally `Send` and `Sync`, so a `!Send` tag can cross threads through the `listener!` macro. This crate does not use that macro. The store's async channels compile it. | Bump event-listener to >= 5.4.2 in the next PR. |
-| RUSTSEC-2026-0097 (GHSA-cq8v-f236-94qc) | rand | 0.8.5 | `jsonwebtoken` 10.3.0 depends on rand 0.8.5. The lock also carries rand 0.9.5, which is outside this advisory. | Only when `thread_rng` is enabled, a custom logger calls `thread_rng` while the RNG reseeds, and trace logging is on or `getrandom` cannot reseed. This crate does not install that logger. | Bump the 0.8 line to rand >= 0.8.6 in the next PR. |
-| RUSTSEC-2026-0486 | rustix | 1.1.4 | `tempfile` depends on rustix. The `xattr` crate, which `tar` also lists, calls the same module. Our direct `tar` dependency turns default features off, so that unpack path does not enable tar's xattr feature. | `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr` and `flistxattr` mark a zero-length buffer initialized for as many bytes as the kernel's size query reports. This crate does not call them. | Bump rustix to >= 1.1.6 in the next PR. |
-| RUSTSEC-2021-0157 | ammonia | 4.1.2 | `surrealdb-core` 3.2.4 depends on ammonia `^4.1.2`. The only call sites are `string::html::encode` (`ammonia::clean_text`) and `string::html::sanitize` (`ammonia::clean`). | No. Ingest and query do not call those HTML helpers. The bug is unescaped quotes in CSS `url()`, and only when style filtering is enabled. | Bump ammonia in the next PR to >= 4.1.9 and < 4.2.0, or to >= 4.2.5. Both sit in `^4.1.2`. This id is fixed earlier, in >= 4.1.7. |
-| RUSTSEC-2021-0158 | ammonia | 4.1.2 | Same ammonia 4.1.2 call sites as RUSTSEC-2021-0157. | No. Ingest and query do not call the HTML helpers. SVG `animateMotion`, `animateTransform` and `animateColor` were not neutralized. | Bump ammonia in the next PR to >= 4.1.9 and < 4.2.0, or to >= 4.2.5. This id is fixed in >= 4.1.7. |
-| RUSTSEC-2026-0193 (GHSA-9jh8-v38h-cvhr) | ammonia | 4.1.2 | Same ammonia 4.1.2 call sites as RUSTSEC-2021-0157. | No. Ingest and query do not call the HTML helpers. If the affected MathML tags are enabled, `annotation-xml` handling can inject script. | Bump ammonia in the next PR to >= 4.1.9 and < 4.2.0, or to >= 4.2.5. This id is fixed in >= 4.1.3. |
-| RUSTSEC-2026-0213 (GHSA-m6mh-2hw2-555x) | ammonia | 4.1.2 | Same ammonia 4.1.2 call sites as RUSTSEC-2021-0157. | No. Ingest and query do not call the HTML helpers. SVG `animate` and `set` can leave a `javascript:` link. | Bump ammonia in the next PR to >= 4.1.9 and < 4.2.0, or to >= 4.2.5. This id is fixed in >= 4.1.4. |
-| RUSTSEC-2026-0373 | ammonia | 4.1.2 | Same ammonia 4.1.2 call sites as RUSTSEC-2021-0157. | No. Ingest and query do not call the HTML helpers. CSS `url` filtering misses some case variants when CSS sanitization is on. | Bump ammonia in the next PR to >= 4.1.9 and < 4.2.0, or to >= 4.2.5. This id is fixed in >= 4.1.8. |
-| RUSTSEC-2026-0533 | ammonia | 4.1.2 | Same ammonia 4.1.2 call sites as RUSTSEC-2021-0157. | No. Ingest and query do not call the HTML helpers. Embedded SVG and MathML can be arranged so HTML and foreign XML parse differently, which is a mutation XSS. | Bump ammonia in the next PR to >= 4.1.9 and < 4.2.0, or to >= 4.2.5. This id is the one that needs 4.1.9 on the 4.1 line. 4.2.0 through 4.2.4 stay affected. |
+`ammonia` 4.1.9 is inside `surrealdb-core` 3.2.4's `^4.1.2`. That bump carries
+the HTML stack it requires: `cssparser` 0.35.0 to 0.37.0, `html5ever` 0.35.0
+to 0.39.0, `markup5ever` 0.35.0 to 0.39.0, `phf` 0.11.3 leaves (0.13.1 stays),
+`phf_codegen` 0.11.3 to 0.13.1, `phf_generator` 0.11.3 leaves (0.13.1 stays),
+`phf_shared` 0.11.3 leaves (0.13.1 stays), `string_cache` 0.8.9 to 0.9.0,
+`string_cache_codegen` 0.5.4 to 0.6.1, `tendril` 0.4.3 to 0.5.1 and
+`web_atoms` 0.1.3 to 0.2.6. `cssparser-macros` 0.6.1, `futf` 0.1.5, `mac`
+0.1.1, `match_token` 0.35.0 and `phf_macros` 0.11.3 left the lock with the old
+parser. `phf_macros` 0.13.1 stays.
+
+| Package | Was | Now | IDs fixed by this PR |
+|---|---|---|---|
+| rustls | 0.23.37 | 0.23.46 | RUSTSEC-2026-0285 (GHSA-2mjx-qc3c-rqvc), RUSTSEC-2026-0346 (GHSA-c8m5-c952-6cm4), RUSTSEC-2026-0348 (GHSA-h2v8-394m-p7vv), RUSTSEC-2026-0349 (GHSA-w44r-93j7-qv28) |
+| rustls-webpki | 0.103.10 | 0.103.17 | RUSTSEC-2026-0098 (GHSA-965h-392x-2mh5), RUSTSEC-2026-0099 (GHSA-xgp8-3hg3-c2mh), RUSTSEC-2026-0104 (GHSA-82j2-j2ch-gfr8), RUSTSEC-2026-0382 |
+| webpki-roots | 1.0.6 | 1.0.12 | RUSTSEC-2026-0381 |
+| h2 | 0.4.13 | 0.4.20 | RUSTSEC-2026-0258 |
+| tar | 0.4.45 | 0.4.46 | GHSA-3pv8-6f4r-ffg2 |
+| tokio | 1.53.1 | 1.54.1 | RUSTSEC-2026-0386 |
+| crossbeam-epoch | 0.9.18 | 0.9.21 | RUSTSEC-2026-0204 |
+| anyhow | 1.0.102 | 1.0.104 | RUSTSEC-2026-0190 |
+| event-listener | 5.4.1 | 5.4.2 | RUSTSEC-2026-0221 |
+| rand | 0.8.5 | 0.8.8 | RUSTSEC-2026-0097 (GHSA-cq8v-f236-94qc) |
+| rustix | 1.1.4 | 1.1.6 | RUSTSEC-2026-0486 |
+| ammonia | 4.1.2 | 4.1.9 | RUSTSEC-2021-0157, RUSTSEC-2021-0158, RUSTSEC-2026-0193 (GHSA-9jh8-v38h-cvhr), RUSTSEC-2026-0213 (GHSA-m6mh-2hw2-555x), RUSTSEC-2026-0373, RUSTSEC-2026-0533 |
 
 ## In the lock, HTTP/3 off
 
@@ -100,7 +106,10 @@ weak functions are QUIC receive and send paths, so this build cannot call them.
 ## Unmaintained or yanked, no patched version
 
 No patched release exists. The advisory names no weak function beyond the
-crate being unmaintained. `core2` is also fully yanked.
+crate being unmaintained. `core2` is also fully yanked. `spin` 0.9.8 is
+yanked and has no advisory id, so `audit.toml` has nothing to ignore.
+`lazy_static` 1.5.0 and `heapless` 0.7.17 depend on it. The version is the
+same as the previous lock.
 
 | ID | Crate | Version | How it is reached | Can our use hit the weak function? | Action |
 |---|---|---|---|---|---|
