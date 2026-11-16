@@ -2076,6 +2076,11 @@ mod tests {
             let memory = tmp.path();
             let lines = &[("user", "hello"), ("assistant", "alpha")];
             archive(memory, &dialogue(first_id, lines), "jsonl");
+            assert_eq!(
+                prior_capture(&memory.join("conversations"), second_id),
+                None,
+                "{second_id} is not {first_id}"
+            );
             let second = archive(memory, &dialogue(second_id, lines), "jsonl");
             assert_eq!(second.log_number, 2, "{first_id} then {second_id}");
             assert!(second.is_new_archive());
