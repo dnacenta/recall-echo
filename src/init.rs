@@ -189,17 +189,13 @@ fn select_provider(
 }
 
 /// The CLI a menu should default to: the one this session is running under,
-/// else Claude Code, else the first installed.
+/// else grok, else the first installed.
 fn default_cli(detected: &[AgentCli]) -> AgentCli {
     let running_under = agent_cli::current().filter(|cli| detected.contains(cli));
     running_under
-        .or_else(|| {
-            detected
-                .contains(&AgentCli::ClaudeCode)
-                .then_some(AgentCli::ClaudeCode)
-        })
+        .or_else(|| detected.contains(&AgentCli::Grok).then_some(AgentCli::Grok))
         .or_else(|| detected.first().copied())
-        .unwrap_or(AgentCli::ClaudeCode)
+        .unwrap_or(AgentCli::Grok)
 }
 
 /// Short menu over the CLIs that are actually installed.
@@ -1219,16 +1215,16 @@ mod tests {
     }
 
     #[test]
-    fn the_default_prefers_claude_code_over_install_order() {
+    fn the_default_prefers_grok_over_install_order() {
         assert_eq!(
             default_cli(&[AgentCli::Codex, AgentCli::ClaudeCode]),
-            AgentCli::ClaudeCode
+            AgentCli::Codex
         );
         assert_eq!(
             default_cli(&[AgentCli::Gemini, AgentCli::Grok]),
-            AgentCli::Gemini
+            AgentCli::Grok
         );
-        assert_eq!(default_cli(&[]), AgentCli::ClaudeCode);
+        assert_eq!(default_cli(&[]), AgentCli::Grok);
     }
 
     struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);

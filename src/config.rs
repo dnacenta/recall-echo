@@ -1353,7 +1353,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn default_provider() -> Provider {
-    Provider::ClaudeCode
+    Provider::Grok
 }
 
 // ── Load / Save ──────────────────────────────────────────────────────────
@@ -1897,7 +1897,7 @@ mod tests {
     fn default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.ephemeral.max_entries, 5);
-        assert_eq!(cfg.llm.provider, Provider::ClaudeCode);
+        assert_eq!(cfg.llm.provider, Provider::Grok);
         assert!(cfg.llm.model.is_empty());
     }
 
@@ -1905,7 +1905,7 @@ mod tests {
     fn parse_ephemeral_only() {
         let cfg: Config = toml::from_str("[ephemeral]\nmax_entries = 10\n").unwrap();
         assert_eq!(cfg.ephemeral.max_entries, 10);
-        assert_eq!(cfg.llm.provider, Provider::ClaudeCode);
+        assert_eq!(cfg.llm.provider, Provider::Grok);
     }
 
     #[test]
@@ -1968,7 +1968,7 @@ mod tests {
     #[test]
     fn resolved_defaults() {
         let llm = LlmSection::default();
-        assert_eq!(llm.provider, Provider::ClaudeCode);
+        assert_eq!(llm.provider, Provider::Grok);
         assert_eq!(llm.resolved_model(), "");
         assert_eq!(llm.resolved_api_base(), "");
 
@@ -2045,7 +2045,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             fs::write(config_path(tmp.path()), &toml).unwrap();
             assert!(load(tmp.path()).llm.model.is_empty());
-            assert_eq!(load(tmp.path()).llm.provider, Provider::ClaudeCode);
+            assert_eq!(load(tmp.path()).llm.provider, Provider::Grok);
         }
     }
 
@@ -2068,7 +2068,7 @@ mod tests {
             format!("[llm]\nprovider = \"{alias}\"\nmodel = \"kept\"\n"),
         )
         .unwrap();
-        assert_eq!(load(tmp.path()).llm.provider, Provider::ClaudeCode);
+        assert_eq!(load(tmp.path()).llm.provider, Provider::Grok);
         assert!(load(tmp.path()).llm.model.is_empty());
     }
 

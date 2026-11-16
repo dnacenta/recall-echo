@@ -8,7 +8,7 @@ optional; a missing file or an invalid value falls back to the default, silently
 max_entries = 5               # rolling window of session summaries, 1-50
 
 [llm]
-provider = "claude-code"      # default when unset; `init` writes the CLI it found
+provider = "grok"             # default when the key is missing; `init` writes the CLI it found
 model = ""                    # empty = the provider's default, except openai (no default)
 api_base = ""                 # HTTP only; required for openai, no default endpoint
 
@@ -91,9 +91,9 @@ provider will run. `recall-echo config set KEY VALUE` changes one (`provider`, `
 
 | `provider` | How it runs | What it costs |
 |---|---|---|
-| `claude-code` | spawns `claude` | the user's own CLI login (the default) |
+| `claude-code` | spawns `claude` | the user's own CLI login |
 | `gemini` | spawns `gemini` | Gemini subscription or free tier |
-| `grok` | spawns `grok` | Grok subscription |
+| `grok` | spawns `grok` | Grok subscription (the default) |
 | `codex` | spawns `codex exec` | ChatGPT/Codex subscription |
 | `cli` | spawns whatever `[llm.cli]` describes | whatever that CLI costs |
 | `openai` | HTTP to the OpenAI-compatible endpoint in `api_base` | per token; `api_base` and `OPENAI_API_KEY` are both required |

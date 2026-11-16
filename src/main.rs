@@ -390,7 +390,7 @@ enum BenchCommands {
 enum ConfigCommands {
     /// Show current configuration
     Show,
-    /// Set a config value (e.g., `config set provider claude-code`)
+    /// Set a config value (e.g., `config set provider grok`)
     Set {
         /// Config key (provider, model, api_base, llm.cli.*, ephemeral.max_entries)
         key: String,

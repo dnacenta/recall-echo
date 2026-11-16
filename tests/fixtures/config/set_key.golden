@@ -1,6 +1,6 @@
 default llm.provider = cli
 ok
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 default llm.provider = nonesuch
@@ -8,7 +8,7 @@ err config: unknown provider: nonesuch (use 'anthropic', 'openai', 'claude-code'
 
 default provider = cli
 ok
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 default provider = nonesuch
@@ -2180,7 +2180,7 @@ ok
 -llm.cli.command = "alpha"
 -llm.model = "alpha"
 +llm.model = ""
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 populated llm.provider = nonesuch
@@ -2193,7 +2193,7 @@ ok
 -llm.cli.command = "alpha"
 -llm.model = "alpha"
 +llm.model = ""
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
 populated provider = nonesuch
@@ -2953,6 +2953,6 @@ ok
 
 seq default llm.model = alpha then provider = cli
 ok
--llm.provider = "claude-code"
+-llm.provider = "grok"
 +llm.provider = "cli"
 
