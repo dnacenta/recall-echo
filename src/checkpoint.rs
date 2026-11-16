@@ -88,14 +88,16 @@ pub fn run_with_hook_input(
 
     // The sidecar is a second record. A failure here must not throw away the
     // archive that was just written; the helper logs and returns.
-    archive::write_sidecar_best_effort(
-        base_dir,
-        next_num,
-        &fm.session_id,
-        &date,
-        None,
-        &data.entries,
-    );
+    if crate::graph::v2::input::turns_sidecar_enabled() {
+        archive::write_sidecar_best_effort(
+            base_dir,
+            next_num,
+            &fm.session_id,
+            &date,
+            None,
+            &data.entries,
+        );
+    }
 
     // Graph ingestion
     {

@@ -139,20 +139,91 @@ pub(crate) fn turns_sidecar(memory_dir: &Path, log_number: u32) -> PathBuf {
         .join(format!("conversation-{log_number:03}.json"))
 }
 
+/// Hook checkpoints write a turns sidecar, and [`load_session`] uses one only
+/// when its session id matches the archive. Always on, in one place.
+#[must_use]
+pub(crate) fn turns_sidecar_enabled() -> bool {
+    true
+}
+
+/// `session_id` on a turns sidecar, when the file parses.
+#[must_use]
+pub(crate) fn sidecar_session_id(path: &Path) -> Option<String> {
+    let file: TurnsFile = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    Some(file.session_id)
+}
+
 /// Sidecar when one was written, otherwise the markdown archive.
+///
+/// When both exist, the sidecar is used only when its `session_id` matches
+/// the archive frontmatter. A mismatch is one log line, then the markdown.
 pub(crate) fn load_session(memory_dir: &Path, log_number: u32) -> Result<SessionInput, GraphError> {
     let stem = format!("conversation-{log_number:03}");
     let sidecar = turns_sidecar(memory_dir, log_number);
-    if sidecar.is_file() {
-        return read_sidecar(&sidecar);
-    }
     let archive = memory_dir.join("conversations").join(format!("{stem}.md"));
+    if sidecar.is_file() {
+        let loaded = read_sidecar(&sidecar)?;
+        if markdown_instead(log_number, &loaded, &archive) {
+            return read_markdown(&archive);
+        }
+        return Ok(loaded);
+    }
     if archive.is_file() {
         return read_markdown(&archive);
     }
     Err(GraphError::NotFound(format!(
         "{stem} has no turns sidecar and no archive"
     )))
+}
+
+/// True when both records exist and the sidecar must not be used.
+fn markdown_instead(log_number: u32, loaded: &SessionInput, archive: &Path) -> bool {
+    if !turns_sidecar_enabled() || !archive.is_file() {
+        return false;
+    }
+    if archive_session_id(archive).as_deref() == Some(loaded.session_id.as_str()) {
+        return false;
+    }
+    warn_sidecar_mismatch(log_number);
+    true
+}
+
+fn sidecar_mismatch_line(log_number: u32) -> String {
+    format!(
+        "recall-echo: conversation-{log_number:03} turns sidecar session does not match the archive; reading markdown"
+    )
+}
+
+fn warn_sidecar_mismatch(log_number: u32) {
+    eprintln!("{}", sidecar_mismatch_line(log_number));
+}
+
+fn archive_session_id(path: &Path) -> Option<String> {
+    let text = frontmatter_block(path)?;
+    crate::frontmatter::parse(&text).map(|frontmatter| frontmatter.session_id)
+}
+
+/// The opening frontmatter block, at most 64 lines.
+fn frontmatter_block(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(path).ok()?;
+    let mut header = String::new();
+    let mut markers = 0u32;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if index >= 64 {
+            break;
+        }
+        let line = line.ok()?;
+        header.push_str(&line);
+        header.push('\n');
+        if line.trim() == "---" {
+            markers += 1;
+            if markers == 2 {
+                break;
+            }
+        }
+    }
+    Some(header)
 }
 
 /// Lines the second pipeline reads.
@@ -1050,5 +1121,133 @@ kept
         .unwrap();
         assert_eq!(sidecar["cwd"], "/work/linkshelf");
         assert_eq!(sidecar["project"]["name"], "linkshelf");
+    }
+
+    fn write_pair(
+        memory: &Path,
+        archive_session: &str,
+        archive_body: &str,
+        sidecar_session: &str,
+        turns: &[(&str, TurnRole)],
+    ) {
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        let archive = format!(
+            "---\nlog: 1\ndate: \"2026-04-01T00:00:00Z\"\nsession_id: \"{archive_session}\"\n\
+             message_count: 1\nduration: \"1m\"\nsource: \"jsonl\"\ntopics: []\n---\n\n\
+             {archive_body}"
+        );
+        fs::write(memory.join("conversations/conversation-001.md"), archive).unwrap();
+        let entries: Vec<ConversationEntry> = turns
+            .iter()
+            .map(|(text, role)| match role {
+                TurnRole::User => ConversationEntry::UserMessage((*text).to_string()),
+                TurnRole::Assistant => ConversationEntry::AssistantText((*text).to_string()),
+            })
+            .collect();
+        write_turns_sidecar(memory, 1, sidecar_session, "2026-04-01", None, &entries).unwrap();
+    }
+
+    fn texts(session: &SessionInput) -> Vec<&str> {
+        session
+            .turns
+            .iter()
+            .map(|turn| turn.text.as_str())
+            .collect()
+    }
+
+    /// AC2: a capture whose sidecar names the archive keeps the sidecar turns.
+    #[test]
+    fn a_capture_archive_loads_its_matching_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        let conv = crate::conversation::Conversation {
+            session_id: "sess".into(),
+            first_timestamp: Some("2026-04-01T00:00:00Z".into()),
+            last_timestamp: Some("2026-04-01T00:01:00Z".into()),
+            user_message_count: 2,
+            assistant_message_count: 0,
+            entries: vec![
+                ConversationEntry::UserMessage("alpha".into()),
+                ConversationEntry::UserMessage("beta".into()),
+            ],
+        };
+        crate::archive::archive_conversation(
+            tmp.path(),
+            &conv,
+            &crate::summarize::ConversationSummary::default(),
+            "jsonl",
+        )
+        .unwrap();
+
+        let session = load_session(tmp.path(), 1).unwrap();
+        assert_eq!(session.session_id, "sess");
+        assert_eq!(session.date, "2026-04-01");
+        assert_eq!(
+            session
+                .turns
+                .iter()
+                .map(|turn| (turn.role, turn.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(TurnRole::User, "alpha"), (TurnRole::User, "beta")]
+        );
+        assert!(turns_sidecar_enabled());
+    }
+
+    /// A matching sidecar wins, including when both session ids are empty.
+    #[test]
+    fn a_matching_sidecar_is_used_including_an_empty_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pair(
+            tmp.path(),
+            "",
+            "### User\n\nfrom the archive\n",
+            "",
+            &[("from the sidecar", TurnRole::User)],
+        );
+        let session = load_session(tmp.path(), 1).unwrap();
+        assert_eq!(session.session_id, "");
+        assert_eq!(texts(&session), vec!["from the sidecar"]);
+    }
+
+    /// AC4: a leftover sidecar for another session is ignored, with one log line.
+    #[test]
+    fn a_mismatched_sidecar_is_ignored_and_logged_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pair(
+            tmp.path(),
+            "sess-b",
+            "### User\n\nfrom the archive\n",
+            "sess-a",
+            &[("from the sidecar", TurnRole::Assistant)],
+        );
+        let session = load_session(tmp.path(), 1).unwrap();
+        assert_eq!(session.session_id, "sess-b");
+        assert_eq!(texts(&session), vec!["from the archive"]);
+        assert_eq!(session.turns[0].role, TurnRole::User);
+        let production = include_str!("input.rs").split("mod tests").next().unwrap();
+        assert_eq!(production.matches("warn_sidecar_mismatch(").count(), 2);
+        assert_eq!(
+            sidecar_mismatch_line(1),
+            "recall-echo: conversation-001 turns sidecar session does not match the archive; reading markdown"
+        );
+    }
+
+    /// A sidecar with no archive is still the session, as before.
+    #[test]
+    fn a_sidecar_without_an_archive_is_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_turns_sidecar(
+            tmp.path(),
+            4,
+            "sess-a",
+            "2026-04-01",
+            None,
+            &[ConversationEntry::UserMessage("only".into())],
+        )
+        .unwrap();
+        let session = load_session(tmp.path(), 4).unwrap();
+        assert_eq!(session.session_id, "sess-a");
+        assert_eq!(texts(&session), vec!["only"]);
+        assert_eq!(session.turns[0].role, TurnRole::User);
     }
 }

@@ -320,7 +320,13 @@ fn read_header(path: &Path) -> Option<Frontmatter> {
 
 /// Turns from the sidecar, when that file exists and names `session_id`.
 fn stored_turns(memory_dir: &Path, log: u32, session_id: &str) -> Option<Vec<(TurnRole, String)>> {
-    if !crate::graph::v2::input::turns_sidecar(memory_dir, log).is_file() {
+    let path = crate::graph::v2::input::turns_sidecar(memory_dir, log);
+    if !path.is_file() {
+        return None;
+    }
+    // `load_session` reads the markdown when the sidecar names another session.
+    // A repeat still requires the sidecar file itself to name this session.
+    if crate::graph::v2::input::sidecar_session_id(&path).as_deref() != Some(session_id) {
         return None;
     }
     let session = crate::graph::v2::input::load_session(memory_dir, log).ok()?;
