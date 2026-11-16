@@ -380,7 +380,12 @@ pub async fn run(
         .collect::<Result<Vec<_>, _>>()?;
     let mut report =
         grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
-    report.consolidate_hold = consolidate.writes_hold();
+    // The JSON field follows the config this run resolved, not the CLI on-flag.
+    // A missing key stays the default, so a flagless run reports the hold.
+    report.consolidate_hold = crate::config::load_from_dir(&memory_dir)
+        .graph
+        .unwrap_or_default()
+        .hold_applies();
     report.setup_millis = setup_millis;
     Ok(report)
 }
@@ -5026,6 +5031,61 @@ mod tests {
             (Some(7), Some(2))
         );
         assert_eq!((nope.input_tokens, nope.output_tokens), (Some(7), Some(2)));
+    }
+
+    /// A flagless run reports the hold. Opting out of the hold, or of
+    /// consolidation, omits the field. The on-flag is not what decides it.
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn consolidate_hold_in_the_report_follows_the_resolved_config() {
+        const SCRIPT: &str = "name = \"hold\"\nfacts = []\n\
+             [[sessions]]\nid = \"s1\"\ndate = \"2026-03-01T00:00:00Z\"\n\
+             [[sessions.turns]]\nrole = \"user\"\ntext = \"Keep the shelf label as cedar.\"\n";
+
+        async fn reported(opt_outs: OptOuts) -> Option<bool> {
+            let script = crate::bench::writes::parse_script(SCRIPT).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let report = run(
+                &script,
+                tmp.path(),
+                Extractor::Scripted,
+                PipelineVersion::V1,
+                KnownFactsContext::Off,
+                KnownMatch::Off,
+                Consolidate::Off,
+                DropRestatements::Off,
+                ConsolidateLinks::Off,
+                GroundComponentEdges::Off,
+                ConsolidateComponents::Off,
+                RecoverTurns::Off,
+                ConsolidateKeyRename::Off,
+                ConsolidateReplacesCue::Off,
+                ConsolidateReplacesDeparture::Off,
+                ConsolidateOrphanSweep::Off,
+                ConsolidateRuleFragments::Off,
+                ConsolidateRetireComponent::Off,
+                KnownKeyBinding::Off,
+                opt_outs,
+            )
+            .await
+            .unwrap();
+            serde_json::to_value(&report)
+                .unwrap()
+                .get("consolidate_hold")
+                .map(|value| value.as_bool().expect("consolidate_hold is a bool"))
+        }
+
+        assert_eq!(reported(OptOuts::default()).await, Some(true));
+        let no_hold = OptOuts {
+            consolidate_hold: true,
+            ..OptOuts::default()
+        };
+        assert_eq!(reported(no_hold).await, None);
+        let no_consolidate = OptOuts {
+            consolidate: true,
+            ..OptOuts::default()
+        };
+        assert_eq!(reported(no_consolidate).await, None);
     }
 
     #[cfg(feature = "embedded")]
