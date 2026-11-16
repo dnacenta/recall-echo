@@ -127,8 +127,44 @@ pub(crate) fn write_turns_sidecar(
     };
     let path = dir.join(format!("conversation-{log_number:03}.json"));
     let body = serde_json::to_string_pretty(&sidecar)?;
-    fs::write(path, format!("{body}\n"))?;
+    replace_file(&path, &format!("{body}\n"))?;
     Ok(())
+}
+
+/// Write `contents` via a temp file in the same directory, then rename.
+///
+/// A failed write leaves the previous file intact. The renamed bytes are
+/// `contents` unchanged.
+fn replace_file(path: &Path, contents: &str) -> Result<(), GraphError> {
+    let tmp = temp_beside(path)?;
+    if let Err(err) = fs::write(&tmp, contents) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+fn temp_beside(path: &Path) -> Result<PathBuf, GraphError> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sidecar path has no directory",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sidecar path has no file name",
+        )
+    })?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp");
+    Ok(parent.join(tmp_name))
 }
 
 /// `turns/conversation-NNN.json`, the sidecar [`load_session`] prefers.
@@ -153,20 +189,18 @@ pub(crate) fn sidecar_session_id(path: &Path) -> Option<String> {
     Some(file.session_id)
 }
 
-/// Sidecar when one was written, otherwise the markdown archive.
+/// Sidecar when one was written and can be read, otherwise the markdown archive.
 ///
-/// When both exist, the sidecar is used only when its `session_id` matches
-/// the archive frontmatter. A mismatch is one log line, then the markdown.
+/// When both exist, the sidecar is used when it parses and its `session_id`
+/// matches a parsed archive frontmatter. A mismatch, or a sidecar that does
+/// not parse, is one log line and then the markdown. An archive header that
+/// does not parse keeps the sidecar. A sidecar with no archive is unchanged.
 pub(crate) fn load_session(memory_dir: &Path, log_number: u32) -> Result<SessionInput, GraphError> {
     let stem = format!("conversation-{log_number:03}");
     let sidecar = turns_sidecar(memory_dir, log_number);
     let archive = memory_dir.join("conversations").join(format!("{stem}.md"));
     if sidecar.is_file() {
-        let loaded = read_sidecar(&sidecar)?;
-        if markdown_instead(log_number, &loaded, &archive) {
-            return read_markdown(&archive);
-        }
-        return Ok(loaded);
+        return session_from_sidecar(log_number, &sidecar, &archive);
     }
     if archive.is_file() {
         return read_markdown(&archive);
@@ -176,12 +210,36 @@ pub(crate) fn load_session(memory_dir: &Path, log_number: u32) -> Result<Session
     )))
 }
 
-/// True when both records exist and the sidecar must not be used.
+fn session_from_sidecar(
+    log_number: u32,
+    sidecar: &Path,
+    archive: &Path,
+) -> Result<SessionInput, GraphError> {
+    match read_sidecar(sidecar) {
+        Ok(loaded) => {
+            if markdown_instead(log_number, &loaded, archive) {
+                read_markdown(archive)
+            } else {
+                Ok(loaded)
+            }
+        }
+        Err(err) if turns_sidecar_enabled() && archive.is_file() => {
+            warn_unreadable_sidecar(log_number, &err);
+            read_markdown(archive)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// True when the archive parsed a different session id, so the sidecar is stale.
 fn markdown_instead(log_number: u32, loaded: &SessionInput, archive: &Path) -> bool {
     if !turns_sidecar_enabled() || !archive.is_file() {
         return false;
     }
-    if archive_session_id(archive).as_deref() == Some(loaded.session_id.as_str()) {
+    let Some(header) = crate::archive::read_header(archive) else {
+        return false;
+    };
+    if header.session_id == loaded.session_id {
         return false;
     }
     warn_sidecar_mismatch(log_number);
@@ -194,36 +252,23 @@ fn sidecar_mismatch_line(log_number: u32) -> String {
     )
 }
 
+fn unreadable_sidecar_line(log_number: u32, err: &GraphError) -> String {
+    format!(
+        "recall-echo: conversation-{log_number:03} turns sidecar could not be read ({err}); reading markdown"
+    )
+}
+
 fn warn_sidecar_mismatch(log_number: u32) {
-    eprintln!("{}", sidecar_mismatch_line(log_number));
+    emit_line(&sidecar_mismatch_line(log_number));
 }
 
-fn archive_session_id(path: &Path) -> Option<String> {
-    let text = frontmatter_block(path)?;
-    crate::frontmatter::parse(&text).map(|frontmatter| frontmatter.session_id)
+fn warn_unreadable_sidecar(log_number: u32, err: &GraphError) {
+    emit_line(&unreadable_sidecar_line(log_number, err));
 }
 
-/// The opening frontmatter block, at most 64 lines.
-fn frontmatter_block(path: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader};
-    let file = fs::File::open(path).ok()?;
-    let mut header = String::new();
-    let mut markers = 0u32;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        if index >= 64 {
-            break;
-        }
-        let line = line.ok()?;
-        header.push_str(&line);
-        header.push('\n');
-        if line.trim() == "---" {
-            markers += 1;
-            if markers == 2 {
-                break;
-            }
-        }
-    }
-    Some(header)
+fn emit_line(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 /// Lines the second pipeline reads.
@@ -1220,16 +1265,160 @@ kept
             "sess-a",
             &[("from the sidecar", TurnRole::Assistant)],
         );
-        let session = load_session(tmp.path(), 1).unwrap();
+        let (session, logged) = stderr_lines(|| load_session(tmp.path(), 1).unwrap());
         assert_eq!(session.session_id, "sess-b");
         assert_eq!(texts(&session), vec!["from the archive"]);
         assert_eq!(session.turns[0].role, TurnRole::User);
-        let production = include_str!("input.rs").split("mod tests").next().unwrap();
-        assert_eq!(production.matches("warn_sidecar_mismatch(").count(), 2);
         assert_eq!(
-            sidecar_mismatch_line(1),
-            "recall-echo: conversation-001 turns sidecar session does not match the archive; reading markdown"
+            logged,
+            vec![
+                "recall-echo: conversation-001 turns sidecar session does not match the archive; reading markdown"
+                    .to_string()
+            ]
         );
+    }
+
+    /// A torn sidecar is ignored when the archive is there, and still an error alone.
+    #[test]
+    fn a_truncated_sidecar_with_an_archive_is_read_from_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pair(
+            tmp.path(),
+            "sess-a",
+            "### User\n\nfrom the archive\n",
+            "sess-a",
+            &[("from the sidecar", TurnRole::Assistant)],
+        );
+        assert!(!tmp.path().join("turns/.conversation-001.json.tmp").exists());
+        fs::write(tmp.path().join("turns/conversation-001.json"), "{").unwrap();
+
+        let (session, logged) = stderr_lines(|| load_session(tmp.path(), 1).unwrap());
+        assert_eq!(session.session_id, "sess-a");
+        assert_eq!(texts(&session), vec!["from the archive"]);
+        assert_eq!(session.turns[0].role, TurnRole::User);
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0]
+            .starts_with("recall-echo: conversation-001 turns sidecar could not be read ("));
+        assert!(logged[0].ends_with("); reading markdown"));
+    }
+
+    #[test]
+    fn a_truncated_sidecar_without_an_archive_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("turns")).unwrap();
+        fs::write(tmp.path().join("turns/conversation-001.json"), "{").unwrap();
+
+        let (result, logged) = stderr_lines(|| load_session(tmp.path(), 1));
+        assert!(result.is_err());
+        assert!(logged.is_empty());
+        let message = result.unwrap_err().to_string();
+        assert!(!message.contains("has no turns sidecar and no archive"));
+    }
+
+    /// An archive whose header does not parse keeps a valid sidecar.
+    #[test]
+    fn an_unparsed_archive_header_keeps_the_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        fs::write(
+            tmp.path().join("conversations/conversation-001.md"),
+            "not frontmatter\n\n### User\n\nfrom the archive\n",
+        )
+        .unwrap();
+        write_turns_sidecar(
+            tmp.path(),
+            1,
+            "sess-a",
+            "2026-04-01",
+            None,
+            &[ConversationEntry::UserMessage("from the sidecar".into())],
+        )
+        .unwrap();
+
+        let (session, logged) = stderr_lines(|| load_session(tmp.path(), 1).unwrap());
+        assert_eq!(session.session_id, "sess-a");
+        assert_eq!(texts(&session), vec!["from the sidecar"]);
+        assert!(logged.is_empty());
+    }
+
+    fn stderr_lines<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let capture = StderrCapture::start();
+        let value = action();
+        let text = capture.finish();
+        let lines = text.lines().map(str::to_string).collect();
+        (value, lines)
+    }
+
+    struct StderrCapture {
+        saved: libc::c_int,
+        read_end: libc::c_int,
+        write_end: libc::c_int,
+        restored: bool,
+    }
+
+    impl StderrCapture {
+        fn start() -> Self {
+            let mut pipe = [0; 2];
+            // SAFETY: `pipe` is a two-slot buffer for the POSIX pipe call.
+            let rc = unsafe { libc::pipe(pipe.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            // SAFETY: dup of stderr returns a new fd or -1.
+            let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved >= 0);
+            let capture = Self {
+                saved,
+                read_end: pipe[0],
+                write_end: pipe[1],
+                restored: false,
+            };
+            // SAFETY: both fds are open. Drop restores stderr if this fails.
+            let swapped = unsafe { libc::dup2(capture.write_end, libc::STDERR_FILENO) };
+            assert_eq!(swapped, libc::STDERR_FILENO);
+            capture
+        }
+
+        fn finish(mut self) -> String {
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            self.restore();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                // SAFETY: `buf` is writable and `read_end` is this pipe.
+                let n = unsafe { libc::read(self.read_end, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n as usize]);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        fn restore(&mut self) {
+            if self.restored {
+                return;
+            }
+            // SAFETY: `saved` and `write_end` are fds this capture opened.
+            unsafe {
+                libc::dup2(self.saved, libc::STDERR_FILENO);
+                libc::close(self.saved);
+                libc::close(self.write_end);
+            }
+            self.restored = true;
+        }
+    }
+
+    impl Drop for StderrCapture {
+        fn drop(&mut self) {
+            self.restore();
+            if self.read_end >= 0 {
+                // SAFETY: `read_end` is the pipe read end, closed once.
+                unsafe { libc::close(self.read_end) };
+                self.read_end = -1;
+            }
+        }
     }
 
     /// A sidecar with no archive is still the session, as before.

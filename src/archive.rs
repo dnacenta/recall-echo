@@ -297,7 +297,7 @@ fn prior_capture(conversations_dir: &Path, session_id: &str) -> Option<u32> {
 }
 
 /// Frontmatter from the opening block. At most 64 lines are read.
-fn read_header(path: &Path) -> Option<Frontmatter> {
+pub(crate) fn read_header(path: &Path) -> Option<Frontmatter> {
     let file = fs::File::open(path).ok()?;
     let mut header = String::new();
     let mut markers = 0u32;
