@@ -3,11 +3,11 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
-## [5.0.0] — Unreleased
+## [5.0.0] — 2026-11-16
 
 ### Added
 
-- Opt-in consolidation pass after a session write (`[graph] consolidate`, `--consolidate`), off by default. The judge reply is one JSON object; a fenced or wrapped object is read and prose is not (#182, #184).
+- Consolidation pass after a session write (`[graph] consolidate`, `--consolidate`), on by default since 5.0.0 (see Changed). The judge reply is one JSON object; a fenced or wrapped object is read and prose is not (#182, #184).
 - With consolidation on, a verdict a guard does not apply is counted by reason (`consolidate.dropped`, summed as `consolidate_drops`). Off, the bench report is unchanged (#186).
 
 ### Breaking
