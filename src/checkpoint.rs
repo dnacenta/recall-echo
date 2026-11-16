@@ -86,6 +86,17 @@ pub fn run_with_hook_input(
     let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
     fs::write(&conv_file, &full_content)?;
 
+    // The sidecar is a second record. A failure here must not throw away the
+    // archive that was just written; the helper logs and returns.
+    archive::write_sidecar_best_effort(
+        base_dir,
+        next_num,
+        &fm.session_id,
+        &date,
+        None,
+        &data.entries,
+    );
+
     // Graph ingestion
     {
         let result = archive::ArchiveResult {
@@ -124,6 +135,7 @@ struct CheckpointData {
     duration: String,
     md_body: String,
     tags_section: String,
+    entries: Vec<conversation::ConversationEntry>,
 }
 
 fn extract_from_transcript(input: &crate::jsonl::HookInput) -> Option<CheckpointData> {
@@ -150,6 +162,7 @@ fn extract_from_transcript(input: &crate::jsonl::HookInput) -> Option<Checkpoint
         duration,
         md_body,
         tags_section,
+        entries: conv.entries,
     })
 }
 
@@ -161,6 +174,7 @@ fn empty_checkpoint() -> CheckpointData {
         duration: String::new(),
         md_body: "# Checkpoint\n\nNo transcript available.\n".to_string(),
         tags_section: String::new(),
+        entries: Vec::new(),
     }
 }
 
@@ -282,5 +296,122 @@ mod tests {
         assert!(data.topics.is_empty());
         assert_eq!(data.message_count, 0);
         assert!(data.md_body.contains("No transcript available"));
+    }
+
+    fn prepared_root() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("conversations")).unwrap();
+        tmp
+    }
+
+    fn hook_for(root: &Path, session_id: &str, lines: &[&str]) -> crate::jsonl::HookInput {
+        let path = root.join("session.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        crate::jsonl::HookInput {
+            session_id: session_id.to_string(),
+            transcript_path: path.to_string_lossy().to_string(),
+            _cwd: None,
+            _hook_event_name: Some("PreCompact".to_string()),
+        }
+    }
+
+    /// AC1: a hook checkpoint writes a sidecar, and load returns each turn's role.
+    #[test]
+    fn hook_checkpoint_writes_a_sidecar_with_roles() {
+        let tmp = prepared_root();
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"sess-a","message":{"role":"user","content":"alpha"}}"#,
+            r#"{"type":"user","timestamp":"2026-03-05T14:31:00.100Z","sessionId":"sess-a","message":{"role":"user","content":"beta"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-05T14:32:00.100Z","sessionId":"sess-a","message":{"role":"assistant","content":[{"type":"text","text":"gamma"}]}}"#,
+        ];
+        let input = hook_for(tmp.path(), "sess-a", &lines);
+        run_with_hook_input("precompact", Some(&input), tmp.path()).unwrap();
+
+        let sidecar_path = tmp.path().join("turns/conversation-001.json");
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+        assert_eq!(sidecar["session_id"], "sess-a");
+        let archive =
+            fs::read_to_string(tmp.path().join("conversations/conversation-001.md")).unwrap();
+        let frontmatter = crate::frontmatter::parse(&archive).unwrap();
+        assert_eq!(
+            sidecar["date"],
+            conversation::date_from_timestamp(&frontmatter.date)
+        );
+        assert!(archive.contains("### User"));
+        assert!(!archive.contains("turns/"));
+
+        let session = crate::graph::v2::input::load_session(tmp.path(), 1).unwrap();
+        assert_eq!(session.session_id, "sess-a");
+        assert_eq!(session.date, sidecar["date"].as_str().unwrap());
+        let turns: Vec<_> = session
+            .turns
+            .iter()
+            .map(|turn| (turn.role, turn.text.as_str()))
+            .collect();
+        assert_eq!(
+            turns,
+            vec![
+                (crate::graph::v2::input::TurnRole::User, "alpha"),
+                (crate::graph::v2::input::TurnRole::User, "beta"),
+                (crate::graph::v2::input::TurnRole::Assistant, "gamma"),
+            ]
+        );
+    }
+
+    /// AC3: an empty checkpoint still writes a sidecar, replacing a leftover.
+    #[test]
+    fn empty_hook_checkpoint_overwrites_a_leftover_sidecar() {
+        let tmp = prepared_root();
+        crate::graph::v2::input::write_turns_sidecar(
+            tmp.path(),
+            1,
+            "sess-a",
+            "2020-01-01",
+            None,
+            &[conversation::ConversationEntry::UserMessage(
+                "leftover".into(),
+            )],
+        )
+        .unwrap();
+
+        run_with_hook_input("precompact", None, tmp.path()).unwrap();
+
+        let session = crate::graph::v2::input::load_session(tmp.path(), 1).unwrap();
+        assert_eq!(session.session_id, "");
+        assert!(session.turns.is_empty());
+        let archive =
+            fs::read_to_string(tmp.path().join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("No transcript available"));
+        let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("| 001 |"));
+    }
+
+    /// AC7: a sidecar write that cannot create the file keeps the markdown and index.
+    #[test]
+    fn a_failed_sidecar_write_keeps_the_markdown_and_index() {
+        let tmp = prepared_root();
+        let turns = tmp.path().join("turns");
+        fs::create_dir_all(&turns).unwrap();
+        let mut perms = fs::metadata(&turns).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&turns, perms).unwrap();
+
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"sess-a","message":{"role":"user","content":"alpha"}}"#,
+        ];
+        let input = hook_for(tmp.path(), "sess-a", &lines);
+        run_with_hook_input("precompact", Some(&input), tmp.path()).unwrap();
+
+        let archive =
+            fs::read_to_string(tmp.path().join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("session_id: \"sess-a\""));
+        assert!(archive.contains("alpha"));
+        let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("sess-a"));
+        assert!(!tmp.path().join("turns/conversation-001.json").exists());
     }
 }
