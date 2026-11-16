@@ -187,7 +187,7 @@ pub async fn create_checkpoint(
     let log_number = result.log_number;
 
     // Graph ingestion (async path)
-    if log_number > 0 {
+    if result.is_new_archive() {
         if let Err(e) = crate::graph_bridge::ingest_into_graph(
             memory_dir,
             &result.full_content,

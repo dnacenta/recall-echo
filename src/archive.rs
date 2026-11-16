@@ -17,10 +17,11 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::config;
-use crate::conversation::{self, Conversation};
+use crate::conversation::{self, Conversation, ConversationEntry};
 use crate::ephemeral::{self, EphemeralEntry};
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
+use crate::graph::v2::input::TurnRole;
 use crate::summarize;
 use crate::tags;
 use crate::transcript::{ClaudeCodeTranscripts, Transcript};
@@ -41,6 +42,15 @@ pub struct ArchiveResult {
     pub log_number: u32,
     pub full_content: String,
     pub session_id: String,
+}
+
+impl ArchiveResult {
+    /// Empty content means an empty session or a session already archived
+    /// under `log_number`, so there is nothing to ingest.
+    #[must_use]
+    pub fn is_new_archive(&self) -> bool {
+        self.log_number > 0 && !self.full_content.is_empty()
+    }
 }
 
 /// Scan conversations/ for highest conversation-NNN number. Returns 0 if none.
@@ -253,6 +263,119 @@ fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
     Ok(())
 }
 
+/// Sources written by a capture. A checkpoint trigger is never one of these.
+const CAPTURE_SOURCES: [&str; 6] = ["jsonl", "gemini", "claude-code", "codex", "grok", "session"];
+
+/// The highest earlier capture of `session_id`. An empty id, a checkpoint,
+/// and an unreadable header are not captures.
+fn prior_capture(conversations_dir: &Path, session_id: &str) -> Option<u32> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let mut best: Option<u32> = None;
+    let entries = fs::read_dir(conversations_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(num_str) = name
+            .strip_prefix("conversation-")
+            .and_then(|rest| rest.strip_suffix(".md"))
+        else {
+            continue;
+        };
+        let Ok(number) = num_str.parse::<u32>() else {
+            continue;
+        };
+        let Some(header) = read_header(&entry.path()) else {
+            continue;
+        };
+        if header.session_id == session_id && CAPTURE_SOURCES.contains(&header.source.as_str()) {
+            best = Some(best.map_or(number, |current| current.max(number)));
+        }
+    }
+    best
+}
+
+/// Frontmatter from the opening block. At most 64 lines are read.
+fn read_header(path: &Path) -> Option<Frontmatter> {
+    let file = fs::File::open(path).ok()?;
+    let mut header = String::new();
+    let mut markers = 0u32;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if index >= 64 {
+            break;
+        }
+        let line = line.ok()?;
+        header.push_str(&line);
+        header.push('\n');
+        if line.trim() == "---" {
+            markers += 1;
+            if markers == 2 {
+                break;
+            }
+        }
+    }
+    crate::frontmatter::parse(&header)
+}
+
+/// Turns from the sidecar, when that file exists and names `session_id`.
+fn stored_turns(memory_dir: &Path, log: u32, session_id: &str) -> Option<Vec<(TurnRole, String)>> {
+    if !crate::graph::v2::input::turns_sidecar(memory_dir, log).is_file() {
+        return None;
+    }
+    let session = crate::graph::v2::input::load_session(memory_dir, log).ok()?;
+    if session.session_id != session_id {
+        return None;
+    }
+    Some(
+        session
+            .turns
+            .into_iter()
+            .map(|turn| (turn.role, turn.text))
+            .collect(),
+    )
+}
+
+/// User and assistant text, in order. Empty text and tool entries are skipped.
+fn text_turns(entries: &[ConversationEntry]) -> Vec<(TurnRole, &str)> {
+    let mut turns = Vec::new();
+    for entry in entries {
+        let (role, text) = match entry {
+            ConversationEntry::UserMessage(text) => (TurnRole::User, text.as_str()),
+            ConversationEntry::AssistantText(text) => (TurnRole::Assistant, text.as_str()),
+            ConversationEntry::ToolUse { .. } | ConversationEntry::ToolResult { .. } => continue,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        turns.push((role, text));
+    }
+    turns
+}
+
+/// True when `incoming` is a non-empty exact prefix of `stored`, role and text.
+fn is_repeat(incoming: &[(TurnRole, &str)], stored: &[(TurnRole, String)]) -> bool {
+    if incoming.is_empty() || incoming.len() > stored.len() {
+        return false;
+    }
+    for (index, turn) in incoming.iter().enumerate() {
+        let Some(kept) = stored.get(index) else {
+            return false;
+        };
+        if turn.0 != kept.0 || turn.1 != kept.1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The earlier capture to return when `conv` repeats it.
+fn repeat_of(memory_dir: &Path, conv: &Conversation) -> Option<u32> {
+    let log = prior_capture(&memory_dir.join("conversations"), &conv.session_id)?;
+    let stored = stored_turns(memory_dir, log, &conv.session_id)?;
+    is_repeat(&text_turns(&conv.entries), &stored).then_some(log)
+}
+
 fn write_archive(
     memory_dir: &Path,
     conv: &Conversation,
@@ -275,6 +398,18 @@ fn write_archive(
     if conv.user_message_count == 0 {
         return Ok(ArchiveResult {
             log_number: 0,
+            full_content: String::new(),
+            session_id: conv.session_id.clone(),
+        });
+    }
+
+    if let Some(log) = repeat_of(memory_dir, conv) {
+        eprintln!(
+            "recall-echo: conversation-{log:03}.md already holds session {}, nothing new to archive",
+            conv.session_id
+        );
+        return Ok(ArchiveResult {
+            log_number: log,
             full_content: String::new(),
             session_id: conv.session_id.clone(),
         });
@@ -439,7 +574,7 @@ pub(crate) fn write_sidecar_best_effort(
 
 /// Ingest an archive result into the knowledge graph.
 pub fn graph_ingest(memory_dir: &Path, result: &ArchiveResult) {
-    if result.log_number == 0 {
+    if !result.is_new_archive() {
         return;
     }
     let rt = match client_runtime() {
@@ -611,8 +746,10 @@ fn archive_and_ingest(
     let result = archive_conversation_with_cwd(base_dir, conv, &summary, source, cwd)?;
     let log_number = result.log_number;
 
-    graph_ingest(base_dir, &result);
-    pipeline_sync_on_archive(base_dir);
+    if result.is_new_archive() {
+        graph_ingest(base_dir, &result);
+        pipeline_sync_on_archive(base_dir);
+    }
 
     Ok(log_number)
 }
@@ -917,7 +1054,7 @@ pub async fn archive_session(
     let log_number = result.log_number;
 
     // Graph ingestion (async path — no need for Runtime)
-    if log_number > 0 {
+    if result.is_new_archive() {
         if let Err(e) = crate::graph_bridge::ingest_into_graph(
             memory_dir,
             &result.full_content,
@@ -1105,7 +1242,9 @@ mod tests {
         let summary = summarize::ConversationSummary::default();
 
         archive_pulse_conversation(memory, &conv, &summary, "session", "Echo").unwrap();
-        archive_conversation(memory, &conv, &summary, "jsonl").unwrap();
+        let mut plain = conv.clone();
+        plain.session_id = "plain-session".to_string();
+        archive_conversation(memory, &plain, &summary, "jsonl").unwrap();
 
         let named = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
         assert!(named.contains("\npulse: \"Echo\"\n"), "{named}");
@@ -1601,5 +1740,491 @@ mod tests {
             Some("/from/ref")
         );
         assert_eq!(resolve_cwd(None, None, None), None);
+    }
+
+    fn dialogue(session_id: &str, lines: &[(&str, &str)]) -> Conversation {
+        let mut conv = Conversation::new(session_id);
+        for (role, text) in lines {
+            match *role {
+                "user" => {
+                    conv.user_message_count += 1;
+                    conv.entries
+                        .push(ConversationEntry::UserMessage((*text).to_string()));
+                }
+                "assistant" => {
+                    conv.assistant_message_count += 1;
+                    conv.entries
+                        .push(ConversationEntry::AssistantText((*text).to_string()));
+                }
+                _ => unreachable!("role"),
+            }
+        }
+        conv
+    }
+
+    fn archive(memory: &Path, conv: &Conversation, source: &str) -> ArchiveResult {
+        archive_conversation(
+            memory,
+            conv,
+            &summarize::ConversationSummary::default(),
+            source,
+        )
+        .unwrap()
+    }
+
+    fn conversation_names(memory: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(memory.join("conversations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("conversation-") && name.ends_with(".md"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn archive_data_rows(memory: &Path) -> usize {
+        let path = memory.join("ARCHIVE.md");
+        if !path.exists() {
+            return 0;
+        }
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.starts_with("| ") && line.as_bytes().get(2).is_some_and(u8::is_ascii_digit)
+            })
+            .count()
+    }
+
+    fn sidecar_names(memory: &Path) -> Vec<String> {
+        let dir = memory.join("turns");
+        if !dir.is_dir() {
+            return Vec::new();
+        }
+        let mut names = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn record_bytes(memory: &Path) -> Vec<Vec<u8>> {
+        vec![
+            fs::read(memory.join("conversations/conversation-001.md")).unwrap(),
+            fs::read(memory.join("turns/conversation-001.json")).unwrap(),
+            fs::read(memory.join("ARCHIVE.md")).unwrap(),
+            fs::read(memory.join("EPHEMERAL.md")).unwrap(),
+        ]
+    }
+
+    fn claude_transcript(dir: &Path) -> String {
+        let path = dir.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"alpha"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn hook_for(session: &str, path: &str) -> crate::jsonl::HookInput {
+        crate::jsonl::HookInput {
+            session_id: session.into(),
+            transcript_path: path.into(),
+            _cwd: None,
+            _hook_event_name: Some("SessionEnd".into()),
+        }
+    }
+
+    /// AC-1: the same capture twice writes one archive and returns it.
+    #[test]
+    fn a_repeat_capture_returns_the_existing_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = dialogue("sess", &[("user", "hello"), ("assistant", "alpha")]);
+        assert!(archive(memory, &conv, "jsonl").is_new_archive());
+        let before = record_bytes(memory);
+
+        let second = archive(memory, &conv, "jsonl");
+
+        assert_eq!(second.log_number, 1);
+        assert!(!second.is_new_archive());
+        assert!(second.full_content.is_empty());
+        assert_eq!(record_bytes(memory), before);
+        assert_eq!(
+            conversation_names(memory),
+            vec!["conversation-001.md".to_string()]
+        );
+        assert_eq!(archive_data_rows(memory), 1);
+        assert_eq!(
+            crate::ephemeral::count_entries(&memory.join("EPHEMERAL.md")).unwrap(),
+            1
+        );
+        assert_eq!(
+            sidecar_names(memory),
+            vec!["conversation-001.json".to_string()]
+        );
+        assert!(!memory.join("graph").exists());
+    }
+
+    /// AC-2: the SessionEnd hook does not archive the same transcript twice.
+    #[test]
+    fn the_hook_archives_one_transcript_once() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let path = claude_transcript(memory);
+        let hook = hook_for("sess", &path);
+        run_with_hook_input(&hook, memory).unwrap();
+        run_with_hook_input(&hook, memory).unwrap();
+        assert_eq!(conversation_names(memory).len(), 1);
+        assert_eq!(archive_data_rows(memory), 1);
+        assert!(!memory.join("graph").exists());
+    }
+
+    /// AC-2: a sweep capture and the hook of the same file are one archive.
+    #[test]
+    fn a_sweep_capture_then_the_hook_archives_once() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let path = claude_transcript(memory);
+        let conv = crate::jsonl::parse_transcript(&path, "sess").unwrap();
+        archive(memory, &conv, "claude-code");
+        run_with_hook_input(&hook_for("sess", &path), memory).unwrap();
+        assert_eq!(
+            conversation_names(memory),
+            vec!["conversation-001.md".to_string()]
+        );
+        assert_eq!(archive_data_rows(memory), 1);
+        let archived =
+            fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        assert!(archived.contains("source: \"claude-code\""), "{archived}");
+        assert!(!memory.join("graph").exists());
+    }
+
+    /// AC-3: an exact prefix of the stored turns writes nothing.
+    #[test]
+    fn a_prefix_of_the_stored_turns_is_a_repeat() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let full = dialogue(
+            "sess",
+            &[
+                ("user", "alpha"),
+                ("assistant", "hello"),
+                ("user", "alpha"),
+                ("assistant", "hello"),
+            ],
+        );
+        let prefix = dialogue("sess", &[("user", "alpha"), ("assistant", "hello")]);
+        archive(memory, &full, "jsonl");
+        let before = record_bytes(memory);
+        let again = archive(memory, &prefix, "jsonl");
+        assert_eq!(again.log_number, 1);
+        assert!(!again.is_new_archive());
+        assert_eq!(record_bytes(memory), before);
+    }
+
+    /// AC-3: the same number of turns with different text is a new archive.
+    #[test]
+    fn the_same_count_with_different_text_is_a_new_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        archive(
+            memory,
+            &dialogue("sess", &[("user", "hello"), ("assistant", "alpha")]),
+            "jsonl",
+        );
+        let second = archive(
+            memory,
+            &dialogue("sess", &[("user", "alpha"), ("assistant", "hello")]),
+            "jsonl",
+        );
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-3: the same texts with the roles swapped are a new archive.
+    #[test]
+    fn the_same_texts_with_roles_swapped_is_a_new_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        archive(
+            memory,
+            &dialogue("sess", &[("user", "hello"), ("assistant", "alpha")]),
+            "jsonl",
+        );
+        let second = archive(
+            memory,
+            &dialogue("sess", &[("assistant", "hello"), ("user", "alpha")]),
+            "jsonl",
+        );
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-3: a grown transcript is a new archive.
+    #[test]
+    fn a_grown_transcript_is_a_new_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        archive(
+            memory,
+            &dialogue("sess", &[("user", "hello"), ("assistant", "alpha")]),
+            "jsonl",
+        );
+        let second = archive(
+            memory,
+            &dialogue(
+                "sess",
+                &[("user", "hello"), ("assistant", "alpha"), ("user", "hello")],
+            ),
+            "jsonl",
+        );
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-4: a PreCompact checkpoint is not the capture the hook returns.
+    #[test]
+    fn a_precompact_checkpoint_is_not_the_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let path = claude_transcript(memory);
+        let input = hook_for("sess", &path);
+        crate::checkpoint::run_with_hook_input("precompact", Some(&input), memory).unwrap();
+        run_with_hook_input(&input, memory).unwrap();
+        assert_eq!(conversation_names(memory).len(), 2);
+        let first = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        let second = fs::read_to_string(memory.join("conversations/conversation-002.md")).unwrap();
+        assert!(first.contains("source: \"precompact\""), "{first}");
+        assert!(second.contains("source: \"jsonl\""), "{second}");
+        assert!(second.contains("### User"), "{second}");
+        assert!(!memory.join("graph").exists());
+    }
+
+    /// AC-4: source `checkpoint` is not a prior capture.
+    #[test]
+    fn a_checkpoint_source_is_not_a_prior_capture() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = dialogue("sess", &[("user", "hello")]);
+        archive(memory, &conv, "checkpoint");
+        let second = archive(memory, &conv, "jsonl");
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-5: a prefix of the latest capture reuses that archive, not an earlier one.
+    #[test]
+    fn a_prefix_reuses_the_latest_capture() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        archive(
+            memory,
+            &dialogue("sess", &[("user", "alpha"), ("assistant", "hello")]),
+            "jsonl",
+        );
+        archive(
+            memory,
+            &dialogue(
+                "sess",
+                &[
+                    ("user", "alpha"),
+                    ("assistant", "hello"),
+                    ("user", "alpha"),
+                    ("assistant", "hello"),
+                ],
+            ),
+            "jsonl",
+        );
+        let reused = archive(
+            memory,
+            &dialogue(
+                "sess",
+                &[("user", "alpha"), ("assistant", "hello"), ("user", "alpha")],
+            ),
+            "jsonl",
+        );
+        assert_eq!(reused.log_number, 2);
+        assert!(!reused.is_new_archive());
+        assert_eq!(conversation_names(memory).len(), 2);
+    }
+
+    /// AC-5: an empty session id is never deduplicated.
+    #[test]
+    fn an_empty_session_id_is_archived_twice() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = dialogue("", &[("user", "hello")]);
+        assert_eq!(archive(memory, &conv, "jsonl").log_number, 1);
+        let second = archive(memory, &conv, "jsonl");
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-5: `sess` and `sess-2` are different sessions in either order.
+    #[test]
+    fn distinct_session_ids_are_not_repeats() {
+        for (first_id, second_id) in [("sess", "sess-2"), ("sess-2", "sess")] {
+            let tmp = memory_with_conversations();
+            let memory = tmp.path();
+            let lines = &[("user", "hello"), ("assistant", "alpha")];
+            archive(memory, &dialogue(first_id, lines), "jsonl");
+            let second = archive(memory, &dialogue(second_id, lines), "jsonl");
+            assert_eq!(second.log_number, 2, "{first_id} then {second_id}");
+            assert!(second.is_new_archive());
+        }
+    }
+
+    /// AC-5: a session whose only user text is empty is not a repeat.
+    #[test]
+    fn an_empty_user_message_is_not_a_repeat() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = Conversation {
+            session_id: "sess".into(),
+            first_timestamp: None,
+            last_timestamp: None,
+            user_message_count: 1,
+            assistant_message_count: 0,
+            entries: vec![ConversationEntry::UserMessage(String::new())],
+        };
+        assert_eq!(archive(memory, &conv, "jsonl").log_number, 1);
+        let second = archive(memory, &conv, "jsonl");
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-6: without a sidecar, two consecutive user messages are not a repeat.
+    ///
+    /// The markdown merges those messages, so reading it would not round-trip.
+    /// The sidecar is what makes the first repeat a repeat; deleting it must
+    /// not fall through to the markdown.
+    #[test]
+    fn a_missing_sidecar_is_not_a_repeat() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = dialogue("sess", &[("user", "alpha"), ("user", "hello")]);
+        archive(memory, &conv, "jsonl");
+        let again = archive(memory, &conv, "jsonl");
+        assert_eq!(again.log_number, 1);
+        assert!(!again.is_new_archive());
+
+        fs::remove_file(memory.join("turns/conversation-001.json")).unwrap();
+        assert!(stored_turns(memory, 1, "sess").is_none());
+        let third = archive(memory, &conv, "jsonl");
+        assert_eq!(third.log_number, 2);
+        assert!(third.is_new_archive());
+    }
+
+    /// AC-6: a sidecar that names another session is not this capture.
+    #[test]
+    fn a_sidecar_for_another_session_is_not_a_repeat() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = dialogue("sess", &[("user", "hello")]);
+        archive(memory, &conv, "jsonl");
+        let path = memory.join("turns/conversation-001.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["session_id"] = serde_json::json!("sess-2");
+        let body = serde_json::to_string_pretty(&value).unwrap();
+        fs::write(&path, format!("{body}\n")).unwrap();
+        let second = archive(memory, &conv, "jsonl");
+        assert_eq!(second.log_number, 2);
+        assert!(second.is_new_archive());
+    }
+
+    /// AC-6: `text_turns` and the sidecar agree, including what both skip.
+    #[test]
+    fn text_turns_match_the_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            ConversationEntry::UserMessage(String::new()),
+            ConversationEntry::UserMessage("alpha".into()),
+            ConversationEntry::UserMessage("hello".into()),
+            ConversationEntry::ToolUse {
+                name: "read".into(),
+                input_summary: "notes".into(),
+            },
+            ConversationEntry::ToolResult {
+                content: "ok".into(),
+                is_error: false,
+            },
+            ConversationEntry::AssistantText(String::new()),
+            ConversationEntry::AssistantText("alpha\n---\nhello".into()),
+        ];
+        crate::graph::v2::input::write_turns_sidecar(
+            tmp.path(),
+            1,
+            "sess",
+            "2026-01-01",
+            None,
+            &entries,
+        )
+        .unwrap();
+        let loaded = crate::graph::v2::input::load_session(tmp.path(), 1).unwrap();
+        let got: Vec<(TurnRole, String)> = loaded
+            .turns
+            .iter()
+            .map(|turn| (turn.role, turn.text.clone()))
+            .collect();
+        let expected: Vec<(TurnRole, String)> = text_turns(&entries)
+            .into_iter()
+            .map(|(role, text)| (role, text.to_string()))
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(
+            expected,
+            vec![
+                (TurnRole::User, "alpha".to_string()),
+                (TurnRole::User, "hello".to_string()),
+                (TurnRole::Assistant, "alpha\n---\nhello".to_string()),
+            ]
+        );
+    }
+
+    /// AC-7: a returned or empty result is not a new archive.
+    #[test]
+    fn is_new_archive_requires_a_number_and_a_body() {
+        let cases = [(0u32, "", false), (3, "", false), (3, "x", true)];
+        for (log_number, body, expected) in cases {
+            let result = ArchiveResult {
+                log_number,
+                full_content: body.into(),
+                session_id: "sess".into(),
+            };
+            assert_eq!(result.is_new_archive(), expected, "{log_number} {body:?}");
+        }
+    }
+
+    /// AC-7: ingesting a returned archive does not create a graph.
+    #[test]
+    fn graph_ingest_skips_a_returned_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let conv = dialogue("sess", &[("user", "hello")]);
+        archive(memory, &conv, "jsonl");
+        let returned = archive(memory, &conv, "jsonl");
+        assert!(!returned.is_new_archive());
+        graph_ingest(memory, &returned);
+        assert!(!memory.join("graph").exists());
+    }
+
+    /// AC-7: the callers that ingest gate on `is_new_archive`.
+    #[test]
+    fn ingest_callers_gate_on_is_new_archive() {
+        let archive_src = include_str!("archive.rs");
+        let production = archive_src.split("mod tests").next().expect("tests");
+        assert_eq!(production.matches("result.is_new_archive()").count(), 3);
+        let checkpoint = include_str!("checkpoint.rs");
+        let checkpoint_production = checkpoint.split("mod tests").next().expect("tests");
+        assert!(checkpoint_production.contains("if result.is_new_archive()"));
     }
 }
