@@ -3,7 +3,7 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
-## [Unreleased]
+## [5.0.0] — Unreleased
 
 ### Added
 
@@ -12,8 +12,9 @@ changes a user has to know about before upgrading.
 
 ### Breaking
 
-- Default provider is the CLI login (`claude-code`). `num_ctx`, `api_style`, and `provider = "ollama"` are refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.
+- The local-model path is removed. `num_ctx` and `api_style` are refused, and `provider = "ollama"` is refused. OpenAI-compatible HTTP requires `api_base`, `model`, and `OPENAI_API_KEY`, with no default endpoint or model.
 - Rust API: `ApiStyle` is removed. `LlmSection` and `HttpConfig` lost `num_ctx`, `api_style`, and the local-model fields.
+- The default extraction provider is grok. A config with no `provider` key uses grok. Set `provider = "claude-code"` to keep the previous default.
 
 ### Changed
 
