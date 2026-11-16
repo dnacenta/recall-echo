@@ -7332,6 +7332,9 @@ mod tests {
         let both = crate::config::GraphSection {
             consolidate: true,
             consolidate_links: true,
+            consolidate_hold: false,
+            drop_restatements: false,
+            known_facts_context: false,
             ..crate::config::GraphSection::default()
         };
         assert!(both.links_apply());

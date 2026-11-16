@@ -1475,6 +1475,7 @@ async fn grade_once(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                recall_echo::bench::writes::OptOuts::default(),
             )
             .await
         }
@@ -1499,6 +1500,7 @@ async fn grade_once(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                recall_echo::bench::writes::OptOuts::default(),
             )
             .await
         }
@@ -1558,6 +1560,7 @@ async fn grade_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                recall_echo::bench::writes::OptOuts::default(),
             )
             .await
         }
@@ -1583,6 +1586,7 @@ async fn grade_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                recall_echo::bench::writes::OptOuts::default(),
             )
             .await
         }
