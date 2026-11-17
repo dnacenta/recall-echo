@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use crate::archive;
+use crate::config;
 use crate::conversation;
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
@@ -42,17 +43,42 @@ pub fn run_with_hook_input(
     hook_input: Option<&crate::jsonl::HookInput>,
     base_dir: &Path,
 ) -> Result<(), RecallError> {
-    if let Some(input) = hook_input {
-        let transcript_path = input.transcript_path.trim();
-        if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
-            crate::jsonl::report_declined_subagent(transcript_path, "no checkpoint written");
-            return Ok(());
-        }
+    let config_error = config::try_load(base_dir).err();
+    if decline_subagent(hook_input) {
+        return Ok(());
     }
+    let next_num = write_checkpoint(trigger, hook_input, base_dir, config_error.is_some())?;
+    finish_checkpoint(config_error, next_num)
+}
 
+fn decline_subagent(hook_input: Option<&crate::jsonl::HookInput>) -> bool {
+    let Some(input) = hook_input else {
+        return false;
+    };
+    let transcript_path = input.transcript_path.trim();
+    if !crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
+        return false;
+    }
+    crate::jsonl::report_declined_subagent(transcript_path, "no checkpoint written");
+    true
+}
+
+fn finish_checkpoint(config_error: Option<RecallError>, next_num: u32) -> Result<(), RecallError> {
+    let Some(err) = config_error else {
+        return Ok(());
+    };
+    archive::report_archived_without_extraction(next_num);
+    Err(err)
+}
+
+fn write_checkpoint(
+    trigger: &str,
+    hook_input: Option<&crate::jsonl::HookInput>,
+    base_dir: &Path,
+    skip_ingest: bool,
+) -> Result<u32, RecallError> {
     let conversations_dir = base_dir.join("conversations");
     let archive_index = base_dir.join("ARCHIVE.md");
-
     if !conversations_dir.exists() {
         return Err(RecallError::NotInitialized(
             "conversations/ directory not found. Run init first.".into(),
@@ -61,52 +87,14 @@ pub fn run_with_hook_input(
 
     let now = conversation::utc_now();
     let date = conversation::date_from_timestamp(&now);
-
-    // If we have hook input with a transcript, parse it for metadata
-    let data = match hook_input {
-        Some(input) => extract_from_transcript(input).unwrap_or_else(empty_checkpoint),
-        None => empty_checkpoint(),
-    };
-
-    let mut fm = Frontmatter {
-        log: 0,
-        date: now,
-        session_id: data.session_id,
-        message_count: data.message_count,
-        duration: data.duration.clone(),
-        source: trigger.to_string(),
-        pulse: None,
-        topics: data.topics.clone(),
-    };
-
+    let data = checkpoint_data(hook_input);
+    let mut fm = checkpoint_frontmatter(trigger, 0, &now, &data);
     let (next_num, full_content) = archive::claim_archive_number(&conversations_dir, |n| {
         fm.log = n;
         format!("{}\n\n{}{}", fm.render(), data.md_body, data.tags_section)
     })?;
-
-    // The sidecar is a second record. A failure here must not throw away the
-    // archive that was just written; the helper logs and returns.
-    if crate::graph::v2::input::turns_sidecar_enabled() {
-        archive::write_sidecar_best_effort(
-            base_dir,
-            next_num,
-            &fm.session_id,
-            &date,
-            None,
-            &data.entries,
-        );
-    }
-
-    // Graph ingestion
-    {
-        let result = archive::ArchiveResult {
-            log_number: next_num,
-            full_content: full_content.clone(),
-            session_id: fm.session_id.clone(),
-        };
-        archive::graph_ingest(base_dir, &result);
-    }
-
+    write_checkpoint_sidecar(base_dir, next_num, &fm, &date, &data);
+    ingest_checkpoint(base_dir, next_num, &full_content, &fm, skip_ingest);
     archive::append_index(
         &archive_index,
         next_num,
@@ -116,7 +104,6 @@ pub fn run_with_hook_input(
         data.message_count,
         &data.duration,
     )?;
-
     eprintln!(
         "recall-echo: checkpoint conversation-{:03}.md ({} \u{2014} {} messages, {} topics)",
         next_num,
@@ -124,8 +111,70 @@ pub fn run_with_hook_input(
         data.message_count,
         data.topics.len()
     );
+    Ok(next_num)
+}
 
-    Ok(())
+fn checkpoint_data(hook_input: Option<&crate::jsonl::HookInput>) -> CheckpointData {
+    match hook_input {
+        Some(input) => extract_from_transcript(input).unwrap_or_else(empty_checkpoint),
+        None => empty_checkpoint(),
+    }
+}
+
+fn checkpoint_frontmatter(
+    trigger: &str,
+    next_num: u32,
+    now: &str,
+    data: &CheckpointData,
+) -> Frontmatter {
+    Frontmatter {
+        log: next_num,
+        date: now.to_string(),
+        session_id: data.session_id.clone(),
+        message_count: data.message_count,
+        duration: data.duration.clone(),
+        source: trigger.to_string(),
+        pulse: None,
+        topics: data.topics.clone(),
+    }
+}
+
+fn write_checkpoint_sidecar(
+    base_dir: &Path,
+    next_num: u32,
+    fm: &Frontmatter,
+    date: &str,
+    data: &CheckpointData,
+) {
+    if !crate::graph::v2::input::turns_sidecar_enabled() {
+        return;
+    }
+    archive::write_sidecar_best_effort(
+        base_dir,
+        next_num,
+        &fm.session_id,
+        date,
+        None,
+        &data.entries,
+    );
+}
+
+fn ingest_checkpoint(
+    base_dir: &Path,
+    next_num: u32,
+    full_content: &str,
+    fm: &Frontmatter,
+    malformed: bool,
+) {
+    if !archive::permits_ingest(archive::ingest_mode(malformed)) {
+        return;
+    }
+    let result = archive::ArchiveResult {
+        log_number: next_num,
+        full_content: full_content.to_string(),
+        session_id: fm.session_id.clone(),
+    };
+    archive::graph_ingest(base_dir, &result);
 }
 
 struct CheckpointData {
@@ -484,5 +533,28 @@ mod tests {
         assert_eq!(numbers.len(), 8, "{numbers:?}");
         numbers.dedup();
         assert_eq!(numbers.len(), 8, "{numbers:?}");
+    }
+
+    #[test]
+    fn the_precompact_hook_keeps_the_checkpoint_on_a_malformed_config() {
+        let tmp = prepared_root();
+        let path = config::config_path(tmp.path());
+        fs::write(&path, "this is not toml [[[\n").unwrap();
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"sess","message":{"role":"user","content":"hello"}}"#,
+        ];
+        let input = hook_for(tmp.path(), "sess", &lines);
+        let err = run_with_hook_input("precompact", Some(&input), tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        let archive =
+            fs::read_to_string(tmp.path().join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("hello"), "{archive}");
+        assert!(tmp.path().join("turns/conversation-001.json").is_file());
+        let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("sess"), "{index}");
+        assert!(!tmp.path().join("graph").exists());
     }
 }

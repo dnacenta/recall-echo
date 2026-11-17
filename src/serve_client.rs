@@ -104,7 +104,7 @@ const MAX_STOP_ROUNDS: u32 = 3;
 /// overrides it. The hash is taken over the canonical memory directory, so
 /// every graph gets its own daemon and symlinked paths share one.
 pub fn socket_path(memory_dir: &Path) -> Result<PathBuf, RecallError> {
-    let config = crate::config::load_from_dir(memory_dir);
+    let config = crate::config::try_load_from_dir(memory_dir)?;
     let path = match config.serve.socket_path.as_deref() {
         Some(configured) if !configured.trim().is_empty() => {
             PathBuf::from(crate::paths::expand_tilde(configured.trim()))
@@ -902,6 +902,18 @@ mod tests {
 
         let err = socket_path(dir.path()).unwrap_err();
         assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn socket_path_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".recall-echo.toml");
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = socket_path(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
     }
 
     #[test]

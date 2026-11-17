@@ -149,7 +149,7 @@ pub fn archive_conversation(
     summary: &summarize::ConversationSummary,
     source: &str,
 ) -> Result<ArchiveResult, RecallError> {
-    write_archive(memory_dir, conv, summary, source, None, None)
+    write_archive(memory_dir, conv, summary, source, None, None, true)
 }
 
 /// [`archive_conversation`] with the session's working directory.
@@ -163,7 +163,7 @@ pub(crate) fn archive_conversation_with_cwd(
     source: &str,
     cwd: Option<&str>,
 ) -> Result<ArchiveResult, RecallError> {
-    write_archive(memory_dir, conv, summary, source, None, cwd)
+    write_archive(memory_dir, conv, summary, source, None, cwd, true)
 }
 
 /// [`archive_conversation`] for a named pulse: the archive's frontmatter
@@ -176,7 +176,7 @@ pub fn archive_pulse_conversation(
     pulse_name: &str,
 ) -> Result<ArchiveResult, RecallError> {
     let pulse = Some(pulse_name).filter(|name| !name.trim().is_empty());
-    write_archive(memory_dir, conv, summary, source, pulse, None)
+    write_archive(memory_dir, conv, summary, source, pulse, None, true)
 }
 
 /// The `## Summary` block, or nothing when the caller has no summary text.
@@ -218,6 +218,10 @@ struct ArchiveTail<'a> {
     conv: &'a Conversation,
     summary: &'a summarize::ConversationSummary,
     cwd: Option<&'a str>,
+    /// When false, trim with the default limit and do not read the config.
+    /// The hook path sets this after `try_load` has already failed, so `load`
+    /// does not print that error again.
+    read_config: bool,
 }
 
 /// Write the turns sidecar, the ARCHIVE.md row and the EPHEMERAL entry, in
@@ -226,6 +230,7 @@ struct ArchiveTail<'a> {
 /// The sidecar is a second record. A failure here must not throw away the
 /// archive that was just written.
 fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
+    let max_entries = ephemeral_limit(&tail);
     write_sidecar_best_effort(
         tail.memory_dir,
         tail.next_num,
@@ -256,9 +261,16 @@ fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
         summary: tail.summary.summary.clone(),
     };
     ephemeral::append_entry(tail.ephemeral_path, &entry)?;
-    let cfg = config::load_from_dir(tail.memory_dir);
-    ephemeral::trim_to_limit(tail.ephemeral_path, cfg.ephemeral.max_entries)?;
+    ephemeral::trim_to_limit(tail.ephemeral_path, max_entries)?;
     Ok(())
+}
+
+fn ephemeral_limit(tail: &ArchiveTail<'_>) -> usize {
+    if tail.read_config {
+        config::load_from_dir(tail.memory_dir).ephemeral.max_entries
+    } else {
+        config::Config::default().ephemeral.max_entries
+    }
 }
 
 /// Sources written by a capture. A checkpoint trigger is never one of these.
@@ -582,6 +594,7 @@ fn write_archive(
     source: &str,
     pulse: Option<&str>,
     cwd: Option<&str>,
+    read_config: bool,
 ) -> Result<ArchiveResult, RecallError> {
     let conversations_dir = memory_dir.join("conversations");
     let archive_index = memory_dir.join("ARCHIVE.md");
@@ -644,6 +657,7 @@ fn write_archive(
         conv,
         summary,
         cwd,
+        read_config,
     })?;
 
     eprintln!("recall-echo: archived conversation-{next_num:03}.md ({total_messages} messages)");
@@ -894,7 +908,15 @@ pub fn archive_from_jsonl(
     session_id: &str,
     transcript_path: &str,
 ) -> Result<u32, RecallError> {
-    archive_jsonl(base_dir, session_id, transcript_path, None, None)
+    Ok(archive_jsonl(
+        base_dir,
+        session_id,
+        transcript_path,
+        None,
+        None,
+        Ingest::Yes,
+    )?
+    .log_number)
 }
 
 fn archive_jsonl(
@@ -903,10 +925,11 @@ fn archive_jsonl(
     transcript_path: &str,
     hook_cwd: Option<&str>,
     recorded_cwd: Option<&str>,
-) -> Result<u32, RecallError> {
+    ingest: Ingest,
+) -> Result<ArchiveResult, RecallError> {
     let conv = crate::jsonl::parse_transcript(transcript_path, session_id)?;
     let cwd = resolve_cwd(hook_cwd, Some(Path::new(transcript_path)), recorded_cwd);
-    archive_and_ingest(base_dir, &conv, "jsonl", cwd.as_deref())
+    archive_and_ingest(base_dir, &conv, "jsonl", cwd.as_deref(), ingest)
 }
 
 /// Summarise, archive, and hand the result to the graph.
@@ -917,17 +940,48 @@ fn archive_and_ingest(
     conv: &Conversation,
     source: &str,
     cwd: Option<&str>,
-) -> Result<u32, RecallError> {
+    ingest: Ingest,
+) -> Result<ArchiveResult, RecallError> {
     let summary = summarize::algorithmic_summary(conv);
-    let result = archive_conversation_with_cwd(base_dir, conv, &summary, source, cwd)?;
-    let log_number = result.log_number;
+    let read_config = permits_ingest(ingest);
+    let result = write_archive(base_dir, conv, &summary, source, None, cwd, read_config)?;
 
-    if result.is_new_archive() {
+    if result.is_new_archive() && read_config {
         graph_ingest(base_dir, &result);
         pipeline_sync_on_archive(base_dir);
     }
 
-    Ok(log_number)
+    Ok(result)
+}
+
+/// Whether the hook should run graph ingest and consolidation.
+#[derive(Clone, Copy)]
+pub(crate) enum Ingest {
+    Yes,
+    No,
+}
+
+pub(crate) fn permits_ingest(ingest: Ingest) -> bool {
+    matches!(ingest, Ingest::Yes)
+}
+
+pub(crate) fn ingest_mode(malformed: bool) -> Ingest {
+    if malformed {
+        Ingest::No
+    } else {
+        Ingest::Yes
+    }
+}
+
+/// One line. The full config error is printed once by the process exit path.
+pub(crate) fn report_archived_without_extraction(log_number: u32) {
+    eprintln!(
+        "recall-echo: archived conversation-{log_number:03}.md without extraction or consolidation (config error below)"
+    );
+}
+
+fn fresh_archive(result: &ArchiveResult) -> bool {
+    result.log_number > 0 && !result.full_content.is_empty()
 }
 
 /// What a hook pointed `archive-session` at.
@@ -1010,6 +1064,8 @@ pub fn run_with_hook_input(
     hook_input: &crate::jsonl::HookInput,
     base_dir: &Path,
 ) -> Result<(), RecallError> {
+    let config_error = config::try_load(base_dir).err();
+    let ingest = ingest_mode(config_error.is_some());
     let transcript_path = hook_input.transcript_path.trim();
 
     match classify(transcript_path, &hook_input.session_id) {
@@ -1019,24 +1075,29 @@ pub fn run_with_hook_input(
                  archive. `archive-session` expects a SessionEnd payload on stdin, shaped \
                  {{\"session_id\": …, \"transcript_path\": …}}."
             );
+            Ok(())
         }
         HookTarget::Absent => {
             eprintln!(
                 "recall-echo: no transcript at {transcript_path} (session not persisted), \
                  nothing to archive"
             );
+            Ok(())
         }
         HookTarget::Subagent => {
             crate::jsonl::report_declined_subagent(transcript_path, "nothing archived");
+            Ok(())
         }
         HookTarget::ClaudeJsonl => {
-            archive_jsonl(
+            let result = archive_jsonl(
                 base_dir,
                 &hook_input.session_id,
                 transcript_path,
                 hook_input._cwd.as_deref(),
                 None,
+                ingest,
             )?;
+            finish_config_error(config_error, &result)
         }
         HookTarget::GeminiSession(conv) => {
             let cwd = resolve_cwd(
@@ -1044,7 +1105,8 @@ pub fn run_with_hook_input(
                 Some(Path::new(transcript_path)),
                 None,
             );
-            archive_and_ingest(base_dir, &conv, "gemini", cwd.as_deref())?;
+            let result = archive_and_ingest(base_dir, &conv, "gemini", cwd.as_deref(), ingest)?;
+            finish_config_error(config_error, &result)
         }
         HookTarget::Unreadable => {
             eprintln!(
@@ -1054,9 +1116,22 @@ pub fn run_with_hook_input(
                  ~/.gemini/tmp/<hash>/chats/session-*.json — please report this file's shape \
                  at https://github.com/dnacenta/recall-echo/issues so it can be read too."
             );
+            Ok(())
         }
     }
-    Ok(())
+}
+
+fn finish_config_error(
+    config_error: Option<RecallError>,
+    result: &ArchiveResult,
+) -> Result<(), RecallError> {
+    let Some(err) = config_error else {
+        return Ok(());
+    };
+    if fresh_archive(result) {
+        report_archived_without_extraction(result.log_number);
+    }
+    Err(err)
 }
 
 /// [`archive_all_unarchived_at`] with no `--pulse-root`.
@@ -1166,6 +1241,7 @@ pub fn archive_all_with(
             &path_str,
             None,
             transcript.cwd.as_deref(),
+            Ingest::Yes,
         ) {
             Ok(_) => report.archived += 1,
             Err(e) => {
@@ -3014,5 +3090,64 @@ mod tests {
             assert_eq!(index.matches(&format!("alpha-{i}")).count(), 1, "{index}");
         }
         assert!(claim_temps(&conversations).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_config_skips_graph_ingest() {
+        assert!(!permits_ingest(Ingest::No));
+        assert!(permits_ingest(Ingest::Yes));
+        assert!(matches!(ingest_mode(true), Ingest::No));
+        assert!(matches!(ingest_mode(false), Ingest::Yes));
+    }
+
+    #[test]
+    fn the_archive_hook_keeps_the_transcript_on_a_malformed_config() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let path = crate::config::config_path(memory);
+        fs::write(&path, "this is not toml [[[\n").unwrap();
+        let (_transcript_dir, transcript) = written("session.jsonl", CLAUDE_JSONL);
+        let input = crate::jsonl::HookInput {
+            session_id: "sess".to_string(),
+            transcript_path: transcript,
+            _cwd: None,
+            _hook_event_name: Some("SessionEnd".to_string()),
+        };
+        let err = run_with_hook_input(&input, memory).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        let archive = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("hello"), "{archive}");
+        assert!(memory.join("turns/conversation-001.json").is_file());
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("sess"), "{index}");
+        let ephemeral = fs::read_to_string(memory.join("EPHEMERAL.md")).unwrap();
+        assert!(ephemeral.contains("conversation-001.md"), "{ephemeral}");
+        assert!(!memory.join("graph").exists());
+    }
+
+    #[test]
+    fn a_repeat_on_a_malformed_config_does_not_claim_a_new_archive() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let (_transcript_dir, transcript) = written("session.jsonl", CLAUDE_JSONL);
+        let input = crate::jsonl::HookInput {
+            session_id: "sess".to_string(),
+            transcript_path: transcript,
+            _cwd: None,
+            _hook_event_name: Some("SessionEnd".to_string()),
+        };
+        run_with_hook_input(&input, memory).unwrap();
+        let path = crate::config::config_path(memory);
+        fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = run_with_hook_input(&input, memory).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        let conversations = fs::read_dir(memory.join("conversations")).unwrap().count();
+        assert_eq!(conversations, 1);
     }
 }

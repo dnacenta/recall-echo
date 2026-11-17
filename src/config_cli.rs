@@ -13,7 +13,7 @@ use crate::theme::{BOLD, DIM, GOOD, RESET};
 
 /// Display current configuration.
 pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
-    let cfg = config::load(memory_dir);
+    let cfg = config::try_load(memory_dir)?;
     let path = config::config_path(memory_dir);
     let exists = path.exists();
 
@@ -178,32 +178,64 @@ fn show_cli_section(llm: &config::LlmSection) {
 
 /// Set a config key and save.
 pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError> {
-    // `load` would hand back defaults, and the save below would erase the file.
-    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
-        return Err(err);
-    }
-    let mut cfg = config::load(memory_dir);
+    // A file `try_load` rejects is left untouched: saving defaults would erase it.
+    let mut cfg = config::try_load(memory_dir)?;
     cfg.set_key(key, value)?;
     config::save(memory_dir, &cfg)?;
-
     eprintln!("{GOOD}✓{RESET} Set {BOLD}{key}{RESET} = {BOLD}{value}{RESET}");
+    report_set_provider(&cfg, key);
+    Ok(())
+}
 
-    // Show what the new provider resolves to — a CLI provider has no API base,
-    // and what matters instead is the call it will make.
-    if key == "llm.provider" || key == "provider" {
-        if cfg.llm.provider.is_cli() {
-            match CliSpec::resolve(&cfg.llm.provider, &cfg.llm.cli) {
-                Ok(spec) => eprintln!(
-                    "  command  → {}",
-                    spec.argv_preview(&spec.resolve_model(&cfg.llm.model))
-                ),
-                Err(err) => eprintln!("  {err}"),
-            }
-        } else {
-            eprintln!("  model    → {}", cfg.llm.resolved_model());
-            eprintln!("  api_base → {}", cfg.llm.resolved_api_base());
-        }
+fn report_set_provider(cfg: &config::Config, key: &str) {
+    if key != "llm.provider" && key != "provider" {
+        return;
+    }
+    if cfg.llm.provider.is_cli() {
+        report_cli_after_set(cfg);
+        return;
+    }
+    eprintln!("  model    → {}", cfg.llm.resolved_model());
+    eprintln!("  api_base → {}", cfg.llm.resolved_api_base());
+}
+
+fn report_cli_after_set(cfg: &config::Config) {
+    match CliSpec::resolve(&cfg.llm.provider, &cfg.llm.cli) {
+        Ok(spec) => eprintln!(
+            "  command  → {}",
+            spec.argv_preview(&spec.resolve_model(&cfg.llm.model))
+        ),
+        Err(err) => eprintln!("  {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_show_fails_on_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config::config_path(dir.path());
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = show(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
     }
 
-    Ok(())
+    #[test]
+    fn config_set_fails_and_leaves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config::config_path(dir.path());
+        let body = "this is not toml [[[\n";
+        std::fs::write(&path, body).unwrap();
+        let err = set(dir.path(), "ephemeral.max_entries", "5").unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    }
 }
