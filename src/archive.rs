@@ -2696,8 +2696,15 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied,
                 "no",
             ))
-        });
-        assert!(err.is_err());
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RecallError::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "{err}"
+        );
         assert!(claim_temps(dir).is_empty(), "after an error");
     }
 
