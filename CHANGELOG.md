@@ -3,6 +3,16 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [Unreleased]
+
+### Fixed
+
+- A session that only had a PreCompact checkpoint is now captured in full by the capture sweep and `archive --all-unarchived` (#228).
+
+### Changed
+
+- The first `archive --all-unarchived` after upgrading captures every earlier checkpoint-only session whose transcript still exists, and each new archive is extracted on your configured provider: expect a one-time burst of extraction. The capture sweep only picks up sessions newer than its watermark (#228).
+
 ## [5.0.0] — 2026-11-16
 
 ### Added

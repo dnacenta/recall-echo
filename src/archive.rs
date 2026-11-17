@@ -964,7 +964,7 @@ pub fn archive_all_with(
         ));
     }
 
-    let archived_sessions = collect_archived_sessions(&conversations_dir);
+    let archived_sessions = collect_captured_sessions(&conversations_dir);
 
     if !transcripts.is_installed() {
         eprintln!("No projects directory found \u{2014} nothing to archive.");
@@ -1033,6 +1033,40 @@ pub fn collect_archived_sessions(conversations_dir: &Path) -> std::collections::
         }
     }
     sessions
+}
+
+/// Session ids that have a real capture in `conversations/`.
+///
+/// Checkpoints never count. A file counts only when [`read_header`] yields a
+/// non-empty `session_id` whose `source` is in [`CAPTURE_SOURCES`].
+pub(crate) fn collect_captured_sessions(
+    conversations_dir: &Path,
+) -> std::collections::HashSet<String> {
+    let mut sessions = std::collections::HashSet::new();
+    let Ok(entries) = fs::read_dir(conversations_dir) else {
+        return sessions;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_conversation_markdown(&name) {
+            continue;
+        }
+        let Some(header) = read_header(&entry.path()) else {
+            continue;
+        };
+        if header.session_id.is_empty() {
+            continue;
+        }
+        if CAPTURE_SOURCES.contains(&header.source.as_str()) {
+            sessions.insert(header.session_id);
+        }
+    }
+    sessions
+}
+
+fn is_conversation_markdown(name: &str) -> bool {
+    name.starts_with("conversation-") && name.ends_with(".md")
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,5 +2323,156 @@ mod tests {
             prior_capture(&tmp.path().join("conversations"), "sess"),
             Some(1)
         );
+    }
+
+    fn write_conversation(dir: &Path, number: u32, session_id: &str, source: &str) {
+        let body = format!(
+            "---\nlog: {number}\ndate: \"2026-08-05T22:29:00Z\"\nsession_id: \"{session_id}\"\nmessage_count: 1\nduration: \"unknown\"\nsource: \"{source}\"\ntopics: []\n---\n\n# Conversation {number:03}\n\n---\n\n### User\n\nhello\n"
+        );
+        fs::write(dir.join(format!("conversation-{number:03}.md")), body).unwrap();
+    }
+
+    /// A PreCompact checkpoint is not a capture, and neither is an empty id
+    /// or a header that does not parse.
+    #[test]
+    fn a_checkpoint_only_session_is_not_captured() {
+        let tmp = memory_with_conversations();
+        let dir = tmp.path().join("conversations");
+        write_conversation(&dir, 1, "sess", "precompact");
+        write_conversation(&dir, 2, "sess-2", "checkpoint");
+        write_conversation(&dir, 3, "", "jsonl");
+        fs::write(dir.join("conversation-004.md"), "session_id: alpha\n").unwrap();
+
+        let captured = collect_captured_sessions(&dir);
+        assert!(captured.is_empty(), "{captured:?}");
+        let archived = collect_archived_sessions(&dir);
+        assert!(archived.contains("sess"), "{archived:?}");
+        assert!(archived.contains("sess-2"), "{archived:?}");
+        assert!(archived.contains("alpha"), "{archived:?}");
+    }
+
+    /// Every allowlisted source counts. A checkpoint beside them does not.
+    #[test]
+    fn a_capture_counts_as_captured() {
+        let tmp = memory_with_conversations();
+        let dir = tmp.path().join("conversations");
+        let ids = ["sess", "sess-2", "alpha", "sess-3", "sess-4", "sess-5"];
+        assert_eq!(ids.len(), CAPTURE_SOURCES.len());
+        for (index, source) in CAPTURE_SOURCES.iter().enumerate() {
+            write_conversation(&dir, (index as u32) + 1, ids[index], source);
+        }
+        write_conversation(&dir, 7, "hello", "precompact");
+
+        let captured = collect_captured_sessions(&dir);
+        assert_eq!(captured.len(), CAPTURE_SOURCES.len(), "{captured:?}");
+        for id in ids {
+            assert!(captured.contains(id), "{id} missing from {captured:?}");
+        }
+        assert!(!captured.contains("hello"));
+    }
+
+    const CODEX_ROLLOUT: &str = concat!(
+        r#"{"timestamp":"2026-08-05T22:29:00.878Z","type":"session_meta","payload":{"session_id":"SESSION","cwd":"/tmp/probe"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-05T22:29:02.329Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-05T22:29:04.028Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"alpha"}]}}"#,
+        "\n",
+    );
+
+    const CODEX_SESS: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn settled_now() -> crate::capture::CaptureOptions {
+        crate::capture::CaptureOptions {
+            settle: std::time::Duration::from_secs(0),
+            now: std::time::SystemTime::now(),
+        }
+    }
+
+    fn codex_fixture(root: &Path, session_id: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let memory = root.join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(sessions.join("2026/08/05")).unwrap();
+        let rollout = sessions.join(format!(
+            "2026/08/05/rollout-2026-08-05T22-29-00-{session_id}.jsonl"
+        ));
+        fs::write(&rollout, CODEX_ROLLOUT.replace("SESSION", session_id)).unwrap();
+        fs::create_dir_all(memory.join("capture")).unwrap();
+        fs::write(memory.join("capture/codex.watermark"), "1\n").unwrap();
+        (memory, sessions)
+    }
+
+    /// A checkpoint-only session newer than the watermark is captured in full.
+    #[test]
+    fn the_sweep_captures_a_checkpoint_only_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (memory, sessions) = codex_fixture(tmp.path(), CODEX_SESS);
+        write_conversation(&memory.join("conversations"), 1, CODEX_SESS, "precompact");
+        assert!(!memory.join("graph").exists());
+
+        let report = crate::capture::sweep(
+            &memory,
+            &crate::transcript::CodexTranscripts::new(sessions),
+            settled_now(),
+        )
+        .unwrap();
+
+        assert_eq!(report.archived, vec![2]);
+        let captured =
+            fs::read_to_string(memory.join("conversations/conversation-002.md")).unwrap();
+        let header = crate::frontmatter::parse(&captured).unwrap();
+        assert_eq!(header.session_id, CODEX_SESS);
+        assert_eq!(header.source, "codex");
+        assert!(CAPTURE_SOURCES.contains(&header.source.as_str()));
+        assert!(memory.join("turns/conversation-002.json").is_file());
+        assert!(!memory.join("graph").exists());
+    }
+
+    /// A session that already has a capture is still skipped.
+    #[test]
+    fn the_sweep_still_skips_a_captured_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (memory, sessions) = codex_fixture(tmp.path(), CODEX_SESS);
+        write_conversation(&memory.join("conversations"), 1, CODEX_SESS, "codex");
+
+        let report = crate::capture::sweep(
+            &memory,
+            &crate::transcript::CodexTranscripts::new(sessions),
+            settled_now(),
+        )
+        .unwrap();
+
+        assert!(report.archived.is_empty(), "{report:?}");
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(
+            fs::read_dir(memory.join("conversations")).unwrap().count(),
+            1
+        );
+    }
+
+    /// `archive --all-unarchived` captures a checkpoint-only session.
+    #[test]
+    fn all_unarchived_captures_a_checkpoint_only_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects/-home-dev-app");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("sess.jsonl"), CLAUDE_JSONL).unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("conversations")).unwrap();
+        write_conversation(&memory.join("conversations"), 1, "sess", "precompact");
+        assert!(!memory.join("graph").exists());
+
+        let transcripts = ClaudeCodeTranscripts::new(tmp.path().join("projects"));
+        let report = archive_all_with(&memory, &transcripts).unwrap();
+
+        assert_eq!(report.archived, 1);
+        assert_eq!(report.already_archived, 0);
+        let captured =
+            fs::read_to_string(memory.join("conversations/conversation-002.md")).unwrap();
+        assert!(captured.contains("source: \"jsonl\""), "{captured}");
+        assert!(captured.contains("session_id: \"sess\""), "{captured}");
+        assert!(memory.join("turns/conversation-002.json").is_file());
+        assert!(!memory.join("graph").exists());
     }
 }
