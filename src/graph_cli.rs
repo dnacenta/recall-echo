@@ -3389,6 +3389,15 @@ pub async fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(
 
 /// Trace pipeline flow for an entity.
 pub async fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), RecallError> {
+    print!("{}", render_pipeline_flow(memory_dir, entity_name).await?);
+    Ok(())
+}
+
+/// The text [`pipeline_flow`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_pipeline_flow(
+    memory_dir: &Path,
+    entity_name: &str,
+) -> Result<String, RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -3398,27 +3407,51 @@ pub async fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), R
 
     serve_client::exclusive(memory_dir, |gm| async move {
         let chain = gm.pipeline_flow(entity_name).await?;
-
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let mut out = String::new();
         if chain.is_empty() {
-            println!("{WARN}No pipeline relationships found for \"{entity_name}\".{RESET}");
-            return Ok(());
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("{WARN}No pipeline relationships found for \"{entity_name}\".{RESET}\n"),
+            );
+            return Ok(out);
         }
 
-        println!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n");
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n\n"),
+        );
         for (source, rel_type, target) in &chain {
-            println!(
-                "  {} ({}) {ACCENT}—[{rel_type}]→{RESET} {} ({})",
-                source.name, source.entity_type, target.name, target.entity_type
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!(
+                    "  {} ({}) {ACCENT}—[{rel_type}]→{RESET} {} ({})\n",
+                    source.name, source.entity_type, target.name, target.entity_type
+                ),
             );
         }
-
-        Ok(())
+        Ok(out)
     })
     .await
 }
 
 /// List stale pipeline entities.
 pub async fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<(), RecallError> {
+    print!(
+        "{}",
+        render_pipeline_stale(memory_dir, staleness_days).await?
+    );
+    Ok(())
+}
+
+/// The text [`pipeline_stale`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_pipeline_stale(
+    memory_dir: &Path,
+    staleness_days: u32,
+) -> Result<String, RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -3428,32 +3461,64 @@ pub async fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<()
 
     serve_client::exclusive(memory_dir, |gm| async move {
         let stats = gm.pipeline_stats(staleness_days).await?;
-
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let mut out = String::new();
         let total_stale = stats.stale_thoughts.len() + stats.stale_questions.len();
         if total_stale == 0 {
-            println!("{GOOD}✓{RESET} No stale pipeline entities.");
-            return Ok(());
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("{GOOD}✓{RESET} No stale pipeline entities.\n"),
+            );
+            return Ok(out);
         }
 
-        println!("{BOLD}Stale Pipeline Entities{RESET}\n");
-
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!("{BOLD}Stale Pipeline Entities{RESET}\n\n"),
+        );
         if !stats.stale_thoughts.is_empty() {
-            println!("  {WARN}Thoughts (>{staleness_days} days):{RESET}");
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("  {WARN}Thoughts (>{staleness_days} days):{RESET}\n"),
+            );
             for entity in &stats.stale_thoughts {
-                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+                push_masked(
+                    &mut out,
+                    mask.as_ref(),
+                    &format!(
+                        "    • {} {DIM}({}){RESET}\n",
+                        entity.name, entity.entity_type
+                    ),
+                );
             }
         }
-
         if !stats.stale_questions.is_empty() {
-            println!("  {WARN}Questions (>{} days):{RESET}", staleness_days * 2);
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("  {WARN}Questions (>{} days):{RESET}\n", staleness_days * 2),
+            );
             for entity in &stats.stale_questions {
-                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+                push_masked(
+                    &mut out,
+                    mask.as_ref(),
+                    &format!(
+                        "    • {} {DIM}({}){RESET}\n",
+                        entity.name, entity.entity_type
+                    ),
+                );
             }
         }
-
-        Ok(())
+        Ok(out)
     })
     .await
+}
+
+fn push_masked(out: &mut String, mask: Option<&crate::graph::forgotten::ForgetSet>, line: &str) {
+    out.push_str(&crate::graph::forgotten::apply_mask(mask, line));
 }
 
 /// Read pipeline documents from a directory.
@@ -3810,8 +3875,10 @@ async fn confirm_and_forget(
     target: &CorrectTarget,
     removal: &Removal,
 ) -> Result<(), RecallError> {
-    print_removal_plan(removal);
-    note_lasting_forget(crate::graph::forgotten::lasting_forget_on(memory_dir));
+    print_removal_plan(
+        removal,
+        crate::graph::forgotten::lasting_forget_on(memory_dir),
+    );
     if !options.yes && !confirm_removal(removal)? {
         println!("{WARN}Nothing removed.{RESET}");
         return Ok(());
@@ -3823,13 +3890,6 @@ async fn confirm_and_forget(
     // remove must not exit as though it had.
     print_correction(&applied);
     refusal(&applied)
-}
-
-fn note_lasting_forget(on: bool) {
-    if !on {
-        return;
-    }
-    println!("\n  {DIM}The forget is kept in memory/forgotten.jsonl until --unforget.{RESET}");
 }
 
 async fn unforget_command(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
@@ -4023,7 +4083,7 @@ fn print_correction(report: &CorrectionReport) {
             );
         }
         CorrectionReport::Contradicted { edges } => print_contradictions(edges),
-        CorrectionReport::Planned { removal } => print_removal_plan(removal),
+        CorrectionReport::Planned { removal } => print_removal_plan(removal, false),
         CorrectionReport::Removed { removal } => {
             let entity = removal
                 .entity
@@ -4065,7 +4125,7 @@ fn print_contradictions(edges: &[EdgeCorrection]) {
     );
 }
 
-fn print_removal_plan(removal: &Removal) {
+fn print_removal_plan(removal: &Removal, lasting: bool) {
     println!("{BOLD}{WARN}This would remove:{RESET}\n");
     if let Some(entity) = &removal.entity {
         println!(
@@ -4082,6 +4142,18 @@ fn print_removal_plan(removal: &Removal) {
             plural(removal.edges.len(), "relationship", "relationships")
         );
         print_edges(&removal.edges);
+    }
+    print_removal_close(lasting);
+}
+
+fn print_removal_close(lasting: bool) {
+    if lasting {
+        println!(
+            "\n  {DIM}Removal is not evidence — the decision stays in memory/forgotten.jsonl \
+             until --unforget and cannot be re-weighed. Prefer --wrong unless the memory \
+             should never have existed.{RESET}"
+        );
+        return;
     }
     println!(
         "\n  {DIM}Removal is not evidence — it leaves no trace and cannot be re-weighed. \
@@ -4153,6 +4225,19 @@ pub async fn decay_report(
     entity_name: Option<&str>,
     show_all: bool,
 ) -> Result<(), RecallError> {
+    print!(
+        "{}",
+        render_decay_report(memory_dir, entity_name, show_all).await?
+    );
+    Ok(())
+}
+
+/// The text [`decay_report`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_decay_report(
+    memory_dir: &Path,
+    entity_name: Option<&str>,
+    show_all: bool,
+) -> Result<String, RecallError> {
     use crate::graph::confidence;
     use crate::graph::types::Direction;
 
@@ -4165,6 +4250,8 @@ pub async fn decay_report(
 
     serve_client::exclusive(memory_dir, |gm| async move {
         let now = chrono::Utc::now();
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let mut out = String::new();
 
         let rels = if let Some(name) = entity_name {
             gm.get_relationships(name, Direction::Both).await?
@@ -4173,14 +4260,22 @@ pub async fn decay_report(
         };
 
         if rels.is_empty() {
-            println!("{WARN}No relationships found.{RESET}");
-            return Ok(());
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("{WARN}No relationships found.{RESET}\n"),
+            );
+            return Ok(out);
         }
 
-        println!(
-            "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n",
-            rels.len(),
-            confidence::DEFAULT_HALF_LIFE_DAYS
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!(
+                "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n\n",
+                rels.len(),
+                confidence::DEFAULT_HALF_LIFE_DAYS
+            ),
         );
 
         let mut decayed_count = 0u32;
@@ -4242,23 +4337,31 @@ pub async fn decay_report(
                 }
             );
 
-            println!(
-                "  {from_short} {ACCENT}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}",
-                rel.rel_type, rel.confidence, effective,
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!(
+                    "  {from_short} {ACCENT}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}\n",
+                    rel.rel_type, rel.confidence, effective,
+                ),
             );
         }
 
-        println!(
-            "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}",
-            rels.len(),
-            if rels.is_empty() {
-                0.0
-            } else {
-                total_decay / rels.len() as f64
-            }
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!(
+                "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}\n",
+                rels.len(),
+                if rels.is_empty() {
+                    0.0
+                } else {
+                    total_decay / rels.len() as f64
+                }
+            ),
         );
 
-        Ok(())
+        Ok(out)
     })
     .await
 }

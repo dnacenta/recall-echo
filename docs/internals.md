@@ -37,7 +37,7 @@ talk itself into things. The maths: [bayesian-confidence.md](bayesian-confidence
 
 A correction is evidence at your authority, not an override: a claim resting on twenty
 observations survives one `--wrong` with less confidence, a claim resting on one collapses.
-`--forget` deletes outright and leaves no trace, so prefer `--wrong`.
+`--forget` deletes the graph row. With `graph.lasting_forget` off it leaves no trace; with the flag on the decision stays in `memory/forgotten.jsonl` until `--unforget`. Prefer `--wrong`.
 
 ## Layout
 

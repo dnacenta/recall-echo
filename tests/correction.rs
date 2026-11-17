@@ -997,6 +997,183 @@ async fn a_confirmed_forget_does_not_rewrite_source_files() {
     }
 }
 
+#[tokio::test]
+async fn a_leftover_closed_edge_is_masked_on_decay_flow_and_stale() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    daemon::create_entity(&db, "entity:d", "D", "person").await;
+    daemon::create_entity(&db, "entity:vim", "Vim", "tool").await;
+    let live = daemon::create_edge(&db, &Edge::default()).await;
+    let closed = daemon::create_edge(&db, &Edge::default()).await;
+    close_edge(&db, &closed).await;
+    daemon::create_edge(
+        &db,
+        &Edge {
+            rel_type: "EVOLVED_FROM",
+            ..Edge::default()
+        },
+    )
+    .await;
+    mark_stale_thought(&db, "entity:vim").await;
+    age_edges(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Removed { .. }));
+    fixture.stop_daemon().await;
+
+    let db = fixture.open().await;
+    let rows = edge_rows(&db).await;
+    assert!(
+        rows.iter()
+            .any(|row| row.id == closed && row.closed && row.rel_type == "USES"),
+        "closed edge was deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.id == live),
+        "live edge survived the forget: {rows:?}"
+    );
+    daemon::close(db).await;
+
+    let decay = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("decay");
+    let flow = graph_cli::render_pipeline_flow(&fixture.memory_dir, "D")
+        .await
+        .expect("flow");
+    let stale = graph_cli::render_pipeline_stale(&fixture.memory_dir, 1)
+        .await
+        .expect("stale");
+    for (name, text) in [("decay", decay), ("flow", flow), ("stale", stale)] {
+        assert!(text.contains("[forgotten]"), "{name}: {text}");
+        assert!(
+            !text.to_lowercase().contains("vim"),
+            "{name} still prints the value: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restored_row_is_masked_on_decay() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+
+    let backup = fixture.memory_dir.join("graph-copy");
+    copy_dir(&fixture.memory_dir.join("graph"), &backup);
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Removed { .. }));
+    fixture.stop_daemon().await;
+
+    std::fs::remove_dir_all(fixture.memory_dir.join("graph")).expect("remove graph");
+    copy_dir(&backup, &fixture.memory_dir.join("graph"));
+
+    let text = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("decay");
+    assert!(text.contains("[forgotten]"), "{text}");
+    assert!(!text.to_lowercase().contains("vim"), "{text}");
+
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 1);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn flag_off_decay_still_prints_the_value() {
+    let fixture = Fixture::new();
+    std::fs::create_dir(fixture.memory_dir.join("forgotten.jsonl")).expect("block the file");
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+
+    let text = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("flag off does not read the forget file");
+    assert!(text.to_lowercase().contains("vim"), "{text}");
+    assert!(!text.contains("[forgotten]"), "{text}");
+}
+
+#[derive(Debug)]
+struct StoredEdge {
+    id: String,
+    rel_type: String,
+    closed: bool,
+}
+
+async fn close_edge(db: &Surreal<Db>, edge_id: &str) {
+    db.query("UPDATE type::record($id) SET valid_until = time::now()")
+        .bind(("id", edge_id.to_string()))
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .expect("close edge");
+}
+
+async fn mark_stale_thought(db: &Surreal<Db>, entity_id: &str) {
+    db.query(
+        "UPDATE type::record($id) SET \
+             attributes.pipeline_stage = 'thoughts', \
+             attributes.pipeline_status = 'active', \
+             updated_at = <datetime>'2020-01-01T00:00:00Z'",
+    )
+    .bind(("id", entity_id.to_string()))
+    .await
+    .and_then(surrealdb::IndexedResults::check)
+    .expect("mark thought");
+}
+
+async fn age_edges(db: &Surreal<Db>) {
+    db.query("UPDATE relates_to SET valid_from = <datetime>'2020-01-01T00:00:00Z'")
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .expect("age edges");
+}
+
+async fn edge_rows(db: &Surreal<Db>) -> Vec<StoredEdge> {
+    let mut response = db
+        .query(
+            "SELECT type::string(id) AS id, rel_type, valid_until != NONE AS closed \
+             FROM relates_to",
+        )
+        .await
+        .expect("list");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("rows");
+    rows.into_iter()
+        .map(|row| StoredEdge {
+            id: row["id"].as_str().unwrap_or_default().to_string(),
+            rel_type: row["rel_type"].as_str().unwrap_or_default().to_string(),
+            closed: row["closed"].as_bool().unwrap_or(false),
+        })
+        .collect()
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("dest");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).expect("copy");
+        }
+    }
+}
+
 #[test]
 fn conversation_numbers_ignore_the_forget_lock_and_temps() {
     let dir = tempfile::tempdir().expect("temp");
