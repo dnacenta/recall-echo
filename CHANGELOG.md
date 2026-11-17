@@ -5,8 +5,17 @@ changes a user has to know about before upgrading.
 
 ## [Unreleased]
 
+### Breaking
+
+- `ExtractOptions` has a new public field `force`. A struct literal that builds `ExtractOptions` no longer compiles until it sets `force` (#241).
+
+### Added
+
+- `--force` for `graph extract --rebuild`. A forced rebuild of a v2 store keeps the old store as `graph.v1-backup-<date>`, the same prefix as a v1 rebuild, so `newest_backup` and the rollback command are unchanged (#241).
+
 ### Fixed
 
+- `graph extract --pipeline v2 --rebuild` refuses a `graph/` that is already a v2 store instead of re-extracting everything; pass `--force` to rebuild anyway (#241).
 - A `.recall-echo.toml` that fails to parse, or still sets a removed key, is now an error that names the file, instead of silently running on the defaults (grok and the full consolidation stack). `status`, `config show` and `config set` exit non-zero, and the removed-key message names the file. Unknown keys are reported as a warning (#243).
 - Running `graph ingest` again on an archive that pipeline v2 already extracted no longer extracts it again; it prints that there is nothing to do (#231).
 

@@ -951,6 +951,8 @@ struct RebuildPlan {
     /// Leftover episodes already counted by the completeness scan.
     /// `None` when that scan did not run.
     leftovers: Option<usize>,
+    /// A dry run with no daemon did not open `graph/`, so its stamp is unknown.
+    stamp_unknown: bool,
 }
 
 #[cfg(feature = "llm")]
@@ -1017,9 +1019,13 @@ impl EpisodeRows {
 ///
 /// Server mode, a pipeline other than v2, a config that cannot be saved, and
 /// a build directory that is not already stamped v2 are refused before the
-/// daemon is stopped and before the old store is touched. A stamped build
-/// directory is a resume of its unfinished logs. `--dry-run` lists archives
-/// and estimated calls and does not stop the daemon.
+/// daemon is stopped and before the old store is touched. A `graph/` that is
+/// already stamped v2, with no build directory, is refused the same way
+/// unless [`ExtractOptions::force`] is set. The stamp comes from a running
+/// daemon, or from a copy of `graph/` when none is running; `graph/` itself
+/// is not opened. A stamped build directory is a resume of its unfinished
+/// logs. `--dry-run` lists archives and estimated calls and does not stop
+/// the daemon.
 ///
 /// The build, the catch-up of logs that appear while it runs, the swap, and
 /// the config write all hold the admin lock. A live run plans after that lock
@@ -1035,14 +1041,14 @@ pub async fn rebuild(
 ) -> Result<(), RecallError> {
     preflight_rebuild(memory_dir, &options)?;
     if options.dry_run {
-        let plan = plan_rebuild(memory_dir).await?;
+        let plan = plan_rebuild(memory_dir, options.force, false).await?;
         return print_rebuild_dry_run(memory_dir, &plan);
     }
     let planned = std::sync::Mutex::new(None);
     serve_client::exclusive_without_store(
         memory_dir,
         || async {
-            let plan = plan_rebuild(memory_dir).await?;
+            let plan = plan_rebuild(memory_dir, options.force, true).await?;
             *planned.lock().unwrap_or_else(|err| err.into_inner()) = Some(plan);
             stop_for_rebuild(memory_dir, stop).await
         },
@@ -1137,8 +1143,16 @@ fn refuse_unusable_config(
 
 /// Log list, half-swap check, and the pending build. A live rebuild calls
 /// this only after the admin lock is held.
+///
+/// `live` is false for a dry run. The stamp of an existing `graph/` is read
+/// only when no build directory is present, and only then a v2 store without
+/// `force` is refused. That check runs before the daemon is stopped.
 #[cfg(feature = "llm")]
-async fn plan_rebuild(memory_dir: &Path) -> Result<RebuildPlan, RecallError> {
+async fn plan_rebuild(
+    memory_dir: &Path,
+    force: bool,
+    live: bool,
+) -> Result<RebuildPlan, RecallError> {
     let conversations = find_conversations_dir(memory_dir)?;
     let logs = conversation_logs(&conversations)?;
     if logs.is_empty() {
@@ -1155,13 +1169,182 @@ async fn plan_rebuild(memory_dir: &Path) -> Result<RebuildPlan, RecallError> {
             "Graph store not initialized. Run `recall-echo graph init` first.".into(),
         ));
     }
-    let built = pending_in_build(&memory_dir.join(V2_BUILD_DIR), &conversations, &logs).await?;
+    let build = memory_dir.join(V2_BUILD_DIR);
+    let stamp_unknown = fresh_graph_stamp(&build, memory_dir, force, live).await?;
+    let built = pending_in_build(&build, &conversations, &logs).await?;
     Ok(RebuildPlan {
         conversations,
         pending: built.pending,
         resume: built.resume,
         leftovers: built.leftovers,
+        stamp_unknown,
     })
+}
+
+/// What `graph/` is stamped, when a rebuild has to decide whether to start over.
+#[cfg(feature = "llm")]
+#[derive(Debug, PartialEq, Eq)]
+enum GraphStamp {
+    V2,
+    NotV2,
+    Unknown,
+}
+
+/// `Ok(true)` when a dry run could not see the stamp.
+///
+/// A build directory is a resume and skips this. Otherwise the running
+/// daemon's hello is enough. A live run with no daemon reads a copy of
+/// `graph/` and does not open the original.
+#[cfg(feature = "llm")]
+async fn fresh_graph_stamp(
+    build: &Path,
+    memory_dir: &Path,
+    force: bool,
+    live: bool,
+) -> Result<bool, RecallError> {
+    if build.exists() {
+        return Ok(false);
+    }
+    let stamp = graph_stamp(memory_dir, live).await?;
+    if let Some(message) = v2_refusal(&stamp, force) {
+        return Err(RecallError::Other(message));
+    }
+    Ok(matches!(stamp, GraphStamp::Unknown))
+}
+
+/// The stamp a rebuild would act on.
+///
+/// A running daemon answers from its hello, and the store is not opened.
+/// With no daemon, `may_open` reads a copy of `graph/`. A dry run passes
+/// `may_open = false` and gets [`GraphStamp::Unknown`] instead.
+#[cfg(feature = "llm")]
+async fn graph_stamp(memory_dir: &Path, may_open: bool) -> Result<GraphStamp, RecallError> {
+    if let Some(info) = serve_client::daemon_info(memory_dir).await? {
+        return Ok(stamp_from_daemon(info.pipeline_stamp));
+    }
+    if !may_open {
+        return Ok(GraphStamp::Unknown);
+    }
+    open_graph_stamp(memory_dir).await
+}
+
+#[cfg(feature = "llm")]
+fn stamp_from_daemon(stamp: crate::serve::PipelineStamp) -> GraphStamp {
+    match stamp {
+        crate::serve::PipelineStamp::Stamped(text) if text == "v2" => GraphStamp::V2,
+        _ => GraphStamp::NotV2,
+    }
+}
+
+/// Copy `graph/` outside the memory directory, read its stamp, and drop both
+/// the database handle and the copy. `graph/` is never opened.
+#[cfg(feature = "llm")]
+async fn open_graph_stamp(memory_dir: &Path) -> Result<GraphStamp, RecallError> {
+    let graph = memory_dir.join("graph");
+    let scratch = StampScratch::create(memory_dir)?;
+    let copy = scratch.path().join("graph");
+    copy_tree(&graph, &copy).map_err(stamp_read_error)?;
+    let db = crate::graph::store::open(&copy)
+        .await
+        .map_err(stamp_read_error)?;
+    let read = crate::graph::v2::read_stamp(&db).await;
+    drop(db);
+    drop(scratch);
+    match read {
+        Ok(stamp) => Ok(stamp_from_text(stamp.as_deref())),
+        Err(err) => Err(stamp_read_error(err)),
+    }
+}
+
+/// A fresh directory under the system temp dir, removed on drop.
+///
+/// It is never inside the memory directory. `tempfile` is a dev-dependency,
+/// so this is the same scratch a `TempDir` would be: outside the store, and
+/// gone after the stamp is read.
+#[cfg(feature = "llm")]
+struct StampScratch {
+    path: PathBuf,
+}
+
+#[cfg(feature = "llm")]
+impl StampScratch {
+    fn create(memory_dir: &Path) -> Result<Self, RecallError> {
+        let root = std::env::temp_dir();
+        if root.starts_with(memory_dir) {
+            return Err(RecallError::Other(
+                "graph/: stamp copy landed inside the memory directory".into(),
+            ));
+        }
+        for n in 0..100u32 {
+            let path = root.join(format!("recall-echo-stamp-{}-{n}", std::process::id()));
+            if path.starts_with(memory_dir) {
+                return Err(RecallError::Other(
+                    "graph/: stamp copy landed inside the memory directory".into(),
+                ));
+            }
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(stamp_read_error(err)),
+            }
+        }
+        Err(RecallError::Other(
+            "graph/: could not create a directory for the stamp copy".into(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(feature = "llm")]
+impl Drop for StampScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(feature = "llm")]
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "llm")]
+fn stamp_from_text(stamp: Option<&str>) -> GraphStamp {
+    if stamp == Some("v2") {
+        GraphStamp::V2
+    } else {
+        GraphStamp::NotV2
+    }
+}
+
+#[cfg(feature = "llm")]
+fn stamp_read_error(err: impl std::fmt::Display) -> RecallError {
+    RecallError::Other(format!("graph/: {err}"))
+}
+
+/// Refusal for a store that is already v2, when the caller did not pass `--force`.
+#[cfg(feature = "llm")]
+fn v2_refusal(stamp: &GraphStamp, force: bool) -> Option<String> {
+    if force || !matches!(stamp, GraphStamp::V2) {
+        None
+    } else {
+        Some(
+            "graph/ is already a v2 store; nothing to rebuild. To rebuild anyway (full re-extraction; the current store is kept as graph.v1-backup-<date>): recall-echo graph extract --pipeline v2 --rebuild --force"
+                .to_string(),
+        )
+    }
 }
 
 /// Crash between the two renames: `graph/` is gone, a backup holds it, and
@@ -1476,6 +1659,9 @@ fn log_from_archive_name(name: &str) -> Option<u32> {
 
 #[cfg(feature = "llm")]
 fn print_rebuild_dry_run(memory_dir: &Path, plan: &RebuildPlan) -> Result<(), RecallError> {
+    if plan.stamp_unknown {
+        println!("graph/: stamp unknown (daemon not running)");
+    }
     if plan.resume {
         println!(
             "Resuming rebuild from {} (stamped v2); continuing from unextracted logs.",
@@ -3893,6 +4079,30 @@ mod tests {
         gm.mark_extracted(7).await.expect("mark extracted");
         assert_eq!(v2_extract_state(&gm, 7).await.unwrap(), (true, false));
         assert_eq!(v2_extract_state(&gm, 8).await.unwrap(), (false, false));
+    }
+
+    #[test]
+    fn v2_refusal_only_for_v2_without_force() {
+        let stamps = [GraphStamp::V2, GraphStamp::NotV2, GraphStamp::Unknown];
+        for stamp in stamps {
+            for force in [false, true] {
+                let refusal = v2_refusal(&stamp, force);
+                assert_eq!(
+                    refusal.is_some(),
+                    matches!(stamp, GraphStamp::V2) && !force,
+                    "{stamp:?} force={force}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_force_command() {
+        let text = v2_refusal(&GraphStamp::V2, false).expect("refused");
+        assert_eq!(
+            text,
+            "graph/ is already a v2 store; nothing to rebuild. To rebuild anyway (full re-extraction; the current store is kept as graph.v1-backup-<date>): recall-echo graph extract --pipeline v2 --rebuild --force"
+        );
     }
 
     #[test]

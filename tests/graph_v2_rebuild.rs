@@ -97,6 +97,10 @@ impl Scripted {
             .iter()
             .any(|message| message.contains(needle))
     }
+
+    fn calls(&self) -> usize {
+        self.seen.lock().expect("seen").len()
+    }
 }
 
 #[async_trait]
@@ -1289,4 +1293,150 @@ async fn a_second_rebuild_plans_after_it_takes_the_lock() {
         episodes.iter().all(|row| log_number(row) != Some(1)),
         "{episodes:?}"
     );
+}
+
+async fn store_shape(path: &Path) -> (usize, usize, Vec<String>) {
+    let episodes = query(path, "SELECT log_number FROM episode").await.len();
+    let entities = query(path, "SELECT name FROM entity").await.len();
+    let stamp = strings(
+        &query(path, "SELECT pipeline FROM meta:pipeline").await,
+        "pipeline",
+    );
+    (episodes, entities, stamp)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_store_is_refused_without_force() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    let graph = memory.join("graph");
+    stamp_v2(&graph).await;
+    let before_shape = store_shape(&graph).await;
+    settled(&graph).await;
+    let before_bytes = snapshot(&graph);
+    let stop = IdleStop::new();
+    let provider = Scripted::answering();
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &stop,
+        Some(&provider),
+    )
+    .await
+    .expect_err("v2 store");
+    let message = err.to_string();
+    assert!(message.contains("already a v2 store"), "{message}");
+    assert!(message.contains("--force"), "{message}");
+    assert!(!stop.called());
+    assert_eq!(provider.calls(), 0);
+    assert!(backups(memory).is_empty(), "{:?}", backups(memory));
+    assert!(!memory.join("graph.v2-build").exists());
+    assert_eq!(snapshot(&graph), before_bytes);
+    assert_eq!(store_shape(&graph).await, before_shape);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_forced_rebuild_of_a_v2_store_swaps_and_keeps_a_backup() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    stamp_v2(&memory.join("graph")).await;
+    let mut opts = options(PipelineVersion::V2, false);
+    opts.force = true;
+    rebuild(memory, opts, &IdleStop::new(), Some(&Scripted::answering()))
+        .await
+        .expect("forced rebuild");
+    let found = backups(memory);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].join("KEEP").is_file(), "{}", found[0].display());
+    let stamp = strings(
+        &query(&memory.join("graph"), "SELECT pipeline FROM meta:pipeline").await,
+        "pipeline",
+    );
+    assert_eq!(stamp, vec!["v2".to_string()]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_dry_run_on_a_v2_store_without_a_daemon_writes_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    stamp_v2(&memory.join("graph")).await;
+    settled(&memory.join("graph")).await;
+    let before = snapshot(memory);
+    let stop = IdleStop::new();
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, true),
+        &stop,
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("dry run");
+    assert!(!stop.called());
+    assert_eq!(snapshot(memory), before);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_build_dir_resumes_without_a_stamp_check() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::failing(PYTHON)),
+    )
+    .await
+    .expect_err("stop on the second archive");
+    assert!(err.to_string().contains("log 002"), "{err}");
+    assert!(memory.join("graph.v2-build").is_dir());
+    stamp_v2(&memory.join("graph")).await;
+
+    let stop = IdleStop::new();
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &stop,
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("build dir resumes without a stamp check");
+    assert!(stop.called());
+    assert!(!memory.join("graph.v2-build").exists());
+    let stamp = strings(
+        &query(&memory.join("graph"), "SELECT pipeline FROM meta:pipeline").await,
+        "pipeline",
+    );
+    assert_eq!(stamp, vec!["v2".to_string()]);
+    assert_eq!(backups(memory).len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stamp_read_error_on_the_live_open_names_graph() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    write_archives(memory);
+    write_config(memory, false);
+    let graph = memory.join("graph");
+    std::fs::create_dir_all(&graph).expect("graph");
+    std::fs::write(graph.join("surreal"), b"not a directory").expect("block open");
+    let stop = IdleStop::new();
+    let provider = Scripted::answering();
+    let err = rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &stop,
+        Some(&provider),
+    )
+    .await
+    .expect_err("stamp read");
+    let message = err.to_string();
+    assert!(message.contains("graph/"), "{message}");
+    assert!(!stop.called());
+    assert_eq!(provider.calls(), 0);
+    assert!(backups(memory).is_empty());
+    assert!(!memory.join("graph.v2-build").exists());
 }
