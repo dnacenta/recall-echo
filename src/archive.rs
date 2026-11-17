@@ -13,8 +13,9 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config;
 use crate::conversation::{self, Conversation, ConversationEntry};
@@ -203,9 +204,10 @@ fn summary_section(summary: &summarize::ConversationSummary) -> String {
 }
 
 /// Paths and fields the archive record is written from.
+///
+/// The conversation file is already on disk; `full_content` is what was written.
 struct ArchiveTail<'a> {
     memory_dir: &'a Path,
-    conversations_dir: &'a Path,
     archive_index: &'a Path,
     ephemeral_path: &'a Path,
     next_num: u32,
@@ -219,15 +221,15 @@ struct ArchiveTail<'a> {
     full_content: &'a str,
 }
 
-/// Write the archive file, the turns sidecar, the ARCHIVE.md row and the
-/// EPHEMERAL entry, in that order.
+/// Write the turns sidecar, the ARCHIVE.md row and the EPHEMERAL entry, in
+/// that order. The conversation file was claimed already.
+///
+/// The sidecar is a second record. A failure here must not throw away the
+/// archive that was just written.
 fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
-    let conv_file = tail
-        .conversations_dir
-        .join(format!("conversation-{:03}.md", tail.next_num));
-    fs::write(&conv_file, tail.full_content)?;
-    // The sidecar is a second record. A failure here must not throw away the
-    // archive that was just written.
+    // Already written by `claim_archive_number`. Kept on the tail so the
+    // caller still hands the bytes that landed on disk.
+    let _ = tail.full_content;
     write_sidecar_best_effort(
         tail.memory_dir,
         tail.next_num,
@@ -382,6 +384,136 @@ fn repeat_of(memory_dir: &Path, conv: &Conversation) -> Option<u32> {
     is_repeat(&text_turns(&conv.entries), &stored).then_some(log)
 }
 
+static CLAIM_SEQ: AtomicU64 = AtomicU64::new(0);
+const CLAIM_ATTEMPTS: u32 = 64;
+
+struct ClaimFile {
+    path: PathBuf,
+}
+
+impl ClaimFile {
+    fn new(dir: &Path) -> Self {
+        let path = dir.join(format!(
+            ".claim-{}-{}.tmp",
+            std::process::id(),
+            CLAIM_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        Self { path }
+    }
+}
+
+impl Drop for ClaimFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Claim the next free conversation number and write `render(n)` there.
+///
+/// `render` is called again with n+1 when another writer took n.
+pub(crate) fn claim_archive_number(
+    conversations_dir: &Path,
+    render: impl FnMut(u32) -> String,
+) -> Result<(u32, String), RecallError> {
+    claim_archive_number_in(conversations_dir, render, link_claim)
+}
+
+fn link_claim(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::hard_link(tmp, dest)
+}
+
+fn claim_archive_number_in(
+    conversations_dir: &Path,
+    mut render: impl FnMut(u32) -> String,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(u32, String), RecallError> {
+    let mut number = highest_conversation_number(conversations_dir) + 1;
+    let tmp = ClaimFile::new(conversations_dir);
+    for _ in 0..CLAIM_ATTEMPTS {
+        let content = render(number);
+        fs::write(&tmp.path, &content)?;
+        let dest = conversation_file(conversations_dir, number);
+        match place_claim(&tmp.path, &dest, &content, &link) {
+            Ok(()) => return Ok((number, content)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => number += 1,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(RecallError::Other(
+        "could not claim a free conversation number after 64 attempts".into(),
+    ))
+}
+
+fn conversation_file(dir: &Path, number: u32) -> PathBuf {
+    dir.join(format!("conversation-{number:03}.md"))
+}
+
+/// The link step. A test passes a linker that fails so the fallback can run.
+fn place_claim(
+    tmp: &Path,
+    dest: &Path,
+    content: &str,
+    link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match link(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if hard_link_unavailable(&err) => reserve_new_file(dest, content),
+        Err(err) => Err(err),
+    }
+}
+
+fn hard_link_unavailable(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Unsupported || is_cross_device(err)
+}
+
+fn is_cross_device(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::CrossesDevices || err.raw_os_error() == Some(libc::EXDEV)
+}
+
+fn reserve_new_file(dest: &Path, content: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    file.write_all(content.as_bytes())
+}
+
+struct ArchiveRender<'a> {
+    conv: &'a Conversation,
+    summary: &'a summarize::ConversationSummary,
+    source: &'a str,
+    pulse: Option<&'a str>,
+    timestamp: &'a str,
+    duration: &'a str,
+    total_messages: u32,
+}
+
+impl ArchiveRender<'_> {
+    fn render(&self, number: u32) -> String {
+        let fm = Frontmatter {
+            log: number,
+            date: self.timestamp.to_string(),
+            session_id: self.conv.session_id.clone(),
+            message_count: self.total_messages,
+            duration: self.duration.to_string(),
+            source: self.source.to_string(),
+            pulse: self.pulse.map(str::to_string),
+            topics: self.summary.topics.clone(),
+        };
+        let md_body = conversation::conversation_to_markdown(self.conv, number);
+        let conv_tags = tags::extract_tags(&self.conv.entries);
+        let tags_section = tags::format_tags_section(&conv_tags);
+        let summary_section = summary_section(self.summary);
+        format!(
+            "{}\n\n{}{}\n{}",
+            fm.render(),
+            summary_section,
+            md_body,
+            tags_section
+        )
+    }
+}
+
 fn write_archive(
     memory_dir: &Path,
     conv: &Conversation,
@@ -421,48 +553,26 @@ fn write_archive(
         });
     }
 
-    let next_num = highest_conversation_number(&conversations_dir) + 1;
-
     let (timestamp, date) = session_clock(conv.first_timestamp.as_deref());
     let duration = match (&conv.first_timestamp, &conv.last_timestamp) {
         (Some(start), Some(end)) => conversation::calculate_duration(start, end),
         _ => "unknown".to_string(),
     };
     let total_messages = conv.total_messages();
-
-    // Build frontmatter
-    let fm = Frontmatter {
-        log: next_num,
-        date: timestamp.clone(),
-        session_id: conv.session_id.clone(),
-        message_count: total_messages,
-        duration: duration.clone(),
-        source: source.to_string(),
-        pulse: pulse.map(String::from),
-        topics: summary.topics.clone(),
+    let rendered = ArchiveRender {
+        conv,
+        summary,
+        source,
+        pulse,
+        timestamp: &timestamp,
+        duration: &duration,
+        total_messages,
     };
-
-    // Convert conversation to markdown
-    let md_body = conversation::conversation_to_markdown(conv, next_num);
-
-    // Extract tags
-    let conv_tags = tags::extract_tags(&conv.entries);
-    let tags_section = tags::format_tags_section(&conv_tags);
-
-    // Add summary section if available
-    let summary_section = summary_section(summary);
-
-    let full_content = format!(
-        "{}\n\n{}{}\n{}",
-        fm.render(),
-        summary_section,
-        md_body,
-        tags_section
-    );
+    let (next_num, full_content) =
+        claim_archive_number(&conversations_dir, |number| rendered.render(number))?;
 
     record_archive(ArchiveTail {
         memory_dir,
-        conversations_dir: &conversations_dir,
         archive_index: &archive_index,
         ephemeral_path: &ephemeral_path,
         next_num,
@@ -2474,5 +2584,253 @@ mod tests {
         assert!(captured.contains("session_id: \"sess\""), "{captured}");
         assert!(memory.join("turns/conversation-002.json").is_file());
         assert!(!memory.join("graph").exists());
+    }
+
+    fn rendered_log(number: u32) -> String {
+        format!("---\nlog: {number}\n---\n\n# Conversation {number:03}\n")
+    }
+
+    fn claim_temps(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(".claim-").then_some(name)
+            })
+            .collect()
+    }
+
+    fn unsupported_link(_tmp: &Path, _dest: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no hard links",
+        ))
+    }
+
+    fn crosses_devices_link(_tmp: &Path, _dest: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::CrossesDevices,
+            "cross-device",
+        ))
+    }
+
+    fn exdev_link(_tmp: &Path, _dest: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+    }
+
+    #[test]
+    fn a_taken_number_moves_the_archive_to_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (number, content) = claim_archive_number(dir, |k| {
+            if k == 1 {
+                fs::write(dir.join("conversation-001.md"), "occupied").unwrap();
+            }
+            rendered_log(k)
+        })
+        .unwrap();
+        assert_eq!(number, 2);
+        assert!(content.contains("log: 2"), "{content}");
+        assert!(content.contains("# Conversation 002"), "{content}");
+        assert_eq!(
+            fs::read_to_string(dir.join("conversation-002.md")).unwrap(),
+            content
+        );
+    }
+
+    #[test]
+    fn the_taken_file_is_left_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let occupied = b"occupied-bytes\n";
+        claim_archive_number(dir, |k| {
+            if k == 1 {
+                fs::write(dir.join("conversation-001.md"), occupied).unwrap();
+            }
+            rendered_log(k)
+        })
+        .unwrap();
+        assert_eq!(fs::read(dir.join("conversation-001.md")).unwrap(), occupied);
+    }
+
+    #[test]
+    fn no_claim_file_is_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let pending = ClaimFile::new(dir);
+        let name = pending
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with(".claim-") && name.ends_with(".tmp"),
+            "{name}"
+        );
+        assert!(!name.starts_with("conversation-"), "{name}");
+        assert!(!name.starts_with("archive-log-"), "{name}");
+        fs::write(&pending.path, "temp").unwrap();
+        fs::write(dir.join("conversation-003.md"), "kept").unwrap();
+        assert_eq!(highest_conversation_number(dir), 3);
+        drop(pending);
+        assert!(!dir.join(&name).exists());
+
+        claim_archive_number(dir, rendered_log).unwrap();
+        assert!(claim_temps(dir).is_empty(), "after success");
+
+        let next = highest_conversation_number(dir) + 1;
+        claim_archive_number(dir, |k| {
+            if k == next {
+                fs::write(conversation_file(dir, k), "taken").unwrap();
+            }
+            rendered_log(k)
+        })
+        .unwrap();
+        assert!(claim_temps(dir).is_empty(), "after a collision");
+
+        let err = claim_archive_number_in(dir, rendered_log, |_: &Path, _: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no",
+            ))
+        });
+        assert!(err.is_err());
+        assert!(claim_temps(dir).is_empty(), "after an error");
+    }
+
+    #[test]
+    fn too_many_collisions_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let err = claim_archive_number(dir, |n| {
+            fs::write(conversation_file(dir, n), "taken").unwrap();
+            rendered_log(n)
+        })
+        .unwrap_err();
+        assert!(matches!(err, RecallError::Other(_)), "{err}");
+        assert!(claim_temps(dir).is_empty());
+        assert!(dir.join("conversation-064.md").is_file());
+        assert!(!dir.join("conversation-065.md").exists());
+    }
+
+    #[test]
+    fn fallback_create_new_writes_the_archive() {
+        let links: [fn(&Path, &Path) -> std::io::Result<()>; 3] =
+            [unsupported_link, crosses_devices_link, exdev_link];
+        for link in links {
+            let tmp = tempfile::tempdir().unwrap();
+            let (number, content) =
+                claim_archive_number_in(tmp.path(), rendered_log, link).unwrap();
+            assert_eq!(number, 1);
+            assert!(content.contains("log: 1"), "{content}");
+            assert!(content.contains("# Conversation 001"), "{content}");
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("conversation-001.md")).unwrap(),
+                content
+            );
+            assert!(claim_temps(tmp.path()).is_empty());
+        }
+    }
+
+    #[test]
+    fn fallback_create_new_rerenders_after_a_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let occupied = "occupied-bytes\n";
+        let mut calls = Vec::new();
+        let (number, content) = claim_archive_number_in(
+            dir,
+            |k| {
+                calls.push(k);
+                if k == 1 {
+                    fs::write(dir.join("conversation-001.md"), occupied).unwrap();
+                }
+                rendered_log(k)
+            },
+            unsupported_link,
+        )
+        .unwrap();
+        assert_eq!(calls, vec![1, 2]);
+        assert_eq!(number, 2);
+        assert!(content.contains("log: 2"), "{content}");
+        assert!(content.contains("# Conversation 002"), "{content}");
+        assert_eq!(
+            fs::read_to_string(dir.join("conversation-001.md")).unwrap(),
+            occupied
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("conversation-002.md")).unwrap(),
+            content
+        );
+        assert!(claim_temps(dir).is_empty());
+    }
+
+    #[test]
+    fn concurrent_archives_take_distinct_numbers() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path().to_path_buf();
+        fs::write(
+            memory.join("ARCHIVE.md"),
+            "# Conversation Archive\n\n| # | Date | Session | Topics | Messages | Duration |\n|---|------|---------|--------|----------|----------|\n",
+        )
+        .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let iterations = 4u32;
+        let spawn = |prefix: &str, barrier: std::sync::Arc<std::sync::Barrier>, memory: PathBuf| {
+            let prefix = prefix.to_string();
+            std::thread::spawn(move || {
+                for i in 0..iterations {
+                    barrier.wait();
+                    let conv = one_turn(&format!("{prefix}-{i}"), Some("2026-08-05T22:29:00Z"));
+                    archive_conversation(
+                        &memory,
+                        &conv,
+                        &summarize::ConversationSummary::default(),
+                        "jsonl",
+                    )
+                    .unwrap();
+                }
+            })
+        };
+        let first = spawn("sess", std::sync::Arc::clone(&barrier), memory.clone());
+        let second = spawn("alpha", barrier, memory.clone());
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let conversations = memory.join("conversations");
+        let mut numbers = Vec::new();
+        for entry in fs::read_dir(&conversations).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(raw) = name
+                .strip_prefix("conversation-")
+                .and_then(|rest| rest.strip_suffix(".md"))
+            else {
+                continue;
+            };
+            let number: u32 = raw.parse().unwrap();
+            let body = fs::read_to_string(entry.path()).unwrap();
+            let header = crate::frontmatter::parse(&body).unwrap();
+            assert_eq!(header.log, number, "{name}");
+            assert!(
+                body.contains(&format!("# Conversation {number:03}")),
+                "{name}"
+            );
+            numbers.push(number);
+        }
+        numbers.sort_unstable();
+        let distinct = numbers.len();
+        numbers.dedup();
+        assert_eq!(numbers.len(), 8, "{numbers:?}");
+        assert_eq!(distinct, numbers.len());
+
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        for i in 0..iterations {
+            assert_eq!(index.matches(&format!("sess-{i}")).count(), 1, "{index}");
+            assert_eq!(index.matches(&format!("alpha-{i}")).count(), 1, "{index}");
+        }
+        assert!(claim_temps(&conversations).is_empty());
     }
 }
