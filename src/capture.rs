@@ -195,10 +195,12 @@ pub fn pending(
     Ok(pending)
 }
 
-/// Session ids already represented in `conversations/`.
+/// Session ids already captured in `conversations/`.
+///
+/// A checkpoint does not count. See [`archive::collect_captured_sessions`].
 #[must_use]
 pub fn archived_sessions(memory_dir: &Path) -> HashSet<String> {
-    archive::collect_archived_sessions(&memory_dir.join("conversations"))
+    archive::collect_captured_sessions(&memory_dir.join("conversations"))
 }
 
 // ── Archiving one transcript ─────────────────────────────────────────────
