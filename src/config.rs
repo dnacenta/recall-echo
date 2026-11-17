@@ -5,6 +5,7 @@
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,32 @@ fn is_dropped_llm_key(key: &str) -> bool {
         .any(|name| key == *name || key.strip_prefix("llm.").is_some_and(|rest| rest == *name))
 }
 
+fn removed_key_text(key: &str) -> String {
+    format!("{key} was removed in this version; delete the key")
+}
+
 fn dropped_key_error(key: &str) -> crate::error::RecallError {
-    crate::error::RecallError::Config(format!("{key} was removed in this version; delete the key"))
+    crate::error::RecallError::Config(removed_key_text(key))
+}
+
+/// `<path>: llm.<key> was removed in this version; delete the key`
+fn removed_key_line(path: &Path, key: &str) -> String {
+    format!(
+        "{}: {}",
+        path.display(),
+        removed_key_text(&format!("llm.{key}"))
+    )
+}
+
+fn prefixed_config(path: &Path, message: &str) -> crate::error::RecallError {
+    crate::error::RecallError::Config(format!("{}: {message}", path.display()))
+}
+
+fn prefix_config_error(path: &Path, err: crate::error::RecallError) -> crate::error::RecallError {
+    match err {
+        crate::error::RecallError::Config(message) => prefixed_config(path, &message),
+        other => other,
+    }
 }
 
 fn dropped_llm_key(content: &str) -> Option<&'static str> {
@@ -60,15 +85,30 @@ fn dropped_llm_key(content: &str) -> Option<&'static str> {
 /// built or the file is rewritten. `load` falls back to defaults, and the
 /// default provider spawns a logged-in CLI, so extraction must not proceed.
 pub(crate) fn legacy_llm_refusal(base: &Path) -> Option<crate::error::RecallError> {
-    let content = fs::read_to_string(config_path(base)).ok()?;
-    if let Some(key) = dropped_llm_key(&content) {
-        return Some(dropped_key_error(&format!("llm.{key}")));
+    let path = config_path(base);
+    let content = fs::read_to_string(&path).ok()?;
+    legacy_refusal(&path, &content)
+}
+
+/// Removed `[llm]` key, or the retired provider alias, with the file path.
+fn legacy_refusal(path: &Path, content: &str) -> Option<crate::error::RecallError> {
+    if let Some(key) = dropped_llm_key(content) {
+        return Some(crate::error::RecallError::Config(removed_key_line(
+            path, key,
+        )));
     }
-    let value: toml::Value = toml::from_str(&content).ok()?;
+    retired_alias_refusal(path, content)
+}
+
+fn retired_alias_refusal(path: &Path, content: &str) -> Option<crate::error::RecallError> {
+    let value: toml::Value = toml::from_str(content).ok()?;
     let provider = value.get("llm")?.get("provider")?.as_str()?;
+    if !provider.eq_ignore_ascii_case(retired_local_provider_alias()) {
+        return None;
+    }
     Provider::from_str_loose(provider)
         .err()
-        .filter(|_| provider.eq_ignore_ascii_case(retired_local_provider_alias()))
+        .map(|err| prefix_config_error(path, err))
 }
 
 /// Spelled with `concat!` on purpose so the removal grep stays clean.
@@ -1402,11 +1442,77 @@ pub fn load_from_dir(dir: &Path) -> Config {
     load(dir)
 }
 
+/// Load `.recall-echo.toml` from `base`, or the defaults when it is absent.
+///
+/// A file that cannot be read, does not parse, fails [`validate`], or still
+/// sets a removed key is an error naming the file. An unknown key is kept
+/// and reported once on stderr. A valid file yields the same [`Config`] as
+/// [`load`].
+pub fn try_load(base: &Path) -> Result<Config, crate::error::RecallError> {
+    let path = config_path(base);
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let content = fs::read_to_string(&path).map_err(|err| {
+        crate::error::RecallError::Config(format!("{}: cannot read: {err}", path.display()))
+    })?;
+    if let Some(err) = legacy_refusal(&path, &content) {
+        return Err(err);
+    }
+    let cfg = parse_validated(&path, &content)?;
+    warn_unknown_keys(&path, &unknown_keys(&content));
+    Ok(cfg)
+}
+
+/// Load `.recall-echo.toml` from `dir`. Same as [`try_load`].
+pub fn try_load_from_dir(dir: &Path) -> Result<Config, crate::error::RecallError> {
+    try_load(dir)
+}
+
+fn parse_validated(path: &Path, content: &str) -> Result<Config, crate::error::RecallError> {
+    let cfg: Config =
+        toml::from_str(content).map_err(|err| prefixed_config(path, &err.to_string()))?;
+    validate(cfg).map_err(|err| prefixed_config(path, &config_error_text(&err)))
+}
+
+fn config_error_text(err: &crate::error::RecallError) -> String {
+    match err {
+        crate::error::RecallError::Config(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Keys present in `content` that [`Config`] does not declare.
+fn unknown_keys(content: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let deserializer = toml::Deserializer::new(content);
+    let _parsed: Result<Config, _> = serde_ignored::deserialize(deserializer, |field| {
+        keys.push(field.to_string());
+    });
+    keys
+}
+
+/// One stderr line per key, at most once per process.
+fn warn_unknown_keys(path: &Path, keys: &[String]) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    for key in keys {
+        eprintln!("recall-echo: {}: unknown key {key} ignored", path.display());
+    }
+    true
+}
+
 /// Load config from .recall-echo.toml in the base dir.
 ///
 /// Returns defaults if the file doesn't exist or is malformed. A file that
 /// still sets a removed `[llm]` key, or the retired local-model provider
 /// alias, is not applied: the error is printed and the defaults stand.
+/// The removed-key line names the file.
 #[must_use]
 pub fn load(base: &Path) -> Config {
     let path = config_path(base);
@@ -1420,7 +1526,7 @@ pub fn load(base: &Path) -> Config {
     };
 
     if let Some(key) = dropped_llm_key(&content) {
-        eprintln!("recall-echo: {}", dropped_key_error(&format!("llm.{key}")));
+        eprintln!("recall-echo: {}", removed_key_line(&path, key));
         return Config::default();
     }
 
@@ -2124,6 +2230,230 @@ mod tests {
         }
         fs::write(config_path(tmp.path()), "[llm]\nprovider = \"grok\"\n").unwrap();
         assert!(legacy_llm_refusal(tmp.path()).is_none());
+    }
+
+    fn write_config(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = config_path(dir);
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn try_load_without_a_file_is_the_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = try_load(tmp.path()).unwrap();
+        assert_eq!(format!("{loaded:?}"), format!("{:?}", Config::default()));
+        assert_eq!(format!("{loaded:?}"), format!("{:?}", load(tmp.path())));
+    }
+
+    #[test]
+    fn try_load_of_a_valid_file_equals_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[ephemeral]\nmax_entries = 9\n\n[llm]\nprovider = \"grok\"\nmodel = \"alpha\"\n",
+        );
+        let loaded = try_load(tmp.path()).unwrap();
+        assert_eq!(format!("{loaded:?}"), format!("{:?}", load(tmp.path())));
+        assert_eq!(loaded.ephemeral.max_entries, 9);
+        assert_eq!(loaded.llm.model, "alpha");
+    }
+
+    #[test]
+    fn try_load_of_a_malformed_file_names_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "this is not toml [[[\n");
+        let err = try_load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("TOML parse error"), "{err}");
+    }
+
+    #[test]
+    fn try_load_of_a_type_error_names_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "[ephemeral]\nmax_entries = \"alpha\"\n");
+        let err = try_load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(
+            err.contains("max_entries") || err.contains("invalid type"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn try_load_of_a_removed_key_names_the_key_and_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = dropped_llm_keys()[0];
+        let path = write_config(
+            tmp.path(),
+            &format!("[llm]\nprovider = \"grok\"\n{key} = 1\n"),
+        );
+        let expected = format!(
+            "{}: llm.{key} was removed in this version; delete the key",
+            path.display()
+        );
+        let err = try_load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains(&expected), "{err}");
+        let refusal = legacy_llm_refusal(tmp.path()).unwrap().to_string();
+        assert!(refusal.contains(&expected), "{refusal}");
+    }
+
+    #[test]
+    fn try_load_of_the_retired_alias_names_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alias = retired_local_provider_alias();
+        let path = write_config(tmp.path(), &format!("[llm]\nprovider = \"{alias}\"\n"));
+        let err = try_load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(
+            err.contains("that provider was removed in this version"),
+            "{err}"
+        );
+        assert!(err.contains("claude-code"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_load_of_an_unreadable_file_names_the_file() {
+        // SAFETY: geteuid is a pure query of the process credentials.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "[ephemeral]\nmax_entries = 5\n");
+        let unreadable = std::fs::Permissions::from_mode(0o000);
+        fs::set_permissions(&path, unreadable).unwrap();
+        let err = try_load(tmp.path()).unwrap_err();
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("cannot read"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_key_is_reported_not_fatal() {
+        let body = "[ephemeral]\nmax_entries = 7\n\n[llm]\nnote = \"alpha\"\n";
+        assert_eq!(unknown_keys(body), vec!["llm.note".to_string()]);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), body);
+        let loaded = try_load(tmp.path()).unwrap();
+        assert_eq!(loaded.ephemeral.max_entries, 7);
+        let line = format!(
+            "recall-echo: {}: unknown key llm.note ignored",
+            path.display()
+        );
+        assert_eq!(unknown_key_lines(&path, &unknown_keys(body)), vec![line]);
+        assert!(!warn_unknown_keys(&path, &["llm.note".to_string()]));
+    }
+
+    fn unknown_key_lines(path: &Path, keys: &[String]) -> Vec<String> {
+        keys.iter()
+            .map(|key| format!("recall-echo: {}: unknown key {key} ignored", path.display()))
+            .collect()
+    }
+
+    /// Every section a default config omits on write is set here, including
+    /// the bools that skip-serialize at their default. A known key reported
+    /// as unknown would show up.
+    #[test]
+    fn a_known_key_file_reports_no_unknown_keys() {
+        let body = "\
+[ephemeral]
+max_entries = 5
+
+[llm]
+provider = \"grok\"
+model = \"\"
+api_base = \"\"
+
+[llm.cli]
+preset = \"grok\"
+command = \"alpha\"
+args = [\"alpha\"]
+prompt_delivery = \"stdin\"
+prompt_flag = \"alpha\"
+model_flag = \"alpha\"
+output_format_flag = \"alpha\"
+output_format_value = \"alpha\"
+output_mode = \"raw\"
+ndjson_match = [\"type=alpha\"]
+system_prompt_flag = \"alpha\"
+result_json_path = [\"alpha\"]
+usage_input_path = [\"alpha\"]
+usage_output_path = [\"alpha\"]
+extra_args = [\"alpha\"]
+timeout_secs = 1
+
+[pipeline]
+docs_dir = \"alpha\"
+auto_sync = false
+
+[graph]
+mode = \"embedded\"
+url = \"ws://localhost:8787\"
+namespace = \"nullarc\"
+database = \"\"
+username = \"\"
+password_file = \"\"
+pipeline = \"v1\"
+known_facts_context = true
+known_key_binding = true
+known_match = false
+consolidate = true
+consolidate_hold = true
+consolidate_links = true
+consolidate_components = true
+consolidate_key_rename = true
+consolidate_replaces_cue = true
+consolidate_replaces_departure = true
+consolidate_orphan_sweep = true
+consolidate_rule_fragments = true
+consolidate_retire_component = true
+drop_restatements = true
+ground_component_edges = true
+recover_turns = false
+
+[graph.scoring]
+weight_semantic = 0.45
+weight_hotness = 0.30
+weight_utility = 0.25
+corroboration_boost = 0.05
+
+[graph.provenance]
+weight_external = 1.0
+weight_user = 0.8
+weight_assistant = 0.3
+weight_self = 0.05
+
+[graph.dedup]
+certain_similarity = 0.92
+review_similarity = 0.82
+max_candidates = 3
+
+[serve]
+socket_path = \"alpha.sock\"
+idle_timeout_secs = 3600
+
+[extraction]
+background_enabled = true
+idle_after_secs = 120
+batch_size = 3
+
+[capture]
+enabled = true
+sources = [\"grok\"]
+settle_secs = 300
+";
+        assert!(
+            unknown_keys(body).is_empty(),
+            "known keys reported: {:?}",
+            unknown_keys(body)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), body);
+        let loaded = try_load(tmp.path()).unwrap();
+        assert_eq!(format!("{loaded:?}"), format!("{:?}", load(tmp.path())));
     }
 
     #[test]
