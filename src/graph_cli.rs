@@ -721,6 +721,38 @@ async fn extract_ingested_v2(
     Ok(())
 }
 
+/// Extract one log with a caller-supplied provider. Production extract builds its own.
+#[cfg(feature = "llm")]
+pub async fn extract_log_with(
+    memory_dir: &Path,
+    log: u32,
+    text: &str,
+    session_id: &str,
+    llm: &dyn crate::graph::llm::LlmProvider,
+) -> Result<IngestionReport, RecallError> {
+    let memory = memory_dir.to_path_buf();
+    let text = text.to_string();
+    let session_id = session_id.to_string();
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let context = IngestContext::new(session_id, Some(log));
+        let report = crate::graph::v2::extract_log(
+            &gm,
+            &memory,
+            log,
+            &text,
+            &context,
+            llm,
+            PipelineVersion::V2,
+        )
+        .await?;
+        if !report.leaves_pending() {
+            gm.mark_extracted(log).await?;
+        }
+        Ok(report)
+    })
+    .await
+}
+
 #[cfg(not(feature = "llm"))]
 async fn extract_ingested_v2(
     _memory_dir: &Path,
@@ -1123,6 +1155,7 @@ struct BuildTotals {
     archives: u32,
     /// Leftover episodes from the last completeness scan, when that scan ran.
     leftovers: Option<usize>,
+    forgotten_skips: u32,
 }
 
 /// One archive after its episodes were brought up to the chunk count.
@@ -1186,7 +1219,8 @@ impl EpisodeRows {
 /// daemon, or from a copy of `graph/surreal/` when none is running; `graph/`
 /// itself is not opened. A stamped build directory is a resume of its unfinished
 /// logs. `--dry-run` lists archives and estimated calls and does not stop
-/// the daemon.
+/// the daemon. The returned count is how many candidates matched a live
+/// forget record. It is zero when the flag is off.
 ///
 /// The build, the catch-up of logs that appear while it runs, the swap, and
 /// the config write all hold the admin lock. A live run plans after that lock
@@ -1199,11 +1233,12 @@ pub async fn rebuild(
     options: ExtractOptions,
     stop: &impl RebuildStop,
     llm: Option<&dyn crate::graph::llm::LlmProvider>,
-) -> Result<(), RecallError> {
+) -> Result<u32, RecallError> {
     preflight_rebuild(memory_dir, &options)?;
     if options.dry_run {
         let plan = plan_rebuild(memory_dir, options.force, false).await?;
-        return print_rebuild_dry_run(memory_dir, &plan);
+        print_rebuild_dry_run(memory_dir, &plan)?;
+        return Ok(0);
     }
     let planned = std::sync::Mutex::new(None);
     serve_client::exclusive_without_store(
@@ -1235,7 +1270,7 @@ async fn finish_rebuild(
     plan: &RebuildPlan,
     options: &ExtractOptions,
     llm: Option<&dyn crate::graph::llm::LlmProvider>,
-) -> Result<(), RecallError> {
+) -> Result<u32, RecallError> {
     let totals = if let Some(provider) = llm {
         drive_rebuild(memory_dir, plan, provider, options).await?
     } else {
@@ -1247,9 +1282,10 @@ async fn finish_rebuild(
         drive_rebuild(memory_dir, plan, owned.as_ref(), options).await?
     };
     if !totals.finished {
-        return Ok(());
+        return Ok(totals.forgotten_skips);
     }
-    swap_and_record(memory_dir, totals.archives, totals.facts, totals.leftovers)
+    swap_and_record(memory_dir, totals.archives, totals.facts, totals.leftovers)?;
+    Ok(totals.forgotten_skips)
 }
 
 /// Config, pipeline, server mode, and rewrite validation. No store is opened,
@@ -2378,6 +2414,7 @@ async fn drive_rebuild(
     let mut measured = 0u64;
     let mut estimated = 0u64;
     let mut facts = 0u32;
+    let mut forgotten_skips = 0u32;
     let mut batch = plan.pending.clone();
     let mut processed = false;
     let leftovers;
@@ -2417,6 +2454,7 @@ async fn drive_rebuild(
                     facts,
                     archives: 0,
                     leftovers: None,
+                    forgotten_skips,
                 });
             }
             let built =
@@ -2427,6 +2465,7 @@ async fn drive_rebuild(
             if let BuiltArchive::Done(report) = built {
                 measured = measured.saturating_add(report.measured_tokens);
                 estimated = estimated.saturating_add(report.estimated_tokens);
+                forgotten_skips = forgotten_skips.saturating_add(report.forgotten_skips);
                 if report.leaves_pending() {
                     let detail = report
                         .errors
@@ -2462,6 +2501,7 @@ async fn drive_rebuild(
         facts,
         archives: u32::try_from(archives.len()).unwrap_or(u32::MAX),
         leftovers,
+        forgotten_skips,
     })
 }
 
@@ -2817,7 +2857,11 @@ fn refusal_text(err: &crate::graph::error::GraphError) -> &'static str {
 /// whose counters stay zero, so the v1 success line does not change.
 #[cfg(feature = "llm")]
 fn v2_report_suffix(report: &IngestionReport) -> String {
-    if report.windows == 0 && report.candidates == 0 && report.kept == 0 && report.drops.is_empty()
+    if report.windows == 0
+        && report.candidates == 0
+        && report.kept == 0
+        && report.drops.is_empty()
+        && report.forgotten_skips == 0
     {
         return String::new();
     }
@@ -2833,13 +2877,23 @@ fn v2_report_suffix(report: &IngestionReport) -> String {
             .join(",")
     };
     format!(
-        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept{}",
+        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept{}{}",
         report.windows,
         report.llm_calls,
         report.candidates,
         report.kept,
-        resolve_suffix(&report.resolve)
+        resolve_suffix(&report.resolve),
+        forgotten_suffix(report)
     )
+}
+
+#[cfg(feature = "llm")]
+fn forgotten_suffix(report: &IngestionReport) -> String {
+    if report.forgotten_skips == 0 {
+        String::new()
+    } else {
+        format!(", forgotten_skips={}", report.forgotten_skips)
+    }
 }
 
 #[cfg(feature = "llm")]
@@ -2906,7 +2960,8 @@ pub struct ExtractOptions {
 #[cfg(feature = "llm")]
 pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), RecallError> {
     if options.rebuild {
-        return rebuild(memory_dir, options, &LiveDaemonStop, None).await;
+        rebuild(memory_dir, options, &LiveDaemonStop, None).await?;
+        return Ok(());
     }
     let ExtractOptions {
         log,
@@ -4492,6 +4547,22 @@ mod tests {
             "{}",
             v2_report_suffix(&v2)
         );
+    }
+
+    #[test]
+    fn a_forgotten_skip_is_named_on_the_extract_line() {
+        let report = IngestionReport {
+            windows: 1,
+            forgotten_skips: 1,
+            ..IngestionReport::default()
+        };
+        assert!(
+            v2_report_suffix(&report).contains("forgotten_skips=1"),
+            "{}",
+            v2_report_suffix(&report)
+        );
+        let quiet = IngestionReport::default();
+        assert!(!v2_report_suffix(&quiet).contains("forgotten_skips"));
     }
 
     /// The line a user reads must not claim a measurement it does not have.

@@ -74,6 +74,7 @@ struct LiveRow {
 /// A store read failure adds one error and lists nothing. The caller still
 /// succeeds. `facts` supplies subjects stored this session; the project name
 /// and its aliases are always included, up to 48 names.
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub(crate) async fn fill_report(
     gm: &GraphMemory,
     enabled: bool,
@@ -81,43 +82,55 @@ pub(crate) async fn fill_report(
     facts: &[Fact],
     report: &mut crate::graph::types::IngestionReport,
 ) {
+    if let Err(err) = fill_report_result(gm, enabled, session, facts, report).await {
+        report.errors.push(err.to_string());
+    }
+}
+
+/// [`fill_report`], returning a malformed forget file as an error when the flag is on.
+pub(crate) async fn fill_report_result(
+    gm: &GraphMemory,
+    enabled: bool,
+    session: &SessionInput,
+    facts: &[Fact],
+    report: &mut crate::graph::types::IngestionReport,
+) -> Result<(), GraphError> {
     if !enabled {
-        return;
+        return Ok(());
     }
     let hits = collect_hits(&session.turns);
     if hits.is_empty() {
-        return;
+        return Ok(());
     }
     let names = neighbourhood(&session.project, facts);
     let live = match load_live(gm, &names).await {
         Ok(rows) => rows,
         Err(_) => {
             report.errors.push(READ_ERROR.to_string());
-            return;
+            return Ok(());
         }
     };
     report.recovered = classify(&hits, &live);
-    mask_recovered_quotes(gm, report);
+    mask_recovered_quotes(gm, report)
 }
 
-fn mask_recovered_quotes(gm: &GraphMemory, report: &mut crate::graph::types::IngestionReport) {
+fn mask_recovered_quotes(
+    gm: &GraphMemory,
+    report: &mut crate::graph::types::IngestionReport,
+) -> Result<(), GraphError> {
     let Some(memory) = gm.path().parent() else {
-        return;
+        return Ok(());
     };
     if !crate::graph::forgotten::lasting_forget_on(memory) {
-        return;
+        return Ok(());
     }
-    let set = match crate::graph::forgotten::load_forget_set(memory, true) {
-        Ok(set) => set,
-        Err(err) => {
-            report.errors.push(err.to_string());
-            return;
-        }
-    };
+    let set = crate::graph::forgotten::load_forget_set(memory, true)
+        .map_err(|err| GraphError::Parse(err.to_string()))?;
     for item in &mut report.recovered.items {
         item.quote = crate::graph::forgotten::mask_forgotten(&item.quote, &set);
         item.value = crate::graph::forgotten::mask_forgotten(&item.value, &set);
     }
+    Ok(())
 }
 
 fn collect_hits(turns: &[Turn]) -> Vec<Hit> {
@@ -1689,5 +1702,50 @@ mod store_tests {
             .items
             .iter()
             .all(|item| item.value != "httpx.AsyncClient"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_forget_file_fails_recovery_when_the_flag_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        plant(dir.path(), true);
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nrecover_turns = true\nlasting_forget = true\nground_component_edges = false\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("forgotten.jsonl"), b"{not json\n").unwrap();
+        let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+            .await
+            .unwrap();
+        let err = extract_session(
+            &gm,
+            dir.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &Scripted { reply: REPLY },
+        )
+        .await
+        .expect_err("malformed forget file");
+        assert!(err.to_string().contains("invalid JSON"), "{err}");
+        assert!(err.to_string().contains("forgotten.jsonl"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn flag_off_recovery_ignores_a_malformed_forget_file() {
+        let dir = tempfile::tempdir().unwrap();
+        plant(dir.path(), true);
+        std::fs::create_dir(dir.path().join("forgotten.jsonl")).unwrap();
+        let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+            .await
+            .unwrap();
+        extract_session(
+            &gm,
+            dir.path(),
+            1,
+            &IngestContext::new("s", Some(1)),
+            &Scripted { reply: REPLY },
+        )
+        .await
+        .expect("flag off does not read the forget file");
     }
 }

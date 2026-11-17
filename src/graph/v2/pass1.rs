@@ -397,14 +397,14 @@ pub(crate) async fn extract_session(
     });
     // After the report clock, so a scan does not change `timing`. The pass
     // only reads and only when its switch is on.
-    super::recover::fill_report(
+    super::recover::fill_report_result(
         gm,
         recover_turns_enabled(memory_dir),
         &session,
         &facts,
         &mut report,
     )
-    .await;
+    .await?;
     Ok(report)
 }
 
