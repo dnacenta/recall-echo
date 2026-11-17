@@ -57,10 +57,7 @@ pub fn create_provider_with_binary(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<ProviderHandle, crate::error::RecallError> {
-    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
-        return Err(err);
-    }
-    let mut cfg = config::load(memory_dir).llm;
+    let mut cfg = config::try_load(memory_dir)?.llm;
 
     if let Some(p) = provider_override {
         cfg.provider = Provider::from_str_loose(p)?;
@@ -84,10 +81,7 @@ pub fn create_provider_with_overrides(
     memory_dir: &Path,
     overrides: &CliOverrides,
 ) -> Result<ProviderHandle, crate::error::RecallError> {
-    if let Some(err) = config::legacy_llm_refusal(memory_dir) {
-        return Err(err);
-    }
-    let mut cfg = config::load(memory_dir).llm;
+    let mut cfg = config::try_load(memory_dir)?.llm;
     if let Some(command) = &overrides.command {
         let command = command.to_str().ok_or_else(|| {
             crate::error::RecallError::Config(format!(
@@ -1168,5 +1162,26 @@ mod tests {
                 .unwrap();
         assert_eq!(built.api_key, "sk-test");
         assert_eq!(built.model, "m");
+    }
+
+    #[test]
+    fn create_provider_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".recall-echo.toml");
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = create_provider(dir.path(), None, None)
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        let err = create_provider_with_overrides(dir.path(), &CliOverrides::default())
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
     }
 }

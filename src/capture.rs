@@ -374,7 +374,7 @@ pub fn ingest(memory_dir: &Path, sources: &[Source]) -> Result<(), RecallError> 
         ));
     }
 
-    let config = crate::config::load_from_dir(memory_dir);
+    let config = crate::config::try_load_from_dir(memory_dir)?;
     let options = CaptureOptions::from_config(&config.capture);
     let mut total = 0usize;
 

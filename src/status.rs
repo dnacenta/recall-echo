@@ -30,6 +30,7 @@ fn trust_issue(pulse_root: &Path) -> Option<String> {
 
 pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
     let memory = pulse_root.join("memory");
+    config::try_load(&memory)?;
     if !memory.exists() {
         return Err(RecallError::NotInitialized(
             "memory/ directory not found. Run `recall-echo init` first.".into(),
@@ -327,6 +328,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn status_fails_on_a_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        let path = memory.join(".recall-echo.toml");
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = run_with_base(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+    }
 
     /// Init writes hooks and a persisted root pointer outside the store, so
     /// it runs here against a sandbox: the suite never touches the real

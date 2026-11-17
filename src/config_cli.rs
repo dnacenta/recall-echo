@@ -13,7 +13,7 @@ use crate::theme::{BOLD, DIM, GOOD, RESET};
 
 /// Display current configuration.
 pub fn show(memory_dir: &Path) -> Result<(), RecallError> {
-    let cfg = config::load(memory_dir);
+    let cfg = config::try_load(memory_dir)?;
     let path = config::config_path(memory_dir);
     let exists = path.exists();
 
@@ -182,7 +182,7 @@ pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError>
     if let Some(err) = config::legacy_llm_refusal(memory_dir) {
         return Err(err);
     }
-    let mut cfg = config::load(memory_dir);
+    let mut cfg = config::try_load(memory_dir)?;
     cfg.set_key(key, value)?;
     config::save(memory_dir, &cfg)?;
 
@@ -206,4 +206,35 @@ pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_show_fails_on_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config::config_path(dir.path());
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = show(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_set_fails_and_leaves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config::config_path(dir.path());
+        let body = "this is not toml [[[\n";
+        std::fs::write(&path, body).unwrap();
+        let err = set(dir.path(), "ephemeral.max_entries", "5").unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    }
 }
