@@ -15,6 +15,7 @@ changes a user has to know about before upgrading.
 
 ### Fixed
 
+- `graph ingest --pipeline v2` no longer reports a log as already extracted when its episode chunks failed to write. Any episode write error now stops before extraction (no provider call, no fact write), names the failed chunks, prints the command to retry, and exits non-zero (#248).
 - `graph extract --pipeline v2 --rebuild` refuses a `graph/` that is already a v2 store instead of re-extracting everything; pass `--force` to rebuild anyway (#241).
 - A session that only had a PreCompact checkpoint is now captured in full by the capture sweep and `archive --all-unarchived` (#228).
 - Two archives written at the same time (a session-end hook, the capture sweep, a PreCompact checkpoint) no longer take the same conversation number; the later one takes the next free number (#228).
