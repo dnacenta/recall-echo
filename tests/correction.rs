@@ -600,27 +600,6 @@ impl Drop for HeldForgetLock {
     }
 }
 
-struct ForgetWait {
-    previous: Option<String>,
-}
-
-impl ForgetWait {
-    fn millis(ms: &str) -> Self {
-        let previous = std::env::var("RECALL_ECHO_FORGET_LOCK_MS").ok();
-        std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", ms);
-        Self { previous }
-    }
-}
-
-impl Drop for ForgetWait {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", value),
-            None => std::env::remove_var("RECALL_ECHO_FORGET_LOCK_MS"),
-        }
-    }
-}
-
 #[tokio::test]
 async fn flag_off_forget_deletes_and_writes_no_file() {
     let fixture = Fixture::new();
@@ -743,7 +722,6 @@ async fn a_held_forget_lock_deletes_nothing() {
 
     let lock_path = fixture.memory_dir.join(".forgotten.lock");
     let _held = HeldForgetLock::on(&lock_path);
-    let _wait = ForgetWait::millis("0");
     let err = try_correct(
         &fixture.memory_dir,
         entity("Vim"),
@@ -926,6 +904,35 @@ async fn relate_and_add_entity_name_unforget_when_the_flag_is_on() {
         .await
         .iter()
         .any(|name| name == "Vim"));
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn a_malformed_forget_file_deletes_nothing() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let path = fixture.memory_dir.join("forgotten.jsonl");
+    std::fs::write(&path, b"{not json\n").expect("leftover");
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let err = try_correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await
+    .expect_err("malformed forget file");
+    let message = err.to_string();
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(message.contains("invalid JSON"), "{message}");
+    assert_eq!(std::fs::read(&path).expect("bytes"), b"{not json\n");
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 2);
+    assert_eq!(daemon::entity_names(&db).await.len(), 3);
     daemon::close(db).await;
 }
 

@@ -207,20 +207,50 @@ pub(crate) fn lock_forgotten(memory_dir: &Path, wait: Duration) -> Result<Forget
     Ok(ForgetLock { _file: file })
 }
 
-/// Production wait, or `RECALL_ECHO_FORGET_LOCK_MS` when that seam is set.
+/// How long a forget waits for `memory/.forgotten.lock`.
+///
+/// Tests can shorten it. Production always waits [`crate::file_lock::LOCK_WAIT`].
 #[must_use]
 pub(crate) fn forget_lock_wait() -> Duration {
-    match std::env::var("RECALL_ECHO_FORGET_LOCK_MS") {
-        Ok(text) => wait_from_millis(&text),
-        Err(_) => crate::file_lock::LOCK_WAIT,
+    #[cfg(test)]
+    if let Some(wait) = WAIT_OVERRIDE.with(std::cell::Cell::get) {
+        return wait;
+    }
+    crate::file_lock::LOCK_WAIT
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous test wait when dropped. In-process only.
+#[cfg(test)]
+pub(crate) struct ForgetWaitOverride {
+    previous: Option<Duration>,
+}
+
+#[cfg(test)]
+impl ForgetWaitOverride {
+    pub(crate) fn at(wait: Duration) -> Self {
+        let previous = WAIT_OVERRIDE.with(|cell| cell.replace(Some(wait)));
+        Self { previous }
     }
 }
 
-fn wait_from_millis(text: &str) -> Duration {
-    match text.parse::<u64>() {
-        Ok(ms) => Duration::from_millis(ms),
-        Err(_) => crate::file_lock::LOCK_WAIT,
+#[cfg(test)]
+impl Drop for ForgetWaitOverride {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        WAIT_OVERRIDE.with(|cell| cell.set(previous));
     }
+}
+
+/// Parse the forget file while `lock` is held. Missing is empty.
+///
+/// A malformed file is an error, so the caller can refuse before any delete.
+pub(crate) fn ensure_readable(memory_dir: &Path, _lock: &ForgetLock) -> Result<(), RecallError> {
+    load_records(memory_dir).map(|_| ())
 }
 
 /// Lock, then append. An empty slice does not create the file or the lock.
@@ -984,8 +1014,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     const AT: &str = "2026-11-17T12:00:00Z";
 
     fn mode_of(path: &Path) -> u32 {
@@ -1343,17 +1371,30 @@ mod tests {
     }
 
     #[test]
-    fn forget_lock_wait_uses_the_env_seam() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    fn forget_lock_wait_uses_the_test_seam() {
+        let _guard = ForgetWaitOverride::at(Duration::ZERO);
+        assert_eq!(forget_lock_wait(), Duration::ZERO);
+    }
+
+    #[test]
+    fn forget_lock_wait_ignores_the_environment() {
         let previous = std::env::var("RECALL_ECHO_FORGET_LOCK_MS").ok();
         std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", "0");
-        assert_eq!(forget_lock_wait(), Duration::ZERO);
-        std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", "nope");
         assert_eq!(forget_lock_wait(), crate::file_lock::LOCK_WAIT);
         match previous {
             Some(value) => std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", value),
             None => std::env::remove_var("RECALL_ECHO_FORGET_LOCK_MS"),
         }
+    }
+
+    #[test]
+    fn a_malformed_file_is_unreadable_and_a_missing_file_is_empty() {
+        let dir = tempfile::tempdir().expect("temp");
+        let lock = lock_forgotten(dir.path(), Duration::from_secs(1)).expect("lock");
+        ensure_readable(dir.path(), &lock).expect("missing file");
+        std::fs::write(dir.path().join("forgotten.jsonl"), b"{not json\n").expect("file");
+        let err = ensure_readable(dir.path(), &lock).expect_err("malformed");
+        assert!(err.to_string().contains("invalid JSON"), "{err}");
     }
 
     #[test]

@@ -588,9 +588,10 @@ fn lock_before_forget(
     if !is_confirmed_forget(correction) || !forgotten::lasting_forget_on(memory) {
         return Ok(None);
     }
-    forgotten::lock_forgotten(memory, forgotten::forget_lock_wait())
-        .map(Some)
-        .map_err(forget_error)
+    let lock =
+        forgotten::lock_forgotten(memory, forgotten::forget_lock_wait()).map_err(forget_error)?;
+    forgotten::ensure_readable(memory, &lock).map_err(forget_error)?;
+    Ok(Some(lock))
 }
 
 fn is_confirmed_forget(correction: Correction) -> bool {
