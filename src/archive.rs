@@ -13,7 +13,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -205,7 +205,7 @@ fn summary_section(summary: &summarize::ConversationSummary) -> String {
 
 /// Paths and fields the archive record is written from.
 ///
-/// The conversation file is already on disk; `full_content` is what was written.
+/// The conversation file is already on disk.
 struct ArchiveTail<'a> {
     memory_dir: &'a Path,
     archive_index: &'a Path,
@@ -218,7 +218,6 @@ struct ArchiveTail<'a> {
     conv: &'a Conversation,
     summary: &'a summarize::ConversationSummary,
     cwd: Option<&'a str>,
-    full_content: &'a str,
 }
 
 /// Write the turns sidecar, the ARCHIVE.md row and the EPHEMERAL entry, in
@@ -227,9 +226,6 @@ struct ArchiveTail<'a> {
 /// The sidecar is a second record. A failure here must not throw away the
 /// archive that was just written.
 fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
-    // Already written by `claim_archive_number`. Kept on the tail so the
-    // caller still hands the bytes that landed on disk.
-    let _ = tail.full_content;
     write_sidecar_best_effort(
         tail.memory_dir,
         tail.next_num,
@@ -386,19 +382,39 @@ fn repeat_of(memory_dir: &Path, conv: &Conversation) -> Option<u32> {
 
 static CLAIM_SEQ: AtomicU64 = AtomicU64::new(0);
 const CLAIM_ATTEMPTS: u32 = 64;
+const CLAIM_NAME_ATTEMPTS: u32 = 32;
 
 struct ClaimFile {
     path: PathBuf,
+    file: fs::File,
 }
 
 impl ClaimFile {
-    fn new(dir: &Path) -> Self {
-        let path = dir.join(format!(
-            ".claim-{}-{}.tmp",
-            std::process::id(),
-            CLAIM_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        Self { path }
+    /// Create a new temp file. An existing path is never opened.
+    fn create(dir: &Path) -> std::io::Result<Self> {
+        let mut last = std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a claim temp file",
+        );
+        for attempt in 0..CLAIM_NAME_ATTEMPTS {
+            let path = claim_temp_path(dir, attempt);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = err,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last)
+    }
+
+    fn rewrite(&mut self, content: &str) -> std::io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(content.as_bytes())
     }
 }
 
@@ -408,6 +424,32 @@ impl Drop for ClaimFile {
     }
 }
 
+/// `.claim-<pid>-<token>-<attempt>.tmp`. Attempt 0 is stable so a leftover
+/// name is skipped; later attempts add a fresh token and never reuse a path.
+fn claim_temp_path(dir: &Path, attempt: u32) -> PathBuf {
+    let token = if attempt == 0 {
+        0
+    } else {
+        claim_token(attempt)
+    };
+    dir.join(format!(
+        ".claim-{}-{token:x}-{attempt}.tmp",
+        std::process::id()
+    ))
+}
+
+fn claim_token(attempt: u32) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = CLAIM_SEQ.fetch_add(1, Ordering::Relaxed);
+    nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seq)
+        .wrapping_add(u64::from(attempt))
+}
+
 /// Claim the next free conversation number and write `render(n)` there.
 ///
 /// `render` is called again with n+1 when another writer took n.
@@ -415,33 +457,38 @@ pub(crate) fn claim_archive_number(
     conversations_dir: &Path,
     render: impl FnMut(u32) -> String,
 ) -> Result<(u32, String), RecallError> {
-    claim_archive_number_in(conversations_dir, render, link_claim)
+    claim_archive_number_in(conversations_dir, render, link_claim, rename_claim)
 }
 
 fn link_claim(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     fs::hard_link(tmp, dest)
 }
 
+fn rename_claim(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::rename(tmp, dest)
+}
+
 fn claim_archive_number_in(
     conversations_dir: &Path,
     mut render: impl FnMut(u32) -> String,
     link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(u32, String), RecallError> {
     let mut number = highest_conversation_number(conversations_dir) + 1;
-    let tmp = ClaimFile::new(conversations_dir);
+    let mut tmp = ClaimFile::create(conversations_dir)?;
     for _ in 0..CLAIM_ATTEMPTS {
         let content = render(number);
-        fs::write(&tmp.path, &content)?;
+        tmp.rewrite(&content)?;
         let dest = conversation_file(conversations_dir, number);
-        match place_claim(&tmp.path, &dest, &content, &link) {
+        match place_claim(&tmp.path, &dest, &link, &rename) {
             Ok(()) => return Ok((number, content)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => number += 1,
             Err(err) => return Err(err.into()),
         }
     }
-    Err(RecallError::Other(
-        "could not claim a free conversation number after 64 attempts".into(),
-    ))
+    Err(RecallError::Other(format!(
+        "could not claim a free conversation number after {CLAIM_ATTEMPTS} attempts"
+    )))
 }
 
 fn conversation_file(dir: &Path, number: u32) -> PathBuf {
@@ -452,30 +499,44 @@ fn conversation_file(dir: &Path, number: u32) -> PathBuf {
 fn place_claim(
     tmp: &Path,
     dest: &Path,
-    content: &str,
     link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+    rename: &impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     match link(tmp, dest) {
         Ok(()) => Ok(()),
-        Err(err) if hard_link_unavailable(&err) => reserve_new_file(dest, content),
+        Err(err) if hard_link_unavailable(&err) => publish_claim(tmp, dest, rename),
         Err(err) => Err(err),
     }
 }
 
 fn hard_link_unavailable(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::Unsupported || is_cross_device(err)
+    err.kind() == std::io::ErrorKind::Unsupported
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+        || is_cross_device(err)
 }
 
 fn is_cross_device(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::CrossesDevices || err.raw_os_error() == Some(libc::EXDEV)
 }
 
-fn reserve_new_file(dest: &Path, content: &str) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
+/// Reserve `dest` empty, then move the fully written temp file onto it.
+///
+/// A failure after the reservation removes it, so nothing sees a partial
+/// `conversation-NNN.md`.
+fn publish_claim(
+    tmp: &Path,
+    dest: &Path,
+    rename: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(dest)?;
-    file.write_all(content.as_bytes())
+    if let Err(err) = rename(tmp, dest) {
+        let _ = fs::remove_file(dest);
+        return Err(err);
+    }
+    Ok(())
 }
 
 struct ArchiveRender<'a> {
@@ -583,7 +644,6 @@ fn write_archive(
         conv,
         summary,
         cwd,
-        full_content: &full_content,
     })?;
 
     eprintln!("recall-echo: archived conversation-{next_num:03}.md ({total_messages} messages)");
@@ -1676,6 +1736,7 @@ mod tests {
             fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
         let frontmatter = crate::frontmatter::parse(&archived).unwrap();
         assert_eq!(frontmatter.date, "2026-09-28T09:10:37Z");
+        assert_eq!(frontmatter.duration, "< 1m");
         let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
         assert!(index.contains("| 001 | 2026-09-28 | sess |"), "{index}");
         let ephemeral = fs::read_to_string(memory.join("EPHEMERAL.md")).unwrap();
@@ -2539,6 +2600,53 @@ mod tests {
         assert!(!memory.join("graph").exists());
     }
 
+    /// A checkpoint-only transcript at or before the watermark is not swept.
+    #[test]
+    fn the_sweep_skips_a_checkpoint_only_session_at_the_watermark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (memory, sessions) = codex_fixture(tmp.path(), CODEX_SESS);
+        write_conversation(&memory.join("conversations"), 1, CODEX_SESS, "precompact");
+        let rollout = sessions.join(format!(
+            "2026/08/05/rollout-2026-08-05T22-29-00-{CODEX_SESS}.jsonl"
+        ));
+        let mark = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&rollout)
+            .unwrap()
+            .set_modified(mark)
+            .unwrap();
+        let modified = fs::metadata(&rollout).unwrap().modified().unwrap();
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let watermark = if modified > std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs) {
+            secs + 1
+        } else {
+            secs
+        };
+        fs::write(
+            memory.join("capture/codex.watermark"),
+            format!("{watermark}\n"),
+        )
+        .unwrap();
+
+        let report = crate::capture::sweep(
+            &memory,
+            &crate::transcript::CodexTranscripts::new(sessions),
+            settled_now(),
+        )
+        .unwrap();
+
+        assert!(report.archived.is_empty(), "{report:?}");
+        assert!(!memory.join("conversations/conversation-002.md").exists());
+        assert_eq!(
+            fs::read_dir(memory.join("conversations")).unwrap().count(),
+            1
+        );
+    }
+
     /// A session that already has a capture is still skipped.
     #[test]
     fn the_sweep_still_skips_a_captured_session() {
@@ -2619,6 +2727,25 @@ mod tests {
         Err(std::io::Error::from_raw_os_error(libc::EXDEV))
     }
 
+    fn eperm_link(_tmp: &Path, _dest: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    fn permission_denied_link(_tmp: &Path, _dest: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "eperm",
+        ))
+    }
+
+    fn claim_falling_back(
+        dir: &Path,
+        render: impl FnMut(u32) -> String,
+        link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<(u32, String), RecallError> {
+        claim_archive_number_in(dir, render, link, rename_claim)
+    }
+
     #[test]
     fn a_taken_number_moves_the_archive_to_the_next() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2659,7 +2786,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        let pending = ClaimFile::new(dir);
+        let pending = ClaimFile::create(dir).unwrap();
         let name = pending
             .path
             .file_name()
@@ -2691,17 +2818,14 @@ mod tests {
         .unwrap();
         assert!(claim_temps(dir).is_empty(), "after a collision");
 
-        let err = claim_archive_number_in(dir, rendered_log, |_: &Path, _: &Path| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "no",
-            ))
+        let err = claim_falling_back(dir, rendered_log, |_: &Path, _: &Path| {
+            Err(std::io::Error::other("eio"))
         })
         .unwrap_err();
         assert!(
             matches!(
                 err,
-                RecallError::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied
+                RecallError::Io(ref io) if io.kind() == std::io::ErrorKind::Other
             ),
             "{err}"
         );
@@ -2725,12 +2849,16 @@ mod tests {
 
     #[test]
     fn fallback_create_new_writes_the_archive() {
-        let links: [fn(&Path, &Path) -> std::io::Result<()>; 3] =
-            [unsupported_link, crosses_devices_link, exdev_link];
+        let links: [fn(&Path, &Path) -> std::io::Result<()>; 5] = [
+            unsupported_link,
+            crosses_devices_link,
+            exdev_link,
+            eperm_link,
+            permission_denied_link,
+        ];
         for link in links {
             let tmp = tempfile::tempdir().unwrap();
-            let (number, content) =
-                claim_archive_number_in(tmp.path(), rendered_log, link).unwrap();
+            let (number, content) = claim_falling_back(tmp.path(), rendered_log, link).unwrap();
             assert_eq!(number, 1);
             assert!(content.contains("log: 1"), "{content}");
             assert!(content.contains("# Conversation 001"), "{content}");
@@ -2748,7 +2876,7 @@ mod tests {
         let dir = tmp.path();
         let occupied = "occupied-bytes\n";
         let mut calls = Vec::new();
-        let (number, content) = claim_archive_number_in(
+        let (number, content) = claim_falling_back(
             dir,
             |k| {
                 calls.push(k);
@@ -2773,6 +2901,53 @@ mod tests {
             content
         );
         assert!(claim_temps(dir).is_empty());
+    }
+
+    /// A rename failure after the number is reserved leaves no numbered file
+    /// and no temp file.
+    #[test]
+    fn a_failed_publish_leaves_no_numbered_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let err = claim_archive_number_in(
+            dir,
+            rendered_log,
+            unsupported_link,
+            |_from: &Path, _to: &Path| Err(std::io::Error::other("rename")),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RecallError::Io(ref io) if io.kind() == std::io::ErrorKind::Other
+            ),
+            "{err}"
+        );
+        assert!(claim_temps(dir).is_empty());
+        assert!(!conversation_file(dir, 1).exists());
+    }
+
+    /// A leftover claim name that is a second link to an archive is not opened
+    /// for writing, so that archive stays byte-identical.
+    #[test]
+    fn a_prelinked_claim_name_does_not_overwrite_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let original = b"archive-bytes\n";
+        let archive = conversation_file(dir, 1);
+        fs::write(&archive, original).unwrap();
+        let planted = claim_temp_path(dir, 0);
+        fs::hard_link(&archive, &planted).unwrap();
+
+        let (number, content) = claim_archive_number(dir, rendered_log).unwrap();
+
+        assert_eq!(number, 2);
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert_eq!(fs::read(&planted).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(conversation_file(dir, 2)).unwrap(),
+            content
+        );
     }
 
     #[test]
