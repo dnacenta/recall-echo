@@ -11,11 +11,13 @@
 //! Both converge into `archive_conversation()` which writes the markdown file,
 //! updates ARCHIVE.md, appends to EPHEMERAL.md, and writes a turns sidecar.
 
+use std::cell::Cell;
 use std::fmt::Write as _;
-use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::config;
 use crate::conversation::{self, Conversation, ConversationEntry};
@@ -81,6 +83,11 @@ pub fn highest_conversation_number(conversations_dir: &Path) -> u32 {
     max
 }
 
+/// Header bytes `append_index` writes, the same three lines as `init`'s template.
+const ARCHIVE_HEADER: &str = "# Conversation Archive\n\n\
+| # | Date | Session | Topics | Messages | Duration |\n\
+|---|------|---------|--------|----------|----------|\n";
+
 /// Append an entry to ARCHIVE.md (markdown table row).
 pub fn append_index(
     archive_path: &Path,
@@ -91,46 +98,109 @@ pub fn append_index(
     message_count: u32,
     duration: &str,
 ) -> Result<(), RecallError> {
-    use std::io::Write;
+    append_index_with(
+        archive_path,
+        log_num,
+        date,
+        session_id,
+        topics,
+        message_count,
+        duration,
+        crate::file_lock::lock_wait(),
+    )
+}
 
-    let needs_header = if archive_path.exists() {
-        fs::read_to_string(archive_path)
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    } else {
-        true
-    };
+#[allow(clippy::too_many_arguments)]
+fn append_index_with(
+    archive_path: &Path,
+    log_num: u32,
+    date: &str,
+    session_id: &str,
+    topics: &[String],
+    message_count: u32,
+    duration: &str,
+    wait: Duration,
+) -> Result<(), RecallError> {
+    let mut file = open_index(archive_path)?;
+    crate::file_lock::lock_exclusive(&file, archive_path, wait)?;
+    let needs_header = index_needs_header(&mut file);
+    let record = index_record(
+        needs_header,
+        log_num,
+        date,
+        session_id,
+        topics,
+        message_count,
+        duration,
+    );
+    file.write_all(record.as_bytes())?;
+    Ok(())
+}
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
+fn open_index(path: &Path) -> Result<File, RecallError> {
+    OpenOptions::new()
+        .read(true)
         .append(true)
-        .open(archive_path)?;
+        .create(true)
+        .open(path)
+        .map_err(RecallError::from)
+}
 
+/// Main's predicate: missing, empty, whitespace-only, or unreadable content
+/// all need the header. A read error counts as empty.
+fn index_needs_header(file: &mut File) -> bool {
+    let mut buf = String::new();
+    let readable = file.seek(SeekFrom::Start(0)).is_ok() && file.read_to_string(&mut buf).is_ok();
+    !readable || buf.trim().is_empty()
+}
+
+fn index_record(
+    needs_header: bool,
+    log_num: u32,
+    date: &str,
+    session_id: &str,
+    topics: &[String],
+    message_count: u32,
+    duration: &str,
+) -> String {
+    let mut out = String::new();
     if needs_header {
-        writeln!(file, "# Conversation Archive\n")?;
-        writeln!(
-            file,
-            "| # | Date | Session | Topics | Messages | Duration |"
-        )?;
-        writeln!(
-            file,
-            "|---|------|---------|--------|----------|----------|"
-        )?;
+        out.push_str(ARCHIVE_HEADER);
     }
+    push_index_row(
+        &mut out,
+        log_num,
+        date,
+        session_id,
+        topics,
+        message_count,
+        duration,
+    );
+    out
+}
 
-    let topics_str = if topics.is_empty() {
+fn push_index_row(
+    out: &mut String,
+    log_num: u32,
+    date: &str,
+    session_id: &str,
+    topics: &[String],
+    message_count: u32,
+    duration: &str,
+) {
+    let topics_str = topics_cell(topics);
+    let _ = writeln!(
+        out,
+        "| {log_num:03} | {date} | {session_id} | {topics_str} | {message_count} | {duration} |"
+    );
+}
+
+fn topics_cell(topics: &[String]) -> String {
+    if topics.is_empty() {
         "\u{2014}".to_string()
     } else {
         topics.join(", ")
-    };
-
-    writeln!(
-        file,
-        "| {log_num:03} | {date} | {session_id} | {topics_str} | {message_count} | {duration} |"
-    )?;
-
-    Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +319,8 @@ fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
         &tail.summary.topics,
         tail.total_messages,
         &tail.duration,
-    )?;
+    )
+    .map_err(|err| note_if_locked(tail.next_num, "ARCHIVE.md", err))?;
 
     // Append to EPHEMERAL.md
     let entry = EphemeralEntry {
@@ -1064,6 +1135,7 @@ pub fn run_with_hook_input(
     hook_input: &crate::jsonl::HookInput,
     base_dir: &Path,
 ) -> Result<(), RecallError> {
+    clear_lock_note();
     let config_error = config::try_load(base_dir).err();
     let ingest = ingest_mode(config_error.is_some());
     let transcript_path = hook_input.transcript_path.trim();
@@ -1088,25 +1160,27 @@ pub fn run_with_hook_input(
             crate::jsonl::report_declined_subagent(transcript_path, "nothing archived");
             Ok(())
         }
-        HookTarget::ClaudeJsonl => {
-            let result = archive_jsonl(
+        HookTarget::ClaudeJsonl => finish_hook_archive(
+            archive_jsonl(
                 base_dir,
                 &hook_input.session_id,
                 transcript_path,
                 hook_input._cwd.as_deref(),
                 None,
                 ingest,
-            )?;
-            finish_config_error(config_error, &result)
-        }
+            ),
+            config_error,
+        ),
         HookTarget::GeminiSession(conv) => {
             let cwd = resolve_cwd(
                 hook_input._cwd.as_deref(),
                 Some(Path::new(transcript_path)),
                 None,
             );
-            let result = archive_and_ingest(base_dir, &conv, "gemini", cwd.as_deref(), ingest)?;
-            finish_config_error(config_error, &result)
+            finish_hook_archive(
+                archive_and_ingest(base_dir, &conv, "gemini", cwd.as_deref(), ingest),
+                config_error,
+            )
         }
         HookTarget::Unreadable => {
             eprintln!(
@@ -1132,6 +1206,70 @@ fn finish_config_error(
         report_archived_without_extraction(result.log_number);
     }
     Err(err)
+}
+
+fn finish_hook_archive(
+    result: Result<ArchiveResult, RecallError>,
+    config_error: Option<RecallError>,
+) -> Result<(), RecallError> {
+    match result {
+        Ok(result) => finish_config_error(config_error, &result),
+        Err(err) => {
+            report_pending_lock_timeout();
+            Err(err)
+        }
+    }
+}
+
+struct LockNote {
+    log_number: u32,
+    record: &'static str,
+}
+
+thread_local! {
+    static LOCK_NOTE: Cell<Option<LockNote>> = const { Cell::new(None) };
+}
+
+fn clear_lock_note() {
+    LOCK_NOTE.with(|cell| cell.set(None));
+}
+
+fn note_if_locked(log_number: u32, record: &'static str, err: RecallError) -> RecallError {
+    if is_lock_timeout(&err) {
+        LOCK_NOTE.with(|cell| {
+            cell.set(Some(LockNote { log_number, record }));
+        });
+    }
+    err
+}
+
+fn is_lock_timeout(err: &RecallError) -> bool {
+    err.to_string()
+        .contains("locked by another recall-echo process")
+}
+
+/// One line, then the returned error, the same shape as a broken config.
+pub(crate) fn report_lock_timeout(log_number: u32, record: &'static str, err: &RecallError) {
+    if is_lock_timeout(err) {
+        report_lock_line(log_number, record);
+    }
+}
+
+fn report_pending_lock_timeout() {
+    let Some(note) = LOCK_NOTE.with(Cell::take) else {
+        return;
+    };
+    report_lock_line(note.log_number, note.record);
+}
+
+fn report_lock_line(log_number: u32, record: &str) {
+    // `writeln` to the stderr handle, not `eprintln`: a hook test has to read
+    // the line back, and the test harness swallows `eprintln` before it
+    // reaches the file descriptor.
+    let _ = writeln!(
+        std::io::stderr(),
+        "recall-echo: archived conversation-{log_number:03}.md; {record} not updated (lock error below)"
+    );
 }
 
 /// [`archive_all_unarchived_at`] with no `--pulse-root`.
@@ -3149,5 +3287,236 @@ mod tests {
         );
         let conversations = fs::read_dir(memory.join("conversations")).unwrap().count();
         assert_eq!(conversations, 1);
+    }
+
+    #[test]
+    fn index_record_matches_the_old_bytes() {
+        let with_header = index_record(true, 7, "2026-03-05", "sess", &[], 4, "5m");
+        assert_eq!(
+            with_header,
+            format!("{ARCHIVE_HEADER}{}", golden_row(7, "\u{2014}"))
+        );
+        let topics = vec!["auth".to_string(), "ci".to_string()];
+        let row_only = index_record(false, 7, "2026-03-05", "sess", &topics, 4, "5m");
+        assert_eq!(row_only, golden_row(7, "auth, ci"));
+    }
+
+    #[test]
+    fn append_index_bytes_match_main_for_every_starting_state() {
+        assert_index_bytes(None);
+        assert_index_bytes(Some(""));
+        assert_index_bytes(Some(" \n\t\n"));
+        assert_index_bytes(Some(ARCHIVE_HEADER));
+        let prior = format!("{ARCHIVE_HEADER}{}", golden_row(1, "old"));
+        assert_index_bytes(Some(&prior));
+        assert_unreadable_index_is_unchanged();
+    }
+
+    fn golden_row(log_num: u32, topics: &str) -> String {
+        format!("| {log_num:03} | 2026-03-05 | sess | {topics} | 4 | 5m |\n")
+    }
+
+    fn assert_index_bytes(start: Option<&str>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ARCHIVE.md");
+        if let Some(body) = start {
+            fs::write(&path, body).unwrap();
+        }
+        append_index(&path, 7, "2026-03-05", "sess", &[], 4, "5m").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            expected_index(start),
+            "{start:?}"
+        );
+    }
+
+    fn expected_index(start: Option<&str>) -> String {
+        let prefix = start.unwrap_or("");
+        let mut expected = prefix.to_string();
+        if prefix.trim().is_empty() {
+            expected.push_str(ARCHIVE_HEADER);
+        }
+        expected.push_str(&golden_row(7, "\u{2014}"));
+        expected
+    }
+
+    fn assert_unreadable_index_is_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ARCHIVE.md");
+        let original = b"secret\n";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+        let err = append_index(&path, 7, "2026-03-05", "sess", &[], 4, "5m").unwrap_err();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+    }
+
+    #[test]
+    fn concurrent_archives_write_one_header_and_whole_rows() {
+        write_rows_from(IndexStart::Blank);
+        write_rows_from(IndexStart::Missing);
+    }
+
+    #[derive(Clone, Copy)]
+    enum IndexStart {
+        Blank,
+        Missing,
+    }
+
+    fn write_rows_from(start: IndexStart) {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path().to_path_buf();
+        if matches!(start, IndexStart::Blank) {
+            fs::write(memory.join("ARCHIVE.md"), "").unwrap();
+        }
+        let threads = 4;
+        let each = 3;
+        spawn_archives(&memory, threads, each);
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert_whole_index(&index, threads * each);
+    }
+
+    fn spawn_archives(memory: &Path, threads: usize, each: usize) {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::new();
+        for thread in 0..threads {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let memory = memory.to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                archive_rounds(&memory, &barrier, thread, each);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    fn archive_rounds(memory: &Path, barrier: &std::sync::Barrier, thread: usize, each: usize) {
+        for i in 0..each {
+            barrier.wait();
+            let conv = one_turn(&format!("t{thread}-{i}"), Some("2026-08-05T22:29:00Z"));
+            archive_conversation(
+                memory,
+                &conv,
+                &summarize::ConversationSummary::default(),
+                "jsonl",
+            )
+            .unwrap();
+        }
+    }
+
+    fn assert_whole_index(index: &str, sessions: usize) {
+        assert_eq!(
+            index.matches("# Conversation Archive").count(),
+            1,
+            "{index}"
+        );
+        let pattern =
+            regex::Regex::new(r"^\| \d{3} \| [^|]+ \| [^|]+ \| [^|]+ \| \d+ \| [^|]+ \|$").unwrap();
+        let mut rows = Vec::new();
+        for line in index.lines() {
+            assert!(
+                index_line_ok(line, &pattern),
+                "torn or unexpected line: {line:?}\n{index}"
+            );
+            if pattern.is_match(line) {
+                rows.push(line);
+            }
+        }
+        assert_eq!(rows.len(), sessions, "{index}");
+        rows.sort_unstable();
+        rows.dedup();
+        assert_eq!(rows.len(), sessions, "{index}");
+    }
+
+    fn index_line_ok(line: &str, pattern: &regex::Regex) -> bool {
+        line.is_empty()
+            || line == "# Conversation Archive"
+            || line == "| # | Date | Session | Topics | Messages | Duration |"
+            || line == "|---|------|---------|--------|----------|----------|"
+            || pattern.is_match(line)
+    }
+
+    #[test]
+    fn a_held_archive_lock_times_out_naming_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ARCHIVE.md");
+        let original = "keep\n";
+        fs::write(&path, original).unwrap();
+        let _held = crate::file_lock::HeldLock::on(&path);
+        let err = append_index_with(
+            &path,
+            7,
+            "2026-03-05",
+            "sess",
+            &[],
+            4,
+            "5m",
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains("locked by another recall-echo process"),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn a_lock_timeout_in_the_archive_hook_keeps_the_archive_and_fails() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let index = memory.join("ARCHIVE.md");
+        fs::write(&index, ARCHIVE_HEADER).unwrap();
+        let _held = crate::file_lock::HeldLock::on(&index);
+        let _wait = crate::file_lock::WaitOverride::at(Duration::from_millis(200));
+        let (_dir, transcript) = written("session.jsonl", CLAUDE_JSONL);
+        let input = session_hook("sess", transcript);
+        let started = std::time::Instant::now();
+        let (result, logged) =
+            crate::file_lock::capture_stderr(|| run_with_hook_input(&input, memory));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert_archive_hook_lock_failure(memory, &index, result, &logged);
+    }
+
+    fn session_hook(session_id: &str, transcript: String) -> crate::jsonl::HookInput {
+        crate::jsonl::HookInput {
+            session_id: session_id.to_string(),
+            transcript_path: transcript,
+            _cwd: None,
+            _hook_event_name: Some("SessionEnd".to_string()),
+        }
+    }
+
+    fn assert_archive_hook_lock_failure(
+        memory: &Path,
+        index: &Path,
+        result: Result<(), RecallError>,
+        logged: &str,
+    ) {
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains(&index.display().to_string()), "{message}");
+        assert!(
+            message.contains("locked by another recall-echo process"),
+            "{message}"
+        );
+        assert!(
+            logged.contains("archived conversation-001.md")
+                && logged.contains("ARCHIVE.md not updated"),
+            "{logged}"
+        );
+        let archive = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("hello"), "{archive}");
+        assert!(memory.join("turns/conversation-001.json").is_file());
+        assert_eq!(fs::read_to_string(index).unwrap(), ARCHIVE_HEADER);
+        assert!(!memory.join("graph").exists());
     }
 }

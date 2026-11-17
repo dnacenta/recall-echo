@@ -15,6 +15,7 @@ changes a user has to know about before upgrading.
 
 ### Fixed
 
+- Two archives written at the same time no longer duplicate the ARCHIVE.md header or interleave their rows: the header check and the row are written in one piece under a lock on ARCHIVE.md (#250).
 - `graph extract --pipeline v2 --rebuild` refuses a `graph/` that is already a v2 store instead of re-extracting everything; pass `--force` to rebuild anyway (#241).
 - A session that only had a PreCompact checkpoint is now captured in full by the capture sweep and `archive --all-unarchived` (#228).
 - Two archives written at the same time (a session-end hook, the capture sweep, a PreCompact checkpoint) no longer take the same conversation number; the later one takes the next free number (#228).
