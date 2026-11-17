@@ -238,10 +238,7 @@ fn trim_rendered(content: &str, max: usize) -> String {
 
 fn replace_file(target: &Path, contents: &str) -> Result<(), RecallError> {
     let temp = temp_path(target);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
+    let mut file = open_temp(&temp)?;
     let mut guard = TempGuard::arm(temp);
     file.write_all(contents.as_bytes())?;
     // The rename is what readers see. sync_data first so a crash after the
@@ -251,6 +248,16 @@ fn replace_file(target: &Path, contents: &str) -> Result<(), RecallError> {
     fs::rename(&guard.path, target)?;
     guard.disarm();
     Ok(())
+}
+
+fn open_temp(path: &Path) -> Result<File, RecallError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(RecallError::from)
 }
 
 fn temp_path(target: &Path) -> PathBuf {
@@ -472,7 +479,7 @@ mod tests {
 
     #[test]
     fn record_entry_preserves_mode_and_a_symlinked_target() {
-        assert_absent_mode_matches_write();
+        assert_a_new_file_is_owner_only();
         assert_existing_mode_is_kept();
         assert_symlink_target_is_replaced();
     }
@@ -482,15 +489,23 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    fn assert_absent_mode_matches_write() {
+    fn assert_a_new_file_is_owner_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let via_write = tmp.path().join("via-write");
-        fs::write(&via_write, "x\n").unwrap();
         let path = tmp.path().join("EPHEMERAL.md");
         record_entry(&path, &make_entry("a", 1), 5).unwrap();
-        assert_eq!(mode_bits(&path), mode_bits(&via_write));
+        assert_eq!(mode_bits(&path), 0o600);
         assert_eq!(mode_bits(&tmp.path().join(".EPHEMERAL.lock")), 0o600);
         assert_no_temps(tmp.path());
+    }
+
+    #[test]
+    fn ephemeral_temp_is_created_at_mode_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".EPHEMERAL.md.1.1.tmp");
+        let file = open_temp(&path).unwrap();
+        assert_eq!(mode_bits(&path), 0o600);
+        drop(file);
+        let _ = fs::remove_file(&path);
     }
 
     fn assert_existing_mode_is_kept() {
