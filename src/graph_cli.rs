@@ -1589,23 +1589,11 @@ enum SnapFail {
 /// store whose manifest was not copied would be reported as not v2. A copy
 /// that keeps a later manifest and earlier tables can open and report v2
 /// for a store that is not. Either mismatch is a retry. After the retries,
-/// the rebuild is refused with `graph/` and `--force`. It is not started.
+/// the rebuild is refused. It is not started.
 #[cfg(feature = "llm")]
 fn judge_stamp(view: &StampView) -> Result<GraphStamp, StampJudge> {
-    if view.before != view.after {
-        return Err(StampJudge::Retry(
-            "graph/surreal changed while it was copied".into(),
-        ));
-    }
-    if !copy_matches(&view.before, &view.copied) {
-        return Err(StampJudge::Retry(
-            "the stamp copy does not match graph/surreal".into(),
-        ));
-    }
-    if lacks_manifest(&view.before) {
-        return Err(StampJudge::Retry(
-            "graph/surreal has sstables or a wal and no manifest".into(),
-        ));
+    if let Some(detail) = stamp_distrust(&view.before, &view.after, &view.copied) {
+        return Err(StampJudge::Retry(detail.into()));
     }
     match &view.opened {
         None => Err(StampJudge::Retry("the stamp copy was not opened".into())),
@@ -1626,10 +1614,29 @@ fn torn_store_error(message: &str) -> bool {
         || text.contains("checksum")
 }
 
+/// Why this snapshot cannot be trusted, if it cannot.
+#[cfg(feature = "llm")]
+fn stamp_distrust(
+    before: &StoreFingerprint,
+    after: &StoreFingerprint,
+    copied: &StoreFingerprint,
+) -> Option<&'static str> {
+    if before != after {
+        return Some("graph/surreal changed while it was copied");
+    }
+    if !copy_matches(before, copied) {
+        return Some("the stamp copy does not match graph/surreal");
+    }
+    if lacks_manifest(before) {
+        return Some("graph/surreal has sstables or a wal and no manifest");
+    }
+    None
+}
+
 #[cfg(feature = "llm")]
 fn inconsistent_stamp_error(detail: &str) -> RecallError {
     RecallError::Other(format!(
-        "graph/: could not read a consistent stamp from graph/surreal ({detail}). To rebuild anyway: recall-echo graph extract --pipeline v2 --rebuild --force"
+        "graph/: the store under graph/ changed during the read ({detail}). Stop whatever is writing graph/ (a running server or hook) and retry."
     ))
 }
 
@@ -1709,8 +1716,12 @@ async fn stamp_attempt(
     scratch: &Path,
     attempt: usize,
 ) -> Result<GraphStamp, StampJudge> {
-    let graph = scratch.join(format!("try-{attempt}")).join("graph");
+    let try_root = scratch.join(format!("try-{attempt}"));
+    let graph = try_root.join("graph");
     let dest = graph.join("surreal");
+    // Drop the copy when this attempt returns. The next attempt only needs
+    // the stamp value, so peak disk use stays one copy plus the store.
+    let _remove_try = RemoveTry(try_root);
     let before = match fingerprint(surreal) {
         Ok(fp) => fp,
         Err(SnapFail::Changing) => {
@@ -1728,7 +1739,7 @@ async fn stamp_attempt(
         }
         return Err(StampJudge::Fatal(stamp_read_error(err)));
     }
-    let after = match fingerprint(surreal) {
+    let after = match fingerprint_from(surreal, Some(&before)) {
         Ok(fp) => fp,
         Err(SnapFail::Changing) => {
             return Err(StampJudge::Retry(
@@ -1746,8 +1757,7 @@ async fn stamp_attempt(
         }
         Err(SnapFail::Hard(err)) => return Err(StampJudge::Fatal(stamp_read_error(err))),
     };
-    let trusted = before == after && copy_matches(&before, &copied) && !lacks_manifest(&before);
-    let opened = if trusted {
+    let opened = if stamp_distrust(&before, &after, &copied).is_none() {
         Some(open_copied_stamp(&graph).await)
     } else {
         None
@@ -1776,6 +1786,16 @@ async fn open_copied_stamp(graph: &Path) -> Result<Option<String>, String> {
 
 #[cfg(feature = "llm")]
 fn fingerprint(surreal: &Path) -> Result<StoreFingerprint, SnapFail> {
+    fingerprint_from(surreal, None)
+}
+
+/// `prior` supplies hashes for files whose size and mtime are unchanged, so
+/// the second look at the source does not read those bytes again.
+#[cfg(feature = "llm")]
+fn fingerprint_from(
+    surreal: &Path,
+    prior: Option<&StoreFingerprint>,
+) -> Result<StoreFingerprint, SnapFail> {
     match std::fs::read_dir(surreal) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(SnapFail::Changing),
@@ -1783,7 +1803,7 @@ fn fingerprint(surreal: &Path) -> Result<StoreFingerprint, SnapFail> {
     }
     let mut files = std::collections::BTreeMap::new();
     for name in ["manifest", "sstables", "wal", "vlog"] {
-        collect_snapshot(surreal, name, &mut files)?;
+        collect_snapshot(surreal, name, prior, &mut files)?;
     }
     Ok(StoreFingerprint { files })
 }
@@ -1792,6 +1812,7 @@ fn fingerprint(surreal: &Path) -> Result<StoreFingerprint, SnapFail> {
 fn collect_snapshot(
     surreal: &Path,
     rel: &str,
+    prior: Option<&StoreFingerprint>,
     files: &mut std::collections::BTreeMap<String, StoreEntry>,
 ) -> Result<(), SnapFail> {
     let path = surreal.join(rel);
@@ -1826,7 +1847,7 @@ fn collect_snapshot(
             Err(err) => return Err(SnapFail::Hard(err)),
         };
         if file_type.is_dir() {
-            collect_snapshot(surreal, &child, files)?;
+            collect_snapshot(surreal, &child, prior, files)?;
             continue;
         }
         let meta = match entry.metadata() {
@@ -1836,8 +1857,27 @@ fn collect_snapshot(
             }
             Err(err) => return Err(SnapFail::Hard(err)),
         };
+        let modified = modified_of(&meta);
+        if let Some(old) = prior.and_then(|prior| prior.files.get(&child)) {
+            if !old.is_dir
+                && old.len == meta.len()
+                && old.modified == modified
+                && old.hash.is_some()
+            {
+                files.insert(child, old.clone());
+                continue;
+            }
+        }
         let hash = hash_file(&path.join(name))?;
-        files.insert(child, store_entry(&meta, false, Some(hash)));
+        files.insert(
+            child,
+            StoreEntry {
+                is_dir: false,
+                len: meta.len(),
+                modified,
+                hash: Some(hash),
+            },
+        );
     }
     Ok(())
 }
@@ -1869,16 +1909,31 @@ fn hash_file(path: &Path) -> Result<[u8; 32], SnapFail> {
 
 #[cfg(feature = "llm")]
 fn store_entry(meta: &std::fs::Metadata, is_dir: bool, hash: Option<[u8; 32]>) -> StoreEntry {
-    let modified = meta.modified().ok().and_then(|time| {
-        time.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-    });
     StoreEntry {
         is_dir,
         len: meta.len(),
-        modified,
+        modified: modified_of(meta),
         hash,
+    }
+}
+
+#[cfg(feature = "llm")]
+fn modified_of(meta: &std::fs::Metadata) -> Option<(u64, u32)> {
+    meta.modified().ok().and_then(|time| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+    })
+}
+
+/// Removes one stamp attempt's copy. The next attempt only keeps the stamp.
+#[cfg(feature = "llm")]
+struct RemoveTry(PathBuf);
+
+#[cfg(feature = "llm")]
+impl Drop for RemoveTry {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -4751,7 +4806,9 @@ mod tests {
         assert_eq!(calls, 5);
         let message = err.to_string();
         assert!(message.contains("graph/"), "{message}");
-        assert!(message.contains("--force"), "{message}");
+        assert!(message.contains("changed during the read"), "{message}");
+        assert!(message.contains("retry"), "{message}");
+        assert!(!message.contains("--force"), "{message}");
 
         let ready = stable_stamp_view(Some("v2".to_string()));
         let mut scripted = vec![torn, ready.clone(), ready];
@@ -4778,7 +4835,9 @@ mod tests {
         .expect_err("one not-v2 snapshot is not acted on");
         let message = err.to_string();
         assert!(message.contains("graph/"), "{message}");
-        assert!(message.contains("--force"), "{message}");
+        assert!(message.contains("changed during the read"), "{message}");
+        assert!(message.contains("retry"), "{message}");
+        assert!(!message.contains("--force"), "{message}");
     }
 
     #[cfg(feature = "llm")]
