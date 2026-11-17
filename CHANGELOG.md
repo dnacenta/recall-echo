@@ -5,8 +5,17 @@ changes a user has to know about before upgrading.
 
 ## [Unreleased]
 
+### Breaking
+
+- `ExtractOptions` has a new public field `force`. A struct literal that builds `ExtractOptions` no longer compiles until it sets `force` (#241).
+
+### Added
+
+- `--force` for `graph extract --rebuild`. A forced rebuild of a v2 store keeps the old store as `graph.v1-backup-<date>`, the same prefix as a v1 rebuild, so `newest_backup` and the rollback command are unchanged (#241).
+
 ### Fixed
 
+- `graph extract --pipeline v2 --rebuild` refuses a `graph/` that is already a v2 store instead of re-extracting everything; pass `--force` to rebuild anyway (#241).
 - A session that only had a PreCompact checkpoint is now captured in full by the capture sweep and `archive --all-unarchived` (#228).
 - Two archives written at the same time (a session-end hook, the capture sweep, a PreCompact checkpoint) no longer take the same conversation number; the later one takes the next free number (#228).
 - A `.recall-echo.toml` that fails to parse, or still sets a removed key, is now an error that names the file, instead of silently running on the defaults (grok and the full consolidation stack). `status`, `config show` and `config set` exit non-zero, and the removed-key message names the file. Unknown keys are reported as a warning (#243).
