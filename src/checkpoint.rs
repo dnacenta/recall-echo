@@ -8,7 +8,6 @@
 //! 1. **JSONL hook** — called by Claude Code PreCompact hook (standalone)
 //! 2. **Pulse-null** — called with in-memory Messages (behind feature flag)
 
-use std::fs;
 use std::path::Path;
 
 use crate::archive;
@@ -60,7 +59,6 @@ pub fn run_with_hook_input(
         ));
     }
 
-    let next_num = archive::highest_conversation_number(&conversations_dir) + 1;
     let now = conversation::utc_now();
     let date = conversation::date_from_timestamp(&now);
 
@@ -70,8 +68,8 @@ pub fn run_with_hook_input(
         None => empty_checkpoint(),
     };
 
-    let fm = Frontmatter {
-        log: next_num,
+    let mut fm = Frontmatter {
+        log: 0,
         date: now,
         session_id: data.session_id,
         message_count: data.message_count,
@@ -81,10 +79,10 @@ pub fn run_with_hook_input(
         topics: data.topics.clone(),
     };
 
-    let full_content = format!("{}\n\n{}{}", fm.render(), data.md_body, data.tags_section);
-
-    let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&conv_file, &full_content)?;
+    let (next_num, full_content) = archive::claim_archive_number(&conversations_dir, |n| {
+        fm.log = n;
+        format!("{}\n\n{}{}", fm.render(), data.md_body, data.tags_section)
+    })?;
 
     // The sidecar is a second record. A failure here must not throw away the
     // archive that was just written; the helper logs and returns.
@@ -222,6 +220,7 @@ pub async fn create_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     fn write_test_jsonl(dir: &Path) -> String {
@@ -415,5 +414,75 @@ mod tests {
         let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
         assert!(index.contains("sess-a"));
         assert!(!tmp.path().join("turns/conversation-001.json").exists());
+    }
+
+    /// A PreCompact checkpoint racing an archive takes a different number,
+    /// and the checkpoint's `log:` is that number.
+    #[test]
+    fn a_checkpoint_and_an_archive_take_distinct_numbers() {
+        let tmp = prepared_root();
+        let memory = tmp.path().to_path_buf();
+        fs::write(
+            memory.join("ARCHIVE.md"),
+            "# Conversation Archive\n\n| # | Date | Session | Topics | Messages | Duration |\n|---|------|---------|--------|----------|----------|\n",
+        )
+        .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let iterations = 4u32;
+        let archive_memory = memory.clone();
+        let archive_barrier = std::sync::Arc::clone(&barrier);
+        let archived = std::thread::spawn(move || {
+            for i in 0..iterations {
+                archive_barrier.wait();
+                let mut conv = crate::conversation::Conversation::new(&format!("sess-{i}"));
+                conv.user_message_count = 1;
+                conv.entries
+                    .push(crate::conversation::ConversationEntry::UserMessage(
+                        "hello".into(),
+                    ));
+                crate::archive::archive_conversation(
+                    &archive_memory,
+                    &conv,
+                    &crate::summarize::ConversationSummary::default(),
+                    "jsonl",
+                )
+                .unwrap();
+            }
+        });
+        for i in 0..iterations {
+            barrier.wait();
+            let line = format!(
+                r#"{{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"alpha-{i}","message":{{"role":"user","content":"hello"}}}}"#
+            );
+            let input = hook_for(&memory, &format!("alpha-{i}"), &[&line]);
+            run_with_hook_input("precompact", Some(&input), &memory).unwrap();
+        }
+        archived.join().unwrap();
+
+        let mut numbers = Vec::new();
+        for entry in fs::read_dir(memory.join("conversations"))
+            .unwrap()
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(raw) = name
+                .strip_prefix("conversation-")
+                .and_then(|rest| rest.strip_suffix(".md"))
+            else {
+                continue;
+            };
+            let number: u32 = raw.parse().unwrap();
+            let body = fs::read_to_string(entry.path()).unwrap();
+            let header = crate::frontmatter::parse(&body).unwrap();
+            assert_eq!(header.log, number, "{name}");
+            if header.source == "precompact" {
+                assert!(header.session_id.starts_with("alpha-"), "{body}");
+            }
+            numbers.push(number);
+        }
+        numbers.sort_unstable();
+        assert_eq!(numbers.len(), 8, "{numbers:?}");
+        numbers.dedup();
+        assert_eq!(numbers.len(), 8, "{numbers:?}");
     }
 }
