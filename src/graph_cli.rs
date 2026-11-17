@@ -1335,7 +1335,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        return std::fs::DirBuilder::new().mode(0o700).create(path);
+        std::fs::DirBuilder::new().mode(0o700).create(path)
     }
     #[cfg(not(unix))]
     {
