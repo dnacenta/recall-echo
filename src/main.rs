@@ -623,6 +623,10 @@ enum GraphCommands {
         /// Remove it and its relationships outright
         #[arg(long)]
         forget: bool,
+        /// Deactivate a lasting forget so a later write is allowed again.
+        /// Requires `graph.lasting_forget`. Does not change the graph.
+        #[arg(long, conflicts_with_all = ["wrong", "forget"])]
+        unforget: bool,
         /// With --wrong on an entity: contradict every one of its relationships
         #[arg(long)]
         all_edges: bool,
@@ -989,6 +993,7 @@ fn main() {
                                 object,
                                 wrong,
                                 forget,
+                                unforget,
                                 all_edges,
                                 yes,
                             } => {
@@ -1000,6 +1005,7 @@ fn main() {
                                     forget,
                                     all_edges,
                                     yes,
+                                    unforget,
                                 };
                                 graph_cli::correct(&memory_dir, &options).await
                             }

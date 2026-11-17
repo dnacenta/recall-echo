@@ -208,6 +208,22 @@ pub(crate) fn lock_forgotten(memory_dir: &Path, wait: Duration) -> Result<Forget
     Ok(ForgetLock { _file: file })
 }
 
+/// Production wait, or `RECALL_ECHO_FORGET_LOCK_MS` when that seam is set.
+#[must_use]
+pub(crate) fn forget_lock_wait() -> Duration {
+    match std::env::var("RECALL_ECHO_FORGET_LOCK_MS") {
+        Ok(text) => wait_from_millis(&text),
+        Err(_) => crate::file_lock::LOCK_WAIT,
+    }
+}
+
+fn wait_from_millis(text: &str) -> Duration {
+    match text.parse::<u64>() {
+        Ok(ms) => Duration::from_millis(ms),
+        Err(_) => crate::file_lock::LOCK_WAIT,
+    }
+}
+
 /// Lock, then append. An empty slice does not create the file or the lock.
 pub(crate) fn append_forget_records(
     memory_dir: &Path,
@@ -234,6 +250,53 @@ pub(crate) fn append_locked(
     let mut existing = load_records(memory_dir)?;
     existing.extend(records.iter().cloned());
     write_records(&path, &existing)
+}
+
+/// Live rows `--unforget` would deactivate. Does not create or lock the file.
+pub(crate) fn matching_live(
+    memory_dir: &Path,
+    selector: &UnforgetSelector,
+) -> Result<Vec<ForgetRecord>, RecallError> {
+    let records = load_records(memory_dir)?;
+    Ok(records
+        .into_iter()
+        .filter(|record| live_selected(record, selector))
+        .collect())
+}
+
+fn live_selected(record: &ForgetRecord, selector: &UnforgetSelector) -> bool {
+    record.status == RecordStatus::Active && selected(record, selector)
+}
+
+/// One entity row for the folded name, plus one fact row per removed edge.
+#[must_use]
+pub(crate) fn records_for_removal(removal: &super::correct::Removal) -> Vec<ForgetRecord> {
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut records = Vec::new();
+    push_entity_record(&mut records, removal, &at);
+    push_edge_records(&mut records, removal, &at);
+    records
+}
+
+fn push_entity_record(
+    records: &mut Vec<ForgetRecord>,
+    removal: &super::correct::Removal,
+    at: &str,
+) {
+    let Some(entity) = removal.entity.as_ref() else {
+        return;
+    };
+    let mut record = entity_record(&entity.name, at);
+    record.entity_id = Some(entity.id.clone());
+    records.push(record);
+}
+
+fn push_edge_records(records: &mut Vec<ForgetRecord>, removal: &super::correct::Removal, at: &str) {
+    for edge in &removal.edges {
+        let mut record = fact_record(&edge.from, &edge.rel_type, &edge.to, at);
+        record.edge_id = Some(edge.id.clone());
+        records.push(record);
+    }
 }
 
 /// Mark the selected live rows inactive. Returns how many changed.
@@ -817,6 +880,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     const AT: &str = "2026-11-17T12:00:00Z";
 
     fn mode_of(path: &Path) -> u32 {
@@ -1138,6 +1203,53 @@ mod tests {
         let entity = live_set(&[entity_record("Vim", AT)]);
         assert_eq!(mask_forgotten("Vim is here", &entity), "Vim is here");
         assert!(entity.facts.is_empty());
+    }
+
+    #[test]
+    fn records_for_a_removal_keep_the_entity_and_each_edge() {
+        use super::super::correct::{EntityMatch, Removal};
+        use super::super::edge_view::EdgeView;
+        let removal = Removal {
+            entity: Some(EntityMatch {
+                id: "entity:vim".into(),
+                name: " Vim ".into(),
+                entity_type: "tool".into(),
+            }),
+            edges: vec![EdgeView {
+                id: "edge:1".into(),
+                from: "D".into(),
+                to: "Vim".into(),
+                rel_type: "USES".into(),
+                description: None,
+                confidence: 1.0,
+                evidence: 1.0,
+                self_reinforcements: 0,
+                superseded: false,
+            }],
+        };
+        let records = records_for_removal(&removal);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].subject, "vim");
+        assert_eq!(records[0].kind, Some(RecordKind::Entity));
+        assert_eq!(records[0].entity_id.as_deref(), Some("entity:vim"));
+        assert_eq!(records[1].relation.as_deref(), Some("USES"));
+        assert_eq!(records[1].value.as_deref(), Some("Vim"));
+        assert_eq!(records[1].edge_id.as_deref(), Some("edge:1"));
+        assert_eq!(records[1].provenance, "user");
+    }
+
+    #[test]
+    fn forget_lock_wait_uses_the_env_seam() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = std::env::var("RECALL_ECHO_FORGET_LOCK_MS").ok();
+        std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", "0");
+        assert_eq!(forget_lock_wait(), Duration::ZERO);
+        std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", "nope");
+        assert_eq!(forget_lock_wait(), crate::file_lock::LOCK_WAIT);
+        match previous {
+            Some(value) => std::env::set_var("RECALL_ECHO_FORGET_LOCK_MS", value),
+            None => std::env::remove_var("RECALL_ECHO_FORGET_LOCK_MS"),
+        }
     }
 
     #[test]

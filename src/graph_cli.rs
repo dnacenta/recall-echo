@@ -3725,6 +3725,8 @@ pub struct CorrectOptions {
     pub all_edges: bool,
     /// Skip the confirmation a removal otherwise requires.
     pub yes: bool,
+    /// Deactivate a lasting-forget record. The graph is not changed.
+    pub unforget: bool,
 }
 
 impl CorrectOptions {
@@ -3771,31 +3773,156 @@ impl CorrectOptions {
 /// A hot operation: it goes through the daemon like search and ingest, so a
 /// correction lands while a session is still using the store.
 pub async fn correct(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
+    if options.unforget {
+        return unforget_command(memory_dir, options).await;
+    }
+    apply_correction(memory_dir, options).await
+}
+
+async fn apply_correction(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
     let target = options.target()?;
     let report = send_correction(memory_dir, &target, options.correction()?).await?;
+    finish_correction(memory_dir, options, &target, report).await
+}
 
+async fn finish_correction(
+    memory_dir: &Path,
+    options: &CorrectOptions,
+    target: &CorrectTarget,
+    report: CorrectionReport,
+) -> Result<(), RecallError> {
     match report {
         // A removal is planned before it is applied, so the human sees what
         // goes before anything does.
         CorrectionReport::Planned { removal } => {
-            print_removal_plan(&removal);
-            if !options.yes && !confirm_removal(&removal)? {
-                println!("{WARN}Nothing removed.{RESET}");
-                return Ok(());
-            }
-            let applied =
-                send_correction(memory_dir, &target, Correction::Forget { confirmed: true })
-                    .await?;
-            // Still through `refusal`: the graph can have moved between the
-            // plan and the confirmation, and a removal that found nothing to
-            // remove must not exit as though it had.
-            print_correction(&applied);
-            refusal(&applied)
+            confirm_and_forget(memory_dir, options, target, &removal).await
         }
         other => {
             print_correction(&other);
             refusal(&other)
         }
+    }
+}
+
+async fn confirm_and_forget(
+    memory_dir: &Path,
+    options: &CorrectOptions,
+    target: &CorrectTarget,
+    removal: &Removal,
+) -> Result<(), RecallError> {
+    print_removal_plan(removal);
+    note_lasting_forget(crate::graph::forgotten::lasting_forget_on(memory_dir));
+    if !options.yes && !confirm_removal(removal)? {
+        println!("{WARN}Nothing removed.{RESET}");
+        return Ok(());
+    }
+    let applied =
+        send_correction(memory_dir, target, Correction::Forget { confirmed: true }).await?;
+    // Still through `refusal`: the graph can have moved between the
+    // plan and the confirmation, and a removal that found nothing to
+    // remove must not exit as though it had.
+    print_correction(&applied);
+    refusal(&applied)
+}
+
+fn note_lasting_forget(on: bool) {
+    if !on {
+        return;
+    }
+    println!("\n  {DIM}The forget is kept in memory/forgotten.jsonl until --unforget.{RESET}");
+}
+
+async fn unforget_command(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
+    require_lasting_forget(memory_dir)?;
+    let selector = unforget_selector(options)?;
+    let matches = crate::graph::forgotten::matching_live(memory_dir, &selector)?;
+    commit_unforget(memory_dir, options, &selector, &matches)
+}
+
+fn require_lasting_forget(memory_dir: &Path) -> Result<(), RecallError> {
+    if crate::graph::forgotten::lasting_forget_on(memory_dir) {
+        return Ok(());
+    }
+    Err(RecallError::Other(
+        "graph.lasting_forget is off; nothing was written. Set graph.lasting_forget before --unforget"
+            .into(),
+    ))
+}
+
+fn unforget_selector(
+    options: &CorrectOptions,
+) -> Result<crate::graph::forgotten::UnforgetSelector, RecallError> {
+    match (&options.rel_type, &options.object) {
+        (None, None) => Ok(crate::graph::forgotten::UnforgetSelector::Entity {
+            subject: options.subject.clone(),
+        }),
+        (Some(relation), Some(value)) => Ok(crate::graph::forgotten::UnforgetSelector::Fact {
+            subject: options.subject.clone(),
+            relation: relation.clone(),
+            value: value.clone(),
+        }),
+        _ => Err(RecallError::Other(
+            "a relationship needs all three names: \
+             `graph correct <from> <REL> <to> --unforget`"
+                .into(),
+        )),
+    }
+}
+
+fn commit_unforget(
+    memory_dir: &Path,
+    options: &CorrectOptions,
+    selector: &crate::graph::forgotten::UnforgetSelector,
+    matches: &[crate::graph::forgotten::ForgetRecord],
+) -> Result<(), RecallError> {
+    if matches.is_empty() {
+        return Err(RecallError::Other(
+            "no live forget record matched — nothing was changed".into(),
+        ));
+    }
+    print_unforget_plan(matches);
+    if !options.yes && !confirm_unforget()? {
+        println!("{WARN}Nothing restored.{RESET}");
+        return Ok(());
+    }
+    let count = crate::graph::forgotten::unforget_records(
+        memory_dir,
+        selector,
+        crate::graph::forgotten::forget_lock_wait(),
+    )?;
+    println!(
+        "{GOOD}✓{RESET} Deactivated {count} {}.",
+        plural(count, "forget record", "forget records")
+    );
+    Ok(())
+}
+
+fn confirm_unforget() -> Result<bool, RecallError> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return Err(RecallError::Other(
+            "refusing to unforget without confirmation — re-run with --yes".into(),
+        ));
+    }
+    print!("{BOLD}Restore this forget?{RESET} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+fn print_unforget_plan(records: &[crate::graph::forgotten::ForgetRecord]) {
+    println!("{BOLD}{WARN}This would restore:{RESET}\n");
+    for record in records {
+        println!("  {}", unforget_line(record));
+    }
+}
+
+fn unforget_line(record: &crate::graph::forgotten::ForgetRecord) -> String {
+    match (&record.relation, &record.value) {
+        (Some(relation), Some(value)) => format!("{} —[{relation}]→ {value}", record.subject),
+        _ => record.subject.clone(),
     }
 }
 
