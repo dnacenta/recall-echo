@@ -1,0 +1,1163 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Durable forget records in `memory/forgotten.jsonl`.
+//!
+//! The file lives beside the graph, not inside it, so a rebuild that swaps
+//! `graph/` does not drop the decision. The match key is the folded subject,
+//! the folded relation or key, and the value compared the way a same-fact
+//! write already compares values. Subject plus value is not a match.
+//!
+//! Writes take `memory/.forgotten.lock`, sweep stale temps, and publish a
+//! `0600` temp with `sync_data` before `rename`, so a crash cannot leave a
+//! half-written file as the record. `sync_data` runs before the rename: a
+//! crash after the rename must not publish bytes that never reached disk.
+
+// Entry points are reached from forget, extract, and read once those paths
+// consult the flag. Until then the module is exercised by its tests.
+#![allow(dead_code)]
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::{Map, Value};
+
+use super::aliases::fold;
+use super::v2::known_match::value_spans;
+use super::v2::values_equal;
+use crate::error::RecallError;
+
+const FILE_NAME: &str = "forgotten.jsonl";
+const LOCK_NAME: &str = ".forgotten.lock";
+const TEMP_PREFIX: &str = ".forgotten.jsonl.";
+const RECORD_VERSION: u64 = 1;
+const PRIVATE: u32 = 0o600;
+const MASK: &str = "[forgotten]";
+const PROVENANCE: &str = "user";
+
+/// `memory/forgotten.jsonl`.
+#[must_use]
+pub(crate) fn forgotten_path(memory_dir: &Path) -> PathBuf {
+    memory_dir.join(FILE_NAME)
+}
+
+/// `memory/.forgotten.lock`.
+#[must_use]
+pub(crate) fn forgotten_lock_path(memory_dir: &Path) -> PathBuf {
+    memory_dir.join(LOCK_NAME)
+}
+
+/// Whether `[graph] lasting_forget` is on. Does not open the forget file.
+#[must_use]
+pub(crate) fn lasting_forget_on(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .lasting_forget
+}
+
+/// One JSONL row. `kind` may be absent on input when `relation` and `value` are present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ForgetRecord {
+    pub v: u32,
+    pub status: RecordStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RecordKind>,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub forgotten_at: String,
+    pub provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unforgotten_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RecordStatus {
+    Active,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RecordKind {
+    Fact,
+    Entity,
+}
+
+/// Live records only, keyed for match and mask.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ForgetSet {
+    facts: Vec<LiveFact>,
+    entities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveFact {
+    subject: String,
+    relation: String,
+    value: String,
+}
+
+impl ForgetSet {
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.entities.is_empty()
+    }
+
+    /// Live fact rows plus live entity rows.
+    #[must_use]
+    pub(crate) fn live_count(&self) -> usize {
+        self.facts.len() + self.entities.len()
+    }
+}
+
+/// An active fact row. The subject is stored as given; matching folds it.
+#[must_use]
+pub(crate) fn fact_record(
+    subject: &str,
+    relation: &str,
+    value: &str,
+    forgotten_at: &str,
+) -> ForgetRecord {
+    ForgetRecord {
+        v: 1,
+        status: RecordStatus::Active,
+        kind: Some(RecordKind::Fact),
+        subject: subject.to_string(),
+        relation: Some(relation.to_string()),
+        value: Some(value.to_string()),
+        forgotten_at: forgotten_at.to_string(),
+        provenance: PROVENANCE.to_string(),
+        entity_id: None,
+        edge_id: None,
+        unforgotten_at: None,
+    }
+}
+
+/// An active entity row. The subject is the folded name.
+#[must_use]
+pub(crate) fn entity_record(subject: &str, forgotten_at: &str) -> ForgetRecord {
+    ForgetRecord {
+        v: 1,
+        status: RecordStatus::Active,
+        kind: Some(RecordKind::Entity),
+        subject: fold(subject),
+        relation: None,
+        value: None,
+        forgotten_at: forgotten_at.to_string(),
+        provenance: PROVENANCE.to_string(),
+        entity_id: None,
+        edge_id: None,
+        unforgotten_at: None,
+    }
+}
+
+/// `None` when `n` is zero, so a report can omit the counter.
+#[must_use]
+pub(crate) fn forgotten_skips_field(n: u32) -> Option<u32> {
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// Load live records. Flag off returns an empty set and does not touch the file.
+pub(crate) fn load_forget_set(memory_dir: &Path, flag_on: bool) -> Result<ForgetSet, RecallError> {
+    if !flag_on {
+        return Ok(ForgetSet::default());
+    }
+    Ok(live_set(&load_records(memory_dir)?))
+}
+
+/// What `--unforget` selects. History stays in the file.
+pub(crate) enum UnforgetSelector {
+    Fact {
+        subject: String,
+        relation: String,
+        value: String,
+    },
+    Entity {
+        subject: String,
+    },
+}
+
+/// Exclusive lock on `memory/.forgotten.lock`. Dropping it releases the lock.
+pub(crate) struct ForgetLock {
+    _file: File,
+}
+
+/// Open the sibling lock and wait up to `wait`.
+pub(crate) fn lock_forgotten(memory_dir: &Path, wait: Duration) -> Result<ForgetLock, RecallError> {
+    let path = forgotten_lock_path(memory_dir);
+    let file = open_lock(&path)?;
+    crate::file_lock::lock_exclusive(&file, &path, wait)?;
+    Ok(ForgetLock { _file: file })
+}
+
+/// Lock, then append. An empty slice does not create the file or the lock.
+pub(crate) fn append_forget_records(
+    memory_dir: &Path,
+    records: &[ForgetRecord],
+    wait: Duration,
+) -> Result<(), RecallError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let lock = lock_forgotten(memory_dir, wait)?;
+    append_locked(memory_dir, &lock, records)
+}
+
+/// Append while `lock` is already held. Does not take the lock again.
+pub(crate) fn append_locked(
+    memory_dir: &Path,
+    _lock: &ForgetLock,
+    records: &[ForgetRecord],
+) -> Result<(), RecallError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let path = forgotten_path(memory_dir);
+    let mut existing = load_records(memory_dir)?;
+    existing.extend(records.iter().cloned());
+    write_records(&path, &existing)
+}
+
+/// Mark the selected live rows inactive. Returns how many changed.
+pub(crate) fn unforget_records(
+    memory_dir: &Path,
+    selector: &UnforgetSelector,
+    wait: Duration,
+) -> Result<usize, RecallError> {
+    let lock = lock_forgotten(memory_dir, wait)?;
+    unforget_locked(memory_dir, &lock, selector)
+}
+
+fn unforget_locked(
+    memory_dir: &Path,
+    _lock: &ForgetLock,
+    selector: &UnforgetSelector,
+) -> Result<usize, RecallError> {
+    let path = forgotten_path(memory_dir);
+    let mut records = load_records(memory_dir)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let count = deactivate(&mut records, selector, &now);
+    if count == 0 {
+        return Ok(0);
+    }
+    write_records(&path, &records)?;
+    Ok(count)
+}
+
+/// Exact live fact: folded subject, folded relation or key, same-fact value.
+#[must_use]
+pub(crate) fn is_forgotten_fact(
+    set: &ForgetSet,
+    subject: &str,
+    relation: &str,
+    value: &str,
+) -> bool {
+    let subject = fold(subject);
+    let relation = fold(relation);
+    set.facts
+        .iter()
+        .any(|fact| fact_key_hit(fact, &subject, &relation, value))
+}
+
+fn fact_key_hit(fact: &LiveFact, subject: &str, relation: &str, value: &str) -> bool {
+    fact.subject == subject && fact.relation == relation && values_equal(&fact.value, value)
+}
+
+/// Folded subject against a live entity row.
+#[must_use]
+pub(crate) fn is_forgotten_entity(set: &ForgetSet, subject: &str) -> bool {
+    let subject = fold(subject);
+    set.entities.iter().any(|name| name == &subject)
+}
+
+/// A manual `add-entity` or `relate` the forget file refuses.
+pub(crate) enum ManualWrite<'a> {
+    AddEntity(&'a str),
+    Relate {
+        from: &'a str,
+        relation: &'a str,
+        to: &'a str,
+    },
+}
+
+/// `Err` names `--unforget` when the write would recreate a live forget.
+pub(crate) fn refuse_manual_write(
+    set: &ForgetSet,
+    write: ManualWrite<'_>,
+) -> Result<(), RecallError> {
+    match blocked_name(set, write) {
+        Some(name) => Err(manual_refusal(name)),
+        None => Ok(()),
+    }
+}
+
+fn blocked_name<'a>(set: &ForgetSet, write: ManualWrite<'a>) -> Option<&'a str> {
+    match write {
+        ManualWrite::AddEntity(name) => is_forgotten_entity(set, name).then_some(name),
+        ManualWrite::Relate { from, relation, to } => relate_block(set, from, relation, to),
+    }
+}
+
+fn relate_block<'a>(
+    set: &ForgetSet,
+    from: &'a str,
+    relation: &'a str,
+    to: &'a str,
+) -> Option<&'a str> {
+    if is_forgotten_entity(set, from) {
+        return Some(from);
+    }
+    if is_forgotten_entity(set, to) {
+        return Some(to);
+    }
+    if is_forgotten_fact(set, from, relation, to) {
+        return Some(from);
+    }
+    None
+}
+
+fn manual_refusal(name: &str) -> RecallError {
+    RecallError::Other(format!(
+        "\"{name}\" is forgotten; graph correct --unforget restores it before it can be written again"
+    ))
+}
+
+/// Replace each live fact value with `[forgotten]`. Entity names are not masked.
+#[must_use]
+pub(crate) fn mask_forgotten(text: &str, set: &ForgetSet) -> String {
+    if text.is_empty() || set.facts.is_empty() {
+        return text.to_string();
+    }
+    let spans = forgotten_spans(text, set);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    paint_spans(text, &spans)
+}
+
+fn forgotten_spans(text: &str, set: &ForgetSet) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for fact in &set.facts {
+        spans.extend(value_spans(text, &fact.value));
+    }
+    merge_spans(spans)
+}
+
+fn merge_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_by_key(|span| (span.0, span.1));
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for span in spans {
+        match merged.last_mut() {
+            Some(current) if span.0 <= current.1 => current.1 = current.1.max(span.1),
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
+fn paint_spans(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for &(start, end) in spans {
+        if !span_in_range(text, cursor, start, end) {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(MASK);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn span_in_range(text: &str, cursor: usize, start: usize, end: usize) -> bool {
+    start >= cursor && end <= text.len() && start < end
+}
+
+fn live_set(records: &[ForgetRecord]) -> ForgetSet {
+    let mut set = ForgetSet::default();
+    for record in records {
+        if record.status == RecordStatus::Active {
+            push_live(record, &mut set);
+        }
+    }
+    set
+}
+
+fn push_live(record: &ForgetRecord, set: &mut ForgetSet) {
+    match record.kind {
+        Some(RecordKind::Entity) => set.entities.push(fold(&record.subject)),
+        _ => push_live_fact(record, set),
+    }
+}
+
+fn push_live_fact(record: &ForgetRecord, set: &mut ForgetSet) {
+    let (Some(relation), Some(value)) = (record.relation.as_deref(), record.value.as_deref())
+    else {
+        return;
+    };
+    set.facts.push(LiveFact {
+        subject: fold(&record.subject),
+        relation: fold(relation),
+        value: value.to_string(),
+    });
+}
+
+fn deactivate(records: &mut [ForgetRecord], selector: &UnforgetSelector, now: &str) -> usize {
+    let mut count = 0;
+    for record in records.iter_mut() {
+        if record.status == RecordStatus::Active && selected(record, selector) {
+            record.status = RecordStatus::Inactive;
+            record.unforgotten_at = Some(now.to_string());
+            count += 1;
+        }
+    }
+    count
+}
+
+fn selected(record: &ForgetRecord, selector: &UnforgetSelector) -> bool {
+    match selector {
+        UnforgetSelector::Fact {
+            subject,
+            relation,
+            value,
+        } => fact_selected(record, subject, relation, value),
+        UnforgetSelector::Entity { subject } => fold(&record.subject) == fold(subject),
+    }
+}
+
+fn fact_selected(record: &ForgetRecord, subject: &str, relation: &str, value: &str) -> bool {
+    if record.kind == Some(RecordKind::Entity) {
+        return false;
+    }
+    fold(&record.subject) == fold(subject)
+        && relation_matches(record.relation.as_deref(), relation)
+        && value_matches(record.value.as_deref(), value)
+}
+
+fn relation_matches(stored: Option<&str>, query: &str) -> bool {
+    stored.is_some_and(|relation| fold(relation) == fold(query))
+}
+
+fn value_matches(stored: Option<&str>, query: &str) -> bool {
+    stored.is_some_and(|value| values_equal(value, query))
+}
+
+fn load_records(memory_dir: &Path) -> Result<Vec<ForgetRecord>, RecallError> {
+    let path = forgotten_path(memory_dir);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(unreadable(&path, &err)),
+    };
+    parse_records(&path, &text)
+}
+
+fn parse_records(path: &Path, text: &str) -> Result<Vec<ForgetRecord>, RecallError> {
+    let mut records = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = parse_line(line).map_err(|fail| malformed(path, index + 1, fail))?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+enum LineFail {
+    InvalidJson,
+    Missing,
+    Version,
+}
+
+fn parse_line(line: &str) -> Result<ForgetRecord, LineFail> {
+    let value: Value = serde_json::from_str(line).map_err(|_| LineFail::InvalidJson)?;
+    let obj = value.as_object().ok_or(LineFail::InvalidJson)?;
+    record_from_object(obj)
+}
+
+struct RecordHead {
+    status: RecordStatus,
+    kind: RecordKind,
+    subject: String,
+    forgotten_at: String,
+    provenance: String,
+}
+
+struct RecordBody {
+    relation: Option<String>,
+    value: Option<String>,
+    entity_id: Option<String>,
+    edge_id: Option<String>,
+    unforgotten_at: Option<String>,
+}
+
+fn record_from_object(obj: &Map<String, Value>) -> Result<ForgetRecord, LineFail> {
+    let head = record_head(obj)?;
+    let body = record_body(obj, head.kind)?;
+    Ok(ForgetRecord {
+        v: 1,
+        status: head.status,
+        kind: Some(head.kind),
+        subject: head.subject,
+        relation: body.relation,
+        value: body.value,
+        forgotten_at: head.forgotten_at,
+        provenance: head.provenance,
+        entity_id: body.entity_id,
+        edge_id: body.edge_id,
+        unforgotten_at: body.unforgotten_at,
+    })
+}
+
+fn record_head(obj: &Map<String, Value>) -> Result<RecordHead, LineFail> {
+    require_version(obj)?;
+    Ok(RecordHead {
+        status: require_status(obj)?,
+        kind: require_kind(obj)?,
+        subject: require_string(obj, "subject")?.to_string(),
+        forgotten_at: require_time(obj, "forgotten_at")?,
+        provenance: require_provenance(obj)?,
+    })
+}
+
+fn record_body(obj: &Map<String, Value>, kind: RecordKind) -> Result<RecordBody, LineFail> {
+    let (relation, value) = relation_value(obj, kind)?;
+    Ok(RecordBody {
+        relation,
+        value,
+        entity_id: optional_string(obj, "entity_id")?,
+        edge_id: optional_string(obj, "edge_id")?,
+        unforgotten_at: optional_time(obj, "unforgotten_at")?,
+    })
+}
+
+fn require_version(obj: &Map<String, Value>) -> Result<(), LineFail> {
+    match obj.get("v") {
+        None => Err(LineFail::Missing),
+        Some(value) if value.as_u64() == Some(RECORD_VERSION) => Ok(()),
+        Some(_) => Err(LineFail::Version),
+    }
+}
+
+fn require_status(obj: &Map<String, Value>) -> Result<RecordStatus, LineFail> {
+    match require_string(obj, "status")? {
+        "active" => Ok(RecordStatus::Active),
+        "inactive" => Ok(RecordStatus::Inactive),
+        _ => Err(LineFail::InvalidJson),
+    }
+}
+
+fn require_kind(obj: &Map<String, Value>) -> Result<RecordKind, LineFail> {
+    match obj.get("kind") {
+        None => infer_kind(obj),
+        Some(value) => named_kind(value),
+    }
+}
+
+fn named_kind(value: &Value) -> Result<RecordKind, LineFail> {
+    match value.as_str() {
+        Some("fact") => Ok(RecordKind::Fact),
+        Some("entity") => Ok(RecordKind::Entity),
+        _ => Err(LineFail::InvalidJson),
+    }
+}
+
+fn infer_kind(obj: &Map<String, Value>) -> Result<RecordKind, LineFail> {
+    if obj.get("relation").and_then(Value::as_str).is_some()
+        && obj.get("value").and_then(Value::as_str).is_some()
+    {
+        Ok(RecordKind::Fact)
+    } else {
+        Err(LineFail::Missing)
+    }
+}
+
+fn relation_value(
+    obj: &Map<String, Value>,
+    kind: RecordKind,
+) -> Result<(Option<String>, Option<String>), LineFail> {
+    match kind {
+        RecordKind::Fact => Ok((
+            Some(require_string(obj, "relation")?.to_string()),
+            Some(require_string(obj, "value")?.to_string()),
+        )),
+        RecordKind::Entity => entity_without_triple(obj),
+    }
+}
+
+fn entity_without_triple(
+    obj: &Map<String, Value>,
+) -> Result<(Option<String>, Option<String>), LineFail> {
+    if obj.contains_key("relation") || obj.contains_key("value") {
+        return Err(LineFail::InvalidJson);
+    }
+    Ok((None, None))
+}
+
+fn require_provenance(obj: &Map<String, Value>) -> Result<String, LineFail> {
+    match require_string(obj, "provenance")? {
+        PROVENANCE => Ok(PROVENANCE.to_string()),
+        _ => Err(LineFail::InvalidJson),
+    }
+}
+
+fn require_time(obj: &Map<String, Value>, key: &str) -> Result<String, LineFail> {
+    let text = require_string(obj, key)?;
+    if chrono::DateTime::parse_from_rfc3339(text).is_err() {
+        return Err(LineFail::InvalidJson);
+    }
+    Ok(text.to_string())
+}
+
+fn optional_time(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, LineFail> {
+    match optional_string(obj, key)? {
+        None => Ok(None),
+        Some(text) if chrono::DateTime::parse_from_rfc3339(&text).is_ok() => Ok(Some(text)),
+        Some(_) => Err(LineFail::InvalidJson),
+    }
+}
+
+fn require_string<'a>(obj: &'a Map<String, Value>, key: &str) -> Result<&'a str, LineFail> {
+    match obj.get(key) {
+        Some(Value::String(text)) if !text.is_empty() => Ok(text),
+        Some(_) => Err(LineFail::InvalidJson),
+        None => Err(LineFail::Missing),
+    }
+}
+
+fn optional_string(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, LineFail> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if !text.is_empty() => Ok(Some(text.clone())),
+        Some(_) => Err(LineFail::InvalidJson),
+    }
+}
+
+fn malformed(path: &Path, line_no: usize, fail: LineFail) -> RecallError {
+    let reason = match fail {
+        LineFail::InvalidJson => "invalid JSON",
+        LineFail::Missing => "missing required fields",
+        LineFail::Version => "unsupported v",
+    };
+    RecallError::Other(format!("{}: {reason} at line {line_no}", path.display()))
+}
+
+fn unreadable(path: &Path, err: &io::Error) -> RecallError {
+    RecallError::Other(format!("{}: unreadable: {err}", path.display()))
+}
+
+fn write_records(target: &Path, records: &[ForgetRecord]) -> Result<(), RecallError> {
+    sweep_stale_temps(&parent_dir(target))?;
+    replace_file(target, &render_records(records)?)
+}
+
+fn render_records(records: &[ForgetRecord]) -> Result<String, RecallError> {
+    let mut out = String::new();
+    for record in records {
+        out.push_str(&serde_json::to_string(record)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn replace_file(target: &Path, contents: &str) -> Result<(), RecallError> {
+    let (path, mut file) = create_temp(target)?;
+    let mut guard = TempGuard::arm(path);
+    file.write_all(contents.as_bytes())?;
+    // Publish only bytes that have reached disk. See the module note.
+    file.sync_data()?;
+    drop(file);
+    fs::rename(&guard.path, target)?;
+    guard.disarm();
+    Ok(())
+}
+
+fn create_temp(target: &Path) -> Result<(PathBuf, File), RecallError> {
+    let mut collision = None;
+    for _ in 0..8 {
+        let path = temp_path(target);
+        match open_temp(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if is_collision(&err) => collision = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(collision.unwrap_or_else(|| {
+        RecallError::Other(format!(
+            "{}: could not create a private temp file",
+            target.display()
+        ))
+    }))
+}
+
+fn is_collision(err: &RecallError) -> bool {
+    matches!(err, RecallError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists)
+}
+
+fn open_temp(path: &Path) -> Result<File, RecallError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE)
+        .open(path)
+        .map_err(RecallError::from)
+}
+
+fn temp_path(target: &Path) -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let name = format!("{TEMP_PREFIX}{}.{n}.tmp", std::process::id());
+    parent_dir(target).join(name)
+}
+
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn sweep_stale_temps(dir: &Path) -> Result<(), RecallError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        remove_stale_temp(&entry?)?;
+    }
+    Ok(())
+}
+
+fn remove_stale_temp(entry: &fs::DirEntry) -> Result<(), RecallError> {
+    let name = entry.file_name();
+    if stale_temp_name(&name.to_string_lossy()) {
+        fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}
+
+fn stale_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    rest.ends_with(".tmp")
+}
+
+fn open_lock(path: &Path) -> Result<File, RecallError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(PRIVATE)
+        .open(path)
+        .map_err(|err| RecallError::Other(format!("{}: {err}", path.display())))?;
+    ensure_private(&file)?;
+    Ok(file)
+}
+
+fn ensure_private(file: &File) -> Result<(), RecallError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode == PRIVATE {
+        return Ok(());
+    }
+    file.set_permissions(fs::Permissions::from_mode(PRIVATE))?;
+    Ok(())
+}
+
+struct TempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempGuard {
+    fn arm(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const AT: &str = "2026-11-17T12:00:00Z";
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    fn sample_fact() -> ForgetRecord {
+        fact_record("Ada", "uses", "Rust", AT)
+    }
+
+    fn assert_names_path(err: &RecallError, path: &Path) {
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn missing_and_empty_files_are_no_records() {
+        let dir = tempfile::tempdir().expect("temp");
+        let missing = load_forget_set(dir.path(), true).expect("missing");
+        assert!(missing.is_empty());
+        fs::write(forgotten_path(dir.path()), "\n\n").expect("empty");
+        let empty = load_forget_set(dir.path(), true).expect("empty");
+        assert!(empty.is_empty());
+        assert!(!forgotten_lock_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn an_empty_append_creates_nothing() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(dir.path(), &[], Duration::from_secs(1)).expect("append");
+        assert!(!forgotten_path(dir.path()).exists());
+        assert!(!forgotten_lock_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_record_round_trips_and_the_files_are_private() {
+        let dir = tempfile::tempdir().expect("temp");
+        let stale = dir.path().join(".forgotten.jsonl.4.4.tmp");
+        fs::write(&stale, "not a record").expect("stale");
+        let entity = entity_record("  Vim ", AT);
+        assert_eq!(entity.subject, "vim");
+        append_forget_records(dir.path(), &[sample_fact(), entity], Duration::from_secs(1))
+            .expect("append");
+        assert!(!stale.exists(), "a stale temp is not the file");
+        assert_eq!(mode_of(&forgotten_path(dir.path())), PRIVATE);
+        assert_eq!(mode_of(&forgotten_lock_path(dir.path())), PRIVATE);
+        assert!(dir
+            .path()
+            .read_dir()
+            .expect("dir")
+            .flatten()
+            .all(|entry| !stale_temp_name(&entry.file_name().to_string_lossy())));
+
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert!(is_forgotten_entity(&set, "VIM"));
+        assert_eq!(set.live_count(), 2);
+        let text = fs::read_to_string(forgotten_path(dir.path())).expect("file");
+        assert!(text.contains("\"provenance\":\"user\""));
+        assert!(text.contains("\"v\":1"));
+        assert!(text.contains("\"subject\":\"Ada\""));
+    }
+
+    #[test]
+    fn subject_and_value_without_the_relation_does_not_match() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(dir.path(), &[sample_fact()], Duration::from_secs(1))
+            .expect("append");
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(is_forgotten_fact(&set, "  ADA ", "USES", "rust"));
+        assert!(
+            !is_forgotten_fact(&set, "Ada", "likes", "Rust"),
+            "the same subject and value under another relation is a different fact"
+        );
+        assert!(!is_forgotten_fact(&set, "Ada", "uses", "Go"));
+        assert!(!is_forgotten_fact(&set, "Bea", "uses", "Rust"));
+        assert!(!is_forgotten_entity(&set, "Ada"));
+    }
+
+    #[test]
+    fn a_folded_subject_matches_and_a_different_subject_does_not() {
+        let set = live_set(&[fact_record("Ada Lovelace", "works_on", "Rust", AT)]);
+        assert!(is_forgotten_fact(
+            &set,
+            "ada   lovelace",
+            "works_on",
+            "Rust"
+        ));
+        assert!(!is_forgotten_fact(&set, "Ada", "works_on", "Rust"));
+    }
+
+    #[test]
+    fn a_different_value_for_the_same_subject_and_relation_is_kept() {
+        let set = live_set(&[sample_fact()]);
+        assert!(!is_forgotten_fact(&set, "Ada", "uses", "Go"));
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert!(!values_equal("10s", "10ms"));
+        assert!(values_equal("10s", "10S"));
+    }
+
+    #[test]
+    fn blank_lines_are_ignored_and_kind_can_be_omitted() {
+        let dir = tempfile::tempdir().expect("temp");
+        let line = concat!(
+            "\n{\"v\":1,\"status\":\"active\",\"subject\":\"Ada\",\"relation\":\"uses\",",
+            "\"value\":\"Rust\",\"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n\n"
+        );
+        fs::write(forgotten_path(dir.path()), line).expect("write");
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert_eq!(set.live_count(), 1);
+    }
+
+    #[test]
+    fn a_malformed_file_names_the_path() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = forgotten_path(dir.path());
+        let cases = [
+            ("not-json\n", "invalid JSON"),
+            ("{\"v\":1}\n", "missing required fields"),
+            (
+                "{\"v\":2,\"status\":\"active\",\"kind\":\"entity\",\"subject\":\"Ada\",\"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n",
+                "unsupported v",
+            ),
+        ];
+        for (body, reason) in cases {
+            fs::write(&path, body).expect("write");
+            let err = load_forget_set(dir.path(), true).expect_err("malformed");
+            let message = err.to_string();
+            assert_names_path(&err, &path);
+            assert!(message.contains(reason), "{message}");
+        }
+        fs::remove_file(&path).expect("remove");
+        fs::create_dir(&path).expect("dir");
+        let err = load_forget_set(dir.path(), true).expect_err("unreadable");
+        let message = err.to_string();
+        assert_names_path(&err, &path);
+        assert!(message.contains("unreadable"), "{message}");
+    }
+
+    #[test]
+    fn flag_off_load_ignores_a_malformed_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = forgotten_path(dir.path());
+        fs::write(&path, b"{not json\n").expect("write");
+        let before = fs::read(&path).expect("bytes");
+        let set = load_forget_set(dir.path(), false).expect("flag off");
+        assert!(set.is_empty());
+        assert_eq!(fs::read(&path).expect("bytes"), before);
+        let missing = dir.path().join("absent");
+        let set = load_forget_set(&missing, false).expect("no dir");
+        assert!(set.is_empty());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn lasting_forget_on_reads_the_flag_and_not_the_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        fs::write(forgotten_path(dir.path()), b"{not json\n").expect("bad");
+        assert!(!lasting_forget_on(dir.path()));
+        fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .expect("config");
+        assert!(lasting_forget_on(dir.path()));
+        let set = load_forget_set(dir.path(), false).expect("still off when told");
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn a_held_lock_times_out_and_leaves_the_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        let lock_path = forgotten_lock_path(dir.path());
+        fs::write(&lock_path, b"").expect("lock");
+        let file = forgotten_path(dir.path());
+        fs::write(&file, b"keep\n").expect("file");
+        let held = crate::file_lock::HeldLock::on(&lock_path);
+        let err = append_forget_records(dir.path(), &[sample_fact()], Duration::ZERO)
+            .expect_err("timeout");
+        let message = err.to_string();
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("locked"), "{message}");
+        assert_eq!(fs::read(&file).expect("bytes"), b"keep\n");
+        drop(held);
+    }
+
+    #[test]
+    fn a_temp_file_is_created_at_mode_0600() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join(".forgotten.jsonl.temp-check.tmp");
+        let file = open_temp(&path).expect("temp");
+        drop(file);
+        assert_eq!(mode_of(&path), PRIVATE);
+    }
+
+    #[test]
+    fn an_unforget_keeps_history_and_drops_only_the_selected_key() {
+        let dir = tempfile::tempdir().expect("temp");
+        let likes = fact_record("Ada", "likes", "Rust", AT);
+        append_forget_records(dir.path(), &[sample_fact(), likes], Duration::from_secs(1))
+            .expect("append");
+        let changed = unforget_records(
+            dir.path(),
+            &UnforgetSelector::Fact {
+                subject: "ada".into(),
+                relation: "USES".into(),
+                value: "rust".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .expect("unforget");
+        assert_eq!(changed, 1);
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(!is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert!(is_forgotten_fact(&set, "Ada", "likes", "Rust"));
+        let text = fs::read_to_string(forgotten_path(dir.path())).expect("file");
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("\"status\":\"inactive\""));
+        assert!(text.contains("\"unforgotten_at\""));
+        assert_eq!(mode_of(&forgotten_path(dir.path())), PRIVATE);
+        append_forget_records(dir.path(), &[sample_fact()], Duration::from_secs(1)).expect("again");
+        let set = load_forget_set(dir.path(), true).expect("reload");
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+    }
+
+    #[test]
+    fn an_entity_unforget_clears_that_subject_and_keeps_other_facts() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(
+            dir.path(),
+            &[
+                entity_record("Ada", AT),
+                fact_record("Ada", "uses", "Rust", AT),
+                fact_record("Bea", "uses", "Rust", AT),
+            ],
+            Duration::from_secs(1),
+        )
+        .expect("append");
+        let changed = unforget_records(
+            dir.path(),
+            &UnforgetSelector::Entity {
+                subject: "ADA".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .expect("unforget");
+        assert_eq!(changed, 2);
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(!is_forgotten_entity(&set, "Ada"));
+        assert!(!is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert!(is_forgotten_fact(&set, "Bea", "uses", "Rust"));
+        let text = fs::read_to_string(forgotten_path(dir.path())).expect("file");
+        assert_eq!(text.lines().count(), 3);
+    }
+
+    #[test]
+    fn a_manual_write_of_a_forgotten_name_names_unforget() {
+        let set = live_set(&[
+            entity_record("Ada", AT),
+            fact_record("Bea", "uses", "Rust", AT),
+        ]);
+        let err = refuse_manual_write(&set, ManualWrite::AddEntity("ada")).expect_err("entity");
+        assert!(err.to_string().contains("--unforget"), "{err}");
+        assert!(refuse_manual_write(&set, ManualWrite::AddEntity("Bea")).is_ok());
+        let from = refuse_manual_write(
+            &set,
+            ManualWrite::Relate {
+                from: "Ada",
+                relation: "likes",
+                to: "Go",
+            },
+        )
+        .expect_err("from");
+        assert!(from.to_string().contains("--unforget"));
+        let to = refuse_manual_write(
+            &set,
+            ManualWrite::Relate {
+                from: "Cleo",
+                relation: "likes",
+                to: "Ada",
+            },
+        )
+        .expect_err("to");
+        assert!(to.to_string().contains("--unforget"));
+        let fact = refuse_manual_write(
+            &set,
+            ManualWrite::Relate {
+                from: "Bea",
+                relation: "uses",
+                to: "Rust",
+            },
+        )
+        .expect_err("fact");
+        assert!(fact.to_string().contains("--unforget"));
+        assert!(refuse_manual_write(
+            &set,
+            ManualWrite::Relate {
+                from: "Bea",
+                relation: "likes",
+                to: "Rust",
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn mask_replaces_a_live_value_and_not_an_entity_name() {
+        let facts = live_set(&[fact_record("Ada", "uses", "Rust", AT)]);
+        assert_eq!(
+            mask_forgotten("Ada uses Rust.", &facts),
+            "Ada uses [forgotten]."
+        );
+        assert_eq!(mask_forgotten("see rust!", &facts), "see [forgotten]!");
+        assert_eq!(mask_forgotten("Go stays", &facts), "Go stays");
+        let entity = live_set(&[entity_record("Vim", AT)]);
+        assert_eq!(mask_forgotten("Vim is here", &entity), "Vim is here");
+        assert!(entity.facts.is_empty());
+    }
+
+    #[test]
+    fn forgotten_skips_field_is_omitted_when_zero() {
+        assert_eq!(forgotten_skips_field(0), None);
+        assert_eq!(forgotten_skips_field(1), Some(1));
+    }
+
+    #[test]
+    fn a_second_append_keeps_the_first_record() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(dir.path(), &[sample_fact()], Duration::from_secs(1)).expect("first");
+        append_forget_records(
+            dir.path(),
+            &[fact_record("Bea", "uses", "Go", AT)],
+            Duration::from_secs(1),
+        )
+        .expect("second");
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert!(is_forgotten_fact(&set, "Bea", "uses", "Go"));
+    }
+}

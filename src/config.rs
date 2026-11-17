@@ -946,6 +946,11 @@ pub struct GraphSection {
     /// Stands alone: it does not turn any other switch on, and it never writes.
     #[serde(default = "default_recover_turns", skip_serializing_if = "is_false")]
     pub recover_turns: bool,
+    /// Keep a confirmed forget in `memory/forgotten.jsonl` until `--unforget`.
+    /// Off unless set. Stands alone: it does not turn any other switch on.
+    /// With it off, nothing reads, locks, or writes that file.
+    #[serde(default = "default_lasting_forget", skip_serializing_if = "is_false")]
+    pub lasting_forget: bool,
 }
 
 impl Default for GraphSection {
@@ -977,6 +982,7 @@ impl Default for GraphSection {
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
+            lasting_forget: default_lasting_forget(),
         }
     }
 }
@@ -1413,6 +1419,10 @@ fn default_ground_component_edges() -> bool {
 }
 
 fn default_recover_turns() -> bool {
+    false
+}
+
+fn default_lasting_forget() -> bool {
     false
 }
 
@@ -1948,6 +1958,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.drop_restatements", flag_drop_restatements),
     ("graph.ground_component_edges", flag_ground_component_edges),
     ("graph.recover_turns", flag_recover_turns),
+    ("graph.lasting_forget", flag_lasting_forget),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2029,6 +2040,10 @@ fn flag_ground_component_edges(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_recover_turns(graph: &mut GraphSection) -> &mut bool {
     &mut graph.recover_turns
+}
+
+fn flag_lasting_forget(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.lasting_forget
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -3977,6 +3992,53 @@ settle_secs = 300
         cfg.set_key("graph.recover_turns", "true").unwrap();
         assert!(cfg.set_key("graph.recover_turns", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").recover_turns);
+    }
+
+    #[test]
+    fn lasting_forget_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_lasting_forget());
+        assert!(!GraphSection::default().lasting_forget);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().lasting_forget);
+        let explicit_false: Config =
+            toml::from_str("[graph]\nlasting_forget = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.lasting_forget);
+        assert!(false_graph.ground_component_edges);
+        assert!(false_graph.consolidate);
+        assert!(!false_graph.recover_turns);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("lasting_forget"));
+        assert!(!rendered_false.contains("recover_turns"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nlasting_forget = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.lasting_forget);
+        assert!(true_graph.consolidate);
+        assert!(true_graph.known_facts_context);
+        assert!(!true_graph.known_match);
+        assert!(!true_graph.recover_turns);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.lasting_forget", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.lasting_forget);
+        assert!(graph.consolidate);
+        assert!(!graph.recover_turns);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("lasting_forget = true"));
+        assert!(!rendered.contains("consolidate ="));
+        assert!(!rendered.contains("recover_turns"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        assert!(parsed.graph.expect("graph").lasting_forget);
+
+        cfg.set_key("graph.lasting_forget", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").lasting_forget);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("lasting_forget"));
+        cfg.set_key("graph.lasting_forget", "true").unwrap();
+        assert!(cfg.set_key("graph.lasting_forget", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").lasting_forget);
     }
 
     #[test]

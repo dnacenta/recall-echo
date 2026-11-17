@@ -16,6 +16,7 @@ pub mod edge_view;
 pub mod embed;
 pub mod error;
 pub mod extract;
+pub(crate) mod forgotten;
 pub mod gc;
 pub mod ingest;
 pub mod inspect;
