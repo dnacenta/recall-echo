@@ -8,6 +8,7 @@ changes a user has to know about before upgrading.
 ### Fixed
 
 - `graph ingest --pipeline v2` no longer reports a log as already extracted when its episode chunks failed to write. Any episode write error now stops before extraction (no provider call, no fact write), names the failed chunks, prints the command to retry, and exits non-zero (#248).
+- `graph extract --pipeline v2 --rebuild` reads the pipeline stamp from a copy of `graph/surreal/` only when `manifest/`, `sstables/`, `wal/` and `vlog/` are unchanged across the copy, including file bytes, and a second snapshot agrees. A torn or still-changing copy is retried, then refused: the error names `graph/` and tells you to stop whatever is writing it and retry, instead of failing at random or being treated as not a v2 store (#256).
 - Two archives written at the same time no longer duplicate the ARCHIVE.md header or interleave their rows: the header check and the row are written in one piece under a lock on ARCHIVE.md (#250).
 - Two archives written at the same time no longer drop each other's EPHEMERAL.md entry, and EPHEMERAL.md is replaced atomically, so the SessionStart hook never reads it half-written (#251).
 
