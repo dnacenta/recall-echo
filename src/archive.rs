@@ -331,8 +331,8 @@ fn record_archive(tail: ArchiveTail<'_>) -> Result<(), RecallError> {
         archive_file: format!("conversation-{:03}.md", tail.next_num),
         summary: tail.summary.summary.clone(),
     };
-    ephemeral::append_entry(tail.ephemeral_path, &entry)?;
-    ephemeral::trim_to_limit(tail.ephemeral_path, max_entries)?;
+    ephemeral::record_entry(tail.ephemeral_path, &entry, max_entries)
+        .map_err(|err| note_if_locked(tail.next_num, "EPHEMERAL.md", err))?;
     Ok(())
 }
 
@@ -3476,14 +3476,8 @@ mod tests {
         let _wait = crate::file_lock::WaitOverride::at(Duration::from_millis(200));
         let (_dir, transcript) = written("session.jsonl", CLAUDE_JSONL);
         let input = session_hook("sess", transcript);
-        let started = std::time::Instant::now();
         let (result, logged) =
             crate::file_lock::capture_stderr(|| run_with_hook_input(&input, memory));
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "waited {:?}",
-            started.elapsed()
-        );
         assert_archive_hook_lock_failure(memory, &index, result, &logged);
     }
 
@@ -3508,6 +3502,7 @@ mod tests {
             message.contains("locked by another recall-echo process"),
             "{message}"
         );
+        assert!(message.contains("for 0 s"), "{message}");
         assert!(
             logged.contains("archived conversation-001.md")
                 && logged.contains("ARCHIVE.md not updated"),
@@ -3518,5 +3513,172 @@ mod tests {
         assert!(memory.join("turns/conversation-001.json").is_file());
         assert_eq!(fs::read_to_string(index).unwrap(), ARCHIVE_HEADER);
         assert!(!memory.join("graph").exists());
+    }
+
+    #[test]
+    fn a_lock_timeout_on_ephemeral_in_the_archive_hook_keeps_the_archive_and_fails() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path();
+        let lock = memory.join(".EPHEMERAL.lock");
+        fs::write(&lock, "held").unwrap();
+        let _held = crate::file_lock::HeldLock::on(&lock);
+        let _wait = crate::file_lock::WaitOverride::at(Duration::from_millis(200));
+        let (_dir, transcript) = written("session.jsonl", CLAUDE_JSONL);
+        let input = session_hook("sess", transcript);
+        let (result, logged) =
+            crate::file_lock::capture_stderr(|| run_with_hook_input(&input, memory));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert!(message.contains("for 0 s"), "{message}");
+        assert!(
+            logged.contains("archived conversation-001.md")
+                && logged.contains("EPHEMERAL.md not updated"),
+            "{logged}"
+        );
+        let archive = fs::read_to_string(memory.join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("hello"), "{archive}");
+        let index = fs::read_to_string(memory.join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("sess"), "{index}");
+        assert!(!memory.join("EPHEMERAL.md").exists());
+        assert_eq!(fs::read(&lock).unwrap(), b"held");
+        assert!(!memory.join("graph").exists());
+        assert_no_ephemeral_temps(memory);
+    }
+
+    #[test]
+    fn concurrent_archives_keep_every_ephemeral_entry() {
+        let tmp = run_concurrent_ephemeral(4, 3, 50);
+        let body = fs::read_to_string(tmp.path().join("EPHEMERAL.md")).unwrap();
+        assert_session_entries(&body, 4, 3);
+        assert_eq!(ephemeral::parse_entries(&body).len(), 12, "{body}");
+        assert_no_ephemeral_temps(tmp.path());
+    }
+
+    #[test]
+    fn concurrent_archives_trim_ephemeral_to_the_limit() {
+        let tmp = run_concurrent_ephemeral(4, 3, 3);
+        let body = fs::read_to_string(tmp.path().join("EPHEMERAL.md")).unwrap();
+        let entries = ephemeral::parse_entries(&body);
+        assert_eq!(entries.len(), 3, "{body}");
+        for entry in &entries {
+            assert!(entry.starts_with("## Session "), "{entry}");
+            assert!(entry.contains("**Summary**:"), "{entry}");
+        }
+        assert_no_ephemeral_temps(tmp.path());
+    }
+
+    #[test]
+    fn a_reader_never_sees_a_truncated_ephemeral() {
+        let tmp = memory_with_conversations();
+        let memory = tmp.path().to_path_buf();
+        write_ephemeral_limit(&memory, 50);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let log = std::sync::Arc::new(std::sync::Mutex::new(ReaderLog::default()));
+        let reader = spawn_ephemeral_reader(
+            memory.join("EPHEMERAL.md"),
+            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(&log),
+        );
+        spawn_archives(&memory, 4, 3);
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        let log = log.lock().unwrap();
+        assert!(log.saw_entry, "reader never saw an entry");
+        assert!(log.failures.is_empty(), "{:?}", log.failures);
+        let body = fs::read_to_string(memory.join("EPHEMERAL.md")).unwrap();
+        assert_eq!(ephemeral::parse_entries(&body).len(), 12, "{body}");
+        assert_no_ephemeral_temps(&memory);
+    }
+
+    fn run_concurrent_ephemeral(threads: usize, each: usize, max: usize) -> tempfile::TempDir {
+        let tmp = memory_with_conversations();
+        write_ephemeral_limit(tmp.path(), max);
+        spawn_archives(tmp.path(), threads, each);
+        tmp
+    }
+
+    fn write_ephemeral_limit(memory: &Path, max: usize) {
+        let path = crate::config::config_path(memory);
+        fs::write(&path, format!("[ephemeral]\nmax_entries = {max}\n")).unwrap();
+    }
+
+    fn assert_session_entries(body: &str, threads: usize, each: usize) {
+        for thread in 0..threads {
+            for i in 0..each {
+                assert!(
+                    body.contains(&format!("## Session t{thread}-{i}")),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    fn assert_no_ephemeral_temps(dir: &Path) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale = name.starts_with(".EPHEMERAL.md.") && name.ends_with(".tmp");
+            assert!(!stale, "{name}");
+        }
+    }
+
+    #[derive(Default)]
+    struct ReaderLog {
+        saw_entry: bool,
+        failures: Vec<String>,
+    }
+
+    fn spawn_ephemeral_reader(
+        path: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        log: std::sync::Arc<std::sync::Mutex<ReaderLog>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || read_ephemeral_until(path, stop, log))
+    }
+
+    fn read_ephemeral_until(
+        path: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        log: std::sync::Arc<std::sync::Mutex<ReaderLog>>,
+    ) {
+        let mut floor = 0usize;
+        while !stop.load(Ordering::Relaxed) {
+            observe_ephemeral(&path, &mut floor, &log);
+            std::thread::yield_now();
+        }
+    }
+
+    fn observe_ephemeral(path: &Path, floor: &mut usize, log: &std::sync::Mutex<ReaderLog>) {
+        match fs::read_to_string(path) {
+            Ok(text) => note_ephemeral_text(&text, floor, log),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if *floor > 0 {
+                    log.lock()
+                        .unwrap()
+                        .failures
+                        .push("missing after an entry".into());
+                }
+            }
+            Err(err) => log.lock().unwrap().failures.push(err.to_string()),
+        }
+    }
+
+    fn note_ephemeral_text(text: &str, floor: &mut usize, log: &std::sync::Mutex<ReaderLog>) {
+        let mut guard = log.lock().unwrap();
+        if text.is_empty() {
+            if *floor > 0 {
+                guard.failures.push("empty after an entry".into());
+            }
+            return;
+        }
+        let count = ephemeral::parse_entries(text).len();
+        if count < *floor {
+            guard
+                .failures
+                .push(format!("shrank from {floor} to {count}"));
+        }
+        if count > 0 {
+            guard.saw_entry = true;
+            *floor = count;
+        }
     }
 }

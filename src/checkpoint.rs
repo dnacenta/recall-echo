@@ -587,21 +587,16 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"sess","message":{"role":"user","content":"hello"}}"#,
         ];
         let input = hook_for(tmp.path(), "sess", &lines);
-        let started = std::time::Instant::now();
         let (result, logged) = crate::file_lock::capture_stderr(|| {
             run_with_hook_input("precompact", Some(&input), tmp.path())
         });
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "waited {:?}",
-            started.elapsed()
-        );
         let message = result.unwrap_err().to_string();
         assert!(message.contains(&index.display().to_string()), "{message}");
         assert!(
             message.contains("locked by another recall-echo process"),
             "{message}"
         );
+        assert!(message.contains("for 0 s"), "{message}");
         assert!(
             logged.contains("archived conversation-001.md")
                 && logged.contains("ARCHIVE.md not updated"),

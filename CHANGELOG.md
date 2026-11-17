@@ -16,6 +16,7 @@ changes a user has to know about before upgrading.
 ### Fixed
 
 - Two archives written at the same time no longer duplicate the ARCHIVE.md header or interleave their rows: the header check and the row are written in one piece under a lock on ARCHIVE.md (#250).
+- Two archives written at the same time no longer drop each other's EPHEMERAL.md entry, and EPHEMERAL.md is replaced atomically, so the SessionStart hook never reads it half-written (#251).
 - `graph extract --pipeline v2 --rebuild` refuses a `graph/` that is already a v2 store instead of re-extracting everything; pass `--force` to rebuild anyway (#241).
 - A session that only had a PreCompact checkpoint is now captured in full by the capture sweep and `archive --all-unarchived` (#228).
 - Two archives written at the same time (a session-end hook, the capture sweep, a PreCompact checkpoint) no longer take the same conversation number; the later one takes the next free number (#228).
@@ -24,6 +25,7 @@ changes a user has to know about before upgrading.
 
 ### Changed
 
+- Archive writes take an advisory lock on ARCHIVE.md and on a new hidden `memory/.EPHEMERAL.lock`, and wait up to 10 s for it. On a timeout the conversation file is kept, the error names the file, and the hook exits non-zero. The locks do not cover NFS (#250, #251).
 - The first `archive --all-unarchived` after upgrading captures every earlier checkpoint-only session whose transcript still exists, and each new archive is extracted on your configured provider: expect a one-time burst of extraction. The capture sweep only picks up sessions newer than its watermark (#228).
 - On a malformed config the SessionEnd and PreCompact hooks still write the archive, skip graph ingest, extraction and consolidation, report the error with the file path, and exit non-zero (#243).
 
