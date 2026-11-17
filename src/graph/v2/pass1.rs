@@ -301,6 +301,7 @@ pub(crate) async fn extract_session(
         let _ = stored;
         (facts, Vec::new(), MatchReport::default(), None)
     };
+    let (facts, targets) = without_forgotten(memory_dir, facts, targets, &mut report)?;
 
     let mut resolve_ms = 0;
     let mut write_ms = 0;
@@ -560,6 +561,71 @@ fn recover_turns_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .recover_applies()
+}
+
+/// Drop facts that match a live forget record. Flag off does not open the file.
+fn without_forgotten(
+    memory_dir: &Path,
+    facts: Vec<Fact>,
+    targets: Vec<Option<super::known_match::MatchTarget>>,
+    report: &mut IngestionReport,
+) -> Result<(Vec<Fact>, Vec<Option<super::known_match::MatchTarget>>), GraphError> {
+    if !crate::graph::forgotten::lasting_forget_on(memory_dir) {
+        return Ok((facts, targets));
+    }
+    let set =
+        crate::graph::forgotten::load_forget_set(memory_dir, true).map_err(forget_as_graph)?;
+    if set.is_empty() {
+        return Ok((facts, targets));
+    }
+    Ok(split_forgotten(facts, targets, &set, report))
+}
+
+fn forget_as_graph(err: crate::error::RecallError) -> GraphError {
+    GraphError::Parse(err.to_string())
+}
+
+fn split_forgotten(
+    facts: Vec<Fact>,
+    targets: Vec<Option<super::known_match::MatchTarget>>,
+    set: &crate::graph::forgotten::ForgetSet,
+    report: &mut IngestionReport,
+) -> (Vec<Fact>, Vec<Option<super::known_match::MatchTarget>>) {
+    let mut kept_facts = Vec::new();
+    let mut kept_targets = Vec::new();
+    let paired = targets.len() == facts.len();
+    for (index, fact) in facts.into_iter().enumerate() {
+        if candidate_forgotten(set, &fact) {
+            report.forgotten_skips += 1;
+            continue;
+        }
+        if paired {
+            kept_targets.push(targets[index].clone());
+        }
+        kept_facts.push(fact);
+    }
+    (kept_facts, if paired { kept_targets } else { targets })
+}
+
+fn candidate_forgotten(set: &crate::graph::forgotten::ForgetSet, fact: &Fact) -> bool {
+    if crate::graph::forgotten::is_forgotten_entity(set, &fact.subject_name) {
+        return true;
+    }
+    if crate::graph::forgotten::is_forgotten_fact(
+        set,
+        &fact.subject_name,
+        fact.predicate.as_str(),
+        &fact.object_name,
+    ) {
+        return true;
+    }
+    !fact.key.is_empty()
+        && crate::graph::forgotten::is_forgotten_fact(
+            set,
+            &fact.subject_name,
+            &fact.key,
+            &fact.object_name,
+        )
 }
 
 /// Drop a decided rule only when it and one setting are a component by themselves.
@@ -6379,5 +6445,227 @@ mod tests {
         let user = provider.user.lock().expect("user").clone();
         assert!(user.contains(&ranked_block), "{user}");
         assert!(!user.contains(&unranked_block), "{user}");
+    }
+
+    fn shelf_uses(object: &str) -> Fact {
+        let mut fact = harbor_setting("", object);
+        fact.subject_name = "shelf".into();
+        fact.predicate = Predicate::Uses;
+        fact.object_kind = Some(Kind::Technology);
+        fact
+    }
+
+    fn forget_set_for(
+        records: &[crate::graph::forgotten::ForgetRecord],
+    ) -> crate::graph::forgotten::ForgetSet {
+        let dir = tempfile::tempdir().expect("temp");
+        crate::graph::forgotten::append_forget_records(
+            dir.path(),
+            records,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("append");
+        crate::graph::forgotten::load_forget_set(dir.path(), true).expect("load")
+    }
+
+    #[test]
+    fn a_forgotten_fact_drops_only_the_same_relation_and_value() {
+        let set = forget_set_for(&[crate::graph::forgotten::fact_record(
+            "shelf",
+            "uses",
+            "Rust",
+            "2026-11-17T12:00:00Z",
+        )]);
+        let mut report = IngestionReport::default();
+        let (kept, _) = split_forgotten(
+            vec![
+                shelf_uses("Rust"),
+                shelf_uses("Go"),
+                {
+                    let mut liked = shelf_uses("Rust");
+                    liked.predicate = Predicate::WorksOn;
+                    liked
+                },
+                harbor_setting("port", "Rust"),
+            ],
+            Vec::new(),
+            &set,
+            &mut report,
+        );
+        assert_eq!(report.forgotten_skips, 1);
+        assert_eq!(kept.len(), 3);
+        assert!(kept.iter().any(|fact| fact.object_name == "Go"));
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::WorksOn));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::Setting && fact.object_name == "Rust"));
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"forgotten_skips\":1"), "{text}");
+    }
+
+    #[test]
+    fn an_entity_record_drops_every_candidate_for_that_subject() {
+        let set = forget_set_for(&[crate::graph::forgotten::entity_record(
+            "Shelf",
+            "2026-11-17T12:00:00Z",
+        )]);
+        let mut report = IngestionReport::default();
+        let mut shelf_port = harbor_setting("port", "9000");
+        shelf_port.subject_name = "shelf".into();
+        let (kept, _) = split_forgotten(
+            vec![
+                shelf_uses("Rust"),
+                shelf_port,
+                harbor_setting("port", "9000"),
+            ],
+            Vec::new(),
+            &set,
+            &mut report,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].subject_name, "harbor");
+        assert_eq!(report.forgotten_skips, 2);
+    }
+
+    #[test]
+    fn flag_off_does_not_read_a_malformed_forget_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = crate::graph::forgotten::forgotten_path(dir.path());
+        std::fs::create_dir(&path).expect("unreadable");
+        let fact = shelf_uses("Rust");
+        let mut report = IngestionReport::default();
+        let (kept, _) =
+            without_forgotten(dir.path(), vec![fact], Vec::new(), &mut report).expect("flag off");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(report.forgotten_skips, 0);
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(!text.contains("forgotten_skips"), "{text}");
+        let err = without_forgotten_on(dir.path(), vec![shelf_uses("Rust")], &mut report);
+        let message = err.expect_err("flag on").to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("unreadable"), "{message}");
+    }
+
+    fn without_forgotten_on(
+        memory_dir: &std::path::Path,
+        facts: Vec<Fact>,
+        report: &mut IngestionReport,
+    ) -> Result<
+        (
+            Vec<Fact>,
+            Vec<Option<crate::graph::v2::known_match::MatchTarget>>,
+        ),
+        GraphError,
+    > {
+        std::fs::write(
+            memory_dir.join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .expect("config");
+        without_forgotten(memory_dir, facts, Vec::new(), report)
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_later_extract_drops_the_forgotten_value_and_keeps_a_new_one() {
+        let dir = tempfile::tempdir().expect("temp");
+        let memory = dir.path();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\nground_component_edges = false\n",
+        )
+        .expect("config");
+        crate::graph::forgotten::append_forget_records(
+            memory,
+            &[crate::graph::forgotten::fact_record(
+                "shelf",
+                "port",
+                "9000",
+                "2026-11-17T12:00:00Z",
+            )],
+            std::time::Duration::from_secs(1),
+        )
+        .expect("record");
+        input::write_turns_sidecar(
+            memory,
+            1,
+            "s",
+            "2026-01-02T00:00:00Z",
+            None,
+            &[crate::conversation::ConversationEntry::UserMessage(
+                "the port is 9000. the port is 9001.".into(),
+            )],
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s", Some(1)),
+            &PortProvider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.forgotten_skips, 1, "{:?}", report.drops);
+        let values = setting_values(&gm).await;
+        assert!(values.contains(&"9001".to_string()), "{values:?}");
+        assert!(!values.iter().any(|value| value == "9000"), "{values:?}");
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"forgotten_skips\":1"), "{text}");
+    }
+
+    #[cfg(feature = "embedded")]
+    struct PortProvider;
+
+    #[cfg(feature = "embedded")]
+    #[async_trait::async_trait]
+    impl LlmProvider for PortProvider {
+        async fn complete(
+            &self,
+            system_prompt: &str,
+            user_message: &str,
+            _: u32,
+        ) -> Result<String, GraphError> {
+            if system_prompt.starts_with("You link NEW MENTIONS") {
+                return Ok(r#"{"entities":[]}"#.to_string());
+            }
+            if system_prompt.starts_with("You compare stored") {
+                return Ok(r#"{"pairs":[]}"#.to_string());
+            }
+            if !user_message.contains("the port is 9000") {
+                return Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string());
+            }
+            Ok(r#"{"facts":[
+                {"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"the port is 9000","confidence":0.9},
+                {"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9001","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"the port is 9001","confidence":0.9}
+            ],"bugs":[],"releases":[]}"#.to_string())
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn setting_values(gm: &GraphMemory) -> Vec<String> {
+        let entities = crate::graph::crud::list_entities(gm.db(), None)
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        for entity in entities {
+            let Some(slots) = entity
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs["v2"]["slots"].as_array())
+            else {
+                continue;
+            };
+            for slot in slots {
+                if let Some(value) = slot["value"].as_str() {
+                    values.push(value.to_string());
+                }
+            }
+        }
+        values.sort();
+        values
     }
 }
