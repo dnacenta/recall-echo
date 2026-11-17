@@ -2079,6 +2079,11 @@ pub struct ExtractOptions {
     pub pipeline: Option<PipelineVersion>,
     /// Build a fresh v2 store and swap it into place. Ignores `--log` and `--all`.
     pub rebuild: bool,
+    /// Rebuild even when `graph/` is already a v2 store.
+    ///
+    /// Valid only together with [`Self::rebuild`]. A forced rebuild re-extracts
+    /// every archive and keeps the current store as `graph.v1-backup-<date>`.
+    pub force: bool,
 }
 
 /// Extract entities from already-ingested archives using an LLM.
@@ -2097,6 +2102,7 @@ pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), R
         max_tokens,
         pipeline,
         rebuild: _,
+        force: _,
     } = options;
     let pipeline_flag = pipeline;
     let memory = memory_dir.to_path_buf();
@@ -3402,6 +3408,7 @@ mod tests {
                 max_tokens: 0,
                 pipeline: Some(PipelineVersion::V1),
                 rebuild: false,
+                force: false,
             },
         )
         .await

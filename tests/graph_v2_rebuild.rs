@@ -145,6 +145,7 @@ fn options(pipeline: PipelineVersion, dry_run: bool) -> ExtractOptions {
         max_tokens: 0,
         pipeline: Some(pipeline),
         rebuild: true,
+        force: false,
     }
 }
 

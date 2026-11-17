@@ -547,6 +547,9 @@ enum GraphCommands {
         /// Rebuild a fresh pipeline v2 store beside the current one and swap it into place
         #[arg(long)]
         rebuild: bool,
+        /// With --rebuild: rebuild even when graph/ is already a v2 store. Re-extracts every archive; the current store is kept as graph.v1-backup-<date>.
+        #[arg(long, requires = "rebuild", verbatim_doc_comment)]
+        force: bool,
     },
     /// Pipeline operations — sync, status, flow, stale detection
     Pipeline {
@@ -918,6 +921,7 @@ fn main() {
                                 max_tokens,
                                 pipeline,
                                 rebuild,
+                                force,
                             } => {
                                 graph_cli::extract(
                                     &memory_dir,
@@ -931,6 +935,7 @@ fn main() {
                                         max_tokens,
                                         pipeline,
                                         rebuild,
+                                        force,
                                     },
                                 )
                                 .await
@@ -2958,5 +2963,56 @@ mod tests {
         })
         .expect_err("provider");
         assert_eq!(err.to_string(), UNKNOWN_PROVIDER);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn force_without_rebuild_is_a_usage_error() {
+        let parsed = Cli::try_parse_from(["recall-echo", "graph", "extract", "--force"]);
+        let err = match parsed {
+            Err(err) => err,
+            Ok(_) => panic!("--force without --rebuild parsed"),
+        };
+        let text = err.to_string();
+        assert!(text.contains("--rebuild"), "{text}");
+        assert_eq!(err.exit_code(), 2, "{text}");
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("graph")
+            .expect("graph")
+            .find_subcommand_mut("extract")
+            .expect("extract")
+            .get_arguments()
+            .find(|arg| arg.get_id() == "force")
+            .expect("force arg")
+            .get_help()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            help,
+            "With --rebuild: rebuild even when graph/ is already a v2 store. Re-extracts every archive; the current store is kept as graph.v1-backup-<date>."
+        );
+
+        let parsed = Cli::try_parse_from([
+            "recall-echo",
+            "graph",
+            "extract",
+            "--pipeline",
+            "v2",
+            "--rebuild",
+            "--force",
+        ])
+        .expect("force with rebuild");
+        match parsed.command.expect("command") {
+            Commands::Graph { command, .. } => match command {
+                GraphCommands::Extract { force, rebuild, .. } => {
+                    assert!(force);
+                    assert!(rebuild);
+                }
+                _ => panic!("expected graph extract"),
+            },
+            _ => panic!("expected graph"),
+        }
     }
 }
