@@ -45,17 +45,41 @@ pub fn run_with_hook_input(
     base_dir: &Path,
 ) -> Result<(), RecallError> {
     let config_error = config::try_load(base_dir).err();
-    if let Some(input) = hook_input {
-        let transcript_path = input.transcript_path.trim();
-        if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
-            crate::jsonl::report_declined_subagent(transcript_path, "no checkpoint written");
-            return Ok(());
-        }
+    if decline_subagent(hook_input) {
+        return Ok(());
     }
+    let next_num = write_checkpoint(trigger, hook_input, base_dir, config_error.is_some())?;
+    finish_checkpoint(config_error, next_num)
+}
 
+fn decline_subagent(hook_input: Option<&crate::jsonl::HookInput>) -> bool {
+    let Some(input) = hook_input else {
+        return false;
+    };
+    let transcript_path = input.transcript_path.trim();
+    if !crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
+        return false;
+    }
+    crate::jsonl::report_declined_subagent(transcript_path, "no checkpoint written");
+    true
+}
+
+fn finish_checkpoint(config_error: Option<RecallError>, next_num: u32) -> Result<(), RecallError> {
+    if let Some(err) = config_error {
+        report_checkpoint_without_extraction(&err, next_num);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn write_checkpoint(
+    trigger: &str,
+    hook_input: Option<&crate::jsonl::HookInput>,
+    base_dir: &Path,
+    skip_ingest: bool,
+) -> Result<u32, RecallError> {
     let conversations_dir = base_dir.join("conversations");
     let archive_index = base_dir.join("ARCHIVE.md");
-
     if !conversations_dir.exists() {
         return Err(RecallError::NotInitialized(
             "conversations/ directory not found. Run init first.".into(),
@@ -65,56 +89,13 @@ pub fn run_with_hook_input(
     let next_num = archive::highest_conversation_number(&conversations_dir) + 1;
     let now = conversation::utc_now();
     let date = conversation::date_from_timestamp(&now);
-
-    // If we have hook input with a transcript, parse it for metadata
-    let data = match hook_input {
-        Some(input) => extract_from_transcript(input).unwrap_or_else(empty_checkpoint),
-        None => empty_checkpoint(),
-    };
-
-    let fm = Frontmatter {
-        log: next_num,
-        date: now,
-        session_id: data.session_id,
-        message_count: data.message_count,
-        duration: data.duration.clone(),
-        source: trigger.to_string(),
-        pulse: None,
-        topics: data.topics.clone(),
-    };
-
+    let data = checkpoint_data(hook_input);
+    let fm = checkpoint_frontmatter(trigger, next_num, &now, &data);
     let full_content = format!("{}\n\n{}{}", fm.render(), data.md_body, data.tags_section);
-
     let conv_file = conversations_dir.join(format!("conversation-{next_num:03}.md"));
     fs::write(&conv_file, &full_content)?;
-
-    // The sidecar is a second record. A failure here must not throw away the
-    // archive that was just written; the helper logs and returns.
-    if crate::graph::v2::input::turns_sidecar_enabled() {
-        archive::write_sidecar_best_effort(
-            base_dir,
-            next_num,
-            &fm.session_id,
-            &date,
-            None,
-            &data.entries,
-        );
-    }
-
-    let ingest = if config_error.is_some() {
-        archive::Ingest::No
-    } else {
-        archive::Ingest::Yes
-    };
-    if archive::permits_ingest(ingest) {
-        let result = archive::ArchiveResult {
-            log_number: next_num,
-            full_content: full_content.clone(),
-            session_id: fm.session_id.clone(),
-        };
-        archive::graph_ingest(base_dir, &result);
-    }
-
+    write_checkpoint_sidecar(base_dir, next_num, &fm, &date, &data);
+    ingest_checkpoint(base_dir, next_num, &full_content, &fm, skip_ingest);
     archive::append_index(
         &archive_index,
         next_num,
@@ -124,7 +105,6 @@ pub fn run_with_hook_input(
         data.message_count,
         &data.duration,
     )?;
-
     eprintln!(
         "recall-echo: checkpoint conversation-{:03}.md ({} \u{2014} {} messages, {} topics)",
         next_num,
@@ -132,13 +112,75 @@ pub fn run_with_hook_input(
         data.message_count,
         data.topics.len()
     );
+    Ok(next_num)
+}
 
-    if let Some(err) = config_error {
-        report_checkpoint_without_extraction(&err, next_num);
-        return Err(err);
+fn checkpoint_data(hook_input: Option<&crate::jsonl::HookInput>) -> CheckpointData {
+    match hook_input {
+        Some(input) => extract_from_transcript(input).unwrap_or_else(empty_checkpoint),
+        None => empty_checkpoint(),
     }
+}
 
-    Ok(())
+fn checkpoint_frontmatter(
+    trigger: &str,
+    next_num: u32,
+    now: &str,
+    data: &CheckpointData,
+) -> Frontmatter {
+    Frontmatter {
+        log: next_num,
+        date: now.to_string(),
+        session_id: data.session_id.clone(),
+        message_count: data.message_count,
+        duration: data.duration.clone(),
+        source: trigger.to_string(),
+        pulse: None,
+        topics: data.topics.clone(),
+    }
+}
+
+fn write_checkpoint_sidecar(
+    base_dir: &Path,
+    next_num: u32,
+    fm: &Frontmatter,
+    date: &str,
+    data: &CheckpointData,
+) {
+    if !crate::graph::v2::input::turns_sidecar_enabled() {
+        return;
+    }
+    archive::write_sidecar_best_effort(
+        base_dir,
+        next_num,
+        &fm.session_id,
+        date,
+        None,
+        &data.entries,
+    );
+}
+
+fn ingest_checkpoint(
+    base_dir: &Path,
+    next_num: u32,
+    full_content: &str,
+    fm: &Frontmatter,
+    skip_ingest: bool,
+) {
+    let ingest = if skip_ingest {
+        archive::Ingest::No
+    } else {
+        archive::Ingest::Yes
+    };
+    if !archive::permits_ingest(ingest) {
+        return;
+    }
+    let result = archive::ArchiveResult {
+        log_number: next_num,
+        full_content: full_content.to_string(),
+        session_id: fm.session_id.clone(),
+    };
+    archive::graph_ingest(base_dir, &result);
 }
 
 fn report_checkpoint_without_extraction(err: &RecallError, log_number: u32) {

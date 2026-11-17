@@ -1519,33 +1519,38 @@ pub fn load(base: &Path) -> Config {
     if !path.exists() {
         return Config::default();
     }
+    match fs::read_to_string(&path) {
+        Ok(content) => load_read(&path, &content),
+        Err(_) => Config::default(),
+    }
+}
 
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Config::default(),
-    };
-
-    if let Some(key) = dropped_llm_key(&content) {
-        eprintln!("recall-echo: {}", removed_key_line(&path, key));
+fn load_read(path: &Path, content: &str) -> Config {
+    if let Some(key) = dropped_llm_key(content) {
+        eprintln!("recall-echo: {}", removed_key_line(path, key));
         return Config::default();
     }
+    match toml::from_str(content) {
+        Ok(cfg) => validated_or_default(cfg),
+        Err(err) => dropped_parse(err.to_string()),
+    }
+}
 
-    match toml::from_str(&content) {
-        Ok(cfg) => match validate(cfg) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!("recall-echo: {err}");
-                Config::default()
-            }
-        },
+fn validated_or_default(cfg: Config) -> Config {
+    match validate(cfg) {
+        Ok(cfg) => cfg,
         Err(err) => {
-            let message = err.to_string();
-            if message.contains("removed in this version") {
-                eprintln!("recall-echo: {message}");
-            }
+            eprintln!("recall-echo: {err}");
             Config::default()
         }
     }
+}
+
+fn dropped_parse(message: String) -> Config {
+    if message.contains("removed in this version") {
+        eprintln!("recall-echo: {message}");
+    }
+    Config::default()
 }
 
 /// Set `[graph] pipeline` and write it through [`save`].

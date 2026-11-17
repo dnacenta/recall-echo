@@ -375,35 +375,57 @@ pub fn ingest(memory_dir: &Path, sources: &[Source]) -> Result<(), RecallError> 
     }
 
     let config = crate::config::try_load_from_dir(memory_dir)?;
-    let options = CaptureOptions::from_config(&config.capture);
-    let mut total = 0usize;
-
-    for source in sources {
-        let Some(adapter) = adapter_for(*source) else {
-            continue;
-        };
-        if !adapter.is_installed() {
-            eprintln!(
-                "recall-echo: {source} has no sessions at {}",
-                adapter.sessions_root().display()
-            );
-            continue;
-        }
-        let report = sweep(memory_dir, adapter.as_ref(), options)?;
-        total += report.archived.len();
-        match report.summary(*source) {
-            Some(line) => eprintln!("recall-echo: {line}"),
-            None => match report.subagents_note() {
-                Some(skipped) => eprintln!("recall-echo: no new {source} sessions ({skipped})"),
-                None => eprintln!("recall-echo: no new {source} sessions"),
-            },
-        }
-    }
-
+    let total = import_sources(
+        memory_dir,
+        sources,
+        CaptureOptions::from_config(&config.capture),
+    )?;
     if total == 0 {
         eprintln!("recall-echo: nothing new to import");
     }
     Ok(())
+}
+
+fn import_sources(
+    memory_dir: &Path,
+    sources: &[Source],
+    options: CaptureOptions,
+) -> Result<usize, RecallError> {
+    let mut total = 0usize;
+    for source in sources {
+        total += import_source(memory_dir, *source, options)?;
+    }
+    Ok(total)
+}
+
+fn import_source(
+    memory_dir: &Path,
+    source: Source,
+    options: CaptureOptions,
+) -> Result<usize, RecallError> {
+    let Some(adapter) = adapter_for(source) else {
+        return Ok(0);
+    };
+    if !adapter.is_installed() {
+        eprintln!(
+            "recall-echo: {source} has no sessions at {}",
+            adapter.sessions_root().display()
+        );
+        return Ok(0);
+    }
+    let report = sweep(memory_dir, adapter.as_ref(), options)?;
+    match report.summary(source) {
+        Some(line) => eprintln!("recall-echo: {line}"),
+        None => note_empty_import(source, report.subagents_note()),
+    }
+    Ok(report.archived.len())
+}
+
+fn note_empty_import(source: Source, skipped: Option<String>) {
+    match skipped {
+        Some(skipped) => eprintln!("recall-echo: no new {source} sessions ({skipped})"),
+        None => eprintln!("recall-echo: no new {source} sessions"),
+    }
 }
 
 /// The CLIs `ingest` and the daemon sweep work on, given a config.

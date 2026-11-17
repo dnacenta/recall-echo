@@ -185,27 +185,31 @@ pub fn set(memory_dir: &Path, key: &str, value: &str) -> Result<(), RecallError>
     let mut cfg = config::try_load(memory_dir)?;
     cfg.set_key(key, value)?;
     config::save(memory_dir, &cfg)?;
-
     eprintln!("{GOOD}✓{RESET} Set {BOLD}{key}{RESET} = {BOLD}{value}{RESET}");
-
-    // Show what the new provider resolves to — a CLI provider has no API base,
-    // and what matters instead is the call it will make.
-    if key == "llm.provider" || key == "provider" {
-        if cfg.llm.provider.is_cli() {
-            match CliSpec::resolve(&cfg.llm.provider, &cfg.llm.cli) {
-                Ok(spec) => eprintln!(
-                    "  command  → {}",
-                    spec.argv_preview(&spec.resolve_model(&cfg.llm.model))
-                ),
-                Err(err) => eprintln!("  {err}"),
-            }
-        } else {
-            eprintln!("  model    → {}", cfg.llm.resolved_model());
-            eprintln!("  api_base → {}", cfg.llm.resolved_api_base());
-        }
-    }
-
+    report_set_provider(&cfg, key);
     Ok(())
+}
+
+fn report_set_provider(cfg: &config::Config, key: &str) {
+    if key != "llm.provider" && key != "provider" {
+        return;
+    }
+    if cfg.llm.provider.is_cli() {
+        report_cli_after_set(cfg);
+        return;
+    }
+    eprintln!("  model    → {}", cfg.llm.resolved_model());
+    eprintln!("  api_base → {}", cfg.llm.resolved_api_base());
+}
+
+fn report_cli_after_set(cfg: &config::Config) {
+    match CliSpec::resolve(&cfg.llm.provider, &cfg.llm.cli) {
+        Ok(spec) => eprintln!(
+            "  command  → {}",
+            spec.argv_preview(&spec.resolve_model(&cfg.llm.model))
+        ),
+        Err(err) => eprintln!("  {err}"),
+    }
 }
 
 #[cfg(test)]
