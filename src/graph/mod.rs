@@ -97,6 +97,10 @@ pub struct GraphMemory {
     pipeline_stamp: std::sync::Mutex<StampCache>,
 }
 
+fn load_open_config(memory_dir: &Path) -> Result<crate::config::Config, GraphError> {
+    crate::config::try_load_from_dir(memory_dir).map_err(|err| GraphError::Parse(err.to_string()))
+}
+
 impl GraphMemory {
     /// Open a graph store at the given path.
     ///
@@ -107,7 +111,7 @@ impl GraphMemory {
     /// The `path` is used for the FastEmbed models cache in both modes.
     pub async fn open(path: &Path) -> Result<Self, GraphError> {
         let memory_dir = path.parent().unwrap_or(path);
-        let config = crate::config::load_from_dir(memory_dir);
+        let config = load_open_config(memory_dir)?;
         let mode = config
             .graph
             .as_ref()
@@ -153,7 +157,7 @@ impl GraphMemory {
     /// The `path` is still used for the FastEmbed models cache.
     pub async fn open_server(path: &Path) -> Result<Self, GraphError> {
         let memory_dir = path.parent().unwrap_or(path);
-        let config = crate::config::load_from_dir(memory_dir);
+        let config = load_open_config(memory_dir)?;
 
         let graph_section = config.graph.unwrap_or_default();
         let password = if graph_section.password_file.is_empty() {
@@ -828,4 +832,31 @@ struct CountRow {
 struct TypeCount {
     entity_type: String,
     count: u64,
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn graph_open_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".recall-echo.toml");
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let graph = dir.path().join("graph");
+        let opened = GraphMemory::open(&graph).await.err().expect("refused");
+        assert!(
+            opened.to_string().contains(&path.display().to_string()),
+            "{opened}"
+        );
+        assert!(!graph.exists());
+        let server = GraphMemory::open_server(&graph)
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            server.to_string().contains(&path.display().to_string()),
+            "{server}"
+        );
+    }
 }

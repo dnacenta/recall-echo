@@ -937,7 +937,7 @@ impl ServeOptions {
     /// `foreground` (systemd) disables idle shutdown and mirrors the log to
     /// stderr, leaving daemon lifetime to the supervisor.
     pub fn from_config(memory_dir: &Path, foreground: bool) -> Result<Self, RecallError> {
-        let config = crate::config::load_from_dir(memory_dir);
+        let config = crate::config::try_load_from_dir(memory_dir)?;
         let idle_timeout = match (foreground, config.serve.idle_timeout_secs) {
             (true, _) | (_, 0) => None,
             (false, secs) => Some(Duration::from_secs(secs)),
@@ -1995,6 +1995,18 @@ mod tests {
                 .unwrap()
                 .idle_timeout,
             None
+        );
+    }
+
+    #[test]
+    fn serve_options_refuse_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".recall-echo.toml");
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = ServeOptions::from_config(dir.path(), false).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
         );
     }
 

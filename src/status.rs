@@ -30,6 +30,7 @@ fn trust_issue(pulse_root: &Path) -> Option<String> {
 
 pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
     let memory = pulse_root.join("memory");
+    config::try_load(&memory)?;
     if !memory.exists() {
         return Err(RecallError::NotInitialized(
             "memory/ directory not found. Run `recall-echo init` first.".into(),
@@ -37,53 +38,35 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
     }
 
     let mut issues: Vec<String> = Vec::new();
+    let overall = overall_label(&memory, &mut issues);
+    eprintln!("\n{BOLD}recall-echo{RESET} — {overall}\n");
+    report_memory_md(pulse_root, &memory, &mut issues);
+    report_ephemeral(&memory);
+    report_archives(&memory);
+    report_graph(&memory, &mut issues);
+    report_issues(&issues);
+    Ok(())
+}
 
-    // Header
-    let overall = if memory.join("conversations").exists()
+fn overall_label(memory: &Path, issues: &mut Vec<String>) -> String {
+    if memory.join("conversations").exists()
         && memory.join("EPHEMERAL.md").exists()
         && memory.join("MEMORY.md").exists()
     {
-        format!("{GOOD}healthy{RESET}")
-    } else {
-        issues.push("Run `recall-echo init` to complete setup".to_string());
-        format!("{WARN}incomplete{RESET}")
-    };
+        return format!("{GOOD}healthy{RESET}");
+    }
+    issues.push("Run `recall-echo init` to complete setup".to_string());
+    format!("{WARN}incomplete{RESET}")
+}
 
-    eprintln!("\n{BOLD}recall-echo{RESET} — {overall}\n");
-
-    // MEMORY.md
+fn report_memory_md(pulse_root: &Path, memory: &Path, issues: &mut Vec<String>) {
     let memory_path = memory.join("MEMORY.md");
     // Read once, and only a regular file: a FIFO would block the read forever.
     let memory_md = fs::metadata(&memory_path)
         .is_ok_and(|meta| meta.is_file())
         .then(|| fs::read_to_string(&memory_path).unwrap_or_default());
     if let Some(content) = memory_md {
-        let lines = content.lines().count();
-        let pct = (lines as f32 / 200.0 * 100.0) as u32;
-        let bar = progress_bar(pct, 4);
-        let color = if pct > 90 {
-            BAD
-        } else if pct > 70 {
-            WARN
-        } else {
-            GOOD
-        };
-        eprintln!("  MEMORY.md       {color}{lines}/200 lines ({pct}%){RESET}  {bar}");
-        if pct > 70 {
-            issues.push(format!("MEMORY.md approaching limit ({pct}%)"));
-        }
-        eprintln!(
-            "                  {DIM}{} — loaded into every Claude Code session{RESET}",
-            crate::distill::size_summary(&content)
-        );
-        if content.len() > crate::distill::DISTILL_AFTER_BYTES {
-            issues.push(format!(
-                "MEMORY.md is {} KB, over the {} KB budget — run distill",
-                content.len() / 1024,
-                crate::distill::DISTILL_AFTER_BYTES / 1024
-            ));
-        }
-        issues.extend(crate::rules_file::hidden_import_warning(&content));
+        note_memory_file(&content, issues);
     } else if fs::symlink_metadata(&memory_path).is_ok() {
         eprintln!("  MEMORY.md       {BAD}not a regular file{RESET}");
         issues.push("MEMORY.md is not a regular file".to_string());
@@ -92,65 +75,99 @@ pub fn run_with_base(pulse_root: &Path) -> Result<(), RecallError> {
         issues.push("MEMORY.md not found".to_string());
     }
     issues.extend(trust_issue(pulse_root));
+}
 
-    // EPHEMERAL.md
-    let cfg = config::load(&memory);
+fn note_memory_file(content: &str, issues: &mut Vec<String>) {
+    let lines = content.lines().count();
+    let pct = (lines as f32 / 200.0 * 100.0) as u32;
+    let bar = progress_bar(pct, 4);
+    let color = memory_color(pct);
+    eprintln!("  MEMORY.md       {color}{lines}/200 lines ({pct}%){RESET}  {bar}");
+    if pct > 70 {
+        issues.push(format!("MEMORY.md approaching limit ({pct}%)"));
+    }
+    eprintln!(
+        "                  {DIM}{} — loaded into every Claude Code session{RESET}",
+        crate::distill::size_summary(content)
+    );
+    if content.len() > crate::distill::DISTILL_AFTER_BYTES {
+        issues.push(format!(
+            "MEMORY.md is {} KB, over the {} KB budget — run distill",
+            content.len() / 1024,
+            crate::distill::DISTILL_AFTER_BYTES / 1024
+        ));
+    }
+    issues.extend(crate::rules_file::hidden_import_warning(content));
+}
+
+fn memory_color(pct: u32) -> crate::theme::Paint {
+    if pct > 90 {
+        BAD
+    } else if pct > 70 {
+        WARN
+    } else {
+        GOOD
+    }
+}
+
+fn report_ephemeral(memory: &Path) {
+    let cfg = config::load(memory);
     let max_entries = cfg.ephemeral.max_entries;
     let ephemeral_path = memory.join("EPHEMERAL.md");
     if ephemeral_path.exists() {
         let count = ephemeral::count_entries(&ephemeral_path).unwrap_or(0);
         eprintln!("  EPHEMERAL       {count}/{max_entries} sessions");
-    } else {
-        eprintln!("  EPHEMERAL       {DIM}not found{RESET}");
+        return;
     }
+    eprintln!("  EPHEMERAL       {DIM}not found{RESET}");
+}
 
-    // Archives
+fn report_archives(memory: &Path) {
     let conversations_dir = memory.join("conversations");
-    if conversations_dir.exists() {
-        let (count, total_bytes) = count_conversations(&conversations_dir);
-        let size_str = format_bytes(total_bytes);
-        eprintln!("  Archives        {count} conversations ({size_str})");
-
-        if count > 0 {
-            let (oldest, newest) = find_date_range(&conversations_dir);
-            if let Some(newest) = newest {
-                eprintln!("  Last archived   {newest}");
-            }
-            if let Some(oldest) = oldest {
-                eprintln!("  Oldest archive  {oldest}");
-            }
-        }
-    } else {
+    if !conversations_dir.exists() {
         eprintln!("  Archives        {DIM}not initialized{RESET}");
+        return;
     }
-
-    // Graph — counts stay with `graph status` (this command does not take the
-    // store). The pipeline line reads the stamp only when the directory is
-    // already a SurrealKV store, or from a daemon that already holds it.
-    let graph_dir = memory.join("graph");
-    if graph_dir.exists() {
-        eprintln!(
-            "  Graph           {DIM}present — run `recall-echo graph status` for counts{RESET}"
-        );
-        let pipeline = pipeline_report(&memory);
-        eprintln!("  Pipeline        {}", pipeline.summary);
-        if let Some(warning) = pipeline.warning {
-            issues.push(warning);
-        }
+    let (count, total_bytes) = count_conversations(&conversations_dir);
+    let size_str = format_bytes(total_bytes);
+    eprintln!("  Archives        {count} conversations ({size_str})");
+    if count > 0 {
+        report_archive_dates(&conversations_dir);
     }
+}
 
-    // Issues
+fn report_archive_dates(conversations_dir: &Path) {
+    let (oldest, newest) = find_date_range(conversations_dir);
+    if let Some(newest) = newest {
+        eprintln!("  Last archived   {newest}");
+    }
+    if let Some(oldest) = oldest {
+        eprintln!("  Oldest archive  {oldest}");
+    }
+}
+
+fn report_graph(memory: &Path, issues: &mut Vec<String>) {
+    if !memory.join("graph").exists() {
+        return;
+    }
+    eprintln!("  Graph           {DIM}present — run `recall-echo graph status` for counts{RESET}");
+    let pipeline = pipeline_report(memory);
+    eprintln!("  Pipeline        {}", pipeline.summary);
+    if let Some(warning) = pipeline.warning {
+        issues.push(warning);
+    }
+}
+
+fn report_issues(issues: &[String]) {
     eprintln!();
     if issues.is_empty() {
         eprintln!("  {GOOD}No issues detected.{RESET}");
     } else {
-        for issue in &issues {
+        for issue in issues {
             eprintln!("  {WARN}!{RESET} {issue}");
         }
     }
     eprintln!();
-
-    Ok(())
 }
 
 struct PipelineReport {
@@ -327,6 +344,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn status_fails_on_a_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        let path = memory.join(".recall-echo.toml");
+        std::fs::write(&path, "this is not toml [[[\n").unwrap();
+        let err = run_with_base(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+    }
 
     /// Init writes hooks and a persisted root pointer outside the store, so
     /// it runs here against a sandbox: the suite never touches the real
