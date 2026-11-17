@@ -8,6 +8,7 @@ changes a user has to know about before upgrading.
 ### Fixed
 
 - `graph ingest --pipeline v2` no longer reports a log as already extracted when its episode chunks failed to write. Any episode write error now stops before extraction (no provider call, no fact write), names the failed chunks, prints the command to retry, and exits non-zero (#248).
+- `graph extract --pipeline v2 --rebuild` reads the pipeline stamp from a copy of `graph/surreal/` only when `manifest/`, `sstables/`, `wal/` and `vlog/` are unchanged across the copy, including file bytes, and a second snapshot agrees. A torn or still-changing copy is retried, then refused with `graph/` and `--force`, instead of failing at random or being treated as not a v2 store (#256).
 
 ## [5.1.0] — 2026-11-17
 
