@@ -1414,6 +1414,36 @@ async fn a_build_dir_resumes_without_a_stamp_check() {
     assert_eq!(backups(memory).len(), 1);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_v1_store_with_a_symlinked_models_dir_rebuilds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let memory = dir.path();
+    seed(memory, false).await;
+    let outside = tempfile::tempdir().expect("models");
+    std::fs::write(outside.path().join("cache.bin"), b"model").expect("cache");
+    let models = memory.join("graph/models");
+    std::fs::remove_dir_all(&models).expect("remove models");
+    std::os::unix::fs::symlink(outside.path(), &models).expect("symlink");
+
+    rebuild(
+        memory,
+        options(PipelineVersion::V2, false),
+        &IdleStop::new(),
+        Some(&Scripted::answering()),
+    )
+    .await
+    .expect("rebuild with a symlinked models dir");
+
+    assert!(outside.path().join("cache.bin").is_file());
+    assert_eq!(backups(memory).len(), 1);
+    let stamp = strings(
+        &query(&memory.join("graph"), "SELECT pipeline FROM meta:pipeline").await,
+        "pipeline",
+    );
+    assert_eq!(stamp, vec!["v2".to_string()]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_stamp_read_error_on_the_live_open_names_graph() {
     let dir = tempfile::tempdir().expect("temp dir");

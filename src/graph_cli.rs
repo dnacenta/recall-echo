@@ -1022,8 +1022,8 @@ impl EpisodeRows {
 /// daemon is stopped and before the old store is touched. A `graph/` that is
 /// already stamped v2, with no build directory, is refused the same way
 /// unless [`ExtractOptions::force`] is set. The stamp comes from a running
-/// daemon, or from a copy of `graph/` when none is running; `graph/` itself
-/// is not opened. A stamped build directory is a resume of its unfinished
+/// daemon, or from a copy of `graph/surreal/` when none is running; `graph/`
+/// itself is not opened. A stamped build directory is a resume of its unfinished
 /// logs. `--dry-run` lists archives and estimated calls and does not stop
 /// the daemon.
 ///
@@ -1215,8 +1215,8 @@ async fn fresh_graph_stamp(
 /// The stamp a rebuild would act on.
 ///
 /// A running daemon answers from its hello, and the store is not opened.
-/// With no daemon, `may_open` reads a copy of `graph/`. A dry run passes
-/// `may_open = false` and gets [`GraphStamp::Unknown`] instead.
+/// With no daemon, `may_open` reads a copy of `graph/surreal/`. A dry run
+/// passes `may_open = false` and gets [`GraphStamp::Unknown`] instead.
 #[cfg(feature = "llm")]
 async fn graph_stamp(memory_dir: &Path, may_open: bool) -> Result<GraphStamp, RecallError> {
     if let Some(info) = serve_client::daemon_info(memory_dir).await? {
@@ -1236,15 +1236,22 @@ fn stamp_from_daemon(stamp: crate::serve::PipelineStamp) -> GraphStamp {
     }
 }
 
-/// Copy `graph/` outside the memory directory, read its stamp, and drop both
-/// the database handle and the copy. `graph/` is never opened.
+/// Copy `graph/surreal/` outside the memory directory, read its stamp, and
+/// drop both the database handle and the copy.
+///
+/// [`crate::graph::store::open`] only reads `<path>/surreal`, so the rest of
+/// `graph/` (a symlinked `models/` cache, for example) is not copied and is
+/// never opened. A missing `graph/surreal/` is an absent store.
 #[cfg(feature = "llm")]
 async fn open_graph_stamp(memory_dir: &Path) -> Result<GraphStamp, RecallError> {
-    let graph = memory_dir.join("graph");
+    let surreal = memory_dir.join("graph").join("surreal");
+    if surreal_is_absent(&surreal)? {
+        return Ok(GraphStamp::NotV2);
+    }
     let scratch = StampScratch::create(memory_dir)?;
-    let copy = scratch.path().join("graph");
-    copy_tree(&graph, &copy).map_err(stamp_read_error)?;
-    let db = crate::graph::store::open(&copy)
+    let graph_copy = scratch.path().join("graph");
+    copy_tree(&surreal, &graph_copy.join("surreal")).map_err(stamp_read_error)?;
+    let db = crate::graph::store::open(&graph_copy)
         .await
         .map_err(stamp_read_error)?;
     let read = crate::graph::v2::read_stamp(&db).await;
@@ -1256,11 +1263,29 @@ async fn open_graph_stamp(memory_dir: &Path) -> Result<GraphStamp, RecallError> 
     }
 }
 
+/// `true` when `graph/surreal/` is not there. A file at that path is present
+/// and fails later, when the copy tries to read it as a store directory.
+#[cfg(feature = "llm")]
+fn surreal_is_absent(surreal: &Path) -> Result<bool, RecallError> {
+    match std::fs::symlink_metadata(surreal) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(stamp_read_error(err)),
+        Ok(_) => Ok(false),
+    }
+}
+
+/// Prefix of stamp-copy directories under the system temp dir.
+///
+/// A process killed while the copy is open can leave one of these behind.
+/// Nothing sweeps them.
+#[cfg(feature = "llm")]
+const STAMP_SCRATCH_PREFIX: &str = "recall-echo-stamp-";
+
 /// A fresh directory under the system temp dir, removed on drop.
 ///
 /// It is never inside the memory directory. `tempfile` is a dev-dependency,
 /// so this is the same scratch a `TempDir` would be: outside the store, and
-/// gone after the stamp is read.
+/// gone after the stamp is read. On Unix the directory is mode `0700`.
 #[cfg(feature = "llm")]
 struct StampScratch {
     path: PathBuf,
@@ -1276,13 +1301,13 @@ impl StampScratch {
             ));
         }
         for n in 0..100u32 {
-            let path = root.join(format!("recall-echo-stamp-{}-{n}", std::process::id()));
+            let path = root.join(format!("{STAMP_SCRATCH_PREFIX}{}-{n}", std::process::id()));
             if path.starts_with(memory_dir) {
                 return Err(RecallError::Other(
                     "graph/: stamp copy landed inside the memory directory".into(),
                 ));
             }
-            match std::fs::create_dir(&path) {
+            match create_private_dir(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(stamp_read_error(err)),
@@ -1302,6 +1327,19 @@ impl StampScratch {
 impl Drop for StampScratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(feature = "llm")]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        return std::fs::DirBuilder::new().mode(0o700).create(path);
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
     }
 }
 
@@ -4079,6 +4117,25 @@ mod tests {
         gm.mark_extracted(7).await.expect("mark extracted");
         assert_eq!(v2_extract_state(&gm, 7).await.unwrap(), (true, false));
         assert_eq!(v2_extract_state(&gm, 8).await.unwrap(), (false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stamp_scratch_dir_is_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let memory = tempfile::tempdir().expect("memory");
+        let scratch = StampScratch::create(memory.path()).expect("scratch");
+        let mode = std::fs::metadata(scratch.path())
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+        assert!(scratch
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(STAMP_SCRATCH_PREFIX)));
     }
 
     #[test]
