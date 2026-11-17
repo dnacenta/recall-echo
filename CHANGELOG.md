@@ -3,6 +3,12 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [Unreleased]
+
+### Fixed
+
+- `graph ingest --pipeline v2` no longer reports a log as already extracted when its episode chunks failed to write. Any episode write error now stops before extraction (no provider call, no fact write), names the failed chunks, prints the command to retry, and exits non-zero (#248).
+
 ## [5.1.0] — 2026-11-17
 
 ### Breaking
