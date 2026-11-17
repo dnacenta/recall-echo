@@ -12,6 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::archive;
+use crate::config;
 use crate::conversation;
 use crate::error::RecallError;
 use crate::frontmatter::Frontmatter;
@@ -43,6 +44,7 @@ pub fn run_with_hook_input(
     hook_input: Option<&crate::jsonl::HookInput>,
     base_dir: &Path,
 ) -> Result<(), RecallError> {
+    let config_error = config::try_load(base_dir).err();
     if let Some(input) = hook_input {
         let transcript_path = input.transcript_path.trim();
         if crate::jsonl::is_subagent_transcript(Path::new(transcript_path)) {
@@ -99,8 +101,12 @@ pub fn run_with_hook_input(
         );
     }
 
-    // Graph ingestion
-    {
+    let ingest = if config_error.is_some() {
+        archive::Ingest::No
+    } else {
+        archive::Ingest::Yes
+    };
+    if archive::permits_ingest(ingest) {
         let result = archive::ArchiveResult {
             log_number: next_num,
             full_content: full_content.clone(),
@@ -127,7 +133,22 @@ pub fn run_with_hook_input(
         data.topics.len()
     );
 
+    if let Some(err) = config_error {
+        report_checkpoint_without_extraction(&err, next_num);
+        return Err(err);
+    }
+
     Ok(())
+}
+
+fn report_checkpoint_without_extraction(err: &RecallError, log_number: u32) {
+    let reason = match err {
+        RecallError::Config(message) => message.as_str(),
+        _ => "",
+    };
+    eprintln!(
+        "recall-echo: {reason}; archived conversation-{log_number:03}.md without extraction or consolidation"
+    );
 }
 
 struct CheckpointData {
@@ -415,5 +436,28 @@ mod tests {
         let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
         assert!(index.contains("sess-a"));
         assert!(!tmp.path().join("turns/conversation-001.json").exists());
+    }
+
+    #[test]
+    fn the_precompact_hook_keeps_the_checkpoint_on_a_malformed_config() {
+        let tmp = prepared_root();
+        let path = config::config_path(tmp.path());
+        fs::write(&path, "this is not toml [[[\n").unwrap();
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"sess","message":{"role":"user","content":"hello"}}"#,
+        ];
+        let input = hook_for(tmp.path(), "sess", &lines);
+        let err = run_with_hook_input("precompact", Some(&input), tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        let archive =
+            fs::read_to_string(tmp.path().join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("hello"), "{archive}");
+        assert!(tmp.path().join("turns/conversation-001.json").is_file());
+        let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
+        assert!(index.contains("sess"), "{index}");
+        assert!(!tmp.path().join("graph").exists());
     }
 }

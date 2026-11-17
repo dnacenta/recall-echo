@@ -3,6 +3,16 @@
 Release notes for tagged versions are generated on GitHub; this file records
 changes a user has to know about before upgrading.
 
+## [Unreleased]
+
+### Fixed
+
+- A `.recall-echo.toml` that fails to parse, or still sets a removed key, is now an error that names the file, instead of silently running on the defaults (grok and the full consolidation stack). `status`, `config show` and `config set` exit non-zero, and the removed-key message names the file. Unknown keys are reported as a warning (#243).
+
+### Changed
+
+- On a malformed config the SessionEnd and PreCompact hooks still write the archive, skip graph ingest, extraction and consolidation, report the error with the file path, and exit non-zero (#243).
+
 ## [5.0.0] — 2026-11-16
 
 ### Added

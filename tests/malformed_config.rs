@@ -8,8 +8,9 @@
 //! none of them start a daemon.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -59,6 +60,23 @@ fn run(sandbox: &Sandbox, args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("run recall-echo")
+}
+
+fn run_with_stdin(sandbox: &Sandbox, args: &[&str], stdin: &str) -> Output {
+    let mut child = command(sandbox)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn recall-echo");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait")
 }
 
 fn assert_names_config(output: &Output, config: &Path) {
@@ -135,4 +153,35 @@ fn ingest_names_a_malformed_config() {
     let memory = sandbox.memory.to_str().expect("utf-8");
     let output = run(&sandbox, &["ingest", "--from", "grok", "--dir", memory]);
     assert_names_config(&output, &sandbox.config);
+}
+
+#[test]
+fn archive_session_keeps_the_transcript_and_exits_1() {
+    let sandbox = sandbox(false);
+    let transcript = sandbox.memory.join("session.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+    )
+    .expect("transcript");
+    let payload = format!(
+        "{{\"session_id\":\"sess\",\"transcript_path\":\"{}\"}}",
+        transcript.display()
+    );
+    let pulse = sandbox.pulse.to_str().expect("utf-8");
+    let output = run_with_stdin(
+        &sandbox,
+        &["archive-session", "--pulse-root", pulse],
+        &payload,
+    );
+    assert_names_config(&output, &sandbox.config);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("without extraction or consolidation"),
+        "{stderr}"
+    );
+    let archive = fs::read_to_string(sandbox.memory.join("conversations/conversation-001.md"))
+        .expect("archive");
+    assert!(archive.contains("hello"), "{archive}");
+    assert!(!sandbox.memory.join("graph").exists());
 }
