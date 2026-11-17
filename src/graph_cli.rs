@@ -464,9 +464,33 @@ pub async fn ingest(
         }
     }
     if let Some(text) = v2_text {
-        extract_ingested_v2(memory_dir, &text, &session_id, log_number).await?;
+        extract_ingested_v2(
+            memory_dir,
+            &text,
+            &session_id,
+            log_number,
+            report.episodes_created,
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// A repeat ingest of a log pipeline v2 already extracted has nothing to do.
+#[cfg(feature = "llm")]
+fn skip_v2_extract(episodes_created: u32, has_episodes: bool, awaits_extraction: bool) -> bool {
+    episodes_created == 0 && has_episodes && !awaits_extraction
+}
+
+/// `(has_episodes, awaits_extraction)` for one log. A store error propagates.
+#[cfg(feature = "llm")]
+async fn v2_extract_state(
+    gm: &crate::graph::GraphMemory,
+    log: u32,
+) -> Result<(bool, bool), RecallError> {
+    let has_episodes = gm.get_episode_by_log_number(log).await?.is_some();
+    let awaits_extraction = gm.log_awaits_extraction(log).await?;
+    Ok((has_episodes, awaits_extraction))
 }
 
 /// Run pipeline v2 on an archive whose episodes were just ingested.
@@ -476,6 +500,7 @@ async fn extract_ingested_v2(
     text: &str,
     session_id: &str,
     log_number: Option<u32>,
+    episodes_created: u32,
 ) -> Result<(), RecallError> {
     let Some(log) = log_number else {
         return Err(RecallError::Config(
@@ -487,6 +512,10 @@ async fn extract_ingested_v2(
     let text = text.to_string();
     let session_id = session_id.to_string();
     let report = serve_client::exclusive(memory_dir, |gm| async move {
+        let (has, awaits) = v2_extract_state(&gm, log).await?;
+        if skip_v2_extract(episodes_created, has, awaits) {
+            return Ok(None);
+        }
         let context = IngestContext::new(session_id, Some(log));
         let report = crate::graph::v2::extract_log(
             &gm,
@@ -501,9 +530,13 @@ async fn extract_ingested_v2(
         if !report.leaves_pending() {
             gm.mark_extracted(log).await?;
         }
-        Ok(report)
+        Ok(Some(report))
     })
     .await?;
+    let Some(report) = report else {
+        println!("  {GOOD}✓{RESET} pipeline v2: log {log:03} already extracted; nothing to do");
+        return Ok(());
+    };
     if report.leaves_pending() {
         let first = report
             .errors
@@ -533,6 +566,7 @@ async fn extract_ingested_v2(
     _text: &str,
     _session_id: &str,
     _log_number: Option<u32>,
+    _episodes_created: u32,
 ) -> Result<(), RecallError> {
     Err(RecallError::Config(
         "pipeline v2 extracts with an LLM provider, which this build does not include".into(),
@@ -3795,6 +3829,63 @@ mod tests {
         .expect("first success");
         assert_eq!(value, 7);
         assert_eq!(calls, 0);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn a_repeat_ingest_of_an_extracted_log_skips() {
+        assert!(skip_v2_extract(0, true, false));
+    }
+
+    /// New episodes extract for every stored-state combination.
+    #[cfg(feature = "llm")]
+    #[test]
+    fn new_episodes_always_extract() {
+        for created in [1u32, 2, u32::MAX] {
+            for has_episodes in [false, true] {
+                for awaits_extraction in [false, true] {
+                    assert!(
+                        !skip_v2_extract(created, has_episodes, awaits_extraction),
+                        "{created} {has_episodes} {awaits_extraction}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn an_unextracted_episode_still_extracts() {
+        assert!(!skip_v2_extract(0, true, true));
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn a_log_without_episodes_takes_the_old_path() {
+        assert!(!skip_v2_extract(0, false, false));
+        assert!(!skip_v2_extract(0, false, true));
+    }
+
+    /// No model: episodes exist and still await extraction, then the flag
+    /// clears, and a log that was never ingested has neither.
+    #[cfg(all(feature = "llm", feature = "embedded"))]
+    #[tokio::test]
+    async fn v2_extract_state_reads_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        let text = "### User\n\nA note about the shelf.\n";
+        let context = IngestContext::new("session-note", Some(7));
+        let report = gm
+            .ingest_archive(text, &context, None)
+            .await
+            .expect("ingest without a model");
+        assert!(report.episodes_created > 0);
+        assert_eq!(v2_extract_state(&gm, 7).await.unwrap(), (true, true));
+        gm.mark_extracted(7).await.expect("mark extracted");
+        assert_eq!(v2_extract_state(&gm, 7).await.unwrap(), (true, false));
+        assert_eq!(v2_extract_state(&gm, 8).await.unwrap(), (false, false));
     }
 
     #[test]

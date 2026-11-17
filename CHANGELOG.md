@@ -10,6 +10,7 @@ changes a user has to know about before upgrading.
 - A session that only had a PreCompact checkpoint is now captured in full by the capture sweep and `archive --all-unarchived` (#228).
 - Two archives written at the same time (a session-end hook, the capture sweep, a PreCompact checkpoint) no longer take the same conversation number; the later one takes the next free number (#228).
 - A `.recall-echo.toml` that fails to parse, or still sets a removed key, is now an error that names the file, instead of silently running on the defaults (grok and the full consolidation stack). `status`, `config show` and `config set` exit non-zero, and the removed-key message names the file. Unknown keys are reported as a warning (#243).
+- Running `graph ingest` again on an archive that pipeline v2 already extracted no longer extracts it again; it prints that there is nothing to do (#231).
 
 ### Changed
 
