@@ -177,9 +177,12 @@ fn archive_session_keeps_the_transcript_and_exits_1() {
     assert_names_config(&output, &sandbox.config);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("without extraction or consolidation"),
+        stderr.contains(
+            "archived conversation-001.md without extraction or consolidation (config error below)"
+        ),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("TOML parse error").count(), 1, "{stderr}");
     let archive = fs::read_to_string(sandbox.memory.join("conversations/conversation-001.md"))
         .expect("archive");
     assert!(archive.contains("hello"), "{archive}");

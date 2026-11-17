@@ -65,11 +65,11 @@ fn decline_subagent(hook_input: Option<&crate::jsonl::HookInput>) -> bool {
 }
 
 fn finish_checkpoint(config_error: Option<RecallError>, next_num: u32) -> Result<(), RecallError> {
-    if let Some(err) = config_error {
-        report_checkpoint_without_extraction(&err, next_num);
-        return Err(err);
-    }
-    Ok(())
+    let Some(err) = config_error else {
+        return Ok(());
+    };
+    archive::report_archived_without_extraction(next_num);
+    Err(err)
 }
 
 fn write_checkpoint(
@@ -165,14 +165,9 @@ fn ingest_checkpoint(
     next_num: u32,
     full_content: &str,
     fm: &Frontmatter,
-    skip_ingest: bool,
+    malformed: bool,
 ) {
-    let ingest = if skip_ingest {
-        archive::Ingest::No
-    } else {
-        archive::Ingest::Yes
-    };
-    if !archive::permits_ingest(ingest) {
+    if !archive::permits_ingest(archive::ingest_mode(malformed)) {
         return;
     }
     let result = archive::ArchiveResult {
@@ -181,16 +176,6 @@ fn ingest_checkpoint(
         session_id: fm.session_id.clone(),
     };
     archive::graph_ingest(base_dir, &result);
-}
-
-fn report_checkpoint_without_extraction(err: &RecallError, log_number: u32) {
-    let reason = match err {
-        RecallError::Config(message) => message.as_str(),
-        _ => "",
-    };
-    eprintln!(
-        "recall-echo: {reason}; archived conversation-{log_number:03}.md without extraction or consolidation"
-    );
 }
 
 struct CheckpointData {

@@ -84,6 +84,7 @@ fn dropped_llm_key(content: &str) -> Option<&'static str> {
 /// The error a legacy `[llm]` section must surface before any provider is
 /// built or the file is rewritten. `load` falls back to defaults, and the
 /// default provider spawns a logged-in CLI, so extraction must not proceed.
+#[cfg(test)]
 pub(crate) fn legacy_llm_refusal(base: &Path) -> Option<crate::error::RecallError> {
     let path = config_path(base);
     let content = fs::read_to_string(&path).ok()?;
@@ -1450,18 +1451,53 @@ pub fn load_from_dir(dir: &Path) -> Config {
 /// [`load`].
 pub fn try_load(base: &Path) -> Result<Config, crate::error::RecallError> {
     let path = config_path(base);
-    if !path.exists() {
+    let Some(content) = read_config_text(&path)? else {
         return Ok(Config::default());
-    }
-    let content = fs::read_to_string(&path).map_err(|err| {
-        crate::error::RecallError::Config(format!("{}: cannot read: {err}", path.display()))
-    })?;
+    };
     if let Some(err) = legacy_refusal(&path, &content) {
         return Err(err);
     }
     let cfg = parse_validated(&path, &content)?;
     warn_unknown_keys(&path, &unknown_keys(&content));
     Ok(cfg)
+}
+
+/// `Ok(None)` when the file is absent. A dangling link or a stat error is `Err`.
+fn read_config_text(path: &Path) -> Result<Option<String>, crate::error::RecallError> {
+    if !config_file_is_present(path)? {
+        return Ok(None);
+    }
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(err) => Err(cannot_read(path, &err)),
+    }
+}
+
+fn config_file_is_present(path: &Path) -> Result<bool, crate::error::RecallError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(cannot_read(path, &err)),
+    };
+    if meta.file_type().is_symlink() {
+        return link_target_is_present(path);
+    }
+    Ok(true)
+}
+
+fn link_target_is_present(path: &Path) -> Result<bool, crate::error::RecallError> {
+    match path.try_exists() {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(crate::error::RecallError::Config(format!(
+            "{}: cannot read: dangling symbolic link",
+            path.display()
+        ))),
+        Err(err) => Err(cannot_read(path, &err)),
+    }
+}
+
+fn cannot_read(path: &Path, err: &std::io::Error) -> crate::error::RecallError {
+    crate::error::RecallError::Config(format!("{}: cannot read: {err}", path.display()))
 }
 
 /// Load `.recall-echo.toml` from `dir`. Same as [`try_load`].
@@ -1487,9 +1523,33 @@ fn unknown_keys(content: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let deserializer = toml::Deserializer::new(content);
     let _parsed: Result<Config, _> = serde_ignored::deserialize(deserializer, |field| {
-        keys.push(field.to_string());
+        keys.push(dotted_ignored_key(&field));
     });
     keys
+}
+
+/// Dotted key, without the `?` `Display` inserts for `Option` and newtype wrappers.
+fn dotted_ignored_key(path: &serde_ignored::Path<'_>) -> String {
+    let mut parts = Vec::new();
+    push_ignored_key(&mut parts, path);
+    parts.join(".")
+}
+
+fn push_ignored_key(parts: &mut Vec<String>, path: &serde_ignored::Path<'_>) {
+    match path {
+        serde_ignored::Path::Root => {}
+        serde_ignored::Path::Seq { parent, index } => {
+            push_ignored_key(parts, parent);
+            parts.push(index.to_string());
+        }
+        serde_ignored::Path::Map { parent, key } => {
+            push_ignored_key(parts, parent);
+            parts.push(key.clone());
+        }
+        serde_ignored::Path::Some { parent }
+        | serde_ignored::Path::NewtypeStruct { parent }
+        | serde_ignored::Path::NewtypeVariant { parent } => push_ignored_key(parts, parent),
+    }
 }
 
 /// One stderr line per key, at most once per process.
@@ -2336,6 +2396,17 @@ mod tests {
         assert!(message.contains("cannot read"), "{message}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn try_load_of_a_dangling_symlink_names_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = config_path(tmp.path());
+        std::os::unix::fs::symlink("missing-alpha", &path).unwrap();
+        let err = try_load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("dangling symbolic link"), "{err}");
+    }
+
     #[test]
     fn an_unknown_key_is_reported_not_fatal() {
         let body = "[ephemeral]\nmax_entries = 7\n\n[llm]\nnote = \"alpha\"\n";
@@ -2350,6 +2421,22 @@ mod tests {
         );
         assert_eq!(unknown_key_lines(&path, &unknown_keys(body)), vec![line]);
         assert!(!warn_unknown_keys(&path, &["llm.note".to_string()]));
+    }
+
+    #[test]
+    fn unknown_keys_under_option_sections_have_no_question_mark() {
+        assert_eq!(
+            unknown_keys("[graph]\nconsolidate_retire_compnent = false\n"),
+            vec!["graph.consolidate_retire_compnent".to_string()]
+        );
+        assert_eq!(
+            unknown_keys("[pipeline]\ndocs_dri = \"alpha\"\n"),
+            vec!["pipeline.docs_dri".to_string()]
+        );
+        assert_eq!(
+            unknown_keys("[graph.scoring]\nweight_semantc = 0.1\n"),
+            vec!["graph.scoring.weight_semantc".to_string()]
+        );
     }
 
     fn unknown_key_lines(path: &Path, keys: &[String]) -> Vec<String> {
