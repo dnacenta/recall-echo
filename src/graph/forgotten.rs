@@ -14,10 +14,6 @@
 //! half-written file as the record. `sync_data` runs before the rename: a
 //! crash after the rename must not publish bytes that never reached disk.
 
-// Entry points are reached from forget, extract, and read once those paths
-// consult the flag. Until then the module is exercised by its tests.
-#![allow(dead_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -166,7 +162,10 @@ pub(crate) fn entity_record(subject: &str, forgotten_at: &str) -> ForgetRecord {
 }
 
 /// `None` when `n` is zero, so a report can omit the counter.
+///
+/// The report field uses the same zero check. This function is the shared form.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn forgotten_skips_field(n: u32) -> Option<u32> {
     if n == 0 {
         None
@@ -225,6 +224,9 @@ fn wait_from_millis(text: &str) -> Duration {
 }
 
 /// Lock, then append. An empty slice does not create the file or the lock.
+///
+/// Confirmed forget holds the lock across the delete and calls [`append_locked`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn append_forget_records(
     memory_dir: &Path,
     records: &[ForgetRecord],
@@ -401,6 +403,108 @@ fn manual_refusal(name: &str) -> RecallError {
     RecallError::Other(format!(
         "\"{name}\" is forgotten; graph correct --unforget restores it before it can be written again"
     ))
+}
+
+/// Mask text fields of a graph response. An empty set returns `value` unchanged.
+#[must_use]
+pub(crate) fn mask_json(set: &ForgetSet, value: serde_json::Value) -> serde_json::Value {
+    if set.facts.is_empty() {
+        return value;
+    }
+    mask_json_value(set, value, false)
+}
+
+fn mask_json_value(
+    set: &ForgetSet,
+    value: serde_json::Value,
+    mask_text: bool,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) if mask_text => {
+            serde_json::Value::String(mask_forgotten(&text, set))
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(mask_object(set, map)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(mask_array(set, items, mask_text))
+        }
+        other => other,
+    }
+}
+
+fn mask_object(
+    set: &ForgetSet,
+    map: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    map.into_iter()
+        .map(|(key, value)| {
+            let mask_text = text_field(&key);
+            (key, mask_json_value(set, value, mask_text))
+        })
+        .collect()
+}
+
+fn mask_array(
+    set: &ForgetSet,
+    items: Vec<serde_json::Value>,
+    mask_text: bool,
+) -> Vec<serde_json::Value> {
+    items
+        .into_iter()
+        .map(|item| mask_json_value(set, item, mask_text))
+        .collect()
+}
+
+fn text_field(key: &str) -> bool {
+    matches!(
+        key,
+        "abstract_text"
+            | "content"
+            | "overview"
+            | "description"
+            | "quote"
+            | "text"
+            | "summary"
+            | "line"
+            | "value"
+            | "name"
+            | "from"
+            | "to"
+    )
+}
+
+/// The rendered text, plus a values-free count when the flag is on and live records exist.
+pub(crate) fn finish_read_text(memory_dir: &Path, text: String) -> Result<String, RecallError> {
+    if !lasting_forget_on(memory_dir) {
+        return Ok(text);
+    }
+    let set = load_forget_set(memory_dir, true)?;
+    Ok(finish_with_set(&set, text))
+}
+
+fn finish_with_set(set: &ForgetSet, text: String) -> String {
+    let mut masked = mask_forgotten(&text, set);
+    let count = set.live_count();
+    if count > 0 {
+        masked.push_str(&format!("\n  Forgotten: {count}\n"));
+    }
+    masked
+}
+
+/// Loaded mask, or nothing when the flag is off (no read of the forget file).
+pub(crate) fn read_mask(memory_dir: &Path) -> Result<Option<ForgetSet>, RecallError> {
+    if !lasting_forget_on(memory_dir) {
+        return Ok(None);
+    }
+    let set = load_forget_set(memory_dir, true)?;
+    Ok(Some(set))
+}
+
+#[must_use]
+pub(crate) fn apply_mask(set: Option<&ForgetSet>, text: &str) -> String {
+    match set {
+        Some(set) => mask_forgotten(text, set),
+        None => text.to_string(),
+    }
 }
 
 /// Replace each live fact value with `[forgotten]`. Entity names are not masked.
@@ -1256,6 +1360,50 @@ mod tests {
     fn forgotten_skips_field_is_omitted_when_zero() {
         assert_eq!(forgotten_skips_field(0), None);
         assert_eq!(forgotten_skips_field(1), Some(1));
+    }
+
+    #[test]
+    fn mask_json_replaces_text_fields_and_leaves_other_strings() {
+        let set = live_set(&[fact_record("Ada", "uses", "Rust", AT)]);
+        let value = serde_json::json!({
+            "name": "Rust",
+            "id": "entity:rust",
+            "abstract_text": "Ada uses Rust.",
+            "score": 1
+        });
+        let masked = mask_json(&set, value);
+        assert_eq!(masked["name"], "[forgotten]");
+        assert_eq!(masked["abstract_text"], "Ada uses [forgotten].");
+        assert_eq!(masked["id"], "entity:rust");
+        assert_eq!(masked["score"], 1);
+        let entity = live_set(&[entity_record("Vim", AT)]);
+        let named = serde_json::json!({"name": "Vim"});
+        assert_eq!(mask_json(&entity, named)["name"], "Vim");
+    }
+
+    #[test]
+    fn a_zero_count_adds_nothing_and_flag_off_reads_nothing() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = forgotten_path(dir.path());
+        fs::create_dir(&path).expect("unreadable");
+        let text = finish_read_text(dir.path(), "What I know\n".into()).expect("off");
+        assert_eq!(text, "What I know\n");
+        fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .expect("config");
+        let err = finish_read_text(dir.path(), "What I know\n".into()).expect_err("bad file");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn a_live_record_adds_a_count_without_the_value() {
+        let set = live_set(&[fact_record("Ada", "uses", "Rust", AT)]);
+        let text = finish_with_set(&set, "Ada uses Rust.\n".into());
+        assert!(text.contains("[forgotten]"));
+        assert!(text.contains("Forgotten: 1"));
+        assert!(!text.contains("Rust"));
     }
 
     #[test]

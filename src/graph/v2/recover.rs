@@ -97,6 +97,27 @@ pub(crate) async fn fill_report(
         }
     };
     report.recovered = classify(&hits, &live);
+    mask_recovered_quotes(gm, report);
+}
+
+fn mask_recovered_quotes(gm: &GraphMemory, report: &mut crate::graph::types::IngestionReport) {
+    let Some(memory) = gm.path().parent() else {
+        return;
+    };
+    if !crate::graph::forgotten::lasting_forget_on(memory) {
+        return;
+    }
+    let set = match crate::graph::forgotten::load_forget_set(memory, true) {
+        Ok(set) => set,
+        Err(err) => {
+            report.errors.push(err.to_string());
+            return;
+        }
+    };
+    for item in &mut report.recovered.items {
+        item.quote = crate::graph::forgotten::mask_forgotten(&item.quote, &set);
+        item.value = crate::graph::forgotten::mask_forgotten(&item.value, &set);
+    }
 }
 
 fn collect_hits(turns: &[Turn]) -> Vec<Hit> {

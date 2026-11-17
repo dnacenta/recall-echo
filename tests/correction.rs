@@ -949,6 +949,47 @@ async fn flag_off_forget_ignores_a_malformed_leftover() {
     assert!(!fixture.memory_dir.join(".forgotten.lock").exists());
 }
 
+#[tokio::test]
+async fn a_confirmed_forget_does_not_rewrite_source_files() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let files = [
+        "conversations/conversation-001.md",
+        "EPHEMERAL.md",
+        "MEMORY.md",
+        "turns/conversation-001.json",
+        "checkpoints/precompact.md",
+        "graph.v1-backup-2026/KEEP",
+    ];
+    let mut before = Vec::new();
+    for file in files {
+        let path = fixture.memory_dir.join(file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        let bytes = format!("raw value Vim in {file}\n");
+        std::fs::write(&path, &bytes).expect("plant");
+        before.push(bytes);
+    }
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+    correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    for (file, bytes) in files.iter().zip(before) {
+        let path = fixture.memory_dir.join(file);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            bytes,
+            "{file}"
+        );
+    }
+}
+
 #[test]
 fn conversation_numbers_ignore_the_forget_lock_and_temps() {
     let dir = tempfile::tempdir().expect("temp");

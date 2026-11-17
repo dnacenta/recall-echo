@@ -608,8 +608,10 @@ enum GraphCommands {
     /// Tell memory that something it learned is wrong
     ///
     /// `--wrong` records contradicting evidence at your authority, which is how
-    /// confidence is supposed to move. `--forget` removes outright and leaves
-    /// no trace — prefer `--wrong` unless the memory should never have existed.
+    /// confidence is supposed to move. `--forget` removes the graph row. With
+    /// `graph.lasting_forget` (default off) the decision stays in
+    /// `memory/forgotten.jsonl` until `--unforget`; with the flag off it leaves
+    /// no trace. Prefer `--wrong` unless the memory should never have existed.
     Correct {
         /// Entity name, or the source entity of a relationship
         subject: String,

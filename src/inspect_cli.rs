@@ -60,6 +60,7 @@ pub async fn run(
         }
     };
 
+    let text = crate::graph::forgotten::finish_read_text(memory_dir, text)?;
     print!("{text}");
     Ok(())
 }

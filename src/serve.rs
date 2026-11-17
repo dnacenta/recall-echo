@@ -535,7 +535,35 @@ async fn execute_graph(
             serde_json::to_value(graph.about(&args.topic, clamp_limit(args.limit)).await?)?
         }
     };
-    Ok(Some(data))
+    Ok(Some(mask_read(graph, request, data)?))
+}
+
+fn mask_read(
+    graph: &GraphMemory,
+    request: &Request,
+    data: serde_json::Value,
+) -> Result<serde_json::Value, GraphError> {
+    if !request_returns_text(request) {
+        return Ok(data);
+    }
+    let memory = memory_of(graph);
+    if !forgotten::lasting_forget_on(memory) {
+        return Ok(data);
+    }
+    let set = forgotten::load_forget_set(memory, true).map_err(forget_error)?;
+    Ok(forgotten::mask_json(&set, data))
+}
+
+fn request_returns_text(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Search(_)
+            | Request::SearchEpisodes(_)
+            | Request::Query(_)
+            | Request::Traverse(_)
+            | Request::Overview(_)
+            | Request::About(_)
+    )
 }
 
 fn memory_of(graph: &GraphMemory) -> &Path {
