@@ -7,6 +7,7 @@ changes a user has to know about before upgrading.
 
 ### Fixed
 
+- `graph ingest --pipeline v2` no longer reports a log as already extracted when its episode chunks failed to write. Any episode write error now stops before extraction (no provider call, no fact write), names the failed chunks, prints the command to retry, and exits non-zero (#248).
 - Two archives written at the same time no longer duplicate the ARCHIVE.md header or interleave their rows: the header check and the row are written in one piece under a lock on ARCHIVE.md (#250).
 - Two archives written at the same time no longer drop each other's EPHEMERAL.md entry, and EPHEMERAL.md is replaced atomically, so the SessionStart hook never reads it half-written (#251).
 

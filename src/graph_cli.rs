@@ -458,12 +458,18 @@ pub async fn ingest(
         report.episodes_created,
         provenance_label(provenance)
     );
-    if !report.errors.is_empty() {
-        for err in &report.errors {
-            println!("  {WARN}warning:{RESET} {err}");
-        }
-    }
+    print_ingest_warnings(&report.errors);
     if let Some(text) = v2_text {
+        // Any error stops here, before a provider exists and before the
+        // admin lock. Skip and extract stay inside `extract_ingested_v2`.
+        fail_v2_ingest_on_errors(
+            memory_dir,
+            archive_path,
+            provenance,
+            log_number,
+            report.episodes_created,
+            &report.errors,
+        )?;
         extract_ingested_v2(
             memory_dir,
             &text,
@@ -476,10 +482,165 @@ pub async fn ingest(
     Ok(())
 }
 
+/// Episode-write problems, one `warning:` line each, before any v2 decision.
+fn print_ingest_warnings(errors: &[String]) {
+    if !errors.is_empty() {
+        for err in errors {
+            println!("  {WARN}warning:{RESET} {err}");
+        }
+    }
+}
+
 /// A repeat ingest of a log pipeline v2 already extracted has nothing to do.
 #[cfg(feature = "llm")]
 fn skip_v2_extract(episodes_created: u32, has_episodes: bool, awaits_extraction: bool) -> bool {
     episodes_created == 0 && has_episodes && !awaits_extraction
+}
+
+/// What pipeline v2 does with one ingest.
+#[cfg(feature = "llm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2Step {
+    Skip,
+    Extract,
+    Fail,
+}
+
+/// `errors > 0` fails the run. Otherwise [`skip_v2_extract`] decides.
+///
+/// `Fail` needs no store state, so the caller can return before creating a
+/// provider. `has` and `awaits` are only read when `errors` is zero.
+#[cfg(feature = "llm")]
+fn v2_step(created: u32, errors: usize, has: bool, awaits: bool) -> V2Step {
+    if errors > 0 {
+        V2Step::Fail
+    } else if skip_v2_extract(created, has, awaits) {
+        V2Step::Skip
+    } else {
+        V2Step::Extract
+    }
+}
+
+/// Indices from `episode chunk {i}:` errors, in report order.
+///
+/// A string that does not match is left out of this list. The caller still
+/// counts it. Duplicate indices are kept.
+#[cfg(feature = "llm")]
+fn failed_chunks(errors: &[String]) -> Vec<usize> {
+    errors
+        .iter()
+        .filter_map(|error| episode_chunk_index(error.as_str()))
+        .collect()
+}
+
+/// The chunk index at the start of an episode-write error, when it has one.
+#[cfg(feature = "llm")]
+fn episode_chunk_index(error: &str) -> Option<usize> {
+    let rest = error.strip_prefix("episode chunk ")?;
+    let (index, _) = rest.split_once(':')?;
+    index.parse().ok()
+}
+
+/// The error a v2 ingest prints when episode writes failed.
+///
+/// Names the log when it has a number, the count, the chunk indices, any
+/// error that was not a chunk write, and the exact retry command.
+#[cfg(feature = "llm")]
+fn ingest_failure_message(log: Option<u32>, errors: &[String], retry: &str) -> String {
+    let place = match log {
+        Some(number) => format!("log {number:03}"),
+        None => "unnumbered archive".to_string(),
+    };
+    let noun = if errors.len() == 1 { "chunk" } else { "chunks" };
+    let listed = list_chunk_indices(&failed_chunks(errors));
+    let others = quote_unmatched_errors(errors);
+    format!(
+        "graph ingest: {place}: {} episode {noun} failed to write{listed}{others}; nothing was extracted. Retry: {retry}",
+        errors.len()
+    )
+}
+
+#[cfg(feature = "llm")]
+fn list_chunk_indices(indices: &[usize]) -> String {
+    if indices.is_empty() {
+        return String::new();
+    }
+    let body = indices
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" (chunks {body})")
+}
+
+#[cfg(feature = "llm")]
+fn quote_unmatched_errors(errors: &[String]) -> String {
+    let others: Vec<&str> = errors
+        .iter()
+        .filter(|error| episode_chunk_index(error).is_none())
+        .map(String::as_str)
+        .collect();
+    if others.is_empty() {
+        return String::new();
+    }
+    let quoted = others
+        .iter()
+        .map(|error| format!("\"{error}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; other: {quoted}")
+}
+
+/// `recall-echo graph --pulse-root <root> ingest <archive> --pipeline v2`.
+///
+/// `<root>` is the parent of the memory directory. `--external` is added
+/// only when this run forced [`Provenance::External`]. Paths are printed as
+/// themselves, the same way the other commands this crate prints are.
+#[cfg(feature = "llm")]
+fn v2_retry_command(memory_dir: &Path, archive: &Path, provenance: Option<Provenance>) -> String {
+    let root = memory_dir.parent().unwrap_or(memory_dir);
+    let external = if provenance == Some(Provenance::External) {
+        " --external"
+    } else {
+        ""
+    };
+    format!(
+        "recall-echo graph --pulse-root {} ingest {} --pipeline v2{external}",
+        root.display(),
+        archive.display()
+    )
+}
+
+/// Exit 1 when the v2 report has errors. No store and no provider.
+#[cfg(feature = "llm")]
+fn fail_v2_ingest_on_errors(
+    memory_dir: &Path,
+    archive_path: &Path,
+    provenance: Option<Provenance>,
+    log_number: Option<u32>,
+    episodes_created: u32,
+    errors: &[String],
+) -> Result<(), RecallError> {
+    // `has` and `awaits` are unknown here. They do not matter: any error is Fail.
+    if v2_step(episodes_created, errors.len(), false, false) != V2Step::Fail {
+        return Ok(());
+    }
+    let retry = v2_retry_command(memory_dir, archive_path, provenance);
+    Err(RecallError::Other(ingest_failure_message(
+        log_number, errors, &retry,
+    )))
+}
+
+#[cfg(not(feature = "llm"))]
+fn fail_v2_ingest_on_errors(
+    _memory_dir: &Path,
+    _archive_path: &Path,
+    _provenance: Option<Provenance>,
+    _log_number: Option<u32>,
+    _episodes_created: u32,
+    _errors: &[String],
+) -> Result<(), RecallError> {
+    Ok(())
 }
 
 /// `(has_episodes, awaits_extraction)` for one log. A store error propagates.
@@ -4108,6 +4269,117 @@ mod tests {
     fn a_log_without_episodes_takes_the_old_path() {
         assert!(!skip_v2_extract(0, false, false));
         assert!(!skip_v2_extract(0, false, true));
+    }
+
+    #[test]
+    fn an_ingest_with_errors_never_extracts() {
+        for errors in [1usize, 2] {
+            for created in [0u32, 1, u32::MAX] {
+                for has in [false, true] {
+                    for awaits in [false, true] {
+                        assert_eq!(
+                            v2_step(created, errors, has, awaits),
+                            V2Step::Fail,
+                            "created={created} errors={errors} has={has} awaits={awaits}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_error_free_ingest_decides_as_before() {
+        for created in [0u32, 1, u32::MAX] {
+            for has in [false, true] {
+                for awaits in [false, true] {
+                    let step = v2_step(created, 0, has, awaits);
+                    let expected = if skip_v2_extract(created, has, awaits) {
+                        V2Step::Skip
+                    } else {
+                        V2Step::Extract
+                    };
+                    assert_eq!(
+                        step, expected,
+                        "created={created} has={has} awaits={awaits}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_chunks_reads_the_episode_chunk_indices() {
+        let errors = vec![
+            "episode chunk 3: write failed".to_string(),
+            "store is read-only".to_string(),
+            "episode chunk 5: locked".to_string(),
+            "episode chunk 3: write failed".to_string(),
+            "see episode chunk 4: not a prefix".to_string(),
+            "episode chunk : missing index".to_string(),
+            "episode chunk 8".to_string(),
+            "episode chunk 0: zero".to_string(),
+        ];
+        assert_eq!(failed_chunks(&errors), vec![3, 5, 3, 0]);
+    }
+
+    #[test]
+    fn the_ingest_failure_names_chunks_and_the_retry_command() {
+        let memory = Path::new("/p/memory");
+        let archive = Path::new("/p/memory/conversations/conversation-007.md");
+        let chunks = vec![
+            "episode chunk 3: write failed".to_string(),
+            "episode chunk 5: locked".to_string(),
+        ];
+        let plain = fail_v2_ingest_on_errors(memory, archive, None, Some(7), 0, &chunks)
+            .expect_err("chunk errors fail");
+        assert_eq!(
+            plain.to_string(),
+            "graph ingest: log 007: 2 episode chunks failed to write (chunks 3, 5); nothing was extracted. Retry: recall-echo graph --pulse-root /p ingest /p/memory/conversations/conversation-007.md --pipeline v2"
+        );
+
+        let external = fail_v2_ingest_on_errors(
+            memory,
+            archive,
+            Some(Provenance::External),
+            Some(7),
+            1,
+            &chunks,
+        )
+        .expect_err("external run fails too");
+        assert_eq!(
+            external.to_string(),
+            "graph ingest: log 007: 2 episode chunks failed to write (chunks 3, 5); nothing was extracted. Retry: recall-echo graph --pulse-root /p ingest /p/memory/conversations/conversation-007.md --pipeline v2 --external"
+        );
+
+        let user =
+            fail_v2_ingest_on_errors(memory, archive, Some(Provenance::User), Some(7), 0, &chunks)
+                .expect_err("a non-external class does not add --external");
+        assert_eq!(user.to_string(), plain.to_string());
+
+        let mixed = vec![
+            "episode chunk 3: write failed".to_string(),
+            "store is read-only".to_string(),
+        ];
+        let mixed_err = fail_v2_ingest_on_errors(memory, archive, None, Some(7), 0, &mixed)
+            .expect_err("a non-matching error still fails");
+        assert_eq!(
+            mixed_err.to_string(),
+            "graph ingest: log 007: 2 episode chunks failed to write (chunks 3); other: \"store is read-only\"; nothing was extracted. Retry: recall-echo graph --pulse-root /p ingest /p/memory/conversations/conversation-007.md --pipeline v2"
+        );
+
+        let only_other = vec!["disk full".to_string()];
+        let other_err = fail_v2_ingest_on_errors(memory, archive, None, None, 0, &only_other)
+            .expect_err("an unnumbered archive still fails");
+        assert_eq!(
+            other_err.to_string(),
+            "graph ingest: unnumbered archive: 1 episode chunk failed to write; other: \"disk full\"; nothing was extracted. Retry: recall-echo graph --pulse-root /p ingest /p/memory/conversations/conversation-007.md --pipeline v2"
+        );
+
+        assert!(
+            fail_v2_ingest_on_errors(memory, archive, None, Some(7), 0, &[]).is_ok(),
+            "no errors is not a failure"
+        );
     }
 
     /// No model: episodes exist and still await extraction, then the flag
