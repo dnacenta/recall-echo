@@ -94,16 +94,10 @@ fn write_checkpoint(
         format!("{}\n\n{}{}", fm.render(), data.md_body, data.tags_section)
     })?;
     write_checkpoint_sidecar(base_dir, next_num, &fm, &date, &data);
+    // Index before ingest so a lock timeout keeps the checkpoint file and
+    // skips the graph, the same as a failed `write_archive`.
+    append_checkpoint_index(&archive_index, next_num, &date, &fm, &data)?;
     ingest_checkpoint(base_dir, next_num, &full_content, &fm, skip_ingest);
-    archive::append_index(
-        &archive_index,
-        next_num,
-        &date,
-        &fm.session_id,
-        &data.topics,
-        data.message_count,
-        &data.duration,
-    )?;
     eprintln!(
         "recall-echo: checkpoint conversation-{:03}.md ({} \u{2014} {} messages, {} topics)",
         next_num,
@@ -112,6 +106,27 @@ fn write_checkpoint(
         data.topics.len()
     );
     Ok(next_num)
+}
+
+fn append_checkpoint_index(
+    archive_index: &Path,
+    next_num: u32,
+    date: &str,
+    fm: &Frontmatter,
+    data: &CheckpointData,
+) -> Result<(), RecallError> {
+    archive::append_index(
+        archive_index,
+        next_num,
+        date,
+        &fm.session_id,
+        &data.topics,
+        data.message_count,
+        &data.duration,
+    )
+    .inspect_err(|err| {
+        archive::report_lock_timeout(next_num, "ARCHIVE.md", err);
+    })
 }
 
 fn checkpoint_data(hook_input: Option<&crate::jsonl::HookInput>) -> CheckpointData {
@@ -555,6 +570,43 @@ mod tests {
         assert!(tmp.path().join("turns/conversation-001.json").is_file());
         let index = fs::read_to_string(tmp.path().join("ARCHIVE.md")).unwrap();
         assert!(index.contains("sess"), "{index}");
+        assert!(!tmp.path().join("graph").exists());
+    }
+
+    #[test]
+    fn a_lock_timeout_in_the_checkpoint_hook_keeps_the_archive_and_fails() {
+        let tmp = prepared_root();
+        let index = tmp.path().join("ARCHIVE.md");
+        let header = "# Conversation Archive\n\n\
+| # | Date | Session | Topics | Messages | Duration |\n\
+|---|------|---------|--------|----------|----------|\n";
+        fs::write(&index, header).unwrap();
+        let _held = crate::file_lock::HeldLock::on(&index);
+        let _wait = crate::file_lock::WaitOverride::at(std::time::Duration::from_millis(200));
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-03-05T14:30:00.100Z","sessionId":"sess","message":{"role":"user","content":"hello"}}"#,
+        ];
+        let input = hook_for(tmp.path(), "sess", &lines);
+        let (result, logged) = crate::file_lock::capture_stderr(|| {
+            run_with_hook_input("precompact", Some(&input), tmp.path())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains(&index.display().to_string()), "{message}");
+        assert!(
+            message.contains("locked by another recall-echo process"),
+            "{message}"
+        );
+        assert!(message.contains("for 0 s"), "{message}");
+        assert!(
+            logged.contains("archived conversation-001.md")
+                && logged.contains("ARCHIVE.md not updated"),
+            "{logged}"
+        );
+        let archive =
+            fs::read_to_string(tmp.path().join("conversations/conversation-001.md")).unwrap();
+        assert!(archive.contains("hello"), "{archive}");
+        assert!(tmp.path().join("turns/conversation-001.json").is_file());
+        assert_eq!(fs::read_to_string(&index).unwrap(), header);
         assert!(!tmp.path().join("graph").exists());
     }
 }

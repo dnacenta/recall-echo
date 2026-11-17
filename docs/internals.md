@@ -47,11 +47,14 @@ All paths hang off a pulse root, the home of the agent whose memory this is:
 {pulse_root}/memory/
 ├── MEMORY.md              layer 1: curated facts (keep it under ~200 lines)
 ├── EPHEMERAL.md           layer 2: rolling window of session summaries (default 5, FIFO)
+├── .EPHEMERAL.lock        lock for EPHEMERAL.md updates (empty; safe to ignore)
 ├── ARCHIVE.md             layer 3: conversation index
 ├── conversations/         layer 3: conversation-001.md, conversation-002.md, …
 ├── graph/                 layer 0: surreal/ (data), models/ (embeddings), daemon.log
 └── .recall-echo.toml      optional configuration
 ```
+
+ARCHIVE.md and EPHEMERAL.md updates use advisory `flock` locks; they are not reliable on NFS.
 
 ## Knowledge graph
 

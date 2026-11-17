@@ -1988,6 +1988,19 @@ async fn half_swap_refusal(
 }
 
 #[cfg(feature = "llm")]
+fn ephemeral_bookkeeping(name: &str) -> bool {
+    name == ".EPHEMERAL.lock" || ephemeral_temp_name(name)
+}
+
+#[cfg(feature = "llm")]
+fn ephemeral_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".EPHEMERAL.md.") else {
+        return false;
+    };
+    rest.ends_with(".tmp")
+}
+
+#[cfg(feature = "llm")]
 fn newest_backup(memory_dir: &Path) -> Result<Option<PathBuf>, RecallError> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(memory_dir)? {
@@ -1995,7 +2008,7 @@ fn newest_backup(memory_dir: &Path) -> Result<Option<PathBuf>, RecallError> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.starts_with("graph.v1-backup-") {
+        if ephemeral_bookkeeping(name) || !name.starts_with("graph.v1-backup-") {
             continue;
         }
         let modified = path.metadata().and_then(|meta| meta.modified()).ok();

@@ -40,6 +40,7 @@ pub mod dashboard;
 pub mod distill;
 pub mod ephemeral;
 pub mod error;
+pub(crate) mod file_lock;
 pub mod frontmatter;
 pub mod init;
 pub mod inspect_cli;
