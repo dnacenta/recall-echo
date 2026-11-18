@@ -1823,6 +1823,10 @@ mod tests {
             PASS1_SYSTEM,
             format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}")
         );
+    }
+
+    #[test]
+    fn coverage_off_system_text_matches_the_existing_prompts() {
         assert_eq!(pass1_system(false, false), PASS1_SYSTEM_BARE);
         assert_eq!(pass1_system(true, false), PASS1_SYSTEM);
     }

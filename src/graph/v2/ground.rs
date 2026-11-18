@@ -1399,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn code_span_drops_a_backtick_quote_a_boundary_and_a_paraphrase() {
+    fn code_span_drops_a_backtick_quote_and_a_paraphrase() {
         let turn = "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.";
         let on = covered(&[(turn, TurnRole::User)]);
         assert_eq!(

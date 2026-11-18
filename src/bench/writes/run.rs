@@ -431,6 +431,9 @@ async fn collect_sessions(
             kept: report.kept,
             drops: report.drops,
             known_key_bound: report.known_key_bound,
+            key_form_bound: report.key_form_bound,
+            code_span_cited: report.code_span_cited,
+            port_cue_bound: report.port_cue_bound,
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
@@ -504,6 +507,9 @@ async fn ingest_v2(
     report.kept = extracted.kept;
     report.drops = extracted.drops;
     report.known_key_bound = extracted.known_key_bound;
+    report.key_form_bound = extracted.key_form_bound;
+    report.code_span_cited = extracted.code_span_cited;
+    report.port_cue_bound = extracted.port_cue_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
     report.retirements_skipped = extracted.retirements_skipped;
@@ -2838,6 +2844,166 @@ mod tests {
         let off_json = serde_json::to_value(&off.sessions[0]).unwrap();
         assert!(off_json.get("recovered").is_none(), "{off_json}");
         assert_eq!(comparable_run(off), comparable_run(on));
+    }
+
+    #[cfg(feature = "embedded")]
+    const COVERAGE_TURNS: [&str; 3] = [
+        "Python 3.11 minimum",
+        "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.",
+        "serving on 4000, have a look at the archive page",
+    ];
+
+    #[cfg(feature = "embedded")]
+    fn coverage_script() -> FactScript {
+        FactScript {
+            name: "coverage".into(),
+            sessions: vec![ScriptSession {
+                id: "s1".into(),
+                date: "2026-01-02T00:00:00Z".into(),
+                turns: COVERAGE_TURNS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| ScriptTurn {
+                        role: if index == 1 {
+                            Speaker::Assistant
+                        } else {
+                            Speaker::User
+                        },
+                        text: (*text).to_string(),
+                        claims: vec![],
+                        noise: false,
+                    })
+                    .collect(),
+                transcript: None,
+                transcript_path: None,
+                claims: vec![],
+            }],
+            facts: vec![],
+            expect: vec![],
+            questions: vec![],
+            project: None,
+            cwd: None,
+            superseded_pairs: Vec::new(),
+            noise: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    struct CoverageReply;
+
+    #[cfg(feature = "embedded")]
+    #[async_trait]
+    impl LlmProvider for CoverageReply {
+        async fn complete(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+        ) -> Result<String, crate::graph::error::GraphError> {
+            Ok(r#"{"decision":"create","reason":"distinct"}"#.into())
+        }
+
+        async fn complete_structured_chat(
+            &self,
+            _: &str,
+            _: &[Message],
+            _: &serde_json::Value,
+            _: u32,
+        ) -> Result<Completion, crate::graph::error::GraphError> {
+            Ok(Completion::unmeasured(
+                r#"{"facts":[{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"python_min_version","object":"3.11","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Python 3.11 minimum","confidence":0.9},{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"md_ext","object":"footnotes","object_type":"literal","status":"decided","replaces":"","turn":1,"quote":"md_ext = [\"footnotes\", \"tables\"] in quillpress.toml","confidence":0.9},{"subject":"tidepool","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"4000","object_type":"literal","status":"decided","replaces":"","turn":2,"quote":"serving on 4000, have a look at the archive page","confidence":0.9}],"bugs":[],"releases":[]}"#,
+            ))
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    fn coverage_entries() -> Vec<crate::conversation::ConversationEntry> {
+        vec![
+            crate::conversation::ConversationEntry::UserMessage(COVERAGE_TURNS[0].into()),
+            crate::conversation::ConversationEntry::AssistantText(COVERAGE_TURNS[1].into()),
+            crate::conversation::ConversationEntry::UserMessage(COVERAGE_TURNS[2].into()),
+        ]
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn collect_coverage(on: bool) -> grade::WriteReport {
+        let script = coverage_script();
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let written = write_archives(&memory_dir, &script).unwrap();
+        let project = tmp.path().join("tidepool");
+        fs::create_dir(&project).unwrap();
+        crate::graph::v2::input::write_turns_sidecar(
+            &memory_dir,
+            written[0].log_number,
+            &written[0].id,
+            "2026-01-02",
+            project.to_str(),
+            &coverage_entries(),
+        )
+        .unwrap();
+        apply_graph_switches(
+            &memory_dir,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            on,
+            OptOuts::stack_off(),
+        )
+        .unwrap();
+        let gm = GraphMemory::open(&memory_dir.join("graph")).await.unwrap();
+        gm.embedder().unwrap();
+        let provider = Counting::new(Box::new(CoverageReply));
+        let sessions = collect_sessions(&gm, &memory_dir, &written, &provider, PipelineVersion::V2)
+            .await
+            .unwrap();
+        let weights = *gm.provenance_weights();
+        grade::grade_with_pipeline(
+            &script,
+            &sessions,
+            &weights,
+            &[],
+            grade::ExtractorLabel::Provider,
+            PipelineVersion::V2,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn coverage_counters_reach_the_session_report_only_when_the_flag_is_on() {
+        let on = collect_coverage(true).await;
+        let off = collect_coverage(false).await;
+        assert!(
+            on.sessions[0].warnings.is_empty(),
+            "{:?}",
+            on.sessions[0].warnings
+        );
+        assert!(
+            off.sessions[0].warnings.is_empty(),
+            "{:?}",
+            off.sessions[0].warnings
+        );
+        let encoded = serde_json::to_value(&on.sessions[0]).unwrap();
+        assert_eq!(encoded["key_form_bound"], 1, "{encoded}");
+        assert_eq!(encoded["code_span_cited"], 1, "{encoded}");
+        assert_eq!(encoded["port_cue_bound"], 1, "{encoded}");
+        let off_json = serde_json::to_value(&off.sessions[0]).unwrap();
+        assert!(off_json.get("key_form_bound").is_none(), "{off_json}");
+        assert!(off_json.get("code_span_cited").is_none(), "{off_json}");
+        assert!(off_json.get("port_cue_bound").is_none(), "{off_json}");
     }
 
     /// Durations and record ids differ between two runs. The rest of the
@@ -5851,6 +6017,9 @@ mod tests {
             kept: 0,
             drops: std::collections::HashMap::new(),
             known_key_bound: 0,
+            key_form_bound: 0,
+            code_span_cited: 0,
+            port_cue_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
