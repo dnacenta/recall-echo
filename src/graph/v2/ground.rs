@@ -62,6 +62,8 @@
 //! One sentence of that assistant turn has to name the key and those numbers,
 //! and no other number. The citation stays on the user turn.
 
+use std::cell::Cell;
+
 use super::input::{Turn, TurnRole};
 use super::schema::{key_is_empty, normalise, over_long, DROP_QUOTE};
 
@@ -106,6 +108,9 @@ pub(crate) struct SessionGround {
     session_words: Vec<String>,
     session_numbers: Vec<String>,
     coverage: bool,
+    key_form_bound: Cell<u32>,
+    code_span_cited: Cell<u32>,
+    port_cue_bound: Cell<u32>,
 }
 
 struct TurnGround {
@@ -150,6 +155,9 @@ impl SessionGround {
             session_words,
             session_numbers,
             coverage: false,
+            key_form_bound: Cell::new(0),
+            code_span_cited: Cell::new(0),
+            port_cue_bound: Cell::new(0),
         }
     }
 
@@ -165,6 +173,29 @@ impl SessionGround {
     #[must_use]
     pub(crate) fn coverage(&self) -> bool {
         self.coverage
+    }
+
+    /// Counts for the rules that kept a candidate, then zero the cells.
+    pub(crate) fn take_coverage_counts(&self) -> (u32, u32, u32) {
+        let counts = self.coverage_counts();
+        self.key_form_bound.set(0);
+        self.code_span_cited.set(0);
+        self.port_cue_bound.set(0);
+        counts
+    }
+
+    /// `key_form_bound`, `code_span_cited`, `port_cue_bound`.
+    #[must_use]
+    pub(crate) fn coverage_counts(&self) -> (u32, u32, u32) {
+        (
+            self.key_form_bound.get(),
+            self.code_span_cited.get(),
+            self.port_cue_bound.get(),
+        )
+    }
+
+    fn bump(&self, cell: &Cell<u32>) {
+        cell.set(cell.get().saturating_add(1));
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -183,7 +214,28 @@ impl SessionGround {
         if let Some(turn) = self.turns.iter().find(|turn| turn.text.contains(quote)) {
             return Ok(with_quote(turn, quote));
         }
-        self.cite_separators(cited, quote).ok_or(DROP_QUOTE)
+        if let Some(hit) = self.cite_separators(cited, quote) {
+            return Ok(hit);
+        }
+        self.cite_code_span(cited, quote).ok_or(DROP_QUOTE)
+    }
+
+    /// Exact and separator misses. Coverage off, or a quote that already has
+    /// a backtick, stays a quote drop. Underscores are not folded in here.
+    fn cite_code_span(&self, cited: usize, quote: &str) -> Option<Cited> {
+        if !self.coverage || quote.contains('`') {
+            return None;
+        }
+        let hit = self
+            .turn(cited)
+            .and_then(|turn| code_span_hit(turn, quote))
+            .or_else(|| {
+                self.turns
+                    .iter()
+                    .find_map(|turn| code_span_hit(turn, quote))
+            })?;
+        self.bump(&self.code_span_cited);
+        Some(hit)
     }
 
     /// First field that is an exact span of the cited turn, in the given order.
@@ -292,9 +344,29 @@ impl SessionGround {
             return false;
         };
         let sentence = sentence_containing(&cited.text, quote);
-        if direct_key_bound(key, &[quote, sentence]) {
+        let texts = [quote, sentence];
+        if self.bind_key_direct(key, &texts) {
             return true;
         }
+        if self.bind_key_agreement(key, value, turn, quote) {
+            return true;
+        }
+        self.bind_key_port(key, value, quote, sentence)
+    }
+
+    /// Plain whole tokens, then listed forms when coverage is on.
+    fn bind_key_direct(&self, key: &str, texts: &[&str]) -> bool {
+        if direct_key_bound(key, texts, false) {
+            return true;
+        }
+        if !self.coverage || !direct_key_bound(key, texts, true) {
+            return false;
+        }
+        self.bump(&self.key_form_bound);
+        true
+    }
+
+    fn bind_key_agreement(&self, key: &str, value: &str, turn: usize, quote: &str) -> bool {
         match self
             .turns
             .iter()
@@ -303,6 +375,15 @@ impl SessionGround {
             Some(cited_pos) => self.agreement_binds(key, value, cited_pos, quote),
             None => false,
         }
+    }
+
+    /// A `port` key and one short integer, after direct binding and agreement miss.
+    fn bind_key_port(&self, key: &str, value: &str, quote: &str, sentence: &str) -> bool {
+        if !self.coverage || !port_cue(key, value, quote, sentence) {
+            return false;
+        }
+        self.bump(&self.port_cue_bound);
+        true
     }
 
     /// A keyed setting whose value is a short punctuation literal the quote wraps.
@@ -330,7 +411,7 @@ impl SessionGround {
             return false;
         }
         let sentence = sentence_containing(&cited.text, quote);
-        direct_key_bound(key, &[quote, sentence])
+        direct_key_bound(key, &[quote, sentence], false)
     }
 
     /// User agreement: the cited sentence states only the value's numbers, the
@@ -515,6 +596,134 @@ fn find_with_separators(text: &str, quote: &str) -> Option<(usize, usize)> {
     None
 }
 
+fn code_span_hit(turn: &TurnGround, quote: &str) -> Option<Cited> {
+    let (start, end) = find_code_span(&turn.text, quote)?;
+    Some(Cited {
+        turn: turn.index,
+        role: turn.role,
+        quote: turn.text[start..end].to_string(),
+    })
+}
+
+/// Leftmost span whose non-backtick characters equal the quote with backticks
+/// removed. The span must start and end on a character that is not a backtick.
+fn find_code_span(text: &str, quote: &str) -> Option<(usize, usize)> {
+    let wanted: Vec<char> = strip_backticks(quote).chars().collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for start_at in 0..chars.len() {
+        let Some(end) = match_code_span(&chars, start_at, &wanted) else {
+            continue;
+        };
+        let start = chars[start_at].0;
+        if span_bounds_ok(text, start, end) {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+fn strip_backticks(text: &str) -> String {
+    text.chars().filter(|ch| *ch != '`').collect()
+}
+
+fn span_bounds_ok(text: &str, start: usize, end: usize) -> bool {
+    bound_char(text, start).is_some_and(|ch| ch != '`')
+        && bound_before(text, end).is_some_and(|ch| ch != '`')
+}
+
+fn bound_char(text: &str, index: usize) -> Option<char> {
+    text[index..].chars().next()
+}
+
+fn bound_before(text: &str, end: usize) -> Option<char> {
+    text[..end].chars().next_back()
+}
+
+fn match_code_span(chars: &[(usize, char)], start_at: usize, wanted: &[char]) -> Option<usize> {
+    let mut index = start_at;
+    let mut last_end = None;
+    for expected in wanted {
+        loop {
+            let (byte, ch) = *chars.get(index)?;
+            index += 1;
+            if ch == '`' {
+                continue;
+            }
+            if ch != *expected {
+                return None;
+            }
+            last_end = Some(byte + ch.len_utf8());
+            break;
+        }
+    }
+    last_end
+}
+
+fn port_cue(key: &str, value: &str, quote: &str, sentence: &str) -> bool {
+    if !key_has_port(key) {
+        return false;
+    }
+    let Some(number) = bare_port_value(value) else {
+        return false;
+    };
+    if numbers_in(quote) != [number.clone()] {
+        return false;
+    }
+    cue_has(quote, &number) || cue_has(sentence, &number)
+}
+
+fn key_has_port(key: &str) -> bool {
+    specific_key_tokens(key).contains(&"port")
+}
+
+fn bare_port_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let len = trimmed.len();
+    if (1..=5).contains(&len) && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+const PORT_VERBS: &[&str] = &[
+    "serving",
+    "serves",
+    "served",
+    "listening",
+    "listens",
+    "running",
+    "runs",
+];
+
+fn cue_has(text: &str, number: &str) -> bool {
+    let words = cue_words(text);
+    words.windows(3).any(|window| port_window(window, number))
+}
+
+fn port_window(window: &[String], number: &str) -> bool {
+    PORT_VERBS.contains(&window[0].as_str()) && window[1] == "on" && window[2] == number
+}
+
+fn cue_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
 fn match_separator_at(text: &str, start: usize, pattern: &[char]) -> Option<usize> {
     let mut index = start;
     for (at, expected) in pattern.iter().enumerate() {
@@ -609,20 +818,51 @@ fn version_stem(key: &str) -> Option<&str> {
     key.strip_suffix("_version")
 }
 
-fn direct_key_bound(key: &str, texts: &[&str]) -> bool {
-    if !version_stem_ok(key, texts) {
+fn direct_key_bound(key: &str, texts: &[&str], coverage: bool) -> bool {
+    if !version_stem_ok(key, texts, coverage) {
         return false;
     }
     let specific = specific_key_tokens(key);
-    !specific.is_empty() && specific.iter().any(|token| token_occurs(token, texts))
+    !specific.is_empty()
+        && specific
+            .iter()
+            .any(|token| token_hits(token, texts, coverage))
 }
 
-fn version_stem_ok(key: &str, texts: &[&str]) -> bool {
+fn version_stem_ok(key: &str, texts: &[&str], coverage: bool) -> bool {
     let Some(stem) = version_stem(key) else {
         return true;
     };
     let stem_tokens: Vec<&str> = stem.split('_').filter(|token| !token.is_empty()).collect();
-    !stem_tokens.is_empty() && stem_tokens.iter().all(|token| token_occurs(token, texts))
+    !stem_tokens.is_empty()
+        && stem_tokens
+            .iter()
+            .all(|token| token_hits(token, texts, coverage))
+}
+
+/// The token, or one listed form when coverage is on. Forms are whole tokens.
+fn token_hits(token: &str, texts: &[&str], coverage: bool) -> bool {
+    if token_occurs(token, texts) {
+        return true;
+    }
+    coverage && form_occurs(token, texts)
+}
+
+fn form_occurs(token: &str, texts: &[&str]) -> bool {
+    key_forms(token)
+        .iter()
+        .any(|form| token_occurs(form, texts))
+}
+
+fn key_forms(token: &str) -> &'static [&'static str] {
+    match token {
+        "min" => &["minimum"],
+        "max" => &["maximum"],
+        "width" => &["wide"],
+        "license" => &["licence"],
+        "licence" => &["license"],
+        _ => &[],
+    }
 }
 
 pub(crate) fn specific_key_tokens(key: &str) -> Vec<&str> {
@@ -781,7 +1021,7 @@ fn is_word_char(ch: char) -> bool {
 
 fn agreement_tokens(key: &str, sentence: &str) -> bool {
     let specific = specific_key_tokens(key);
-    if specific.is_empty() || !version_stem_ok(key, &[sentence]) {
+    if specific.is_empty() || !version_stem_ok(key, &[sentence], false) {
         return false;
     }
     // Drop the trailing `version` token only when another specific token
@@ -1031,6 +1271,174 @@ mod tests {
             })
             .collect::<Vec<_>>();
         SessionGround::prepare(&turns)
+    }
+
+    fn covered(lines: &[(&str, TurnRole)]) -> SessionGround {
+        ground(lines).with_coverage(true)
+    }
+
+    fn bound(session: &SessionGround, key: &str, value: &str, quote: &str) -> bool {
+        session.key_bound(key, value, 0, quote)
+    }
+
+    #[test]
+    fn key_forms_bind_only_when_coverage_is_on() {
+        let cases = [
+            (
+                "python_min_version",
+                "3.11",
+                "Python 3.11 minimum",
+                "Python 3.11 minimum",
+            ),
+            (
+                "min_python_version",
+                "3.11",
+                "Python 3.11 minimum, and uv",
+                "Python 3.11 minimum, and uv",
+            ),
+            (
+                "image_max_width_px",
+                "1200",
+                "resize everything to 1200px wide max",
+                "resize everything to 1200px wide max",
+            ),
+            (
+                "max_width",
+                "1600px",
+                "caps every picture at 1600px wide",
+                "caps every picture at 1600px wide",
+            ),
+            (
+                "max_width_px",
+                "1600",
+                "caps every picture at 1600px wide",
+                "caps every picture at 1600px wide",
+            ),
+        ];
+        for (key, value, quote, turn) in cases {
+            let on = covered(&[(turn, TurnRole::User)]);
+            assert!(bound(&on, key, value, quote), "{key} on");
+            assert_eq!(on.coverage_counts().0, 1, "{key} form count");
+            let off = ground(&[(turn, TurnRole::User)]);
+            assert!(!bound(&off, key, value, quote), "{key} off");
+            assert_eq!(off.coverage_counts(), (0, 0, 0), "{key} off counts");
+        }
+        let licence = "Licence: dual MIT OR Apache-2.0 like most of the ecosystem.";
+        let quote = "dual MIT OR Apache-2.0 like most of the ecosystem";
+        let on = covered(&[(licence, TurnRole::User)]);
+        assert!(bound(&on, "license", "MIT OR Apache-2.0", quote));
+        assert_eq!(on.coverage_counts().0, 1);
+        let off = ground(&[(licence, TurnRole::User)]);
+        assert!(!bound(&off, "license", "MIT OR Apache-2.0", quote));
+    }
+
+    #[test]
+    fn key_forms_reject_words_outside_the_closed_table() {
+        let maximal = covered(&[("the maximal size is 4", TurnRole::User)]);
+        assert!(!bound(&maximal, "max_jobs", "4", "the maximal size is 4"));
+        assert_eq!(maximal.coverage_counts().0, 0);
+        let swapped = covered(&[("Python 3.11 minimum", TurnRole::User)]);
+        assert!(!bound(
+            &swapped,
+            "python_max_version",
+            "3.11",
+            "Python 3.11 minimum"
+        ));
+        let generic = covered(&[("the minimum is 3", TurnRole::User)]);
+        assert!(!bound(&generic, "min", "3", "the minimum is 3"));
+        assert_eq!(generic.coverage_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn code_span_keeps_the_raw_turn_span_only_when_coverage_is_on() {
+        let md = "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.";
+        let md_quote = "md_ext = [\"footnotes\", \"tables\"] in quillpress.toml";
+        let stored = "md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml";
+        let on = covered(&[(md, TurnRole::Assistant)]);
+        let cited = on.cite(0, md_quote).expect("cited");
+        assert_eq!(cited.quote, stored);
+        assert_eq!(cited.role, TurnRole::Assistant);
+        assert_eq!(on.coverage_counts().1, 1);
+        let off = ground(&[(md, TurnRole::Assistant)]);
+        assert_eq!(off.cite(0, md_quote).unwrap_err(), DROP_QUOTE);
+        assert_eq!(off.coverage_counts().1, 0);
+
+        let positional = "positional `<SOURCE>` and `<DEST>` stay";
+        let positional_quote = "positional <SOURCE> and <DEST> stay";
+        let positional_stored = "positional `<SOURCE>` and `<DEST>` stay";
+        let marks = covered(&[(positional, TurnRole::User)]);
+        assert_eq!(
+            marks.cite(0, positional_quote).expect("positional").quote,
+            positional_stored
+        );
+
+        let lazy = "use `loading=\"lazy\"` on images";
+        let lazy_on = covered(&[(lazy, TurnRole::User)]);
+        assert_eq!(
+            lazy_on.cite(0, "loading=\"lazy\"").expect("lazy").quote,
+            "loading=\"lazy\""
+        );
+        let split = covered(&[("hel`lo", TurnRole::User)]);
+        assert_eq!(split.cite(0, "hello").expect("split").quote, "hel`lo");
+    }
+
+    #[test]
+    fn code_span_skips_backticks_on_the_quote_and_the_turn() {
+        let turn = "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.";
+        let quote = "md_ext = [\"footnotes\", \"tables\"] in quillpress.toml";
+        let (start, end) = find_code_span(turn, quote).expect("turn side");
+        assert_eq!(
+            &turn[start..end],
+            "md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml"
+        );
+        assert_ne!(turn.as_bytes()[start], b'`');
+        assert_ne!(turn.as_bytes()[end - 1], b'`');
+        let quoted = "`md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml";
+        let (qstart, qend) = find_code_span(turn, quoted).expect("quote side");
+        assert_eq!((qstart, qend), (start, end));
+    }
+
+    #[test]
+    fn code_span_drops_a_backtick_quote_a_boundary_and_a_paraphrase() {
+        let turn = "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.";
+        let on = covered(&[(turn, TurnRole::User)]);
+        assert_eq!(
+            on.cite(0, "`not a span of this turn`").unwrap_err(),
+            DROP_QUOTE
+        );
+        assert_eq!(
+            on.cite(0, "footnotes and tables were enabled").unwrap_err(),
+            DROP_QUOTE
+        );
+        assert_eq!(on.coverage_counts().1, 0);
+    }
+
+    #[test]
+    fn port_cue_binds_one_integer_after_direct_binding_misses() {
+        let quote = "serving on 4000, have a look at the archive page";
+        let on = covered(&[(quote, TurnRole::User)]);
+        assert!(bound(&on, "port", "4000", quote));
+        assert_eq!(on.coverage_counts(), (0, 0, 1));
+        let off = ground(&[(quote, TurnRole::User)]);
+        assert!(!bound(&off, "port", "4000", quote));
+        assert_eq!(off.coverage_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn port_cue_rejects_the_other_shapes_and_a_direct_hit() {
+        let version = covered(&[("runs on 3.12", TurnRole::User)]);
+        assert!(!bound(&version, "python_version", "3.12", "runs on 3.12"));
+        assert_eq!(version.coverage_counts().2, 0);
+        let two = covered(&[("serving on 4000 and 4001", TurnRole::User)]);
+        assert!(!bound(&two, "port", "4000", "serving on 4000 and 4001"));
+        assert_eq!(two.coverage_counts().2, 0);
+        let wide = covered(&[("serving on 400000", TurnRole::User)]);
+        assert!(!bound(&wide, "port", "400000", "serving on 400000"));
+        let other = covered(&[("serving on 4000", TurnRole::User)]);
+        assert!(!bound(&other, "jobs", "4000", "serving on 4000"));
+        let direct = covered(&[("port 4000 is taken", TurnRole::User)]);
+        assert!(bound(&direct, "port", "4000", "port 4000 is taken"));
+        assert_eq!(direct.coverage_counts().2, 0);
     }
 
     #[test]

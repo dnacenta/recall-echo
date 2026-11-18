@@ -1238,6 +1238,16 @@ pub struct IngestionReport {
     /// Zero when the switch or the known block is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub known_key_bound: u32,
+    /// Settings kept because a listed key-token form occurred. Omitted when zero.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub key_form_bound: u32,
+    /// Quotes kept by skipping backticks in the turn. Omitted when zero.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub code_span_cited: u32,
+    /// Settings kept by a port cue after direct binding and agreement missed.
+    /// Omitted when zero.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub port_cue_bound: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
@@ -1364,6 +1374,24 @@ impl IngestionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_counters_are_omitted_from_json_when_zero() {
+        let text = serde_json::to_string(&IngestionReport::default()).expect("json");
+        assert!(!text.contains("key_form_bound"), "{text}");
+        assert!(!text.contains("code_span_cited"), "{text}");
+        assert!(!text.contains("port_cue_bound"), "{text}");
+        let report = IngestionReport {
+            key_form_bound: 1,
+            code_span_cited: 1,
+            port_cue_bound: 1,
+            ..IngestionReport::default()
+        };
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"key_form_bound\":1"), "{text}");
+        assert!(text.contains("\"code_span_cited\":1"), "{text}");
+        assert!(text.contains("\"port_cue_bound\":1"), "{text}");
+    }
 
     #[test]
     fn forgotten_skips_is_omitted_from_json_when_zero() {

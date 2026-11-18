@@ -918,7 +918,15 @@ fn collect_facts(
             }
         }
     }
+    pour_coverage(ground, report);
     facts
+}
+
+fn pour_coverage(ground: &SessionGround, report: &mut IngestionReport) {
+    let (forms, spans, ports) = ground.take_coverage_counts();
+    report.key_form_bound = report.key_form_bound.saturating_add(forms);
+    report.code_span_cited = report.code_span_cited.saturating_add(spans);
+    report.port_cue_bound = report.port_cue_bound.saturating_add(ports);
 }
 
 fn accept_item(
@@ -1932,6 +1940,215 @@ mod tests {
 
     fn report_json(report: &IngestionReport) -> String {
         serde_json::to_string(report).expect("report json")
+    }
+
+    fn setting_row(turn: usize, key: &str, object: &str, quote: &str) -> Value {
+        serde_json::json!({
+            "subject": "tidepool",
+            "subject_type": "project",
+            "predicate": "setting",
+            "role": "none",
+            "key": key,
+            "object": object,
+            "object_type": "literal",
+            "status": "decided",
+            "replaces": "",
+            "turn": turn,
+            "quote": quote,
+            "confidence": 0.9
+        })
+    }
+
+    fn shape_turns() -> Vec<Turn> {
+        vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "Python 3.11 minimum".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::Assistant,
+                text: "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.".into(),
+            },
+            Turn {
+                index: 2,
+                role: TurnRole::User,
+                text: "serving on 4000, have a look at the archive page".into(),
+            },
+        ]
+    }
+
+    fn shape_reply() -> Map<String, Value> {
+        serde_json::json!({
+            "facts": [
+                setting_row(0, "python_min_version", "3.11", "Python 3.11 minimum"),
+                setting_row(
+                    1,
+                    "md_ext",
+                    "footnotes",
+                    "md_ext = [\"footnotes\", \"tables\"] in quillpress.toml"
+                ),
+                setting_row(
+                    2,
+                    "port",
+                    "4000",
+                    "serving on 4000, have a look at the archive page"
+                ),
+            ],
+            "bugs": [],
+            "releases": []
+        })
+        .as_object()
+        .expect("object")
+        .clone()
+    }
+
+    fn run_shapes(coverage: bool) -> IngestionReport {
+        let input = session(shape_turns());
+        let ground = SessionGround::prepare(&input.turns).with_coverage(coverage);
+        let mut report = IngestionReport::default();
+        let _facts = collect_facts(&shape_reply(), &input, &ground, &mut report, false, None);
+        report
+    }
+
+    #[test]
+    fn coverage_keeps_one_row_of_each_shape_and_still_checks_the_value() {
+        let off = run_shapes(false);
+        assert_eq!(off.kept, 0, "{:?}", off.drops);
+        assert_eq!(off.drops.get(DROP_KEY_BINDING).copied(), Some(2));
+        assert_eq!(off.drops.get(DROP_QUOTE).copied(), Some(1));
+        assert_eq!(
+            (off.key_form_bound, off.code_span_cited, off.port_cue_bound),
+            (0, 0, 0)
+        );
+        assert!(!report_json(&off).contains("key_form_bound"));
+
+        let on = run_shapes(true);
+        assert_eq!(on.kept, 3, "{:?}", on.drops);
+        assert_eq!(
+            (on.key_form_bound, on.code_span_cited, on.port_cue_bound),
+            (1, 1, 1)
+        );
+
+        let input = session(shape_turns());
+        let ground = SessionGround::prepare(&input.turns).with_coverage(true);
+        let reply = serde_json::json!({
+            "facts": [setting_row(2, "port", "9999", "serving on 4000, have a look at the archive page")],
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = collect_facts(
+            reply.as_object().expect("object"),
+            &input,
+            &ground,
+            &mut report,
+            false,
+            None,
+        );
+        assert!(facts.is_empty());
+        assert_eq!(report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_eq!(report.port_cue_bound, 0);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_scripted_provider_keeps_each_coverage_shape_only_when_the_flag_is_on() {
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        struct Scripted {
+            reply: String,
+            system: Mutex<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Scripted {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Err(GraphError::Llm("plain complete was called".into()))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                _: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                *self.system.lock().expect("lock") = system.to_string();
+                Ok(Completion::unmeasured(self.reply.clone()))
+            }
+        }
+
+        fn plant(memory: &std::path::Path) {
+            let cwd = memory.join("tidepool");
+            std::fs::create_dir_all(&cwd).expect("cwd");
+            input::write_turns_sidecar(
+                memory,
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().expect("cwd")),
+                &[
+                    crate::conversation::ConversationEntry::UserMessage(
+                        "Python 3.11 minimum".into(),
+                    ),
+                    crate::conversation::ConversationEntry::AssistantText(
+                        "Done: `md_ext = [\"footnotes\", \"tables\"]` in quillpress.toml.".into(),
+                    ),
+                    crate::conversation::ConversationEntry::UserMessage(
+                        "serving on 4000, have a look at the archive page".into(),
+                    ),
+                ],
+            )
+            .expect("sidecar");
+        }
+
+        async fn run(coverage: bool) -> IngestionReport {
+            let dir = tempfile::tempdir().expect("temp");
+            plant(dir.path());
+            let mut config = stack_off_except(&[]);
+            if coverage {
+                config.push_str("extract_coverage = true\n");
+            }
+            std::fs::write(dir.path().join(".recall-echo.toml"), config).expect("config");
+            let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+                .await
+                .expect("store");
+            let provider = Scripted {
+                reply: serde_json::to_string(&shape_reply()).expect("reply"),
+                system: Mutex::new(String::new()),
+            };
+            let report = extract_session(
+                &gm,
+                dir.path(),
+                1,
+                &IngestContext::new("s", Some(1)),
+                &provider,
+            )
+            .await
+            .expect("extract");
+            assert_eq!(
+                provider.system.lock().expect("lock").as_str(),
+                PASS1_SYSTEM_BARE
+            );
+            report
+        }
+
+        let off = run(false).await;
+        assert_eq!(off.kept, 0, "{:?}", off.drops);
+        assert_eq!(
+            (off.key_form_bound, off.code_span_cited, off.port_cue_bound),
+            (0, 0, 0)
+        );
+        let on = run(true).await;
+        assert_eq!(on.kept, 3, "{:?}", on.drops);
+        assert_eq!(
+            (on.key_form_bound, on.code_span_cited, on.port_cue_bound),
+            (1, 1, 1)
+        );
     }
 
     #[test]
