@@ -348,6 +348,7 @@ pub(crate) async fn extract_session(
         write_ctx.orphan_sweep_on = orphan_sweep_enabled(memory_dir);
         write_ctx.rule_fragments_on = rule_fragments_enabled(memory_dir);
         write_ctx.retire_component_on = retire_component_enabled(memory_dir);
+        write_ctx.component_takeover_on = component_takeover_enabled(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -401,6 +402,7 @@ pub(crate) async fn extract_session(
         write_ctx.orphan_sweep_on = orphan_sweep_enabled(memory_dir);
         write_ctx.rule_fragments_on = rule_fragments_enabled(memory_dir);
         write_ctx.retire_component_on = retire_component_enabled(memory_dir);
+        write_ctx.component_takeover_on = component_takeover_enabled(memory_dir);
         let started = std::time::Instant::now();
         let stats = write::WriteStats::default();
         super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -555,6 +557,13 @@ fn retire_component_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .retire_component_apply()
+}
+
+fn component_takeover_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .component_takeover_apply()
 }
 
 fn known_key_binding_enabled(memory_dir: &Path) -> bool {

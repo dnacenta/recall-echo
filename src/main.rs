@@ -304,6 +304,10 @@ enum BenchCommands {
         /// Does not turn on `--ground-component-edges`.
         #[arg(long)]
         consolidate_retire_component: bool,
+        /// Close a project tool a component took over, after the session write.
+        /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
+        #[arg(long)]
+        consolidate_component_takeover: bool,
         /// Bind a decided setting key from a shown known row. On unless
         /// `--no-known-key-binding`. Does not turn on `--known-facts-context`.
         #[arg(long)]
@@ -342,6 +346,7 @@ enum BenchCommands {
                 "consolidate_orphan_sweep",
                 "consolidate_rule_fragments",
                 "consolidate_retire_component",
+                "consolidate_component_takeover",
             ]
         )]
         no_consolidate: bool,
@@ -1176,6 +1181,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             no_consolidate_orphan_sweep,
             no_consolidate_rule_fragments,
             no_consolidate_retire_component,
+            consolidate_component_takeover,
             no_known_key_binding,
             no_drop_restatements,
             no_ground_component_edges,
@@ -1273,6 +1279,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_orphan_sweep: no_consolidate_orphan_sweep,
                 consolidate_rule_fragments: no_consolidate_rule_fragments,
                 consolidate_retire_component: no_consolidate_retire_component,
+                consolidate_component_takeover,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2456,6 +2463,49 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn consolidate_component_takeover_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-component-takeover",
+        ])
+        .expect("parse component takeover");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_component_takeover,
+                        consolidate_retire_component,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_component_takeover);
+                assert!(!consolidate);
+                assert!(!consolidate_retire_component);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let rejected = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--consolidate-component-takeover",
+        ]);
+        assert!(rejected.is_err(), "opt-out and takeover should be rejected");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn known_key_binding_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2773,6 +2823,7 @@ mod tests {
             consolidate_orphan_sweep: f[9],
             consolidate_rule_fragments: f[10],
             consolidate_retire_component: f[11],
+            consolidate_component_takeover: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],

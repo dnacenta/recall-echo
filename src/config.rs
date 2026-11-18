@@ -930,6 +930,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_true"
     )]
     pub consolidate_retire_component: bool,
+    /// Close a project tool once a component of that project uses a different
+    /// tool for the same job. Off unless set, and ignored unless
+    /// [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_component_takeover",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_component_takeover: bool,
     /// Drop a decided rule that only restates a same-session setting.
     /// On unless set to false.
     #[serde(default = "default_drop_restatements", skip_serializing_if = "is_true")]
@@ -984,6 +992,7 @@ impl Default for GraphSection {
             consolidate_orphan_sweep: default_consolidate_orphan_sweep(),
             consolidate_rule_fragments: default_consolidate_rule_fragments(),
             consolidate_retire_component: default_consolidate_retire_component(),
+            consolidate_component_takeover: default_consolidate_component_takeover(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
@@ -1055,6 +1064,13 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn retire_component_apply(&self) -> bool {
         self.consolidate && self.consolidate_retire_component
+    }
+
+    /// A component's new tool closes the project's old tool only when
+    /// consolidation is on as well.
+    #[must_use]
+    pub(crate) fn component_takeover_apply(&self) -> bool {
+        self.consolidate && self.consolidate_component_takeover
     }
 
     /// A shown known row can bind a decided setting key only when the known
@@ -1414,6 +1430,10 @@ fn default_consolidate_rule_fragments() -> bool {
 
 fn default_consolidate_retire_component() -> bool {
     true
+}
+
+fn default_consolidate_component_takeover() -> bool {
+    false
 }
 
 fn default_drop_restatements() -> bool {
@@ -1965,6 +1985,10 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
         "graph.consolidate_retire_component",
         flag_consolidate_retire_component,
     ),
+    (
+        "graph.consolidate_component_takeover",
+        flag_consolidate_component_takeover,
+    ),
     ("graph.drop_restatements", flag_drop_restatements),
     ("graph.ground_component_edges", flag_ground_component_edges),
     ("graph.recover_turns", flag_recover_turns),
@@ -2039,6 +2063,10 @@ fn flag_consolidate_rule_fragments(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_consolidate_retire_component(graph: &mut GraphSection) -> &mut bool {
     &mut graph.consolidate_retire_component
+}
+
+fn flag_consolidate_component_takeover(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_component_takeover
 }
 
 fn flag_drop_restatements(graph: &mut GraphSection) -> &mut bool {
@@ -3789,6 +3817,86 @@ settle_secs = 300
                 .as_ref()
                 .expect("graph")
                 .consolidate_retire_component
+        );
+    }
+
+    #[test]
+    fn consolidate_component_takeover_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_component_takeover());
+        assert!(!GraphSection::default().consolidate_component_takeover);
+        assert!(!GraphSection::default().component_takeover_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().component_takeover_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_component_takeover"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nconsolidate_component_takeover = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.consolidate_component_takeover);
+        assert!(true_graph.consolidate);
+        assert!(true_graph.component_takeover_apply());
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("consolidate_component_takeover = true"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.consolidate_component_takeover);
+        assert!(again.component_takeover_apply());
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_component_takeover = false\n")
+                .expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_component_takeover);
+        assert!(!false_graph.component_takeover_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_component_takeover"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_component_takeover", "true")
+            .unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_component_takeover);
+        assert!(graph.component_takeover_apply());
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render set");
+        assert!(rendered.contains("consolidate_component_takeover = true"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse set");
+        assert!(parsed.graph.expect("graph").consolidate_component_takeover);
+
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .component_takeover_apply());
+        assert!(
+            cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_component_takeover
+        );
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .component_takeover_apply());
+        cfg.set_key("graph.consolidate_component_takeover", "false")
+            .unwrap();
+        assert!(!cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .component_takeover_apply());
+        assert!(cfg
+            .set_key("graph.consolidate_component_takeover", "yes")
+            .is_err());
+        assert!(
+            !cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_component_takeover
         );
     }
 
