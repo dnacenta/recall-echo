@@ -67,6 +67,29 @@ Known facts lists what memory already holds. When a decided fact replaces one of
 
 const KNOWN_SENTENCES: &str = "\n\nKnown facts lists what memory already holds. When a decided fact replaces one of them, copy that known value exactly into `replaces`, and reuse its key for the same setting.";
 
+/// Added after the bare instructions when extract coverage is on.
+const COVERAGE_SENTENCES: &str = "\n\nKeep the details that make a fact useful. When the turn that states a fact also gives its reason, a measured value next to a limit, the script, test or file that carries it out, or the exact class or API used, keep them: a rule says them in its own sentence; a setting value stays bare and its reason goes in one rule on the same subject that names the setting. A value said in passing still counts when it shows what is in use now, such as the port a server is running on, the command just used to run the tests, or a script that moved data and how much it moved; these are facts, not one-off actions.";
+
+fn pass1_system(known_on: bool, coverage_on: bool) -> String {
+    if !coverage_on {
+        return coverage_off_system(known_on).to_string();
+    }
+    let mut text = String::from(PASS1_SYSTEM_BARE);
+    text.push_str(COVERAGE_SENTENCES);
+    if known_on {
+        text.push_str(KNOWN_SENTENCES);
+    }
+    text
+}
+
+fn coverage_off_system(known_on: bool) -> &'static str {
+    if known_on {
+        PASS1_SYSTEM
+    } else {
+        PASS1_SYSTEM_BARE
+    }
+}
+
 const fn bare_end() -> usize {
     let full = PASS1_SYSTEM.as_bytes();
     let suffix = KNOWN_SENTENCES.as_bytes();
@@ -223,11 +246,7 @@ pub(crate) async fn extract_session(
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
-    let system = if known_on {
-        PASS1_SYSTEM
-    } else {
-        PASS1_SYSTEM_BARE
-    };
+    let system = pass1_system(known_on, coverage);
     // The block is the only pre-pass lookup. Matching, when the block is off,
     // waits until the kept facts are known so a session with nothing to match
     // does not read the store.
@@ -251,7 +270,7 @@ pub(crate) async fn extract_session(
             &session,
             window,
             &shown_known.block,
-            system,
+            &system,
             &mut report,
         )
         .await
@@ -1794,6 +1813,9 @@ mod tests {
     const SYSTEM_BEFORE_KNOWN_BLOCK: &str =
         include_str!("../../../tests/fixtures/pass1/system-pre-known-block.txt");
 
+    /// Flag on, known block off.
+    const SYSTEM_COVERAGE: &str = include_str!("../../../tests/fixtures/pass1/system-coverage.txt");
+
     #[test]
     fn off_system_prompt_matches_the_golden_pre_block_prompt() {
         assert_eq!(PASS1_SYSTEM_BARE, SYSTEM_BEFORE_KNOWN_BLOCK);
@@ -1801,6 +1823,84 @@ mod tests {
             PASS1_SYSTEM,
             format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}")
         );
+        assert_eq!(pass1_system(false, false), PASS1_SYSTEM_BARE);
+        assert_eq!(pass1_system(true, false), PASS1_SYSTEM);
+    }
+
+    #[test]
+    fn coverage_system_text_matches_the_golden_and_the_known_block() {
+        assert_eq!(pass1_system(false, true), SYSTEM_COVERAGE);
+        assert_eq!(
+            pass1_system(true, true),
+            format!("{PASS1_SYSTEM_BARE}{COVERAGE_SENTENCES}{KNOWN_SENTENCES}")
+        );
+        assert!(SYSTEM_COVERAGE.starts_with(PASS1_SYSTEM_BARE));
+        assert!(SYSTEM_COVERAGE.ends_with(COVERAGE_SENTENCES.trim_start_matches('\n')));
+    }
+
+    #[test]
+    fn coverage_sentences_carry_no_bench_vocabulary() {
+        let text = COVERAGE_SENTENCES.to_lowercase();
+        for word in [
+            "4000",
+            "8000",
+            "8080",
+            "pytest",
+            "unittest",
+            "migrate",
+            "212",
+            "nas",
+            "spinning",
+            "thrash",
+            "asyncclient",
+            "httpx",
+            "fix_tz",
+            "test_export_utc",
+            "clash",
+            "highlight",
+            "pygments",
+            "1200",
+            "1600",
+            "footnote",
+            "licence",
+        ] {
+            assert!(!text.contains(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn coverage_on_without_those_shapes_keeps_the_same_rows() {
+        let input = session(vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: "Port 9000 is chosen.".into(),
+        }]);
+        let reply = serde_json::json!({
+            "facts": [fact_json(0, "Port 9000 is chosen.")],
+            "bugs": [],
+            "releases": []
+        });
+        let reply = reply.as_object().expect("object").clone();
+        let run = |coverage: bool| {
+            let ground = SessionGround::prepare(&input.turns).with_coverage(coverage);
+            let mut report = IngestionReport::default();
+            let facts = collect_facts(&reply, &input, &ground, &mut report, false, None);
+            (facts, report)
+        };
+        let (off_facts, off_report) = run(false);
+        let (on_facts, on_report) = run(true);
+        assert_eq!(off_facts, on_facts);
+        assert_eq!(off_facts.len(), 1);
+        assert_eq!(off_report.kept, on_report.kept);
+        assert_eq!(
+            (
+                on_report.key_form_bound,
+                on_report.code_span_cited,
+                on_report.port_cue_bound
+            ),
+            (0, 0, 0)
+        );
+        assert_ne!(pass1_system(false, false), pass1_system(false, true));
     }
 
     fn session(turns: Vec<Turn>) -> SessionInput {
@@ -2130,10 +2230,12 @@ mod tests {
             )
             .await
             .expect("extract");
-            assert_eq!(
-                provider.system.lock().expect("lock").as_str(),
-                PASS1_SYSTEM_BARE
-            );
+            let expected = if coverage {
+                format!("{PASS1_SYSTEM_BARE}{COVERAGE_SENTENCES}")
+            } else {
+                PASS1_SYSTEM_BARE.to_string()
+            };
+            assert_eq!(provider.system.lock().expect("lock").as_str(), expected);
             report
         }
 

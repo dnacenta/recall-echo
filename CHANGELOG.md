@@ -7,6 +7,7 @@ changes a user has to know about before upgrading.
 
 ### Added
 
+- `graph.extract_coverage`, default off. With it on, pass 1 keeps a fact's reason, a measured value next to a limit, the script, test or file that carries it out, and the exact class or API, plus a value said in passing when it shows what is in use now. It also binds a closed set of key-token forms, a quote whose turn wraps part of it in backticks, and a `port` key stated as serving on that integer. Reports gain `key_form_bound`, `code_span_cited` and `port_cue_bound`, omitted when zero. With the flag off, the prompt, grounding, reports and logs stay as they are. `bench writes --extract-coverage` turns it on for that run only.
 - `graph.lasting_forget`, default off. With it on, a confirmed `graph correct --forget` still deletes the graph row and also records the decision in `memory/forgotten.jsonl` until `graph correct --unforget`. Matching later writes are skipped (`forgotten_skips`, omitted from reports when zero) and reads replace the forgotten value with `[forgotten]`. With the flag off, forget stays a hard delete and the file is not read or written.
 
 ## [5.1.0] — 2026-11-17
