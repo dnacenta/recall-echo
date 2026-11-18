@@ -338,6 +338,7 @@ pub async fn run(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: OptOuts,
 ) -> Result<WriteReport, RecallError> {
     require_scratch(work_dir)?;
@@ -360,6 +361,7 @@ pub async fn run(
         consolidate_rule_fragments,
         consolidate_retire_component,
         known_key_binding,
+        extract_coverage,
         opt_outs,
     )?;
     let gm = GraphMemory::open(&memory_dir.join("graph")).await?;
@@ -609,6 +611,7 @@ pub async fn run_repeat(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: OptOuts,
 ) -> Result<RepeatReport, RecallError> {
     if repeat == 0 {
@@ -643,6 +646,7 @@ pub async fn run_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                extract_coverage,
                 opt_outs,
             )
             .await?,
@@ -670,6 +674,7 @@ fn apply_graph_switches(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: OptOuts,
 ) -> Result<(), RecallError> {
     let lines = switch_lines(
@@ -688,6 +693,7 @@ fn apply_graph_switches(
         consolidate_rule_fragments,
         consolidate_retire_component,
         known_key_binding,
+        extract_coverage,
         opt_outs,
     );
     if lines.is_empty() {
@@ -719,6 +725,7 @@ fn switch_lines(
     consolidate_rule_fragments: ConsolidateRuleFragments,
     consolidate_retire_component: ConsolidateRetireComponent,
     known_key_binding: KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: OptOuts,
 ) -> Vec<&'static str> {
     let mut lines = Vec::new();
@@ -836,6 +843,7 @@ fn switch_lines(
         recover_turns == RecoverTurns::On,
         "recover_turns = true",
     );
+    push_line(&mut lines, extract_coverage, "extract_coverage = true");
     lines
 }
 
@@ -2251,6 +2259,58 @@ mod tests {
     }
 
     #[test]
+    fn extract_coverage_is_written_only_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            false,
+            OptOuts::default(),
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            true,
+            OptOuts::default(),
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nextract_coverage = true\n");
+    }
+
+    #[test]
     fn consolidate_switch_is_written_only_when_on() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
@@ -2272,6 +2332,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2293,6 +2354,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2318,6 +2380,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2350,6 +2413,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2372,6 +2436,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2410,6 +2475,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2445,6 +2511,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2477,6 +2544,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2518,6 +2586,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2540,6 +2609,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2579,6 +2649,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2601,6 +2672,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2713,6 +2785,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .unwrap();
@@ -2904,6 +2977,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2926,6 +3000,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2963,6 +3038,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -2997,6 +3073,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3038,6 +3115,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3060,6 +3138,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3099,6 +3178,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3143,6 +3223,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3165,6 +3246,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3211,6 +3293,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3233,6 +3316,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3281,6 +3365,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3303,6 +3388,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3352,6 +3438,7 @@ mod tests {
             ConsolidateRuleFragments::On,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3397,6 +3484,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::On,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3441,6 +3529,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3463,6 +3552,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::On,
+            false,
             OptOuts::default(),
         )
         .unwrap();
@@ -3533,6 +3623,7 @@ mod tests {
                 ConsolidateRuleFragments::Off,
                 ConsolidateRetireComponent::Off,
                 KnownKeyBinding::Off,
+                false,
                 OptOuts::default(),
             )
             .unwrap();
@@ -3602,6 +3693,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -3770,6 +3862,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -3887,6 +3980,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -3922,6 +4016,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -4009,6 +4104,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -4326,6 +4422,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .unwrap();
@@ -4485,6 +4582,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -4710,6 +4808,7 @@ mod tests {
                 ConsolidateRuleFragments::Off,
                 ConsolidateRetireComponent::Off,
                 KnownKeyBinding::Off,
+                false,
                 OptOuts::stack_off(),
             )
             .await
@@ -4758,6 +4857,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -5065,6 +5165,7 @@ mod tests {
                 ConsolidateRuleFragments::Off,
                 ConsolidateRetireComponent::Off,
                 KnownKeyBinding::Off,
+                false,
                 opt_outs,
             )
             .await
@@ -5113,6 +5214,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await
@@ -5256,6 +5358,7 @@ mod tests {
             ConsolidateRuleFragments::Off,
             ConsolidateRetireComponent::Off,
             KnownKeyBinding::Off,
+            false,
             OptOuts::stack_off(),
         )
         .await

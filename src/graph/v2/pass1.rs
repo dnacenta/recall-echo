@@ -216,7 +216,10 @@ pub(crate) async fn extract_session(
     let pass1_started = std::time::Instant::now();
     // The known block is opt-in model input, not a turn. Off does not read
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
-    let ground = SessionGround::prepare(&session.turns);
+    // Extract coverage is read once. Off leaves the system text, grounding
+    // and report on the path they have today.
+    let coverage = extract_coverage_enabled(memory_dir);
+    let ground = SessionGround::prepare(&session.turns).with_coverage(coverage);
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
@@ -275,7 +278,7 @@ pub(crate) async fn extract_session(
     // Decide against this list, then drop. Reconcile below indexes targets by
     // the facts it receives, so the list must not shrink after that.
     let facts = if drop_restatements_enabled(memory_dir) {
-        drop_restating_rules(facts, &mut report)
+        drop_restating_rules_covering(facts, &mut report, coverage)
     } else {
         facts
     };
@@ -556,6 +559,13 @@ fn ground_component_edges_enabled(memory_dir: &Path) -> bool {
         .ground_component_edges
 }
 
+fn extract_coverage_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .extract_coverage
+}
+
 fn recover_turns_enabled(memory_dir: &Path) -> bool {
     crate::config::load_from_dir(memory_dir)
         .graph
@@ -632,12 +642,29 @@ fn candidate_forgotten(set: &crate::graph::forgotten::ForgetSet, fact: &Fact) ->
 ///
 /// Matches are edges in a bipartite graph. A larger component is ambiguous, so
 /// every fact in it stays. `kept` is left as the candidate count.
+#[cfg(test)]
 fn drop_restating_rules(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
+    drop_restating_rules_covering(facts, report, false)
+}
+
+fn drop_restating_rules_covering(
+    facts: Vec<Fact>,
+    report: &mut IngestionReport,
+    coverage: bool,
+) -> Vec<Fact> {
     let drop = isolated_restatement_rules(&facts);
     let mut kept = Vec::with_capacity(facts.len());
     for (index, fact) in facts.into_iter().enumerate() {
         if drop[index] {
-            count_drop(report, DROP_RESTATEMENT);
+            let slot = fact_slot(&fact);
+            count_labeled_drop(
+                report,
+                coverage,
+                DROP_RESTATEMENT,
+                &fact.subject_name,
+                slot,
+                fact.turn,
+            );
             continue;
         }
         kept.push(fact);
@@ -868,7 +895,15 @@ fn collect_facts(
         for (index, item) in items.iter().enumerate() {
             report.candidates += 1;
             if index >= MAX_ITEMS {
-                count_drop(report, DROP_OVERFLOW);
+                let (subject, slot, turn) = drop_identity(section, item);
+                count_labeled_drop(
+                    report,
+                    ground.coverage(),
+                    DROP_OVERFLOW,
+                    &subject,
+                    &slot,
+                    turn,
+                );
                 continue;
             }
             match accept_item(section, item, session, ground, report, ground_on, known) {
@@ -876,7 +911,10 @@ fn collect_facts(
                     report.kept += 1;
                     facts.extend(batch);
                 }
-                Err(reason) => count_drop(report, reason),
+                Err(reason) => {
+                    let (subject, slot, turn) = drop_identity(section, item);
+                    count_labeled_drop(report, ground.coverage(), reason, &subject, &slot, turn);
+                }
             }
         }
     }
@@ -1284,7 +1322,14 @@ fn expand_bug(
                     &carrier,
                 ));
             } else {
-                count_drop(report, DROP_VALUE_SUPPORT_PARTIAL);
+                count_labeled_drop(
+                    report,
+                    ground.coverage(),
+                    DROP_VALUE_SUPPORT_PARTIAL,
+                    symptom,
+                    "affects",
+                    carrier.turn,
+                );
             }
         } else {
             facts.push(inferred(edge_fact(
@@ -1381,7 +1426,14 @@ fn push_field(
             fact.provenance = Provenance::SelfGenerated;
             facts.push(fact);
         }
-        FieldCredit::Drop => count_drop(report, DROP_VALUE_SUPPORT_PARTIAL),
+        FieldCredit::Drop => count_labeled_drop(
+            report,
+            ground.coverage(),
+            DROP_VALUE_SUPPORT_PARTIAL,
+            &carrier.subject_name,
+            predicate.as_str(),
+            carrier.turn,
+        ),
     }
 }
 
@@ -1532,6 +1584,88 @@ fn fact_identity(
 
 fn count_drop(report: &mut IngestionReport, reason: &str) {
     *report.drops.entry(reason.to_string()).or_insert(0) += 1;
+}
+
+fn count_labeled_drop(
+    report: &mut IngestionReport,
+    coverage: bool,
+    reason: &str,
+    subject: &str,
+    slot: &str,
+    turn: usize,
+) {
+    count_drop(report, reason);
+    log_pass1_drop(coverage, reason, subject, slot, turn);
+}
+
+/// One stderr line per pass-1 drop when extract coverage is on.
+///
+/// Flag off returns before any write, so the line is absent.
+fn log_pass1_drop(coverage: bool, reason: &str, subject: &str, slot: &str, turn: usize) {
+    if !coverage {
+        return;
+    }
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        pass1_drop_line(reason, subject, slot, turn)
+    );
+}
+
+fn pass1_drop_line(reason: &str, subject: &str, slot: &str, turn: usize) -> String {
+    format!(
+        "pass1 drop: {reason} | {}:{} | turn {turn}",
+        log_plain(subject),
+        log_plain(slot)
+    )
+}
+
+fn drop_identity(section: &str, item: &Value) -> (String, String, usize) {
+    let Some(object) = item.as_object() else {
+        return (String::new(), section.to_string(), 0);
+    };
+    let turn = json_turn(object);
+    match section {
+        "facts" => fact_drop_identity(object, turn),
+        "bugs" => (json_text(object, "symptom"), "bug".to_string(), turn),
+        "releases" => (json_text(object, "version"), "release".to_string(), turn),
+        _ => (String::new(), section.to_string(), turn),
+    }
+}
+
+fn fact_drop_identity(object: &Map<String, Value>, turn: usize) -> (String, String, usize) {
+    let key = json_text(object, "key");
+    let slot = if key.trim().is_empty() {
+        json_text(object, "predicate")
+    } else {
+        key
+    };
+    (json_text(object, "subject"), slot, turn)
+}
+
+fn fact_slot(fact: &Fact) -> &str {
+    if fact.key.trim().is_empty() {
+        fact.predicate.as_str()
+    } else {
+        fact.key.as_str()
+    }
+}
+
+fn json_text(object: &Map<String, Value>, name: &str) -> String {
+    object
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_turn(object: &Map<String, Value>) -> usize {
+    object
+        .get("turn")
+        .and_then(Value::as_u64)
+        .and_then(|turn| usize::try_from(turn).ok())
+        .unwrap_or(0)
 }
 
 fn pass1_schema() -> &'static Value {
@@ -1754,6 +1888,50 @@ mod tests {
             "quote": quote,
             "confidence": 0.9
         })
+    }
+
+    #[test]
+    fn flag_off_drop_stderr_and_report_match_the_default_path() {
+        let reply = serde_json::json!({
+            "facts": [fact_json(0, "not in the transcript at all")],
+            "bugs": [],
+            "releases": []
+        });
+        let reply = reply.as_object().expect("object").clone();
+        let input = session(turns());
+        let mut plain = IngestionReport::default();
+        let (plain_facts, plain_err) =
+            crate::file_lock::capture_stderr(|| facts_from_reply(&reply, &input, &mut plain));
+        let mut covered = IngestionReport::default();
+        let ground = SessionGround::prepare(&input.turns).with_coverage(false);
+        let (off_facts, off_err) = crate::file_lock::capture_stderr(|| {
+            collect_facts(&reply, &input, &ground, &mut covered, false, None)
+        });
+        assert_eq!(plain_facts, off_facts);
+        assert_eq!(report_json(&plain), report_json(&covered));
+        assert!(!plain_err.contains("pass1 drop:"), "{plain_err}");
+        assert!(!off_err.contains("pass1 drop:"), "{off_err}");
+        assert_eq!(covered.drops.get(DROP_QUOTE).copied(), Some(1));
+
+        let mut on_report = IngestionReport::default();
+        let ground = SessionGround::prepare(&input.turns).with_coverage(true);
+        let (_on_facts, on_err) = crate::file_lock::capture_stderr(|| {
+            collect_facts(&reply, &input, &ground, &mut on_report, false, None)
+        });
+        assert_eq!(report_json(&plain), report_json(&on_report));
+        assert_eq!(on_err.trim(), "pass1 drop: quote | tidepool:port | turn 0");
+    }
+
+    #[test]
+    fn pass1_drop_line_strips_control_characters() {
+        assert_eq!(
+            pass1_drop_line("quote", "a\nb", "p\tort", 3),
+            "pass1 drop: quote | ab:port | turn 3"
+        );
+    }
+
+    fn report_json(report: &IngestionReport) -> String {
+        serde_json::to_string(report).expect("report json")
     }
 
     #[test]

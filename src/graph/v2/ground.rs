@@ -105,6 +105,7 @@ pub(crate) struct SessionGround {
     session_norm: String,
     session_words: Vec<String>,
     session_numbers: Vec<String>,
+    coverage: bool,
 }
 
 struct TurnGround {
@@ -148,7 +149,22 @@ impl SessionGround {
             session_norm,
             session_words,
             session_numbers,
+            coverage: false,
         }
+    }
+
+    /// Turn extract-coverage grounding on for this session. Off leaves every
+    /// check on the path [`SessionGround::prepare`] built.
+    #[must_use]
+    pub(crate) fn with_coverage(mut self, on: bool) -> Self {
+        self.coverage = on;
+        self
+    }
+
+    /// Whether extract coverage is on for this session.
+    #[must_use]
+    pub(crate) fn coverage(&self) -> bool {
+        self.coverage
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.

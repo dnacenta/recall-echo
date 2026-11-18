@@ -321,6 +321,10 @@ enum BenchCommands {
         /// Implies nothing. The list is not stored.
         #[arg(long)]
         recover_turns: bool,
+        /// Keep pass-1 details and the rows grounding drops. Off unless set.
+        /// Implies nothing. Writes `extract_coverage = true` for this run only.
+        #[arg(long)]
+        extract_coverage: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1160,6 +1164,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             drop_restatements,
             ground_component_edges,
             recover_turns,
+            extract_coverage,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1252,6 +1257,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 recall_echo::bench::writes::KnownKeyBinding::On,
                 recall_echo::bench::writes::KnownKeyBinding::Off,
             ),
+            extract_coverage,
             recall_echo::bench::writes::OptOuts {
                 known_facts_context: no_known_facts_context,
                 consolidate: no_consolidate,
@@ -1451,6 +1457,7 @@ fn run_writes(
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
     consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: recall_echo::bench::writes::OptOuts,
 ) -> Result<(), recall_echo::error::RecallError> {
     use recall_echo::bench::writes;
@@ -1497,6 +1504,7 @@ fn run_writes(
             consolidate_rule_fragments,
             consolidate_retire_component,
             known_key_binding,
+            extract_coverage,
             opt_outs,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1523,6 +1531,7 @@ fn run_writes(
             consolidate_rule_fragments,
             consolidate_retire_component,
             known_key_binding,
+            extract_coverage,
             opt_outs,
         ))?;
         serde_json::to_string_pretty(&report)?
@@ -1554,6 +1563,7 @@ async fn grade_once(
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
     consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: recall_echo::bench::writes::OptOuts,
 ) -> Result<recall_echo::bench::writes::WriteReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1583,6 +1593,7 @@ async fn grade_once(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                extract_coverage,
                 opt_outs,
             )
             .await
@@ -1608,6 +1619,7 @@ async fn grade_once(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                extract_coverage,
                 opt_outs,
             )
             .await
@@ -1639,6 +1651,7 @@ async fn grade_repeat(
     consolidate_rule_fragments: recall_echo::bench::writes::ConsolidateRuleFragments,
     consolidate_retire_component: recall_echo::bench::writes::ConsolidateRetireComponent,
     known_key_binding: recall_echo::bench::writes::KnownKeyBinding,
+    extract_coverage: bool,
     opt_outs: recall_echo::bench::writes::OptOuts,
 ) -> Result<recall_echo::bench::writes::RepeatReport, recall_echo::error::RecallError> {
     use recall_echo::bench::writes::{self, Extractor};
@@ -1669,6 +1682,7 @@ async fn grade_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                extract_coverage,
                 opt_outs,
             )
             .await
@@ -1695,6 +1709,7 @@ async fn grade_repeat(
                 consolidate_rule_fragments,
                 consolidate_retire_component,
                 known_key_binding,
+                extract_coverage,
                 opt_outs,
             )
             .await
@@ -2029,6 +2044,46 @@ mod tests {
             .expect("writes");
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--consolidate-components"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn extract_coverage_is_its_own_bench_flag() {
+        let parsed = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--extract-coverage",
+        ])
+        .expect("parse coverage");
+        match parsed.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        extract_coverage,
+                        recover_turns,
+                        known_facts_context,
+                        ..
+                    },
+            } => {
+                assert!(extract_coverage);
+                assert!(!recover_turns);
+                assert!(!known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--extract-coverage"), "{help}");
+        assert!(!help.contains("--no-extract-coverage"), "{help}");
     }
 
     #[cfg(feature = "bench")]
@@ -2722,6 +2777,7 @@ mod tests {
             drop_restatements: f[13],
             ground_component_edges: f[14],
             recover_turns: f[15],
+            extract_coverage: false,
             no_known_facts_context: o[0],
             no_consolidate: o[1],
             no_consolidate_hold: o[2],
