@@ -968,6 +968,14 @@ pub struct ConsolidateReport {
     /// Absent when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_retire_ambiguous: Option<u32>,
+    /// Project `uses` edges closed because a component took over the job.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_takeover_closes: Option<u32>,
+    /// Component tools with two or more project tools that share the job.
+    /// None of those tools close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_takeover_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1152,6 +1160,8 @@ impl ConsolidateReport {
             self.component_retire_nosucc,
             self.component_retire_overflow,
             self.component_retire_ambiguous,
+            self.component_takeover_closes,
+            self.component_takeover_ambiguous,
         ])
     }
 }
@@ -1641,6 +1651,32 @@ mod tests {
             component_retire_nosucc: Some(0),
             component_retire_overflow: Some(0),
             component_retire_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+    }
+
+    #[test]
+    fn component_takeover_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("component_takeover_closes").is_none());
+        assert!(encoded.get("component_takeover_ambiguous").is_none());
+        let closed = ConsolidateReport {
+            component_takeover_closes: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["component_takeover_closes"], 1);
+        assert!(encoded.get("component_takeover_ambiguous").is_none());
+        let ambiguous = ConsolidateReport {
+            component_takeover_ambiguous: Some(2),
+            ..ConsolidateReport::default()
+        };
+        assert!(!ambiguous.is_blank());
+        let zeros = ConsolidateReport {
+            component_takeover_closes: Some(0),
+            component_takeover_ambiguous: Some(0),
             ..ConsolidateReport::default()
         };
         assert!(zeros.is_blank());

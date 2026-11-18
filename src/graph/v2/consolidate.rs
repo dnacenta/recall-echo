@@ -5196,6 +5196,7 @@ struct PostSnap {
     orphan: Option<OrphanSnap>,
     fragments: Option<FragmentSnap>,
     retire: Option<RetireSnap>,
+    takeover: Option<TakeoverSnap>,
 }
 
 struct OrphanSnap {
@@ -5268,6 +5269,7 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
             orphan: None,
             fragments: None,
             retire: None,
+            takeover: None,
         });
     }
     let rows = read_entity_rows(gm).await?;
@@ -5288,11 +5290,24 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
     } else {
         None
     };
+    let takeover = maybe_takeover(gm, ctx, &rows).await?;
     Ok(PostSnap {
         orphan,
         fragments,
         retire,
+        takeover,
     })
+}
+
+async fn maybe_takeover(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<Option<TakeoverSnap>, GraphError> {
+    if !ctx.component_takeover_on {
+        return Ok(None);
+    }
+    Ok(Some(takeover_snap(gm, ctx, rows).await?))
 }
 
 async fn apply_post(
@@ -5314,6 +5329,10 @@ async fn apply_post(
     if let Some(retire) = &snap.retire {
         let plan = plan_retire(ctx, retire);
         apply_retire(gm, ctx, &plan, report).await;
+    }
+    if let Some(takeover) = &snap.takeover {
+        let plan = plan_takeover(ctx, takeover);
+        apply_takeover(gm, ctx, &plan, report).await;
     }
 }
 
@@ -6707,6 +6726,602 @@ fn retire_ambiguous_line(project: &str, key: &str, index: usize) -> String {
         "consolidate retire ambiguous: {}:{} | slot {index}",
         quote_head(project),
         quote_head(key)
+    )
+}
+
+const TAKEOVER_REASON: &str = "component_takeover";
+const OPEN_USES_TAKEOVER: &str = "\
+SELECT id, in, out.name AS object, status, pending, description, evidence FROM relates_to \
+WHERE rel_type = 'uses' AND valid_until = NONE";
+
+struct TakeoverSnap {
+    project_id: Option<String>,
+    entities: Vec<TakeoverEntity>,
+    parts: Vec<PartLink>,
+    uses: Vec<TakeoverUse>,
+}
+
+struct TakeoverEntity {
+    id: String,
+    name: String,
+    kind: String,
+    slots: Vec<TakeoverSlot>,
+}
+
+impl ProjectRow for TakeoverEntity {
+    fn project_name(&self) -> &str {
+        &self.name
+    }
+
+    fn project_kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn project_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+}
+
+struct TakeoverSlot {
+    predicate: String,
+    key: String,
+    value: String,
+    first_session: String,
+    first_turn: Option<i64>,
+}
+
+struct TakeoverUse {
+    id: String,
+    from_id: String,
+    object: String,
+    status: String,
+    pending: bool,
+    description: String,
+    first_session: String,
+    first_turn: Option<i64>,
+}
+
+struct TakeoverPair<'a> {
+    project: &'a str,
+    component: &'a str,
+    old_tool: &'a str,
+    new_tool: &'a str,
+}
+
+struct TakeoverHit<'a> {
+    edge: &'a TakeoverUse,
+    token: String,
+}
+
+struct TakeoverClose {
+    id: String,
+    project: String,
+    old_tool: String,
+    component: String,
+    new_tool: String,
+    token: String,
+}
+
+struct TakeoverAmbiguous {
+    component: String,
+    new_tool: String,
+    count: usize,
+}
+
+struct TakeoverPlan {
+    closes: Vec<TakeoverClose>,
+    ambiguous: Vec<TakeoverAmbiguous>,
+}
+
+async fn takeover_snap(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<TakeoverSnap, GraphError> {
+    let entities = parse_takeover_entities(rows);
+    let project_id = preferred_project_id(&entities, ctx);
+    let parts = read_retire_parts(gm).await?;
+    let uses = read_takeover_uses(gm).await?;
+    Ok(TakeoverSnap {
+        project_id,
+        entities,
+        parts,
+        uses,
+    })
+}
+
+async fn read_takeover_uses(gm: &GraphMemory) -> Result<Vec<TakeoverUse>, GraphError> {
+    note_post_read();
+    let mut response = gm.db().query(OPEN_USES_TAKEOVER).await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(parse_takeover_uses(&rows))
+}
+
+fn parse_takeover_entities(rows: &[Value]) -> Vec<TakeoverEntity> {
+    rows.iter().filter_map(takeover_entity).collect()
+}
+
+fn takeover_entity(row: &Value) -> Option<TakeoverEntity> {
+    let id = id_text(row.get("id"));
+    if id.is_empty() {
+        return None;
+    }
+    Some(TakeoverEntity {
+        name: json_text(row.get("name")),
+        kind: row_kind(row).to_string(),
+        slots: takeover_slots(row),
+        id,
+    })
+}
+
+fn takeover_slots(row: &Value) -> Vec<TakeoverSlot> {
+    let Some(slots) = row
+        .pointer("/attributes/v2/slots")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    slots.iter().filter_map(takeover_slot).collect()
+}
+
+fn takeover_slot(slot: &Value) -> Option<TakeoverSlot> {
+    if !slot.is_object() {
+        return None;
+    }
+    Some(TakeoverSlot {
+        predicate: json_text(slot.get("predicate")),
+        key: json_text(slot.get("key")),
+        value: json_text(slot.get("value")),
+        first_session: first_evidence_session(slot),
+        first_turn: first_evidence_turn(slot),
+    })
+}
+
+fn first_evidence_turn(row: &Value) -> Option<i64> {
+    let item = row.get("evidence")?.as_array()?.first()?;
+    item.get("turn")?.as_i64()
+}
+
+fn parse_takeover_uses(rows: &[Value]) -> Vec<TakeoverUse> {
+    let mut uses: Vec<TakeoverUse> = rows.iter().filter_map(takeover_use).collect();
+    uses.sort_by(|left, right| left.id.cmp(&right.id));
+    uses
+}
+
+fn takeover_use(row: &Value) -> Option<TakeoverUse> {
+    let id = id_text(row.get("id"));
+    let from_id = id_text(row.get("in"));
+    if id.is_empty() || from_id.is_empty() {
+        return None;
+    }
+    Some(TakeoverUse {
+        id,
+        from_id,
+        object: json_text(row.get("object")),
+        status: json_text(row.get("status")),
+        pending: super::write::is_pending(row),
+        description: json_text(row.get("description")),
+        first_session: first_evidence_session(row),
+        first_turn: first_evidence_turn(row),
+    })
+}
+
+fn plan_takeover(ctx: &WriteCtx<'_>, snap: &TakeoverSnap) -> TakeoverPlan {
+    let mut plan = TakeoverPlan {
+        closes: Vec::new(),
+        ambiguous: Vec::new(),
+    };
+    let Some(project) = takeover_project(snap) else {
+        return plan;
+    };
+    for anchor in &snap.uses {
+        push_takeover_anchor(&mut plan, ctx, snap, project, anchor);
+    }
+    plan
+}
+
+fn takeover_project(snap: &TakeoverSnap) -> Option<&TakeoverEntity> {
+    let id = snap.project_id.as_deref()?;
+    snap.entities.iter().find(|entity| entity.id == id)
+}
+
+fn push_takeover_anchor(
+    plan: &mut TakeoverPlan,
+    ctx: &WriteCtx<'_>,
+    snap: &TakeoverSnap,
+    project: &TakeoverEntity,
+    anchor: &TakeoverUse,
+) {
+    if !takeover_anchor(anchor, snap, &project.id, ctx.session_id) {
+        return;
+    }
+    let Some(component) = takeover_entity_by_id(snap, &anchor.from_id) else {
+        return;
+    };
+    let found = takeover_hits(ctx, &snap.uses, project, component, anchor);
+    record_takeover(plan, project, component, anchor, &found);
+}
+
+fn takeover_anchor(
+    edge: &TakeoverUse,
+    snap: &TakeoverSnap,
+    project_id: &str,
+    session: &str,
+) -> bool {
+    decided_use(edge) && edge.first_session == session && component_anchor(edge, snap, project_id)
+}
+
+fn decided_use(edge: &TakeoverUse) -> bool {
+    edge.status == "decided" && !edge.pending
+}
+
+fn component_anchor(edge: &TakeoverUse, snap: &TakeoverSnap, project_id: &str) -> bool {
+    let Some(entity) = takeover_entity_by_id(snap, &edge.from_id) else {
+        return false;
+    };
+    entity.kind == "component" && part_of_project(snap, &entity.id, project_id)
+}
+
+fn part_of_project(snap: &TakeoverSnap, entity: &str, project: &str) -> bool {
+    snap.parts
+        .iter()
+        .any(|link| part_links(link, entity, project))
+}
+
+fn takeover_entity_by_id<'a>(snap: &'a TakeoverSnap, id: &str) -> Option<&'a TakeoverEntity> {
+    snap.entities.iter().find(|entity| entity.id == id)
+}
+
+fn takeover_hits<'a>(
+    ctx: &WriteCtx<'_>,
+    uses: &'a [TakeoverUse],
+    project: &TakeoverEntity,
+    component: &TakeoverEntity,
+    anchor: &TakeoverUse,
+) -> Vec<TakeoverHit<'a>> {
+    uses.iter()
+        .filter_map(|old| takeover_hit(ctx, project, component, anchor, old))
+        .collect()
+}
+
+fn takeover_hit<'a>(
+    ctx: &WriteCtx<'_>,
+    project: &TakeoverEntity,
+    component: &TakeoverEntity,
+    anchor: &TakeoverUse,
+    old: &'a TakeoverUse,
+) -> Option<TakeoverHit<'a>> {
+    if !takeover_candidate(ctx, old, anchor, &project.id) {
+        return None;
+    }
+    let token = bridge_token(ctx, project, component, old, anchor)?;
+    Some(TakeoverHit { edge: old, token })
+}
+
+fn takeover_candidate(
+    ctx: &WriteCtx<'_>,
+    old: &TakeoverUse,
+    anchor: &TakeoverUse,
+    project_id: &str,
+) -> bool {
+    project_use(old, project_id)
+        && earlier_session(&old.first_session, ctx.session_id)
+        && !same_name(&old.object, &anchor.object)
+        && roles_match(&old.description, &anchor.description)
+        && !tool_mentioned(ctx, &old.object)
+}
+
+fn project_use(edge: &TakeoverUse, project_id: &str) -> bool {
+    decided_use(edge) && edge.from_id == project_id
+}
+
+fn roles_match(left: &str, right: &str) -> bool {
+    role_body(left).is_some() && left == right
+}
+
+fn role_body(text: &str) -> Option<&str> {
+    let role = text.strip_prefix("role=")?;
+    (!role.is_empty()).then_some(role)
+}
+
+fn tool_mentioned(ctx: &WriteCtx<'_>, name: &str) -> bool {
+    let run = job_words(name);
+    run.is_empty() || ctx.turns.iter().any(|turn| contains_run(&run, &turn.text))
+}
+
+fn contains_run(run: &[String], text: &str) -> bool {
+    let words = job_words(text);
+    words.len() >= run.len() && words.windows(run.len()).any(|window| window == run)
+}
+
+fn job_words(text: &str) -> Vec<String> {
+    normalise(text)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn bridge_token(
+    ctx: &WriteCtx<'_>,
+    project: &TakeoverEntity,
+    component: &TakeoverEntity,
+    old: &TakeoverUse,
+    anchor: &TakeoverUse,
+) -> Option<String> {
+    let old_rows = cited_slots(project, &old.first_session, old.first_turn);
+    let new_rows = fresh_slots(project, component, ctx.session_id, anchor.first_turn);
+    disagreeing_token(
+        &old_rows,
+        &new_rows,
+        &pair_of(project, component, old, anchor),
+    )
+}
+
+fn pair_of<'a>(
+    project: &'a TakeoverEntity,
+    component: &'a TakeoverEntity,
+    old: &'a TakeoverUse,
+    anchor: &'a TakeoverUse,
+) -> TakeoverPair<'a> {
+    TakeoverPair {
+        project: &project.name,
+        component: &component.name,
+        old_tool: &old.object,
+        new_tool: &anchor.object,
+    }
+}
+
+fn cited_slots<'a>(
+    entity: &'a TakeoverEntity,
+    session: &str,
+    turn: Option<i64>,
+) -> Vec<&'a TakeoverSlot> {
+    entity
+        .slots
+        .iter()
+        .filter(|slot| same_job_sighting(slot, session, turn))
+        .collect()
+}
+
+fn same_job_sighting(slot: &TakeoverSlot, session: &str, turn: Option<i64>) -> bool {
+    job_predicate(slot) && slot.first_session == session && slot.first_turn == turn
+}
+
+fn job_predicate(slot: &TakeoverSlot) -> bool {
+    slot.predicate == "setting" || slot.predicate == "rule"
+}
+
+fn fresh_slots<'a>(
+    project: &'a TakeoverEntity,
+    component: &'a TakeoverEntity,
+    session: &str,
+    turn: Option<i64>,
+) -> Vec<&'a TakeoverSlot> {
+    let mut rows = cited_slots(component, session, turn);
+    if component.id != project.id {
+        rows.extend(cited_slots(project, session, turn));
+    }
+    rows
+}
+
+fn disagreeing_token(
+    old_rows: &[&TakeoverSlot],
+    new_rows: &[&TakeoverSlot],
+    pair: &TakeoverPair<'_>,
+) -> Option<String> {
+    let mut found = BTreeSet::new();
+    for old in old_rows {
+        collect_shared(&mut found, old, new_rows, pair);
+    }
+    found.into_iter().next()
+}
+
+fn collect_shared(
+    found: &mut BTreeSet<String>,
+    old: &TakeoverSlot,
+    new_rows: &[&TakeoverSlot],
+    pair: &TakeoverPair<'_>,
+) {
+    for new in new_rows {
+        if values_equal(&old.value, &new.value) {
+            continue;
+        }
+        add_shared(found, old, new, pair);
+    }
+}
+
+fn add_shared(
+    found: &mut BTreeSet<String>,
+    old: &TakeoverSlot,
+    new: &TakeoverSlot,
+    pair: &TakeoverPair<'_>,
+) {
+    let left = job_tokens(old, pair);
+    let right = job_tokens(new, pair);
+    for token in left.intersection(&right) {
+        found.insert((*token).clone());
+    }
+}
+
+fn job_tokens(slot: &TakeoverSlot, pair: &TakeoverPair<'_>) -> BTreeSet<String> {
+    raw_job_tokens(slot)
+        .into_iter()
+        .filter(|token| keep_job_token(token, pair))
+        .collect()
+}
+
+fn raw_job_tokens(slot: &TakeoverSlot) -> Vec<String> {
+    match slot.predicate.as_str() {
+        "setting" => setting_key_tokens(&slot.key),
+        "rule" => job_words(&slot.value),
+        _ => Vec::new(),
+    }
+}
+
+fn setting_key_tokens(key: &str) -> Vec<String> {
+    key.split('_').filter_map(key_piece).collect()
+}
+
+fn key_piece(piece: &str) -> Option<String> {
+    let token = normalise(piece);
+    (!token.is_empty()).then_some(token)
+}
+
+fn keep_job_token(token: &str, pair: &TakeoverPair<'_>) -> bool {
+    long_job_token(token)
+        && !is_stop_word(token)
+        && !generic_key_token(token)
+        && !party_name_token(token, pair)
+        && !whole_tool_name(token, pair)
+}
+
+fn long_job_token(token: &str) -> bool {
+    token.chars().count() >= 5
+}
+
+fn generic_key_token(token: &str) -> bool {
+    matches!(
+        token,
+        "value" | "number" | "setting" | "default" | "current" | "new" | "min" | "max"
+    )
+}
+
+fn party_name_token(token: &str, pair: &TakeoverPair<'_>) -> bool {
+    job_words(pair.project).iter().any(|part| part == token)
+        || job_words(pair.component).iter().any(|part| part == token)
+}
+
+fn whole_tool_name(token: &str, pair: &TakeoverPair<'_>) -> bool {
+    token == normalise(pair.old_tool) || token == normalise(pair.new_tool)
+}
+
+fn record_takeover(
+    plan: &mut TakeoverPlan,
+    project: &TakeoverEntity,
+    component: &TakeoverEntity,
+    anchor: &TakeoverUse,
+    found: &[TakeoverHit<'_>],
+) {
+    match found.len() {
+        0 => {}
+        1 => plan
+            .closes
+            .push(close_of(project, component, anchor, &found[0])),
+        count => plan.ambiguous.push(TakeoverAmbiguous {
+            component: component.name.clone(),
+            new_tool: anchor.object.clone(),
+            count,
+        }),
+    }
+}
+
+fn close_of(
+    project: &TakeoverEntity,
+    component: &TakeoverEntity,
+    anchor: &TakeoverUse,
+    hit: &TakeoverHit<'_>,
+) -> TakeoverClose {
+    TakeoverClose {
+        id: hit.edge.id.clone(),
+        project: project.name.clone(),
+        old_tool: hit.edge.object.clone(),
+        component: component.name.clone(),
+        new_tool: anchor.object.clone(),
+        token: hit.token.clone(),
+    }
+}
+
+async fn apply_takeover(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &TakeoverPlan,
+    report: &mut IngestionReport,
+) {
+    note_takeover_ambiguous(&plan.ambiguous, report);
+    for close in &plan.closes {
+        if close_takeover(gm, ctx, close, report).await {
+            add_count(&mut report.consolidate.component_takeover_closes);
+        }
+    }
+}
+
+fn note_takeover_ambiguous(notes: &[TakeoverAmbiguous], report: &mut IngestionReport) {
+    for note in notes {
+        add_count(&mut report.consolidate.component_takeover_ambiguous);
+        emit_post_line(takeover_ambiguous_line(note));
+    }
+}
+
+async fn close_takeover(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    close: &TakeoverClose,
+    report: &mut IngestionReport,
+) -> bool {
+    let Some(until) = session_midnight(ctx.date) else {
+        return false;
+    };
+    let ended = format!("{}:{TAKEOVER_REASON}", ctx.session_id);
+    match close_row(gm, &takeover_edge_row(close), &until, &ended).await {
+        Ok(true) => {
+            report.retirements.push(takeover_retirement(close));
+            emit_post_line(takeover_line(close));
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            false
+        }
+    }
+}
+
+fn takeover_edge_row(close: &TakeoverClose) -> Row {
+    Row {
+        id: String::new(),
+        entity: String::new(),
+        slot: None,
+        edge: Some(close.id.clone()),
+        subject: close.project.clone(),
+        pred: "uses".into(),
+        key: String::new(),
+        value: close.old_tool.clone(),
+        evidence: Value::Null,
+        from: String::new(),
+        here: false,
+        pending: false,
+        object_name: Some(close.old_tool.clone()),
+    }
+}
+
+fn takeover_retirement(close: &TakeoverClose) -> Retirement {
+    Retirement {
+        reason: TAKEOVER_REASON.to_string(),
+        subject: close.project.clone(),
+        predicate: "uses".into(),
+        key: String::new(),
+        old_value: close.old_tool.clone(),
+        new_value: close.new_tool.clone(),
+    }
+}
+
+fn takeover_line(close: &TakeoverClose) -> String {
+    format!(
+        "consolidate takeover: {} uses {} -> {} uses {} | job {}",
+        quote_head(&close.project),
+        quote_head(&close.old_tool),
+        quote_head(&close.component),
+        quote_head(&close.new_tool),
+        quote_head(&close.token)
+    )
+}
+
+fn takeover_ambiguous_line(note: &TakeoverAmbiguous) -> String {
+    format!(
+        "consolidate takeover ambiguous: {} uses {} | {} candidates",
+        quote_head(&note.component),
+        quote_head(&note.new_tool),
+        note.count
     )
 }
 
@@ -18824,6 +19439,621 @@ mod tests {
             .iter()
             .all(|line| !line.contains("takeover")));
         assert_eq!(super::post_reads(), 0);
+    }
+
+    fn user_turn(index: usize, text: &str) -> Turn {
+        Turn {
+            index,
+            role: TurnRole::User,
+            text: text.into(),
+        }
+    }
+
+    fn at_turn(mut fact: Fact, turn: usize) -> Fact {
+        fact.turn = turn;
+        fact
+    }
+
+    fn as_kind(mut fact: Fact, kind: Kind) -> Fact {
+        fact.subject_kind = kind;
+        fact
+    }
+
+    fn as_role(mut fact: Fact, role: super::super::schema::Role) -> Fact {
+        fact.role = Some(role);
+        fact
+    }
+
+    fn library_use(subject: &str, kind: Kind, object: &str, turn: usize) -> Fact {
+        at_turn(
+            as_role(
+                use_of(subject, kind, object, "decided"),
+                super::super::schema::Role::Library,
+            ),
+            turn,
+        )
+    }
+
+    fn timed_setting(subject: &str, kind: Kind, key: &str, value: &str, turn: usize) -> Fact {
+        as_kind(
+            at_turn(setting_of(subject, key, value, "decided"), turn),
+            kind,
+        )
+    }
+
+    fn timed_rule(subject: &str, kind: Kind, text: &str, turn: usize) -> Fact {
+        as_kind(at_turn(rule_of(subject, text), turn), kind)
+    }
+
+    fn nightjar_part(turn: usize) -> Fact {
+        at_turn(part_link("nightjar", "quillpress", Kind::Project), turn)
+    }
+
+    async fn pend_named_part(gm: &GraphMemory, subject: &str) {
+        let edges = part_edges(gm, subject).await;
+        let id = id_text(edges[0].get("id"));
+        gm.db()
+            .query("UPDATE type::record($id) SET pending = $pending")
+            .bind(("id", id))
+            .bind(("pending", json!({"since": "s11", "conflicts": "part"})))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    fn open_named(row: &Value, object: &str) -> bool {
+        row["object"] == object && row.get("ended_by").and_then(Value::as_str).is_none()
+    }
+
+    async fn open_use(gm: &GraphMemory, object: &str) -> bool {
+        uses_edges(gm)
+            .await
+            .iter()
+            .any(|row| open_named(row, object))
+    }
+
+    async fn finish_takeover(
+        gm: &GraphMemory,
+        turns: &[Turn],
+        facts: &[Fact],
+        flag: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = quillpress();
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &project, "s11", "2026-04-11", turns);
+        ctx.component_takeover_on = flag;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, facts, &WriteStats::default(), &stub, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    async fn seed_and_run(
+        old: &[Fact],
+        new: &[Fact],
+        mention: &str,
+        flag: bool,
+        pend: bool,
+    ) -> (
+        tempfile::TempDir,
+        GraphMemory,
+        IngestionReport,
+        Vec<String>,
+        u32,
+    ) {
+        let (tmp, gm) = open().await;
+        let old_turns = [user_turn(2, "quillpress uses Pygments at build time")];
+        commit_quill(&gm, "s04", "2026-04-04", &old_turns, old).await;
+        let new_turns = [user_turn(3, mention)];
+        commit_quill(&gm, "s11", "2026-04-11", &new_turns, new).await;
+        if pend {
+            pend_named_part(&gm, "nightjar").await;
+        }
+        let (report, lines, reads) = finish_takeover(&gm, &new_turns, new, flag).await;
+        (tmp, gm, report, lines, reads)
+    }
+
+    fn setting_pair() -> (Vec<Fact>, Vec<Fact>) {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 3),
+        ];
+        (old, new)
+    }
+
+    const QUIET_TURN: &str = "nightjar highlights code in the browser";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_closes_a_setting_job() {
+        let (old, new) = setting_pair();
+        let (_tmp, gm, report, lines, reads) =
+            seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert_eq!(
+            use_ended(&gm, "Pygments").await.as_deref(),
+            Some("s11:component_takeover")
+        );
+        assert!(open_use(&gm, "highlight.js").await);
+        assert!(ended_key(&slots(&gm, "quillpress").await, "highlight_time").is_none());
+        assert!(ended_key(&slots(&gm, "nightjar").await, "highlight_time").is_none());
+        assert_eq!(
+            lines,
+            vec!["consolidate takeover: quillpress uses Pygments -> nightjar uses highlight.js | job highlight"]
+        );
+        assert_eq!(report.consolidate.component_takeover_closes, Some(1));
+        assert!(report.consolidate.component_takeover_ambiguous.is_none());
+        assert_eq!(report.retirements.len(), 1);
+        assert_eq!(report.retirements[0].reason, "component_takeover");
+        assert_eq!(report.retirements[0].subject, "quillpress");
+        assert_eq!(report.retirements[0].old_value, "Pygments");
+        assert_eq!(report.retirements[0].new_value, "highlight.js");
+        assert_eq!(reads, 3);
+        assert_eq!(report.consolidate.errors, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_closes_a_rule_job() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_rule(
+                "quillpress",
+                Kind::Project,
+                "Highlight code at build time.",
+                2,
+            ),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_rule(
+                "nightjar",
+                Kind::Component,
+                "Highlight code in the browser.",
+                3,
+            ),
+        ];
+        let (_tmp, gm, report, lines, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert_eq!(
+            use_ended(&gm, "Pygments").await.as_deref(),
+            Some("s11:component_takeover")
+        );
+        assert!(open_use(&gm, "highlight.js").await);
+        assert_eq!(report.consolidate.component_takeover_closes, Some(1));
+        assert!(lines[0].contains("job highlight"), "{lines:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_closes_a_rule_and_setting_job() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_rule(
+                "quillpress",
+                Kind::Project,
+                "Highlight fenced code at build time.",
+                2,
+            ),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting(
+                "nightjar",
+                Kind::Component,
+                "highlight_runtime",
+                "browser",
+                3,
+            ),
+        ];
+        let (_tmp, gm, report, lines, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert_eq!(
+            use_ended(&gm, "Pygments").await.as_deref(),
+            Some("s11:component_takeover")
+        );
+        assert_eq!(report.consolidate.component_takeover_closes, Some(1));
+        assert!(lines[0].ends_with("job highlight"), "{lines:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_skips_a_tool_named_in_the_session() {
+        let (old, new) = setting_pair();
+        let (_tmp, gm, report, lines, _) =
+            seed_and_run(&old, &new, "nightjar replaced Pygments", true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+        assert!(lines.iter().all(|line| !line.contains("takeover")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_needs_a_co_cited_job_row() {
+        let old = vec![library_use("quillpress", Kind::Project, "Pygments", 2)];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                9,
+            ),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 9),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+
+        let old = vec![library_use("quillpress", Kind::Project, "Pygments", 2)];
+        let new = vec![
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_keeps_a_five_character_job_token() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_rule("quillpress", Kind::Project, "Build code.", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_rule("nightjar", Kind::Component, "Build data.", 3),
+        ];
+        let (_tmp, gm, report, lines, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert_eq!(
+            use_ended(&gm, "Pygments").await.as_deref(),
+            Some("s11:component_takeover")
+        );
+        assert_eq!(report.consolidate.component_takeover_closes, Some(1));
+        assert!(lines[0].ends_with("job build"), "{lines:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_drops_a_short_shared_token() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting("quillpress", Kind::Project, "code", "build", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "code", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_drops_a_stop_word_token() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_rule("quillpress", Kind::Project, "Using code.", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_rule("nightjar", Kind::Component, "Using data.", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_drops_a_generic_key_token() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting("quillpress", Kind::Project, "default_mode", "build", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "default_path", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_drops_a_party_name_token() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting("quillpress", Kind::Project, "quillpress_mode", "build", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "quillpress_path", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_drops_a_whole_tool_name() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting("quillpress", Kind::Project, "pygments_mode", "build", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "pygments_path", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_skips_equal_job_values() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting("quillpress", Kind::Project, "highlight_time", "browser", 2),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_needs_the_same_role() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+        ];
+        let mut new_use = use_of("nightjar", Kind::Component, "highlight.js", "decided");
+        new_use.role = Some(super::super::schema::Role::Database);
+        new_use.turn = 3;
+        let new = vec![
+            nightjar_part(3),
+            new_use,
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+
+        let bare = at_turn(
+            use_of("quillpress", Kind::Project, "Pygments", "decided"),
+            2,
+        );
+        let old = vec![
+            bare,
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+        ];
+        let new = setting_pair().1;
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_only_closes_a_project_tool() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+        ];
+        let new = vec![
+            nightjar_part(3),
+            library_use("quillpress", Kind::Project, "highlight.js", 3),
+            timed_setting("quillpress", Kind::Project, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(open_use(&gm, "highlight.js").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+
+        let new = vec![
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 4),
+            library_use("sidecar", Kind::Technology, "Legacy", 2),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+        ];
+        let new = setting_pair().1;
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(open_use(&gm, "Legacy").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_ignores_a_non_component_anchor() {
+        let (old, _) = setting_pair();
+        let new = vec![
+            as_kind(nightjar_part(3), Kind::Technology),
+            library_use("nightjar", Kind::Technology, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Technology, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_skips_a_pending_part_link() {
+        let (old, new) = setting_pair();
+        let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, true).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_skips_a_tool_first_seen_this_session() {
+        let new = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 3),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                3,
+            ),
+            nightjar_part(3),
+            library_use("nightjar", Kind::Component, "highlight.js", 3),
+            timed_setting("nightjar", Kind::Component, "highlight_time", "browser", 3),
+        ];
+        let (_tmp, gm, report, _, _) = seed_and_run(&[], &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_leaves_two_candidates_open() {
+        let old = vec![
+            library_use("quillpress", Kind::Project, "Pygments", 2),
+            timed_setting(
+                "quillpress",
+                Kind::Project,
+                "highlight_time",
+                "build time",
+                2,
+            ),
+            library_use("quillpress", Kind::Project, "Chroma", 2),
+            timed_setting("quillpress", Kind::Project, "highlight_mode", "server", 2),
+        ];
+        let new = setting_pair().1;
+        let (_tmp, gm, report, lines, _) = seed_and_run(&old, &new, QUIET_TURN, true, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(open_use(&gm, "Chroma").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+        assert_eq!(report.consolidate.component_takeover_ambiguous, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate takeover ambiguous: nightjar uses highlight.js | 2 candidates"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_off_does_not_close_when_another_post_pass_runs() {
+        let (old, new) = setting_pair();
+        let (_tmp, gm) = open().await;
+        let old_turns = [user_turn(2, "quillpress uses Pygments at build time")];
+        commit_quill(&gm, "s04", "2026-04-04", &old_turns, &old).await;
+        let new_turns = [user_turn(3, QUIET_TURN)];
+        commit_quill(&gm, "s11", "2026-04-11", &new_turns, &new).await;
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = quillpress();
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &project, "s11", "2026-04-11", &new_turns);
+        ctx.retire_component_on = true;
+        ctx.component_takeover_on = false;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &new, &WriteStats::default(), &stub, &mut report).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+        assert!(super::take_post_lines()
+            .iter()
+            .all(|line| !line.contains("takeover")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_off_reads_nothing() {
+        let (old, new) = setting_pair();
+        let (_tmp, gm, report, lines, reads) =
+            seed_and_run(&old, &new, QUIET_TURN, false, false).await;
+        assert!(open_use(&gm, "Pygments").await);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+        assert!(report.consolidate.component_takeover_ambiguous.is_none());
+        assert!(lines.iter().all(|line| !line.contains("takeover")));
+        assert_eq!(reads, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_takeover_counts_a_read_error_and_closes_nothing() {
+        let (old, new) = setting_pair();
+        let (tmp, gm) = open().await;
+        let old_turns = [user_turn(2, "quillpress uses Pygments at build time")];
+        commit_quill(&gm, "s04", "2026-04-04", &old_turns, &old).await;
+        let new_turns = [user_turn(3, QUIET_TURN)];
+        commit_quill(&gm, "s11", "2026-04-11", &new_turns, &new).await;
+        gm.db()
+            .query("REMOVE TABLE relates_to")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (report, lines, _) = finish_takeover(&gm, &new_turns, &new, true).await;
+        assert_eq!(report.consolidate.errors, 1);
+        assert!(report.consolidate.component_takeover_closes.is_none());
+        assert!(lines.iter().all(|line| !line.contains("takeover")));
+        assert!(ended_key(&slots(&gm, "quillpress").await, "highlight_time").is_none());
+        drop(tmp);
     }
 }
 

@@ -7,7 +7,7 @@ changes a user has to know about before upgrading.
 
 ### Added
 
-- `graph.consolidate_component_takeover`, default off. It applies only when `graph.consolidate` is also on. `bench writes --consolidate-component-takeover` writes that opt-in for one run. With the flag off, config and consolidation output stay as they are.
+- `graph.consolidate_component_takeover`, default off. With `graph.consolidate` also on, consolidation can close one project `uses` edge when a component of that project starts using a different tool for the same job. The job is a shared word in a setting or rule cited with each tool. The close is rule-only and makes no model call. `component_takeover_closes` and `component_takeover_ambiguous` are omitted from the report when unset. `bench writes --consolidate-component-takeover` turns the flag on for one run. With the flag off, config, reports and output stay as they are.
 - `graph.lasting_forget`, default off. With it on, a confirmed `graph correct --forget` still deletes the graph row and also records the decision in `memory/forgotten.jsonl` until `graph correct --unforget`. Matching later writes are skipped (`forgotten_skips`, omitted from reports when zero) and reads replace the forgotten value with `[forgotten]`. With the flag off, forget stays a hard delete and the file is not read or written.
 
 ## [5.1.0] — 2026-11-17
