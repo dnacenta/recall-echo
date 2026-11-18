@@ -721,6 +721,38 @@ async fn extract_ingested_v2(
     Ok(())
 }
 
+/// Extract one log with a caller-supplied provider. Production extract builds its own.
+#[cfg(feature = "llm")]
+pub async fn extract_log_with(
+    memory_dir: &Path,
+    log: u32,
+    text: &str,
+    session_id: &str,
+    llm: &dyn crate::graph::llm::LlmProvider,
+) -> Result<IngestionReport, RecallError> {
+    let memory = memory_dir.to_path_buf();
+    let text = text.to_string();
+    let session_id = session_id.to_string();
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let context = IngestContext::new(session_id, Some(log));
+        let report = crate::graph::v2::extract_log(
+            &gm,
+            &memory,
+            log,
+            &text,
+            &context,
+            llm,
+            PipelineVersion::V2,
+        )
+        .await?;
+        if !report.leaves_pending() {
+            gm.mark_extracted(log).await?;
+        }
+        Ok(report)
+    })
+    .await
+}
+
 #[cfg(not(feature = "llm"))]
 async fn extract_ingested_v2(
     _memory_dir: &Path,
@@ -1123,6 +1155,7 @@ struct BuildTotals {
     archives: u32,
     /// Leftover episodes from the last completeness scan, when that scan ran.
     leftovers: Option<usize>,
+    forgotten_skips: u32,
 }
 
 /// One archive after its episodes were brought up to the chunk count.
@@ -1186,7 +1219,8 @@ impl EpisodeRows {
 /// daemon, or from a copy of `graph/surreal/` when none is running; `graph/`
 /// itself is not opened. A stamped build directory is a resume of its unfinished
 /// logs. `--dry-run` lists archives and estimated calls and does not stop
-/// the daemon.
+/// the daemon. The returned count is how many candidates matched a live
+/// forget record. It is zero when the flag is off.
 ///
 /// The build, the catch-up of logs that appear while it runs, the swap, and
 /// the config write all hold the admin lock. A live run plans after that lock
@@ -1199,11 +1233,12 @@ pub async fn rebuild(
     options: ExtractOptions,
     stop: &impl RebuildStop,
     llm: Option<&dyn crate::graph::llm::LlmProvider>,
-) -> Result<(), RecallError> {
+) -> Result<u32, RecallError> {
     preflight_rebuild(memory_dir, &options)?;
     if options.dry_run {
         let plan = plan_rebuild(memory_dir, options.force, false).await?;
-        return print_rebuild_dry_run(memory_dir, &plan);
+        print_rebuild_dry_run(memory_dir, &plan)?;
+        return Ok(0);
     }
     let planned = std::sync::Mutex::new(None);
     serve_client::exclusive_without_store(
@@ -1235,7 +1270,7 @@ async fn finish_rebuild(
     plan: &RebuildPlan,
     options: &ExtractOptions,
     llm: Option<&dyn crate::graph::llm::LlmProvider>,
-) -> Result<(), RecallError> {
+) -> Result<u32, RecallError> {
     let totals = if let Some(provider) = llm {
         drive_rebuild(memory_dir, plan, provider, options).await?
     } else {
@@ -1247,9 +1282,10 @@ async fn finish_rebuild(
         drive_rebuild(memory_dir, plan, owned.as_ref(), options).await?
     };
     if !totals.finished {
-        return Ok(());
+        return Ok(totals.forgotten_skips);
     }
-    swap_and_record(memory_dir, totals.archives, totals.facts, totals.leftovers)
+    swap_and_record(memory_dir, totals.archives, totals.facts, totals.leftovers)?;
+    Ok(totals.forgotten_skips)
 }
 
 /// Config, pipeline, server mode, and rewrite validation. No store is opened,
@@ -2378,6 +2414,7 @@ async fn drive_rebuild(
     let mut measured = 0u64;
     let mut estimated = 0u64;
     let mut facts = 0u32;
+    let mut forgotten_skips = 0u32;
     let mut batch = plan.pending.clone();
     let mut processed = false;
     let leftovers;
@@ -2417,6 +2454,7 @@ async fn drive_rebuild(
                     facts,
                     archives: 0,
                     leftovers: None,
+                    forgotten_skips,
                 });
             }
             let built =
@@ -2427,6 +2465,7 @@ async fn drive_rebuild(
             if let BuiltArchive::Done(report) = built {
                 measured = measured.saturating_add(report.measured_tokens);
                 estimated = estimated.saturating_add(report.estimated_tokens);
+                forgotten_skips = forgotten_skips.saturating_add(report.forgotten_skips);
                 if report.leaves_pending() {
                     let detail = report
                         .errors
@@ -2462,6 +2501,7 @@ async fn drive_rebuild(
         facts,
         archives: u32::try_from(archives.len()).unwrap_or(u32::MAX),
         leftovers,
+        forgotten_skips,
     })
 }
 
@@ -2817,7 +2857,11 @@ fn refusal_text(err: &crate::graph::error::GraphError) -> &'static str {
 /// whose counters stay zero, so the v1 success line does not change.
 #[cfg(feature = "llm")]
 fn v2_report_suffix(report: &IngestionReport) -> String {
-    if report.windows == 0 && report.candidates == 0 && report.kept == 0 && report.drops.is_empty()
+    if report.windows == 0
+        && report.candidates == 0
+        && report.kept == 0
+        && report.drops.is_empty()
+        && report.forgotten_skips == 0
     {
         return String::new();
     }
@@ -2833,13 +2877,23 @@ fn v2_report_suffix(report: &IngestionReport) -> String {
             .join(",")
     };
     format!(
-        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept{}",
+        ", {} windows, {} calls, {} candidates, drops {drops}, {} kept{}{}",
         report.windows,
         report.llm_calls,
         report.candidates,
         report.kept,
-        resolve_suffix(&report.resolve)
+        resolve_suffix(&report.resolve),
+        forgotten_suffix(report)
     )
+}
+
+#[cfg(feature = "llm")]
+fn forgotten_suffix(report: &IngestionReport) -> String {
+    if report.forgotten_skips == 0 {
+        String::new()
+    } else {
+        format!(", forgotten_skips={}", report.forgotten_skips)
+    }
 }
 
 #[cfg(feature = "llm")]
@@ -2906,7 +2960,8 @@ pub struct ExtractOptions {
 #[cfg(feature = "llm")]
 pub async fn extract(memory_dir: &Path, options: ExtractOptions) -> Result<(), RecallError> {
     if options.rebuild {
-        return rebuild(memory_dir, options, &LiveDaemonStop, None).await;
+        rebuild(memory_dir, options, &LiveDaemonStop, None).await?;
+        return Ok(());
     }
     let ExtractOptions {
         log,
@@ -3389,6 +3444,15 @@ pub async fn pipeline_status(memory_dir: &Path, staleness_days: u32) -> Result<(
 
 /// Trace pipeline flow for an entity.
 pub async fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), RecallError> {
+    print!("{}", render_pipeline_flow(memory_dir, entity_name).await?);
+    Ok(())
+}
+
+/// The text [`pipeline_flow`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_pipeline_flow(
+    memory_dir: &Path,
+    entity_name: &str,
+) -> Result<String, RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -3398,27 +3462,51 @@ pub async fn pipeline_flow(memory_dir: &Path, entity_name: &str) -> Result<(), R
 
     serve_client::exclusive(memory_dir, |gm| async move {
         let chain = gm.pipeline_flow(entity_name).await?;
-
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let mut out = String::new();
         if chain.is_empty() {
-            println!("{WARN}No pipeline relationships found for \"{entity_name}\".{RESET}");
-            return Ok(());
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("{WARN}No pipeline relationships found for \"{entity_name}\".{RESET}\n"),
+            );
+            return Ok(out);
         }
 
-        println!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n");
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!("{BOLD}Pipeline Flow: {entity_name}{RESET}\n\n"),
+        );
         for (source, rel_type, target) in &chain {
-            println!(
-                "  {} ({}) {ACCENT}—[{rel_type}]→{RESET} {} ({})",
-                source.name, source.entity_type, target.name, target.entity_type
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!(
+                    "  {} ({}) {ACCENT}—[{rel_type}]→{RESET} {} ({})\n",
+                    source.name, source.entity_type, target.name, target.entity_type
+                ),
             );
         }
-
-        Ok(())
+        Ok(out)
     })
     .await
 }
 
 /// List stale pipeline entities.
 pub async fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<(), RecallError> {
+    print!(
+        "{}",
+        render_pipeline_stale(memory_dir, staleness_days).await?
+    );
+    Ok(())
+}
+
+/// The text [`pipeline_stale`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_pipeline_stale(
+    memory_dir: &Path,
+    staleness_days: u32,
+) -> Result<String, RecallError> {
     let graph_dir = memory_dir.join("graph");
     if !graph_dir.exists() {
         return Err(RecallError::NotInitialized(
@@ -3428,32 +3516,64 @@ pub async fn pipeline_stale(memory_dir: &Path, staleness_days: u32) -> Result<()
 
     serve_client::exclusive(memory_dir, |gm| async move {
         let stats = gm.pipeline_stats(staleness_days).await?;
-
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let mut out = String::new();
         let total_stale = stats.stale_thoughts.len() + stats.stale_questions.len();
         if total_stale == 0 {
-            println!("{GOOD}✓{RESET} No stale pipeline entities.");
-            return Ok(());
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("{GOOD}✓{RESET} No stale pipeline entities.\n"),
+            );
+            return Ok(out);
         }
 
-        println!("{BOLD}Stale Pipeline Entities{RESET}\n");
-
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!("{BOLD}Stale Pipeline Entities{RESET}\n\n"),
+        );
         if !stats.stale_thoughts.is_empty() {
-            println!("  {WARN}Thoughts (>{staleness_days} days):{RESET}");
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("  {WARN}Thoughts (>{staleness_days} days):{RESET}\n"),
+            );
             for entity in &stats.stale_thoughts {
-                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+                push_masked(
+                    &mut out,
+                    mask.as_ref(),
+                    &format!(
+                        "    • {} {DIM}({}){RESET}\n",
+                        entity.name, entity.entity_type
+                    ),
+                );
             }
         }
-
         if !stats.stale_questions.is_empty() {
-            println!("  {WARN}Questions (>{} days):{RESET}", staleness_days * 2);
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("  {WARN}Questions (>{} days):{RESET}\n", staleness_days * 2),
+            );
             for entity in &stats.stale_questions {
-                println!("    • {} {DIM}({}){RESET}", entity.name, entity.entity_type);
+                push_masked(
+                    &mut out,
+                    mask.as_ref(),
+                    &format!(
+                        "    • {} {DIM}({}){RESET}\n",
+                        entity.name, entity.entity_type
+                    ),
+                );
             }
         }
-
-        Ok(())
+        Ok(out)
     })
     .await
+}
+
+fn push_masked(out: &mut String, mask: Option<&crate::graph::forgotten::ForgetSet>, line: &str) {
+    out.push_str(&crate::graph::forgotten::apply_mask(mask, line));
 }
 
 /// Read pipeline documents from a directory.
@@ -3725,6 +3845,8 @@ pub struct CorrectOptions {
     pub all_edges: bool,
     /// Skip the confirmation a removal otherwise requires.
     pub yes: bool,
+    /// Deactivate a lasting-forget record. The graph is not changed.
+    pub unforget: bool,
 }
 
 impl CorrectOptions {
@@ -3771,31 +3893,151 @@ impl CorrectOptions {
 /// A hot operation: it goes through the daemon like search and ingest, so a
 /// correction lands while a session is still using the store.
 pub async fn correct(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
+    if options.unforget {
+        return unforget_command(memory_dir, options).await;
+    }
+    apply_correction(memory_dir, options).await
+}
+
+async fn apply_correction(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
     let target = options.target()?;
     let report = send_correction(memory_dir, &target, options.correction()?).await?;
+    finish_correction(memory_dir, options, &target, report).await
+}
 
+async fn finish_correction(
+    memory_dir: &Path,
+    options: &CorrectOptions,
+    target: &CorrectTarget,
+    report: CorrectionReport,
+) -> Result<(), RecallError> {
     match report {
         // A removal is planned before it is applied, so the human sees what
         // goes before anything does.
         CorrectionReport::Planned { removal } => {
-            print_removal_plan(&removal);
-            if !options.yes && !confirm_removal(&removal)? {
-                println!("{WARN}Nothing removed.{RESET}");
-                return Ok(());
-            }
-            let applied =
-                send_correction(memory_dir, &target, Correction::Forget { confirmed: true })
-                    .await?;
-            // Still through `refusal`: the graph can have moved between the
-            // plan and the confirmation, and a removal that found nothing to
-            // remove must not exit as though it had.
-            print_correction(&applied);
-            refusal(&applied)
+            confirm_and_forget(memory_dir, options, target, &removal).await
         }
         other => {
             print_correction(&other);
             refusal(&other)
         }
+    }
+}
+
+async fn confirm_and_forget(
+    memory_dir: &Path,
+    options: &CorrectOptions,
+    target: &CorrectTarget,
+    removal: &Removal,
+) -> Result<(), RecallError> {
+    print_removal_plan(
+        removal,
+        crate::graph::forgotten::lasting_forget_on(memory_dir),
+    );
+    if !options.yes && !confirm_removal(removal)? {
+        println!("{WARN}Nothing removed.{RESET}");
+        return Ok(());
+    }
+    let applied =
+        send_correction(memory_dir, target, Correction::Forget { confirmed: true }).await?;
+    // Still through `refusal`: the graph can have moved between the
+    // plan and the confirmation, and a removal that found nothing to
+    // remove must not exit as though it had.
+    print_correction(&applied);
+    refusal(&applied)
+}
+
+async fn unforget_command(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
+    require_lasting_forget(memory_dir)?;
+    let selector = unforget_selector(options)?;
+    let matches = crate::graph::forgotten::matching_live(memory_dir, &selector)?;
+    commit_unforget(memory_dir, options, &selector, &matches)
+}
+
+fn require_lasting_forget(memory_dir: &Path) -> Result<(), RecallError> {
+    if crate::graph::forgotten::lasting_forget_on(memory_dir) {
+        return Ok(());
+    }
+    Err(RecallError::Other(
+        "graph.lasting_forget is off; nothing was written. Set graph.lasting_forget before --unforget"
+            .into(),
+    ))
+}
+
+fn unforget_selector(
+    options: &CorrectOptions,
+) -> Result<crate::graph::forgotten::UnforgetSelector, RecallError> {
+    match (&options.rel_type, &options.object) {
+        (None, None) => Ok(crate::graph::forgotten::UnforgetSelector::Entity {
+            subject: options.subject.clone(),
+        }),
+        (Some(relation), Some(value)) => Ok(crate::graph::forgotten::UnforgetSelector::Fact {
+            subject: options.subject.clone(),
+            relation: relation.clone(),
+            value: value.clone(),
+        }),
+        _ => Err(RecallError::Other(
+            "a relationship needs all three names: \
+             `graph correct <from> <REL> <to> --unforget`"
+                .into(),
+        )),
+    }
+}
+
+fn commit_unforget(
+    memory_dir: &Path,
+    options: &CorrectOptions,
+    selector: &crate::graph::forgotten::UnforgetSelector,
+    matches: &[crate::graph::forgotten::ForgetRecord],
+) -> Result<(), RecallError> {
+    if matches.is_empty() {
+        return Err(RecallError::Other(
+            "no live forget record matched — nothing was changed".into(),
+        ));
+    }
+    print_unforget_plan(matches);
+    if !options.yes && !confirm_unforget()? {
+        println!("{WARN}Nothing restored.{RESET}");
+        return Ok(());
+    }
+    let count = crate::graph::forgotten::unforget_records(
+        memory_dir,
+        selector,
+        crate::graph::forgotten::forget_lock_wait(),
+    )?;
+    println!(
+        "{GOOD}✓{RESET} Deactivated {count} {}.",
+        plural(count, "forget record", "forget records")
+    );
+    Ok(())
+}
+
+fn confirm_unforget() -> Result<bool, RecallError> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return Err(RecallError::Other(
+            "refusing to unforget without confirmation — re-run with --yes".into(),
+        ));
+    }
+    print!("{BOLD}Restore this forget?{RESET} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+fn print_unforget_plan(records: &[crate::graph::forgotten::ForgetRecord]) {
+    println!("{BOLD}{WARN}This would restore:{RESET}\n");
+    for record in records {
+        println!("  {}", unforget_line(record));
+    }
+}
+
+fn unforget_line(record: &crate::graph::forgotten::ForgetRecord) -> String {
+    match (&record.relation, &record.value) {
+        (Some(relation), Some(value)) => format!("{} —[{relation}]→ {value}", record.subject),
+        _ => record.subject.clone(),
     }
 }
 
@@ -3896,7 +4138,7 @@ fn print_correction(report: &CorrectionReport) {
             );
         }
         CorrectionReport::Contradicted { edges } => print_contradictions(edges),
-        CorrectionReport::Planned { removal } => print_removal_plan(removal),
+        CorrectionReport::Planned { removal } => print_removal_plan(removal, false),
         CorrectionReport::Removed { removal } => {
             let entity = removal
                 .entity
@@ -3938,7 +4180,7 @@ fn print_contradictions(edges: &[EdgeCorrection]) {
     );
 }
 
-fn print_removal_plan(removal: &Removal) {
+fn print_removal_plan(removal: &Removal, lasting: bool) {
     println!("{BOLD}{WARN}This would remove:{RESET}\n");
     if let Some(entity) = &removal.entity {
         println!(
@@ -3955,6 +4197,18 @@ fn print_removal_plan(removal: &Removal) {
             plural(removal.edges.len(), "relationship", "relationships")
         );
         print_edges(&removal.edges);
+    }
+    print_removal_close(lasting);
+}
+
+fn print_removal_close(lasting: bool) {
+    if lasting {
+        println!(
+            "\n  {DIM}Removal is not evidence — the decision stays in memory/forgotten.jsonl \
+             until --unforget and cannot be re-weighed. Prefer --wrong unless the memory \
+             should never have existed.{RESET}"
+        );
+        return;
     }
     println!(
         "\n  {DIM}Removal is not evidence — it leaves no trace and cannot be re-weighed. \
@@ -4026,6 +4280,19 @@ pub async fn decay_report(
     entity_name: Option<&str>,
     show_all: bool,
 ) -> Result<(), RecallError> {
+    print!(
+        "{}",
+        render_decay_report(memory_dir, entity_name, show_all).await?
+    );
+    Ok(())
+}
+
+/// The text [`decay_report`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_decay_report(
+    memory_dir: &Path,
+    entity_name: Option<&str>,
+    show_all: bool,
+) -> Result<String, RecallError> {
     use crate::graph::confidence;
     use crate::graph::types::Direction;
 
@@ -4038,6 +4305,8 @@ pub async fn decay_report(
 
     serve_client::exclusive(memory_dir, |gm| async move {
         let now = chrono::Utc::now();
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let mut out = String::new();
 
         let rels = if let Some(name) = entity_name {
             gm.get_relationships(name, Direction::Both).await?
@@ -4046,14 +4315,22 @@ pub async fn decay_report(
         };
 
         if rels.is_empty() {
-            println!("{WARN}No relationships found.{RESET}");
-            return Ok(());
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!("{WARN}No relationships found.{RESET}\n"),
+            );
+            return Ok(out);
         }
 
-        println!(
-            "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n",
-            rels.len(),
-            confidence::DEFAULT_HALF_LIFE_DAYS
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!(
+                "{BOLD}Decay Report{RESET} ({} relationships, half-life: {} days)\n\n",
+                rels.len(),
+                confidence::DEFAULT_HALF_LIFE_DAYS
+            ),
         );
 
         let mut decayed_count = 0u32;
@@ -4115,23 +4392,31 @@ pub async fn decay_report(
                 }
             );
 
-            println!(
-                "  {from_short} {ACCENT}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}",
-                rel.rel_type, rel.confidence, effective,
+            push_masked(
+                &mut out,
+                mask.as_ref(),
+                &format!(
+                    "  {from_short} {ACCENT}—[{}]→{RESET} {to_short}  stored:{:.2} effective:{:.2} {decay_indicator}{evidence_tag}{reinforced_tag}\n",
+                    rel.rel_type, rel.confidence, effective,
+                ),
             );
         }
 
-        println!(
-            "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}",
-            rels.len(),
-            if rels.is_empty() {
-                0.0
-            } else {
-                total_decay / rels.len() as f64
-            }
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &format!(
+                "\n{BOLD}Summary{RESET}: {decayed_count}/{} relationships decayed, avg decay: {:.3}\n",
+                rels.len(),
+                if rels.is_empty() {
+                    0.0
+                } else {
+                    total_decay / rels.len() as f64
+                }
+            ),
         );
 
-        Ok(())
+        Ok(out)
     })
     .await
 }
@@ -4262,6 +4547,22 @@ mod tests {
             "{}",
             v2_report_suffix(&v2)
         );
+    }
+
+    #[test]
+    fn a_forgotten_skip_is_named_on_the_extract_line() {
+        let report = IngestionReport {
+            windows: 1,
+            forgotten_skips: 1,
+            ..IngestionReport::default()
+        };
+        assert!(
+            v2_report_suffix(&report).contains("forgotten_skips=1"),
+            "{}",
+            v2_report_suffix(&report)
+        );
+        let quiet = IngestionReport::default();
+        assert!(!v2_report_suffix(&quiet).contains("forgotten_skips"));
     }
 
     /// The line a user reads must not claim a measurement it does not have.

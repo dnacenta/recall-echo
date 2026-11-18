@@ -102,8 +102,21 @@ recall-echo graph correct FROM REL TO --forget   remove one relationship
 
 `--wrong` records one contradicting observation at `weight_user` (0.8 by default) and
 lets the posterior move: say it twice and it counts twice. `--forget` prints what would go
-and asks first; a non-interactive stdin is never taken as consent. Corrections exist only
-on the CLI, because a model calling them would record its own judgement as yours.
+and asks first; a non-interactive stdin is never taken as consent. With
+`graph.lasting_forget` off (the default) the removal leaves no trace. With the flag on,
+the decision stays in `memory/forgotten.jsonl` until `graph correct --unforget`, later
+writes of that subject, relation or key, and value are skipped, and reads show
+`[forgotten]` in place of the value. Set it with `config set graph.lasting_forget true`.
+Corrections exist only on the CLI, because a model calling them would record its own
+judgement as yours.
+
+A lasting forget does not rewrite `conversations/*.md`, `EPHEMERAL.md`, `MEMORY.md`,
+turn sidecars, PreCompact checkpoints, or `graph.v1-backup-*`. `consume` and MEMORY.md
+may still show the raw value. Putting an old `graph.v1-backup-*` back on `graph/` can
+restore rows; while the forget file and the flag remain, reads still mask and writes
+still skip, and those restored rows are not deleted. Replacing the whole `memory/` tree,
+including the forget file, undoes the decision. There is no slot forget: a `setting`,
+`rule`, or `prefers` value goes away only as part of an entity forget.
 
 ## Writing and maintenance
 

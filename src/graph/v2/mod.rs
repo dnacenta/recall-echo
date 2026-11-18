@@ -36,8 +36,8 @@ use super::GraphMemory;
 use crate::error::RecallError;
 pub(crate) use resolve::RESOLVER_CALL_BOUND;
 pub(crate) use write::{
-    carries_v2_record, ensure_v2_store, read_stamp, refuse_v1_session, refuse_v1_write, V1_REFUSAL,
-    V2_REFUSAL,
+    carries_v2_record, ensure_v2_store, read_stamp, refuse_v1_session, refuse_v1_write,
+    values_equal, V1_REFUSAL, V2_REFUSAL,
 };
 
 /// Which extraction pipeline a run uses.

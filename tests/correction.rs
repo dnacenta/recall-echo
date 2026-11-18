@@ -22,7 +22,8 @@ mod common;
 use common::daemon::{self, Edge, Fixture};
 use recall_echo::graph::correct::{CorrectTarget, Correction, CorrectionReport};
 use recall_echo::graph::store::Db;
-use recall_echo::serve::{CorrectArgs, Request};
+use recall_echo::graph_cli::{self, CorrectOptions};
+use recall_echo::serve::{AddEntityArgs, CorrectArgs, RelateArgs, Request};
 use recall_echo::serve_client;
 use std::path::Path;
 use surrealdb::Surreal;
@@ -533,4 +534,654 @@ async fn forgetting_a_name_that_does_not_resolve_removes_nothing() {
     assert_eq!(daemon::entity_names(&db).await.len(), 3);
     assert_eq!(daemon::edges(&db).await.len(), 2);
     daemon::close(db).await;
+}
+
+fn enable_lasting(memory_dir: &Path) {
+    let path = memory_dir.join(".recall-echo.toml");
+    let mut text = std::fs::read_to_string(&path).expect("config");
+    text.push_str("\n[graph]\nlasting_forget = true\n");
+    std::fs::write(&path, text).expect("write config");
+}
+
+fn forget_rows(memory_dir: &Path) -> Vec<serde_json::Value> {
+    let path = memory_dir.join("forgotten.jsonl");
+    let text = std::fs::read_to_string(&path).expect("forget file");
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect()
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+async fn try_correct(
+    memory_dir: &Path,
+    target: CorrectTarget,
+    correction: Correction,
+) -> Result<CorrectionReport, recall_echo::error::RecallError> {
+    let request = Request::Correct(CorrectArgs { target, correction });
+    let data = serve_client::execute(memory_dir, &request).await?;
+    Ok(serde_json::from_value(data)?)
+}
+
+struct HeldForgetLock {
+    file: std::fs::File,
+}
+
+impl HeldForgetLock {
+    fn on(path: &Path) -> Self {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("lock file");
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "could not hold the forget lock");
+        Self { file }
+    }
+}
+
+impl Drop for HeldForgetLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[tokio::test]
+async fn flag_off_forget_deletes_and_writes_no_file() {
+    let fixture = Fixture::new();
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Removed { .. }));
+    assert!(!fixture.memory_dir.join("forgotten.jsonl").exists());
+    assert!(!fixture.memory_dir.join(".forgotten.lock").exists());
+}
+
+#[tokio::test]
+async fn an_unconfirmed_forget_with_the_flag_on_writes_no_record() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        entity("Vim"),
+        Correction::Forget { confirmed: false },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Planned { .. }));
+    assert!(!fixture.memory_dir.join("forgotten.jsonl").exists());
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 2);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn a_confirmed_relationship_forget_records_each_live_edge() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    let CorrectionReport::Removed { removal } = report else {
+        panic!("expected a removal");
+    };
+    assert!(removal.entity.is_none());
+    assert_eq!(removal.edges.len(), 1);
+
+    let rows = forget_rows(&fixture.memory_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["v"], 1);
+    assert_eq!(rows[0]["status"], "active");
+    assert_eq!(rows[0]["kind"], "fact");
+    assert_eq!(rows[0]["subject"], "D");
+    assert_eq!(rows[0]["relation"], "USES");
+    assert_eq!(rows[0]["value"], "Vim");
+    assert_eq!(rows[0]["provenance"], "user");
+    assert_eq!(mode_of(&fixture.memory_dir.join("forgotten.jsonl")), 0o600);
+    assert_eq!(mode_of(&fixture.memory_dir.join(".forgotten.lock")), 0o600);
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 1);
+    assert_eq!(daemon::entity_names(&db).await.len(), 3);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn a_confirmed_entity_forget_records_the_name_and_every_edge() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        entity("Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    let CorrectionReport::Removed { removal } = report else {
+        panic!("expected a removal");
+    };
+    assert_eq!(removal.edges.len(), 2);
+
+    let rows = forget_rows(&fixture.memory_dir);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| {
+        row["kind"] == "entity" && row["subject"] == "vim" && row["status"] == "active"
+    }));
+    assert!(rows.iter().any(|row| {
+        row["kind"] == "fact" && row["subject"] == "D" && row["relation"] == "USES"
+    }));
+    assert!(rows.iter().any(|row| {
+        row["kind"] == "fact" && row["subject"] == "Vim" && row["relation"] == "CONFIGURED_BY"
+    }));
+    assert_eq!(mode_of(&fixture.memory_dir.join("forgotten.jsonl")), 0o600);
+}
+
+#[tokio::test]
+async fn a_held_forget_lock_deletes_nothing() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let lock_path = fixture.memory_dir.join(".forgotten.lock");
+    let _held = HeldForgetLock::on(&lock_path);
+    let err = try_correct(
+        &fixture.memory_dir,
+        entity("Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await
+    .expect_err("lock");
+    let message = err.to_string();
+    assert!(
+        message.contains(&lock_path.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("locked"), "{message}");
+    assert!(!fixture.memory_dir.join("forgotten.jsonl").exists());
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 2);
+    assert_eq!(daemon::entity_names(&db).await.len(), 3);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn unforget_without_yes_writes_nothing_and_yes_deactivates_one_fact() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+    correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+
+    let options = CorrectOptions {
+        subject: "D".into(),
+        rel_type: Some("uses".into()),
+        object: Some("Vim".into()),
+        wrong: false,
+        forget: false,
+        all_edges: false,
+        yes: false,
+        unforget: true,
+    };
+    let err = graph_cli::correct(&fixture.memory_dir, &options)
+        .await
+        .expect_err("needs yes");
+    assert!(err.to_string().contains("--yes"), "{err}");
+    assert_eq!(forget_rows(&fixture.memory_dir)[0]["status"], "active");
+
+    let mut confirmed = options;
+    confirmed.yes = true;
+    graph_cli::correct(&fixture.memory_dir, &confirmed)
+        .await
+        .expect("unforget");
+    let rows = forget_rows(&fixture.memory_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], "inactive");
+    assert!(rows[0]["unforgotten_at"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn unforget_with_the_flag_off_names_the_flag_and_writes_nothing() {
+    let fixture = Fixture::new();
+    let path = fixture.memory_dir.join("forgotten.jsonl");
+    std::fs::write(&path, b"{not json\n").expect("leftover");
+    let err = graph_cli::correct(
+        &fixture.memory_dir,
+        &CorrectOptions {
+            subject: "Vim".into(),
+            rel_type: None,
+            object: None,
+            wrong: false,
+            forget: false,
+            all_edges: false,
+            yes: true,
+            unforget: true,
+        },
+    )
+    .await
+    .expect_err("flag off");
+    assert!(err.to_string().contains("lasting_forget"), "{err}");
+    assert_eq!(std::fs::read(&path).expect("bytes"), b"{not json\n");
+}
+
+#[tokio::test]
+async fn an_entity_unforget_clears_that_subject_only() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+    correct(
+        &fixture.memory_dir,
+        entity("Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &CorrectOptions {
+            subject: "Vim".into(),
+            rel_type: None,
+            object: None,
+            wrong: false,
+            forget: false,
+            all_edges: false,
+            yes: true,
+            unforget: true,
+        },
+    )
+    .await
+    .expect("unforget");
+
+    let rows = forget_rows(&fixture.memory_dir);
+    assert_eq!(rows.len(), 3);
+    let active: Vec<_> = rows
+        .iter()
+        .filter(|row| row["status"] == "active")
+        .collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["subject"], "D");
+    assert_eq!(active[0]["relation"], "USES");
+}
+
+#[tokio::test]
+async fn relate_and_add_entity_name_unforget_when_the_flag_is_on() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+    correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+
+    let relate = serve_client::execute(
+        &fixture.memory_dir,
+        &Request::Relate(RelateArgs {
+            from: "D".into(),
+            rel_type: "USES".into(),
+            to: "Vim".into(),
+            description: None,
+            source: None,
+        }),
+    )
+    .await
+    .expect_err("relate");
+    assert!(relate.to_string().contains("--unforget"), "{relate}");
+
+    correct(
+        &fixture.memory_dir,
+        entity("Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    let add = serve_client::execute(
+        &fixture.memory_dir,
+        &Request::AddEntity(AddEntityArgs {
+            name: "Vim".into(),
+            entity_type: "tool".into(),
+            abstract_text: "editor".into(),
+            overview: None,
+            source: None,
+        }),
+    )
+    .await
+    .expect_err("add");
+    assert!(add.to_string().contains("--unforget"), "{add}");
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert!(!daemon::entity_names(&db)
+        .await
+        .iter()
+        .any(|name| name == "Vim"));
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn a_malformed_forget_file_deletes_nothing() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let path = fixture.memory_dir.join("forgotten.jsonl");
+    std::fs::write(&path, b"{not json\n").expect("leftover");
+    let db = fixture.open().await;
+    seed_two_claims(&db).await;
+    daemon::close(db).await;
+
+    let err = try_correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await
+    .expect_err("malformed forget file");
+    let message = err.to_string();
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(message.contains("invalid JSON"), "{message}");
+    assert_eq!(std::fs::read(&path).expect("bytes"), b"{not json\n");
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 2);
+    assert_eq!(daemon::entity_names(&db).await.len(), 3);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn flag_off_forget_ignores_a_malformed_leftover() {
+    let fixture = Fixture::new();
+    let path = fixture.memory_dir.join("forgotten.jsonl");
+    std::fs::write(&path, b"{not json\n").expect("leftover");
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Removed { .. }));
+    assert_eq!(std::fs::read(&path).expect("bytes"), b"{not json\n");
+    assert!(!fixture.memory_dir.join(".forgotten.lock").exists());
+}
+
+#[tokio::test]
+async fn a_confirmed_forget_does_not_rewrite_source_files() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let files = [
+        "conversations/conversation-001.md",
+        "EPHEMERAL.md",
+        "MEMORY.md",
+        "turns/conversation-001.json",
+        "checkpoints/precompact.md",
+        "graph.v1-backup-2026/KEEP",
+    ];
+    let mut before = Vec::new();
+    for file in files {
+        let path = fixture.memory_dir.join(file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        let bytes = format!("raw value Vim in {file}\n");
+        std::fs::write(&path, &bytes).expect("plant");
+        before.push(bytes);
+    }
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+    correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    for (file, bytes) in files.iter().zip(before) {
+        let path = fixture.memory_dir.join(file);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            bytes,
+            "{file}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_leftover_closed_edge_is_masked_on_decay_flow_and_stale() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    daemon::create_entity(&db, "entity:d", "D", "person").await;
+    daemon::create_entity(&db, "entity:vim", "Vim", "tool").await;
+    let live = daemon::create_edge(&db, &Edge::default()).await;
+    let closed = daemon::create_edge(&db, &Edge::default()).await;
+    close_edge(&db, &closed).await;
+    daemon::create_edge(
+        &db,
+        &Edge {
+            rel_type: "EVOLVED_FROM",
+            ..Edge::default()
+        },
+    )
+    .await;
+    mark_stale_thought(&db, "entity:vim").await;
+    age_edges(&db).await;
+    daemon::close(db).await;
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Removed { .. }));
+    fixture.stop_daemon().await;
+
+    let db = fixture.open().await;
+    let rows = edge_rows(&db).await;
+    assert!(
+        rows.iter()
+            .any(|row| row.id == closed && row.closed && row.rel_type == "USES"),
+        "closed edge was deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.id == live),
+        "live edge survived the forget: {rows:?}"
+    );
+    daemon::close(db).await;
+
+    let decay = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("decay");
+    let flow = graph_cli::render_pipeline_flow(&fixture.memory_dir, "D")
+        .await
+        .expect("flow");
+    let stale = graph_cli::render_pipeline_stale(&fixture.memory_dir, 1)
+        .await
+        .expect("stale");
+    for (name, text) in [("decay", decay), ("flow", flow), ("stale", stale)] {
+        assert!(text.contains("[forgotten]"), "{name}: {text}");
+        assert!(
+            !text.to_lowercase().contains("vim"),
+            "{name} still prints the value: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restored_row_is_masked_on_decay() {
+    let fixture = Fixture::new();
+    enable_lasting(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+
+    let backup = fixture.memory_dir.join("graph-copy");
+    copy_dir(&fixture.memory_dir.join("graph"), &backup);
+
+    let report = correct(
+        &fixture.memory_dir,
+        edge("D", "USES", "Vim"),
+        Correction::Forget { confirmed: true },
+    )
+    .await;
+    assert!(matches!(report, CorrectionReport::Removed { .. }));
+    fixture.stop_daemon().await;
+
+    std::fs::remove_dir_all(fixture.memory_dir.join("graph")).expect("remove graph");
+    copy_dir(&backup, &fixture.memory_dir.join("graph"));
+
+    let text = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("decay");
+    assert!(text.contains("[forgotten]"), "{text}");
+    assert!(!text.to_lowercase().contains("vim"), "{text}");
+
+    let db = fixture.open().await;
+    assert_eq!(daemon::edges(&db).await.len(), 1);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn flag_off_decay_still_prints_the_value() {
+    let fixture = Fixture::new();
+    std::fs::create_dir(fixture.memory_dir.join("forgotten.jsonl")).expect("block the file");
+    let db = fixture.open().await;
+    seed_one_claim(&db).await;
+    daemon::close(db).await;
+
+    let text = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("flag off does not read the forget file");
+    assert!(text.to_lowercase().contains("vim"), "{text}");
+    assert!(!text.contains("[forgotten]"), "{text}");
+}
+
+#[derive(Debug)]
+struct StoredEdge {
+    id: String,
+    rel_type: String,
+    closed: bool,
+}
+
+async fn close_edge(db: &Surreal<Db>, edge_id: &str) {
+    db.query("UPDATE type::record($id) SET valid_until = time::now()")
+        .bind(("id", edge_id.to_string()))
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .expect("close edge");
+}
+
+async fn mark_stale_thought(db: &Surreal<Db>, entity_id: &str) {
+    db.query(
+        "UPDATE type::record($id) SET \
+             attributes.pipeline_stage = 'thoughts', \
+             attributes.pipeline_status = 'active', \
+             updated_at = <datetime>'2020-01-01T00:00:00Z'",
+    )
+    .bind(("id", entity_id.to_string()))
+    .await
+    .and_then(surrealdb::IndexedResults::check)
+    .expect("mark thought");
+}
+
+async fn age_edges(db: &Surreal<Db>) {
+    db.query("UPDATE relates_to SET valid_from = <datetime>'2020-01-01T00:00:00Z'")
+        .await
+        .and_then(surrealdb::IndexedResults::check)
+        .expect("age edges");
+}
+
+async fn edge_rows(db: &Surreal<Db>) -> Vec<StoredEdge> {
+    let mut response = db
+        .query(
+            "SELECT type::string(id) AS id, rel_type, valid_until != NONE AS closed \
+             FROM relates_to",
+        )
+        .await
+        .expect("list");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("rows");
+    rows.into_iter()
+        .map(|row| StoredEdge {
+            id: row["id"].as_str().unwrap_or_default().to_string(),
+            rel_type: row["rel_type"].as_str().unwrap_or_default().to_string(),
+            closed: row["closed"].as_bool().unwrap_or(false),
+        })
+        .collect()
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("dest");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).expect("copy");
+        }
+    }
+}
+
+#[test]
+fn conversation_numbers_ignore_the_forget_lock_and_temps() {
+    let dir = tempfile::tempdir().expect("temp");
+    std::fs::write(dir.path().join("conversation-003.md"), "x").expect("archive");
+    std::fs::write(dir.path().join(".forgotten.lock"), "").expect("lock");
+    std::fs::write(dir.path().join(".forgotten.jsonl.9.9.tmp"), "temp").expect("temp");
+    assert_eq!(
+        recall_echo::archive::highest_conversation_number(dir.path()),
+        3
+    );
 }

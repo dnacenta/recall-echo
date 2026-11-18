@@ -37,7 +37,7 @@ talk itself into things. The maths: [bayesian-confidence.md](bayesian-confidence
 
 A correction is evidence at your authority, not an override: a claim resting on twenty
 observations survives one `--wrong` with less confidence, a claim resting on one collapses.
-`--forget` deletes outright and leaves no trace, so prefer `--wrong`.
+`--forget` deletes the graph row. With `graph.lasting_forget` off it leaves no trace; with the flag on the decision stays in `memory/forgotten.jsonl` until `--unforget`. Prefer `--wrong`.
 
 ## Layout
 
@@ -48,13 +48,15 @@ All paths hang off a pulse root, the home of the agent whose memory this is:
 ├── MEMORY.md              layer 1: curated facts (keep it under ~200 lines)
 ├── EPHEMERAL.md           layer 2: rolling window of session summaries (default 5, FIFO)
 ├── .EPHEMERAL.lock        lock for EPHEMERAL.md updates (empty; safe to ignore)
+├── forgotten.jsonl        lasting-forget records, when graph.lasting_forget is on
+├── .forgotten.lock        lock for forgotten.jsonl updates (empty; safe to ignore)
 ├── ARCHIVE.md             layer 3: conversation index
 ├── conversations/         layer 3: conversation-001.md, conversation-002.md, …
 ├── graph/                 layer 0: surreal/ (data), models/ (embeddings), daemon.log
 └── .recall-echo.toml      optional configuration
 ```
 
-ARCHIVE.md and EPHEMERAL.md updates use advisory `flock` locks; they are not reliable on NFS.
+ARCHIVE.md, EPHEMERAL.md, and forgotten.jsonl updates use advisory `flock` locks; they are not reliable on NFS.
 
 ## Knowledge graph
 

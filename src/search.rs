@@ -311,56 +311,103 @@ pub fn search_with_base(
         ));
     }
 
+    let mask = crate::graph::forgotten::read_mask(base)?;
+    scan_conversations(&conversations_dir, query, context_lines, mask.as_ref())
+}
+
+fn scan_conversations(
+    conversations_dir: &Path,
+    query: &str,
+    context_lines: usize,
+    mask: Option<&crate::graph::forgotten::ForgetSet>,
+) -> Result<Vec<SearchResult>, RecallError> {
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
-
-    let mut files: Vec<_> = fs::read_dir(&conversations_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("conversation-") && name.ends_with(".md")
-        })
+    let mut files: Vec<_> = fs::read_dir(conversations_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| conversation_name(&entry.file_name()))
         .collect();
-    files.sort_by_key(|e| e.file_name());
+    files.sort_by_key(|entry| entry.file_name());
 
     for entry in &files {
         let file = std::io::BufReader::new(fs::File::open(entry.path())?);
-
         let lines: Vec<String> = file.lines().map_while(Result::ok).collect();
         let filename = entry.file_name().to_string_lossy().to_string();
+        push_hits(
+            &mut results,
+            &filename,
+            &lines,
+            query,
+            &query_lower,
+            context_lines,
+            mask,
+        );
+    }
+    Ok(results)
+}
 
-        for (i, line) in lines.iter().enumerate() {
-            if line.to_lowercase().contains(&query_lower) {
-                let start = i.saturating_sub(context_lines);
-                for (ci, ctx_line) in lines.iter().enumerate().take(i).skip(start) {
-                    results.push(SearchResult {
-                        file: filename.clone(),
-                        line_num: ci + 1,
-                        line: format!("{DIM}{ctx_line}{RESET}"),
-                    });
-                }
+fn conversation_name(name: &std::ffi::OsString) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with("conversation-") && name.ends_with(".md")
+}
 
-                let highlighted = highlight_match(line, query);
-                results.push(SearchResult {
-                    file: filename.clone(),
-                    line_num: i + 1,
-                    line: highlighted,
-                });
-
-                let end = (i + context_lines + 1).min(lines.len());
-                for (ci, ctx_line) in lines.iter().enumerate().take(end).skip(i + 1) {
-                    results.push(SearchResult {
-                        file: filename.clone(),
-                        line_num: ci + 1,
-                        line: format!("{DIM}{ctx_line}{RESET}"),
-                    });
-                }
-            }
+fn push_hits(
+    results: &mut Vec<SearchResult>,
+    filename: &str,
+    lines: &[String],
+    query: &str,
+    query_lower: &str,
+    context_lines: usize,
+    mask: Option<&crate::graph::forgotten::ForgetSet>,
+) {
+    for (index, line) in lines.iter().enumerate() {
+        if line.to_lowercase().contains(query_lower) {
+            push_context(results, filename, lines, index, context_lines, mask, true);
+            results.push(matched_line(filename, index, line, query, mask));
+            push_context(results, filename, lines, index, context_lines, mask, false);
         }
     }
+}
 
-    Ok(results)
+fn push_context(
+    results: &mut Vec<SearchResult>,
+    filename: &str,
+    lines: &[String],
+    index: usize,
+    context_lines: usize,
+    mask: Option<&crate::graph::forgotten::ForgetSet>,
+    before: bool,
+) {
+    let range = if before {
+        index.saturating_sub(context_lines)..index
+    } else {
+        let end = (index + context_lines + 1).min(lines.len());
+        (index + 1)..end
+    };
+    for cursor in range {
+        results.push(SearchResult {
+            file: filename.to_string(),
+            line_num: cursor + 1,
+            line: crate::graph::forgotten::apply_mask(
+                mask,
+                &format!("{DIM}{}{RESET}", lines[cursor]),
+            ),
+        });
+    }
+}
+
+fn matched_line(
+    filename: &str,
+    index: usize,
+    line: &str,
+    query: &str,
+    mask: Option<&crate::graph::forgotten::ForgetSet>,
+) -> SearchResult {
+    SearchResult {
+        file: filename.to_string(),
+        line_num: index + 1,
+        line: crate::graph::forgotten::apply_mask(mask, &highlight_match(line, query)),
+    }
 }
 
 fn highlight_match(line: &str, query: &str) -> String {
@@ -403,6 +450,40 @@ mod tests {
 
         let results = search_with_base("auth", base, 0).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_masks_a_forgotten_value_only_when_the_flag_is_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let conv_dir = base.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        fs::write(
+            conv_dir.join("conversation-001.md"),
+            "### User\n\nAda uses Rust for the service.\n",
+        )
+        .unwrap();
+        fs::write(base.join("forgotten.jsonl"), b"{not json\n").unwrap();
+        let plain = search_with_base("Rust", base, 0).unwrap();
+        assert!(plain.iter().any(|row| row.line.contains("Rust")));
+        assert_eq!(
+            fs::read(base.join("forgotten.jsonl")).unwrap(),
+            b"{not json\n"
+        );
+
+        fs::write(
+            base.join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .unwrap();
+        fs::write(
+            base.join("forgotten.jsonl"),
+            "{\"v\":1,\"status\":\"active\",\"kind\":\"fact\",\"subject\":\"ada\",\"relation\":\"uses\",\"value\":\"Rust\",\"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n",
+        )
+        .unwrap();
+        let masked = search_with_base("Rust", base, 0).unwrap();
+        assert!(masked.iter().any(|row| row.line.contains("[forgotten]")));
+        assert!(masked.iter().all(|row| !row.line.contains("Rust")));
     }
 
     #[test]

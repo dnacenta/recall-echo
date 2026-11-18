@@ -5,6 +5,10 @@ changes a user has to know about before upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- `graph.lasting_forget`, default off. With it on, a confirmed `graph correct --forget` still deletes the graph row and also records the decision in `memory/forgotten.jsonl` until `graph correct --unforget`. Matching later writes are skipped (`forgotten_skips`, omitted from reports when zero) and reads replace the forgotten value with `[forgotten]`. With the flag off, forget stays a hard delete and the file is not read or written.
+
 ## [5.1.0] — 2026-11-17
 
 ### Breaking

@@ -1227,6 +1227,10 @@ pub struct IngestionReport {
     /// Literal facts appended as slots. A reinforced slot is not counted again.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub slots_written: u32,
+    /// Facts not written because they match a live lasting-forget record.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub forgotten_skips: u32,
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
@@ -1360,6 +1364,18 @@ impl IngestionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forgotten_skips_is_omitted_from_json_when_zero() {
+        let text = serde_json::to_string(&IngestionReport::default()).expect("json");
+        assert!(!text.contains("forgotten_skips"), "{text}");
+        let report = IngestionReport {
+            forgotten_skips: 1,
+            ..IngestionReport::default()
+        };
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"forgotten_skips\":1"), "{text}");
+    }
 
     fn chunks(total: u32, failed: u32) -> IngestionReport {
         IngestionReport {

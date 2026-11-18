@@ -30,8 +30,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::error::RecallError;
-use crate::graph::correct::{CorrectTarget, Correction};
+use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport};
 use crate::graph::error::GraphError;
+use crate::graph::forgotten::{self, ForgetLock, ManualWrite};
 use crate::graph::types::{
     EntityType, NewEntity, NewRelationship, PipelineDocuments, QueryOptions, SearchOptions,
 };
@@ -510,39 +511,8 @@ async fn execute_graph(
                 )
                 .await?,
         )?,
-        Request::AddEntity(args) => {
-            let entity_type: EntityType = args
-                .entity_type
-                .parse()
-                .map_err(|e: String| GraphError::Parse(e))?;
-            let mut entity = graph
-                .add_entity(NewEntity {
-                    name: args.name.clone(),
-                    entity_type,
-                    abstract_text: args.abstract_text.clone(),
-                    overview: args.overview.clone(),
-                    content: None,
-                    attributes: None,
-                    source: args.source.clone(),
-                })
-                .await?;
-            // 384 floats of JSON text no client has ever read.
-            entity.embedding = None;
-            serde_json::to_value(entity)?
-        }
-        Request::Relate(args) => {
-            let relationship = graph
-                .add_relationship(NewRelationship {
-                    from_entity: args.from.clone(),
-                    to_entity: args.to.clone(),
-                    rel_type: args.rel_type.clone(),
-                    description: args.description.clone(),
-                    confidence: None,
-                    source: args.source.clone(),
-                })
-                .await?;
-            serde_json::to_value(relationship)?
-        }
+        Request::AddEntity(args) => add_entity_guarded(graph, args).await?,
+        Request::Relate(args) => relate_guarded(graph, args).await?,
         Request::IngestArchive(args) => {
             let context = IngestContext::new(args.session_id.clone(), args.log_number)
                 .with_override(args.provenance);
@@ -557,9 +527,7 @@ async fn execute_graph(
                 .record_session_outcome(&args.session_id, args.outcome)
                 .await?,
         )?,
-        Request::Correct(args) => {
-            serde_json::to_value(graph.correct(&args.target, args.correction).await?)?
-        }
+        Request::Correct(args) => serde_json::to_value(correct_guarded(graph, args).await?)?,
         Request::Overview(args) => {
             serde_json::to_value(graph.overview(clamp_per_type(args.per_type)).await?)?
         }
@@ -567,7 +535,156 @@ async fn execute_graph(
             serde_json::to_value(graph.about(&args.topic, clamp_limit(args.limit)).await?)?
         }
     };
-    Ok(Some(data))
+    Ok(Some(mask_read(graph, request, data)?))
+}
+
+fn mask_read(
+    graph: &GraphMemory,
+    request: &Request,
+    data: serde_json::Value,
+) -> Result<serde_json::Value, GraphError> {
+    if !request_returns_text(request) {
+        return Ok(data);
+    }
+    let memory = memory_of(graph);
+    if !forgotten::lasting_forget_on(memory) {
+        return Ok(data);
+    }
+    let set = forgotten::load_forget_set(memory, true).map_err(forget_error)?;
+    Ok(forgotten::mask_json(&set, data))
+}
+
+fn request_returns_text(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Search(_)
+            | Request::SearchEpisodes(_)
+            | Request::Query(_)
+            | Request::Traverse(_)
+            | Request::Overview(_)
+            | Request::About(_)
+    )
+}
+
+fn memory_of(graph: &GraphMemory) -> &Path {
+    graph.path().parent().unwrap_or(graph.path())
+}
+
+async fn correct_guarded(
+    graph: &GraphMemory,
+    args: &CorrectArgs,
+) -> Result<CorrectionReport, GraphError> {
+    let memory = memory_of(graph);
+    let lock = lock_before_forget(memory, args.correction)?;
+    let report = graph.correct(&args.target, args.correction).await?;
+    write_forget(memory, lock.as_ref(), &report)?;
+    Ok(report)
+}
+
+fn lock_before_forget(
+    memory: &Path,
+    correction: Correction,
+) -> Result<Option<ForgetLock>, GraphError> {
+    if !is_confirmed_forget(correction) || !forgotten::lasting_forget_on(memory) {
+        return Ok(None);
+    }
+    let lock =
+        forgotten::lock_forgotten(memory, forgotten::forget_lock_wait()).map_err(forget_error)?;
+    forgotten::ensure_readable(memory, &lock).map_err(forget_error)?;
+    Ok(Some(lock))
+}
+
+fn is_confirmed_forget(correction: Correction) -> bool {
+    matches!(correction, Correction::Forget { confirmed: true })
+}
+
+fn write_forget(
+    memory: &Path,
+    lock: Option<&ForgetLock>,
+    report: &CorrectionReport,
+) -> Result<(), GraphError> {
+    let Some(lock) = lock else {
+        return Ok(());
+    };
+    let CorrectionReport::Removed { removal } = report else {
+        return Ok(());
+    };
+    let records = forgotten::records_for_removal(removal);
+    forgotten::append_locked(memory, lock, &records).map_err(forget_error)
+}
+
+async fn add_entity_guarded(
+    graph: &GraphMemory,
+    args: &AddEntityArgs,
+) -> Result<serde_json::Value, GraphError> {
+    refuse_add_entity(graph, &args.name)?;
+    let entity_type: EntityType = args
+        .entity_type
+        .parse()
+        .map_err(|err: String| GraphError::Parse(err))?;
+    let mut entity = graph
+        .add_entity(NewEntity {
+            name: args.name.clone(),
+            entity_type,
+            abstract_text: args.abstract_text.clone(),
+            overview: args.overview.clone(),
+            content: None,
+            attributes: None,
+            source: args.source.clone(),
+        })
+        .await?;
+    // 384 floats of JSON text no client has ever read.
+    entity.embedding = None;
+    Ok(serde_json::to_value(entity)?)
+}
+
+fn refuse_add_entity(graph: &GraphMemory, name: &str) -> Result<(), GraphError> {
+    let set = load_live(graph)?;
+    forgotten::refuse_manual_write(&set, ManualWrite::AddEntity(name)).map_err(forget_error)
+}
+
+async fn relate_guarded(
+    graph: &GraphMemory,
+    args: &RelateArgs,
+) -> Result<serde_json::Value, GraphError> {
+    refuse_relate(graph, args)?;
+    let relationship = graph
+        .add_relationship(NewRelationship {
+            from_entity: args.from.clone(),
+            to_entity: args.to.clone(),
+            rel_type: args.rel_type.clone(),
+            description: args.description.clone(),
+            confidence: None,
+            source: args.source.clone(),
+        })
+        .await?;
+    Ok(serde_json::to_value(relationship)?)
+}
+
+fn refuse_relate(graph: &GraphMemory, args: &RelateArgs) -> Result<(), GraphError> {
+    let set = load_live(graph)?;
+    forgotten::refuse_manual_write(
+        &set,
+        ManualWrite::Relate {
+            from: &args.from,
+            relation: &args.rel_type,
+            to: &args.to,
+        },
+    )
+    .map_err(forget_error)
+}
+
+fn load_live(graph: &GraphMemory) -> Result<forgotten::ForgetSet, GraphError> {
+    let memory = memory_of(graph);
+    let flag = forgotten::lasting_forget_on(memory);
+    forgotten::load_forget_set(memory, flag).map_err(forget_error)
+}
+
+fn forget_error(err: RecallError) -> GraphError {
+    match err {
+        RecallError::Other(message) if message.contains("locked") => GraphError::Locked(message),
+        other => GraphError::Parse(other.to_string()),
+    }
 }
 
 // ── Idle tracking ────────────────────────────────────────────────────────

@@ -608,8 +608,10 @@ enum GraphCommands {
     /// Tell memory that something it learned is wrong
     ///
     /// `--wrong` records contradicting evidence at your authority, which is how
-    /// confidence is supposed to move. `--forget` removes outright and leaves
-    /// no trace — prefer `--wrong` unless the memory should never have existed.
+    /// confidence is supposed to move. `--forget` removes the graph row. With
+    /// `graph.lasting_forget` (default off) the decision stays in
+    /// `memory/forgotten.jsonl` until `--unforget`; with the flag off it leaves
+    /// no trace. Prefer `--wrong` unless the memory should never have existed.
     Correct {
         /// Entity name, or the source entity of a relationship
         subject: String,
@@ -623,6 +625,10 @@ enum GraphCommands {
         /// Remove it and its relationships outright
         #[arg(long)]
         forget: bool,
+        /// Deactivate a lasting forget so a later write is allowed again.
+        /// Requires `graph.lasting_forget`. Does not change the graph.
+        #[arg(long, conflicts_with_all = ["wrong", "forget"])]
+        unforget: bool,
         /// With --wrong on an entity: contradict every one of its relationships
         #[arg(long)]
         all_edges: bool,
@@ -989,6 +995,7 @@ fn main() {
                                 object,
                                 wrong,
                                 forget,
+                                unforget,
                                 all_edges,
                                 yes,
                             } => {
@@ -1000,6 +1007,7 @@ fn main() {
                                     forget,
                                     all_edges,
                                     yes,
+                                    unforget,
                                 };
                                 graph_cli::correct(&memory_dir, &options).await
                             }
