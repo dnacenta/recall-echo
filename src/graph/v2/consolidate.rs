@@ -5237,7 +5237,10 @@ struct OrphanPlan {
 }
 
 fn post_switches(ctx: &WriteCtx<'_>) -> bool {
-    ctx.orphan_sweep_on || ctx.rule_fragments_on || ctx.retire_component_on
+    ctx.orphan_sweep_on
+        || ctx.rule_fragments_on
+        || ctx.retire_component_on
+        || ctx.component_takeover_on
 }
 
 async fn post_pass(
@@ -18748,6 +18751,79 @@ mod tests {
         assert!(report.slots_written >= 1, "{:?}", report.drops);
         assert!(super::post_reads() > 0, "write path did not set R");
         assert!(report.consolidate.component_retire_closes.is_none());
+    }
+
+    fn quillpress() -> ProjectIdentity {
+        ProjectIdentity {
+            name: "quillpress".into(),
+            aliases: Vec::new(),
+        }
+    }
+
+    async fn commit_quill(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+    ) -> WriteStats {
+        let project = quillpress();
+        let ctx = WriteCtx::new(&Quiet, &project, session, date, turns);
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pin_component_takeover_off_leaves_the_project_tool_live() {
+        let (_tmp, gm) = open().await;
+        let old_turns = [Turn {
+            index: 2,
+            role: TurnRole::User,
+            text: "quillpress uses Pygments at build time".into(),
+        }];
+        let mut old_use = use_of("quillpress", Kind::Project, "Pygments", "decided");
+        old_use.role = Some(super::super::schema::Role::Library);
+        old_use.turn = 2;
+        let mut old_setting = setting_of("quillpress", "highlight_time", "build time", "decided");
+        old_setting.subject_kind = Kind::Project;
+        old_setting.turn = 2;
+        commit_quill(
+            &gm,
+            "s04",
+            "2026-04-04",
+            &old_turns,
+            &[old_use, old_setting],
+        )
+        .await;
+
+        let new_turns = [Turn {
+            index: 3,
+            role: TurnRole::User,
+            text: "nightjar highlights code in the browser".into(),
+        }];
+        let mut link = part_link("nightjar", "quillpress", Kind::Project);
+        link.turn = 3;
+        let mut new_use = use_of("nightjar", Kind::Component, "highlight.js", "decided");
+        new_use.role = Some(super::super::schema::Role::Library);
+        new_use.turn = 3;
+        let mut new_setting = setting_of("nightjar", "highlight_time", "browser", "decided");
+        new_setting.turn = 3;
+        let facts = [link, new_use, new_setting];
+        let stats = commit_quill(&gm, "s11", "2026-04-11", &new_turns, &facts).await;
+
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = quillpress();
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &project, "s11", "2026-04-11", &new_turns);
+        ctx.component_takeover_on = false;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &facts, &stats, &stub, &mut report).await;
+        assert!(use_ended(&gm, "Pygments").await.is_none());
+        assert!(use_ended(&gm, "highlight.js").await.is_none());
+        assert!(super::take_post_lines()
+            .iter()
+            .all(|line| !line.contains("takeover")));
+        assert_eq!(super::post_reads(), 0);
     }
 }
 

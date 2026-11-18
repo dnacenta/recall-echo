@@ -179,6 +179,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Retire a dropped component's decided settings and uses edges.
     /// Off leaves that pass unchanged and reads nothing for it.
     pub retire_component_on: bool,
+    /// Close a project tool a component took over.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub component_takeover_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -211,6 +214,7 @@ impl<'a> WriteCtx<'a> {
             orphan_sweep_on: false,
             rule_fragments_on: false,
             retire_component_on: false,
+            component_takeover_on: false,
         }
     }
 }
@@ -3480,6 +3484,7 @@ mod tests {
                 orphan_sweep_on: false,
                 rule_fragments_on: false,
                 retire_component_on: false,
+                component_takeover_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4753,6 +4758,7 @@ mod tests {
             orphan_sweep_on: false,
             rule_fragments_on: false,
             retire_component_on: false,
+            component_takeover_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -6258,6 +6264,7 @@ mod tests {
             orphan_sweep_on: false,
             rule_fragments_on: false,
             retire_component_on: false,
+            component_takeover_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -8151,6 +8158,7 @@ mod tests {
             orphan_sweep_on: false,
             rule_fragments_on: false,
             retire_component_on: false,
+            component_takeover_on: false,
         };
         let result = write_facts(
             &gm,
