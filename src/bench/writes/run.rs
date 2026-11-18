@@ -284,6 +284,10 @@ pub struct OptOuts {
     pub consolidate_orphan_sweep: bool,
     pub consolidate_rule_fragments: bool,
     pub consolidate_retire_component: bool,
+    /// Write `consolidate_component_takeover = true` and imply `consolidate`.
+    /// False leaves the key out. Unlike the fields above, this is an opt-in:
+    /// [`Self::stack_off`] leaves it false so an opt-out run does not write it.
+    pub consolidate_component_takeover: bool,
 }
 
 impl OptOuts {
@@ -305,6 +309,7 @@ impl OptOuts {
             consolidate_orphan_sweep: true,
             consolidate_rule_fragments: true,
             consolidate_retire_component: true,
+            consolidate_component_takeover: false,
         }
     }
 }
@@ -732,16 +737,19 @@ fn switch_lines(
     push_line(&mut lines, matched == KnownMatch::On, "known_match = true");
     push_switch(
         &mut lines,
-        writes_consolidate(
-            consolidate,
-            consolidate_links,
-            consolidate_components,
-            consolidate_key_rename,
-            consolidate_replaces_cue,
-            consolidate_replaces_departure,
-            consolidate_orphan_sweep,
-            consolidate_rule_fragments,
-            consolidate_retire_component,
+        with_component_takeover(
+            writes_consolidate(
+                consolidate,
+                consolidate_links,
+                consolidate_components,
+                consolidate_key_rename,
+                consolidate_replaces_cue,
+                consolidate_replaces_departure,
+                consolidate_orphan_sweep,
+                consolidate_rule_fragments,
+                consolidate_retire_component,
+            ),
+            opt_outs.consolidate_component_takeover,
         ),
         opt_outs.consolidate,
         "consolidate = true",
@@ -836,7 +844,16 @@ fn switch_lines(
         recover_turns == RecoverTurns::On,
         "recover_turns = true",
     );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_component_takeover,
+        "consolidate_component_takeover = true",
+    );
     lines
+}
+
+fn with_component_takeover(consolidate: bool, takeover: bool) -> bool {
+    consolidate || takeover
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3417,6 +3434,49 @@ mod tests {
         assert!(graph.ground_component_edges);
         assert!(graph.rule_fragments_apply());
         assert!(graph.orphan_sweep_apply());
+    }
+
+    #[test]
+    fn consolidate_component_takeover_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_component_takeover: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_component_takeover = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_retire_component"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.component_takeover_apply());
+        assert!(graph.consolidate);
     }
 
     #[test]
