@@ -7531,16 +7531,23 @@ fn reason_pair(old: &ReasonSlot, new: &ReasonSlot, session: &str) -> bool {
     new.first_session == session && earlier_session(&old.first_session, session)
 }
 
-/// `new` keeps every run of `old` as one contiguous stretch, then adds more.
+/// `new` keeps every run of `old` in order and adds more. A gap is still an
+/// extension: `go test -tags integration` inside `go test -race -tags integration`
+/// is the same command with `-race` inserted.
 fn value_extends(old: &str, new: &str) -> bool {
     let old_runs = alphanumeric_runs(old);
     let new_runs = alphanumeric_runs(new);
     if old_runs.is_empty() || new_runs.len() <= old_runs.len() {
         return false;
     }
-    new_runs
-        .windows(old_runs.len())
-        .any(|window| window == old_runs.as_slice())
+    let mut rest = new_runs.as_slice();
+    for run in &old_runs {
+        let Some(at) = rest.iter().position(|have| have == run) else {
+            return false;
+        };
+        rest = &rest[at + 1..];
+    }
+    true
 }
 
 fn push_reason_change(
@@ -21357,6 +21364,58 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_an_ordered_gap_is_not_a_change() {
+        let rule = "Tag integration tests with //go:build integration so they only run with go test -tags integration.";
+        let closes = plan_slots(vec![
+            synthetic_slot(
+                "setting",
+                0,
+                "test_command",
+                "go test -tags integration",
+                "rejected",
+                true,
+            ),
+            synthetic_slot(
+                "setting",
+                1,
+                "test_command",
+                "go test -race -tags integration ./...",
+                "decided",
+                true,
+            ),
+            synthetic_slot("rule", 2, "", rule, "decided", true),
+        ]);
+        assert!(closes.is_empty());
+    }
+
+    #[test]
+    fn the_saved_test_command_gap_keeps_the_build_tag_rule() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/retire_reason/coverage/relaybox-r3.txt");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rule = "Tag integration tests with //go:build integration so they only run with go test -tags integration.";
+        assert!(text.contains(
+            "entity:qg8g1httipyn49cr7jb4|setting|test_command|go test -tags integration|2026-09-19|rejected"
+        ));
+        assert!(text.contains(
+            "entity:qg8g1httipyn49cr7jb4|setting|test_command|go test -race -tags integration ./...|2026-09-19"
+        ));
+        assert!(text.contains(&format!(
+            "entity:qg8g1httipyn49cr7jb4|rule||{rule}|2026-09-19"
+        )));
+        let closes = excerpt_closes(&path);
+        assert!(!closes.iter().any(|close| close == rule));
+        assert_eq!(
+            closes,
+            vec![
+                "Retry each delivery 5 times total with exponential backoff of 1s, 2s, 4s, and 8s between attempts.".to_string(),
+                "Sign every request with HMAC-SHA256 over the body using the subscription secret and send it as X-Relaybox-Signature: sha256=<hex>.".to_string(),
+                "Set http.Client Timeout to 10 seconds so a hanging receiver cannot hold a worker forever.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn a_rejected_excerpt_row_stays_rejected() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/retire_reason/coverage/snapfile-r1.txt");
@@ -21436,7 +21495,6 @@ mod tests {
                     "Retry each delivery 5 times total with exponential backoff of 1s, 2s, 4s, and 8s between attempts.",
                     "Sign every request with HMAC-SHA256 over the body using the subscription secret and send it as X-Relaybox-Signature: sha256=<hex>.",
                     "Set http.Client Timeout to 10 seconds so a hanging receiver cannot hold a worker forever.",
-                    "Tag integration tests with //go:build integration so they only run with go test -tags integration.",
                 ],
             ),
         ];
@@ -21470,6 +21528,7 @@ mod tests {
             "Write the generated site to _site/.",
             "Render !!! note blocks as admonitions.",
             "Use rayon for per-file work (EXIF read and hashing), size the pool to the number of logical CPUs by default, and let --jobs N override it.",
+            "Tag integration tests with //go:build integration so they only run with go test -tags integration.",
         ];
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
