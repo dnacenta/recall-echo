@@ -5,6 +5,10 @@ changes a user has to know about before upgrading.
 
 ## [Unreleased]
 
+### Breaking
+
+- The public `rebuild` function now returns `u32`, the forgotten skip count.
+
 ### Added
 
 - `graph.consolidate_component_takeover`, default off. With `graph.consolidate` also on, consolidation can close one project `uses` edge when a component of that project starts using a different tool for the same job. The job is a shared word in a setting or rule cited with each tool. The close is rule-only and makes no model call. `component_takeover_closes` and `component_takeover_ambiguous` are omitted from the report when unset. `bench writes --consolidate-component-takeover` turns the flag on for one run. With the flag off, config, reports and output stay as they are.

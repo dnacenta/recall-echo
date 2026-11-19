@@ -19,7 +19,7 @@ use super::super::llm::LlmProvider;
 use super::super::types::{Entity, IngestionReport, Retirement};
 use super::super::{deserialize_take, GraphMemory};
 use super::enumeration::enumerated;
-use super::ground::{is_stop_word, sentences};
+use super::ground::{is_generic_key, is_stop_word, sentences};
 use super::known_match::{
     coexist, cue_words, departure_near, key_tokens, mention, value_spans, DEPARTURE,
 };
@@ -1974,6 +1974,9 @@ fn shares_pair(
         || component_link(anchor, partner, part_of, owners))
 }
 
+/// Normalised equality. An empty name matches nothing.
+///
+/// Compares the two strings after `normalise`. It does not look up aliases.
 fn same_name(left: &str, right: &str) -> bool {
     let left = normalise(left);
     !left.is_empty() && left == normalise(right)
@@ -7006,6 +7009,7 @@ fn takeover_candidate(
 ) -> bool {
     project_use(old, project_id)
         && earlier_session(&old.first_session, ctx.session_id)
+        // Normalised equality of the two tool names, not an alias match.
         && !same_name(&old.object, &anchor.object)
         && roles_match(&old.description, &anchor.description)
         && !tool_mentioned(ctx, &old.object)
@@ -7170,20 +7174,13 @@ fn key_piece(piece: &str) -> Option<String> {
 fn keep_job_token(token: &str, pair: &TakeoverPair<'_>) -> bool {
     long_job_token(token)
         && !is_stop_word(token)
-        && !generic_key_token(token)
+        && !is_generic_key(token)
         && !party_name_token(token, pair)
         && !whole_tool_name(token, pair)
 }
 
 fn long_job_token(token: &str) -> bool {
     token.chars().count() >= 5
-}
-
-fn generic_key_token(token: &str) -> bool {
-    matches!(
-        token,
-        "value" | "number" | "setting" | "default" | "current" | "new" | "min" | "max"
-    )
 }
 
 fn party_name_token(token: &str, pair: &TakeoverPair<'_>) -> bool {

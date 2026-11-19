@@ -2182,4 +2182,69 @@ mod tests {
         assert_eq!(gm.stats().await.unwrap().relationship_count, 0);
         assert_eq!(gm.stats().await.unwrap().entity_count, 2);
     }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_held_forget_lock_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = dir.path().join("memory");
+        let graph = memory.join("graph");
+        std::fs::create_dir_all(&graph).unwrap();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&graph).await.unwrap();
+        for (id, name, kind) in [
+            ("d", "D", "person"),
+            ("vim", "Vim", "tool"),
+            ("dotfiles", "dotfiles", "project"),
+        ] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = '{name}', entity_type = '{kind}', abstract = '{name} exists.', overview = ''"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        for (from, to, rel) in [("d", "vim", "USES"), ("vim", "dotfiles", "CONFIGURED_BY")] {
+            gm.db()
+                .query(format!(
+                    "RELATE entity:{from}->relates_to->entity:{to} SET rel_type = '{rel}', confidence = 0.9, valid_until = NONE"
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        let before = gm.stats().await.unwrap();
+        let lock_path = memory.join(".forgotten.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+        let _held = crate::file_lock::HeldLock::on(&lock_path);
+        let _wait = forgotten::ForgetWaitOverride::at(Duration::ZERO);
+        let response = dispatch_graph(
+            &gm,
+            &Request::Correct(CorrectArgs {
+                target: CorrectTarget::Entity { name: "Vim".into() },
+                correction: Correction::Forget { confirmed: true },
+            }),
+        )
+        .await;
+        assert!(!response.ok, "{response:?}");
+        let message = response.error.expect("error").message;
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("locked"), "{message}");
+        assert!(!memory.join("forgotten.jsonl").exists());
+        let after = gm.stats().await.unwrap();
+        assert_eq!(after.entity_count, before.entity_count);
+        assert_eq!(after.relationship_count, before.relationship_count);
+        assert_eq!(after.entity_count, 3);
+        assert_eq!(after.relationship_count, 2);
+    }
 }
