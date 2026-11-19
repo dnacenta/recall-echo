@@ -1,0 +1,12 @@
+# relaybox r2
+setting|signature|sha256=<hex>|2026-10-01
+setting|signature|t=<unix seconds>,v1=<hex>|2026-10-15
+setting|timeout|30s|2026-09-01
+setting|payload|json|2026-09-01
+setting|env|production|2026-09-01
+setting|migrate_on_startup|true|2026-09-01
+rule||Send X-Relaybox-Signature: sha256=<hex>.|2026-10-01
+rule||Keep the timeout at 30s because cold starts need the headroom.|2026-09-01
+rule||Keep the payload as json because the receiver expects one object.|2026-09-01
+rule||Read configuration from the environment only because the host injects it.|2026-09-01
+rule||Migrate on startup because the process owns the schema.|2026-09-01

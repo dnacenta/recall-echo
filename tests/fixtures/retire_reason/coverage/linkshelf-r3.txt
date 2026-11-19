@@ -1,0 +1,10 @@
+# linkshelf r3
+setting|tag_storage|one comma-separated string|2026-09-30
+setting|tag_storage|join table|2026-10-02
+setting|storage|JSON|2026-09-30
+setting|storage|SQLite|2026-10-02
+setting|url_normalise|keep the trailing slash|2026-09-29
+rule||Store each bookmark's tags as one comma-separated string.|2026-09-30
+rule||Store each bookmark's tags in a join table.|2026-10-02
+rule||Use SQLite because it handles concurrent writers.|2026-10-02
+rule||Keep the trailing slash because some sites serve a different page without it.|2026-09-29

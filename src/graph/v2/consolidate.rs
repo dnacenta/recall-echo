@@ -20993,6 +20993,288 @@ mod tests {
             .iter()
             .all(|line| !line.contains("retire_reason")));
     }
+
+    struct ExcerptRow {
+        kind: String,
+        key: String,
+        value: String,
+        date: String,
+        rejected: bool,
+        live: bool,
+    }
+
+    fn excerpt_subject(path: &std::path::Path) -> String {
+        let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
+        stem.rsplit_once("-r")
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| stem.to_string())
+    }
+
+    fn excerpt_cell(path: &std::path::Path) -> String {
+        let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
+        let parent = path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if let Some((name, run)) = stem.rsplit_once("-r") {
+            format!("{name} r{run}")
+        } else if parent == "confirm" {
+            format!("confirm {stem}")
+        } else {
+            stem.to_string()
+        }
+    }
+
+    fn parse_excerpt(text: &str) -> Vec<ExcerptRow> {
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('|');
+            let kind = parts.next().unwrap_or("").to_string();
+            let key = parts.next().unwrap_or("").to_string();
+            let value = parts.next().unwrap_or("").to_string();
+            let date = parts.next().unwrap_or("").to_string();
+            let rejected = parts.next() == Some("rejected");
+            rows.push(ExcerptRow {
+                kind,
+                key,
+                value,
+                date,
+                rejected,
+                live: false,
+            });
+        }
+        mark_excerpt_live(&mut rows);
+        rows
+    }
+
+    fn mark_excerpt_live(rows: &mut [ExcerptRow]) {
+        let mut keys = std::collections::BTreeMap::<String, Vec<usize>>::new();
+        for (index, row) in rows.iter().enumerate() {
+            if row.kind == "setting" {
+                keys.entry(row.key.clone()).or_default().push(index);
+            }
+        }
+        for indexes in keys.values() {
+            let best = indexes
+                .iter()
+                .filter(|index| !rows[**index].rejected)
+                .map(|index| rows[*index].date.clone())
+                .max();
+            let Some(best) = best else {
+                continue;
+            };
+            for index in indexes {
+                rows[*index].live = !rows[*index].rejected && rows[*index].date == best;
+            }
+        }
+        for row in rows.iter_mut() {
+            if row.kind == "rule" {
+                row.live = !row.rejected;
+            }
+        }
+    }
+
+    fn excerpt_snap(subject: &str, rows: &[ExcerptRow]) -> ReasonSnap {
+        ReasonSnap {
+            entities: vec![ReasonEntity {
+                id: subject.to_string(),
+                name: subject.to_string(),
+                slots: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| ReasonSlot {
+                        index,
+                        predicate: row.kind.clone(),
+                        key: row.key.clone(),
+                        value: row.value.clone(),
+                        status: "decided".into(),
+                        pending: false,
+                        live: row.live,
+                        ended_by: if row.live {
+                            String::new()
+                        } else {
+                            format!("{}:superseded", row.date)
+                        },
+                        first_session: row.date.clone(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn excerpt_closes(path: &std::path::Path) -> Vec<String> {
+        let text = std::fs::read_to_string(path).unwrap();
+        let rows = parse_excerpt(&text);
+        let subject = excerpt_subject(path);
+        let snap = excerpt_snap(&subject, &rows);
+        let identity = named_project(&subject);
+        let turns = [user_turn(1, "admission")];
+        let ctx = WriteCtx::new(&Quiet, &identity, "admission", "2026-11-01", &turns);
+        let plan = plan_retire_reason(&ctx, &snap);
+        plan.closes
+            .iter()
+            .map(|close| rows[close.index].value.clone())
+            .collect()
+    }
+
+    fn retire_reason_cells() -> Vec<(String, Vec<String>)> {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
+        let mut paths = Vec::new();
+        for dir in ["coverage", "confirm"] {
+            let mut names = std::fs::read_dir(root.join(dir))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            names.sort();
+            paths.extend(names);
+        }
+        let mut cells: Vec<(String, Vec<String>)> = paths
+            .iter()
+            .map(|path| (excerpt_cell(path), excerpt_closes(path)))
+            .collect();
+        cells.sort_by(|left, right| excerpt_order(&left.0).cmp(&excerpt_order(&right.0)));
+        cells
+    }
+
+    fn excerpt_order(label: &str) -> (u8, &str) {
+        let rank = match label {
+            "snapfile r1" => 0,
+            "snapfile r2" => 1,
+            "snapfile r3" => 2,
+            "linkshelf r3" => 3,
+            "quillpress r3" => 4,
+            "relaybox r2" => 5,
+            "quillpress r1" => 6,
+            "store" => 7,
+            "confirm snapfile" => 8,
+            "confirm linkshelf" => 9,
+            "confirm quillpress" => 10,
+            "confirm relaybox" => 11,
+            _ => 12,
+        };
+        (rank, label)
+    }
+
+    fn format_close_list(cells: &[(String, Vec<String>)]) -> String {
+        let mut out = String::new();
+        for (label, closes) in cells {
+            out.push_str(label);
+            out.push('\n');
+            if closes.is_empty() {
+                out.push_str("  (none)\n");
+            }
+            for close in closes {
+                out.push_str("  ");
+                out.push_str(close);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn admission_check_classifies_the_saved_excerpt() {
+        let cells = retire_reason_cells();
+        let printed = format_close_list(&cells);
+        println!("{printed}");
+        let expected = [
+            (
+                "snapfile r1",
+                vec![
+                    "Keep MSRV at 1.74 because the laptop distro ships that toolchain.",
+                    "Size the worker pool to the number of logical CPUs.",
+                ],
+            ),
+            (
+                "snapfile r2",
+                vec![
+                    "Set MSRV to 1.74 because the laptop distro ships that toolchain.",
+                    "Size the worker pool to the number of logical CPUs.",
+                ],
+            ),
+            (
+                "snapfile r3",
+                vec![
+                    "Keep MSRV at 1.74 because the laptop distro pins the older toolchain.",
+                    "Size the worker pool to the number of logical CPUs.",
+                ],
+            ),
+            (
+                "linkshelf r3",
+                vec!["Store each bookmark's tags as one comma-separated string."],
+            ),
+            (
+                "quillpress r3",
+                vec!["Write the generated site to public/."],
+            ),
+            (
+                "relaybox r2",
+                vec!["Send X-Relaybox-Signature: sha256=<hex>."],
+            ),
+            ("quillpress r1", vec!["Run tests with python -m unittest."]),
+            ("store", vec![]),
+            ("confirm snapfile", vec![]),
+            ("confirm linkshelf", vec![]),
+            ("confirm quillpress", vec![]),
+            ("confirm relaybox", vec![]),
+        ];
+        let found: Vec<(&str, Vec<&str>)> = cells
+            .iter()
+            .map(|(label, closes)| (label.as_str(), closes.iter().map(String::as_str).collect()))
+            .collect();
+        let wanted: Vec<(&str, Vec<&str>)> = expected
+            .iter()
+            .map(|(label, closes)| (*label, closes.clone()))
+            .collect();
+        assert_eq!(found, wanted, "{printed}");
+        let stayed = [
+            "Keep MSRV at 1.80 because LazyLock is stable in the standard library.",
+            "Default to 4 jobs because a thread per CPU thrashes spinning disks.",
+            "Apply mvhd_epoch_offset because the header stores a fixed epoch.",
+            "Do not guess dates from mtime.",
+            "Never use file modification time as a date.",
+            "When DateTimeOriginal is missing (screenshots, edited exports), fall back to the file's modification time.",
+            "Put files without a usable EXIF date into undated_dir at the top of the destination, keeping the original file name.",
+            "Use SQLite because it handles concurrent writers.",
+            "Keep the trailing slash because some sites serve a different page without it.",
+            "Store each bookmark's tags in a join table.",
+            "Run tests with just test.",
+            "Use JSONHandler because the cluster log aggregator wants JSON.",
+            "Keep the timeout at 30s because cold starts need the headroom.",
+            "Keep the payload as json because the receiver expects one object.",
+            "Read configuration from the environment only because the host injects it.",
+            "Migrate on startup because the process owns the schema.",
+            "Drop lunr because the search index moved into the page.",
+            "Write the generated site to _site/.",
+            "Render !!! note blocks as admonitions.",
+        ];
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
+        let mut body = String::new();
+        for dir in ["coverage", "confirm"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                body.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+                body.push('\n');
+            }
+        }
+        let closed: Vec<&str> = cells
+            .iter()
+            .flat_map(|(_, closes)| closes.iter().map(String::as_str))
+            .collect();
+        for rule in stayed {
+            assert!(body.contains(rule), "missing must-not-close row: {rule}");
+            assert!(
+                !closed.contains(&rule),
+                "closed a must-not-close row: {rule}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

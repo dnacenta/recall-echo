@@ -1,0 +1,5 @@
+# confirm linkshelf
+setting|tag_storage|join table|2026-10-02
+setting|storage|SQLite|2026-10-02
+rule||Store each bookmark's tags in a join table.|2026-10-02
+rule||Use SQLite because it handles concurrent writers.|2026-10-02

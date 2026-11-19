@@ -1,0 +1,4 @@
+# confirm relaybox
+setting|signature|t=<unix seconds>,v1=<hex>|2026-10-15
+setting|timeout|30s|2026-09-01
+rule||Keep the timeout at 30s because cold starts need the headroom.|2026-09-01

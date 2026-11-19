@@ -1,0 +1,4 @@
+# quillpress r1
+setting|test_command|python -m unittest|2026-10-01
+setting|test_command|just test|2026-10-20
+rule||Run tests with python -m unittest.|2026-10-01
