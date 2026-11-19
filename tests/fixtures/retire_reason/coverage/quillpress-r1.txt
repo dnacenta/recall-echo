@@ -1,4 +1,11 @@
-# quillpress r1
-setting|test_command|python -m unittest|2026-10-01
-setting|test_command|just test|2026-10-20
-rule||Run tests with python -m unittest.|2026-10-01
+entity:sq07ol76vqtxarnwuonr|rule||Render !!! note blocks as admonitions.|2026-10-27
+entity:sq07ol76vqtxarnwuonr|rule||Run tests with python -m unittest and do not add an extra test dependency.|2026-10-03
+entity:sq07ol76vqtxarnwuonr|rule||Skip anything under drafts/ in the build.|2026-10-09
+entity:sq07ol76vqtxarnwuonr|setting|docs_output_dir|_site/docs/|2026-10-27
+entity:sq07ol76vqtxarnwuonr|setting|ignore|["drafts/**", "**/*.wip.md"]|2026-11-06
+entity:sq07ol76vqtxarnwuonr|setting|ignore|["drafts/**"]|2026-10-09
+entity:sq07ol76vqtxarnwuonr|setting|md_ext|["admonition", "toc", "def_list"]|2026-10-27
+entity:sq07ol76vqtxarnwuonr|setting|output_dir|_site/|2026-10-27
+entity:sq07ol76vqtxarnwuonr|setting|output_dir|public/|2026-10-03
+entity:sq07ol76vqtxarnwuonr|setting|test_command|pytest -x|2026-11-03
+entity:sq07ol76vqtxarnwuonr|setting|test_command|python -m unittest|2026-10-03

@@ -1,2 +1,0 @@
-# store
-rule||Use JSONHandler because the cluster log aggregator wants JSON.|2026-10-01

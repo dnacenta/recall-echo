@@ -1,0 +1,22 @@
+entity:cc72a44ev1rkpcf6cxvm|rule||Compute the HMAC over the exact raw body bytes that go on the wire and do not re-encode the payload. Regression test TestSignatureMatchesRawBody uses a payload with unsorted keys.|2026-10-06
+entity:cc72a44ev1rkpcf6cxvm|rule||Retry each delivery 5 times with exponential backoff of 1s, 2s, 4s, then 8s between attempts.|2026-09-05
+entity:cc72a44ev1rkpcf6cxvm|rule||Retry each delivery up to 8 times with exponential backoff, full jitter, and cap each wait at 10 minutes so retries from all workers don't line up.|2026-09-23
+entity:cc72a44ev1rkpcf6cxvm|rule||Send the same X-Relaybox-Delivery uuid on every retry of that delivery.|2026-09-05
+entity:cc72a44ev1rkpcf6cxvm|rule||Set http_client_timeout_seconds to 15 because one receiver in the other region regularly needs 11-12s.|2026-09-26
+entity:cc72a44ev1rkpcf6cxvm|rule||Set the outbound http.Client Timeout to http_client_timeout_seconds so a hanging receiver does not hold a worker forever.|2026-09-10
+entity:cc72a44ev1rkpcf6cxvm|rule||Sign every request with HMAC-SHA256 over the body using the subscription secret and send X-Relaybox-Signature as sha256=<hex>.|2026-09-05
+entity:cc72a44ev1rkpcf6cxvm|setting|http_client_timeout_seconds|10|2026-09-10
+entity:cc72a44ev1rkpcf6cxvm|setting|http_client_timeout_seconds|15|2026-09-26
+entity:cc72a44ev1rkpcf6cxvm|setting|max_backoff|10 minutes|2026-09-23
+entity:cc72a44ev1rkpcf6cxvm|setting|retry_attempts|5|2026-09-05
+entity:cc72a44ev1rkpcf6cxvm|setting|retry_attempts|8|2026-09-23
+entity:cc72a44ev1rkpcf6cxvm|setting|signature_format|sha256=<hex>|2026-09-05
+entity:cc72a44ev1rkpcf6cxvm|setting|signature_format|t=<unix>,v1=<hex>|2026-10-06
+entity:cc72a44ev1rkpcf6cxvm|setting|signature_header|X-Relaybox-Signature|2026-09-05
+entity:yrev7fmbjhws5dgncehv|rule||Emit logs as JSON with slog's JSONHandler because the cluster log aggregator wants JSON.|2026-09-29
+entity:yrev7fmbjhws5dgncehv|rule||In CI run go test -race ./... and go test -race -tags integration ./...|2026-09-19
+entity:yrev7fmbjhws5dgncehv|setting|integration_test_command|go test -race -tags integration ./...|2026-09-19
+entity:yrev7fmbjhws5dgncehv|setting|integration_test_command|go test -tags integration|2026-09-19|rejected
+entity:yrev7fmbjhws5dgncehv|setting|log_handler|JSONHandler|2026-09-29
+entity:yrev7fmbjhws5dgncehv|setting|log_handler|TextHandler|2026-09-08
+entity:yrev7fmbjhws5dgncehv|setting|test_command|go test -race ./...|2026-09-19

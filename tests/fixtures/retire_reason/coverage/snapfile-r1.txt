@@ -1,17 +1,19 @@
-# snapfile r1
-setting|jobs|number of logical CPUs|2026-09-14
-setting|jobs|4|2026-10-04
-setting|rust_version|1.74|2026-09-21|rejected
-setting|rust_version|1.80|2026-09-21
-setting|undated_dir|_undated|2026-09-19
-setting|mvhd_epoch_offset|2082844800|2026-09-01
-setting|mvhd_epoch_offset|0|2026-10-01
-rule||Keep MSRV at 1.74 because the laptop distro ships that toolchain.|2026-09-21
-rule||Size the worker pool to the number of logical CPUs.|2026-09-14
-rule||Keep MSRV at 1.80 because LazyLock is stable in the standard library.|2026-09-21
-rule||Default to 4 jobs because a thread per CPU thrashes spinning disks.|2026-10-04
-rule||Apply mvhd_epoch_offset because the header stores a fixed epoch.|2026-09-01
-rule||Do not guess dates from mtime.|2026-10-04
-rule||Never use file modification time as a date.|2026-10-04
-rule||When DateTimeOriginal is missing (screenshots, edited exports), fall back to the file's modification time.|2026-09-14
-rule||Put files without a usable EXIF date into undated_dir at the top of the destination, keeping the original file name.|2026-09-19
+entity:rxwk56zlorzqjom293sk|rule||Apply mvhd_epoch_offset because the mvhd creation time counts seconds from 1904-01-01, not 1970.|2026-09-21
+entity:rxwk56zlorzqjom293sk|rule||Date .mp4 and .mov videos from the mvhd creation time via the mp4 crate.|2026-09-21
+entity:rxwk56zlorzqjom293sk|rule||Default to 4 jobs because a thread per CPU thrashes spinning disks; SSDs can raise it with --jobs.|2026-10-04
+entity:rxwk56zlorzqjom293sk|rule||Do not guess dates from mtime.|2026-09-19
+entity:rxwk56zlorzqjom293sk|rule||Keep MSRV rust_version at 1.74 because the laptop distro still ships that Rust.|2026-09-07
+entity:rxwk56zlorzqjom293sk|rule||Keep MSRV rust_version at 1.80 because LazyLock in std is worth it.|2026-09-21
+entity:rxwk56zlorzqjom293sk|rule||Print a summary table of moved, skipped, duplicates, and undated at the end of every run.|2026-10-04
+entity:rxwk56zlorzqjom293sk|rule||Put files without a usable EXIF date into undated_dir at the top of the destination, keeping the original file name.|2026-09-19
+entity:rxwk56zlorzqjom293sk|rule||Size the rayon pool to default_jobs (the number of logical CPUs) and allow --jobs N to override it.|2026-09-14
+entity:rxwk56zlorzqjom293sk|rule||When DateTimeOriginal is missing (screenshots, edited exports), fall back to the file's modification time.|2026-09-08
+entity:rxwk56zlorzqjom293sk|setting|ci_rust_channels|stable, 1.80|2026-09-28
+entity:rxwk56zlorzqjom293sk|setting|jobs|4|2026-10-04
+entity:rxwk56zlorzqjom293sk|setting|jobs|number of logical CPUs|2026-09-14
+entity:rxwk56zlorzqjom293sk|setting|mvhd_epoch_offset|2082844800|2026-09-21
+entity:rxwk56zlorzqjom293sk|setting|rust_version|1.74|2026-09-21|rejected
+entity:rxwk56zlorzqjom293sk|setting|rust_version|1.80|2026-09-21
+entity:rxwk56zlorzqjom293sk|setting|test_command|cargo nextest run|2026-09-28
+entity:rxwk56zlorzqjom293sk|setting|test_command|cargo test|2026-09-10
+entity:rxwk56zlorzqjom293sk|setting|undated_dir|_undated|2026-09-19

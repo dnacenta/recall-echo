@@ -7474,7 +7474,7 @@ fn reason_changes(entities: &[ReasonEntity], session: &str) -> Vec<ReasonChange>
     for entity in entities {
         let mut keys = BTreeSet::new();
         for slot in &entity.slots {
-            if setting_row(slot) {
+            if old_setting(slot) {
                 keys.insert(retire_key(&slot.key));
             }
         }
@@ -7485,8 +7485,16 @@ fn reason_changes(entities: &[ReasonEntity], session: &str) -> Vec<ReasonChange>
     found
 }
 
-fn setting_row(slot: &ReasonSlot) -> bool {
-    slot.predicate == "setting" && slot.status == "decided" && !slot.pending
+/// A decided setting, or a rejected one. A rejection is an old value that was
+/// turned down. The live replacement still has to be decided.
+fn old_setting(slot: &ReasonSlot) -> bool {
+    slot.predicate == "setting"
+        && !slot.pending
+        && matches!(slot.status.as_str(), "decided" | "rejected")
+}
+
+fn decided_live_setting(slot: &ReasonSlot) -> bool {
+    slot.predicate == "setting" && slot.status == "decided" && slot.live && !slot.pending
 }
 
 fn push_key_changes(
@@ -7498,10 +7506,10 @@ fn push_key_changes(
     let slots: Vec<&ReasonSlot> = entity
         .slots
         .iter()
-        .filter(|slot| setting_row(slot) && retire_key(&slot.key) == key)
+        .filter(|slot| old_setting(slot) && retire_key(&slot.key) == key)
         .collect();
     for new in &slots {
-        if !new.live {
+        if !decided_live_setting(new) {
             continue;
         }
         for old in &slots {
@@ -7514,13 +7522,25 @@ fn push_key_changes(
 }
 
 fn reason_pair(old: &ReasonSlot, new: &ReasonSlot, session: &str) -> bool {
-    if values_equal(&old.value, &new.value) {
+    if values_equal(&old.value, &new.value) || value_extends(&old.value, &new.value) {
         return false;
     }
-    if !old.live {
+    if old.status == "rejected" || !old.live {
         return true;
     }
     new.first_session == session && earlier_session(&old.first_session, session)
+}
+
+/// `new` keeps every run of `old` as one contiguous stretch, then adds more.
+fn value_extends(old: &str, new: &str) -> bool {
+    let old_runs = alphanumeric_runs(old);
+    let new_runs = alphanumeric_runs(new);
+    if old_runs.is_empty() || new_runs.len() <= old_runs.len() {
+        return false;
+    }
+    new_runs
+        .windows(old_runs.len())
+        .any(|window| window == old_runs.as_slice())
 }
 
 fn push_reason_change(
@@ -7579,8 +7599,32 @@ fn reason_rule(slot: &ReasonSlot, session: &str) -> bool {
 
 fn reason_claims(change: &ReasonChange, subject: &str, rule: &ReasonSlot) -> bool {
     same_name(&change.subject, subject)
-        && names_value(&change.old_value, &rule.value)
+        && names_old_value(&change.key, &change.old_value, &rule.value)
         && !names_new_value(&change.new_value, &rule.value)
+}
+
+/// Two or more runs use [`names_value`]. One run is a bounded literal.
+/// A one-run number also needs a word from the key, because the same digits
+/// show up in unrelated rules.
+fn names_old_value(key: &str, value: &str, text: &str) -> bool {
+    let trimmed = value.trim();
+    let runs = alphanumeric_runs(trimmed);
+    if runs.len() >= 2 {
+        return names_value(trimmed, text);
+    }
+    if runs.len() != 1 || !bounded_literal(text, trimmed) {
+        return false;
+    }
+    if runs[0].chars().all(|ch| ch.is_ascii_digit()) {
+        return key_word_in(key, text);
+    }
+    true
+}
+
+fn key_word_in(key: &str, text: &str) -> bool {
+    key.split(['_', '-', '.'])
+        .map(str::to_lowercase)
+        .any(|token| !token.is_empty() && !is_generic_key(&token) && bounded_literal(text, &token))
 }
 
 fn reason_close(entity: &ReasonEntity, slot: &ReasonSlot) -> ReasonClose {
@@ -20354,6 +20398,7 @@ mod tests {
         drop(tmp);
     }
 
+    /// Invented rows. Saved runs live under `tests/fixtures/retire_reason`.
     const OLD_MSRV: &str = "Keep MSRV at 1.74 because the laptop distro ships that toolchain.";
     const NEW_MSRV: &str = "Keep MSRV at 1.80 because LazyLock is stable in the standard library.";
     const POOL_RULE: &str = "Size the worker pool to the number of logical CPUs.";
@@ -20992,19 +21037,13 @@ mod tests {
     }
 
     struct ExcerptRow {
+        entity: String,
         kind: String,
         key: String,
         value: String,
         date: String,
         rejected: bool,
         live: bool,
-    }
-
-    fn excerpt_subject(path: &std::path::Path) -> String {
-        let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
-        stem.rsplit_once("-r")
-            .map(|(name, _)| name.to_string())
-            .unwrap_or_else(|| stem.to_string())
     }
 
     fn excerpt_cell(path: &std::path::Path) -> String {
@@ -21030,17 +21069,17 @@ mod tests {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let mut parts = line.split('|');
-            let kind = parts.next().unwrap_or("").to_string();
-            let key = parts.next().unwrap_or("").to_string();
-            let value = parts.next().unwrap_or("").to_string();
-            let date = parts.next().unwrap_or("").to_string();
-            let rejected = parts.next() == Some("rejected");
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() < 5 {
+                panic!("short excerpt row: {line}");
+            }
+            let rejected = parts.get(5).copied() == Some("rejected");
             rows.push(ExcerptRow {
-                kind,
-                key,
-                value,
-                date,
+                entity: parts[0].to_string(),
+                kind: parts[1].to_string(),
+                key: parts[2].to_string(),
+                value: parts[3].to_string(),
+                date: parts[4].to_string(),
                 rejected,
                 live: false,
             });
@@ -21050,10 +21089,12 @@ mod tests {
     }
 
     fn mark_excerpt_live(rows: &mut [ExcerptRow]) {
-        let mut keys = std::collections::BTreeMap::<String, Vec<usize>>::new();
+        let mut keys = std::collections::BTreeMap::<(String, String), Vec<usize>>::new();
         for (index, row) in rows.iter().enumerate() {
             if row.kind == "setting" {
-                keys.entry(row.key.clone()).or_default().push(index);
+                keys.entry((row.entity.clone(), row.key.clone()))
+                    .or_default()
+                    .push(index);
             }
         }
         for indexes in keys.values() {
@@ -21076,46 +21117,63 @@ mod tests {
         }
     }
 
-    fn excerpt_snap(subject: &str, rows: &[ExcerptRow]) -> ReasonSnap {
-        ReasonSnap {
-            entities: vec![ReasonEntity {
-                id: subject.to_string(),
-                name: subject.to_string(),
-                slots: rows
+    fn excerpt_snap(rows: &[ExcerptRow]) -> ReasonSnap {
+        let mut order = Vec::new();
+        for row in rows {
+            if !order.contains(&row.entity) {
+                order.push(row.entity.clone());
+            }
+        }
+        let entities = order
+            .into_iter()
+            .map(|entity| {
+                let slots = rows
                     .iter()
+                    .filter(|row| row.entity == entity)
                     .enumerate()
                     .map(|(index, row)| ReasonSlot {
                         index,
                         predicate: row.kind.clone(),
                         key: row.key.clone(),
                         value: row.value.clone(),
-                        status: "decided".into(),
+                        status: if row.rejected {
+                            "rejected".into()
+                        } else {
+                            "decided".into()
+                        },
                         pending: false,
                         live: row.live,
                         ended_by: if row.live {
                             String::new()
+                        } else if row.rejected {
+                            format!("{}:rejected", row.date)
                         } else {
                             format!("{}:superseded", row.date)
                         },
                         first_session: row.date.clone(),
                     })
-                    .collect(),
-            }],
-        }
+                    .collect();
+                ReasonEntity {
+                    id: entity.clone(),
+                    name: entity,
+                    slots,
+                }
+            })
+            .collect();
+        ReasonSnap { entities }
     }
 
     fn excerpt_closes(path: &std::path::Path) -> Vec<String> {
         let text = std::fs::read_to_string(path).unwrap();
         let rows = parse_excerpt(&text);
-        let subject = excerpt_subject(path);
-        let snap = excerpt_snap(&subject, &rows);
-        let identity = named_project(&subject);
+        let snap = excerpt_snap(&rows);
+        let identity = named_project("admission");
         let turns = [user_turn(1, "admission")];
         let ctx = WriteCtx::new(&Quiet, &identity, "admission", "2026-11-01", &turns);
         let plan = plan_retire_reason(&ctx, &snap);
         plan.closes
             .iter()
-            .map(|close| rows[close.index].value.clone())
+            .map(|close| close.value.clone())
             .collect()
     }
 
@@ -21123,14 +21181,12 @@ mod tests {
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
         let mut paths = Vec::new();
-        for dir in ["coverage", "confirm"] {
-            let mut names = std::fs::read_dir(root.join(dir))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect::<Vec<_>>();
-            names.sort();
-            paths.extend(names);
-        }
+        let mut names = std::fs::read_dir(root.join("coverage"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        names.sort();
+        paths.extend(names);
         let mut cells: Vec<(String, Vec<String>)> = paths
             .iter()
             .map(|path| (excerpt_cell(path), excerpt_closes(path)))
@@ -21144,15 +21200,15 @@ mod tests {
             "snapfile r1" => 0,
             "snapfile r2" => 1,
             "snapfile r3" => 2,
-            "linkshelf r3" => 3,
-            "quillpress r3" => 4,
-            "relaybox r2" => 5,
+            "linkshelf r1" => 3,
+            "linkshelf r2" => 4,
+            "linkshelf r3" => 5,
             "quillpress r1" => 6,
-            "store" => 7,
-            "confirm snapfile" => 8,
-            "confirm linkshelf" => 9,
-            "confirm quillpress" => 10,
-            "confirm relaybox" => 11,
+            "quillpress r2" => 7,
+            "quillpress r3" => 8,
+            "relaybox r1" => 9,
+            "relaybox r2" => 10,
+            "relaybox r3" => 11,
             _ => 12,
         };
         (rank, label)
@@ -21175,6 +21231,155 @@ mod tests {
         out
     }
 
+    fn plan_slots(slots: Vec<ReasonSlot>) -> Vec<String> {
+        let snap = ReasonSnap {
+            entities: vec![ReasonEntity {
+                id: "subject".into(),
+                name: "subject".into(),
+                slots,
+            }],
+        };
+        let identity = named_project("subject");
+        let turns = [user_turn(1, "synthetic")];
+        let ctx = WriteCtx::new(&Quiet, &identity, "s11", "2026-04-11", &turns);
+        plan_retire_reason(&ctx, &snap)
+            .closes
+            .into_iter()
+            .map(|close| close.value)
+            .collect()
+    }
+
+    fn synthetic_slot(
+        predicate: &str,
+        index: usize,
+        key: &str,
+        value: &str,
+        status: &str,
+        live: bool,
+    ) -> ReasonSlot {
+        ReasonSlot {
+            index,
+            predicate: predicate.into(),
+            key: key.into(),
+            value: value.into(),
+            status: status.into(),
+            pending: false,
+            live,
+            ended_by: if live {
+                String::new()
+            } else {
+                "s04:superseded".into()
+            },
+            first_session: if live { "s11" } else { "s04" }.into(),
+        }
+    }
+
+    #[test]
+    fn synthetic_rejected_old_value_closes_the_reason() {
+        let closes = plan_slots(vec![
+            synthetic_slot("setting", 0, "rust_version", "1.74", "rejected", true),
+            synthetic_slot("setting", 1, "rust_version", "1.80", "decided", true),
+            synthetic_slot(
+                "rule",
+                2,
+                "",
+                "Keep MSRV rust_version at 1.74 because the laptop distro still ships that Rust.",
+                "decided",
+                true,
+            ),
+            synthetic_slot(
+                "rule",
+                3,
+                "",
+                "Keep MSRV rust_version at 1.80 because LazyLock in std is worth it.",
+                "decided",
+                true,
+            ),
+        ]);
+        assert_eq!(
+            closes,
+            vec![
+                "Keep MSRV rust_version at 1.74 because the laptop distro still ships that Rust."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn synthetic_a_bare_number_needs_a_word_from_the_key() {
+        let minutes = "Retry each delivery up to 8 times with exponential backoff, full jitter, and cap each wait at 10 minutes so retries from all workers don't line up.";
+        let capped = "Retry each delivery up to 8 times with exponential backoff, full jitter, and each wait capped at 10 minutes.";
+        let timeout = "Set http.Client Timeout to 10 seconds so a hanging receiver cannot hold a worker forever.";
+        let five = "Retry each delivery 5 times with exponential backoff of 1s, 2s, 4s, then 8s between attempts.";
+        let five_total = "Retry each delivery 5 times total with exponential backoff of 1s, 2s, 4s, and 8s between attempts.";
+        let closes = plan_slots(vec![
+            synthetic_slot("setting", 0, "timeout_seconds", "10", "decided", false),
+            synthetic_slot("setting", 1, "timeout_seconds", "15", "decided", true),
+            synthetic_slot("setting", 2, "retry_attempts", "5", "decided", false),
+            synthetic_slot("setting", 3, "retry_attempts", "8", "decided", true),
+            synthetic_slot("rule", 4, "", minutes, "decided", true),
+            synthetic_slot("rule", 5, "", capped, "decided", true),
+            synthetic_slot("rule", 6, "", timeout, "decided", true),
+            synthetic_slot("rule", 7, "", five, "decided", true),
+        ]);
+        assert_eq!(closes, vec![timeout.to_string(), five.to_string()]);
+        let total = plan_slots(vec![
+            synthetic_slot("setting", 0, "max_attempts", "5", "decided", false),
+            synthetic_slot("setting", 1, "max_attempts", "8", "decided", true),
+            synthetic_slot("rule", 2, "", five_total, "decided", true),
+            synthetic_slot("rule", 3, "", minutes, "decided", true),
+        ]);
+        assert_eq!(total, vec![five_total.to_string()]);
+    }
+
+    #[test]
+    fn synthetic_an_extended_ignore_list_is_not_a_change() {
+        let closes = plan_slots(vec![
+            synthetic_slot("setting", 0, "ignore", r#"["drafts/**"]"#, "decided", false),
+            synthetic_slot(
+                "setting",
+                1,
+                "ignore",
+                r#"["drafts/**", "**/*.wip.md"]"#,
+                "decided",
+                true,
+            ),
+            synthetic_slot(
+                "rule",
+                2,
+                "",
+                "Skip anything under drafts/ in the build.",
+                "decided",
+                true,
+            ),
+        ]);
+        assert!(closes.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_excerpt_row_stays_rejected() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/retire_reason/coverage/snapfile-r1.txt");
+        let rows = parse_excerpt(&std::fs::read_to_string(path).unwrap());
+        let snap = excerpt_snap(&rows);
+        let old = snap
+            .entities
+            .iter()
+            .flat_map(|entity| entity.slots.iter())
+            .find(|slot| slot.key == "rust_version" && slot.value == "1.74")
+            .expect("1.74");
+        assert_eq!(old.status, "rejected");
+        assert!(!old.live);
+        let kept = snap
+            .entities
+            .iter()
+            .flat_map(|entity| entity.slots.iter())
+            .find(|slot| slot.key == "rust_version" && slot.value == "1.80")
+            .expect("1.80");
+        assert_eq!(kept.status, "decided");
+        assert!(kept.live);
+    }
+
     #[test]
     fn admission_check_classifies_the_saved_excerpt() {
         let cells = retire_reason_cells();
@@ -21184,42 +21389,56 @@ mod tests {
             (
                 "snapfile r1",
                 vec![
-                    "Keep MSRV at 1.74 because the laptop distro ships that toolchain.",
-                    "Size the worker pool to the number of logical CPUs.",
+                    "Keep MSRV rust_version at 1.74 because the laptop distro still ships that Rust.",
+                    "Size the rayon pool to default_jobs (the number of logical CPUs) and allow --jobs N to override it.",
                 ],
             ),
             (
                 "snapfile r2",
-                vec![
-                    "Set MSRV to 1.74 because the laptop distro ships that toolchain.",
-                    "Size the worker pool to the number of logical CPUs.",
-                ],
+                vec!["Keep the MSRV at 1.74 because the laptop distro still ships that Rust version."],
             ),
             (
                 "snapfile r3",
-                vec![
-                    "Keep MSRV at 1.74 because the laptop distro pins the older toolchain.",
-                    "Size the worker pool to the number of logical CPUs.",
-                ],
+                vec!["Set MSRV to 1.74 because the laptop distro still ships that Rust version."],
+            ),
+            (
+                "linkshelf r1",
+                vec!["Keep tags on each bookmark as one comma-separated string in the JSON store."],
+            ),
+            (
+                "linkshelf r2",
+                vec!["Keep tags on each bookmark as one comma-separated string."],
             ),
             (
                 "linkshelf r3",
-                vec!["Store each bookmark's tags as one comma-separated string."],
+                vec!["Store each bookmark's tags as one comma-separated string, for example python,cli."],
             ),
+            ("quillpress r1", vec!["Run tests with python -m unittest and do not add an extra test dependency."]),
+            ("quillpress r2", vec![]),
             (
                 "quillpress r3",
-                vec!["Write the generated site to public/."],
+                vec!["Write the generated site to public/ at the project root."],
+            ),
+            (
+                "relaybox r1",
+                vec![
+                    "Retry each delivery 5 times with exponential backoff of 1s, 2s, 4s, then 8s between attempts.",
+                    "Sign every request with HMAC-SHA256 over the body using the subscription secret and send X-Relaybox-Signature as sha256=<hex>.",
+                ],
             ),
             (
                 "relaybox r2",
-                vec!["Send X-Relaybox-Signature: sha256=<hex>."],
+                vec!["Set the outbound HTTP client overall timeout to 10 seconds so a hanging receiver cannot hold a worker forever."],
             ),
-            ("quillpress r1", vec!["Run tests with python -m unittest."]),
-            ("store", vec![]),
-            ("confirm snapfile", vec![]),
-            ("confirm linkshelf", vec![]),
-            ("confirm quillpress", vec![]),
-            ("confirm relaybox", vec![]),
+            (
+                "relaybox r3",
+                vec![
+                    "Retry each delivery 5 times total with exponential backoff of 1s, 2s, 4s, and 8s between attempts.",
+                    "Sign every request with HMAC-SHA256 over the body using the subscription secret and send it as X-Relaybox-Signature: sha256=<hex>.",
+                    "Set http.Client Timeout to 10 seconds so a hanging receiver cannot hold a worker forever.",
+                    "Tag integration tests with //go:build integration so they only run with go test -tags integration.",
+                ],
+            ),
         ];
         let found: Vec<(&str, Vec<&str>)> = cells
             .iter()
@@ -21231,34 +21450,33 @@ mod tests {
             .collect();
         assert_eq!(found, wanted, "{printed}");
         let stayed = [
-            "Keep MSRV at 1.80 because LazyLock is stable in the standard library.",
-            "Default to 4 jobs because a thread per CPU thrashes spinning disks.",
-            "Apply mvhd_epoch_offset because the header stores a fixed epoch.",
+            "Skip anything under drafts/ in the build.",
+            "Retry each delivery up to 8 times with exponential backoff, full jitter, and cap each wait at 10 minutes so retries from all workers don't line up.",
+            "Retry each delivery up to 8 times with exponential backoff, full jitter, and each wait capped at 10 minutes.",
+            "Set http_client_timeout_seconds to 15 because one receiver in the other region regularly needs 11-12s.",
+            "Set the outbound HTTP client timeout to 15 seconds because one receiver in the other region regularly needs 11-12 seconds.",
+            "Set the outbound HTTP client overall timeout to 15 seconds because one receiver in the other region regularly needs 11-12s.",
+            "Keep MSRV rust_version at 1.80 because LazyLock in std is worth it.",
+            "Default to 4 jobs because a thread per CPU thrashes spinning disks; SSDs can raise it with --jobs.",
+            "Apply mvhd_epoch_offset because the mvhd creation time counts seconds from 1904-01-01, not 1970.",
             "Do not guess dates from mtime.",
-            "Never use file modification time as a date.",
+            "Never use file modification time to date files.",
             "When DateTimeOriginal is missing (screenshots, edited exports), fall back to the file's modification time.",
             "Put files without a usable EXIF date into undated_dir at the top of the destination, keeping the original file name.",
             "Use SQLite because it handles concurrent writers.",
-            "Keep the trailing slash because some sites serve a different page without it.",
-            "Store each bookmark's tags in a join table.",
-            "Run tests with just test.",
-            "Use JSONHandler because the cluster log aggregator wants JSON.",
-            "Keep the timeout at 30s because cold starts need the headroom.",
-            "Keep the payload as json because the receiver expects one object.",
-            "Read configuration from the environment only because the host injects it.",
-            "Migrate on startup because the process owns the schema.",
-            "Drop lunr because the search index moved into the page.",
+            "Store tags in the tags table and the bookmark_tags join table.",
+            "Emit logs as JSON with slog's JSONHandler because the cluster log aggregator wants JSON.",
+            "Drop lunr because its index is 2.3 MB and slow on phones.",
             "Write the generated site to _site/.",
             "Render !!! note blocks as admonitions.",
+            "Use rayon for per-file work (EXIF read and hashing), size the pool to the number of logical CPUs by default, and let --jobs N override it.",
         ];
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
         let mut body = String::new();
-        for dir in ["coverage", "confirm"] {
-            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
-                body.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
-                body.push('\n');
-            }
+        for entry in std::fs::read_dir(root.join("coverage")).unwrap() {
+            body.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+            body.push('\n');
         }
         let closed: Vec<&str> = cells
             .iter()

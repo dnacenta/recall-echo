@@ -1,5 +1,0 @@
-# confirm snapfile
-setting|jobs|4|2026-10-04
-setting|rust_version|1.80|2026-09-21
-rule||Default to 4 jobs because a thread per CPU thrashes spinning disks.|2026-10-04
-rule||Keep MSRV at 1.80 because LazyLock is stable in the standard library.|2026-09-21
