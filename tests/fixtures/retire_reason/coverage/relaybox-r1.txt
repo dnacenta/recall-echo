@@ -20,3 +20,6 @@ entity:yrev7fmbjhws5dgncehv|setting|integration_test_command|go test -tags integ
 entity:yrev7fmbjhws5dgncehv|setting|log_handler|JSONHandler|2026-09-29
 entity:yrev7fmbjhws5dgncehv|setting|log_handler|TextHandler|2026-09-08
 entity:yrev7fmbjhws5dgncehv|setting|test_command|go test -race ./...|2026-09-19
+entity:m2n3relayboxvalue01|rule||Use pgx v5 directly with pgxpool, not database/sql and not an ORM.|2026-09-03
+entity:m2n3relayboxvalue01|setting|value|database/sql|2026-09-03|rejected
+entity:m2n3relayboxvalue01|setting|value|log/slog|2026-09-08

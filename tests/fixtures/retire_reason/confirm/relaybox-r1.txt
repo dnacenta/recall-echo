@@ -1,0 +1,9 @@
+entity:dnznzl3f0k8j6ywrz5ei|rule||Do not use a config file.|2026-09-02
+entity:dnznzl3f0k8j6ywrz5ei|rule||Use environment variables only for configuration, all prefixed RELAYBOX_.|2026-09-02
+entity:dnznzl3f0k8j6ywrz5ei|setting|config_source|config file|2026-09-02|rejected
+entity:dnznzl3f0k8j6ywrz5ei|setting|config_source|environment variables|2026-09-02
+entity:dnznzl3f0k8j6ywrz5ei|setting|config_source|flags|2026-09-02|rejected
+entity:dnznzl3f0k8j6ywrz5ei|setting|golangci_config_path|.golangci.yml|2026-09-16
+entity:dnznzl3f0k8j6ywrz5ei|setting|pgx_version|v5|2026-09-03
+entity:dnznzl3f0k8j6ywrz5ei|setting|value|database/sql|2026-09-03|rejected
+entity:dnznzl3f0k8j6ywrz5ei|setting|value|log/slog|2026-09-08

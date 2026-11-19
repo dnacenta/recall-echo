@@ -7606,8 +7606,129 @@ fn reason_rule(slot: &ReasonSlot, session: &str) -> bool {
 
 fn reason_claims(change: &ReasonChange, subject: &str, rule: &ReasonSlot) -> bool {
     same_name(&change.subject, subject)
+        && key_can_claim(&change.key)
         && names_old_value(&change.key, &change.old_value, &rule.value)
         && !names_new_value(&change.new_value, &rule.value)
+        && !forbids_old_value(&change.old_value, &rule.value)
+}
+
+/// A junk key such as `value` has no token of its own, so the change claims nothing.
+fn key_can_claim(key: &str) -> bool {
+    let folded = key.trim().to_lowercase();
+    if folded.is_empty() || is_generic_key(&folded) {
+        return false;
+    }
+    let tokens: Vec<&str> = folded
+        .split(['_', '-', '.'])
+        .filter(|token| !token.is_empty())
+        .collect();
+    !tokens.is_empty() && tokens.iter().any(|token| !is_generic_key(token))
+}
+
+/// A rule that forbids V_old is still true after the setting leaves that value.
+///
+/// The cue has to govern the old-value mention, or open the rule. An affirmative
+/// sentence that names the old value as the choice still claims, including one
+/// that later says "not" about something else.
+fn forbids_old_value(value: &str, text: &str) -> bool {
+    if starts_with_prohibition(text) {
+        return true;
+    }
+    let spans = value_spans(text, value);
+    !spans.is_empty() && spans.iter().all(|&(start, _)| cue_governs(text, start))
+}
+
+fn starts_with_prohibition(text: &str) -> bool {
+    let lower = text.trim_start().to_lowercase();
+    prohibition_cues().iter().any(|cue| cue_at(&lower, 0, cue))
+}
+
+fn cue_governs(text: &str, match_at: usize) -> bool {
+    let from = sentence_start_at(text, match_at);
+    let prefix = text[from..match_at].to_lowercase();
+    let Some((cue_at, cue_end)) = last_prohibition(&prefix) else {
+        return false;
+    };
+    near_gap(&prefix[cue_end..]) && !names_chosen_value(&prefix[..cue_at])
+}
+
+fn sentence_start_at(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = at.min(bytes.len());
+    while index > 0 {
+        index -= 1;
+        let mark = bytes[index];
+        if !matches!(mark, b'.' | b'!' | b'?') {
+            continue;
+        }
+        let followed = index + 1 >= bytes.len() || bytes[index + 1].is_ascii_whitespace();
+        let version_dot = mark == b'.' && index > 0 && bytes[index - 1].is_ascii_digit();
+        if followed && !version_dot {
+            return index + 1;
+        }
+    }
+    0
+}
+
+fn last_prohibition(prefix: &str) -> Option<(usize, usize)> {
+    let mut found = None;
+    let mut index = 0;
+    while index < prefix.len() {
+        if let Some(cue) = prohibition_cues()
+            .iter()
+            .copied()
+            .find(|cue| cue_at(prefix, index, cue))
+        {
+            found = Some((index, index + cue.len()));
+            index += cue.len();
+            continue;
+        }
+        index += prefix[index..].chars().next().map_or(1, char::len_utf8);
+    }
+    found
+}
+
+fn prohibition_cues() -> [&'static str; 6] {
+    ["do not", "don't", "never", "avoid", "without", "not"]
+}
+
+fn cue_at(text: &str, index: usize, cue: &str) -> bool {
+    if index > 0
+        && text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+    {
+        return false;
+    }
+    let rest = &text[index..];
+    rest.starts_with(cue)
+        && rest[cue.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_alphanumeric())
+}
+
+fn near_gap(gap: &str) -> bool {
+    alphanumeric_runs(gap).iter().all(|run| {
+        matches!(
+            run.as_str(),
+            "a" | "an" | "the" | "use" | "using" | "used" | "any" | "of" | "to" | "for"
+        )
+    })
+}
+
+/// Text before the cue names some other choice, so "not V_old" is a contrast.
+fn names_chosen_value(prefix: &str) -> bool {
+    const LEAD: &[&str] = &[
+        "please", "just", "only", "always", "simply", "should", "must", "directly", "each",
+        "every", "also", "still", "do",
+    ];
+    alphanumeric_runs(prefix).iter().any(|run| {
+        !is_stop_word(run)
+            && !LEAD.contains(&run.as_str())
+            && (run.chars().count() > 1 || run.chars().all(|ch| ch.is_ascii_digit()))
+    })
 }
 
 /// Two or more runs use [`names_value`]. One run is a bounded literal.
@@ -21060,12 +21181,15 @@ mod tests {
             .and_then(|dir| dir.file_name())
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if let Some((name, run)) = stem.rsplit_once("-r") {
+        let label = if let Some((name, run)) = stem.rsplit_once("-r") {
             format!("{name} r{run}")
-        } else if parent == "confirm" {
-            format!("confirm {stem}")
         } else {
             stem.to_string()
+        };
+        if parent == "confirm" {
+            format!("confirm {label}")
+        } else {
+            label
         }
     }
 
@@ -21188,12 +21312,14 @@ mod tests {
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
         let mut paths = Vec::new();
-        let mut names = std::fs::read_dir(root.join("coverage"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>();
-        names.sort();
-        paths.extend(names);
+        for dir in ["coverage", "confirm"] {
+            let mut names = std::fs::read_dir(root.join(dir))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            names.sort();
+            paths.extend(names);
+        }
         let mut cells: Vec<(String, Vec<String>)> = paths
             .iter()
             .map(|path| (excerpt_cell(path), excerpt_closes(path)))
@@ -21389,6 +21515,90 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_a_prohibition_does_not_claim_the_old_value() {
+        let banned = "Do not use a config file.";
+        let chosen = "Run tests with python -m unittest and do not add an extra test dependency.";
+        let kept =
+            "Keep MSRV rust_version at 1.74 because the laptop distro still ships that Rust.";
+        let retries =
+            "Retry each delivery 5 times with exponential backoff of 1s, 2s, 4s, then 8s between attempts.";
+        let closes = plan_slots(vec![
+            synthetic_slot(
+                "setting",
+                0,
+                "config_source",
+                "config file",
+                "rejected",
+                true,
+            ),
+            synthetic_slot(
+                "setting",
+                1,
+                "config_source",
+                "environment variables",
+                "decided",
+                true,
+            ),
+            synthetic_slot("rule", 2, "", banned, "decided", true),
+            synthetic_slot(
+                "setting",
+                3,
+                "test_command",
+                "python -m unittest",
+                "decided",
+                false,
+            ),
+            synthetic_slot("setting", 4, "test_command", "pytest -x", "decided", true),
+            synthetic_slot("rule", 5, "", chosen, "decided", true),
+            synthetic_slot("setting", 6, "rust_version", "1.74", "rejected", true),
+            synthetic_slot("setting", 7, "rust_version", "1.80", "decided", true),
+            synthetic_slot("rule", 8, "", kept, "decided", true),
+            synthetic_slot("setting", 9, "retry_attempts", "5", "decided", false),
+            synthetic_slot("setting", 10, "retry_attempts", "8", "decided", true),
+            synthetic_slot("rule", 11, "", retries, "decided", true),
+        ]);
+        assert_eq!(
+            closes,
+            vec![chosen.to_string(), kept.to_string(), retries.to_string()]
+        );
+    }
+
+    #[test]
+    fn synthetic_a_generic_key_claims_nothing() {
+        let pgx = "Use pgx v5 directly with pgxpool, not database/sql and not an ORM.";
+        let junk = plan_slots(vec![
+            synthetic_slot("setting", 0, "value", "database/sql", "rejected", true),
+            synthetic_slot("setting", 1, "value", "log/slog", "decided", true),
+            synthetic_slot("rule", 2, "", pgx, "decided", true),
+        ]);
+        assert!(junk.is_empty());
+        let named = plan_slots(vec![
+            synthetic_slot("setting", 0, "sql_driver", "database/sql", "rejected", true),
+            synthetic_slot("setting", 1, "sql_driver", "log/slog", "decided", true),
+            synthetic_slot("rule", 2, "", pgx, "decided", true),
+        ]);
+        assert_eq!(named, vec![pgx.to_string()]);
+    }
+
+    #[test]
+    fn the_saved_confirm_prohibition_stays_live() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/retire_reason/confirm/relaybox-r1.txt");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rule = "Do not use a config file.";
+        assert!(text.contains(
+            "entity:dnznzl3f0k8j6ywrz5ei|setting|config_source|config file|2026-09-02|rejected"
+        ));
+        assert!(text.contains(
+            "entity:dnznzl3f0k8j6ywrz5ei|setting|config_source|environment variables|2026-09-02"
+        ));
+        assert!(text.contains(&format!(
+            "entity:dnznzl3f0k8j6ywrz5ei|rule||{rule}|2026-09-02"
+        )));
+        assert!(excerpt_closes(&path).is_empty());
+    }
+
+    #[test]
     fn the_saved_test_command_gap_keeps_the_build_tag_rule() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/retire_reason/coverage/relaybox-r3.txt");
@@ -21497,6 +21707,7 @@ mod tests {
                     "Set http.Client Timeout to 10 seconds so a hanging receiver cannot hold a worker forever.",
                 ],
             ),
+            ("confirm relaybox r1", vec![]),
         ];
         let found: Vec<(&str, Vec<&str>)> = cells
             .iter()
@@ -21529,13 +21740,17 @@ mod tests {
             "Render !!! note blocks as admonitions.",
             "Use rayon for per-file work (EXIF read and hashing), size the pool to the number of logical CPUs by default, and let --jobs N override it.",
             "Tag integration tests with //go:build integration so they only run with go test -tags integration.",
+            "Do not use a config file.",
+            "Use pgx v5 directly with pgxpool, not database/sql and not an ORM.",
         ];
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retire_reason");
         let mut body = String::new();
-        for entry in std::fs::read_dir(root.join("coverage")).unwrap() {
-            body.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
-            body.push('\n');
+        for dir in ["coverage", "confirm"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                body.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+                body.push('\n');
+            }
         }
         let closed: Vec<&str> = cells
             .iter()
