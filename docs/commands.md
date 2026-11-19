@@ -110,13 +110,22 @@ writes of that subject, relation or key, and value are skipped, and reads show
 Corrections exist only on the CLI, because a model calling them would record its own
 judgement as yours.
 
+With `graph.slot_forget` also on, `graph correct <subject> <REL> --forget` (no value)
+forgets the whole slot: every live value of that subject and relation or key is
+deleted, one `kind: "slot"` record is written, and any later value of that slot is
+skipped until `graph correct <subject> <REL> --unforget`. `<REL>` is the same string
+an exact forget uses (`uses`, a setting key, or `setting:<key>`). An exact-value
+unforget does not clear the slot. With `slot_forget` off, a relationship still needs
+all three names, and a leftover slot row is ignored. Set it with
+`config set graph.slot_forget true`. It does not turn `lasting_forget` on.
+
 A lasting forget does not rewrite `conversations/*.md`, `EPHEMERAL.md`, `MEMORY.md`,
 turn sidecars, PreCompact checkpoints, or `graph.v1-backup-*`. `consume` and MEMORY.md
 may still show the raw value. Putting an old `graph.v1-backup-*` back on `graph/` can
 restore rows; while the forget file and the flag remain, reads still mask and writes
 still skip, and those restored rows are not deleted. Replacing the whole `memory/` tree,
-including the forget file, undoes the decision. There is no slot forget: a `setting`,
-`rule`, or `prefers` value goes away only as part of an entity forget.
+including the forget file, undoes the decision. A forgotten slot masks every current
+value of that subject and relation, including a value restored from a backup.
 
 ## Writing and maintenance
 

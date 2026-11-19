@@ -65,6 +65,8 @@ pub enum CorrectTarget {
         rel_type: String,
         to: String,
     },
+    /// Every live value of one subject and relation or key.
+    Slot { from: String, relation: String },
 }
 
 /// What to do to the target.
@@ -174,6 +176,9 @@ pub async fn correct(
         CorrectTarget::Entity { name } => correct_entity(db, weights, name, correction).await,
         CorrectTarget::Edge { from, rel_type, to } => {
             correct_edge(db, weights, from, rel_type, to, correction).await
+        }
+        CorrectTarget::Slot { from, relation } => {
+            correct_slot(db, from, relation, correction).await
         }
     }
 }
@@ -305,6 +310,195 @@ async fn forget_edges(
         super::crud::delete_relationship(db, &edge.id_string()).await?;
     }
     Ok(CorrectionReport::Removed { removal })
+}
+
+// ── Slot target ──────────────────────────────────────────────────────────
+
+async fn correct_slot(
+    db: &Surreal<Db>,
+    from: &str,
+    relation: &str,
+    correction: Correction,
+) -> Result<CorrectionReport, GraphError> {
+    let Correction::Forget { confirmed } = correction else {
+        return Err(GraphError::Parse(
+            "a slot forget is not a contradiction".into(),
+        ));
+    };
+    let source = match resolve(db, from).await? {
+        Resolution::Found(entity) => entity,
+        Resolution::Unresolved(report) => return Ok(report),
+    };
+    let matched = edges_of_slot(db, &source.id, relation).await?;
+    let mut cache = NameCache::new();
+    let mut views = edge_view::views(db, &mut cache, &matched).await?;
+    let edit = slot_edit(db, &source.id, relation).await?;
+    for (index, value) in edit.values.iter().enumerate() {
+        views.push(slot_value_view(&source.name, relation, value, index));
+    }
+    let removal = Removal {
+        entity: None,
+        edges: views,
+    };
+    if !confirmed {
+        return Ok(CorrectionReport::Planned { removal });
+    }
+    for edge in &matched {
+        super::crud::delete_relationship(db, &edge.id_string()).await?;
+    }
+    if let Some(attributes) = edit.attributes {
+        store_attributes(db, &source.id, &attributes).await?;
+    }
+    Ok(CorrectionReport::Removed { removal })
+}
+
+struct SlotEdit {
+    values: Vec<String>,
+    attributes: Option<serde_json::Value>,
+}
+
+async fn edges_of_slot(
+    db: &Surreal<Db>,
+    entity_id: &str,
+    relation: &str,
+) -> Result<Vec<Relationship>, GraphError> {
+    let edges = edge_view::live_edges_of(db, entity_id).await?;
+    Ok(edges
+        .into_iter()
+        .filter(|edge| {
+            edge_view::record_id(&edge.from_id) == entity_id
+                && edge_relation_hit(&edge.rel_type, relation)
+        })
+        .collect())
+}
+
+fn edge_relation_hit(rel_type: &str, relation: &str) -> bool {
+    rel_type.eq_ignore_ascii_case(relation) || relation_names_key(rel_type, "", relation)
+}
+
+async fn slot_edit(
+    db: &Surreal<Db>,
+    entity_id: &str,
+    relation: &str,
+) -> Result<SlotEdit, GraphError> {
+    let Some(mut attributes) = load_attributes(db, entity_id).await? else {
+        return Ok(SlotEdit {
+            values: Vec::new(),
+            attributes: None,
+        });
+    };
+    let values = drain_matching_slots(&mut attributes, relation);
+    let stored = if values.is_empty() {
+        None
+    } else {
+        Some(attributes)
+    };
+    Ok(SlotEdit {
+        values,
+        attributes: stored,
+    })
+}
+
+async fn load_attributes(
+    db: &Surreal<Db>,
+    entity_id: &str,
+) -> Result<Option<serde_json::Value>, GraphError> {
+    let mut response = db
+        .query("SELECT attributes FROM type::record($id)")
+        .bind(("id", entity_id.to_string()))
+        .await?;
+    let rows: Vec<serde_json::Value> = super::deserialize_take(&mut response, 0)?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.get("attributes").cloned())
+        .filter(|value| value.is_object()))
+}
+
+async fn store_attributes(
+    db: &Surreal<Db>,
+    entity_id: &str,
+    attributes: &serde_json::Value,
+) -> Result<(), GraphError> {
+    db.query("UPDATE type::record($id) SET attributes = $attributes, updated_at = time::now()")
+        .bind(("id", entity_id.to_string()))
+        .bind(("attributes", attributes.clone()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+fn drain_matching_slots(attributes: &mut serde_json::Value, relation: &str) -> Vec<String> {
+    let Some(slots) = attributes
+        .pointer_mut("/v2/slots")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    let mut removed = Vec::new();
+    for slot in slots.drain(..) {
+        if live_attribute_slot(&slot) && attribute_slot_hit(&slot, relation) {
+            if let Some(value) = slot.get("value").and_then(serde_json::Value::as_str) {
+                if !value.is_empty() {
+                    removed.push(value.to_string());
+                }
+            }
+        } else {
+            kept.push(slot);
+        }
+    }
+    *slots = kept;
+    removed
+}
+
+fn live_attribute_slot(slot: &serde_json::Value) -> bool {
+    !super::crud::edge_already_closed(slot.get("valid_until"))
+        && !slot
+            .get("pending")
+            .is_some_and(serde_json::Value::is_object)
+}
+
+fn attribute_slot_hit(slot: &serde_json::Value, relation: &str) -> bool {
+    let predicate = text_field(slot, "predicate");
+    let key = text_field(slot, "key");
+    relation_names_key(&predicate, &key, relation)
+}
+
+fn text_field(slot: &serde_json::Value, key: &str) -> String {
+    slot.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Predicate, key, or `setting:<key>`, folded the way a forget record is.
+fn relation_names_key(predicate: &str, key: &str, relation: &str) -> bool {
+    let relation = super::aliases::fold(relation);
+    if super::aliases::fold(predicate) == relation {
+        return true;
+    }
+    if key.is_empty() {
+        return false;
+    }
+    if super::aliases::fold(key) == relation {
+        return true;
+    }
+    super::aliases::fold(&format!("{predicate}:{key}")) == relation
+}
+
+fn slot_value_view(from: &str, relation: &str, value: &str, index: usize) -> EdgeView {
+    EdgeView {
+        id: format!("slot:{index}"),
+        from: from.to_string(),
+        to: value.to_string(),
+        rel_type: relation.to_string(),
+        description: None,
+        confidence: 1.0,
+        evidence: 0.0,
+        self_reinforcements: 0,
+        superseded: false,
+    }
 }
 
 // ── Contradiction ────────────────────────────────────────────────────────

@@ -291,6 +291,9 @@ pub struct OptOuts {
     /// Write `consolidate_retire_reason = true` and imply `consolidate`.
     /// False leaves the key out. An opt-out run does not write it.
     pub consolidate_retire_reason: bool,
+    /// Write `slot_forget = true`. False leaves the key out.
+    /// Does not turn lasting forget on. An opt-out run does not write it.
+    pub slot_forget: bool,
 }
 
 impl OptOuts {
@@ -314,6 +317,7 @@ impl OptOuts {
             consolidate_retire_component: true,
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
+            slot_forget: false,
         }
     }
 }
@@ -861,6 +865,7 @@ fn switch_lines(
         opt_outs.consolidate_retire_reason,
         "consolidate_retire_reason = true",
     );
+    push_line(&mut lines, opt_outs.slot_forget, "slot_forget = true");
     lines
 }
 
@@ -3572,6 +3577,45 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.retire_reason_apply());
         assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn slot_forget_writes_only_its_key_and_does_not_turn_lasting_forget_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                slot_forget: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nslot_forget = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.slot_forget);
+        assert!(!graph.lasting_forget);
+        assert!(graph.consolidate, "the default consolidation stack stays");
+        assert!(!text.contains("consolidate"));
+        assert!(!text.contains("lasting_forget"));
     }
 
     #[test]

@@ -329,6 +329,10 @@ enum BenchCommands {
         /// Implies nothing. The list is not stored.
         #[arg(long)]
         recover_turns: bool,
+        /// Write `slot_forget = true` for this run. Off unless set.
+        /// Implies nothing, and does not turn lasting forget on.
+        #[arg(long)]
+        slot_forget: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1170,6 +1174,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             drop_restatements,
             ground_component_edges,
             recover_turns,
+            slot_forget,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1281,6 +1286,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_retire_component: no_consolidate_retire_component,
                 consolidate_component_takeover,
                 consolidate_retire_reason,
+                slot_forget,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2504,6 +2510,48 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn slot_forget_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--slot-forget",
+        ])
+        .expect("parse slot forget");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        slot_forget,
+                        recover_turns,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(slot_forget);
+                assert!(!consolidate);
+                assert!(!recover_turns);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--slot-forget"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn known_key_binding_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2823,6 +2871,7 @@ mod tests {
             consolidate_retire_component: f[11],
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
+            slot_forget: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],
