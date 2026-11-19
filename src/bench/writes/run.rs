@@ -288,6 +288,9 @@ pub struct OptOuts {
     /// False leaves the key out. Unlike the fields above, this is an opt-in:
     /// [`Self::stack_off`] leaves it false so an opt-out run does not write it.
     pub consolidate_component_takeover: bool,
+    /// Write `consolidate_retire_reason = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_retire_reason: bool,
 }
 
 impl OptOuts {
@@ -310,6 +313,7 @@ impl OptOuts {
             consolidate_rule_fragments: true,
             consolidate_retire_component: true,
             consolidate_component_takeover: false,
+            consolidate_retire_reason: false,
         }
     }
 }
@@ -738,16 +742,19 @@ fn switch_lines(
     push_switch(
         &mut lines,
         with_component_takeover(
-            writes_consolidate(
-                consolidate,
-                consolidate_links,
-                consolidate_components,
-                consolidate_key_rename,
-                consolidate_replaces_cue,
-                consolidate_replaces_departure,
-                consolidate_orphan_sweep,
-                consolidate_rule_fragments,
-                consolidate_retire_component,
+            with_retire_reason(
+                writes_consolidate(
+                    consolidate,
+                    consolidate_links,
+                    consolidate_components,
+                    consolidate_key_rename,
+                    consolidate_replaces_cue,
+                    consolidate_replaces_departure,
+                    consolidate_orphan_sweep,
+                    consolidate_rule_fragments,
+                    consolidate_retire_component,
+                ),
+                opt_outs.consolidate_retire_reason,
             ),
             opt_outs.consolidate_component_takeover,
         ),
@@ -849,11 +856,20 @@ fn switch_lines(
         opt_outs.consolidate_component_takeover,
         "consolidate_component_takeover = true",
     );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_retire_reason,
+        "consolidate_retire_reason = true",
+    );
     lines
 }
 
 fn with_component_takeover(consolidate: bool, takeover: bool) -> bool {
     consolidate || takeover
+}
+
+fn with_retire_reason(consolidate: bool, retire_reason: bool) -> bool {
+    consolidate || retire_reason
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3476,6 +3492,50 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.component_takeover_apply());
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn consolidate_retire_reason_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_retire_reason: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_retire_reason = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_component_takeover"), "{text}");
+        assert!(!text.contains("consolidate_retire_component"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.retire_reason_apply());
         assert!(graph.consolidate);
     }
 

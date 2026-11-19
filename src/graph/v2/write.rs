@@ -182,6 +182,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Close a project tool a component took over.
     /// Off leaves that pass unchanged and reads nothing for it.
     pub component_takeover_on: bool,
+    /// Close a live rule that still names a replaced setting value.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub retire_reason_on: bool,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -215,6 +218,7 @@ impl<'a> WriteCtx<'a> {
             rule_fragments_on: false,
             retire_component_on: false,
             component_takeover_on: false,
+            retire_reason_on: false,
         }
     }
 }
@@ -3485,6 +3489,7 @@ mod tests {
                 rule_fragments_on: false,
                 retire_component_on: false,
                 component_takeover_on: false,
+                retire_reason_on: false,
             },
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
@@ -4759,6 +4764,7 @@ mod tests {
             rule_fragments_on: false,
             retire_component_on: false,
             component_takeover_on: false,
+            retire_reason_on: false,
         };
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
@@ -6265,6 +6271,7 @@ mod tests {
             rule_fragments_on: false,
             retire_component_on: false,
             component_takeover_on: false,
+            retire_reason_on: false,
             targets: vec![Some(super::super::known_match::MatchTarget {
                 row_id: target.id.clone(),
                 subject: target.subject,
@@ -8159,6 +8166,7 @@ mod tests {
             rule_fragments_on: false,
             retire_component_on: false,
             component_takeover_on: false,
+            retire_reason_on: false,
         };
         let result = write_facts(
             &gm,

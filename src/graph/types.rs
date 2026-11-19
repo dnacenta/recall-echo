@@ -976,6 +976,14 @@ pub struct ConsolidateReport {
     /// None of those tools close. Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_takeover_ambiguous: Option<u32>,
+    /// Rules closed because they still name a setting value that changed.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_reason_closes: Option<u32>,
+    /// Rules named by two or more setting changes. None of those rules close.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_reason_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1162,6 +1170,8 @@ impl ConsolidateReport {
             self.component_retire_ambiguous,
             self.component_takeover_closes,
             self.component_takeover_ambiguous,
+            self.retire_reason_closes,
+            self.retire_reason_ambiguous,
         ])
     }
 }
@@ -1677,6 +1687,32 @@ mod tests {
         let zeros = ConsolidateReport {
             component_takeover_closes: Some(0),
             component_takeover_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+    }
+
+    #[test]
+    fn retire_reason_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("retire_reason_closes").is_none());
+        assert!(encoded.get("retire_reason_ambiguous").is_none());
+        let closed = ConsolidateReport {
+            retire_reason_closes: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["retire_reason_closes"], 1);
+        assert!(encoded.get("retire_reason_ambiguous").is_none());
+        let ambiguous = ConsolidateReport {
+            retire_reason_ambiguous: Some(2),
+            ..ConsolidateReport::default()
+        };
+        assert!(!ambiguous.is_blank());
+        let zeros = ConsolidateReport {
+            retire_reason_closes: Some(0),
+            retire_reason_ambiguous: Some(0),
             ..ConsolidateReport::default()
         };
         assert!(zeros.is_blank());

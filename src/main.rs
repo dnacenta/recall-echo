@@ -308,6 +308,10 @@ enum BenchCommands {
         /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
         #[arg(long)]
         consolidate_component_takeover: bool,
+        /// Close a rule that still names a setting value that changed.
+        /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
+        #[arg(long)]
+        consolidate_retire_reason: bool,
         /// Bind a decided setting key from a shown known row. On unless
         /// `--no-known-key-binding`. Does not turn on `--known-facts-context`.
         #[arg(long)]
@@ -343,6 +347,7 @@ enum BenchCommands {
                 "consolidate_rule_fragments",
                 "consolidate_retire_component",
                 "consolidate_component_takeover",
+                "consolidate_retire_reason",
             ]
         )]
         no_consolidate: bool,
@@ -1177,6 +1182,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             no_consolidate_rule_fragments,
             no_consolidate_retire_component,
             consolidate_component_takeover,
+            consolidate_retire_reason,
             no_known_key_binding,
             no_drop_restatements,
             no_ground_component_edges,
@@ -1274,6 +1280,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_rule_fragments: no_consolidate_rule_fragments,
                 consolidate_retire_component: no_consolidate_retire_component,
                 consolidate_component_takeover,
+                consolidate_retire_reason,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2451,6 +2458,52 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn consolidate_retire_reason_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-retire-reason",
+        ])
+        .expect("parse retire reason");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_retire_reason,
+                        consolidate_component_takeover,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_retire_reason);
+                assert!(!consolidate);
+                assert!(!consolidate_component_takeover);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let rejected = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--consolidate-retire-reason",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "opt-out and retire reason should be rejected"
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn known_key_binding_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2769,6 +2822,7 @@ mod tests {
             consolidate_rule_fragments: f[10],
             consolidate_retire_component: f[11],
             consolidate_component_takeover: false,
+            consolidate_retire_reason: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],

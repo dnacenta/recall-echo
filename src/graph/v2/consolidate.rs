@@ -5197,6 +5197,7 @@ struct PostSnap {
     fragments: Option<FragmentSnap>,
     retire: Option<RetireSnap>,
     takeover: Option<TakeoverSnap>,
+    reason: Option<ReasonSnap>,
 }
 
 struct OrphanSnap {
@@ -5242,6 +5243,7 @@ fn post_switches(ctx: &WriteCtx<'_>) -> bool {
         || ctx.rule_fragments_on
         || ctx.retire_component_on
         || ctx.component_takeover_on
+        || ctx.retire_reason_on
 }
 
 async fn post_pass(
@@ -5270,6 +5272,7 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
             fragments: None,
             retire: None,
             takeover: None,
+            reason: None,
         });
     }
     let rows = read_entity_rows(gm).await?;
@@ -5291,11 +5294,13 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
         None
     };
     let takeover = maybe_takeover(gm, ctx, &rows).await?;
+    let reason = maybe_reason(ctx, &rows);
     Ok(PostSnap {
         orphan,
         fragments,
         retire,
         takeover,
+        reason,
     })
 }
 
@@ -5333,6 +5338,10 @@ async fn apply_post(
     if let Some(takeover) = &snap.takeover {
         let plan = plan_takeover(ctx, takeover);
         apply_takeover(gm, ctx, &plan, report).await;
+    }
+    if let Some(reason) = &snap.reason {
+        let plan = plan_retire_reason(ctx, reason);
+        apply_retire_reason(gm, ctx, &plan, report).await;
     }
 }
 
@@ -7323,6 +7332,298 @@ fn takeover_ambiguous_line(note: &TakeoverAmbiguous) -> String {
         quote_head(&note.new_tool),
         note.count
     )
+}
+
+const REASON_ENDED: &str = "retire_reason";
+
+struct ReasonSnap {
+    entities: Vec<ReasonEntity>,
+}
+
+struct ReasonEntity {
+    id: String,
+    name: String,
+    slots: Vec<ReasonSlot>,
+}
+
+struct ReasonSlot {
+    index: usize,
+    predicate: String,
+    key: String,
+    value: String,
+    status: String,
+    pending: bool,
+    live: bool,
+    ended_by: String,
+    first_session: String,
+}
+
+struct ReasonChange {
+    subject: String,
+    key: String,
+    old_value: String,
+    new_value: String,
+}
+
+struct ReasonClose {
+    entity_id: String,
+    subject: String,
+    index: usize,
+    value: String,
+}
+
+struct ReasonPlan {
+    closes: Vec<ReasonClose>,
+    ambiguous: u32,
+}
+
+fn maybe_reason(ctx: &WriteCtx<'_>, rows: &[Value]) -> Option<ReasonSnap> {
+    if !ctx.retire_reason_on {
+        return None;
+    }
+    Some(ReasonSnap {
+        entities: reason_entities(rows),
+    })
+}
+
+fn reason_entities(rows: &[Value]) -> Vec<ReasonEntity> {
+    rows.iter().filter_map(reason_entity).collect()
+}
+
+fn reason_entity(row: &Value) -> Option<ReasonEntity> {
+    let id = id_text(row.get("id"));
+    if id.is_empty() {
+        return None;
+    }
+    let raw = row
+        .pointer("/attributes/v2/slots")
+        .and_then(Value::as_array);
+    Some(ReasonEntity {
+        name: json_text(row.get("name")),
+        slots: slot_views(row)
+            .into_iter()
+            .map(|view| reason_slot(raw, view))
+            .collect(),
+        id,
+    })
+}
+
+fn reason_slot(raw: Option<&Vec<Value>>, view: SlotView) -> ReasonSlot {
+    ReasonSlot {
+        ended_by: slot_ended_by(raw, view.index),
+        index: view.index,
+        predicate: view.predicate,
+        key: view.key,
+        value: view.value,
+        status: view.status,
+        pending: view.pending,
+        live: view.live,
+        first_session: view.first_session,
+    }
+}
+
+/// A new setting value is named by a bounded literal, or by [`names_value`]
+/// when the value has two or more alphanumeric runs.
+///
+/// A single run uses the literal only, so `_site/` is not the word `site`.
+fn names_new_value(value: &str, text: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if bounded_literal(text, trimmed) {
+        return true;
+    }
+    alphanumeric_runs(trimmed).len() >= 2 && names_value(trimmed, text)
+}
+
+fn bounded_literal(text: &str, value: &str) -> bool {
+    let needle: Vec<char> = value.chars().flat_map(char::to_lowercase).collect();
+    let chars: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() || chars.len() < needle.len() {
+        return false;
+    }
+    (0..=chars.len() - needle.len()).any(|start| literal_at(&chars, &needle, start))
+}
+
+fn literal_at(chars: &[char], needle: &[char], start: usize) -> bool {
+    let end = start + needle.len();
+    chars[start..end] == needle[..]
+        && (start == 0 || !chars[start - 1].is_alphanumeric())
+        && (end == chars.len() || !chars[end].is_alphanumeric())
+}
+
+fn plan_retire_reason(ctx: &WriteCtx<'_>, snap: &ReasonSnap) -> ReasonPlan {
+    let changes = reason_changes(&snap.entities, ctx.session_id);
+    let mut plan = ReasonPlan {
+        closes: Vec::new(),
+        ambiguous: 0,
+    };
+    for entity in &snap.entities {
+        for slot in &entity.slots {
+            record_reason(&mut plan, entity, slot, &changes, ctx.session_id);
+        }
+    }
+    plan.closes.sort_by(|left, right| {
+        left.entity_id
+            .cmp(&right.entity_id)
+            .then(left.index.cmp(&right.index))
+    });
+    plan
+}
+
+fn reason_changes(entities: &[ReasonEntity], session: &str) -> Vec<ReasonChange> {
+    let mut found = Vec::new();
+    for entity in entities {
+        let mut keys = BTreeSet::new();
+        for slot in &entity.slots {
+            if setting_row(slot) {
+                keys.insert(retire_key(&slot.key));
+            }
+        }
+        for key in keys {
+            push_key_changes(&mut found, entity, &key, session);
+        }
+    }
+    found
+}
+
+fn setting_row(slot: &ReasonSlot) -> bool {
+    slot.predicate == "setting" && slot.status == "decided" && !slot.pending
+}
+
+fn push_key_changes(
+    found: &mut Vec<ReasonChange>,
+    entity: &ReasonEntity,
+    key: &str,
+    session: &str,
+) {
+    let slots: Vec<&ReasonSlot> = entity
+        .slots
+        .iter()
+        .filter(|slot| setting_row(slot) && retire_key(&slot.key) == key)
+        .collect();
+    for new in &slots {
+        if !new.live {
+            continue;
+        }
+        for old in &slots {
+            if old.index == new.index || !reason_pair(old, new, session) {
+                continue;
+            }
+            push_reason_change(found, entity, old, new);
+        }
+    }
+}
+
+fn reason_pair(old: &ReasonSlot, new: &ReasonSlot, session: &str) -> bool {
+    if values_equal(&old.value, &new.value) {
+        return false;
+    }
+    if !old.live {
+        return true;
+    }
+    new.first_session == session && earlier_session(&old.first_session, session)
+}
+
+fn push_reason_change(
+    found: &mut Vec<ReasonChange>,
+    entity: &ReasonEntity,
+    old: &ReasonSlot,
+    new: &ReasonSlot,
+) {
+    let change = ReasonChange {
+        subject: entity.name.clone(),
+        key: old.key.clone(),
+        old_value: old.value.clone(),
+        new_value: new.value.clone(),
+    };
+    if found.iter().any(|have| same_reason(have, &change)) {
+        return;
+    }
+    found.push(change);
+}
+
+fn same_reason(left: &ReasonChange, right: &ReasonChange) -> bool {
+    same_name(&left.subject, &right.subject)
+        && retire_key(&left.key) == retire_key(&right.key)
+        && values_equal(&left.old_value, &right.old_value)
+        && values_equal(&left.new_value, &right.new_value)
+}
+
+fn record_reason(
+    plan: &mut ReasonPlan,
+    entity: &ReasonEntity,
+    slot: &ReasonSlot,
+    changes: &[ReasonChange],
+    session: &str,
+) {
+    if !reason_rule(slot, session) {
+        return;
+    }
+    let claimed: Vec<&ReasonChange> = changes
+        .iter()
+        .filter(|change| reason_claims(change, &entity.name, slot))
+        .collect();
+    match claimed.len() {
+        0 => {}
+        1 => plan.closes.push(reason_close(entity, slot)),
+        _ => plan.ambiguous = plan.ambiguous.saturating_add(1),
+    }
+}
+
+fn reason_rule(slot: &ReasonSlot, session: &str) -> bool {
+    slot.predicate == "rule"
+        && slot.live
+        && slot.status == "decided"
+        && !slot.pending
+        && !ended_this_session(&slot.ended_by, session)
+}
+
+fn reason_claims(change: &ReasonChange, subject: &str, rule: &ReasonSlot) -> bool {
+    same_name(&change.subject, subject)
+        && names_value(&change.old_value, &rule.value)
+        && !names_new_value(&change.new_value, &rule.value)
+}
+
+fn reason_close(entity: &ReasonEntity, slot: &ReasonSlot) -> ReasonClose {
+    ReasonClose {
+        entity_id: entity.id.clone(),
+        subject: entity.name.clone(),
+        index: slot.index,
+        value: slot.value.clone(),
+    }
+}
+
+async fn apply_retire_reason(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &ReasonPlan,
+    report: &mut IngestionReport,
+) {
+    for _ in 0..plan.ambiguous {
+        add_count(&mut report.consolidate.retire_reason_ambiguous);
+    }
+    for close in &plan.closes {
+        let line = format!(
+            "consolidate retire_reason: {} {}",
+            close.subject, close.index
+        );
+        if close_sweep_slot(gm, ctx, &reason_sweep(close), REASON_ENDED, &line, report).await {
+            add_count(&mut report.consolidate.retire_reason_closes);
+        }
+    }
+}
+
+fn reason_sweep(close: &ReasonClose) -> SweepClose {
+    SweepClose {
+        entity_id: close.entity_id.clone(),
+        subject: close.subject.clone(),
+        index: close.index,
+        predicate: "rule".into(),
+        key: String::new(),
+        value: close.value.clone(),
+    }
 }
 
 #[cfg(all(test, feature = "embedded"))]
@@ -20054,6 +20355,643 @@ mod tests {
         assert!(lines.iter().all(|line| !line.contains("takeover")));
         assert!(ended_key(&slots(&gm, "quillpress").await, "highlight_time").is_none());
         drop(tmp);
+    }
+
+    const OLD_MSRV: &str = "Keep MSRV at 1.74 because the laptop distro ships that toolchain.";
+    const NEW_MSRV: &str = "Keep MSRV at 1.80 because LazyLock is stable in the standard library.";
+    const POOL_RULE: &str = "Size the worker pool to the number of logical CPUs.";
+    const FOUR_JOBS: &str = "Default to 4 jobs because a thread per CPU thrashes spinning disks.";
+    const PUBLIC_RULE: &str = "Write the generated site to public/.";
+    const SITE_RULE: &str = "Write the generated site to _site/.";
+    const SIGNATURE_RULE: &str = "Send X-Relaybox-Signature: sha256=<hex>.";
+    const TAG_RULE: &str = "Store each bookmark's tags as one comma-separated string.";
+    const MVHD_RULE: &str = "Apply mvhd_epoch_offset because the header stores a fixed epoch.";
+    const MTIME_RULE: &str = "Do not guess dates from mtime.";
+    const FALLBACK_RULE: &str = "When DateTimeOriginal is missing (screenshots, edited exports), fall back to the file's modification time.";
+    const SQLITE_RULE: &str = "Use SQLite because it handles concurrent writers.";
+    const JSON_RULE: &str = "Use JSONHandler because the cluster log aggregator wants JSON.";
+    const BOTH_RULE: &str = "Keep MSRV at 1.74 and write the site to public/ until the cutover.";
+
+    fn named_project(name: &str) -> ProjectIdentity {
+        ProjectIdentity {
+            name: name.into(),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn subject_setting(subject: &str, key: &str, value: &str) -> Fact {
+        as_kind(setting_of(subject, key, value, "decided"), Kind::Project)
+    }
+
+    fn project_rule(subject: &str, text: &str) -> Fact {
+        as_kind(rule_of(subject, text), Kind::Project)
+    }
+
+    async fn commit_named(
+        gm: &GraphMemory,
+        project: &str,
+        session: &str,
+        date: &str,
+        facts: &[Fact],
+    ) {
+        let identity = named_project(project);
+        let turns = [user_turn(1, "stored")];
+        let ctx = WriteCtx::new(&Quiet, &identity, session, date, &turns);
+        write_facts(gm, &ctx, facts).await.unwrap();
+    }
+
+    async fn finish_reason(
+        gm: &GraphMemory,
+        project: &str,
+        session: &str,
+        date: &str,
+        on: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let identity = named_project(project);
+        let turns = [user_turn(2, "later")];
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &identity, session, date, &turns);
+        ctx.retire_reason_on = on;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, &[], &WriteStats::default(), &stub, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    fn rule_named<'a>(rows: &'a [Value], text: &str) -> &'a Value {
+        rows.iter()
+            .find(|slot| slot["predicate"] == "rule" && slot["value"] == text)
+            .unwrap_or_else(|| panic!("missing rule {text}"))
+    }
+
+    fn rule_index(rows: &[Value], text: &str) -> usize {
+        rows.iter()
+            .position(|slot| slot["predicate"] == "rule" && slot["value"] == text)
+            .unwrap_or_else(|| panic!("missing rule {text}"))
+    }
+
+    fn assert_reason_closed(slot: &Value, ended_by: &str, until: &str) {
+        assert_eq!(ended(slot), Some(ended_by));
+        assert_eq!(slot["valid_until"], until);
+    }
+
+    #[test]
+    fn names_new_value_bounds_a_single_run_and_keeps_names_value_for_several() {
+        assert!(super::names_value("public/", PUBLIC_RULE));
+        assert!(!super::names_new_value("_site/", PUBLIC_RULE));
+        assert!(super::names_new_value("_site/", SITE_RULE));
+        assert!(!super::names_value("public/", SITE_RULE));
+        assert!(super::names_new_value("4", FOUR_JOBS));
+        assert!(!super::names_new_value("4", POOL_RULE));
+        assert!(super::names_new_value("1.80", NEW_MSRV));
+        assert!(!super::names_new_value("1.74", NEW_MSRV));
+        assert!(super::names_value("1.74", OLD_MSRV));
+        assert!(!super::names_new_value("1.80", OLD_MSRV));
+        assert!(super::names_value("sha256=<hex>", SIGNATURE_RULE));
+        assert!(!super::names_new_value(
+            "t=<unix seconds>,v1=<hex>",
+            SIGNATURE_RULE
+        ));
+        assert!(super::names_value("number of logical CPUs", POOL_RULE));
+        assert!(!super::names_value("number of logical CPUs", FOUR_JOBS));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_msrv_closes_the_old_reason_and_leaves_the_new_one() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                project_rule("snapfile", OLD_MSRV),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[
+                subject_setting("snapfile", "msrv", "1.80"),
+                project_rule("snapfile", NEW_MSRV),
+            ],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        let index = rule_index(&rows, OLD_MSRV);
+        assert_reason_closed(
+            rule_named(&rows, OLD_MSRV),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        assert!(ended(rule_named(&rows, NEW_MSRV)).is_none());
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+        assert!(report.consolidate.retire_reason_ambiguous.is_none());
+        assert_eq!(
+            lines,
+            vec![format!("consolidate retire_reason: snapfile {index}")]
+        );
+        assert_eq!(report.retirements.len(), 1);
+        assert_eq!(report.retirements[0].reason, "retire_reason");
+        assert_eq!(report.retirements[0].subject, "snapfile");
+        assert_eq!(report.retirements[0].predicate, "rule");
+        assert_eq!(report.retirements[0].old_value, OLD_MSRV);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retire_reason_off_leaves_both_msrv_rules_live_and_reads_nothing() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                project_rule("snapfile", OLD_MSRV),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[
+                subject_setting("snapfile", "msrv", "1.80"),
+                project_rule("snapfile", NEW_MSRV),
+            ],
+        )
+        .await;
+        let (report, lines, reads) =
+            finish_reason(&gm, "snapfile", "s11", "2026-04-11", false).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert!(ended(rule_named(&rows, OLD_MSRV)).is_none());
+        assert!(ended(rule_named(&rows, NEW_MSRV)).is_none());
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert!(report.consolidate.retire_reason_ambiguous.is_none());
+        assert!(lines.iter().all(|line| !line.contains("retire_reason")));
+        assert_eq!(reads, 0);
+        let encoded = serde_json::to_value(&report.consolidate).unwrap();
+        assert!(encoded.get("retire_reason_closes").is_none());
+        assert!(encoded.get("retire_reason_ambiguous").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pool_rule_closes_and_the_four_job_reason_stays() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "jobs", "number of logical CPUs"),
+                project_rule("snapfile", POOL_RULE),
+                project_rule("snapfile", FOUR_JOBS),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("snapfile", "jobs", "4")],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert_reason_closed(
+            rule_named(&rows, POOL_RULE),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        assert!(ended(rule_named(&rows, FOUR_JOBS)).is_none());
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("consolidate retire_reason: snapfile "));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_public_output_rule_closes_and_the_site_rule_stays() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "quillpress",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("quillpress", "output_dir", "public/"),
+                project_rule("quillpress", PUBLIC_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "quillpress",
+            "s11",
+            "2026-04-11",
+            &[
+                subject_setting("quillpress", "output_dir", "_site/"),
+                project_rule("quillpress", SITE_RULE),
+            ],
+        )
+        .await;
+        let (report, _, _) = finish_reason(&gm, "quillpress", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "quillpress").await;
+        assert_reason_closed(
+            rule_named(&rows, PUBLIC_RULE),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        assert!(ended(rule_named(&rows, SITE_RULE)).is_none());
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sha256_signature_rule_closes_when_the_format_changes() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "relaybox",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("relaybox", "signature", "sha256=<hex>"),
+                project_rule("relaybox", SIGNATURE_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "relaybox",
+            "s11",
+            "2026-04-11",
+            &[subject_setting(
+                "relaybox",
+                "signature",
+                "t=<unix seconds>,v1=<hex>",
+            )],
+        )
+        .await;
+        let (report, _, _) = finish_reason(&gm, "relaybox", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "relaybox").await;
+        assert_reason_closed(
+            rule_named(&rows, SIGNATURE_RULE),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_comma_separated_tag_rule_closes_when_tags_move_to_a_join_table() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "linkshelf",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("linkshelf", "tag_storage", "one comma-separated string"),
+                project_rule("linkshelf", TAG_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "linkshelf",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("linkshelf", "tag_storage", "join table")],
+        )
+        .await;
+        let (report, _, _) = finish_reason(&gm, "linkshelf", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "linkshelf").await;
+        assert_reason_closed(
+            rule_named(&rows, TAG_RULE),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catch_up_closes_the_old_reason_in_a_later_session() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                project_rule("snapfile", OLD_MSRV),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s08",
+            "2026-04-08",
+            &[
+                subject_setting("snapfile", "msrv", "1.80"),
+                project_rule("snapfile", NEW_MSRV),
+            ],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "snapfile", "s12", "2026-04-12", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert_reason_closed(
+            rule_named(&rows, OLD_MSRV),
+            "s12:retire_reason",
+            "2026-04-12T00:00:00Z",
+        );
+        assert!(ended(rule_named(&rows, NEW_MSRV)).is_none());
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_key_name_alone_does_not_close_the_mvhd_rule() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "mvhd_epoch_offset", "2082844800"),
+                project_rule("snapfile", MVHD_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("snapfile", "mvhd_epoch_offset", "0")],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert!(ended(rule_named(&rows, MVHD_RULE)).is_none());
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert!(lines.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_date_rule_stays_when_no_mtime_setting_changed() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                project_rule("snapfile", OLD_MSRV),
+                project_rule("snapfile", MTIME_RULE),
+                project_rule("snapfile", FALLBACK_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("snapfile", "msrv", "1.80")],
+        )
+        .await;
+        let (report, _, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert_reason_closed(
+            rule_named(&rows, OLD_MSRV),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        assert!(ended(rule_named(&rows, MTIME_RULE)).is_none());
+        assert!(ended(rule_named(&rows, FALLBACK_RULE)).is_none());
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sqlite_reason_stays_when_it_names_the_new_value() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "linkshelf",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("linkshelf", "storage", "JSON")],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "linkshelf",
+            "s11",
+            "2026-04-11",
+            &[
+                subject_setting("linkshelf", "storage", "SQLite"),
+                project_rule("linkshelf", SQLITE_RULE),
+            ],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "linkshelf", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "linkshelf").await;
+        assert!(ended(rule_named(&rows, SQLITE_RULE)).is_none());
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert!(lines.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rule_on_another_subject_is_not_a_candidate() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "linkshelf",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("linkshelf", "log_handler", "JSONHandler"),
+                project_rule("store", JSON_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "linkshelf",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("linkshelf", "log_handler", "TextHandler")],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "linkshelf", "s11", "2026-04-11", true).await;
+        let store = slots(&gm, "store").await;
+        assert!(ended(rule_named(&store, JSON_RULE)).is_none());
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert!(lines.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_setting_or_a_use_is_not_closed_as_a_reason() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                subject_setting("snapfile", "note", OLD_MSRV),
+                project_rule("snapfile", OLD_MSRV),
+                use_of("snapfile", Kind::Project, "1.74", "decided"),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("snapfile", "msrv", "1.80")],
+        )
+        .await;
+        let (report, _, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert_reason_closed(
+            rule_named(&rows, OLD_MSRV),
+            "s11:retire_reason",
+            "2026-04-11T00:00:00Z",
+        );
+        let note = rows
+            .iter()
+            .find(|slot| slot["key"] == "note")
+            .expect("note");
+        assert_eq!(note["predicate"], "setting");
+        assert!(ended(note).is_none());
+        assert!(open_use(&gm, "1.74").await);
+        assert_eq!(report.consolidate.retire_reason_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_changes_that_name_one_rule_close_nothing() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                subject_setting("snapfile", "output_dir", "public/"),
+                project_rule("snapfile", BOTH_RULE),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[
+                subject_setting("snapfile", "msrv", "1.80"),
+                subject_setting("snapfile", "output_dir", "_site/"),
+            ],
+        )
+        .await;
+        let (report, lines, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert!(ended(rule_named(&rows, BOTH_RULE)).is_none());
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert_eq!(report.consolidate.retire_reason_ambiguous, Some(1));
+        assert!(lines.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retire_reason_counts_a_read_error_and_closes_nothing() {
+        let (tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                project_rule("snapfile", OLD_MSRV),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("snapfile", "msrv", "1.80")],
+        )
+        .await;
+        gm.db()
+            .query("REMOVE TABLE entity")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (report, lines, _) = finish_reason(&gm, "snapfile", "s11", "2026-04-11", true).await;
+        assert_eq!(report.consolidate.errors, 1);
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert!(report.consolidate.retire_reason_ambiguous.is_none());
+        assert!(lines.iter().all(|line| !line.contains("retire_reason")));
+        drop(tmp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retire_reason_off_does_not_close_when_another_post_pass_runs() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("snapfile", "msrv", "1.74"),
+                project_rule("snapfile", OLD_MSRV),
+            ],
+        )
+        .await;
+        commit_named(
+            &gm,
+            "snapfile",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("snapfile", "msrv", "1.80")],
+        )
+        .await;
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let identity = named_project("snapfile");
+        let turns = [user_turn(2, "later")];
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &identity, "s11", "2026-04-11", &turns);
+        ctx.retire_component_on = true;
+        ctx.retire_reason_on = false;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &[], &WriteStats::default(), &stub, &mut report).await;
+        let rows = slots(&gm, "snapfile").await;
+        assert!(ended(rule_named(&rows, OLD_MSRV)).is_none());
+        assert!(report.consolidate.retire_reason_closes.is_none());
+        assert!(super::take_post_lines()
+            .iter()
+            .all(|line| !line.contains("retire_reason")));
     }
 }
 
