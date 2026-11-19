@@ -1,0 +1,16 @@
+entity:6tapjem1198d6rm7jr54|rule||Keep tags on each bookmark as one comma-separated string.|2026-09-30
+entity:6tapjem1198d6rm7jr54|rule||Store tags in a tags table and a bookmark_tags join table.|2026-10-02
+entity:6tapjem1198d6rm7jr54|setting|tag_format|comma-separated string|2026-09-30
+entity:6tapjem1198d6rm7jr54|setting|tag_format|comma-separated string|2026-10-02|rejected
+entity:6tapjem1198d6rm7jr54|setting|tag_format|tags table and bookmark_tags join table|2026-10-02
+entity:8w4ftvcwaodg2hlzuqna|rule||Join tags in CSV with `;`.|2026-10-03
+entity:8w4ftvcwaodg2hlzuqna|setting|csv_columns|url, title, tags, added_at|2026-10-03
+entity:abqkh21a6j7gcnj4jzac|setting|tags_migrated|37|2026-10-02
+entity:cuof899ox57xxztt31ih|rule||Accept an id and one or more tags: linkshelf tag <id> <tag>...|2026-09-30
+entity:q0cvfa9qmj0do08rhgvt|rule||Fetch page titles on add with requests using timeout_seconds 5.|2026-10-08
+entity:q0cvfa9qmj0do08rhgvt|setting|timeout_seconds|5|2026-10-08
+entity:vnnsn8qy7i30qnfa9hpo|rule||Use SQLite because it handles concurrent writers.|2026-10-02
+entity:vnnsn8qy7i30qnfa9hpo|setting|test_command|uv run pytest -q|2026-09-29
+entity:we07kmqvxqg0gxyewrgm|rule||Fetch titles with httpx.AsyncClient limited by a global asyncio.Semaphore(8) and a 5s timeout.|2026-10-13
+entity:we07kmqvxqg0gxyewrgm|rule||Retry with exponential backoff using the tenacity library.|2026-10-15|rejected
+entity:we07kmqvxqg0gxyewrgm|setting|timeout_seconds|5|2026-10-13

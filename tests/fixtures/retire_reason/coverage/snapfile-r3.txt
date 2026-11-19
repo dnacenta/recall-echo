@@ -1,0 +1,21 @@
+entity:8zsch1j73pkngpoyyc66|rule||--json prints the same moved, skipped, duplicates, and undated counts as one JSON object for scripts.|2026-10-04
+entity:8zsch1j73pkngpoyyc66|rule||Date .mp4 and .mov files from the mvhd creation time via the mp4 crate, using the 1904 epoch offset.|2026-09-21
+entity:8zsch1j73pkngpoyyc66|rule||Default the thread pool to 4 jobs because a thread per CPU thrashes spinning disks; SSDs may raise it with --jobs.|2026-10-04
+entity:8zsch1j73pkngpoyyc66|rule||Print a short summary table of moved, skipped, duplicates, and undated at the end of every run.|2026-10-04
+entity:8zsch1j73pkngpoyyc66|rule||Put anything without a usable EXIF date into an _undated/ folder at the top of the destination, keeping the original file name.|2026-09-19
+entity:8zsch1j73pkngpoyyc66|rule||Run CI on ubuntu, macos and windows, each on stable plus the MSRV.|2026-09-28
+entity:8zsch1j73pkngpoyyc66|rule||Set MSRV to 1.74 because the laptop distro still ships that Rust version.|2026-09-07
+entity:8zsch1j73pkngpoyyc66|rule||Set the MSRV to 1.80 because LazyLock in std is worth it and the laptop has a newer toolchain.|2026-09-21
+entity:8zsch1j73pkngpoyyc66|rule||Size the thread pool to the number of logical CPUs by default and let --jobs N override it.|2026-09-14
+entity:8zsch1j73pkngpoyyc66|rule||Treat mvhd creation time as seconds since 1904-01-01 and apply mvhd_epoch_offset_seconds.|2026-09-21
+entity:8zsch1j73pkngpoyyc66|rule||When DateTimeOriginal is missing, fall back to the file's modification time.|2026-09-08
+entity:8zsch1j73pkngpoyyc66|setting|ci_rust_toolchains|stable, 1.80|2026-09-28
+entity:8zsch1j73pkngpoyyc66|setting|jobs_flag|--jobs N|2026-09-14
+entity:8zsch1j73pkngpoyyc66|setting|jobs|4|2026-10-04
+entity:8zsch1j73pkngpoyyc66|setting|msrv|1.74|2026-09-07
+entity:8zsch1j73pkngpoyyc66|setting|msrv|1.80|2026-09-21
+entity:8zsch1j73pkngpoyyc66|setting|mvhd_epoch_offset_seconds|2082844800|2026-09-21
+entity:8zsch1j73pkngpoyyc66|setting|test_command|cargo nextest run|2026-09-28
+entity:8zsch1j73pkngpoyyc66|setting|test_command|cargo test|2026-09-10
+entity:8zsch1j73pkngpoyyc66|setting|test_command|cargo test|2026-09-28|rejected
+entity:8zsch1j73pkngpoyyc66|setting|undated_dir|<DEST>/_undated/|2026-09-19

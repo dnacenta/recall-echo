@@ -1,0 +1,17 @@
+entity:0n9f6hyt1mrhmqlxeso8|setting|pytest_command|uv run pytest -q --cov=linkshelf --cov-fail-under=85|2026-10-11
+entity:axh3iezk7tcdp73rf6ib|rule||CSV columns must be in order: url, title, tags, added_at.|2026-10-03
+entity:axh3iezk7tcdp73rf6ib|rule||Join tags in CSV with a semicolon.|2026-10-03
+entity:axh3iezk7tcdp73rf6ib|setting|csv_columns|url, title, tags, added_at|2026-10-03
+entity:cjjeg7vnvjojigysbu7z|rule||Keep timeout_seconds at 5 for httpx title fetches.|2026-10-13
+entity:cjjeg7vnvjojigysbu7z|setting|timeout_seconds|5|2026-10-13
+entity:nmtsc9fipyo9i4jvap26|rule||Fetch page titles when a bookmark is added, using requests with a 5 second timeout.|2026-10-08
+entity:nmtsc9fipyo9i4jvap26|setting|timeout_seconds|5|2026-10-08
+entity:rnwqsui563xxisylmpc3|rule||Store each bookmark's tags as one comma-separated string, for example python,cli.|2026-09-30
+entity:rnwqsui563xxisylmpc3|rule||Store tags in the tags table and the bookmark_tags join table.|2026-10-02
+entity:rnwqsui563xxisylmpc3|setting|store|SQLite|2026-10-02
+entity:rnwqsui563xxisylmpc3|setting|tags_format|comma-separated string|2026-09-30
+entity:rnwqsui563xxisylmpc3|setting|tags_format|comma-separated string|2026-10-02|rejected
+entity:rnwqsui563xxisylmpc3|setting|tags_format|tags and bookmark_tags tables|2026-10-02
+entity:rnwqsui563xxisylmpc3|setting|test_command|uv run pytest -q|2026-09-29
+entity:s844ppujwhqftxabyyes|setting|tags_migrated|37|2026-10-02
+entity:yj5dnohf9h6oojdctica|rule||Accept linkshelf tag <id> <tag>... to attach one or more tags to a bookmark.|2026-09-30

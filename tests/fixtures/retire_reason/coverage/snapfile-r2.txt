@@ -1,0 +1,20 @@
+entity:5710mxr399vhrgv5kkpo|rule||Apply an offset of 2082844800 seconds to mvhd creation time because it counts seconds from 1904-01-01, not 1970.|2026-09-21
+entity:5710mxr399vhrgv5kkpo|rule||Date .mp4 and .mov files from the mvhd creation time via the mp4 crate.|2026-09-21
+entity:5710mxr399vhrgv5kkpo|rule||Default thread_pool_size to 4 jobs because a thread per CPU thrashes spinning disks on a NAS; SSDs can raise it with --jobs.|2026-10-04
+entity:5710mxr399vhrgv5kkpo|rule||If DateTimeOriginal is missing, fall back to the file's modification time.|2026-09-08
+entity:5710mxr399vhrgv5kkpo|rule||If DateTimeOriginal is missing, fall back to the file's modification time.|2026-09-19|rejected
+entity:5710mxr399vhrgv5kkpo|rule||Keep the MSRV at 1.74 because the laptop distro still ships that Rust version.|2026-09-07
+entity:5710mxr399vhrgv5kkpo|rule||Keep the MSRV at 1.80 because std LazyLock is worth it and the laptop toolchain is new enough.|2026-09-21
+entity:5710mxr399vhrgv5kkpo|rule||Never use file modification time to date files.|2026-09-19
+entity:5710mxr399vhrgv5kkpo|rule||Print a summary table of moved, skipped, duplicates, and undated at the end of every run.|2026-10-04
+entity:5710mxr399vhrgv5kkpo|rule||Put anything without a usable EXIF date into an _undated/ folder at the top of the destination, keeping the original file name.|2026-09-19
+entity:5710mxr399vhrgv5kkpo|rule||Use rayon for per-file work (EXIF read and hashing), size the pool to the number of logical CPUs by default, and let --jobs N override it.|2026-09-14
+entity:5710mxr399vhrgv5kkpo|setting|ci_matrix|ubuntu-latest, macos-latest and windows-latest × {stable, 1.80}|2026-09-28
+entity:5710mxr399vhrgv5kkpo|setting|msrv|1.74|2026-09-07
+entity:5710mxr399vhrgv5kkpo|setting|msrv|1.80|2026-09-21
+entity:5710mxr399vhrgv5kkpo|setting|mvhd_epoch_offset_seconds|2082844800|2026-09-21
+entity:5710mxr399vhrgv5kkpo|setting|test_command|cargo nextest run|2026-09-28
+entity:5710mxr399vhrgv5kkpo|setting|test_command|cargo test|2026-09-10
+entity:5710mxr399vhrgv5kkpo|setting|test_command|cargo test|2026-09-28|rejected
+entity:5710mxr399vhrgv5kkpo|setting|thread_pool_size|logical CPUs|2026-09-14
+entity:5710mxr399vhrgv5kkpo|setting|undated_folder|<DEST>/_undated/|2026-09-19

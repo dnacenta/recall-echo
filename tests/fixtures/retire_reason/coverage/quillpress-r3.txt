@@ -1,0 +1,14 @@
+entity:sihwk21gtal3k71yz0nx|rule||Ignore any file ending in .wip.md, wherever it lives.|2026-11-06
+entity:sihwk21gtal3k71yz0nx|rule||Render !!! note blocks as admonitions.|2026-10-27
+entity:sihwk21gtal3k71yz0nx|rule||Run tests with plain python -m unittest and add no extra test dependency.|2026-10-03
+entity:sihwk21gtal3k71yz0nx|rule||Skip anything under drafts/ in the build.|2026-10-09
+entity:sihwk21gtal3k71yz0nx|rule||Write the generated site to _site/.|2026-10-27
+entity:sihwk21gtal3k71yz0nx|rule||Write the generated site to public/ at the project root.|2026-10-03
+entity:sihwk21gtal3k71yz0nx|setting|docs_output_dir|_site/docs/|2026-10-27
+entity:sihwk21gtal3k71yz0nx|setting|ignore|["drafts/**", "**/*.wip.md"]|2026-11-06
+entity:sihwk21gtal3k71yz0nx|setting|ignore|["drafts/**"]|2026-10-09
+entity:sihwk21gtal3k71yz0nx|setting|ignore|["drafts/**"]|2026-11-06|rejected
+entity:sihwk21gtal3k71yz0nx|setting|markdown_extensions|["admonition", "toc", "def_list"]|2026-10-27
+entity:sihwk21gtal3k71yz0nx|setting|output_dir|_site/|2026-10-27
+entity:sihwk21gtal3k71yz0nx|setting|output_dir|public/|2026-10-03
+entity:sihwk21gtal3k71yz0nx|setting|test_command|python -m unittest|2026-10-03

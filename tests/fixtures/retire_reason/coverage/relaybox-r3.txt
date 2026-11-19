@@ -1,0 +1,22 @@
+entity:8we7ivhsaowogyf63s89|rule||Compute the HMAC over the exact raw body bytes that go on the wire and do not re-encode the payload. TestSignatureMatchesRawBody uses a payload with unsorted keys.|2026-10-06
+entity:8we7ivhsaowogyf63s89|rule||In CI, run go test -race ./... and go test -race -tags integration ./...|2026-09-19
+entity:8we7ivhsaowogyf63s89|rule||Retry each delivery 5 times total with exponential backoff of 1s, 2s, 4s, and 8s between attempts.|2026-09-05
+entity:8we7ivhsaowogyf63s89|rule||Retry each delivery up to 8 times with exponential backoff, full jitter, and each wait capped at 10 minutes.|2026-09-23
+entity:8we7ivhsaowogyf63s89|rule||Send the delivery id as a uuid in X-Relaybox-Delivery, the same value on every retry of that delivery.|2026-09-05
+entity:8we7ivhsaowogyf63s89|rule||Sign every request with HMAC-SHA256 over the body using the subscription secret and send it as X-Relaybox-Signature: sha256=<hex>.|2026-09-05
+entity:8we7ivhsaowogyf63s89|rule||Use full jitter on retry backoff so retries from all workers don't line up.|2026-09-23
+entity:8we7ivhsaowogyf63s89|setting|backoff_cap|10 minutes|2026-09-23
+entity:8we7ivhsaowogyf63s89|setting|log_handler|TextHandler|2026-09-08
+entity:8we7ivhsaowogyf63s89|setting|max_attempts|5|2026-09-05
+entity:8we7ivhsaowogyf63s89|setting|max_attempts|8|2026-09-23
+entity:8we7ivhsaowogyf63s89|setting|signature_format|sha256=<hex>|2026-09-05
+entity:8we7ivhsaowogyf63s89|setting|signature_format|t=<unix seconds>,v1=<hex>|2026-10-06
+entity:8we7ivhsaowogyf63s89|setting|signature_header|X-Relaybox-Signature|2026-09-05
+entity:8we7ivhsaowogyf63s89|setting|test_command|go test -race ./...|2026-09-19
+entity:gs03okahf1u1or4lsx34|rule||Set http.Client Timeout to 10 seconds so a hanging receiver cannot hold a worker forever.|2026-09-10
+entity:gs03okahf1u1or4lsx34|rule||Set the outbound HTTP client timeout to 15 seconds because one receiver in the other region regularly needs 11-12 seconds.|2026-09-26
+entity:gs03okahf1u1or4lsx34|setting|timeout_seconds|10|2026-09-10
+entity:gs03okahf1u1or4lsx34|setting|timeout_seconds|15|2026-09-26
+entity:qg8g1httipyn49cr7jb4|rule||Tag integration tests with //go:build integration so they only run with go test -tags integration.|2026-09-19
+entity:qg8g1httipyn49cr7jb4|setting|test_command|go test -race -tags integration ./...|2026-09-19
+entity:qg8g1httipyn49cr7jb4|setting|test_command|go test -tags integration|2026-09-19|rejected

@@ -1,0 +1,16 @@
+entity:dyno4wb9u8c6gx27p0aw|rule||Fetch page titles when a bookmark is added, using requests with a 5 second timeout.|2026-10-08
+entity:dyno4wb9u8c6gx27p0aw|setting|timeout_seconds|5|2026-10-08
+entity:i1fn76ii1dd8lrwz6irj|setting|csv_columns|url, title, tags, added_at|2026-10-03
+entity:iaq68d4qzkzq3v714hdf|rule||Invoke the tag command as linkshelf tag <id> <tag>... with one bookmark id and one or more tags.|2026-09-30
+entity:iy4b4ac7u6emqhxkz4m5|rule||Keep tags on each bookmark as one comma-separated string in the JSON store.|2026-09-30
+entity:iy4b4ac7u6emqhxkz4m5|rule||Keep the title-fetch timeout_seconds at 5.|2026-10-13
+entity:iy4b4ac7u6emqhxkz4m5|rule||Store tags in a tags table and a bookmark_tags join table.|2026-10-02
+entity:iy4b4ac7u6emqhxkz4m5|rule||Use SQLite because it handles concurrent writers.|2026-10-02
+entity:iy4b4ac7u6emqhxkz4m5|setting|storage_format|SQLite|2026-10-02
+entity:iy4b4ac7u6emqhxkz4m5|setting|tag_format|comma-separated string|2026-09-30
+entity:iy4b4ac7u6emqhxkz4m5|setting|tag_format|comma-separated string|2026-10-02|rejected
+entity:iy4b4ac7u6emqhxkz4m5|setting|tag_format|tags + bookmark_tags|2026-10-02
+entity:iy4b4ac7u6emqhxkz4m5|setting|test_command|uv run pytest -q|2026-09-29
+entity:iy4b4ac7u6emqhxkz4m5|setting|timeout_seconds|5|2026-10-13
+entity:nf8i4zle9htnxqp6lawz|setting|tags_migrated|37|2026-10-02
+entity:shx8aybw6mfy7s2g8xsn|setting|pytest_command|uv run pytest -q --cov=linkshelf --cov-fail-under=85|2026-10-11

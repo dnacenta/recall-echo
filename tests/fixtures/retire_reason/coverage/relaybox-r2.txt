@@ -1,0 +1,17 @@
+entity:a6p1n7t3po1lgx8v2pcz|rule||In CI, also run go test -race -tags integration ./...|2026-09-19
+entity:a6p1n7t3po1lgx8v2pcz|rule||Log with slog's JSONHandler because the cluster log aggregator wants JSON.|2026-09-29
+entity:a6p1n7t3po1lgx8v2pcz|rule||Send the delivery id as X-Relaybox-Delivery: <uuid>, the same value on every retry of that delivery.|2026-09-05
+entity:a6p1n7t3po1lgx8v2pcz|rule||Sign every request with HMAC-SHA256 over the body using the subscription secret and send X-Relaybox-Signature: sha256=<hex>.|2026-09-05
+entity:a6p1n7t3po1lgx8v2pcz|rule||Use exponential backoff with full jitter, capping each wait at 10 minutes so retries from all workers don't line up.|2026-09-23
+entity:a6p1n7t3po1lgx8v2pcz|setting|log_handler|JSONHandler|2026-09-29
+entity:a6p1n7t3po1lgx8v2pcz|setting|log_handler|TextHandler|2026-09-08
+entity:a6p1n7t3po1lgx8v2pcz|setting|retry_attempts|5|2026-09-05
+entity:a6p1n7t3po1lgx8v2pcz|setting|retry_attempts|8|2026-09-23
+entity:a6p1n7t3po1lgx8v2pcz|setting|signature_format|t=<unix seconds>,v1=<hex>|2026-10-06
+entity:a6p1n7t3po1lgx8v2pcz|setting|test_command|go test -race ./...|2026-09-19
+entity:vf2zaa9upo7pk2md2etx|rule||Set the outbound HTTP client overall timeout to 10 seconds so a hanging receiver cannot hold a worker forever.|2026-09-10
+entity:vf2zaa9upo7pk2md2etx|rule||Set the outbound HTTP client overall timeout to 15 seconds because one receiver in the other region regularly needs 11-12s.|2026-09-26
+entity:vf2zaa9upo7pk2md2etx|setting|timeout_seconds|10|2026-09-10
+entity:vf2zaa9upo7pk2md2etx|setting|timeout_seconds|15|2026-09-26
+entity:xm8bpv4k9myy2rdazyvf|rule||Carry a //go:build integration tag so integration tests only run with go test -tags integration.|2026-09-19
+entity:xm8bpv4k9myy2rdazyvf|setting|integration_test_command|go test -race -tags integration ./...|2026-09-19
