@@ -1258,6 +1258,11 @@ pub struct IngestionReport {
     /// Zero when the switch or the known block is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub known_key_bound: u32,
+    /// Candidates kept because a listed key-token form bound the key and no
+    /// earlier key-binding rule did. Omitted when zero, including when the
+    /// switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub key_form_bound: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,

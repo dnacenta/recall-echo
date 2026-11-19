@@ -35,6 +35,10 @@
 //! token must equal a whole normalised token. A digit-only token also matches
 //! when that same maximal number occurs in the raw text. Key tokens are whole
 //! tokens only: a four-character key token does not match inside a longer word.
+//! When extract coverage is on, `direct_key_bound` and `version_stem_ok` also
+//! accept a closed list of whole-word forms: `min`/`minimum`, `max`/`maximum`,
+//! `width`/`wide`, and `license`/`licence` either way. Agreement, value
+//! support and a punctuation literal stay on the exact token.
 //!
 //! The sentence that contains the quote runs from the previous boundary to the
 //! next, and it stops at a boundary the quote itself ends on. `.`, `!` and `?`
@@ -61,6 +65,8 @@
 //! and `avoid` block.
 //! One sentence of that assistant turn has to name the key and those numbers,
 //! and no other number. The citation stays on the user turn.
+
+use std::cell::Cell;
 
 use super::input::{Turn, TurnRole};
 use super::schema::{key_is_empty, normalise, over_long, DROP_QUOTE};
@@ -106,6 +112,7 @@ pub(crate) struct SessionGround {
     session_words: Vec<String>,
     session_numbers: Vec<String>,
     coverage: bool,
+    key_form_bound: Cell<u32>,
 }
 
 struct TurnGround {
@@ -150,6 +157,7 @@ impl SessionGround {
             session_words,
             session_numbers,
             coverage: false,
+            key_form_bound: Cell::new(0),
         }
     }
 
@@ -167,6 +175,11 @@ impl SessionGround {
     #[must_use]
     pub(crate) fn coverage(&self) -> bool {
         self.coverage
+    }
+
+    /// Take the form-bind count and zero it.
+    pub(crate) fn take_key_form_bound(&self) -> u32 {
+        self.key_form_bound.take()
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -281,8 +294,9 @@ impl SessionGround {
     /// A key whose tokens are all generic has nothing to bind, so the setting
     /// fails. The number is still required to occur in the turn by
     /// [`SessionGround::supports_value`]. A `_version` key also needs every
-    /// stem token, and an empty stem fails. When that check fails, a user
-    /// agreement can bind from one sentence of an adjacent assistant turn,
+    /// stem token, and an empty stem fails. When extract coverage is on, a
+    /// listed form of a key token counts as that token. When the direct check
+    /// fails, a user agreement can bind from one sentence of an adjacent assistant turn,
     /// provided the user's own sentence states only the value's numbers and
     /// the word before one is a stop word or an agreement word, not a negation.
     #[must_use]
@@ -307,12 +321,18 @@ impl SessionGround {
         }
     }
 
-    /// Whole tokens, then a listed form when coverage is on.
-    ///
-    /// The form list is empty until it is installed, so coverage does not
-    /// add a hit yet. Agreement is unchanged.
+    /// Exact tokens first. A listed form counts only when coverage is on and
+    /// the exact token missed, and that is the case the counter records.
     fn bind_key_direct(&self, key: &str, texts: &[&str]) -> bool {
-        direct_key_bound(key, texts, self.coverage())
+        if direct_key_bound(key, texts, false) {
+            return true;
+        }
+        if !self.coverage() || !direct_key_bound(key, texts, true) {
+            return false;
+        }
+        self.key_form_bound
+            .set(self.key_form_bound.get().saturating_add(1));
+        true
     }
 
     /// A keyed setting whose value is a short punctuation literal the quote wraps.
@@ -657,9 +677,14 @@ fn form_occurs(token: &str, texts: &[&str]) -> bool {
 
 /// Closed list of a key token and one whole-word form that can stand in for it.
 ///
-/// Empty until the list is installed, so coverage does not add a hit.
-/// Whole-token match only, the same normalisation as [`token_occurs`].
-const KEY_TOKEN_FORMS: &[(&str, &str)] = &[];
+/// Five entries. Whole-token match only, the same normalisation as [`token_occurs`].
+const KEY_TOKEN_FORMS: &[(&str, &str)] = &[
+    ("min", "minimum"),
+    ("max", "maximum"),
+    ("width", "wide"),
+    ("license", "licence"),
+    ("licence", "license"),
+];
 
 pub(crate) fn specific_key_tokens(key: &str) -> Vec<&str> {
     key.split('_')
@@ -1313,10 +1338,117 @@ mod tests {
         assert!(on.coverage());
         assert!(off.key_bound("port", "9000", 0, "Port 9000 is chosen."));
         assert!(on.key_bound("port", "9000", 0, "Port 9000 is chosen."));
+        assert_eq!(on.take_key_form_bound(), 0);
         assert_eq!(
             off.cite(0, "Port 9000").unwrap().quote,
             on.cite(0, "Port 9000").unwrap().quote
         );
+    }
+
+    fn covered(lines: &[(&str, TurnRole)]) -> SessionGround {
+        ground(lines).with_coverage(true)
+    }
+
+    fn bound(session: &SessionGround, key: &str, value: &str, quote: &str) -> bool {
+        session.key_bound(key, value, 0, quote)
+    }
+
+    #[test]
+    fn key_forms_bind_only_when_coverage_is_on() {
+        let cases = [
+            (
+                "python_min_version",
+                "3.11",
+                "Python 3.11 minimum",
+                "Python 3.11 minimum",
+            ),
+            (
+                "min_python_version",
+                "3.11",
+                "Python 3.11 minimum, and uv",
+                "Python 3.11 minimum, and uv",
+            ),
+            (
+                "image_max_width_px",
+                "1200",
+                "resize everything to 1200px wide max",
+                "resize everything to 1200px wide max",
+            ),
+            (
+                "max_width",
+                "1600px",
+                "caps every picture at 1600px wide",
+                "caps every picture at 1600px wide",
+            ),
+            (
+                "max_width_px",
+                "1600",
+                "caps every picture at 1600px wide",
+                "caps every picture at 1600px wide",
+            ),
+        ];
+        for (key, value, quote, turn) in cases {
+            let on = covered(&[(turn, TurnRole::User)]);
+            assert!(bound(&on, key, value, quote), "{key} on");
+            assert_eq!(on.take_key_form_bound(), 1, "{key} form count");
+            assert!(
+                on.supports_value(value, 0, quote, ValueShape::Literal),
+                "{key}"
+            );
+            let off = ground(&[(turn, TurnRole::User)]);
+            assert!(!bound(&off, key, value, quote), "{key} off");
+            assert_eq!(off.take_key_form_bound(), 0, "{key} off count");
+        }
+        let licence = "Licence: dual MIT OR Apache-2.0 like most of the ecosystem.";
+        let quote = "dual MIT OR Apache-2.0 like most of the ecosystem";
+        let on = covered(&[(licence, TurnRole::User)]);
+        assert!(bound(&on, "license", "MIT OR Apache-2.0", quote));
+        assert_eq!(on.take_key_form_bound(), 1);
+        assert!(on.supports_value("MIT OR Apache-2.0", 0, quote, ValueShape::Literal));
+        let off = ground(&[(licence, TurnRole::User)]);
+        assert!(!bound(&off, "license", "MIT OR Apache-2.0", quote));
+        assert_eq!(off.take_key_form_bound(), 0);
+    }
+
+    #[test]
+    fn key_forms_reject_words_outside_the_closed_table() {
+        let maximal = covered(&[("the maximal size is 4", TurnRole::User)]);
+        assert!(!bound(&maximal, "max_jobs", "4", "the maximal size is 4"));
+        assert_eq!(maximal.take_key_form_bound(), 0);
+        let swapped = covered(&[("Python 3.11 minimum", TurnRole::User)]);
+        assert!(!bound(
+            &swapped,
+            "python_max_version",
+            "3.11",
+            "Python 3.11 minimum"
+        ));
+        assert_eq!(swapped.take_key_form_bound(), 0);
+        let generic = covered(&[("the minimum is 3", TurnRole::User)]);
+        assert!(!bound(&generic, "min", "3", "the minimum is 3"));
+        assert_eq!(generic.take_key_form_bound(), 0);
+        let off = ground(&[("Python 3.11 minimum", TurnRole::User)]);
+        assert!(!bound(
+            &off,
+            "python_min_version",
+            "3.11",
+            "Python 3.11 minimum"
+        ));
+        assert_eq!(off.take_key_form_bound(), 0);
+    }
+
+    #[test]
+    fn an_exact_token_does_not_count_as_a_form_and_value_support_stays() {
+        let exact = covered(&[("Python 3.11 min is the floor", TurnRole::User)]);
+        assert!(bound(
+            &exact,
+            "python_min_version",
+            "3.11",
+            "Python 3.11 min is the floor"
+        ));
+        assert_eq!(exact.take_key_form_bound(), 0);
+        let missing = covered(&[("Python 3.11 minimum", TurnRole::User)]);
+        assert!(!missing.supports_value("9.9", 0, "Python 3.11 minimum", ValueShape::Literal));
+        assert_eq!(missing.take_key_form_bound(), 0);
     }
 
     #[test]

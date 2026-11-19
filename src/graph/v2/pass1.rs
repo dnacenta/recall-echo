@@ -906,6 +906,9 @@ fn collect_facts(
             }
         }
     }
+    report.key_form_bound = report
+        .key_form_bound
+        .saturating_add(ground.take_key_form_bound());
     facts
 }
 
@@ -1783,6 +1786,89 @@ mod tests {
         assert!(object.get("facts").is_some());
         assert_eq!(seen.0.lock().expect("lock").as_ref(), Some(pass1_schema()));
         assert_eq!(report.llm_calls, 1);
+    }
+
+    fn setting_json(turn: usize, key: &str, object: &str, quote: &str) -> Value {
+        serde_json::json!({
+            "subject": "tidepool",
+            "subject_type": "project",
+            "predicate": "setting",
+            "role": "none",
+            "key": key,
+            "object": object,
+            "object_type": "literal",
+            "status": "decided",
+            "replaces": "",
+            "turn": turn,
+            "quote": quote,
+            "confidence": 0.9
+        })
+    }
+
+    fn admit_setting(
+        coverage: bool,
+        turn: &str,
+        key: &str,
+        object: &str,
+        quote: &str,
+    ) -> (Vec<Fact>, IngestionReport) {
+        let input = session(vec![Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: turn.into(),
+        }]);
+        let ground = SessionGround::prepare(&input.turns).with_coverage(coverage);
+        let reply = serde_json::json!({
+            "facts": [setting_json(0, key, object, quote)],
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let facts = collect_facts(
+            reply.as_object().expect("object"),
+            &input,
+            &ground,
+            &mut report,
+            false,
+            None,
+        );
+        (facts, report)
+    }
+
+    #[test]
+    fn key_forms_are_admitted_only_when_coverage_is_on_and_the_value_is_supported() {
+        let turn = "Python 3.11 minimum";
+        let quote = "Python 3.11 minimum";
+        let (off_facts, off_report) =
+            admit_setting(false, turn, "python_min_version", "3.11", quote);
+        assert!(off_facts.is_empty());
+        assert_eq!(off_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(off_report.key_form_bound, 0);
+        assert!(!serde_json::to_string(&off_report)
+            .unwrap()
+            .contains("key_form_bound"));
+
+        let (on_facts, on_report) = admit_setting(true, turn, "python_min_version", "3.11", quote);
+        assert_eq!(on_facts.len(), 1, "{:?}", on_report.drops);
+        assert_eq!(on_report.key_form_bound, 1);
+        assert!(serde_json::to_string(&on_report)
+            .unwrap()
+            .contains("\"key_form_bound\":1"));
+        assert!(!on_report.drops.contains_key(DROP_KEY_BINDING));
+
+        let (missing, missing_report) =
+            admit_setting(true, turn, "python_min_version", "9.9", quote);
+        assert!(missing.is_empty());
+        assert_eq!(
+            missing_report.drops.get(DROP_VALUE_SUPPORT).copied(),
+            Some(1),
+            "{:?}",
+            missing_report.drops
+        );
+        assert_eq!(missing_report.key_form_bound, 0);
+        assert!(!serde_json::to_string(&missing_report)
+            .unwrap()
+            .contains("key_form_bound"));
     }
 
     fn fact_json(turn: usize, quote: &str) -> Value {
