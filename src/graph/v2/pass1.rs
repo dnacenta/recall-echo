@@ -629,6 +629,9 @@ fn candidate_forgotten(set: &crate::graph::forgotten::ForgetSet, fact: &Fact) ->
     if crate::graph::forgotten::is_forgotten_entity(set, &fact.subject_name) {
         return true;
     }
+    if slot_forgotten(set, fact) {
+        return true;
+    }
     if crate::graph::forgotten::is_forgotten_fact(
         set,
         &fact.subject_name,
@@ -644,6 +647,17 @@ fn candidate_forgotten(set: &crate::graph::forgotten::ForgetSet, fact: &Fact) ->
             &fact.key,
             &fact.object_name,
         )
+}
+
+/// Entity, then slot, then the exact value. The slot check uses the same
+/// predicate-or-key pairing as the exact fact, without comparing the value.
+fn slot_forgotten(set: &crate::graph::forgotten::ForgetSet, fact: &Fact) -> bool {
+    if crate::graph::forgotten::is_forgotten_slot(set, &fact.subject_name, fact.predicate.as_str())
+    {
+        return true;
+    }
+    !fact.key.is_empty()
+        && crate::graph::forgotten::is_forgotten_slot(set, &fact.subject_name, &fact.key)
 }
 
 /// Drop a decided rule only when it and one setting are a component by themselves.
@@ -6546,6 +6560,80 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_drops_every_value_and_keeps_another_relation() {
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\nslot_forget = true\n",
+        )
+        .expect("config");
+        crate::graph::forgotten::append_forget_records(
+            dir.path(),
+            &[crate::graph::forgotten::slot_record(
+                "harbor",
+                "timeout",
+                &["30s"],
+                "2026-11-17T12:00:00Z",
+            )],
+            std::time::Duration::from_secs(1),
+        )
+        .expect("slot");
+        let set = crate::graph::forgotten::load_forget_set(dir.path(), true).expect("load");
+        let mut report = IngestionReport::default();
+        let mut uses = harbor_setting("", "Rust");
+        uses.predicate = Predicate::Uses;
+        uses.object_kind = Some(Kind::Technology);
+        let (kept, _) = split_forgotten(
+            vec![
+                harbor_setting("timeout", "30s"),
+                harbor_setting("timeout", "10s"),
+                harbor_setting("port", "8080"),
+                uses,
+            ],
+            Vec::new(),
+            &set,
+            &mut report,
+        );
+        assert_eq!(report.forgotten_skips, 2);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|fact| fact.key == "port"));
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::Uses));
+
+        let prefixed_dir = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            prefixed_dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\nslot_forget = true\n",
+        )
+        .expect("config");
+        crate::graph::forgotten::append_forget_records(
+            prefixed_dir.path(),
+            &[crate::graph::forgotten::slot_record(
+                "harbor",
+                "setting:timeout",
+                &[],
+                "2026-11-17T12:00:00Z",
+            )],
+            std::time::Duration::from_secs(1),
+        )
+        .expect("prefixed");
+        let prefixed =
+            crate::graph::forgotten::load_forget_set(prefixed_dir.path(), true).expect("load");
+        let mut prefixed_report = IngestionReport::default();
+        let (kept, _) = split_forgotten(
+            vec![
+                harbor_setting("timeout", "99s"),
+                harbor_setting("port", "8080"),
+            ],
+            Vec::new(),
+            &prefixed,
+            &mut prefixed_report,
+        );
+        assert_eq!(prefixed_report.forgotten_skips, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].key, "port");
+    }
+
+    #[test]
     fn flag_off_does_not_read_a_malformed_forget_file() {
         let dir = tempfile::tempdir().expect("temp");
         let path = crate::graph::forgotten::forgotten_path(dir.path());
@@ -6636,6 +6724,57 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_later_extract_skips_any_value_of_a_forgotten_slot() {
+        let dir = tempfile::tempdir().expect("temp");
+        let memory = dir.path();
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\nslot_forget = true\nground_component_edges = false\n",
+        )
+        .expect("config");
+        crate::graph::forgotten::append_forget_records(
+            memory,
+            &[crate::graph::forgotten::slot_record(
+                "harbor",
+                "timeout",
+                &["30s"],
+                "2026-11-17T12:00:00Z",
+            )],
+            std::time::Duration::from_secs(1),
+        )
+        .expect("slot");
+        input::write_turns_sidecar(
+            memory,
+            1,
+            "s",
+            "2026-01-02T00:00:00Z",
+            None,
+            &[crate::conversation::ConversationEntry::UserMessage(
+                "timeout 30s. timeout 10s. port 8080. uses Rust.".into(),
+            )],
+        )
+        .unwrap();
+        let gm = GraphMemory::open_embedded(&memory.join("graph"))
+            .await
+            .unwrap();
+        let report = extract_session(
+            &gm,
+            memory,
+            1,
+            &IngestContext::new("s", Some(1)),
+            &SlotProvider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.forgotten_skips, 2, "{:?}", report.drops);
+        let values = setting_values(&gm).await;
+        assert_eq!(values, vec!["8080".to_string()], "{values:?}");
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"forgotten_skips\":2"), "{text}");
+    }
+
+    #[cfg(feature = "embedded")]
     struct PortProvider;
 
     #[cfg(feature = "embedded")]
@@ -6659,6 +6798,36 @@ mod tests {
             Ok(r#"{"facts":[
                 {"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9000","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"the port is 9000","confidence":0.9},
                 {"subject":"shelf","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"9001","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"the port is 9001","confidence":0.9}
+            ],"bugs":[],"releases":[]}"#.to_string())
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    struct SlotProvider;
+
+    #[cfg(feature = "embedded")]
+    #[async_trait::async_trait]
+    impl LlmProvider for SlotProvider {
+        async fn complete(
+            &self,
+            system_prompt: &str,
+            user_message: &str,
+            _: u32,
+        ) -> Result<String, GraphError> {
+            if system_prompt.starts_with("You link NEW MENTIONS") {
+                return Ok(r#"{"entities":[]}"#.to_string());
+            }
+            if system_prompt.starts_with("You compare stored") {
+                return Ok(r#"{"pairs":[]}"#.to_string());
+            }
+            if !user_message.contains("timeout 30s") {
+                return Ok(r#"{"facts":[],"bugs":[],"releases":[]}"#.to_string());
+            }
+            Ok(r#"{"facts":[
+                {"subject":"harbor","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"30s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"timeout 30s","confidence":0.9},
+                {"subject":"harbor","subject_type":"project","predicate":"setting","role":"none","key":"timeout","object":"10s","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"timeout 10s","confidence":0.9},
+                {"subject":"harbor","subject_type":"project","predicate":"setting","role":"none","key":"port","object":"8080","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"port 8080","confidence":0.9},
+                {"subject":"harbor","subject_type":"project","predicate":"uses","role":"none","key":"","object":"Rust","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"uses Rust","confidence":0.9}
             ],"bugs":[],"releases":[]}"#.to_string())
         }
     }

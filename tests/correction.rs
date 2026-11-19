@@ -1423,6 +1423,36 @@ async fn the_setting_prefix_form_forgets_that_key() {
     daemon::close(db).await;
 }
 
+#[tokio::test]
+async fn a_restored_slot_value_is_masked_and_another_relation_stays() {
+    let fixture = Fixture::new();
+    enable_slot(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_ada_places(&db).await;
+    daemon::close(db).await;
+
+    let backup = fixture.memory_dir.join("graph-copy");
+    copy_dir(&fixture.memory_dir.join("graph"), &backup);
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, true),
+    )
+    .await
+    .expect("forget");
+    fixture.stop_daemon().await;
+
+    std::fs::remove_dir_all(fixture.memory_dir.join("graph")).expect("remove graph");
+    copy_dir(&backup, &fixture.memory_dir.join("graph"));
+
+    let text = graph_cli::render_decay_report(&fixture.memory_dir, None, true)
+        .await
+        .expect("decay");
+    assert!(text.contains("[forgotten]"), "{text}");
+    assert!(!text.to_lowercase().contains("acme"), "{text}");
+    assert!(!text.to_lowercase().contains("birch"), "{text}");
+    assert!(text.to_lowercase().contains("madrid"), "{text}");
+}
+
 #[test]
 fn conversation_numbers_ignore_the_forget_lock_and_temps() {
     let dir = tempfile::tempdir().expect("temp");

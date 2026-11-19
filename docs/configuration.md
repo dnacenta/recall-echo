@@ -49,6 +49,8 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_retire_reason = false # close a rule that still names a setting's old value; off by default, ignored unless consolidate is on
 # known_match = false         # experimental: match new facts to stored rows after pass 1; off by default
 # recover_turns = false       # list raw-turn values missing from the store; off by default, because it makes extra model calls; never writes
+# lasting_forget = false      # keep a confirmed forget until --unforget; off by default; with it off the forget file is not read
+# slot_forget = false         # forget every value of one subject and relation; off by default, ignored unless lasting_forget is on
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

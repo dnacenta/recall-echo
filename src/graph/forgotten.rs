@@ -550,7 +550,7 @@ fn manual_refusal(name: &str) -> RecallError {
 /// Mask text fields of a graph response. An empty set returns `value` unchanged.
 #[must_use]
 pub(crate) fn mask_json(set: &ForgetSet, value: serde_json::Value) -> serde_json::Value {
-    if set.facts.is_empty() {
+    if set.facts.is_empty() && set.slots.is_empty() {
         return value;
     }
     mask_json_value(set, value, false)
@@ -577,12 +577,55 @@ fn mask_object(
     set: &ForgetSet,
     map: serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Map<String, serde_json::Value> {
+    let slot_hit = object_slot_hit(set, &map);
     map.into_iter()
         .map(|(key, value)| {
+            if slot_hit && value_field(&key) {
+                return (key, mask_slot_value(set, value));
+            }
             let mask_text = text_field(&key);
             (key, mask_json_value(set, value, mask_text))
         })
         .collect()
+}
+
+fn object_slot_hit(set: &ForgetSet, map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if set.slots.is_empty() {
+        return false;
+    }
+    let Some(subject) = first_text(map, &["from", "subject", "subject_name"]) else {
+        return false;
+    };
+    let relation = first_text(map, &["rel_type", "relation", "predicate"]).unwrap_or("");
+    let key = first_text(map, &["key"]).unwrap_or("");
+    if !relation.is_empty() && is_forgotten_slot(set, subject, relation) {
+        return true;
+    }
+    if !key.is_empty() && is_forgotten_slot(set, subject, key) {
+        return true;
+    }
+    !relation.is_empty()
+        && !key.is_empty()
+        && is_forgotten_slot(set, subject, &format!("{relation}:{key}"))
+}
+
+fn first_text<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| map.get(*key).and_then(Value::as_str))
+}
+
+fn value_field(key: &str) -> bool {
+    matches!(key, "to" | "value" | "object" | "object_name")
+}
+
+fn mask_slot_value(set: &ForgetSet, value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(_) => serde_json::Value::String(MASK.to_string()),
+        other => mask_json_value(set, other, false),
+    }
 }
 
 fn mask_array(
@@ -652,7 +695,7 @@ pub(crate) fn apply_mask(set: Option<&ForgetSet>, text: &str) -> String {
 /// Replace each live fact value with `[forgotten]`. Entity names are not masked.
 #[must_use]
 pub(crate) fn mask_forgotten(text: &str, set: &ForgetSet) -> String {
-    if text.is_empty() || set.facts.is_empty() {
+    if text.is_empty() || (set.facts.is_empty() && !slot_values_exist(set)) {
         return text.to_string();
     }
     let spans = forgotten_spans(text, set);
@@ -662,10 +705,19 @@ pub(crate) fn mask_forgotten(text: &str, set: &ForgetSet) -> String {
     paint_spans(text, &spans)
 }
 
+fn slot_values_exist(set: &ForgetSet) -> bool {
+    set.slots.iter().any(|slot| !slot.values.is_empty())
+}
+
 fn forgotten_spans(text: &str, set: &ForgetSet) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     for fact in &set.facts {
         spans.extend(value_spans(text, &fact.value));
+    }
+    for slot in &set.slots {
+        for value in &slot.values {
+            spans.extend(value_spans(text, value));
+        }
     }
     merge_spans(spans)
 }
@@ -1899,5 +1951,71 @@ mod tests {
         )
         .is_ok());
         assert!(refuse_manual_write(&set, ManualWrite::AddEntity("Acme")).is_ok());
+    }
+
+    #[test]
+    fn free_text_masks_slot_snapshot_values_and_structured_masks_the_current_value() {
+        let set = live_set(&[slot_record("Ada", "works_at", &["Acme"], AT)]);
+        assert_eq!(
+            mask_forgotten("Ada works at Acme.", &set),
+            "Ada works at [forgotten]."
+        );
+        assert_eq!(
+            mask_forgotten("Ada works at Cedar.", &set),
+            "Ada works at Cedar."
+        );
+        let current = serde_json::json!({
+            "from": "Ada",
+            "rel_type": "works_at",
+            "to": "Cedar",
+            "id": "edge:1"
+        });
+        let masked = mask_json(&set, current);
+        assert_eq!(masked["to"], "[forgotten]");
+        assert_eq!(masked["from"], "Ada");
+        assert_eq!(masked["id"], "edge:1");
+        let other = serde_json::json!({
+            "from": "Ada",
+            "rel_type": "lives_in",
+            "to": "Madrid"
+        });
+        assert_eq!(mask_json(&set, other)["to"], "Madrid");
+        let setting = serde_json::json!({
+            "subject": "Harbor",
+            "predicate": "setting",
+            "key": "timeout",
+            "value": "99s"
+        });
+        let timeout = live_set(&[slot_record("Harbor", "setting:timeout", &["30s"], AT)]);
+        assert_eq!(mask_json(&timeout, setting)["value"], "[forgotten]");
+        assert_eq!(mask_forgotten("still 30s", &timeout), "still [forgotten]");
+        assert_eq!(mask_forgotten("now 99s", &timeout), "now 99s");
+    }
+
+    #[test]
+    fn a_leftover_slot_value_is_not_masked_when_slot_forget_is_off() {
+        let dir = tempfile::tempdir().expect("temp");
+        fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .expect("lasting");
+        fs::write(
+            forgotten_path(dir.path()),
+            concat!(
+                "{\"v\":1,\"status\":\"active\",\"kind\":\"slot\",\"subject\":\"Ada\",",
+                "\"relation\":\"works_at\",\"values\":[\"Acme\"],",
+                "\"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n",
+                "{\"v\":1,\"status\":\"active\",\"kind\":\"fact\",\"subject\":\"Ada\",",
+                "\"relation\":\"uses\",\"value\":\"Rust\",",
+                "\"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n"
+            ),
+        )
+        .expect("file");
+        let set = load_forget_set(dir.path(), true).expect("load");
+        let text = mask_forgotten("Ada at Acme uses Rust.", &set);
+        assert!(text.contains("Acme"), "{text}");
+        assert!(text.contains("[forgotten]"), "{text}");
+        assert!(!text.contains("Rust"));
     }
 }
