@@ -9,6 +9,11 @@
 //! the folded relation or key, and the value compared the way a same-fact
 //! write already compares values. Subject plus value is not a match.
 //!
+//! A slot record, `kind: "slot"`, names the subject and the relation or key
+//! and blocks every value of that pair. It is loaded only when
+//! `graph.slot_forget` is on together with `graph.lasting_forget`. A leftover
+//! slot row is ignored when slot forget is off.
+//!
 //! Writes take `memory/.forgotten.lock`, sweep stale temps, and publish a
 //! `0600` temp with `sync_data` before `rename`, so a crash cannot leave a
 //! half-written file as the record. `sync_data` runs before the rename: a
@@ -51,10 +56,22 @@ pub(crate) fn forgotten_lock_path(memory_dir: &Path) -> PathBuf {
 /// Whether `[graph] lasting_forget` is on. Does not open the forget file.
 #[must_use]
 pub(crate) fn lasting_forget_on(memory_dir: &Path) -> bool {
+    graph_flags(memory_dir).lasting_forget
+}
+
+/// Whether slot forget applies. True only when both flags are on.
+///
+/// Does not open the forget file, and does not turn lasting forget on.
+#[must_use]
+pub(crate) fn slot_forget_on(memory_dir: &Path) -> bool {
+    let flags = graph_flags(memory_dir);
+    flags.lasting_forget && flags.slot_forget
+}
+
+fn graph_flags(memory_dir: &Path) -> crate::config::GraphSection {
     crate::config::load_from_dir(memory_dir)
         .graph
         .unwrap_or_default()
-        .lasting_forget
 }
 
 /// One JSONL row. `kind` may be absent on input when `relation` and `value` are present.
@@ -69,6 +86,9 @@ pub(crate) struct ForgetRecord {
     pub relation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Deleted objects, kept so a free-text read can mask them. Slot rows only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
     pub forgotten_at: String,
     pub provenance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +111,7 @@ pub(crate) enum RecordStatus {
 pub(crate) enum RecordKind {
     Fact,
     Entity,
+    Slot,
 }
 
 /// Live records only, keyed for match and mask.
@@ -98,6 +119,7 @@ pub(crate) enum RecordKind {
 pub(crate) struct ForgetSet {
     facts: Vec<LiveFact>,
     entities: Vec<String>,
+    slots: Vec<LiveSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,16 +129,23 @@ struct LiveFact {
     value: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSlot {
+    subject: String,
+    relation: String,
+    values: Vec<String>,
+}
+
 impl ForgetSet {
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.facts.is_empty() && self.entities.is_empty()
+        self.facts.is_empty() && self.entities.is_empty() && self.slots.is_empty()
     }
 
-    /// Live fact rows plus live entity rows.
+    /// Live fact rows, live entity rows, and live slot rows.
     #[must_use]
     pub(crate) fn live_count(&self) -> usize {
-        self.facts.len() + self.entities.len()
+        self.facts.len() + self.entities.len() + self.slots.len()
     }
 }
 
@@ -135,6 +164,7 @@ pub(crate) fn fact_record(
         subject: subject.to_string(),
         relation: Some(relation.to_string()),
         value: Some(value.to_string()),
+        values: None,
         forgotten_at: forgotten_at.to_string(),
         provenance: PROVENANCE.to_string(),
         entity_id: None,
@@ -153,11 +183,51 @@ pub(crate) fn entity_record(subject: &str, forgotten_at: &str) -> ForgetRecord {
         subject: fold(subject),
         relation: None,
         value: None,
+        values: None,
         forgotten_at: forgotten_at.to_string(),
         provenance: PROVENANCE.to_string(),
         entity_id: None,
         edge_id: None,
         unforgotten_at: None,
+    }
+}
+
+/// An active slot row. The subject and relation are stored as given.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn slot_record(
+    subject: &str,
+    relation: &str,
+    values: &[&str],
+    forgotten_at: &str,
+) -> ForgetRecord {
+    ForgetRecord {
+        v: 1,
+        status: RecordStatus::Active,
+        kind: Some(RecordKind::Slot),
+        subject: subject.to_string(),
+        relation: Some(relation.to_string()),
+        value: None,
+        values: snapshot_values(values),
+        forgotten_at: forgotten_at.to_string(),
+        provenance: PROVENANCE.to_string(),
+        entity_id: None,
+        edge_id: None,
+        unforgotten_at: None,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn snapshot_values(values: &[&str]) -> Option<Vec<String>> {
+    let kept: Vec<String> = values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .map(|value| (*value).to_string())
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept)
     }
 }
 
@@ -179,7 +249,12 @@ pub(crate) fn load_forget_set(memory_dir: &Path, flag_on: bool) -> Result<Forget
     if !flag_on {
         return Ok(ForgetSet::default());
     }
-    Ok(live_set(&load_records(memory_dir)?))
+    // `flag_on` is the lasting-forget decision. Slot rows join the set only
+    // when both flags are on.
+    Ok(live_set_with(
+        &load_records(memory_dir)?,
+        slot_forget_on(memory_dir),
+    ))
 }
 
 /// What `--unforget` selects. History stays in the file.
@@ -374,6 +449,17 @@ pub(crate) fn is_forgotten_fact(
 
 fn fact_key_hit(fact: &LiveFact, subject: &str, relation: &str, value: &str) -> bool {
     fact.subject == subject && fact.relation == relation && values_equal(&fact.value, value)
+}
+
+/// A live slot blocks any value of this subject and relation or key.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_forgotten_slot(set: &ForgetSet, subject: &str, relation: &str) -> bool {
+    let subject = fold(subject);
+    let relation = fold(relation);
+    set.slots
+        .iter()
+        .any(|slot| slot.subject == subject && slot.relation == relation)
 }
 
 /// Folded subject against a live entity row.
@@ -589,21 +675,39 @@ fn span_in_range(text: &str, cursor: usize, start: usize, end: usize) -> bool {
     start >= cursor && end <= text.len() && start < end
 }
 
+#[cfg(test)]
 fn live_set(records: &[ForgetRecord]) -> ForgetSet {
+    live_set_with(records, true)
+}
+
+fn live_set_with(records: &[ForgetRecord], include_slots: bool) -> ForgetSet {
     let mut set = ForgetSet::default();
     for record in records {
         if record.status == RecordStatus::Active {
-            push_live(record, &mut set);
+            push_live(record, &mut set, include_slots);
         }
     }
     set
 }
 
-fn push_live(record: &ForgetRecord, set: &mut ForgetSet) {
+fn push_live(record: &ForgetRecord, set: &mut ForgetSet, include_slots: bool) {
     match record.kind {
         Some(RecordKind::Entity) => set.entities.push(fold(&record.subject)),
-        _ => push_live_fact(record, set),
+        Some(RecordKind::Slot) if include_slots => push_live_slot(record, set),
+        Some(RecordKind::Slot) => {}
+        Some(RecordKind::Fact) | None => push_live_fact(record, set),
     }
+}
+
+fn push_live_slot(record: &ForgetRecord, set: &mut ForgetSet) {
+    let Some(relation) = record.relation.as_deref() else {
+        return;
+    };
+    set.slots.push(LiveSlot {
+        subject: fold(&record.subject),
+        relation: fold(relation),
+        values: record.values.clone().unwrap_or_default(),
+    });
 }
 
 fn push_live_fact(record: &ForgetRecord, set: &mut ForgetSet) {
@@ -631,6 +735,9 @@ fn deactivate(records: &mut [ForgetRecord], selector: &UnforgetSelector, now: &s
 }
 
 fn selected(record: &ForgetRecord, selector: &UnforgetSelector) -> bool {
+    if record.kind == Some(RecordKind::Slot) {
+        return false;
+    }
     match selector {
         UnforgetSelector::Fact {
             subject,
@@ -642,7 +749,10 @@ fn selected(record: &ForgetRecord, selector: &UnforgetSelector) -> bool {
 }
 
 fn fact_selected(record: &ForgetRecord, subject: &str, relation: &str, value: &str) -> bool {
-    if record.kind == Some(RecordKind::Entity) {
+    if matches!(
+        record.kind,
+        Some(RecordKind::Entity) | Some(RecordKind::Slot)
+    ) {
         return false;
     }
     fold(&record.subject) == fold(subject)
@@ -703,6 +813,7 @@ struct RecordHead {
 struct RecordBody {
     relation: Option<String>,
     value: Option<String>,
+    values: Option<Vec<String>>,
     entity_id: Option<String>,
     edge_id: Option<String>,
     unforgotten_at: Option<String>,
@@ -718,6 +829,7 @@ fn record_from_object(obj: &Map<String, Value>) -> Result<ForgetRecord, LineFail
         subject: head.subject,
         relation: body.relation,
         value: body.value,
+        values: body.values,
         forgotten_at: head.forgotten_at,
         provenance: head.provenance,
         entity_id: body.entity_id,
@@ -738,10 +850,11 @@ fn record_head(obj: &Map<String, Value>) -> Result<RecordHead, LineFail> {
 }
 
 fn record_body(obj: &Map<String, Value>, kind: RecordKind) -> Result<RecordBody, LineFail> {
-    let (relation, value) = relation_value(obj, kind)?;
+    let parsed = relation_value(obj, kind)?;
     Ok(RecordBody {
-        relation,
-        value,
+        relation: parsed.relation,
+        value: parsed.value,
+        values: parsed.values,
         entity_id: optional_string(obj, "entity_id")?,
         edge_id: optional_string(obj, "edge_id")?,
         unforgotten_at: optional_time(obj, "unforgotten_at")?,
@@ -775,6 +888,7 @@ fn named_kind(value: &Value) -> Result<RecordKind, LineFail> {
     match value.as_str() {
         Some("fact") => Ok(RecordKind::Fact),
         Some("entity") => Ok(RecordKind::Entity),
+        Some("slot") => Ok(RecordKind::Slot),
         _ => Err(LineFail::InvalidJson),
     }
 }
@@ -789,26 +903,65 @@ fn infer_kind(obj: &Map<String, Value>) -> Result<RecordKind, LineFail> {
     }
 }
 
-fn relation_value(
-    obj: &Map<String, Value>,
-    kind: RecordKind,
-) -> Result<(Option<String>, Option<String>), LineFail> {
+struct RelationValue {
+    relation: Option<String>,
+    value: Option<String>,
+    values: Option<Vec<String>>,
+}
+
+fn relation_value(obj: &Map<String, Value>, kind: RecordKind) -> Result<RelationValue, LineFail> {
     match kind {
-        RecordKind::Fact => Ok((
-            Some(require_string(obj, "relation")?.to_string()),
-            Some(require_string(obj, "value")?.to_string()),
-        )),
+        RecordKind::Fact => Ok(RelationValue {
+            relation: Some(require_string(obj, "relation")?.to_string()),
+            value: Some(require_string(obj, "value")?.to_string()),
+            values: None,
+        }),
         RecordKind::Entity => entity_without_triple(obj),
+        RecordKind::Slot => slot_relation(obj),
     }
 }
 
-fn entity_without_triple(
-    obj: &Map<String, Value>,
-) -> Result<(Option<String>, Option<String>), LineFail> {
+fn entity_without_triple(obj: &Map<String, Value>) -> Result<RelationValue, LineFail> {
     if obj.contains_key("relation") || obj.contains_key("value") {
         return Err(LineFail::InvalidJson);
     }
-    Ok((None, None))
+    Ok(RelationValue {
+        relation: None,
+        value: None,
+        values: None,
+    })
+}
+
+fn slot_relation(obj: &Map<String, Value>) -> Result<RelationValue, LineFail> {
+    if obj.contains_key("value") {
+        return Err(LineFail::InvalidJson);
+    }
+    Ok(RelationValue {
+        relation: Some(require_string(obj, "relation")?.to_string()),
+        value: None,
+        values: optional_values(obj)?,
+    })
+}
+
+fn optional_values(obj: &Map<String, Value>) -> Result<Option<Vec<String>>, LineFail> {
+    match obj.get("values") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(text) if !text.is_empty() => values.push(text.to_string()),
+                    _ => return Err(LineFail::InvalidJson),
+                }
+            }
+            if values.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(values))
+            }
+        }
+        Some(_) => Err(LineFail::InvalidJson),
+    }
 }
 
 fn require_provenance(obj: &Map<String, Value>) -> Result<String, LineFail> {
@@ -1460,5 +1613,152 @@ mod tests {
         let set = load_forget_set(dir.path(), true).expect("load");
         assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
         assert!(is_forgotten_fact(&set, "Bea", "uses", "Go"));
+    }
+
+    fn slot_line(values: &str) -> String {
+        format!(
+            "{{\"v\":1,\"status\":\"active\",\"kind\":\"slot\",\"subject\":\"Ada\",\
+             \"relation\":\"works_at\",\"values\":{values},\
+             \"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}}\n"
+        )
+    }
+
+    #[test]
+    fn slot_forget_on_is_true_only_when_both_flags_are_on() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join(".recall-echo.toml");
+        assert!(!slot_forget_on(dir.path()));
+        assert!(!lasting_forget_on(dir.path()));
+        fs::write(&path, "[graph]\nslot_forget = true\n").expect("slot only");
+        assert!(!lasting_forget_on(dir.path()));
+        assert!(!slot_forget_on(dir.path()));
+        fs::write(&path, "[graph]\nlasting_forget = true\n").expect("lasting only");
+        assert!(lasting_forget_on(dir.path()));
+        assert!(!slot_forget_on(dir.path()));
+        fs::write(
+            &path,
+            "[graph]\nlasting_forget = true\nslot_forget = true\n",
+        )
+        .expect("both");
+        assert!(slot_forget_on(dir.path()));
+    }
+
+    #[test]
+    fn a_slot_row_matches_the_relation_and_not_another() {
+        let set = live_set(&[slot_record("Ada", "works_at", &["Acme", "Birch"], AT)]);
+        assert!(is_forgotten_slot(&set, "  ADA ", "WORKS_AT"));
+        assert!(!is_forgotten_slot(&set, "Ada", "lives_in"));
+        assert!(!is_forgotten_slot(&set, "Bea", "works_at"));
+        assert!(!is_forgotten_fact(&set, "Ada", "works_at", "Acme"));
+        assert!(!is_forgotten_entity(&set, "Ada"));
+        assert_eq!(set.live_count(), 1);
+    }
+
+    #[test]
+    fn a_leftover_slot_row_does_not_break_a_lasting_forget_load() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut body = slot_line("[\"Acme\"]");
+        body.push_str(
+            "{\"v\":1,\"status\":\"active\",\"kind\":\"fact\",\"subject\":\"Ada\",\"relation\":\"uses\",\
+             \"value\":\"Rust\",\"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n",
+        );
+        fs::write(forgotten_path(dir.path()), &body).expect("file");
+        let set = load_forget_set(dir.path(), true).expect("lasting only");
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert!(!is_forgotten_slot(&set, "Ada", "works_at"));
+        assert_eq!(set.live_count(), 1);
+        assert_eq!(
+            fs::read_to_string(forgotten_path(dir.path())).expect("unchanged"),
+            body
+        );
+
+        fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\nslot_forget = true\n",
+        )
+        .expect("both");
+        let set = load_forget_set(dir.path(), true).expect("both");
+        assert!(is_forgotten_slot(&set, "Ada", "works_at"));
+        assert!(is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+        assert_eq!(set.live_count(), 2);
+    }
+
+    #[test]
+    fn a_slot_row_round_trips_and_an_inactive_one_is_not_live() {
+        let dir = tempfile::tempdir().expect("temp");
+        fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\nslot_forget = true\n",
+        )
+        .expect("both flags");
+        let mut inactive = slot_record("Bea", "likes", &["Go"], AT);
+        inactive.status = RecordStatus::Inactive;
+        append_forget_records(
+            dir.path(),
+            &[slot_record("Ada", "works_at", &["Acme"], AT), inactive],
+            Duration::from_secs(1),
+        )
+        .expect("append");
+        let text = fs::read_to_string(forgotten_path(dir.path())).expect("file");
+        assert!(text.contains("\"kind\":\"slot\""));
+        assert!(text.contains("\"values\":[\"Acme\"]"));
+        assert!(!text.contains("\"value\""));
+        let set = load_forget_set(dir.path(), true).expect("load");
+        assert!(is_forgotten_slot(&set, "Ada", "works_at"));
+        assert!(!is_forgotten_slot(&set, "Bea", "likes"));
+        assert_eq!(set.live_count(), 1);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_still_malformed_and_a_slot_needs_a_relation() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = forgotten_path(dir.path());
+        fs::write(
+            &path,
+            "{\"v\":1,\"status\":\"active\",\"kind\":\"other\",\"subject\":\"Ada\",\
+             \"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n",
+        )
+        .expect("unknown");
+        let err = load_forget_set(dir.path(), true).expect_err("unknown kind");
+        assert!(err.to_string().contains("invalid JSON"), "{err}");
+        fs::write(
+            &path,
+            "{\"v\":1,\"status\":\"active\",\"kind\":\"slot\",\"subject\":\"Ada\",\
+             \"forgotten_at\":\"2026-11-17T12:00:00Z\",\"provenance\":\"user\"}\n",
+        )
+        .expect("missing relation");
+        let err = load_forget_set(dir.path(), true).expect_err("missing relation");
+        assert!(err.to_string().contains("missing required fields"), "{err}");
+    }
+
+    #[test]
+    fn an_entity_unforget_leaves_a_leftover_slot_row() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(
+            dir.path(),
+            &[
+                entity_record("Ada", AT),
+                slot_record("Ada", "works_at", &["Acme"], AT),
+                fact_record("Ada", "uses", "Rust", AT),
+            ],
+            Duration::from_secs(1),
+        )
+        .expect("append");
+        let changed = unforget_records(
+            dir.path(),
+            &UnforgetSelector::Entity {
+                subject: "Ada".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .expect("unforget");
+        assert_eq!(changed, 2);
+        let text = fs::read_to_string(forgotten_path(dir.path())).expect("file");
+        assert!(text.contains("\"kind\":\"slot\""));
+        assert!(text.contains("\"status\":\"active\""));
+        let set = live_set(&load_records(dir.path()).expect("records"));
+        assert!(is_forgotten_slot(&set, "Ada", "works_at"));
+        assert!(!is_forgotten_entity(&set, "Ada"));
+        assert!(!is_forgotten_fact(&set, "Ada", "uses", "Rust"));
     }
 }

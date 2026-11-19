@@ -967,6 +967,11 @@ pub struct GraphSection {
     /// With it off, nothing reads, locks, or writes that file.
     #[serde(default = "default_lasting_forget", skip_serializing_if = "is_false")]
     pub lasting_forget: bool,
+    /// Forget every value of one subject and relation, not one value.
+    /// Off unless set. Stands alone: it does not turn [`Self::lasting_forget`]
+    /// on, and it does nothing unless that flag is also on.
+    #[serde(default = "default_slot_forget", skip_serializing_if = "is_false")]
+    pub slot_forget: bool,
 }
 
 impl Default for GraphSection {
@@ -1001,6 +1006,7 @@ impl Default for GraphSection {
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
             lasting_forget: default_lasting_forget(),
+            slot_forget: default_slot_forget(),
         }
     }
 }
@@ -1462,6 +1468,10 @@ fn default_recover_turns() -> bool {
 }
 
 fn default_lasting_forget() -> bool {
+    false
+}
+
+fn default_slot_forget() -> bool {
     false
 }
 
@@ -2006,6 +2016,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.ground_component_edges", flag_ground_component_edges),
     ("graph.recover_turns", flag_recover_turns),
     ("graph.lasting_forget", flag_lasting_forget),
+    ("graph.slot_forget", flag_slot_forget),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2099,6 +2110,10 @@ fn flag_recover_turns(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_lasting_forget(graph: &mut GraphSection) -> &mut bool {
     &mut graph.lasting_forget
+}
+
+fn flag_slot_forget(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.slot_forget
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -4231,6 +4246,53 @@ settle_secs = 300
         cfg.set_key("graph.lasting_forget", "true").unwrap();
         assert!(cfg.set_key("graph.lasting_forget", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").lasting_forget);
+    }
+
+    #[test]
+    fn slot_forget_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_slot_forget());
+        assert!(!GraphSection::default().slot_forget);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().slot_forget);
+        let explicit_false: Config =
+            toml::from_str("[graph]\nslot_forget = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.slot_forget);
+        assert!(!false_graph.lasting_forget);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("slot_forget"));
+        assert!(!rendered_false.contains("lasting_forget"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nslot_forget = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.slot_forget);
+        assert!(
+            !true_graph.lasting_forget,
+            "slot forget does not turn lasting forget on"
+        );
+        assert!(true_graph.consolidate);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.slot_forget", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.slot_forget);
+        assert!(!graph.lasting_forget);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("slot_forget = true"));
+        assert!(!rendered.contains("lasting_forget"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        assert!(parsed.graph.expect("graph").slot_forget);
+
+        cfg.set_key("graph.slot_forget", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").slot_forget);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("slot_forget"));
+        cfg.set_key("graph.slot_forget", "true").unwrap();
+        assert!(cfg.set_key("graph.slot_forget", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").slot_forget);
     }
 
     #[test]
