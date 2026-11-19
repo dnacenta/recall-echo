@@ -30,7 +30,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::error::RecallError;
-use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport};
+use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport, Removal};
 use crate::graph::error::GraphError;
 use crate::graph::forgotten::{self, ForgetLock, ManualWrite};
 use crate::graph::types::{
@@ -575,10 +575,20 @@ async fn correct_guarded(
     args: &CorrectArgs,
 ) -> Result<CorrectionReport, GraphError> {
     let memory = memory_of(graph);
+    refuse_slot_when_off(memory, &args.target)?;
     let lock = lock_before_forget(memory, args.correction)?;
     let report = graph.correct(&args.target, args.correction).await?;
-    write_forget(memory, lock.as_ref(), &report)?;
+    write_forget(memory, lock.as_ref(), &args.target, &report)?;
     Ok(report)
+}
+
+fn refuse_slot_when_off(memory: &Path, target: &CorrectTarget) -> Result<(), GraphError> {
+    if !matches!(target, CorrectTarget::Slot { .. }) || forgotten::slot_forget_on(memory) {
+        return Ok(());
+    }
+    Err(GraphError::Parse(
+        "a relationship needs all three names: `graph correct <from> <REL> <to> --forget`".into(),
+    ))
 }
 
 fn lock_before_forget(
@@ -601,6 +611,7 @@ fn is_confirmed_forget(correction: Correction) -> bool {
 fn write_forget(
     memory: &Path,
     lock: Option<&ForgetLock>,
+    target: &CorrectTarget,
     report: &CorrectionReport,
 ) -> Result<(), GraphError> {
     let Some(lock) = lock else {
@@ -609,8 +620,32 @@ fn write_forget(
     let CorrectionReport::Removed { removal } = report else {
         return Ok(());
     };
-    let records = forgotten::records_for_removal(removal);
-    forgotten::append_locked(memory, lock, &records).map_err(forget_error)
+    let records = forget_records(target, removal);
+    forgotten::append_locked(memory, lock, &records).map_err(forget_error)?;
+    note_slot_forget(target);
+    Ok(())
+}
+
+fn forget_records(target: &CorrectTarget, removal: &Removal) -> Vec<forgotten::ForgetRecord> {
+    match target {
+        CorrectTarget::Slot { from, relation } => {
+            let values: Vec<&str> = removal
+                .edges
+                .iter()
+                .map(|edge| edge.to.as_str())
+                .filter(|value| !value.is_empty())
+                .collect();
+            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            vec![forgotten::slot_record(from, relation, &values, &at)]
+        }
+        _ => forgotten::records_for_removal(removal),
+    }
+}
+
+fn note_slot_forget(target: &CorrectTarget) {
+    if let CorrectTarget::Slot { from, relation } = target {
+        eprintln!("forget slot: {from} {relation}");
+    }
 }
 
 async fn add_entity_guarded(

@@ -194,7 +194,6 @@ pub(crate) fn entity_record(subject: &str, forgotten_at: &str) -> ForgetRecord {
 
 /// An active slot row. The subject and relation are stored as given.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn slot_record(
     subject: &str,
     relation: &str,
@@ -217,7 +216,6 @@ pub(crate) fn slot_record(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn snapshot_values(values: &[&str]) -> Option<Vec<String>> {
     let kept: Vec<String> = values
         .iter()
@@ -266,6 +264,10 @@ pub(crate) enum UnforgetSelector {
     },
     Entity {
         subject: String,
+    },
+    Slot {
+        subject: String,
+        relation: String,
     },
 }
 
@@ -452,14 +454,35 @@ fn fact_key_hit(fact: &LiveFact, subject: &str, relation: &str, value: &str) -> 
 }
 
 /// A live slot blocks any value of this subject and relation or key.
+///
+/// `setting:timeout` and `timeout` are the same relation. The `setting:` form
+/// is the one a setting key already uses; nothing else is rewritten.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_forgotten_slot(set: &ForgetSet, subject: &str, relation: &str) -> bool {
     let subject = fold(subject);
-    let relation = fold(relation);
     set.slots
         .iter()
-        .any(|slot| slot.subject == subject && slot.relation == relation)
+        .any(|slot| slot.subject == subject && same_relation(&slot.relation, relation))
+}
+
+/// Folded equality, plus the `setting:<key>` form either side may use.
+fn same_relation(stored: &str, query: &str) -> bool {
+    let stored = fold(stored);
+    let query = fold(query);
+    if stored == query {
+        return true;
+    }
+    setting_key(&stored).is_some_and(|key| key == query)
+        || setting_key(&query).is_some_and(|key| key == stored)
+}
+
+fn setting_key(relation: &str) -> Option<&str> {
+    let key = relation.strip_prefix("setting:")?;
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
 }
 
 /// Folded subject against a live entity row.
@@ -508,6 +531,9 @@ fn relate_block<'a>(
     }
     if is_forgotten_entity(set, to) {
         return Some(to);
+    }
+    if is_forgotten_slot(set, from, relation) {
+        return Some(from);
     }
     if is_forgotten_fact(set, from, relation, to) {
         return Some(from);
@@ -735,17 +761,26 @@ fn deactivate(records: &mut [ForgetRecord], selector: &UnforgetSelector, now: &s
 }
 
 fn selected(record: &ForgetRecord, selector: &UnforgetSelector) -> bool {
-    if record.kind == Some(RecordKind::Slot) {
-        return false;
-    }
     match selector {
         UnforgetSelector::Fact {
             subject,
             relation,
             value,
         } => fact_selected(record, subject, relation, value),
-        UnforgetSelector::Entity { subject } => fold(&record.subject) == fold(subject),
+        UnforgetSelector::Entity { subject } => {
+            record.kind != Some(RecordKind::Slot) && fold(&record.subject) == fold(subject)
+        }
+        UnforgetSelector::Slot { subject, relation } => slot_selected(record, subject, relation),
     }
+}
+
+fn slot_selected(record: &ForgetRecord, subject: &str, relation: &str) -> bool {
+    record.kind == Some(RecordKind::Slot)
+        && fold(&record.subject) == fold(subject)
+        && record
+            .relation
+            .as_deref()
+            .is_some_and(|stored| same_relation(stored, relation))
 }
 
 fn fact_selected(record: &ForgetRecord, subject: &str, relation: &str, value: &str) -> bool {
@@ -1760,5 +1795,109 @@ mod tests {
         assert!(is_forgotten_slot(&set, "Ada", "works_at"));
         assert!(!is_forgotten_entity(&set, "Ada"));
         assert!(!is_forgotten_fact(&set, "Ada", "uses", "Rust"));
+    }
+
+    #[test]
+    fn a_setting_key_and_its_prefixed_form_are_the_same_slot() {
+        let prefixed = live_set(&[slot_record("Harbor", "setting:timeout", &["30s"], AT)]);
+        assert!(is_forgotten_slot(&prefixed, "Harbor", "timeout"));
+        assert!(is_forgotten_slot(&prefixed, "harbor", "SETTING:TIMEOUT"));
+        assert!(!is_forgotten_slot(&prefixed, "Harbor", "setting"));
+        assert!(!is_forgotten_slot(&prefixed, "Harbor", "port"));
+        let bare = live_set(&[slot_record("Harbor", "timeout", &["30s"], AT)]);
+        assert!(is_forgotten_slot(&bare, "Harbor", "setting:timeout"));
+        assert!(!is_forgotten_slot(&bare, "Harbor", "setting:port"));
+    }
+
+    #[test]
+    fn an_exact_unforget_does_not_clear_a_slot_and_a_slot_unforget_does() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(
+            dir.path(),
+            &[
+                slot_record("Ada", "works_at", &["Acme", "Birch"], AT),
+                fact_record("Ada", "works_at", "Acme", AT),
+                fact_record("Ada", "lives_in", "Madrid", AT),
+            ],
+            Duration::from_secs(1),
+        )
+        .expect("append");
+        let exact = unforget_records(
+            dir.path(),
+            &UnforgetSelector::Fact {
+                subject: "Ada".into(),
+                relation: "works_at".into(),
+                value: "Acme".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .expect("exact");
+        assert_eq!(exact, 1);
+        let set = live_set(&load_records(dir.path()).expect("records"));
+        assert!(is_forgotten_slot(&set, "Ada", "works_at"));
+        assert!(!is_forgotten_fact(&set, "Ada", "works_at", "Acme"));
+        assert!(is_forgotten_fact(&set, "Ada", "lives_in", "Madrid"));
+
+        let slot = unforget_records(
+            dir.path(),
+            &UnforgetSelector::Slot {
+                subject: "ADA".into(),
+                relation: "works_at".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .expect("slot");
+        assert_eq!(slot, 1);
+        let set = live_set(&load_records(dir.path()).expect("records"));
+        assert!(!is_forgotten_slot(&set, "Ada", "works_at"));
+        assert!(is_forgotten_fact(&set, "Ada", "lives_in", "Madrid"));
+    }
+
+    #[test]
+    fn a_setting_prefix_unforget_clears_the_bare_key() {
+        let dir = tempfile::tempdir().expect("temp");
+        append_forget_records(
+            dir.path(),
+            &[slot_record("Harbor", "timeout", &["30s"], AT)],
+            Duration::from_secs(1),
+        )
+        .expect("append");
+        let changed = unforget_records(
+            dir.path(),
+            &UnforgetSelector::Slot {
+                subject: "Harbor".into(),
+                relation: "setting:timeout".into(),
+            },
+            Duration::from_secs(1),
+        )
+        .expect("unforget");
+        assert_eq!(changed, 1);
+        let set = live_set(&load_records(dir.path()).expect("records"));
+        assert!(!is_forgotten_slot(&set, "Harbor", "timeout"));
+    }
+
+    #[test]
+    fn a_relate_on_a_forgotten_slot_names_unforget_for_any_value() {
+        let set = live_set(&[slot_record("Ada", "works_at", &["Acme"], AT)]);
+        let blocked = refuse_manual_write(
+            &set,
+            ManualWrite::Relate {
+                from: "Ada",
+                relation: "works_at",
+                to: "Birch",
+            },
+        )
+        .expect_err("any value");
+        assert!(blocked.to_string().contains("--unforget"), "{blocked}");
+        assert!(refuse_manual_write(
+            &set,
+            ManualWrite::Relate {
+                from: "Ada",
+                relation: "lives_in",
+                to: "Madrid",
+            },
+        )
+        .is_ok());
+        assert!(refuse_manual_write(&set, ManualWrite::AddEntity("Acme")).is_ok());
     }
 }

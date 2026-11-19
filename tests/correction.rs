@@ -543,6 +543,33 @@ fn enable_lasting(memory_dir: &Path) {
     std::fs::write(&path, text).expect("write config");
 }
 
+fn enable_slot(memory_dir: &Path) {
+    enable_lasting(memory_dir);
+    let path = memory_dir.join(".recall-echo.toml");
+    let mut text = std::fs::read_to_string(&path).expect("config");
+    text.push_str("slot_forget = true\n");
+    std::fs::write(&path, text).expect("write config");
+}
+
+fn slot_options(
+    subject: &str,
+    relation: &str,
+    forget: bool,
+    unforget: bool,
+    yes: bool,
+) -> CorrectOptions {
+    CorrectOptions {
+        subject: subject.into(),
+        rel_type: Some(relation.into()),
+        object: None,
+        wrong: false,
+        forget,
+        all_edges: false,
+        yes,
+        unforget,
+    }
+}
+
 fn forget_rows(memory_dir: &Path) -> Vec<serde_json::Value> {
     let path = memory_dir.join("forgotten.jsonl");
     let text = std::fs::read_to_string(&path).expect("forget file");
@@ -1111,6 +1138,289 @@ fn copy_dir(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), dest).expect("copy");
         }
     }
+}
+
+async fn seed_ada_places(db: &Surreal<Db>) {
+    daemon::create_entity(db, "entity:ada", "Ada", "person").await;
+    daemon::create_entity(db, "entity:acme", "Acme", "project").await;
+    daemon::create_entity(db, "entity:birch", "Birch", "project").await;
+    daemon::create_entity(db, "entity:madrid", "Madrid", "project").await;
+    for (to, rel) in [
+        ("entity:acme", "works_at"),
+        ("entity:birch", "works_at"),
+        ("entity:madrid", "lives_in"),
+    ] {
+        daemon::create_edge(
+            db,
+            &daemon::Edge {
+                from: "entity:ada",
+                to,
+                rel_type: rel,
+                alpha: 4.0,
+                beta: 1.0,
+                self_reinforcements: 0,
+            },
+        )
+        .await;
+    }
+}
+
+async fn edge_rels(db: &Surreal<Db>) -> Vec<String> {
+    let mut response = db
+        .query("SELECT rel_type FROM relates_to")
+        .await
+        .expect("rels");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("rows");
+    rows.iter()
+        .filter_map(|row| row.get("rel_type").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_missing_value_still_needs_three_names_when_slot_forget_is_off() {
+    let fixture = Fixture::new();
+    let err = graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, true),
+    )
+    .await
+    .expect_err("three names");
+    assert!(err.to_string().contains("all three names"), "{err}");
+
+    enable_lasting(&fixture.memory_dir);
+    let err = graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, true),
+    )
+    .await
+    .expect_err("lasting alone");
+    assert!(err.to_string().contains("all three names"), "{err}");
+}
+
+#[tokio::test]
+async fn a_confirmed_slot_forget_deletes_every_value_and_writes_one_record() {
+    let fixture = Fixture::new();
+    enable_slot(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_ada_places(&db).await;
+    daemon::close(db).await;
+
+    let err = graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, false),
+    )
+    .await
+    .expect_err("needs yes");
+    assert!(err.to_string().contains("--yes"), "{err}");
+    assert!(!fixture.memory_dir.join("forgotten.jsonl").exists());
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    let before = edge_rels(&db).await;
+    assert_eq!(before.iter().filter(|rel| rel == &"works_at").count(), 2);
+    daemon::close(db).await;
+
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, true),
+    )
+    .await
+    .expect("slot forget");
+    let rows = forget_rows(&fixture.memory_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "slot");
+    assert_eq!(rows[0]["status"], "active");
+    assert_eq!(rows[0]["subject"], "Ada");
+    assert_eq!(rows[0]["relation"], "works_at");
+    let values = rows[0]["values"].as_array().expect("values");
+    assert!(values.iter().any(|value| value == "Acme"), "{values:?}");
+    assert!(values.iter().any(|value| value == "Birch"), "{values:?}");
+    assert!(!values.iter().any(|value| value == "Madrid"));
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    let rels = edge_rels(&db).await;
+    assert!(!rels.iter().any(|rel| rel == "works_at"), "{rels:?}");
+    assert!(rels.iter().any(|rel| rel == "lives_in"), "{rels:?}");
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn unforget_of_a_slot_restores_it_and_an_exact_unforget_does_not() {
+    let fixture = Fixture::new();
+    enable_slot(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_ada_places(&db).await;
+    daemon::close(db).await;
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, true),
+    )
+    .await
+    .expect("forget");
+
+    let err = graph_cli::correct(
+        &fixture.memory_dir,
+        &CorrectOptions {
+            subject: "Ada".into(),
+            rel_type: Some("works_at".into()),
+            object: Some("Acme".into()),
+            wrong: false,
+            forget: false,
+            all_edges: false,
+            yes: true,
+            unforget: true,
+        },
+    )
+    .await
+    .expect_err("exact value is not the slot");
+    assert!(err.to_string().contains("no live forget record"), "{err}");
+    assert_eq!(forget_rows(&fixture.memory_dir)[0]["status"], "active");
+
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", false, true, true),
+    )
+    .await
+    .expect("unforget slot");
+    assert_eq!(forget_rows(&fixture.memory_dir)[0]["status"], "inactive");
+}
+
+#[tokio::test]
+async fn relate_on_a_forgotten_slot_names_unforget() {
+    let fixture = Fixture::new();
+    enable_slot(&fixture.memory_dir);
+    let db = fixture.open().await;
+    seed_ada_places(&db).await;
+    daemon::create_entity(&db, "entity:elsewhere", "Elsewhere", "project").await;
+    daemon::close(db).await;
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Ada", "works_at", true, false, true),
+    )
+    .await
+    .expect("forget");
+
+    let blocked = serve_client::execute(
+        &fixture.memory_dir,
+        &Request::Relate(RelateArgs {
+            from: "Ada".into(),
+            rel_type: "works_at".into(),
+            to: "Elsewhere".into(),
+            description: None,
+            source: None,
+        }),
+    )
+    .await
+    .expect_err("blocked");
+    assert!(blocked.to_string().contains("--unforget"), "{blocked}");
+
+    serve_client::execute(
+        &fixture.memory_dir,
+        &Request::Relate(RelateArgs {
+            from: "Ada".into(),
+            rel_type: "visits".into(),
+            to: "Elsewhere".into(),
+            description: None,
+            source: None,
+        }),
+    )
+    .await
+    .expect("other relation");
+}
+
+async fn write_settings(db: &Surreal<Db>, body: &str) {
+    let attributes: serde_json::Value = serde_json::from_str(body).expect("attributes");
+    db.query("UPDATE type::record($id) SET attributes = $attributes")
+        .bind(("id", "entity:harbor".to_string()))
+        .bind(("attributes", attributes))
+        .await
+        .expect("update")
+        .check()
+        .expect("check");
+}
+
+async fn setting_keys(db: &Surreal<Db>) -> Vec<String> {
+    let mut response = db
+        .query("SELECT attributes.v2.slots[*].key AS keys FROM type::record($id)")
+        .bind(("id", "entity:harbor".to_string()))
+        .await
+        .expect("read");
+    let rows: Vec<serde_json::Value> = response.take(0).expect("rows");
+    rows.first()
+        .and_then(|row| row.get("keys"))
+        .and_then(|keys| keys.as_array())
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|key| key.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const HARBOR_SETTINGS: &str = r#"{
+    "v2": {
+        "kind": "project",
+        "slots": [
+            {"predicate": "setting", "key": "timeout", "value": "30s", "status": "decided"},
+            {"predicate": "setting", "key": "timeout", "value": "10s", "status": "decided"},
+            {"predicate": "setting", "key": "port", "value": "8080", "status": "decided"}
+        ]
+    }
+}"#;
+
+#[tokio::test]
+async fn a_setting_key_forget_drops_every_value_of_that_key() {
+    let fixture = Fixture::new();
+    enable_slot(&fixture.memory_dir);
+    let db = fixture.open().await;
+    daemon::create_entity(&db, "entity:harbor", "Harbor", "project").await;
+    write_settings(&db, HARBOR_SETTINGS).await;
+    daemon::close(db).await;
+
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Harbor", "timeout", true, false, true),
+    )
+    .await
+    .expect("forget timeout");
+    let rows = forget_rows(&fixture.memory_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "slot");
+    assert_eq!(rows[0]["relation"], "timeout");
+    let values = rows[0]["values"].as_array().expect("values");
+    assert!(values.iter().any(|value| value == "30s"), "{values:?}");
+    assert!(values.iter().any(|value| value == "10s"), "{values:?}");
+
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(setting_keys(&db).await, vec!["port".to_string()]);
+    daemon::close(db).await;
+}
+
+#[tokio::test]
+async fn the_setting_prefix_form_forgets_that_key() {
+    let fixture = Fixture::new();
+    enable_slot(&fixture.memory_dir);
+    let db = fixture.open().await;
+    daemon::create_entity(&db, "entity:harbor", "Harbor", "project").await;
+    write_settings(&db, HARBOR_SETTINGS).await;
+    daemon::close(db).await;
+
+    graph_cli::correct(
+        &fixture.memory_dir,
+        &slot_options("Harbor", "setting:timeout", true, false, true),
+    )
+    .await
+    .expect("forget setting:timeout");
+    assert_eq!(
+        forget_rows(&fixture.memory_dir)[0]["relation"],
+        "setting:timeout"
+    );
+    fixture.stop_daemon().await;
+    let db = fixture.open().await;
+    assert_eq!(setting_keys(&db).await, vec!["port".to_string()]);
+    daemon::close(db).await;
 }
 
 #[test]

@@ -3851,7 +3851,7 @@ pub struct CorrectOptions {
 
 impl CorrectOptions {
     /// What the correction is aimed at.
-    fn target(&self) -> Result<CorrectTarget, RecallError> {
+    fn target(&self, slot_on: bool) -> Result<CorrectTarget, RecallError> {
         match (&self.rel_type, &self.object) {
             (None, None) => Ok(CorrectTarget::Entity {
                 name: self.subject.clone(),
@@ -3861,6 +3861,12 @@ impl CorrectOptions {
                 rel_type: rel_type.clone(),
                 to: object.clone(),
             }),
+            (Some(relation), None) if slot_on && self.forget && !self.wrong => {
+                Ok(CorrectTarget::Slot {
+                    from: self.subject.clone(),
+                    relation: relation.clone(),
+                })
+            }
             _ => Err(RecallError::Other(
                 "a relationship needs all three names: \
                  `graph correct <from> <REL> <to> --wrong`"
@@ -3900,7 +3906,7 @@ pub async fn correct(memory_dir: &Path, options: &CorrectOptions) -> Result<(), 
 }
 
 async fn apply_correction(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
-    let target = options.target()?;
+    let target = options.target(crate::graph::forgotten::slot_forget_on(memory_dir))?;
     let report = send_correction(memory_dir, &target, options.correction()?).await?;
     finish_correction(memory_dir, options, &target, report).await
 }
@@ -3950,7 +3956,7 @@ async fn confirm_and_forget(
 
 async fn unforget_command(memory_dir: &Path, options: &CorrectOptions) -> Result<(), RecallError> {
     require_lasting_forget(memory_dir)?;
-    let selector = unforget_selector(options)?;
+    let selector = unforget_selector(options, crate::graph::forgotten::slot_forget_on(memory_dir))?;
     let matches = crate::graph::forgotten::matching_live(memory_dir, &selector)?;
     commit_unforget(memory_dir, options, &selector, &matches)
 }
@@ -3967,6 +3973,7 @@ fn require_lasting_forget(memory_dir: &Path) -> Result<(), RecallError> {
 
 fn unforget_selector(
     options: &CorrectOptions,
+    slot_on: bool,
 ) -> Result<crate::graph::forgotten::UnforgetSelector, RecallError> {
     match (&options.rel_type, &options.object) {
         (None, None) => Ok(crate::graph::forgotten::UnforgetSelector::Entity {
@@ -3976,6 +3983,10 @@ fn unforget_selector(
             subject: options.subject.clone(),
             relation: relation.clone(),
             value: value.clone(),
+        }),
+        (Some(relation), None) if slot_on => Ok(crate::graph::forgotten::UnforgetSelector::Slot {
+            subject: options.subject.clone(),
+            relation: relation.clone(),
         }),
         _ => Err(RecallError::Other(
             "a relationship needs all three names: \
