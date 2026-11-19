@@ -5,6 +5,10 @@ changes a user has to know about before upgrading.
 
 ## [Unreleased]
 
+### Breaking
+
+- The public `rebuild` function now returns `u32`, the forgotten skip count.
+
 ### Added
 
 - `graph.consolidate_retire_reason`, default off. With `graph.consolidate` also on, consolidation can close one live rule when a setting on the same subject changes and the rule still names the old value but not the new one. The close is rule-only. `retire_reason_closes` and `retire_reason_ambiguous` are omitted from the report when unset. `bench writes --consolidate-retire-reason` turns the flag on for one run. With the flag off, config, reports and output stay as they are.

@@ -284,3 +284,65 @@ async fn extract_after_graph_ingest_skips_the_fact_and_consolidation_leaves_it_o
         "consolidation wrote the forgotten value back: {values:?}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_ingested_transcript_skips_a_forgotten_fact_and_counts_it() {
+    let dir = tempfile::tempdir().expect("temp");
+    let memory = dir.path().to_path_buf();
+    write_config(&memory);
+    write_forget(&memory);
+    std::fs::create_dir_all(memory.join("conversations")).expect("conversations");
+    init_graph(&memory).await;
+    std::env::set_var(
+        serve_client::DAEMON_BIN_ENV,
+        env!("CARGO_BIN_EXE_recall-echo"),
+    );
+
+    let transcript = dir.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        format!(
+            r#"{{"type":"user","timestamp":"2026-03-01T00:00:00.000Z","message":{{"role":"user","content":"{FORGOTTEN}"}}}}"#
+        ),
+    )
+    .expect("transcript");
+    let archived = memory.clone();
+    let source = transcript.clone();
+    let log = tokio::task::spawn_blocking(move || {
+        recall_echo::archive::archive_from_jsonl(
+            &archived,
+            "s-transcript",
+            &source.display().to_string(),
+        )
+    })
+    .await
+    .expect("archive thread")
+    .expect("ingest transcript");
+    assert_ne!(log, 0, "the transcript had no user turn");
+
+    let archive = memory.join(format!("conversations/conversation-{log:03}.md"));
+    let text = std::fs::read_to_string(&archive).expect("archive");
+    let report = recall_echo::graph_cli::extract_log_with(
+        &memory,
+        log,
+        &text,
+        "s-transcript",
+        &Scripted { fail_on: None },
+    )
+    .await
+    .expect("extract");
+    let _ = serve_client::stop_daemon(&memory).await;
+
+    assert_eq!(report.forgotten_skips, 1, "{:?}", report.drops);
+    let gm = GraphMemory::open_embedded(&memory.join("graph"))
+        .await
+        .expect("reopen");
+    assert!(
+        gm.stats().await.expect("stats").episode_count >= 1,
+        "the transcript was not ingested"
+    );
+    drop(gm);
+    let values = slot_values(&memory.join("graph")).await;
+    assert!(values.contains(&"9001".to_string()), "{values:?}");
+    assert!(!values.iter().any(|value| value == "9000"), "{values:?}");
+}

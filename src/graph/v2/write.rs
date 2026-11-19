@@ -221,6 +221,21 @@ impl<'a> WriteCtx<'a> {
             retire_reason_on: false,
         }
     }
+
+    /// Every consolidation switch off.
+    ///
+    /// A test sets only the fields it cares about, so a new switch does not
+    /// have to be repeated at each call.
+    #[cfg(test)]
+    fn switches_off(
+        llm: &'a dyn LlmProvider,
+        project: &'a ProjectIdentity,
+        session_id: &'a str,
+        date: &'a str,
+        turns: &'a [Turn],
+    ) -> Self {
+        Self::new(llm, project, session_id, date, turns)
+    }
 }
 
 /// Refuse a store this pipeline must not write, otherwise stamp it `v2`.
@@ -3466,31 +3481,11 @@ mod tests {
         };
         let llm = Quiet;
         let ctx = match budget {
-            Some(budget) => WriteCtx {
-                llm: &llm,
-                project: &project,
-                session_id,
-                date,
-                turns,
-                conflict_budget: budget,
-                valid_until: session_midnight(date),
-                on_conflict: None,
-                known: Vec::new(),
-                match_on: false,
-                targets: Vec::new(),
-                hold_on: false,
-                links_on: false,
-                ground_on: false,
-                components_on: false,
-                rename_on: false,
-                replaces_cue_on: false,
-                replaces_departure_on: false,
-                orphan_sweep_on: false,
-                rule_fragments_on: false,
-                retire_component_on: false,
-                component_takeover_on: false,
-                retire_reason_on: false,
-            },
+            Some(budget) => {
+                let mut ctx = WriteCtx::switches_off(&llm, &project, session_id, date, turns);
+                ctx.conflict_budget = budget;
+                ctx
+            }
             None => WriteCtx::new(&llm, &project, session_id, date, turns),
         };
         write_facts(gm, &ctx, facts).await
@@ -4741,31 +4736,9 @@ mod tests {
         };
         let llm = Quiet;
         let date = "2026-04-11";
-        let ctx = WriteCtx {
-            llm: &llm,
-            project: &project,
-            session_id: "s2",
-            date,
-            turns: &[],
-            conflict_budget: &budget,
-            valid_until: session_midnight(date),
-            on_conflict: Some(&hook),
-            known: Vec::new(),
-            match_on: false,
-            targets: Vec::new(),
-            hold_on: false,
-            links_on: false,
-            ground_on: false,
-            components_on: false,
-            rename_on: false,
-            replaces_cue_on: false,
-            replaces_departure_on: false,
-            orphan_sweep_on: false,
-            rule_fragments_on: false,
-            retire_component_on: false,
-            component_takeover_on: false,
-            retire_reason_on: false,
-        };
+        let mut ctx = WriteCtx::switches_off(&llm, &project, "s2", date, &[]);
+        ctx.conflict_budget = &budget;
+        ctx.on_conflict = Some(&hook);
         let stats = write_facts(&gm, &ctx, &[decided_slot("theme", "dark", 1)])
             .await
             .unwrap();
@@ -6249,37 +6222,17 @@ mod tests {
         let hook = CloseEdge(target.id.clone());
         let project = app_project();
         let llm = Quiet;
-        let ctx = WriteCtx {
-            llm: &llm,
-            project: &project,
-            session_id: "s2",
-            date: "2026-04-11",
-            turns: &turns,
-            conflict_budget: &budget,
-            valid_until: session_midnight("2026-04-11"),
-            on_conflict: Some(&hook),
-            known: Vec::new(),
-            match_on: true,
-            hold_on: false,
-            links_on: false,
-            ground_on: false,
-            components_on: false,
-            rename_on: false,
-            replaces_cue_on: false,
-            replaces_departure_on: false,
-            orphan_sweep_on: false,
-            rule_fragments_on: false,
-            retire_component_on: false,
-            component_takeover_on: false,
-            retire_reason_on: false,
-            targets: vec![Some(super::super::known_match::MatchTarget {
-                row_id: target.id.clone(),
-                subject: target.subject,
-                predicate: target.predicate,
-                key: target.key,
-                value: target.value,
-            })],
-        };
+        let mut ctx = WriteCtx::switches_off(&llm, &project, "s2", "2026-04-11", &turns);
+        ctx.conflict_budget = &budget;
+        ctx.on_conflict = Some(&hook);
+        ctx.match_on = true;
+        ctx.targets = vec![Some(super::super::known_match::MatchTarget {
+            row_id: target.id.clone(),
+            subject: target.subject,
+            predicate: target.predicate,
+            key: target.key,
+            value: target.value,
+        })];
         let stats = write_facts(&gm, &ctx, &[fact]).await.unwrap();
         assert_eq!(budget.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -8143,31 +8096,9 @@ mod tests {
         };
         let llm = Counting(&calls);
         let date = "2026-04-03";
-        let ctx = WriteCtx {
-            llm: &llm,
-            project: &project,
-            session_id: "s1",
-            date,
-            turns: &[],
-            conflict_budget: &budget,
-            valid_until: session_midnight(date),
-            on_conflict: None,
-            known: Vec::new(),
-            match_on: false,
-            targets: Vec::new(),
-            hold_on: false,
-            links_on: true,
-            ground_on: false,
-            components_on: false,
-            rename_on: false,
-            replaces_cue_on: false,
-            replaces_departure_on: false,
-            orphan_sweep_on: false,
-            rule_fragments_on: false,
-            retire_component_on: false,
-            component_takeover_on: false,
-            retire_reason_on: false,
-        };
+        let mut ctx = WriteCtx::switches_off(&llm, &project, "s1", date, &[]);
+        ctx.conflict_budget = &budget;
+        ctx.links_on = true;
         let result = write_facts(
             &gm,
             &ctx,
