@@ -329,6 +329,10 @@ enum BenchCommands {
         /// Implies nothing. The list is not stored.
         #[arg(long)]
         recover_turns: bool,
+        /// Bind listed key-token forms during pass-1 grounding. Off unless set.
+        /// Implies nothing. Writes `extract_coverage = true` for this run only.
+        #[arg(long)]
+        extract_coverage: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1183,6 +1187,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             no_consolidate_retire_component,
             consolidate_component_takeover,
             consolidate_retire_reason,
+            extract_coverage,
             no_known_key_binding,
             no_drop_restatements,
             no_ground_component_edges,
@@ -1281,6 +1286,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_retire_component: no_consolidate_retire_component,
                 consolidate_component_takeover,
                 consolidate_retire_reason,
+                extract_coverage,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2504,6 +2510,79 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn extract_coverage_is_its_own_bench_flag() {
+        let parsed = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--extract-coverage",
+        ])
+        .expect("parse coverage");
+        match parsed.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        extract_coverage,
+                        consolidate_retire_reason,
+                        consolidate,
+                        recover_turns,
+                        known_facts_context,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(extract_coverage);
+                assert!(!consolidate_retire_reason);
+                assert!(!consolidate);
+                assert!(!recover_turns);
+                assert!(!known_facts_context);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let with_opt_out = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--extract-coverage",
+            "--no-consolidate",
+        ])
+        .expect("coverage does not imply consolidate");
+        match with_opt_out.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        extract_coverage,
+                        no_consolidate,
+                        consolidate_retire_reason,
+                        ..
+                    },
+            } => {
+                assert!(extract_coverage);
+                assert!(no_consolidate);
+                assert!(!consolidate_retire_reason);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes");
+        let help = bench.render_long_help().to_string();
+        assert!(help.contains("--extract-coverage"), "{help}");
+        assert!(!help.contains("--no-extract-coverage"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn known_key_binding_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2823,6 +2902,7 @@ mod tests {
             consolidate_retire_component: f[11],
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
+            extract_coverage: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],

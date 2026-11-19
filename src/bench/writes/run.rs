@@ -291,6 +291,9 @@ pub struct OptOuts {
     /// Write `consolidate_retire_reason = true` and imply `consolidate`.
     /// False leaves the key out. An opt-out run does not write it.
     pub consolidate_retire_reason: bool,
+    /// Write `extract_coverage = true`. False leaves the key out.
+    /// Implies nothing, including `consolidate_retire_reason`.
+    pub extract_coverage: bool,
 }
 
 impl OptOuts {
@@ -314,6 +317,7 @@ impl OptOuts {
             consolidate_retire_component: true,
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
+            extract_coverage: false,
         }
     }
 }
@@ -860,6 +864,11 @@ fn switch_lines(
         &mut lines,
         opt_outs.consolidate_retire_reason,
         "consolidate_retire_reason = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.extract_coverage,
+        "extract_coverage = true",
     );
     lines
 }
@@ -3572,6 +3581,45 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.retire_reason_apply());
         assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn extract_coverage_writes_only_its_key_and_not_retire_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                extract_coverage: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nextract_coverage = true\n");
+        assert!(!text.contains("consolidate_retire_reason"), "{text}");
+        assert!(!text.contains("consolidate ="), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.extract_coverage);
+        assert!(!graph.consolidate_retire_reason);
+        assert!(!graph.retire_reason_apply());
     }
 
     #[test]

@@ -105,6 +105,7 @@ pub(crate) struct SessionGround {
     session_norm: String,
     session_words: Vec<String>,
     session_numbers: Vec<String>,
+    coverage: bool,
 }
 
 struct TurnGround {
@@ -148,7 +149,24 @@ impl SessionGround {
             session_norm,
             session_words,
             session_numbers,
+            coverage: false,
         }
+    }
+
+    /// Turn extract-coverage grounding on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    /// The flag reaches pass-1 grounding only. It does not change the prompt.
+    #[must_use]
+    pub(crate) fn with_coverage(mut self, on: bool) -> Self {
+        self.coverage = on;
+        self
+    }
+
+    /// Whether extract coverage is on for this session.
+    #[must_use]
+    pub(crate) fn coverage(&self) -> bool {
+        self.coverage
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -276,7 +294,7 @@ impl SessionGround {
             return false;
         };
         let sentence = sentence_containing(&cited.text, quote);
-        if direct_key_bound(key, &[quote, sentence]) {
+        if self.bind_key_direct(key, &[quote, sentence]) {
             return true;
         }
         match self
@@ -287,6 +305,14 @@ impl SessionGround {
             Some(cited_pos) => self.agreement_binds(key, value, cited_pos, quote),
             None => false,
         }
+    }
+
+    /// Whole tokens, then a listed form when coverage is on.
+    ///
+    /// The form list is empty until it is installed, so coverage does not
+    /// add a hit yet. Agreement is unchanged.
+    fn bind_key_direct(&self, key: &str, texts: &[&str]) -> bool {
+        direct_key_bound(key, texts, self.coverage())
     }
 
     /// A keyed setting whose value is a short punctuation literal the quote wraps.
@@ -314,7 +340,7 @@ impl SessionGround {
             return false;
         }
         let sentence = sentence_containing(&cited.text, quote);
-        direct_key_bound(key, &[quote, sentence])
+        direct_key_bound(key, &[quote, sentence], false)
     }
 
     /// User agreement: the cited sentence states only the value's numbers, the
@@ -593,21 +619,47 @@ fn version_stem(key: &str) -> Option<&str> {
     key.strip_suffix("_version")
 }
 
-fn direct_key_bound(key: &str, texts: &[&str]) -> bool {
-    if !version_stem_ok(key, texts) {
+fn direct_key_bound(key: &str, texts: &[&str], coverage: bool) -> bool {
+    if !version_stem_ok(key, texts, coverage) {
         return false;
     }
     let specific = specific_key_tokens(key);
-    !specific.is_empty() && specific.iter().any(|token| token_occurs(token, texts))
+    !specific.is_empty()
+        && specific
+            .iter()
+            .any(|token| token_hits(token, texts, coverage))
 }
 
-fn version_stem_ok(key: &str, texts: &[&str]) -> bool {
+fn version_stem_ok(key: &str, texts: &[&str], coverage: bool) -> bool {
     let Some(stem) = version_stem(key) else {
         return true;
     };
     let stem_tokens: Vec<&str> = stem.split('_').filter(|token| !token.is_empty()).collect();
-    !stem_tokens.is_empty() && stem_tokens.iter().all(|token| token_occurs(token, texts))
+    !stem_tokens.is_empty()
+        && stem_tokens
+            .iter()
+            .all(|token| token_hits(token, texts, coverage))
 }
+
+/// The token, or one listed form when coverage is on. Forms are whole tokens.
+fn token_hits(token: &str, texts: &[&str], coverage: bool) -> bool {
+    if token_occurs(token, texts) {
+        return true;
+    }
+    coverage && form_occurs(token, texts)
+}
+
+fn form_occurs(token: &str, texts: &[&str]) -> bool {
+    KEY_TOKEN_FORMS
+        .iter()
+        .any(|(word, form)| *word == token && token_occurs(form, texts))
+}
+
+/// Closed list of a key token and one whole-word form that can stand in for it.
+///
+/// Empty until the list is installed, so coverage does not add a hit.
+/// Whole-token match only, the same normalisation as [`token_occurs`].
+const KEY_TOKEN_FORMS: &[(&str, &str)] = &[];
 
 pub(crate) fn specific_key_tokens(key: &str) -> Vec<&str> {
     key.split('_')
@@ -765,7 +817,8 @@ fn is_word_char(ch: char) -> bool {
 
 fn agreement_tokens(key: &str, sentence: &str) -> bool {
     let specific = specific_key_tokens(key);
-    if specific.is_empty() || !version_stem_ok(key, &[sentence]) {
+    // Agreement stays on exact tokens. Listed forms are direct binding only.
+    if specific.is_empty() || !version_stem_ok(key, &[sentence], false) {
         return false;
     }
     // Drop the trailing `version` token only when another specific token
@@ -1249,6 +1302,21 @@ mod tests {
         assert!(!session.key_bound("line_length", "88", 0, "Coverage is 88%"));
         assert!(session.supports_value("9000", 0, "Port 9000.", ValueShape::Literal));
         assert!(session.key_bound("port", "9000", 0, "Port 9000."));
+    }
+
+    #[test]
+    fn coverage_reaches_grounding_and_leaves_a_plain_bind_unchanged() {
+        let lines = [("Port 9000 is chosen.", TurnRole::User)];
+        let off = ground(&lines);
+        let on = ground(&lines).with_coverage(true);
+        assert!(!off.coverage());
+        assert!(on.coverage());
+        assert!(off.key_bound("port", "9000", 0, "Port 9000 is chosen."));
+        assert!(on.key_bound("port", "9000", 0, "Port 9000 is chosen."));
+        assert_eq!(
+            off.cite(0, "Port 9000").unwrap().quote,
+            on.cite(0, "Port 9000").unwrap().quote
+        );
     }
 
     #[test]

@@ -216,7 +216,8 @@ pub(crate) async fn extract_session(
     let pass1_started = std::time::Instant::now();
     // The known block is opt-in model input, not a turn. Off does not read
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
-    let ground = SessionGround::prepare(&session.turns);
+    let ground =
+        SessionGround::prepare(&session.turns).with_coverage(extract_coverage_enabled(memory_dir));
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
@@ -558,6 +559,13 @@ fn known_key_binding_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .known_key_binding_apply()
+}
+
+fn extract_coverage_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .extract_coverage
 }
 
 fn drop_restatements_enabled(memory_dir: &Path) -> bool {
@@ -1677,6 +1685,26 @@ mod tests {
             PASS1_SYSTEM,
             format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}")
         );
+    }
+
+    #[test]
+    fn extract_coverage_does_not_change_pass1_prompt_or_request_bytes() {
+        assert_eq!(
+            PASS1_SYSTEM_BARE.as_bytes(),
+            SYSTEM_BEFORE_KNOWN_BLOCK.as_bytes()
+        );
+        assert_eq!(
+            PASS1_SYSTEM.as_bytes(),
+            format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}").as_bytes()
+        );
+        let window = "[T0] USER: Python 3.11 minimum\n";
+        let message = user_message("app", "2026-01-02", window, "");
+        assert_eq!(
+            message.as_bytes(),
+            user_message("app", "2026-01-02", window, "").as_bytes()
+        );
+        assert!(!PASS1_SYSTEM.contains("COVERAGE_SENTENCES"));
+        assert!(!PASS1_EXAMPLE_USER.contains("COVERAGE_SENTENCES"));
     }
 
     fn session(turns: Vec<Turn>) -> SessionInput {

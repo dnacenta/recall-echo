@@ -967,6 +967,11 @@ pub struct GraphSection {
     /// With it off, nothing reads, locks, or writes that file.
     #[serde(default = "default_lasting_forget", skip_serializing_if = "is_false")]
     pub lasting_forget: bool,
+    /// Let pass-1 grounding bind a closed list of key-token forms.
+    /// Off unless set. Stands alone: it does not turn any other switch on,
+    /// and it does not change the pass-1 prompt.
+    #[serde(default = "default_extract_coverage", skip_serializing_if = "is_false")]
+    pub extract_coverage: bool,
 }
 
 impl Default for GraphSection {
@@ -1001,6 +1006,7 @@ impl Default for GraphSection {
             ground_component_edges: default_ground_component_edges(),
             recover_turns: default_recover_turns(),
             lasting_forget: default_lasting_forget(),
+            extract_coverage: default_extract_coverage(),
         }
     }
 }
@@ -1462,6 +1468,10 @@ fn default_recover_turns() -> bool {
 }
 
 fn default_lasting_forget() -> bool {
+    false
+}
+
+fn default_extract_coverage() -> bool {
     false
 }
 
@@ -2006,6 +2016,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.ground_component_edges", flag_ground_component_edges),
     ("graph.recover_turns", flag_recover_turns),
     ("graph.lasting_forget", flag_lasting_forget),
+    ("graph.extract_coverage", flag_extract_coverage),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2099,6 +2110,10 @@ fn flag_recover_turns(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_lasting_forget(graph: &mut GraphSection) -> &mut bool {
     &mut graph.lasting_forget
+}
+
+fn flag_extract_coverage(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.extract_coverage
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -4231,6 +4246,71 @@ settle_secs = 300
         cfg.set_key("graph.lasting_forget", "true").unwrap();
         assert!(cfg.set_key("graph.lasting_forget", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").lasting_forget);
+    }
+
+    #[test]
+    fn extract_coverage_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_extract_coverage());
+        assert!(!GraphSection::default().extract_coverage);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().extract_coverage);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("extract_coverage"));
+        assert!(!rendered_default.contains("consolidate_retire_reason"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nextract_coverage = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.extract_coverage);
+        assert!(!false_graph.consolidate_retire_reason);
+        assert!(false_graph.known_facts_context);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("extract_coverage"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nextract_coverage = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.extract_coverage);
+        assert!(!true_graph.consolidate_retire_reason);
+        assert!(!true_graph.retire_reason_apply());
+        assert!(true_graph.known_facts_context);
+        assert!(!true_graph.known_match);
+        assert!(!true_graph.lasting_forget);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("extract_coverage = true"));
+        assert!(!rendered_true.contains("consolidate_retire_reason"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.extract_coverage);
+        assert!(!again.consolidate_retire_reason);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.extract_coverage", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.extract_coverage);
+        assert!(!graph.consolidate_retire_reason);
+        assert!(!graph.retire_reason_apply());
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("extract_coverage = true"));
+        assert!(!rendered.contains("consolidate_retire_reason"));
+        assert!(!rendered.contains("known_facts_context ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.extract_coverage);
+        assert!(!parsed_graph.consolidate_retire_reason);
+
+        cfg.set_key("graph.extract_coverage", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").extract_coverage);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("extract_coverage"));
+        cfg.set_key("graph.extract_coverage", "true").unwrap();
+        assert!(cfg.set_key("graph.extract_coverage", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").extract_coverage);
+        cfg.set_key("graph.consolidate_retire_reason", "false")
+            .unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").extract_coverage);
+        assert!(!cfg.graph.as_ref().expect("graph").consolidate_retire_reason);
     }
 
     #[test]
