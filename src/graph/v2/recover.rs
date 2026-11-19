@@ -71,9 +71,10 @@ struct LiveRow {
 
 /// Scan `session` when `enabled` and record misses on `report`.
 ///
-/// A store read failure adds one error and lists nothing. The caller still
-/// succeeds. `facts` supplies subjects stored this session; the project name
-/// and its aliases are always included, up to 48 names.
+/// A store read failure adds one error and lists nothing. A malformed forget
+/// file is returned, the same as extraction. `facts` supplies subjects stored
+/// this session; the project name and its aliases are always included, up to
+/// 48 names.
 #[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub(crate) async fn fill_report(
     gm: &GraphMemory,
@@ -81,10 +82,8 @@ pub(crate) async fn fill_report(
     session: &SessionInput,
     facts: &[Fact],
     report: &mut crate::graph::types::IngestionReport,
-) {
-    if let Err(err) = fill_report_result(gm, enabled, session, facts, report).await {
-        report.errors.push(err.to_string());
-    }
+) -> Result<(), GraphError> {
+    fill_report_result(gm, enabled, session, facts, report).await
 }
 
 /// [`fill_report`], returning a malformed forget file as an error when the flag is on.

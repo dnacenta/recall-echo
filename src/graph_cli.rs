@@ -3918,7 +3918,10 @@ async fn finish_correction(
             confirm_and_forget(memory_dir, options, target, &removal).await
         }
         other => {
-            print_correction(&other);
+            print_correction(
+                &other,
+                crate::graph::forgotten::lasting_forget_on(memory_dir),
+            );
             refusal(&other)
         }
     }
@@ -3930,10 +3933,8 @@ async fn confirm_and_forget(
     target: &CorrectTarget,
     removal: &Removal,
 ) -> Result<(), RecallError> {
-    print_removal_plan(
-        removal,
-        crate::graph::forgotten::lasting_forget_on(memory_dir),
-    );
+    let lasting = crate::graph::forgotten::lasting_forget_on(memory_dir);
+    print_removal_plan(removal, lasting);
     if !options.yes && !confirm_removal(removal)? {
         println!("{WARN}Nothing removed.{RESET}");
         return Ok(());
@@ -3943,7 +3944,7 @@ async fn confirm_and_forget(
     // Still through `refusal`: the graph can have moved between the
     // plan and the confirmation, and a removal that found nothing to
     // remove must not exit as though it had.
-    print_correction(&applied);
+    print_correction(&applied, lasting);
     refusal(&applied)
 }
 
@@ -4077,7 +4078,7 @@ fn refusal(report: &CorrectionReport) -> Result<(), RecallError> {
     }
 }
 
-fn print_correction(report: &CorrectionReport) {
+fn print_correction(report: &CorrectionReport, lasting: bool) {
     match report {
         CorrectionReport::UnknownEntity { query, candidates } => {
             println!("{WARN}No entity named{RESET} {BOLD}{query}{RESET}.");
@@ -4138,7 +4139,7 @@ fn print_correction(report: &CorrectionReport) {
             );
         }
         CorrectionReport::Contradicted { edges } => print_contradictions(edges),
-        CorrectionReport::Planned { removal } => print_removal_plan(removal, false),
+        CorrectionReport::Planned { removal } => print_removal_plan(removal, lasting),
         CorrectionReport::Removed { removal } => {
             let entity = removal
                 .entity

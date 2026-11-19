@@ -536,7 +536,7 @@ pub async fn recover_replay(memory_dir: &Path) -> Result<Vec<String>, RecallErro
 async fn replay_line(gm: &GraphMemory, memory_dir: &Path, log: u32) -> Result<String, RecallError> {
     let session = crate::graph::v2::input::load_session(memory_dir, log)?;
     let mut report = crate::graph::types::IngestionReport::default();
-    crate::graph::v2::recover::fill_report(gm, true, &session, &[], &mut report).await;
+    crate::graph::v2::recover::fill_report(gm, true, &session, &[], &mut report).await?;
     let line = serde_json::json!({
         "log": log,
         "session": session.session_id,
@@ -2897,6 +2897,41 @@ mod tests {
                         .contains("(12 rows, 3 tags)")),
             "{value}"
         );
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recover_replay_returns_a_malformed_forget_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(memory.join("turns")).unwrap();
+        let project = tmp.path().join("tidepool");
+        fs::create_dir(&project).unwrap();
+        crate::graph::v2::input::write_turns_sidecar(
+            &memory,
+            1,
+            "s1",
+            "2026-01-02",
+            project.to_str(),
+            &[crate::conversation::ConversationEntry::UserMessage(
+                "Run `scripts/migrate.py` (12 rows, 3 tags).".into(),
+            )],
+        )
+        .unwrap();
+        fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nlasting_forget = true\n",
+        )
+        .unwrap();
+        fs::write(memory.join("forgotten.jsonl"), b"{not json\n").unwrap();
+        {
+            let gm = GraphMemory::open(&memory.join("graph")).await.unwrap();
+            crate::graph::v2::ensure_v2_store(&gm).await.unwrap();
+        }
+        let err = recover_replay(&memory).await.expect_err("malformed");
+        let message = err.to_string();
+        assert!(message.contains("invalid JSON"), "{message}");
+        assert!(message.contains("forgotten.jsonl"), "{message}");
     }
 
     #[test]

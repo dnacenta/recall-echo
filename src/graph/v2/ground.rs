@@ -848,7 +848,8 @@ fn is_stop(token: &str) -> bool {
     )
 }
 
-fn is_generic_key(token: &str) -> bool {
+#[must_use]
+pub(crate) fn is_generic_key(token: &str) -> bool {
     matches!(
         token,
         "value" | "number" | "setting" | "default" | "current" | "new" | "min" | "max"
