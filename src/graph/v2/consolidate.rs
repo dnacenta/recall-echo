@@ -10284,7 +10284,7 @@ mod tests {
         let live = super::super::known::read_live(&gm, &project, "binder canvas linen").await;
         assert!(live.iter().any(|row| row.value == "canvas"));
         assert!(live.iter().all(|row| row.value != "linen"));
-        let block = super::super::known::render_known(&live);
+        let block = super::super::known::render_known(&live, 80);
         assert!(block.contains("canvas"));
         assert!(!block.contains("linen"));
     }
@@ -23286,6 +23286,173 @@ mod tests {
         assert!(encoded.get("cross_key_replaces_closes").is_none());
         assert!(encoded.get("cross_key_replaces_ambiguous").is_none());
         assert!(encoded.get("cross_key_replaces_unit_blocked").is_none());
+    }
+
+    fn wide_rule() -> String {
+        format!("Keep the harbor bell brass {}", "c".repeat(230))
+    }
+
+    async fn finish_width(
+        gm: &GraphMemory,
+        facts: &[Fact],
+        rule_on: bool,
+        width: usize,
+    ) -> IngestionReport {
+        super::begin_post_lines();
+        let identity = named_project("Harbor");
+        let turns = [user_turn(2, "later")];
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &identity, "s11", "2026-04-11", &turns);
+        ctx.rule_replaces_on = rule_on;
+        ctx.cross_key_replaces_on = false;
+        ctx.value_chars = width;
+        let mut report = IngestionReport::default();
+        super::post_pass(gm, &ctx, facts, &mut report).await;
+        report
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wider_cut_matches_two_hundred_characters_and_not_eighty() {
+        let rule = wide_rule();
+        assert!(rule.chars().count() > 200);
+        let cut_80 = super::super::known::cut_value(&rule, 80);
+        let cut_200 = super::super::known::cut_value(&rule, 200);
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[project_rule("Harbor", &rule)],
+        )
+        .await;
+        let narrow = harbor_setting("batch_limit", "40", &cut_80);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&narrow),
+        )
+        .await;
+        let missed = finish_width(&gm, std::slice::from_ref(&narrow), true, 200).await;
+        assert!(ended(rule_named(&slots(&gm, "Harbor").await, &rule)).is_none());
+        assert!(missed.consolidate.rule_replaces_closes.is_none());
+        let wide = harbor_setting("row_total", "12", &cut_200);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&wide),
+        )
+        .await;
+        let hit = finish_width(&gm, std::slice::from_ref(&wide), true, 200).await;
+        assert_eq!(
+            ended(rule_named(&slots(&gm, "Harbor").await, &rule)),
+            Some("s11:rule_replaces")
+        );
+        assert_eq!(hit.consolidate.rule_replaces_closes, Some(1));
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[project_rule("Harbor", &rule)],
+        )
+        .await;
+        let at_eighty = harbor_setting("batch_limit", "40", &cut_80);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&at_eighty),
+        )
+        .await;
+        let closed = finish_width(&gm, std::slice::from_ref(&at_eighty), true, 80).await;
+        assert_eq!(
+            ended(rule_named(&slots(&gm, "Harbor").await, &rule)),
+            Some("s11:rule_replaces")
+        );
+        assert_eq!(closed.consolidate.rule_replaces_closes, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_flag_alone_and_together_closes_only_its_rows() {
+        let screen = "25 (fits one screen)";
+        let rule = TIDEPOOL_RULE;
+        let long = long_page();
+        let cases = [
+            (true, false, false, true, false),
+            (false, true, false, false, true),
+            (false, false, true, false, false),
+            (true, true, true, true, true),
+            (false, false, false, false, false),
+        ];
+        for (cross, rules, long_values, expect_b, expect_c) in cases {
+            let (_tmp, gm) = open().await;
+            commit_named(
+                &gm,
+                "Harbor",
+                "s04",
+                "2026-04-04",
+                &[
+                    subject_setting("Harbor", "page_size", screen),
+                    project_rule("Harbor", rule),
+                    subject_setting("Harbor", "page_note", &long),
+                ],
+            )
+            .await;
+            let facts = [
+                harbor_setting("batch_limit", "40", screen),
+                harbor_setting("row_total", "12", rule),
+            ];
+            commit_named(&gm, "Harbor", "s11", "2026-04-11", &facts).await;
+            super::begin_post_lines();
+            super::reset_post_reads();
+            let identity = named_project("Harbor");
+            let turns = [user_turn(2, "later")];
+            let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+            let mut ctx = WriteCtx::new(&stub, &identity, "s11", "2026-04-11", &turns);
+            ctx.cross_key_replaces_on = cross;
+            ctx.rule_replaces_on = rules;
+            ctx.value_chars = if long_values { 200 } else { 80 };
+            let mut report = IngestionReport::default();
+            super::post_pass(&gm, &ctx, &facts, &mut report).await;
+            let rows = slots(&gm, "Harbor").await;
+            let lines = super::take_post_lines();
+            let b_closed = ended(setting_named(&rows, "page_size", screen)).is_some();
+            let c_closed = ended(rule_named(&rows, rule)).is_some();
+            assert_eq!(b_closed, expect_b, "{cross} {rules} {long_values}");
+            assert_eq!(c_closed, expect_c, "{cross} {rules} {long_values}");
+            assert!(ended(setting_named(&rows, "page_note", &long)).is_none());
+            if expect_b {
+                assert_eq!(report.consolidate.cross_key_replaces_closes, Some(1));
+                assert!(lines
+                    .iter()
+                    .any(|line| line.starts_with("consolidate cross_key_replaces:")));
+            } else {
+                assert!(report.consolidate.cross_key_replaces_closes.is_none());
+            }
+            if expect_c {
+                assert_eq!(report.consolidate.rule_replaces_closes, Some(1));
+                assert!(lines
+                    .iter()
+                    .any(|line| line.starts_with("consolidate rule_replaces:")));
+            } else {
+                assert!(report.consolidate.rule_replaces_closes.is_none());
+            }
+            if !cross && !rules {
+                assert_eq!(super::post_reads(), 0);
+                assert!(lines.is_empty());
+                let encoded = serde_json::to_value(&report.consolidate).unwrap();
+                assert!(encoded.get("cross_key_replaces_closes").is_none());
+                assert!(encoded.get("rule_replaces_closes").is_none());
+            }
+        }
     }
 }
 

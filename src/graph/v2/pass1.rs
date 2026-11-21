@@ -462,14 +462,15 @@ async fn load_shown_known(
     known_on: bool,
     match_on: bool,
 ) -> Result<ShownKnown, GraphError> {
+    let width = known_value_chars(memory_dir);
     let (stored, shown, block) = if known_on && match_on {
         let rows = super::known::read_live(gm, project, session_text).await;
-        let shown = super::known::rank_known(rows.clone(), session_text);
-        let block = super::known::render_known(&shown);
+        let shown = super::known::rank_known(rows.clone(), session_text, width);
+        let block = super::known::render_known(&shown, width);
         (Some(rows), shown, block)
     } else if known_on {
-        let rows = super::known::known_rows(gm, project, session_text).await?;
-        let block = super::known::render_known(&rows);
+        let rows = super::known::known_rows(gm, project, session_text, width).await?;
+        let block = super::known::render_known(&rows, width);
         (None, rows, block)
     } else {
         (None, Vec::new(), String::new())
@@ -6895,9 +6896,9 @@ mod tests {
         assert!(!report.drops.contains_key(DROP_KEY_BINDING));
 
         let unranked = super::super::known::read_live(&gm, &project, MARKER_TURN).await;
-        let ranked = super::super::known::rank_known(unranked.clone(), MARKER_TURN);
-        let ranked_block = super::super::known::render_known(&ranked);
-        let unranked_block = super::super::known::render_known(&unranked);
+        let ranked = super::super::known::rank_known(unranked.clone(), MARKER_TURN, 80);
+        let ranked_block = super::super::known::render_known(&ranked, 80);
+        let unranked_block = super::super::known::render_known(&unranked, 80);
         assert_ne!(ranked_block, unranked_block);
         let user = provider.user.lock().expect("user").clone();
         assert!(user.contains(&ranked_block), "{user}");
