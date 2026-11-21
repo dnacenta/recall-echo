@@ -7891,7 +7891,8 @@ struct MovePlan {
     closes: Vec<MoveClose>,
     ambiguous: Vec<MoveNote>,
     sweeps: Vec<ToolSweep>,
-    sweep_overflow: u32,
+    /// Target counts for sweep triggers past [`ORPHAN_TARGET_CAP`]. None of those targets close.
+    sweep_overflows: Vec<usize>,
 }
 
 struct ToolSweep {
@@ -8028,7 +8029,7 @@ fn plan_tool_move(ctx: &WriteCtx<'_>, facts: &[Fact], snap: &MoveSnap) -> MovePl
         closes: Vec::new(),
         ambiguous: Vec::new(),
         sweeps: Vec::new(),
-        sweep_overflow: 0,
+        sweep_overflows: Vec::new(),
     };
     let family = move_family(snap);
     for anchor in &snap.uses {
@@ -8054,7 +8055,7 @@ fn plan_sweeps(
     for trigger in sweep_triggers(ctx, facts, &live) {
         let targets = sweep_targets(snap, family, ctx.session_id, &trigger.stem);
         if targets.len() > ORPHAN_TARGET_CAP {
-            plan.sweep_overflow = plan.sweep_overflow.saturating_add(1);
+            plan.sweep_overflows.push(targets.len());
             continue;
         }
         push_sweep_targets(plan, snap, &mut seen, &trigger, &targets);
@@ -8127,6 +8128,7 @@ fn sweep_targets<'a>(
         .collect()
 }
 
+/// Sweep targets skip [`tool_mentioned`]. The trigger turn always names the tool.
 fn sweep_target(
     edge: &MoveUse,
     family: &BTreeSet<String>,
@@ -8444,6 +8446,7 @@ fn tool_stem(name: &str) -> String {
     runs.join(" ")
 }
 
+#[cfg(test)]
 fn move_job_tokens(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
     raw_job_pieces(slot)
         .into_iter()
@@ -8451,6 +8454,7 @@ fn move_job_tokens(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn raw_job_pieces(slot: &MoveSlot) -> Vec<String> {
     match slot.predicate.as_str() {
         "setting" => setting_key_tokens(&slot.key),
@@ -8500,10 +8504,18 @@ fn whole_move_tool(token: &str, names: &MoveNames<'_>) -> bool {
 
 fn head_tokens(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
     match slot.predicate.as_str() {
-        "setting" => move_job_tokens(slot, names),
+        "setting" => setting_head(slot, names),
         "rule" => rule_head(slot, names),
         _ => BTreeSet::new(),
     }
+}
+
+/// A setting's head is its first key piece only. `migration_format` is `migration`.
+fn setting_head(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
+    let Some(piece) = setting_key_tokens(&slot.key).into_iter().next() else {
+        return BTreeSet::new();
+    };
+    kept_job_token(&piece, names).into_iter().collect()
 }
 
 fn rule_head(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
@@ -8521,9 +8533,7 @@ async fn apply_tool_move(
     report: &mut IngestionReport,
 ) {
     note_move_ambiguous(&plan.ambiguous, report);
-    for _ in 0..plan.sweep_overflow {
-        add_count(&mut report.consolidate.tool_move_ambiguous);
-    }
+    note_sweep_overflow(ctx, &plan.sweep_overflows, report);
     for close in &plan.closes {
         if close_tool_move(gm, ctx, close, report).await {
             add_count(&mut report.consolidate.tool_move_closes);
@@ -8540,6 +8550,13 @@ fn note_move_ambiguous(notes: &[MoveNote], report: &mut IngestionReport) {
     for note in notes {
         add_count(&mut report.consolidate.tool_move_ambiguous);
         emit_post_line(tool_move_ambiguous_line(note));
+    }
+}
+
+fn note_sweep_overflow(ctx: &WriteCtx<'_>, counts: &[usize], report: &mut IngestionReport) {
+    for count in counts {
+        add_count(&mut report.consolidate.tool_move_ambiguous);
+        emit_post_line(tool_sweep_overflow_line(&ctx.project.name, *count));
     }
 }
 
@@ -8669,6 +8686,13 @@ fn tool_sweep_line(sweep: &ToolSweep) -> String {
         quote_head(&sweep.tool),
         sweep.kind,
         quote_head(&sweep.trigger)
+    )
+}
+
+fn tool_sweep_overflow_line(project: &str, count: usize) -> String {
+    format!(
+        "consolidate tool sweep overflow: {} | {count} targets",
+        quote_head(project)
     )
 }
 
@@ -23032,6 +23056,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_move_keeps_a_shared_later_key_piece() {
+        let names = move_names("Harbor", "Tidepool", "Lantern", "Northlamp", "Southlamp");
+        let migration = setting_slot("migration_format", "amber glass", "s01", 1);
+        let signature = setting_slot("signature_format", "cobalt glass", "s02", 2);
+        assert_eq!(
+            head_tokens(&migration, &names),
+            BTreeSet::from([String::from("migration")])
+        );
+        assert_eq!(
+            head_tokens(&signature, &names),
+            BTreeSet::from([String::from("signature")])
+        );
+        let mut snap = project_to_component();
+        snap.entities[0].slots[0].key = "migration_format".into();
+        snap.entities[1].slots[0].key = "signature_format".into();
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
     fn tool_move_needs_an_anchor() {
         let mut snap = project_to_component();
         snap.uses.pop();
@@ -23382,7 +23425,7 @@ mod tests {
     fn assert_sweep(plan: &MovePlan, tool: &str, kind: &str, trigger: &str) {
         assert!(plan.closes.is_empty());
         assert!(plan.ambiguous.is_empty());
-        assert_eq!(plan.sweep_overflow, 0);
+        assert!(plan.sweep_overflows.is_empty());
         assert_eq!(plan.sweeps.len(), 1);
         assert_eq!(plan.sweeps[0].subject, "Tidepool");
         assert_eq!(plan.sweeps[0].tool, tool);
@@ -23454,7 +23497,7 @@ mod tests {
             &[project_reject("Northlamp.js")],
         );
         assert!(plan.sweeps.is_empty());
-        assert_eq!(plan.sweep_overflow, 0);
+        assert!(plan.sweep_overflows.is_empty());
     }
 
     #[test]
@@ -23482,14 +23525,71 @@ mod tests {
             &[project_reject("Northlamp")],
         );
         assert_eq!(under.sweeps.len(), 4);
-        assert_eq!(under.sweep_overflow, 0);
+        assert!(under.sweep_overflows.is_empty());
         let over = plan_move(
             &component_lamps(5),
             "harbor drops a lamp",
             &[project_reject("Northlamp")],
         );
         assert!(over.sweeps.is_empty());
-        assert_eq!(over.sweep_overflow, 1);
+        assert_eq!(over.sweep_overflows, vec![5]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_sweep_overflow_prints_one_line_and_closes_nothing() {
+        let (tmp, gm) = open().await;
+        let mut old = vec![timed_setting(
+            "Harbor",
+            Kind::Project,
+            "archive_root",
+            "shore",
+            1,
+        )];
+        for name in ["Creek", "Marsh", "Inlet", "Basin", "Delta"] {
+            old.push(at_turn(part_link(name, "Harbor", Kind::Project), 1));
+            old.push(library_use(name, Kind::Component, "Northlamp.js", 1));
+        }
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, &old).await;
+        let rejected = vec![project_reject("Northlamp")];
+        let turns = [user_turn(2, "harbor drops a lamp")];
+        let resolver = Stub::new(Answer::Reply(r#"{"entities":[]}"#.into()));
+        let project = harbor_project();
+        let ctx = WriteCtx::new(&resolver, &project, "s02", "2026-04-02", &turns);
+        write_facts(&gm, &ctx, &rejected).await.unwrap();
+
+        let (quiet, quiet_lines, _) =
+            run_tool_move(&gm, "s02", "2026-04-02", &turns, &rejected, false).await;
+        assert!(quiet.consolidate.tool_move_ambiguous.is_none());
+        assert!(quiet.consolidate.tool_move_sweeps.is_none());
+        assert!(quiet_lines.iter().all(|line| !line.contains("tool sweep")));
+        assert!(open_named_uses(&gm, "Northlamp.js").await);
+
+        let (report, lines, _) =
+            run_tool_move(&gm, "s02", "2026-04-02", &turns, &rejected, true).await;
+        assert!(open_named_uses(&gm, "Northlamp.js").await);
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert!(report.consolidate.tool_move_sweeps.is_none());
+        assert_eq!(report.consolidate.tool_move_ambiguous, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate tool sweep overflow: Harbor | 5 targets"]
+        );
+        drop(tmp);
+    }
+
+    async fn open_named_uses(gm: &GraphMemory, object: &str) -> bool {
+        let mut response = gm
+            .db()
+            .query("SELECT ended_by, out.name AS object FROM relates_to WHERE rel_type = 'uses'")
+            .await
+            .unwrap();
+        let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        let matched: Vec<&Value> = rows.iter().filter(|row| row["object"] == object).collect();
+        !matched.is_empty()
+            && matched
+                .iter()
+                .all(|row| row.get("ended_by").and_then(Value::as_str).is_none())
     }
 
     #[test]
