@@ -105,6 +105,8 @@ pub(crate) struct SessionGround {
     session_norm: String,
     session_words: Vec<String>,
     session_numbers: Vec<String>,
+    value_details: bool,
+    key_forms: bool,
 }
 
 struct TurnGround {
@@ -148,7 +150,38 @@ impl SessionGround {
             session_norm,
             session_words,
             session_numbers,
+            value_details: false,
+            key_forms: false,
         }
+    }
+
+    /// Turn the value-detail checks on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    #[must_use]
+    pub(crate) fn with_value_details(mut self, on: bool) -> Self {
+        self.value_details = on;
+        self
+    }
+
+    /// Whether value-detail checks are on for this session.
+    pub(crate) fn value_details(&self) -> bool {
+        self.value_details
+    }
+
+    /// Turn key-form binding on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    /// The flag reaches pass-1 grounding only. It does not change the prompt.
+    #[must_use]
+    pub(crate) fn with_key_forms(mut self, on: bool) -> Self {
+        self.key_forms = on;
+        self
+    }
+
+    /// Whether key-form binding is on for this session.
+    pub(crate) fn key_forms(&self) -> bool {
+        self.key_forms
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -1249,6 +1282,23 @@ mod tests {
         assert!(!session.key_bound("line_length", "88", 0, "Coverage is 88%"));
         assert!(session.supports_value("9000", 0, "Port 9000.", ValueShape::Literal));
         assert!(session.key_bound("port", "9000", 0, "Port 9000."));
+    }
+
+    #[test]
+    fn detail_and_key_form_switches_default_off_and_leave_a_plain_bind_unchanged() {
+        let lines = [("Port 9000 is chosen.", TurnRole::User)];
+        let off = ground(&lines);
+        let on = ground(&lines).with_value_details(true).with_key_forms(true);
+        assert!(!off.value_details());
+        assert!(!off.key_forms());
+        assert!(on.value_details());
+        assert!(on.key_forms());
+        assert!(off.key_bound("port", "9000", 0, "Port 9000 is chosen."));
+        assert!(on.key_bound("port", "9000", 0, "Port 9000 is chosen."));
+        assert_eq!(
+            off.cite(0, "Port 9000").unwrap().quote,
+            on.cite(0, "Port 9000").unwrap().quote
+        );
     }
 
     #[test]

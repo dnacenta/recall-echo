@@ -216,7 +216,12 @@ pub(crate) async fn extract_session(
     let pass1_started = std::time::Instant::now();
     // The known block is opt-in model input, not a turn. Off does not read
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
-    let ground = SessionGround::prepare(&session.turns);
+    let value_details = value_details_enabled(memory_dir);
+    let key_forms = key_forms_enabled(memory_dir);
+    let ground = SessionGround::prepare(&session.turns)
+        .with_value_details(value_details)
+        .with_key_forms(key_forms);
+    let _ = (ground.value_details(), ground.key_forms());
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
@@ -579,6 +584,20 @@ fn recover_turns_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .recover_applies()
+}
+
+fn value_details_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .extract_value_details
+}
+
+fn key_forms_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .extract_key_forms
 }
 
 /// Drop facts that match a live forget record. Flag off does not open the file.
@@ -1691,6 +1710,30 @@ mod tests {
             PASS1_SYSTEM,
             format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}")
         );
+    }
+
+    #[test]
+    fn value_details_and_key_forms_read_only_their_own_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!value_details_enabled(dir.path()));
+        assert!(!key_forms_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nextract_value_details = true\n",
+        )
+        .unwrap();
+        assert!(value_details_enabled(dir.path()));
+        assert!(!key_forms_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nextract_key_forms = true\nconsolidate = false\n",
+        )
+        .unwrap();
+        assert!(!value_details_enabled(dir.path()));
+        assert!(key_forms_enabled(dir.path()));
+        let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
+        assert!(!encoded.contains("detail_tail_stripped"));
+        assert!(!encoded.contains("key_form_bound"));
     }
 
     fn session(turns: Vec<Turn>) -> SessionInput {
