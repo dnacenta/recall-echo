@@ -187,7 +187,6 @@ pub(crate) struct WriteCtx<'a> {
     pub retire_reason_on: bool,
     /// Close one earlier setting under a different key that `replaces` names.
     /// Off leaves that pass unchanged and reads nothing for it.
-    #[allow(dead_code)]
     pub cross_key_replaces_on: bool,
     /// Close one earlier rule that `replaces` names.
     /// Off leaves that pass unchanged and reads nothing for it.

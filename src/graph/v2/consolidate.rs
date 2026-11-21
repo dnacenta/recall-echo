@@ -5248,6 +5248,7 @@ fn post_switches(ctx: &WriteCtx<'_>) -> bool {
         || ctx.retire_component_on
         || ctx.component_takeover_on
         || ctx.retire_reason_on
+        || ctx.cross_key_replaces_on
         || ctx.rule_replaces_on
 }
 
@@ -5352,8 +5353,14 @@ async fn apply_post(
         apply_retire_reason(gm, ctx, &plan, report).await;
     }
     if let Some(rules) = &snap.rules {
-        let plan = plan_rule_replaces(ctx, facts, rules);
-        apply_rule_replaces(gm, ctx, &plan, report).await;
+        if ctx.cross_key_replaces_on {
+            let plan = plan_cross_key(ctx, facts, rules);
+            apply_cross_key(gm, ctx, &plan, report).await;
+        }
+        if ctx.rule_replaces_on {
+            let plan = plan_rule_replaces(ctx, facts, rules);
+            apply_rule_replaces(gm, ctx, &plan, report).await;
+        }
     }
 }
 
@@ -7842,7 +7849,7 @@ struct RulePlan {
 }
 
 fn maybe_rules(ctx: &WriteCtx<'_>, rows: &[Value]) -> Option<ReplacesSnap> {
-    if !ctx.rule_replaces_on {
+    if !ctx.rule_replaces_on && !ctx.cross_key_replaces_on {
         return None;
     }
     Some(ReplacesSnap {
@@ -8043,6 +8050,225 @@ fn replaces_sweep(close: &ReplacesClose) -> SweepClose {
         predicate: close.predicate.clone(),
         key: close.key.clone(),
         value: close.value.clone(),
+    }
+}
+
+const CROSS_KEY_REPLACES: &str = "cross_key_replaces";
+
+struct CrossPlan {
+    closes: Vec<ReplacesClose>,
+    ambiguous: u32,
+    unit_blocked: u32,
+}
+
+fn value_core(value: &str) -> String {
+    let trimmed = value.trim();
+    strip_trailing_group(trimmed).unwrap_or_else(|| value.to_string())
+}
+
+fn strip_trailing_group(trimmed: &str) -> Option<String> {
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.last().copied() != Some(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut open_at = None;
+    for (index, ch) in chars.iter().enumerate().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_at = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open_at?;
+    if open == 0 || chars[open - 1] != ' ' {
+        return None;
+    }
+    Some(chars[..open - 1].iter().collect())
+}
+
+fn vnorm(value: &str) -> String {
+    let mut out = String::new();
+    let mut spaced = false;
+    for ch in value.chars() {
+        if matches!(ch, '`' | '\'' | '"') {
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '=' | '(' | ')') {
+            if !out.is_empty() {
+                spaced = true;
+            }
+            continue;
+        }
+        if spaced {
+            out.push(' ');
+            spaced = false;
+        }
+        for lower in ch.to_lowercase() {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+fn setting_value_matches(value: &str, replaces: &str, width: usize) -> bool {
+    let left = vnorm(&value_core(value));
+    let right = vnorm(&value_core(replaces));
+    if !left.is_empty() && left == right {
+        return true;
+    }
+    let folded = fold_shown(replaces);
+    !folded.is_empty()
+        && super::known::flattened_exceeds(value, width)
+        && fold_shown(&super::known::cut_value(value, width)) == folded
+}
+
+fn unit_class(token: &str) -> Option<&'static str> {
+    match token {
+        "seconds" | "secs" | "sec" | "s" => Some("time-seconds"),
+        "ms" | "millis" | "milliseconds" => Some("time-ms"),
+        "minutes" | "minute" | "mins" => Some("time-minutes"),
+        "hours" | "hour" => Some("time-hours"),
+        "days" | "day" => Some("time-days"),
+        "kb" | "kib" => Some("size-kb"),
+        "mb" | "mib" => Some("size-mb"),
+        "gb" | "gib" => Some("size-gb"),
+        "bytes" => Some("size-bytes"),
+        "percent" | "pct" => Some("percent"),
+        _ => None,
+    }
+}
+
+fn unit_classes(key: &str) -> BTreeSet<&'static str> {
+    let mut classes = BTreeSet::new();
+    for token in key.split(|ch: char| ch == '_' || !ch.is_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(class) = unit_class(&token.to_lowercase()) {
+            classes.insert(class);
+        }
+    }
+    classes
+}
+
+fn units_block(left_key: &str, right_key: &str) -> bool {
+    let left = unit_classes(left_key);
+    let right = unit_classes(right_key);
+    !left.is_empty() && !right.is_empty() && left.is_disjoint(&right)
+}
+
+fn plan_cross_key(ctx: &WriteCtx<'_>, facts: &[Fact], snap: &ReplacesSnap) -> CrossPlan {
+    let mut plan = CrossPlan {
+        closes: Vec::new(),
+        ambiguous: 0,
+        unit_blocked: 0,
+    };
+    for fact in facts {
+        record_cross_fact(&mut plan, snap, fact, ctx.session_id, ctx.value_chars);
+    }
+    plan.closes.sort_by(|left, right| {
+        left.entity_id
+            .cmp(&right.entity_id)
+            .then(left.index.cmp(&right.index))
+    });
+    plan
+}
+
+fn record_cross_fact(
+    plan: &mut CrossPlan,
+    snap: &ReplacesSnap,
+    fact: &Fact,
+    session: &str,
+    width: usize,
+) {
+    if fact.status != "decided" || fact.predicate != Predicate::Setting {
+        return;
+    }
+    let replaces = fact.replaces.trim();
+    if replaces.is_empty() {
+        return;
+    }
+    let Some(entity) = snap.entities.iter().find(|entity| {
+        same_name(&entity.name, &fact.subject_name)
+            && entity
+                .slots
+                .iter()
+                .any(|slot| own_live_slot(slot, fact, session))
+    }) else {
+        return;
+    };
+    if entity.slots.iter().any(|slot| {
+        slot.live
+            && slot.predicate == "setting"
+            && fold_key(&slot.key) == fold_key(&fact.key)
+            && setting_value_matches(&slot.value, replaces, width)
+    }) {
+        return;
+    }
+    let matched: Vec<&ReplacesSlot> = entity
+        .slots
+        .iter()
+        .filter(|slot| {
+            earlier_setting(slot, session)
+                && fold_key(&slot.key) != fold_key(&fact.key)
+                && setting_value_matches(&slot.value, replaces, width)
+        })
+        .collect();
+    match matched.len() {
+        0 => {}
+        1 if units_block(&fact.key, &matched[0].key) => {
+            plan.unit_blocked = plan.unit_blocked.saturating_add(1);
+        }
+        1 => plan.closes.push(replaces_close(entity, matched[0])),
+        _ => plan.ambiguous = plan.ambiguous.saturating_add(1),
+    }
+}
+
+fn earlier_setting(slot: &ReplacesSlot, session: &str) -> bool {
+    slot.predicate == "setting"
+        && slot.live
+        && !slot.pending
+        && slot.status == "decided"
+        && !slot.first_session.is_empty()
+        && slot.first_session != session
+}
+
+async fn apply_cross_key(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &CrossPlan,
+    report: &mut IngestionReport,
+) {
+    for _ in 0..plan.ambiguous {
+        add_count(&mut report.consolidate.cross_key_replaces_ambiguous);
+    }
+    for _ in 0..plan.unit_blocked {
+        add_count(&mut report.consolidate.cross_key_replaces_unit_blocked);
+    }
+    for close in &plan.closes {
+        let line = format!(
+            "consolidate cross_key_replaces: {} {}",
+            close.subject, close.index
+        );
+        if close_sweep_slot(
+            gm,
+            ctx,
+            &replaces_sweep(close),
+            CROSS_KEY_REPLACES,
+            &line,
+            report,
+        )
+        .await
+        {
+            add_count(&mut report.consolidate.cross_key_replaces_closes);
+        }
     }
 }
 
@@ -22381,6 +22607,685 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
+    }
+
+    fn long_page() -> String {
+        let mut value = "a".repeat(79);
+        value.push(',');
+        value.push_str(&"b".repeat(40));
+        value
+    }
+
+    async fn finish_cross(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        facts: &[Fact],
+        on: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let identity = named_project("Harbor");
+        let turns = [user_turn(2, "later")];
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &identity, session, date, &turns);
+        ctx.cross_key_replaces_on = on;
+        ctx.value_chars = 80;
+        let mut report = IngestionReport::default();
+        super::post_pass(gm, &ctx, facts, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    fn harbor_setting(key: &str, value: &str, replaces: &str) -> Fact {
+        with_replaces(subject_setting("Harbor", key, value), replaces)
+    }
+
+    fn cross_lines(lines: &[String]) -> Vec<&String> {
+        lines
+            .iter()
+            .filter(|line| line.contains("cross_key_replaces"))
+            .collect()
+    }
+
+    fn setting_named<'a>(rows: &'a [Value], key: &str, value: &str) -> &'a Value {
+        rows.iter()
+            .find(|slot| slot["key"] == key && slot["value"] == value)
+            .unwrap_or_else(|| panic!("missing {key}={value}"))
+    }
+
+    #[test]
+    fn core_vnorm_and_unit_classes_follow_the_close_rules() {
+        assert_eq!(super::value_core("25 (fits one screen)"), "25");
+        assert_eq!(super::value_core("10 minutes"), "10 minutes");
+        assert_eq!(super::vnorm("25 (fits one screen)"), "25 fits one screen");
+        assert_eq!(
+            super::vnorm(&super::value_core("25 (fits one screen)")),
+            "25"
+        );
+        assert!(super::units_block("wait_secs", "wait_ms"));
+        assert!(!super::units_block("wait_secs", "wait_seconds"));
+        assert!(!super::units_block("wait_minutes", "retry_count"));
+        let long = long_page();
+        let cut = super::super::known::cut_value(&long, 80);
+        assert!(super::setting_value_matches(&long, &cut, 80));
+        assert!(super::setting_value_matches(
+            &long,
+            &cut[..cut.len() - 1],
+            80
+        ));
+        assert!(!super::setting_value_matches(&long, &"a".repeat(50), 80));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cross_key_replaces_closes_the_detail_and_its_core() {
+        for replaces in ["25 (fits one screen)", "25"] {
+            let (_tmp, gm) = open().await;
+            commit_named(
+                &gm,
+                "Harbor",
+                "s04",
+                "2026-04-04",
+                &[subject_setting(
+                    "Harbor",
+                    "page_size",
+                    "25 (fits one screen)",
+                )],
+            )
+            .await;
+            let setting = harbor_setting("batch_limit", "40", replaces);
+            commit_named(
+                &gm,
+                "Harbor",
+                "s11",
+                "2026-04-11",
+                std::slice::from_ref(&setting),
+            )
+            .await;
+            let (report, lines, _) = finish_cross(
+                &gm,
+                "s11",
+                "2026-04-11",
+                std::slice::from_ref(&setting),
+                true,
+            )
+            .await;
+            let rows = slots(&gm, "Harbor").await;
+            let old = setting_named(&rows, "page_size", "25 (fits one screen)");
+            assert_eq!(ended(old), Some("s11:cross_key_replaces"), "{replaces}");
+            assert_eq!(
+                report.consolidate.cross_key_replaces_closes,
+                Some(1),
+                "{replaces}"
+            );
+            assert!(report.consolidate.cross_key_replaces_ambiguous.is_none());
+            assert!(report.consolidate.cross_key_replaces_unit_blocked.is_none());
+            assert_eq!(cross_lines(&lines).len(), 1, "{replaces}");
+            assert_eq!(report.retirements[0].reason, "cross_key_replaces");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shown_cut_and_the_cut_without_its_comma_close() {
+        let long = long_page();
+        let cut = super::super::known::cut_value(&long, 80);
+        for replaces in [cut.clone(), cut[..cut.len() - 1].to_string()] {
+            let (_tmp, gm) = open().await;
+            commit_named(
+                &gm,
+                "Harbor",
+                "s04",
+                "2026-04-04",
+                &[subject_setting("Harbor", "page_note", &long)],
+            )
+            .await;
+            let setting = harbor_setting("batch_limit", "40", &replaces);
+            commit_named(
+                &gm,
+                "Harbor",
+                "s11",
+                "2026-04-11",
+                std::slice::from_ref(&setting),
+            )
+            .await;
+            let (report, _, _) = finish_cross(
+                &gm,
+                "s11",
+                "2026-04-11",
+                std::slice::from_ref(&setting),
+                true,
+            )
+            .await;
+            let rows = slots(&gm, "Harbor").await;
+            assert_eq!(
+                ended(setting_named(&rows, "page_note", &long)),
+                Some("s11:cross_key_replaces"),
+                "{replaces}"
+            );
+            assert_eq!(report.consolidate.cross_key_replaces_closes, Some(1));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loose_text_and_a_unit_conflict_and_two_matches_stay_open() {
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "retry_ceiling", "10 minutes")],
+        )
+        .await;
+        let setting = harbor_setting("request_wait_seconds", "15", "10");
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, lines, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "retry_ceiling",
+            "10 minutes"
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+        assert!(report.consolidate.cross_key_replaces_unit_blocked.is_none());
+        assert!(cross_lines(&lines).is_empty());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "retry_ceiling_minutes", "10")],
+        )
+        .await;
+        let setting = harbor_setting("request_wait_seconds", "15", "10");
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, lines, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "retry_ceiling_minutes",
+            "10"
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+        assert_eq!(report.consolidate.cross_key_replaces_unit_blocked, Some(1));
+        assert!(cross_lines(&lines).is_empty());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[
+                subject_setting("Harbor", "page_count", "10"),
+                subject_setting("Harbor", "item_count", "10"),
+            ],
+        )
+        .await;
+        let setting = harbor_setting("row_total", "12", "10");
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "Harbor").await;
+        assert!(ended(setting_named(&rows, "page_count", "10")).is_none());
+        assert!(ended(setting_named(&rows, "item_count", "10")).is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+        assert_eq!(report.consolidate.cross_key_replaces_ambiguous, Some(1));
+        assert!(report.consolidate.cross_key_replaces_unit_blocked.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_classes_block_only_a_disjoint_pair() {
+        for (old_key, new_key, blocked) in [
+            ("wait_secs", "wait_ms", true),
+            ("wait_secs", "wait_seconds", false),
+            ("wait_minutes", "retry_count", false),
+        ] {
+            let (_tmp, gm) = open().await;
+            commit_named(
+                &gm,
+                "Harbor",
+                "s04",
+                "2026-04-04",
+                &[subject_setting("Harbor", old_key, "10")],
+            )
+            .await;
+            let setting = harbor_setting(new_key, "15", "10");
+            commit_named(
+                &gm,
+                "Harbor",
+                "s11",
+                "2026-04-11",
+                std::slice::from_ref(&setting),
+            )
+            .await;
+            let (report, _, _) = finish_cross(
+                &gm,
+                "s11",
+                "2026-04-11",
+                std::slice::from_ref(&setting),
+                true,
+            )
+            .await;
+            let rows = slots(&gm, "Harbor").await;
+            if blocked {
+                assert!(
+                    ended(setting_named(&rows, old_key, "10")).is_none(),
+                    "{old_key}"
+                );
+                assert_eq!(report.consolidate.cross_key_replaces_unit_blocked, Some(1));
+                assert!(report.consolidate.cross_key_replaces_closes.is_none());
+            } else {
+                assert_eq!(
+                    ended(setting_named(&rows, old_key, "10")),
+                    Some("s11:cross_key_replaces"),
+                    "{old_key}"
+                );
+                assert_eq!(report.consolidate.cross_key_replaces_closes, Some(1));
+                assert!(report.consolidate.cross_key_replaces_unit_blocked.is_none());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_key_replaces_keeps_the_listed_negative_rows() {
+        let screen = "25 (fits one screen)";
+        let (_tmp, gm) = open().await;
+        let mut same_key = subject_setting("Harbor", "batch_limit", screen);
+        same_key.status = "considered".into();
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen), same_key],
+        )
+        .await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Lantern",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Lantern", "page_size", screen)],
+        )
+        .await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Lantern").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let long = long_page();
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_note", &long)],
+        )
+        .await;
+        let setting = harbor_setting("batch_limit", "40", &"a".repeat(50));
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_note",
+            &long
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let mut considered = subject_setting("Harbor", "page_size", screen);
+        considered.status = "considered".into();
+        let (_tmp, gm) = open().await;
+        commit_named(&gm, "Harbor", "s04", "2026-04-04", &[considered]).await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        patch_slot(&gm, "Harbor", screen, |slot| {
+            slot["pending"] = json!({"since": "s04"});
+        })
+        .await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        patch_slot(&gm, "Harbor", screen, |slot| {
+            slot["valid_until"] = json!("2026-04-04T00:00:00Z");
+            slot["ended_by"] = json!("s04:superseded");
+        })
+        .await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        assert_eq!(
+            ended(setting_named(
+                &slots(&gm, "Harbor").await,
+                "page_size",
+                screen
+            )),
+            Some("s04:superseded")
+        );
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        let mut considered_new = harbor_setting("batch_limit", "40", screen);
+        considered_new.status = "considered".into();
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&considered_new),
+        )
+        .await;
+        let (report, _, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&considered_new),
+            true,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        let rule = with_replaces(
+            project_rule("Harbor", "Ship the weekly digest on Monday."),
+            screen,
+        );
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&rule),
+        )
+        .await;
+        let (report, _, _) =
+            finish_cross(&gm, "s11", "2026-04-11", std::slice::from_ref(&rule), true).await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+
+        let section = crate::config::GraphSection {
+            consolidate: false,
+            consolidate_cross_key_replaces: true,
+            ..crate::config::GraphSection::default()
+        };
+        assert!(!section.cross_key_replaces_apply());
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        let setting = harbor_setting("batch_limit", "40", screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, lines, reads) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            false,
+        )
+        .await;
+        assert!(ended(setting_named(
+            &slots(&gm, "Harbor").await,
+            "page_size",
+            screen
+        ))
+        .is_none());
+        assert!(report.consolidate.cross_key_replaces_closes.is_none());
+        assert!(report.consolidate.cross_key_replaces_ambiguous.is_none());
+        assert!(report.consolidate.cross_key_replaces_unit_blocked.is_none());
+        assert!(cross_lines(&lines).is_empty());
+        assert_eq!(reads, 0);
+        let encoded = serde_json::to_value(&report.consolidate).unwrap();
+        assert!(encoded.get("cross_key_replaces_closes").is_none());
+        assert!(encoded.get("cross_key_replaces_ambiguous").is_none());
+        assert!(encoded.get("cross_key_replaces_unit_blocked").is_none());
     }
 }
 
