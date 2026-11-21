@@ -7890,6 +7890,22 @@ struct MoveNote {
 struct MovePlan {
     closes: Vec<MoveClose>,
     ambiguous: Vec<MoveNote>,
+    sweeps: Vec<ToolSweep>,
+    sweep_overflow: u32,
+}
+
+struct ToolSweep {
+    id: String,
+    subject: String,
+    tool: String,
+    kind: &'static str,
+    trigger: String,
+}
+
+struct SweepTrigger {
+    stem: String,
+    kind: &'static str,
+    text: String,
 }
 
 async fn maybe_tool_move(
@@ -8011,6 +8027,8 @@ fn plan_tool_move(ctx: &WriteCtx<'_>, facts: &[Fact], snap: &MoveSnap) -> MovePl
     let mut plan = MovePlan {
         closes: Vec::new(),
         ambiguous: Vec::new(),
+        sweeps: Vec::new(),
+        sweep_overflow: 0,
     };
     let family = move_family(snap);
     for anchor in &snap.uses {
@@ -8018,8 +8036,135 @@ fn plan_tool_move(ctx: &WriteCtx<'_>, facts: &[Fact], snap: &MoveSnap) -> MovePl
             push_move_anchor(&mut plan, ctx, facts, snap, &family, anchor);
         }
     }
+    plan_sweeps(&mut plan, ctx, facts, snap, &family);
     plan.closes.sort_by(|left, right| left.id.cmp(&right.id));
+    plan.sweeps.sort_by(|left, right| left.id.cmp(&right.id));
     plan
+}
+
+fn plan_sweeps(
+    plan: &mut MovePlan,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    snap: &MoveSnap,
+    family: &BTreeSet<String>,
+) {
+    let live = project_live_stems(snap);
+    let mut seen = BTreeSet::new();
+    for trigger in sweep_triggers(ctx, facts, &live) {
+        let targets = sweep_targets(snap, family, ctx.session_id, &trigger.stem);
+        if targets.len() > ORPHAN_TARGET_CAP {
+            plan.sweep_overflow = plan.sweep_overflow.saturating_add(1);
+            continue;
+        }
+        push_sweep_targets(plan, snap, &mut seen, &trigger, &targets);
+    }
+}
+
+fn project_live_stems(snap: &MoveSnap) -> BTreeSet<String> {
+    let Some(project) = snap.project_id.as_deref() else {
+        return BTreeSet::new();
+    };
+    snap.uses
+        .iter()
+        .filter(|edge| edge.from_id == project && edge.status == "decided" && !edge.pending)
+        .map(|edge| tool_stem(&edge.object))
+        .collect()
+}
+
+fn sweep_triggers(
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    live: &BTreeSet<String>,
+) -> Vec<SweepTrigger> {
+    facts
+        .iter()
+        .filter_map(|fact| sweep_trigger(ctx, fact, live))
+        .collect()
+}
+
+fn sweep_trigger(ctx: &WriteCtx<'_>, fact: &Fact, live: &BTreeSet<String>) -> Option<SweepTrigger> {
+    if rejected_project_use(ctx, fact) {
+        return kept_trigger("rejected", &fact.object_name, live);
+    }
+    if project_replaces_use(ctx, fact) {
+        return kept_trigger("replaces", &fact.replaces, live);
+    }
+    None
+}
+
+fn project_replaces_use(ctx: &WriteCtx<'_>, fact: &Fact) -> bool {
+    fact.status == "decided"
+        && fact.predicate == Predicate::Uses
+        && names_project(ctx, &fact.subject_name)
+        && !fact.replaces.is_empty()
+}
+
+fn kept_trigger(kind: &'static str, text: &str, live: &BTreeSet<String>) -> Option<SweepTrigger> {
+    let stem = tool_stem(text);
+    if alphanumeric_count(&stem) < 3 || live.contains(&stem) {
+        return None;
+    }
+    Some(SweepTrigger {
+        stem,
+        kind,
+        text: text.to_string(),
+    })
+}
+
+fn sweep_targets<'a>(
+    snap: &'a MoveSnap,
+    family: &BTreeSet<String>,
+    session: &str,
+    stem: &str,
+) -> Vec<&'a MoveUse> {
+    let Some(project) = snap.project_id.as_deref() else {
+        return Vec::new();
+    };
+    snap.uses
+        .iter()
+        .filter(|edge| sweep_target(edge, family, project, session, stem))
+        .collect()
+}
+
+fn sweep_target(
+    edge: &MoveUse,
+    family: &BTreeSet<String>,
+    project: &str,
+    session: &str,
+    stem: &str,
+) -> bool {
+    edge.from_id != project
+        && family.contains(&edge.from_id)
+        && edge.status == "decided"
+        && !edge.pending
+        && earlier_session(&edge.first_session, session)
+        && !seen_this_session(edge, session)
+        && tool_stem(&edge.object) == stem
+}
+
+fn push_sweep_targets(
+    plan: &mut MovePlan,
+    snap: &MoveSnap,
+    seen: &mut BTreeSet<String>,
+    trigger: &SweepTrigger,
+    targets: &[&MoveUse],
+) {
+    for edge in targets {
+        if !seen.insert(edge.id.clone()) {
+            continue;
+        }
+        let Some(entity) = entity_by_id(snap, &edge.from_id) else {
+            continue;
+        };
+        plan.sweeps.push(ToolSweep {
+            id: edge.id.clone(),
+            subject: entity.name.clone(),
+            tool: edge.object.clone(),
+            kind: trigger.kind,
+            trigger: trigger.text.clone(),
+        });
+    }
 }
 
 fn move_family(snap: &MoveSnap) -> BTreeSet<String> {
@@ -8376,9 +8521,17 @@ async fn apply_tool_move(
     report: &mut IngestionReport,
 ) {
     note_move_ambiguous(&plan.ambiguous, report);
+    for _ in 0..plan.sweep_overflow {
+        add_count(&mut report.consolidate.tool_move_ambiguous);
+    }
     for close in &plan.closes {
         if close_tool_move(gm, ctx, close, report).await {
             add_count(&mut report.consolidate.tool_move_closes);
+        }
+    }
+    for sweep in &plan.sweeps {
+        if close_tool_sweep(gm, ctx, sweep, report).await {
+            add_count(&mut report.consolidate.tool_move_sweeps);
         }
     }
 }
@@ -8451,6 +8604,71 @@ fn tool_move_line(close: &MoveClose) -> String {
         quote_head(&close.new_subject),
         quote_head(&close.new_tool),
         quote_head(&close.job)
+    )
+}
+
+const TOOL_MOVE_SWEEP_REASON: &str = "tool_move_sweep";
+
+async fn close_tool_sweep(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    sweep: &ToolSweep,
+    report: &mut IngestionReport,
+) -> bool {
+    let Some(until) = session_midnight(ctx.date) else {
+        return false;
+    };
+    let ended = format!("{}:{TOOL_MOVE_SWEEP_REASON}", ctx.session_id);
+    match close_row(gm, &tool_sweep_row(sweep), &until, &ended).await {
+        Ok(true) => {
+            report.retirements.push(tool_sweep_retirement(sweep));
+            emit_post_line(tool_sweep_line(sweep));
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            false
+        }
+    }
+}
+
+fn tool_sweep_row(sweep: &ToolSweep) -> Row {
+    Row {
+        id: String::new(),
+        entity: String::new(),
+        slot: None,
+        edge: Some(sweep.id.clone()),
+        subject: sweep.subject.clone(),
+        pred: "uses".into(),
+        key: String::new(),
+        value: sweep.tool.clone(),
+        evidence: Value::Null,
+        from: String::new(),
+        here: false,
+        pending: false,
+        object_name: Some(sweep.tool.clone()),
+    }
+}
+
+fn tool_sweep_retirement(sweep: &ToolSweep) -> Retirement {
+    Retirement {
+        reason: TOOL_MOVE_SWEEP_REASON.to_string(),
+        subject: sweep.subject.clone(),
+        predicate: "uses".into(),
+        key: String::new(),
+        old_value: sweep.tool.clone(),
+        new_value: String::new(),
+    }
+}
+
+fn tool_sweep_line(sweep: &ToolSweep) -> String {
+    format!(
+        "consolidate tool sweep: {} uses {} | {} {}",
+        quote_head(&sweep.subject),
+        quote_head(&sweep.tool),
+        sweep.kind,
+        quote_head(&sweep.trigger)
     )
 }
 
@@ -23137,6 +23355,292 @@ mod tests {
         assert_eq!(report.consolidate.errors, 1);
         assert!(report.consolidate.tool_move_closes.is_none());
         assert!(lines.iter().all(|line| !line.contains("tool move")));
+        drop(tmp);
+    }
+
+    fn component_lamp() -> MoveSnap {
+        snap_of(
+            vec![
+                move_person("p", "Harbor", "project", vec![]),
+                move_person("c", "Tidepool", "component", vec![]),
+            ],
+            vec![decided_part("c", "p")],
+            vec![use_edge("old", "c", "Northlamp.js", "library", "s01", 1)],
+        )
+    }
+
+    fn project_reject(object: &str) -> Fact {
+        at_turn(use_of("Harbor", Kind::Project, object, "rejected"), 2)
+    }
+
+    fn project_replace(object: &str, replaces: &str) -> Fact {
+        let mut fact = at_turn(use_of("Harbor", Kind::Project, object, "decided"), 2);
+        fact.replaces = replaces.into();
+        fact
+    }
+
+    fn assert_sweep(plan: &MovePlan, tool: &str, kind: &str, trigger: &str) {
+        assert!(plan.closes.is_empty());
+        assert!(plan.ambiguous.is_empty());
+        assert_eq!(plan.sweep_overflow, 0);
+        assert_eq!(plan.sweeps.len(), 1);
+        assert_eq!(plan.sweeps[0].subject, "Tidepool");
+        assert_eq!(plan.sweeps[0].tool, tool);
+        assert_eq!(plan.sweeps[0].kind, kind);
+        assert_eq!(plan.sweeps[0].trigger, trigger);
+        assert_eq!(plan.sweeps[0].id, "old");
+    }
+
+    fn component_lamps(count: usize) -> MoveSnap {
+        let mut entities = vec![move_person("p", "Harbor", "project", vec![])];
+        let mut parts = Vec::new();
+        let mut uses = Vec::new();
+        for index in 0..count {
+            let id = format!("c{index}");
+            entities.push(move_person(
+                &id,
+                &format!("Member{index}"),
+                "component",
+                vec![],
+            ));
+            parts.push(decided_part(&id, "p"));
+            uses.push(use_edge(
+                &format!("u{index}"),
+                &id,
+                "Northlamp.js",
+                "library",
+                "s01",
+                1,
+            ));
+        }
+        snap_of(entities, parts, uses)
+    }
+
+    #[test]
+    fn tool_sweep_closes_a_rejected_tool() {
+        let plan = plan_move(
+            &component_lamp(),
+            "harbor drops a lamp",
+            &[project_reject("Northlamp")],
+        );
+        assert_sweep(&plan, "Northlamp.js", "rejected", "Northlamp");
+    }
+
+    #[test]
+    fn tool_sweep_closes_a_replaced_tool() {
+        let mut snap = component_lamp();
+        snap.uses
+            .push(use_edge("new", "p", "Southlamp", "library", "s02", 2));
+        let fact = project_replace("Southlamp", "Northlamp.js");
+        let plan = plan_move(&snap, "harbor keeps a beacon", &[fact]);
+        assert_sweep(&plan, "Northlamp.js", "replaces", "Northlamp.js");
+    }
+
+    #[test]
+    fn tool_sweep_dedupes_two_triggers() {
+        let facts = [project_reject("Northlamp"), project_reject("Northlamp.js")];
+        let plan = plan_move(&component_lamp(), "harbor drops a lamp", &facts);
+        assert_sweep(&plan, "Northlamp.js", "rejected", "Northlamp");
+    }
+
+    #[test]
+    fn tool_sweep_keeps_a_stem_the_project_still_uses() {
+        let mut snap = component_lamp();
+        snap.uses
+            .push(use_edge("live", "p", "Northlamp", "library", "s01", 1));
+        let plan = plan_move(
+            &snap,
+            "harbor drops a lamp",
+            &[project_reject("Northlamp.js")],
+        );
+        assert!(plan.sweeps.is_empty());
+        assert_eq!(plan.sweep_overflow, 0);
+    }
+
+    #[test]
+    fn tool_sweep_keeps_a_target_first_seen_this_session() {
+        let mut snap = component_lamp();
+        snap.uses[0].first_session = "s02".into();
+        snap.uses[0].evidence_sessions = vec!["s02".into()];
+        let plan = plan_move(&snap, "harbor drops a lamp", &[project_reject("Northlamp")]);
+        assert!(plan.sweeps.is_empty());
+    }
+
+    #[test]
+    fn tool_sweep_keeps_a_resighted_target() {
+        let mut snap = component_lamp();
+        snap.uses[0].evidence_sessions.push("s02".into());
+        let plan = plan_move(&snap, "harbor drops a lamp", &[project_reject("Northlamp")]);
+        assert!(plan.sweeps.is_empty());
+    }
+
+    #[test]
+    fn tool_sweep_stops_past_the_target_cap() {
+        let under = plan_move(
+            &component_lamps(4),
+            "harbor drops a lamp",
+            &[project_reject("Northlamp")],
+        );
+        assert_eq!(under.sweeps.len(), 4);
+        assert_eq!(under.sweep_overflow, 0);
+        let over = plan_move(
+            &component_lamps(5),
+            "harbor drops a lamp",
+            &[project_reject("Northlamp")],
+        );
+        assert!(over.sweeps.is_empty());
+        assert_eq!(over.sweep_overflow, 1);
+    }
+
+    #[test]
+    fn tool_sweep_keeps_a_short_stem() {
+        let plan = plan_move(
+            &component_lamp(),
+            "harbor drops a lamp",
+            &[project_reject("ab")],
+        );
+        assert!(plan.sweeps.is_empty());
+    }
+
+    #[test]
+    fn tool_sweep_keeps_an_unlinked_component() {
+        let mut snap = component_lamp();
+        snap.parts.clear();
+        let plan = plan_move(&snap, "harbor drops a lamp", &[project_reject("Northlamp")]);
+        assert!(plan.sweeps.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_then_sweep_across_sessions() {
+        let (tmp, gm) = open().await;
+        let old = vec![
+            library_use("Harbor", Kind::Project, "Northlamp", 1),
+            timed_setting("Harbor", Kind::Project, "beacon_style", "amber glass", 1),
+            at_turn(part_link("Tidepool", "Harbor", Kind::Project), 1),
+            library_use("Tidepool", Kind::Component, "Westlamp.js", 1),
+        ];
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, &old).await;
+        let moved = vec![
+            library_use("Tidepool", Kind::Component, "Southlamp", 2),
+            timed_setting(
+                "Tidepool",
+                Kind::Component,
+                "beacon_style",
+                "cobalt glass",
+                2,
+            ),
+        ];
+        let move_turns = [user_turn(2, "tidepool keeps a beacon")];
+        commit_harbor(&gm, "s02", "2026-04-02", &move_turns, &moved).await;
+        let (report, lines, _) =
+            run_tool_move(&gm, "s02", "2026-04-02", &move_turns, &moved, true).await;
+        assert_eq!(
+            use_ended(&gm, "Northlamp").await.as_deref(),
+            Some("s02:tool_move")
+        );
+        assert!(open_use(&gm, "Westlamp.js").await);
+        assert!(open_use(&gm, "Southlamp").await);
+        assert_eq!(report.consolidate.tool_move_closes, Some(1));
+        assert!(report.consolidate.tool_move_sweeps.is_none());
+        assert_eq!(
+            lines,
+            vec!["consolidate tool move: Harbor uses Northlamp -> Tidepool uses Southlamp | job beacon"]
+        );
+
+        let rejected = vec![at_turn(
+            use_of("Harbor", Kind::Project, "Westlamp", "rejected"),
+            3,
+        )];
+        let sweep_turns = [user_turn(3, "harbor drops the old lamp")];
+        let resolver = Stub::new(Answer::Reply(r#"{"entities":[]}"#.into()));
+        let project = harbor_project();
+        let ctx = WriteCtx::new(&resolver, &project, "s03", "2026-04-03", &sweep_turns);
+        write_facts(&gm, &ctx, &rejected).await.unwrap();
+        let (report, lines, _) =
+            run_tool_move(&gm, "s03", "2026-04-03", &sweep_turns, &rejected, true).await;
+        assert_eq!(
+            use_ended(&gm, "Westlamp.js").await.as_deref(),
+            Some("s03:tool_move_sweep")
+        );
+        assert!(open_use(&gm, "Southlamp").await);
+        assert_eq!(report.consolidate.tool_move_sweeps, Some(1));
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert_eq!(report.retirements.len(), 1);
+        assert_eq!(report.retirements[0].reason, "tool_move_sweep");
+        assert_eq!(report.retirements[0].subject, "Tidepool");
+        assert_eq!(report.retirements[0].old_value, "Westlamp.js");
+        assert_eq!(
+            lines,
+            vec!["consolidate tool sweep: Tidepool uses Westlamp.js | rejected Westlamp"]
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_sweep_closes_a_replaced_tool_in_the_store() {
+        let (tmp, gm) = open().await;
+        let old = vec![
+            timed_setting("Harbor", Kind::Project, "archive_root", "shore", 1),
+            at_turn(part_link("Tidepool", "Harbor", Kind::Project), 1),
+            library_use("Tidepool", Kind::Component, "Northlamp.js", 1),
+        ];
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, &old).await;
+        let mut replaced = at_turn(use_of("Harbor", Kind::Project, "Southlamp", "decided"), 2);
+        replaced.role = Some(super::super::schema::Role::Library);
+        replaced.replaces = "Northlamp.js".into();
+        let facts = vec![replaced];
+        let turns = [user_turn(2, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s02", "2026-04-02", &turns, &facts).await;
+        let (report, lines, _) =
+            run_tool_move(&gm, "s02", "2026-04-02", &turns, &facts, true).await;
+        assert_eq!(
+            use_ended(&gm, "Northlamp.js").await.as_deref(),
+            Some("s02:tool_move_sweep")
+        );
+        assert!(open_use(&gm, "Southlamp").await);
+        assert_eq!(report.consolidate.tool_move_sweeps, Some(1));
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert_eq!(
+            lines,
+            vec!["consolidate tool sweep: Tidepool uses Northlamp.js | replaces Northlamp.js"]
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_does_not_close_an_edge_takeover_already_closed() {
+        let (old, new) = project_component_facts();
+        let (tmp, gm) = open().await;
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, &old).await;
+        let new_turns = [user_turn(2, "tidepool keeps a beacon")];
+        commit_harbor(&gm, "s02", "2026-04-02", &new_turns, &new).await;
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = harbor_project();
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &project, "s02", "2026-04-02", &new_turns);
+        ctx.tool_move_on = true;
+        ctx.component_takeover_on = true;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, &new, &WriteStats::default(), &stub, &mut report).await;
+        let lines = super::take_post_lines();
+        assert_eq!(
+            use_ended(&gm, "Northlamp").await.as_deref(),
+            Some("s02:component_takeover")
+        );
+        assert!(open_use(&gm, "Southlamp").await);
+        assert_eq!(report.consolidate.component_takeover_closes, Some(1));
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert!(report.consolidate.tool_move_sweeps.is_none());
+        assert_eq!(report.retirements.len(), 1);
+        assert_eq!(report.retirements[0].reason, "component_takeover");
+        assert_eq!(
+            lines,
+            vec!["consolidate takeover: Harbor uses Northlamp -> Tidepool uses Southlamp | job beacon"]
+        );
         drop(tmp);
     }
 }

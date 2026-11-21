@@ -1708,6 +1708,36 @@ mod tests {
     }
 
     #[test]
+    fn tool_move_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("tool_move_closes").is_none());
+        assert!(encoded.get("tool_move_sweeps").is_none());
+        assert!(encoded.get("tool_move_ambiguous").is_none());
+        let closed = ConsolidateReport {
+            tool_move_closes: Some(1),
+            tool_move_sweeps: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["tool_move_closes"], 1);
+        assert_eq!(encoded["tool_move_sweeps"], 1);
+        assert!(encoded.get("tool_move_ambiguous").is_none());
+        let ambiguous = ConsolidateReport {
+            tool_move_ambiguous: Some(2),
+            ..ConsolidateReport::default()
+        };
+        assert!(!ambiguous.is_blank());
+        let zeros = ConsolidateReport {
+            tool_move_closes: Some(0),
+            tool_move_sweeps: Some(0),
+            tool_move_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+    }
+
+    #[test]
     fn retire_reason_counters_are_omitted_when_unset() {
         let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
         assert!(encoded.get("retire_reason_closes").is_none());
