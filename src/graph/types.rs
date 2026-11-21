@@ -1255,6 +1255,10 @@ pub struct IngestionReport {
     /// Omitted when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub generic_uses_drops: u32,
+    /// Decided planned release-status rows this session dropped.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub planned_release_drops: u32,
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
@@ -1411,6 +1415,19 @@ mod tests {
         };
         let text = serde_json::to_string(&report).expect("json");
         assert!(text.contains("\"generic_uses_drops\":1"), "{text}");
+        assert!(!text.contains("planned_release_drops"), "{text}");
+    }
+
+    #[test]
+    fn planned_release_drops_is_omitted_from_json_when_zero() {
+        let text = serde_json::to_string(&IngestionReport::default()).expect("json");
+        assert!(!text.contains("planned_release_drops"), "{text}");
+        let report = IngestionReport {
+            planned_release_drops: 1,
+            ..IngestionReport::default()
+        };
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"planned_release_drops\":1"), "{text}");
     }
 
     fn chunks(total: u32, failed: u32) -> IngestionReport {

@@ -743,15 +743,22 @@ fn eligible_rule(fact: &Fact) -> bool {
     fact.predicate == Predicate::Rule && fact.status == "decided" && fact.replaces.trim().is_empty()
 }
 
-/// Drop decided language-role `uses` edges. Other facts stay.
+/// Drop decided language-role `uses` edges and decided planned release status.
 ///
-/// The drops map is left alone. A zero count stays off the report.
+/// A rule, a setting, any other `uses` role, and a release's contents and
+/// `part_of` rows stay. The drops map is left alone. A zero count stays off
+/// the report.
 fn drop_generic_uses(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
     let mut kept = Vec::with_capacity(facts.len());
     for fact in facts {
         if language_uses(&fact) {
             report.generic_uses_drops += 1;
             let _ = writeln!(std::io::stderr(), "{}", generic_uses_line(&fact));
+            continue;
+        }
+        if planned_release(&fact) {
+            report.planned_release_drops += 1;
+            let _ = writeln!(std::io::stderr(), "{}", planned_release_line(&fact));
             continue;
         }
         kept.push(fact);
@@ -765,12 +772,40 @@ fn language_uses(fact: &Fact) -> bool {
         && fact.role == Some(Role::Language)
 }
 
+fn planned_release(fact: &Fact) -> bool {
+    fact.predicate == Predicate::ReleaseStatus
+        && fact.status == "decided"
+        && contains_whole_word(&fact.object_name, "planned")
+}
+
+fn contains_whole_word(text: &str, word: &str) -> bool {
+    let folded: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    let needle: Vec<char> = word.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() || folded.len() < needle.len() {
+        return false;
+    }
+    (0..=folded.len() - needle.len()).any(|start| {
+        let end = start + needle.len();
+        folded[start..end] == needle[..]
+            && (start == 0 || !folded[start - 1].is_alphanumeric())
+            && (end == folded.len() || !folded[end].is_alphanumeric())
+    })
+}
+
 fn generic_uses_line(fact: &Fact) -> String {
     format!(
         "drop generic uses: {} uses {} role={}",
         log_plain(&fact.subject_name),
         log_plain(&fact.object_name),
         log_plain(fact.role.map(Role::as_str).unwrap_or(""))
+    )
+}
+
+fn planned_release_line(fact: &Fact) -> String {
+    format!(
+        "drop planned release: {} release_status {}",
+        log_plain(&fact.subject_name),
+        log_plain(&fact.object_name)
     )
 }
 
@@ -5708,6 +5743,162 @@ mod tests {
         assert!(!text.contains("generic_uses_drops"), "{text}");
     }
 
+    fn release_row(name: &str, predicate: Predicate, value: &str, status: &str) -> Fact {
+        let mut fact = harbor_setting("", value);
+        fact.subject_name = name.into();
+        fact.subject_kind = Kind::Release;
+        fact.predicate = predicate;
+        fact.status = status.into();
+        fact.key.clear();
+        if predicate == Predicate::PartOf {
+            fact.object_kind = Some(Kind::Project);
+        }
+        fact
+    }
+
+    #[test]
+    fn a_planned_release_status_is_dropped_and_the_rest_stays() {
+        let planned = release_row(
+            "harbor v2.0",
+            Predicate::ReleaseStatus,
+            "planned",
+            "decided",
+        );
+        assert_eq!(
+            planned_release_line(&planned),
+            "drop planned release: harbor v2.0 release_status planned"
+        );
+        let mut noisy = planned.clone();
+        noisy.object_name = "plan\nned".into();
+        assert_eq!(
+            planned_release_line(&noisy),
+            "drop planned release: harbor v2.0 release_status planned"
+        );
+        let facts = vec![
+            planned,
+            release_row(
+                "harbor v2.0",
+                Predicate::ReleaseContents,
+                "the shelf",
+                "decided",
+            ),
+            release_row("harbor v2.0", Predicate::PartOf, "harbor", "decided"),
+            release_row(
+                "harbor v1.4.0",
+                Predicate::ReleaseStatus,
+                "released",
+                "decided",
+            ),
+            release_row(
+                "harbor v1.5.0",
+                Predicate::ReleaseStatus,
+                "current",
+                "decided",
+            ),
+            release_row(
+                "harbor v2.1",
+                Predicate::ReleaseStatus,
+                "PLANNED",
+                "decided",
+            ),
+            release_row(
+                "harbor v2.2",
+                Predicate::ReleaseStatus,
+                "still planned",
+                "decided",
+            ),
+            release_row(
+                "harbor v2.3",
+                Predicate::ReleaseStatus,
+                "unplanned",
+                "decided",
+            ),
+            release_row(
+                "harbor v2.4",
+                Predicate::ReleaseStatus,
+                "planned",
+                "considered",
+            ),
+            harbor_setting("release_status", "planned"),
+            harbor_rule("Ship v2.0 next month."),
+        ];
+        let (logged, (kept, report)) = stderr_lines(|| apply_generic_uses(facts));
+        assert_eq!(report.planned_release_drops, 3);
+        assert_eq!(report.generic_uses_drops, 0);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        assert!(kept.iter().all(|fact| !planned_release(fact)));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::ReleaseContents));
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::PartOf));
+        assert!(kept.iter().any(|fact| fact.object_name == "released"));
+        assert!(kept.iter().any(|fact| fact.object_name == "current"));
+        assert!(kept.iter().any(|fact| fact.object_name == "unplanned"));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.status == "considered" && fact.object_name == "planned"));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::Setting && fact.key == "release_status"));
+        assert!(kept.iter().any(|fact| {
+            fact.predicate == Predicate::Rule && fact.object_name == "Ship v2.0 next month."
+        }));
+        assert_eq!(
+            logged,
+            vec![
+                "drop planned release: harbor v2.0 release_status planned".to_string(),
+                "drop planned release: harbor v2.1 release_status PLANNED".to_string(),
+                "drop planned release: harbor v2.2 release_status still planned".to_string(),
+            ]
+        );
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"planned_release_drops\":3"), "{text}");
+        assert!(!text.contains("generic_uses_drops"), "{text}");
+        assert!(!text.contains("\"drops\""), "{text}");
+    }
+
+    #[test]
+    fn a_language_use_beside_its_version_setting_drops_only_the_use() {
+        let mut uses = harbor_setting("", "Go");
+        uses.subject_name = "tidepool".into();
+        uses.predicate = Predicate::Uses;
+        uses.role = Some(Role::Language);
+        uses.object_kind = Some(Kind::Technology);
+        uses.quote = "a Go 1.22 service".into();
+        let mut version = harbor_setting("go_version", "1.22");
+        version.subject_name = "tidepool".into();
+        version.quote = "a Go 1.22 service".into();
+        let (kept, report) = apply_generic_uses(vec![uses, version]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].predicate, Predicate::Setting);
+        assert_eq!(kept[0].key, "go_version");
+        assert_eq!(kept[0].object_name, "1.22");
+        assert_eq!(report.generic_uses_drops, 1);
+        assert_eq!(report.planned_release_drops, 0);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+    }
+
+    #[test]
+    fn a_reason_rule_and_an_environment_override_stay() {
+        let version = harbor_setting("lang_version", "2.4");
+        let rule = harbor_rule("Keep the language at 2.4 because the new loop form needs it.");
+        let (kept, report) = apply_generic_uses(vec![version, rule]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|fact| fact.predicate == Predicate::Rule));
+        assert!(kept.iter().any(|fact| fact.key == "lang_version"));
+        assert_eq!(report.generic_uses_drops, 0);
+        assert_eq!(report.planned_release_drops, 0);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+
+        let workers = harbor_setting("workers", "4");
+        let env = harbor_setting("workers_env", "HARBOR_WORKERS");
+        let (kept, report) = apply_generic_uses(vec![workers, env]);
+        assert_eq!(fact_keys(&kept), vec!["workers", "workers_env"]);
+        assert_eq!(kept[1].object_name, "HARBOR_WORKERS");
+        assert_eq!(report.generic_uses_drops, 0);
+        assert_eq!(report.planned_release_drops, 0);
+    }
+
     #[test]
     fn remapped_part_of_stays() {
         let mention = Mention {
@@ -5804,6 +5995,7 @@ mod tests {
         assert!(facts.iter().any(|fact| fact.predicate == Predicate::PartOf));
         facts.push(harbor_setting("timeout", "10s"));
         facts.push(harbor_rule("timeout is 10s"));
+        let facts_on = facts.clone();
         let (kept, report) = apply_restatements(facts);
         assert!(kept
             .iter()
@@ -5814,6 +6006,19 @@ mod tests {
         assert!(kept.iter().any(|fact| fact.predicate == Predicate::PartOf));
         assert!(kept.iter().all(|fact| fact.predicate != Predicate::Rule));
         assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
+
+        let (kept_on, report_on) = apply_generic_uses(facts_on);
+        assert!(kept_on
+            .iter()
+            .all(|fact| fact.predicate != Predicate::ReleaseStatus));
+        assert!(kept_on
+            .iter()
+            .any(|fact| fact.predicate == Predicate::ReleaseContents));
+        assert!(kept_on
+            .iter()
+            .any(|fact| fact.predicate == Predicate::PartOf));
+        assert_eq!(report_on.planned_release_drops, 1);
+        assert_eq!(report_on.generic_uses_drops, 0);
     }
 
     #[test]
@@ -7086,6 +7291,118 @@ mod tests {
                 {"subject":"harbor","subject_type":"project","predicate":"uses","role":"none","key":"","object":"Rust","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"uses Rust","confidence":0.9}
             ],"bugs":[],"releases":[]}"#.to_string())
         }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_session_drops_one_language_use_and_one_planned_release() {
+        const TURN: &str =
+            "Harbor uses Zig. Ship v2.0 next month with the shelf. Keep the shelf labeled.";
+        const REPLY: &str = r#"{"facts":[{"subject":"harbor","subject_type":"project","predicate":"uses","role":"language","key":"","object":"Zig","object_type":"technology","status":"decided","replaces":"","turn":0,"quote":"Harbor uses Zig.","confidence":0.9},{"subject":"harbor","subject_type":"project","predicate":"rule","role":"none","key":"","object":"Keep the shelf labeled","object_type":"literal","status":"decided","replaces":"","turn":0,"quote":"Keep the shelf labeled.","confidence":0.9}],"bugs":[],"releases":[{"version":"2.0","status":"planned","contents":"the shelf","turn":0,"quote":"Ship v2.0 next month with the shelf.","confidence":0.9}]}"#;
+
+        struct Reply;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Reply {
+            async fn complete(
+                &self,
+                system_prompt: &str,
+                user_message: &str,
+                _: u32,
+            ) -> Result<String, GraphError> {
+                if system_prompt.starts_with("You link NEW MENTIONS") {
+                    return Ok(r#"{"entities":[]}"#.to_string());
+                }
+                if system_prompt.starts_with("You compare stored") {
+                    return Ok(r#"{"pairs":[]}"#.to_string());
+                }
+                if user_message.contains("Harbor uses Zig") {
+                    return Ok(REPLY.to_string());
+                }
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+        }
+
+        async fn once(on: bool) -> (IngestionReport, Vec<String>) {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = tmp.path();
+            let project = memory.join("harbor");
+            std::fs::create_dir(&project).unwrap();
+            let config = if on {
+                stack_off_except(&["drop_generic_uses"])
+            } else {
+                stack_off_except(&[])
+            };
+            std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+            input::write_turns_sidecar(
+                memory,
+                1,
+                "s",
+                "2026-01-02T00:00:00Z",
+                project.to_str(),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    TURN.into(),
+                )],
+            )
+            .unwrap();
+            let gm = GraphMemory::open_embedded(&memory.join("graph"))
+                .await
+                .unwrap();
+            let report = extract_session(&gm, memory, 1, &IngestContext::new("s", Some(1)), &Reply)
+                .await
+                .unwrap();
+            let values = setting_values(&gm).await;
+            (report, values)
+        }
+
+        let (off, off_values) = once(false).await;
+        assert!(off.errors.is_empty(), "{:?}", off.errors);
+        assert_eq!(off.generic_uses_drops, 0);
+        assert_eq!(off.planned_release_drops, 0);
+        let off_json = serde_json::to_string(&off).expect("json");
+        assert!(!off_json.contains("generic_uses_drops"), "{off_json}");
+        assert!(!off_json.contains("planned_release_drops"), "{off_json}");
+        assert!(
+            off_values.iter().any(|value| value == "planned"),
+            "{off_values:?}"
+        );
+        assert!(
+            off_values.iter().any(|value| value == "the shelf"),
+            "{off_values:?}"
+        );
+        assert!(
+            off_values
+                .iter()
+                .any(|value| value == "Keep the shelf labeled"),
+            "{off_values:?}"
+        );
+
+        let (on, on_values) = once(true).await;
+        assert!(on.errors.is_empty(), "{:?}", on.errors);
+        assert_eq!(on.generic_uses_drops, 1, "{:?}", on.drops);
+        assert_eq!(on.planned_release_drops, 1, "{:?}", on.drops);
+        assert!(
+            on_values.iter().all(|value| value != "planned"),
+            "{on_values:?}"
+        );
+        assert!(
+            on_values.iter().any(|value| value == "the shelf"),
+            "{on_values:?}"
+        );
+        assert!(
+            on_values
+                .iter()
+                .any(|value| value == "Keep the shelf labeled"),
+            "{on_values:?}"
+        );
+        assert_eq!(on.kept, off.kept);
+        assert_eq!(
+            on.relationships_created + 1,
+            off.relationships_created,
+            "on {} off {}",
+            on.relationships_created,
+            off.relationships_created
+        );
     }
 
     #[cfg(feature = "embedded")]

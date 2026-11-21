@@ -456,6 +456,7 @@ async fn collect_sessions(
             kept: report.kept,
             drops: report.drops,
             generic_uses_drops: report.generic_uses_drops,
+            planned_release_drops: report.planned_release_drops,
             known_key_bound: report.known_key_bound,
             resolve: report.resolve,
             retirements: report.retirements,
@@ -530,6 +531,7 @@ async fn ingest_v2(
     report.kept = extracted.kept;
     report.drops = extracted.drops;
     report.generic_uses_drops = extracted.generic_uses_drops;
+    report.planned_release_drops = extracted.planned_release_drops;
     report.known_key_bound = extracted.known_key_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
@@ -6085,6 +6087,7 @@ mod tests {
             kept: 0,
             drops: std::collections::HashMap::new(),
             generic_uses_drops: 0,
+            planned_release_drops: 0,
             known_key_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
