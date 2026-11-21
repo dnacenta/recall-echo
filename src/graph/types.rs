@@ -1251,6 +1251,10 @@ pub struct IngestionReport {
     /// Omitted when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub forgotten_skips: u32,
+    /// Decided language-role `uses` edges this session dropped.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub generic_uses_drops: u32,
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
@@ -1395,6 +1399,18 @@ mod tests {
         };
         let text = serde_json::to_string(&report).expect("json");
         assert!(text.contains("\"forgotten_skips\":1"), "{text}");
+    }
+
+    #[test]
+    fn generic_uses_drops_is_omitted_from_json_when_zero() {
+        let text = serde_json::to_string(&IngestionReport::default()).expect("json");
+        assert!(!text.contains("generic_uses_drops"), "{text}");
+        let report = IngestionReport {
+            generic_uses_drops: 1,
+            ..IngestionReport::default()
+        };
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"generic_uses_drops\":1"), "{text}");
     }
 
     fn chunks(total: u32, failed: u32) -> IngestionReport {

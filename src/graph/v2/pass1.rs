@@ -10,6 +10,7 @@
 //! so it does not fail the window.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -276,6 +277,11 @@ pub(crate) async fn extract_session(
     // the facts it receives, so the list must not shrink after that.
     let facts = if drop_restatements_enabled(memory_dir) {
         drop_restating_rules(facts, &mut report)
+    } else {
+        facts
+    };
+    let facts = if drop_generic_uses_enabled(memory_dir) {
+        drop_generic_uses(facts, &mut report)
     } else {
         facts
     };
@@ -567,6 +573,13 @@ fn drop_restatements_enabled(memory_dir: &Path) -> bool {
         .drop_restatements
 }
 
+fn drop_generic_uses_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .drop_generic_uses
+}
+
 fn ground_component_edges_enabled(memory_dir: &Path) -> bool {
     crate::config::load_from_dir(memory_dir)
         .graph
@@ -728,6 +741,37 @@ fn component_counts(facts: &[Fact], parent: &[usize]) -> (Vec<u32>, Vec<u32>) {
 
 fn eligible_rule(fact: &Fact) -> bool {
     fact.predicate == Predicate::Rule && fact.status == "decided" && fact.replaces.trim().is_empty()
+}
+
+/// Drop decided language-role `uses` edges. Other facts stay.
+///
+/// The drops map is left alone. A zero count stays off the report.
+fn drop_generic_uses(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
+    let mut kept = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if language_uses(&fact) {
+            report.generic_uses_drops += 1;
+            let _ = writeln!(std::io::stderr(), "{}", generic_uses_line(&fact));
+            continue;
+        }
+        kept.push(fact);
+    }
+    kept
+}
+
+fn language_uses(fact: &Fact) -> bool {
+    fact.predicate == Predicate::Uses
+        && fact.status == "decided"
+        && fact.role == Some(Role::Language)
+}
+
+fn generic_uses_line(fact: &Fact) -> String {
+    format!(
+        "drop generic uses: {} uses {} role={}",
+        log_plain(&fact.subject_name),
+        log_plain(&fact.object_name),
+        log_plain(fact.role.map(Role::as_str).unwrap_or(""))
+    )
 }
 
 fn anchor_setting(fact: &Fact) -> bool {
@@ -5270,6 +5314,32 @@ mod tests {
         fact
     }
 
+    fn harbor_uses(object: &str, role: Option<Role>, status: &str) -> Fact {
+        let mut fact = harbor_setting("", object);
+        fact.predicate = Predicate::Uses;
+        fact.role = role;
+        fact.object_kind = Some(Kind::Technology);
+        fact.status = status.into();
+        fact.key.clear();
+        fact
+    }
+
+    fn cache_part_of_harbor() -> Fact {
+        let mut fact = harbor_setting("", "harbor");
+        fact.subject_name = "cache".into();
+        fact.subject_kind = Kind::Component;
+        fact.predicate = Predicate::PartOf;
+        fact.object_kind = Some(Kind::Project);
+        fact.key.clear();
+        fact
+    }
+
+    fn apply_generic_uses(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport) {
+        let mut report = IngestionReport::default();
+        let kept = drop_generic_uses(facts, &mut report);
+        (kept, report)
+    }
+
     fn apply_restatements(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport) {
         let mut report = IngestionReport::default();
         let kept = drop_restating_rules(facts, &mut report);
@@ -5559,6 +5629,86 @@ mod tests {
     }
 
     #[test]
+    fn a_decided_language_use_is_dropped_and_other_rows_stay() {
+        let language = harbor_uses("Zig", Some(Role::Language), "decided");
+        let mut noisy = language.clone();
+        noisy.subject_name = "har\nbor".into();
+        assert_eq!(
+            generic_uses_line(&language),
+            "drop generic uses: harbor uses Zig role=language"
+        );
+        assert_eq!(
+            generic_uses_line(&noisy),
+            "drop generic uses: harbor uses Zig role=language"
+        );
+
+        let kept_shapes = vec![
+            harbor_uses("ExampleCI", Some(Role::Ci), "decided"),
+            harbor_uses("ExampleHost", Some(Role::Hosting), "decided"),
+            harbor_uses("Zig", Some(Role::Language), "considered"),
+            harbor_uses("Zig", Some(Role::Language), "rejected"),
+            harbor_uses("Zig", Some(Role::Library), "decided"),
+            harbor_uses("Zig", Some(Role::Framework), "decided"),
+            harbor_uses("Zig", Some(Role::None), "decided"),
+            harbor_uses("Zig", None, "decided"),
+            harbor_setting("lang", "Zig"),
+            harbor_rule("Use Zig for the CLI."),
+            cache_part_of_harbor(),
+        ];
+        let mut facts = vec![language];
+        facts.extend(kept_shapes.iter().cloned());
+        let (logged, (kept, report)) = stderr_lines(|| apply_generic_uses(facts));
+        assert!(kept.iter().all(|fact| !language_uses(fact)));
+        assert_eq!(kept.len(), kept_shapes.len());
+        assert_eq!(report.generic_uses_drops, 1);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        assert!(kept.iter().any(|fact| {
+            fact.object_name == "ExampleCI"
+                && fact.role == Some(Role::Ci)
+                && fact.status == "decided"
+        }));
+        assert!(kept.iter().any(|fact| {
+            fact.object_name == "ExampleHost"
+                && fact.role == Some(Role::Hosting)
+                && fact.status == "decided"
+        }));
+        assert!(kept.iter().any(|fact| fact.status == "considered"));
+        assert!(kept.iter().any(|fact| fact.status == "rejected"));
+        assert!(kept.iter().any(|fact| fact.role == Some(Role::Library)));
+        assert!(kept.iter().any(|fact| fact.role == Some(Role::Framework)));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.role == Some(Role::None) && fact.predicate == Predicate::Uses));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::Uses && fact.role.is_none()));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.predicate == Predicate::Setting && fact.key == "lang"));
+        assert!(kept.iter().any(|fact| {
+            fact.predicate == Predicate::Rule && fact.object_name == "Use Zig for the CLI."
+        }));
+        assert!(kept
+            .iter()
+            .any(|fact| { fact.predicate == Predicate::PartOf && fact.subject_name == "cache" }));
+        assert_eq!(
+            logged,
+            vec!["drop generic uses: harbor uses Zig role=language".to_string()]
+        );
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"generic_uses_drops\":1"), "{text}");
+        assert!(!text.contains("\"drops\""), "{text}");
+
+        let (quiet, (kept, report)) = stderr_lines(|| apply_generic_uses(kept_shapes));
+        assert_eq!(kept.len(), 11);
+        assert_eq!(report.generic_uses_drops, 0);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        assert!(quiet.is_empty(), "{quiet:?}");
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(!text.contains("generic_uses_drops"), "{text}");
+    }
+
+    #[test]
     fn remapped_part_of_stays() {
         let mention = Mention {
             subject: "tidepool".into(),
@@ -5761,6 +5911,112 @@ mod tests {
         )
         .unwrap();
         assert!(drop_restatements_enabled(dir.path()));
+    }
+
+    #[test]
+    fn drop_generic_uses_reads_only_its_own_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!drop_generic_uses_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ndrop_generic_uses = false\n",
+        )
+        .unwrap();
+        assert!(!drop_generic_uses_enabled(dir.path()));
+        assert!(drop_restatements_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ndrop_restatements = false\nrecover_turns = true\n",
+        )
+        .unwrap();
+        assert!(!drop_generic_uses_enabled(dir.path()));
+        assert!(!drop_restatements_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ndrop_generic_uses = true\ndrop_restatements = false\n",
+        )
+        .unwrap();
+        assert!(drop_generic_uses_enabled(dir.path()));
+        assert!(!drop_restatements_enabled(dir.path()));
+    }
+
+    fn stderr_lines<T>(action: impl FnOnce() -> T) -> (Vec<String>, T) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let capture = StderrCapture::start();
+        let value = action();
+        let text = capture.finish();
+        let lines = text.lines().map(str::to_string).collect();
+        (lines, value)
+    }
+
+    struct StderrCapture {
+        saved: libc::c_int,
+        read_end: libc::c_int,
+        write_end: libc::c_int,
+        restored: bool,
+    }
+
+    impl StderrCapture {
+        fn start() -> Self {
+            let mut pipe = [0; 2];
+            // SAFETY: `pipe` is a two-slot buffer for the POSIX pipe call.
+            let rc = unsafe { libc::pipe(pipe.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            // SAFETY: dup of stderr returns a new fd or -1.
+            let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved >= 0);
+            let capture = Self {
+                saved,
+                read_end: pipe[0],
+                write_end: pipe[1],
+                restored: false,
+            };
+            // SAFETY: both fds are open. Drop restores stderr if this fails.
+            let swapped = unsafe { libc::dup2(capture.write_end, libc::STDERR_FILENO) };
+            assert_eq!(swapped, libc::STDERR_FILENO);
+            capture
+        }
+
+        fn finish(mut self) -> String {
+            let _ = std::io::stderr().flush();
+            self.restore();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                // SAFETY: `buf` is writable and `read_end` is this pipe.
+                let n = unsafe { libc::read(self.read_end, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n as usize]);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        fn restore(&mut self) {
+            if self.restored {
+                return;
+            }
+            // SAFETY: `saved` and `write_end` are fds this capture opened.
+            unsafe {
+                libc::dup2(self.saved, libc::STDERR_FILENO);
+                libc::close(self.saved);
+                libc::close(self.write_end);
+            }
+            self.restored = true;
+        }
+    }
+
+    impl Drop for StderrCapture {
+        fn drop(&mut self) {
+            self.restore();
+            if self.read_end >= 0 {
+                // SAFETY: `read_end` is the pipe read end, closed once.
+                unsafe { libc::close(self.read_end) };
+                self.read_end = -1;
+            }
+        }
     }
 
     #[cfg(feature = "embedded")]
