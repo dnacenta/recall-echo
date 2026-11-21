@@ -938,6 +938,13 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_component_takeover: bool,
+    /// Close one live `uses` edge when a tool moves inside the project family.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_tool_move",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_tool_move: bool,
     /// Close a live rule that still names a setting value this subject has
     /// replaced. Off unless set, and ignored unless [`Self::consolidate`] is
     /// also set.
@@ -1001,6 +1008,7 @@ impl Default for GraphSection {
             consolidate_rule_fragments: default_consolidate_rule_fragments(),
             consolidate_retire_component: default_consolidate_retire_component(),
             consolidate_component_takeover: default_consolidate_component_takeover(),
+            consolidate_tool_move: default_consolidate_tool_move(),
             consolidate_retire_reason: default_consolidate_retire_reason(),
             drop_restatements: default_drop_restatements(),
             ground_component_edges: default_ground_component_edges(),
@@ -1080,6 +1088,12 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn component_takeover_apply(&self) -> bool {
         self.consolidate && self.consolidate_component_takeover
+    }
+
+    /// A tool move closes only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn tool_move_apply(&self) -> bool {
+        self.consolidate && self.consolidate_tool_move
     }
 
     /// A reason-rule closes only when consolidation is on as well.
@@ -1448,6 +1462,10 @@ fn default_consolidate_retire_component() -> bool {
 }
 
 fn default_consolidate_component_takeover() -> bool {
+    false
+}
+
+fn default_consolidate_tool_move() -> bool {
     false
 }
 
@@ -2008,6 +2026,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
         "graph.consolidate_component_takeover",
         flag_consolidate_component_takeover,
     ),
+    ("graph.consolidate_tool_move", flag_consolidate_tool_move),
     (
         "graph.consolidate_retire_reason",
         flag_consolidate_retire_reason,
@@ -2090,6 +2109,10 @@ fn flag_consolidate_retire_component(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_consolidate_component_takeover(graph: &mut GraphSection) -> &mut bool {
     &mut graph.consolidate_component_takeover
+}
+
+fn flag_consolidate_tool_move(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_tool_move
 }
 
 fn flag_consolidate_retire_reason(graph: &mut GraphSection) -> &mut bool {
@@ -3925,6 +3948,59 @@ settle_secs = 300
                 .expect("graph")
                 .consolidate_component_takeover
         );
+    }
+
+    #[test]
+    fn consolidate_tool_move_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_tool_move());
+        assert!(!GraphSection::default().consolidate_tool_move);
+        assert!(!GraphSection::default().tool_move_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().tool_move_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_tool_move"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nconsolidate_tool_move = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.consolidate_tool_move);
+        assert!(true_graph.consolidate);
+        assert!(true_graph.tool_move_apply());
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("consolidate_tool_move = true"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.consolidate_tool_move);
+        assert!(again.tool_move_apply());
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_tool_move = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_tool_move);
+        assert!(!false_graph.tool_move_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_tool_move"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_tool_move", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_tool_move);
+        assert!(graph.tool_move_apply());
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render set");
+        assert!(rendered.contains("consolidate_tool_move = true"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse set");
+        assert!(parsed.graph.expect("graph").consolidate_tool_move);
+
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").tool_move_apply());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_tool_move);
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").tool_move_apply());
+        cfg.set_key("graph.consolidate_tool_move", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").tool_move_apply());
+        assert!(cfg.set_key("graph.consolidate_tool_move", "yes").is_err());
+        assert!(!cfg.graph.as_ref().expect("graph").consolidate_tool_move);
     }
 
     #[test]

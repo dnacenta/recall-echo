@@ -312,6 +312,10 @@ enum BenchCommands {
         /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
         #[arg(long)]
         consolidate_retire_reason: bool,
+        /// Close a tool's old use when it moves within the project family.
+        /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
+        #[arg(long)]
+        consolidate_tool_move: bool,
         /// Bind a decided setting key from a shown known row. On unless
         /// `--no-known-key-binding`. Does not turn on `--known-facts-context`.
         #[arg(long)]
@@ -352,6 +356,7 @@ enum BenchCommands {
                 "consolidate_retire_component",
                 "consolidate_component_takeover",
                 "consolidate_retire_reason",
+                "consolidate_tool_move",
             ]
         )]
         no_consolidate: bool,
@@ -1188,6 +1193,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             no_consolidate_retire_component,
             consolidate_component_takeover,
             consolidate_retire_reason,
+            consolidate_tool_move,
             no_known_key_binding,
             no_drop_restatements,
             no_ground_component_edges,
@@ -1286,6 +1292,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_retire_component: no_consolidate_retire_component,
                 consolidate_component_takeover,
                 consolidate_retire_reason,
+                consolidate_tool_move,
                 slot_forget,
             },
         ),
@@ -2510,6 +2517,52 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn consolidate_tool_move_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-tool-move",
+        ])
+        .expect("parse tool move");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_tool_move,
+                        consolidate_component_takeover,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_tool_move);
+                assert!(!consolidate);
+                assert!(!consolidate_component_takeover);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let rejected = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--consolidate-tool-move",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "opt-out and tool move should be rejected"
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn slot_forget_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2871,6 +2924,7 @@ mod tests {
             consolidate_retire_component: f[11],
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
+            consolidate_tool_move: false,
             slot_forget: false,
             known_key_binding: f[12],
             drop_restatements: f[13],

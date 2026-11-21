@@ -47,6 +47,7 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_rule_fragments = true # close a same-turn rule fragment; on by default, ignored unless consolidate is on
 # consolidate_retire_component = true # retire a dropped component's settings; on by default, ignored unless consolidate is on
 # consolidate_retire_reason = false # close a rule that still names a setting's old value; off by default, ignored unless consolidate is on
+# consolidate_tool_move = false # close a live use when a tool moves inside the project family; off by default, ignored unless consolidate is on
 # known_match = false         # experimental: match new facts to stored rows after pass 1; off by default
 # recover_turns = false       # list raw-turn values missing from the store; off by default, because it makes extra model calls; never writes
 # lasting_forget = false      # keep a confirmed forget until --unforget; off by default; with it off the forget file is not read

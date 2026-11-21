@@ -5200,6 +5200,7 @@ struct PostSnap {
     fragments: Option<FragmentSnap>,
     retire: Option<RetireSnap>,
     takeover: Option<TakeoverSnap>,
+    tool_move: Option<MoveSnap>,
     reason: Option<ReasonSnap>,
 }
 
@@ -5246,6 +5247,7 @@ fn post_switches(ctx: &WriteCtx<'_>) -> bool {
         || ctx.rule_fragments_on
         || ctx.retire_component_on
         || ctx.component_takeover_on
+        || ctx.tool_move_on
         || ctx.retire_reason_on
 }
 
@@ -5275,6 +5277,7 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
             fragments: None,
             retire: None,
             takeover: None,
+            tool_move: None,
             reason: None,
         });
     }
@@ -5297,12 +5300,14 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
         None
     };
     let takeover = maybe_takeover(gm, ctx, &rows).await?;
+    let tool_move = maybe_tool_move(gm, ctx, &rows).await?;
     let reason = maybe_reason(ctx, &rows);
     Ok(PostSnap {
         orphan,
         fragments,
         retire,
         takeover,
+        tool_move,
         reason,
     })
 }
@@ -5341,6 +5346,10 @@ async fn apply_post(
     if let Some(takeover) = &snap.takeover {
         let plan = plan_takeover(ctx, takeover);
         apply_takeover(gm, ctx, &plan, report).await;
+    }
+    if let Some(tool_move) = &snap.tool_move {
+        let plan = plan_tool_move(ctx, facts, tool_move);
+        apply_tool_move(gm, ctx, &plan, report).await;
     }
     if let Some(reason) = &snap.reason {
         let plan = plan_retire_reason(ctx, reason);
@@ -7793,6 +7802,665 @@ fn reason_sweep(close: &ReasonClose) -> SweepClose {
         key: String::new(),
         value: close.value.clone(),
     }
+}
+
+const TOOL_MOVE_REASON: &str = "tool_move";
+const STEM_TAILS: &[&str] = &["js", "py", "rs", "rb", "go", "lib", "cli"];
+
+struct MoveSnap {
+    project_id: Option<String>,
+    entities: Vec<MoveEntity>,
+    parts: Vec<PartLink>,
+    uses: Vec<MoveUse>,
+}
+
+struct MoveEntity {
+    id: String,
+    name: String,
+    kind: String,
+    slots: Vec<MoveSlot>,
+}
+
+impl ProjectRow for MoveEntity {
+    fn project_name(&self) -> &str {
+        &self.name
+    }
+
+    fn project_kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn project_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+}
+
+struct MoveSlot {
+    predicate: String,
+    key: String,
+    value: String,
+    status: String,
+    pending: bool,
+    first_session: String,
+    first_turn: Option<i64>,
+}
+
+struct MoveUse {
+    id: String,
+    from_id: String,
+    object: String,
+    status: String,
+    pending: bool,
+    description: String,
+    first_session: String,
+    first_turn: Option<i64>,
+    evidence_sessions: Vec<String>,
+}
+
+struct MoveNames<'a> {
+    project: &'a str,
+    aliases: &'a [String],
+    old_subject: &'a str,
+    new_subject: &'a str,
+    old_tool: &'a str,
+    new_tool: &'a str,
+}
+
+struct MoveHit<'a> {
+    edge: &'a MoveUse,
+    old_subject: String,
+    job: String,
+}
+
+struct MoveClose {
+    id: String,
+    old_subject: String,
+    old_tool: String,
+    new_subject: String,
+    new_tool: String,
+    job: String,
+}
+
+struct MoveNote {
+    subject: String,
+    tool: String,
+    count: usize,
+}
+
+struct MovePlan {
+    closes: Vec<MoveClose>,
+    ambiguous: Vec<MoveNote>,
+}
+
+async fn maybe_tool_move(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<Option<MoveSnap>, GraphError> {
+    if !ctx.tool_move_on {
+        return Ok(None);
+    }
+    Ok(Some(tool_move_snap(gm, ctx, rows).await?))
+}
+
+async fn tool_move_snap(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<MoveSnap, GraphError> {
+    let entities = parse_move_entities(rows);
+    let project_id = preferred_project_id(&entities, ctx);
+    let parts = read_retire_parts(gm).await?;
+    let uses = read_move_uses(gm).await?;
+    Ok(MoveSnap {
+        project_id,
+        entities,
+        parts,
+        uses,
+    })
+}
+
+async fn read_move_uses(gm: &GraphMemory) -> Result<Vec<MoveUse>, GraphError> {
+    note_post_read();
+    let mut response = gm.db().query(OPEN_USES_TAKEOVER).await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(parse_move_uses(&rows))
+}
+
+fn parse_move_entities(rows: &[Value]) -> Vec<MoveEntity> {
+    rows.iter().filter_map(move_entity_row).collect()
+}
+
+fn move_entity_row(row: &Value) -> Option<MoveEntity> {
+    let id = id_text(row.get("id"));
+    if id.is_empty() {
+        return None;
+    }
+    Some(MoveEntity {
+        name: json_text(row.get("name")),
+        kind: row_kind(row).to_string(),
+        slots: move_slots(row),
+        id,
+    })
+}
+
+fn move_slots(row: &Value) -> Vec<MoveSlot> {
+    let Some(slots) = row
+        .pointer("/attributes/v2/slots")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    slots.iter().filter_map(move_slot_row).collect()
+}
+
+fn move_slot_row(slot: &Value) -> Option<MoveSlot> {
+    if !slot.is_object() {
+        return None;
+    }
+    Some(MoveSlot {
+        predicate: json_text(slot.get("predicate")),
+        key: json_text(slot.get("key")),
+        value: json_text(slot.get("value")),
+        status: json_text(slot.get("status")),
+        pending: super::write::is_pending(slot),
+        first_session: first_evidence_session(slot),
+        first_turn: first_evidence_turn(slot),
+    })
+}
+
+fn parse_move_uses(rows: &[Value]) -> Vec<MoveUse> {
+    let mut uses: Vec<MoveUse> = rows.iter().filter_map(move_use_row).collect();
+    uses.sort_by(|left, right| left.id.cmp(&right.id));
+    uses
+}
+
+fn move_use_row(row: &Value) -> Option<MoveUse> {
+    let id = id_text(row.get("id"));
+    let from_id = id_text(row.get("in"));
+    if id.is_empty() || from_id.is_empty() {
+        return None;
+    }
+    Some(MoveUse {
+        id,
+        from_id,
+        object: json_text(row.get("object")),
+        status: json_text(row.get("status")),
+        pending: super::write::is_pending(row),
+        description: json_text(row.get("description")),
+        first_session: first_evidence_session(row),
+        first_turn: first_evidence_turn(row),
+        evidence_sessions: evidence_sessions(row),
+    })
+}
+
+fn evidence_sessions(row: &Value) -> Vec<String> {
+    row.get("evidence")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| json_text(item.get("session")))
+                .filter(|session| !session.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn plan_tool_move(ctx: &WriteCtx<'_>, facts: &[Fact], snap: &MoveSnap) -> MovePlan {
+    let mut plan = MovePlan {
+        closes: Vec::new(),
+        ambiguous: Vec::new(),
+    };
+    let family = move_family(snap);
+    for anchor in &snap.uses {
+        if move_anchor(anchor, &family, ctx.session_id) {
+            push_move_anchor(&mut plan, ctx, facts, snap, &family, anchor);
+        }
+    }
+    plan.closes.sort_by(|left, right| left.id.cmp(&right.id));
+    plan
+}
+
+fn move_family(snap: &MoveSnap) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let Some(project) = snap.project_id.as_deref() else {
+        return ids;
+    };
+    ids.insert(project.to_string());
+    for entity in &snap.entities {
+        if entity.kind == "component" && family_part(&snap.parts, &entity.id, project) {
+            ids.insert(entity.id.clone());
+        }
+    }
+    ids
+}
+
+fn family_part(parts: &[PartLink], entity: &str, project: &str) -> bool {
+    parts.iter().any(|link| part_links(link, entity, project))
+}
+
+fn move_anchor(edge: &MoveUse, family: &BTreeSet<String>, session: &str) -> bool {
+    family.contains(&edge.from_id)
+        && edge.status == "decided"
+        && !edge.pending
+        && edge.first_session == session
+        && move_role(&edge.description).is_some()
+}
+
+fn move_role(description: &str) -> Option<&str> {
+    let role = role_body(description)?;
+    (role != "none").then_some(role)
+}
+
+fn push_move_anchor(
+    plan: &mut MovePlan,
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    snap: &MoveSnap,
+    family: &BTreeSet<String>,
+    anchor: &MoveUse,
+) {
+    let Some(entity) = entity_by_id(snap, &anchor.from_id) else {
+        return;
+    };
+    let hits = move_hits(ctx, facts, snap, family, anchor);
+    record_move(plan, entity, anchor, &hits);
+}
+
+fn move_hits<'a>(
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    snap: &'a MoveSnap,
+    family: &BTreeSet<String>,
+    anchor: &MoveUse,
+) -> Vec<MoveHit<'a>> {
+    snap.uses
+        .iter()
+        .filter_map(|old| move_hit(ctx, facts, snap, family, anchor, old))
+        .collect()
+}
+
+fn move_hit<'a>(
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    snap: &'a MoveSnap,
+    family: &BTreeSet<String>,
+    anchor: &MoveUse,
+    old: &'a MoveUse,
+) -> Option<MoveHit<'a>> {
+    if !move_candidate(ctx, &snap.uses, family, anchor, old) {
+        return None;
+    }
+    let old_entity = entity_by_id(snap, &old.from_id)?;
+    let job = move_job(ctx, facts, snap, anchor, old)?;
+    Some(MoveHit {
+        edge: old,
+        old_subject: old_entity.name.clone(),
+        job,
+    })
+}
+
+fn move_candidate(
+    ctx: &WriteCtx<'_>,
+    uses: &[MoveUse],
+    family: &BTreeSet<String>,
+    anchor: &MoveUse,
+    old: &MoveUse,
+) -> bool {
+    let stem = tool_stem(&old.object);
+    old.id != anchor.id
+        && old.from_id != anchor.from_id
+        && family.contains(&old.from_id)
+        && old.status == "decided"
+        && !old.pending
+        && earlier_session(&old.first_session, ctx.session_id)
+        && !seen_this_session(old, ctx.session_id)
+        && move_role(&old.description) == move_role(&anchor.description)
+        && tool_stem(&anchor.object) != stem
+        && !tool_mentioned(ctx, &old.object)
+        && !stem_shared(uses, family, &stem, &old.id)
+}
+
+fn seen_this_session(edge: &MoveUse, session: &str) -> bool {
+    edge.evidence_sessions.iter().any(|item| item == session)
+}
+
+fn stem_shared(uses: &[MoveUse], family: &BTreeSet<String>, stem: &str, except: &str) -> bool {
+    uses.iter().any(|edge| {
+        edge.id != except
+            && family.contains(&edge.from_id)
+            && edge.status == "decided"
+            && !edge.pending
+            && tool_stem(&edge.object) == stem
+    })
+}
+
+fn entity_by_id<'a>(snap: &'a MoveSnap, id: &str) -> Option<&'a MoveEntity> {
+    snap.entities.iter().find(|entity| entity.id == id)
+}
+
+fn move_job(
+    ctx: &WriteCtx<'_>,
+    facts: &[Fact],
+    snap: &MoveSnap,
+    anchor: &MoveUse,
+    old: &MoveUse,
+) -> Option<String> {
+    let new_entity = entity_by_id(snap, &anchor.from_id)?;
+    let old_entity = entity_by_id(snap, &old.from_id)?;
+    let names = move_names(ctx, old_entity, new_entity, old, anchor);
+    let old_rows = old_side_rows(old_entity, old);
+    let new_rows = new_side_rows(new_entity, anchor, ctx.session_id);
+    if let Some(token) = shared_heads(&old_rows, &new_rows, &names) {
+        return Some(token);
+    }
+    replaces_bridge(facts, &new_entity.name, &old_rows).then(|| "replaces".to_string())
+}
+
+fn move_names<'a>(
+    ctx: &'a WriteCtx<'_>,
+    old_entity: &'a MoveEntity,
+    new_entity: &'a MoveEntity,
+    old: &'a MoveUse,
+    anchor: &'a MoveUse,
+) -> MoveNames<'a> {
+    MoveNames {
+        project: &ctx.project.name,
+        aliases: &ctx.project.aliases,
+        old_subject: &old_entity.name,
+        new_subject: &new_entity.name,
+        old_tool: &old.object,
+        new_tool: &anchor.object,
+    }
+}
+
+fn old_side_rows<'a>(entity: &'a MoveEntity, edge: &MoveUse) -> Vec<&'a MoveSlot> {
+    entity
+        .slots
+        .iter()
+        .filter(|slot| old_side_row(slot, edge))
+        .collect()
+}
+
+fn old_side_row(slot: &MoveSlot, edge: &MoveUse) -> bool {
+    job_row(slot)
+        && !slot.pending
+        && matches!(slot.status.as_str(), "decided" | "rejected")
+        && slot.first_session == edge.first_session
+        && turns_within_one(slot.first_turn, edge.first_turn)
+}
+
+fn new_side_rows<'a>(entity: &'a MoveEntity, edge: &MoveUse, session: &str) -> Vec<&'a MoveSlot> {
+    entity
+        .slots
+        .iter()
+        .filter(|slot| new_side_row(slot, edge, session))
+        .collect()
+}
+
+fn new_side_row(slot: &MoveSlot, edge: &MoveUse, session: &str) -> bool {
+    job_row(slot)
+        && !slot.pending
+        && slot.status == "decided"
+        && slot.first_session == session
+        && same_stored_turn(slot.first_turn, edge.first_turn)
+}
+
+fn job_row(slot: &MoveSlot) -> bool {
+    slot.predicate == "setting" || slot.predicate == "rule"
+}
+
+fn turns_within_one(left: Option<i64>, right: Option<i64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() <= 1,
+        _ => false,
+    }
+}
+
+fn same_stored_turn(left: Option<i64>, right: Option<i64>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left == right)
+}
+
+fn shared_heads(
+    old_rows: &[&MoveSlot],
+    new_rows: &[&MoveSlot],
+    names: &MoveNames<'_>,
+) -> Option<String> {
+    let mut found = BTreeSet::new();
+    for old in old_rows {
+        for new in new_rows {
+            found.extend(shared_head(old, new, names));
+        }
+    }
+    found.into_iter().next()
+}
+
+fn shared_head(old: &MoveSlot, new: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
+    if normalise(&old.value) == normalise(&new.value) {
+        return BTreeSet::new();
+    }
+    head_tokens(old, names)
+        .intersection(&head_tokens(new, names))
+        .cloned()
+        .collect()
+}
+
+fn replaces_bridge(facts: &[Fact], subject: &str, old_rows: &[&MoveSlot]) -> bool {
+    facts
+        .iter()
+        .any(|fact| replaces_fact(fact, subject, old_rows))
+}
+
+fn replaces_fact(fact: &Fact, subject: &str, old_rows: &[&MoveSlot]) -> bool {
+    fact.status == "decided"
+        && matches!(fact.predicate, Predicate::Setting | Predicate::Rule)
+        && same_name(&fact.subject_name, subject)
+        && replaces_value(fact, old_rows)
+}
+
+fn replaces_value(fact: &Fact, old_rows: &[&MoveSlot]) -> bool {
+    let wanted = normalise(&fact.replaces);
+    !wanted.is_empty() && old_rows.iter().any(|row| normalise(&row.value) == wanted)
+}
+
+fn record_move(plan: &mut MovePlan, entity: &MoveEntity, anchor: &MoveUse, hits: &[MoveHit<'_>]) {
+    match hits.len() {
+        0 => {}
+        1 => plan.closes.push(move_close(entity, anchor, &hits[0])),
+        count => plan.ambiguous.push(MoveNote {
+            subject: entity.name.clone(),
+            tool: anchor.object.clone(),
+            count,
+        }),
+    }
+}
+
+fn move_close(entity: &MoveEntity, anchor: &MoveUse, hit: &MoveHit<'_>) -> MoveClose {
+    MoveClose {
+        id: hit.edge.id.clone(),
+        old_subject: hit.old_subject.clone(),
+        old_tool: hit.edge.object.clone(),
+        new_subject: entity.name.clone(),
+        new_tool: anchor.object.clone(),
+        job: hit.job.clone(),
+    }
+}
+
+fn tool_stem(name: &str) -> String {
+    let mut runs = alphanumeric_runs(name);
+    if runs.len() > 1
+        && runs
+            .last()
+            .is_some_and(|tail| STEM_TAILS.contains(&tail.as_str()))
+    {
+        runs.pop();
+    }
+    runs.join(" ")
+}
+
+fn move_job_tokens(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
+    raw_job_pieces(slot)
+        .into_iter()
+        .filter_map(|piece| kept_job_token(&piece, names))
+        .collect()
+}
+
+fn raw_job_pieces(slot: &MoveSlot) -> Vec<String> {
+    match slot.predicate.as_str() {
+        "setting" => setting_key_tokens(&slot.key),
+        "rule" => job_words(&slot.value),
+        _ => Vec::new(),
+    }
+}
+
+fn kept_job_token(raw: &str, names: &MoveNames<'_>) -> Option<String> {
+    let token = strip_job_suffix(raw);
+    keep_move_token(&token, names).then_some(token)
+}
+
+fn strip_job_suffix(token: &str) -> String {
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(stem) = token.strip_suffix(suffix) {
+            if stem.chars().count() >= 5 {
+                return stem.to_string();
+            }
+        }
+    }
+    token.to_string()
+}
+
+fn keep_move_token(token: &str, names: &MoveNames<'_>) -> bool {
+    long_job_token(token)
+        && !is_stop_word(token)
+        && !is_generic_key(token)
+        && !move_name_word(token, names)
+        && !whole_move_tool(token, names)
+}
+
+fn move_name_word(token: &str, names: &MoveNames<'_>) -> bool {
+    word_in(names.project, token)
+        || names.aliases.iter().any(|alias| word_in(alias, token))
+        || word_in(names.old_subject, token)
+        || word_in(names.new_subject, token)
+}
+
+fn word_in(name: &str, token: &str) -> bool {
+    job_words(name).iter().any(|part| part == token)
+}
+
+fn whole_move_tool(token: &str, names: &MoveNames<'_>) -> bool {
+    token == normalise(names.old_tool) || token == normalise(names.new_tool)
+}
+
+fn head_tokens(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
+    match slot.predicate.as_str() {
+        "setting" => move_job_tokens(slot, names),
+        "rule" => rule_head(slot, names),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn rule_head(slot: &MoveSlot, names: &MoveNames<'_>) -> BTreeSet<String> {
+    let words = job_words(&slot.value);
+    let Some(word) = words.iter().find(|word| !is_stop_word(word)) else {
+        return BTreeSet::new();
+    };
+    kept_job_token(word, names).into_iter().collect()
+}
+
+async fn apply_tool_move(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &MovePlan,
+    report: &mut IngestionReport,
+) {
+    note_move_ambiguous(&plan.ambiguous, report);
+    for close in &plan.closes {
+        if close_tool_move(gm, ctx, close, report).await {
+            add_count(&mut report.consolidate.tool_move_closes);
+        }
+    }
+}
+
+fn note_move_ambiguous(notes: &[MoveNote], report: &mut IngestionReport) {
+    for note in notes {
+        add_count(&mut report.consolidate.tool_move_ambiguous);
+        emit_post_line(tool_move_ambiguous_line(note));
+    }
+}
+
+async fn close_tool_move(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    close: &MoveClose,
+    report: &mut IngestionReport,
+) -> bool {
+    let Some(until) = session_midnight(ctx.date) else {
+        return false;
+    };
+    let ended = format!("{}:{TOOL_MOVE_REASON}", ctx.session_id);
+    match close_row(gm, &tool_move_row(close), &until, &ended).await {
+        Ok(true) => {
+            report.retirements.push(tool_move_retirement(close));
+            emit_post_line(tool_move_line(close));
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            false
+        }
+    }
+}
+
+fn tool_move_row(close: &MoveClose) -> Row {
+    Row {
+        id: String::new(),
+        entity: String::new(),
+        slot: None,
+        edge: Some(close.id.clone()),
+        subject: close.old_subject.clone(),
+        pred: "uses".into(),
+        key: String::new(),
+        value: close.old_tool.clone(),
+        evidence: Value::Null,
+        from: String::new(),
+        here: false,
+        pending: false,
+        object_name: Some(close.old_tool.clone()),
+    }
+}
+
+fn tool_move_retirement(close: &MoveClose) -> Retirement {
+    Retirement {
+        reason: TOOL_MOVE_REASON.to_string(),
+        subject: close.old_subject.clone(),
+        predicate: "uses".into(),
+        key: String::new(),
+        old_value: close.old_tool.clone(),
+        new_value: close.new_tool.clone(),
+    }
+}
+
+fn tool_move_line(close: &MoveClose) -> String {
+    format!(
+        "consolidate tool move: {} uses {} -> {} uses {} | job {}",
+        quote_head(&close.old_subject),
+        quote_head(&close.old_tool),
+        quote_head(&close.new_subject),
+        quote_head(&close.new_tool),
+        quote_head(&close.job)
+    )
+}
+
+fn tool_move_ambiguous_line(note: &MoveNote) -> String {
+    format!(
+        "consolidate tool move ambiguous: {} uses {} | {} candidates",
+        quote_head(&note.subject),
+        quote_head(&note.tool),
+        note.count
+    )
 }
 
 #[cfg(all(test, feature = "embedded"))]
@@ -21763,6 +22431,713 @@ mod tests {
                 "closed a must-not-close row: {rule}"
             );
         }
+    }
+
+    fn harbor_project() -> ProjectIdentity {
+        ProjectIdentity {
+            name: "Harbor".into(),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn move_names<'a>(
+        project: &'a str,
+        old_subject: &'a str,
+        new_subject: &'a str,
+        old_tool: &'a str,
+        new_tool: &'a str,
+    ) -> MoveNames<'a> {
+        MoveNames {
+            project,
+            aliases: &[],
+            old_subject,
+            new_subject,
+            old_tool,
+            new_tool,
+        }
+    }
+
+    fn setting_slot(key: &str, value: &str, session: &str, turn: i64) -> MoveSlot {
+        MoveSlot {
+            predicate: "setting".into(),
+            key: key.into(),
+            value: value.into(),
+            status: "decided".into(),
+            pending: false,
+            first_session: session.into(),
+            first_turn: Some(turn),
+        }
+    }
+
+    fn rule_slot(value: &str, session: &str, turn: i64) -> MoveSlot {
+        MoveSlot {
+            predicate: "rule".into(),
+            key: String::new(),
+            value: value.into(),
+            status: "decided".into(),
+            pending: false,
+            first_session: session.into(),
+            first_turn: Some(turn),
+        }
+    }
+
+    fn move_person(id: &str, name: &str, kind: &str, slots: Vec<MoveSlot>) -> MoveEntity {
+        MoveEntity {
+            id: id.into(),
+            name: name.into(),
+            kind: kind.into(),
+            slots,
+        }
+    }
+
+    fn decided_part(from: &str, to: &str) -> PartLink {
+        PartLink {
+            from_id: from.into(),
+            to_id: to.into(),
+            status: "decided".into(),
+            pending: false,
+        }
+    }
+
+    fn use_edge(
+        id: &str,
+        from: &str,
+        object: &str,
+        role: &str,
+        session: &str,
+        turn: i64,
+    ) -> MoveUse {
+        MoveUse {
+            id: id.into(),
+            from_id: from.into(),
+            object: object.into(),
+            status: "decided".into(),
+            pending: false,
+            description: format!("role={role}"),
+            first_session: session.into(),
+            first_turn: Some(turn),
+            evidence_sessions: vec![session.into()],
+        }
+    }
+
+    fn snap_of(entities: Vec<MoveEntity>, parts: Vec<PartLink>, uses: Vec<MoveUse>) -> MoveSnap {
+        MoveSnap {
+            project_id: Some("p".into()),
+            entities,
+            parts,
+            uses,
+        }
+    }
+
+    fn project_to_component() -> MoveSnap {
+        snap_of(
+            vec![
+                move_person(
+                    "p",
+                    "Harbor",
+                    "project",
+                    vec![setting_slot("beacon_style", "amber glass", "s01", 1)],
+                ),
+                move_person(
+                    "c",
+                    "Tidepool",
+                    "component",
+                    vec![setting_slot("beacon_style", "cobalt glass", "s02", 2)],
+                ),
+            ],
+            vec![decided_part("c", "p")],
+            vec![
+                use_edge("old", "p", "Northlamp", "library", "s01", 1),
+                use_edge("new", "c", "Southlamp", "library", "s02", 2),
+            ],
+        )
+    }
+
+    fn plan_move(snap: &MoveSnap, mention: &str, facts: &[Fact]) -> MovePlan {
+        let project = harbor_project();
+        let quiet = Quiet;
+        let turns = [user_turn(2, mention)];
+        let ctx = WriteCtx::new(&quiet, &project, "s02", "2026-04-02", &turns);
+        plan_tool_move(&ctx, facts, snap)
+    }
+
+    fn plan_quiet(snap: &MoveSnap) -> MovePlan {
+        plan_move(snap, "tidepool keeps a beacon", &[])
+    }
+
+    fn assert_moved(plan: &MovePlan, old_subject: &str, new_subject: &str, job: &str) {
+        assert!(plan.ambiguous.is_empty());
+        assert_eq!(plan.closes.len(), 1);
+        let close = &plan.closes[0];
+        assert_eq!(close.old_subject, old_subject);
+        assert_eq!(close.old_tool, "Northlamp");
+        assert_eq!(close.new_subject, new_subject);
+        assert_eq!(close.new_tool, "Southlamp");
+        assert_eq!(close.job, job);
+        assert_eq!(close.id, "old");
+    }
+
+    fn assert_no_move(plan: &MovePlan) {
+        assert!(plan.closes.is_empty());
+        assert!(plan.ambiguous.is_empty());
+    }
+
+    #[test]
+    fn tool_stem_drops_one_trailing_run() {
+        assert_eq!(tool_stem("Northlamp.js"), "northlamp");
+        assert_eq!(tool_stem("Northlamp"), "northlamp");
+        assert_eq!(tool_stem("Tool.py"), "tool");
+        assert_eq!(tool_stem("crate.rs"), "crate");
+        assert_eq!(tool_stem("gem.rb"), "gem");
+        assert_eq!(tool_stem("cmd.go"), "cmd");
+        assert_eq!(tool_stem("pack.lib"), "pack");
+        assert_eq!(tool_stem("ship.cli"), "ship");
+        assert_eq!(tool_stem("cli"), "cli");
+        assert_eq!(tool_stem("js"), "js");
+        assert_eq!(tool_stem("my.lib.js"), "my lib");
+        assert_eq!(strip_job_suffix("highlighting"), "highlight");
+        assert_eq!(strip_job_suffix("processed"), "process");
+        assert_eq!(strip_job_suffix("processes"), "process");
+        assert_eq!(strip_job_suffix("highlights"), "highlight");
+        assert_eq!(strip_job_suffix("codes"), "codes");
+        assert_eq!(strip_job_suffix("build"), "build");
+    }
+
+    #[test]
+    fn job_tokens_strip_one_suffix_and_drop_blocked_words() {
+        let names = move_names("Harbor", "Tidepool", "Lantern", "Northlamp", "Southlamp");
+        let slot = setting_slot(
+            "lighting_harbor_using_default_code_northlamp_style",
+            "amber",
+            "s01",
+            1,
+        );
+        let tokens = move_job_tokens(&slot, &names);
+        assert_eq!(
+            tokens,
+            BTreeSet::from([String::from("light"), String::from("style")])
+        );
+        let alias = String::from("Style");
+        let aliased = MoveNames {
+            project: "Harbor",
+            aliases: std::slice::from_ref(&alias),
+            old_subject: "Tidepool",
+            new_subject: "Lantern",
+            old_tool: "Northlamp",
+            new_tool: "Southlamp",
+        };
+        assert_eq!(
+            move_job_tokens(&slot, &aliased),
+            BTreeSet::from([String::from("light")])
+        );
+    }
+
+    #[test]
+    fn head_tokens_use_a_rules_first_word_only() {
+        let names = move_names("Harbor", "Tidepool", "Lantern", "Northlamp", "Southlamp");
+        let rule = rule_slot("Beacon stays lit after highlighting the shore.", "s01", 1);
+        assert_eq!(
+            head_tokens(&rule, &names),
+            BTreeSet::from([String::from("beacon")])
+        );
+        assert!(move_job_tokens(&rule, &names).contains("shore"));
+        let later = rule_slot("Code the beacon tonight.", "s01", 1);
+        assert!(head_tokens(&later, &names).is_empty());
+        assert!(move_job_tokens(&later, &names).contains("beacon"));
+    }
+
+    #[test]
+    fn tool_move_closes_project_to_component() {
+        assert_moved(
+            &plan_quiet(&project_to_component()),
+            "Harbor",
+            "Tidepool",
+            "beacon",
+        );
+    }
+
+    #[test]
+    fn tool_move_closes_component_to_project() {
+        let snap = snap_of(
+            vec![
+                move_person(
+                    "p",
+                    "Harbor",
+                    "project",
+                    vec![setting_slot("beacon_style", "cobalt glass", "s02", 2)],
+                ),
+                move_person(
+                    "c",
+                    "Tidepool",
+                    "component",
+                    vec![setting_slot("beacon_style", "amber glass", "s01", 1)],
+                ),
+            ],
+            vec![decided_part("c", "p")],
+            vec![
+                use_edge("old", "c", "Northlamp", "library", "s01", 1),
+                use_edge("new", "p", "Southlamp", "library", "s02", 2),
+            ],
+        );
+        assert_moved(&plan_quiet(&snap), "Tidepool", "Harbor", "beacon");
+    }
+
+    #[test]
+    fn tool_move_closes_component_to_sibling() {
+        let snap = snap_of(
+            vec![
+                move_person("p", "Harbor", "project", vec![]),
+                move_person(
+                    "c",
+                    "Tidepool",
+                    "component",
+                    vec![setting_slot("beacon_style", "amber glass", "s01", 1)],
+                ),
+                move_person(
+                    "s",
+                    "Lantern",
+                    "component",
+                    vec![setting_slot("beacon_style", "cobalt glass", "s02", 2)],
+                ),
+            ],
+            vec![decided_part("c", "p"), decided_part("s", "p")],
+            vec![
+                use_edge("old", "c", "Northlamp", "library", "s01", 1),
+                use_edge("new", "s", "Southlamp", "library", "s02", 2),
+            ],
+        );
+        assert_moved(&plan_quiet(&snap), "Tidepool", "Lantern", "beacon");
+    }
+
+    #[test]
+    fn tool_move_closes_on_a_replaces_link() {
+        let mut snap = project_to_component();
+        snap.entities[1].slots[0].key = "storage_path".into();
+        let mut fact = setting_of("Tidepool", "storage_path", "cobalt glass", "decided");
+        fact.replaces = "amber glass".into();
+        assert_moved(
+            &plan_move(&snap, "tidepool keeps a beacon", &[fact]),
+            "Harbor",
+            "Tidepool",
+            "replaces",
+        );
+    }
+
+    #[test]
+    fn tool_move_closes_on_a_rule_head() {
+        let snap = snap_of(
+            vec![
+                move_person(
+                    "p",
+                    "Harbor",
+                    "project",
+                    vec![rule_slot("Beacon stays lit at night.", "s01", 1)],
+                ),
+                move_person(
+                    "c",
+                    "Tidepool",
+                    "component",
+                    vec![rule_slot("Beacon stays dark at dawn.", "s02", 2)],
+                ),
+            ],
+            vec![decided_part("c", "p")],
+            vec![
+                use_edge("old", "p", "Northlamp", "library", "s01", 1),
+                use_edge("new", "c", "Southlamp", "library", "s02", 2),
+            ],
+        );
+        assert_moved(&plan_quiet(&snap), "Harbor", "Tidepool", "beacon");
+    }
+
+    #[test]
+    fn tool_move_closes_a_rejected_old_slot_inside_the_turn_window() {
+        let mut snap = project_to_component();
+        snap.entities[0].slots[0].status = "rejected".into();
+        snap.entities[0].slots[0].first_turn = Some(2);
+        assert_moved(&plan_quiet(&snap), "Harbor", "Tidepool", "beacon");
+    }
+
+    #[test]
+    fn tool_move_keeps_a_shared_tool() {
+        let mut snap = project_to_component();
+        snap.entities
+            .push(move_person("s", "Lantern", "component", vec![]));
+        snap.parts.push(decided_part("s", "p"));
+        snap.uses
+            .push(use_edge("share", "s", "Northlamp.js", "library", "s01", 1));
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_considered_edge() {
+        let mut snap = project_to_component();
+        snap.uses[0].status = "considered".into();
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_rejected_edge() {
+        let mut snap = project_to_component();
+        snap.uses[0].status = "rejected".into();
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_pending_slot() {
+        let mut snap = project_to_component();
+        snap.entities[0].slots[0].pending = true;
+        assert_no_move(&plan_quiet(&snap));
+        let mut fresh = project_to_component();
+        fresh.entities[1].slots[0].pending = true;
+        assert_no_move(&plan_quiet(&fresh));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_pending_edge() {
+        let mut snap = project_to_component();
+        snap.uses[0].pending = true;
+        assert_no_move(&plan_quiet(&snap));
+        snap.uses[0].pending = false;
+        snap.uses[1].pending = true;
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_different_job() {
+        let mut snap = project_to_component();
+        snap.entities[1].slots[0].key = "storage_path".into();
+        assert_no_move(&plan_quiet(&snap));
+        let mut ruled = project_to_component();
+        ruled.entities[0].slots = vec![rule_slot("Store the beacon tonight.", "s01", 1)];
+        ruled.entities[1].slots = vec![rule_slot("Build the beacon tonight.", "s02", 2)];
+        assert_no_move(&plan_quiet(&ruled));
+    }
+
+    #[test]
+    fn tool_move_needs_an_anchor() {
+        let mut snap = project_to_component();
+        snap.uses.pop();
+        assert_no_move(&plan_quiet(&snap));
+        let mut bare = project_to_component();
+        bare.uses[1].description = "role=none".into();
+        assert_no_move(&plan_quiet(&bare));
+        let mut missing = project_to_component();
+        missing.uses[1].description.clear();
+        assert_no_move(&plan_quiet(&missing));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_tool_named_this_session() {
+        let plan = plan_move(&project_to_component(), "northlamp left the shore", &[]);
+        assert_no_move(&plan);
+    }
+
+    #[test]
+    fn tool_move_keeps_a_resighted_edge() {
+        let mut snap = project_to_component();
+        snap.uses[0].evidence_sessions.push("s02".into());
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_a_row_first_seen_this_session() {
+        let mut snap = project_to_component();
+        snap.uses[0].first_session = "s02".into();
+        snap.uses[0].evidence_sessions = vec!["s02".into()];
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_an_unlinked_subject() {
+        let mut snap = project_to_component();
+        snap.parts.clear();
+        assert_no_move(&plan_quiet(&snap));
+        let mut pending = project_to_component();
+        pending.parts[0].pending = true;
+        assert_no_move(&plan_quiet(&pending));
+        let mut considered = project_to_component();
+        considered.parts[0].status = "considered".into();
+        assert_no_move(&plan_quiet(&considered));
+    }
+
+    #[test]
+    fn tool_move_leaves_two_candidates_open() {
+        let mut snap = project_to_component();
+        snap.entities[0]
+            .slots
+            .push(setting_slot("beacon_mode", "night watch", "s01", 1));
+        snap.uses
+            .push(use_edge("other", "p", "Westlamp", "library", "s01", 1));
+        let plan = plan_quiet(&snap);
+        assert!(plan.closes.is_empty());
+        assert_eq!(plan.ambiguous.len(), 1);
+        assert_eq!(plan.ambiguous[0].subject, "Tidepool");
+        assert_eq!(plan.ambiguous[0].tool, "Southlamp");
+        assert_eq!(plan.ambiguous[0].count, 2);
+    }
+
+    #[test]
+    fn tool_move_keeps_a_different_role() {
+        let mut snap = project_to_component();
+        snap.uses[1].description = "role=database".into();
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_keeps_the_same_stem() {
+        let mut snap = project_to_component();
+        snap.uses[1].object = "Northlamp.js".into();
+        assert_no_move(&plan_quiet(&snap));
+    }
+
+    #[test]
+    fn tool_move_needs_a_row_in_the_turn_window() {
+        let mut wide = project_to_component();
+        wide.entities[0].slots[0].first_turn = Some(3);
+        assert_no_move(&plan_quiet(&wide));
+        let mut shifted = project_to_component();
+        shifted.entities[1].slots[0].first_turn = Some(3);
+        assert_no_move(&plan_quiet(&shifted));
+    }
+
+    async fn commit_harbor(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+    ) -> WriteStats {
+        let project = harbor_project();
+        let ctx = WriteCtx::new(&Quiet, &project, session, date, turns);
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    async fn run_tool_move(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+        flag: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = harbor_project();
+        let stub = Stub::new(Answer::Reply(r#"{"pairs":[]}"#.into()));
+        let mut ctx = WriteCtx::new(&stub, &project, session, date, turns);
+        ctx.tool_move_on = flag;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, facts, &WriteStats::default(), &stub, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    fn project_component_facts() -> (Vec<Fact>, Vec<Fact>) {
+        let old = vec![
+            library_use("Harbor", Kind::Project, "Northlamp", 1),
+            timed_setting("Harbor", Kind::Project, "beacon_style", "amber glass", 1),
+            at_turn(part_link("Tidepool", "Harbor", Kind::Project), 1),
+        ];
+        let new = vec![
+            library_use("Tidepool", Kind::Component, "Southlamp", 2),
+            timed_setting(
+                "Tidepool",
+                Kind::Component,
+                "beacon_style",
+                "cobalt glass",
+                2,
+            ),
+        ];
+        (old, new)
+    }
+
+    async fn play_move(
+        old: &[Fact],
+        new: &[Fact],
+        mention: &str,
+        flag: bool,
+    ) -> (
+        tempfile::TempDir,
+        GraphMemory,
+        IngestionReport,
+        Vec<String>,
+        u32,
+    ) {
+        let (tmp, gm) = open().await;
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, old).await;
+        let new_turns = [user_turn(2, mention)];
+        commit_harbor(&gm, "s02", "2026-04-02", &new_turns, new).await;
+        let (report, lines, reads) =
+            run_tool_move(&gm, "s02", "2026-04-02", &new_turns, new, flag).await;
+        (tmp, gm, report, lines, reads)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_closes_a_project_tool_onto_a_component() {
+        let (old, new) = project_component_facts();
+        let (_tmp, gm, report, lines, reads) =
+            play_move(&old, &new, "tidepool keeps a beacon", true).await;
+        assert_eq!(
+            use_ended(&gm, "Northlamp").await.as_deref(),
+            Some("s02:tool_move")
+        );
+        assert!(open_use(&gm, "Southlamp").await);
+        assert!(ended_key(&slots(&gm, "Harbor").await, "beacon_style").is_none());
+        assert!(ended_key(&slots(&gm, "Tidepool").await, "beacon_style").is_none());
+        assert_eq!(
+            lines,
+            vec!["consolidate tool move: Harbor uses Northlamp -> Tidepool uses Southlamp | job beacon"]
+        );
+        assert_eq!(report.consolidate.tool_move_closes, Some(1));
+        assert!(report.consolidate.tool_move_sweeps.is_none());
+        assert!(report.consolidate.tool_move_ambiguous.is_none());
+        assert_eq!(report.retirements.len(), 1);
+        assert_eq!(report.retirements[0].reason, "tool_move");
+        assert_eq!(report.retirements[0].subject, "Harbor");
+        assert_eq!(report.retirements[0].old_value, "Northlamp");
+        assert_eq!(report.retirements[0].new_value, "Southlamp");
+        assert_eq!(reads, 3);
+        assert_eq!(report.consolidate.errors, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_closes_a_component_tool_onto_the_project() {
+        let old = vec![
+            timed_setting("Harbor", Kind::Project, "archive_root", "shore", 1),
+            at_turn(part_link("Tidepool", "Harbor", Kind::Project), 1),
+            library_use("Tidepool", Kind::Component, "Northlamp", 1),
+            timed_setting(
+                "Tidepool",
+                Kind::Component,
+                "beacon_style",
+                "amber glass",
+                1,
+            ),
+        ];
+        let new = vec![
+            library_use("Harbor", Kind::Project, "Southlamp", 2),
+            timed_setting("Harbor", Kind::Project, "beacon_style", "cobalt glass", 2),
+        ];
+        let (_tmp, gm, report, lines, _) =
+            play_move(&old, &new, "harbor keeps a beacon", true).await;
+        assert_eq!(
+            use_ended(&gm, "Northlamp").await.as_deref(),
+            Some("s02:tool_move")
+        );
+        assert!(open_use(&gm, "Southlamp").await);
+        assert_eq!(report.consolidate.tool_move_closes, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate tool move: Tidepool uses Northlamp -> Harbor uses Southlamp | job beacon"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_closes_a_component_tool_onto_a_sibling() {
+        let old = vec![
+            timed_setting("Harbor", Kind::Project, "archive_root", "shore", 1),
+            at_turn(part_link("Tidepool", "Harbor", Kind::Project), 1),
+            at_turn(part_link("Lantern", "Harbor", Kind::Project), 1),
+            library_use("Tidepool", Kind::Component, "Northlamp", 1),
+            timed_setting(
+                "Tidepool",
+                Kind::Component,
+                "beacon_style",
+                "amber glass",
+                1,
+            ),
+        ];
+        let new = vec![
+            library_use("Lantern", Kind::Component, "Southlamp", 2),
+            timed_setting(
+                "Lantern",
+                Kind::Component,
+                "beacon_style",
+                "cobalt glass",
+                2,
+            ),
+        ];
+        let (_tmp, gm, report, lines, _) =
+            play_move(&old, &new, "lantern keeps a beacon", true).await;
+        assert_eq!(
+            use_ended(&gm, "Northlamp").await.as_deref(),
+            Some("s02:tool_move")
+        );
+        assert!(open_use(&gm, "Southlamp").await);
+        assert_eq!(report.consolidate.tool_move_closes, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate tool move: Tidepool uses Northlamp -> Lantern uses Southlamp | job beacon"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_off_leaves_the_edge_and_the_report() {
+        let (old, new) = project_component_facts();
+        let (_tmp, gm, report, lines, reads) =
+            play_move(&old, &new, "tidepool keeps a beacon", false).await;
+        assert!(open_use(&gm, "Northlamp").await);
+        assert!(open_use(&gm, "Southlamp").await);
+        let encoded = serde_json::to_value(&report.consolidate).unwrap();
+        assert!(encoded.get("tool_move_closes").is_none());
+        assert!(encoded.get("tool_move_sweeps").is_none());
+        assert!(encoded.get("tool_move_ambiguous").is_none());
+        assert!(lines.iter().all(|line| !line.contains("tool move")));
+        assert_eq!(reads, 0);
+        assert!(report.retirements.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_keeps_a_resighted_edge_in_the_store() {
+        let (old, new) = project_component_facts();
+        let (tmp, gm) = open().await;
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, &old).await;
+        let mut resight = old[0].clone();
+        resight.turn = 2;
+        let mut facts = vec![resight];
+        facts.extend(new);
+        let new_turns = [user_turn(2, "tidepool keeps a beacon")];
+        commit_harbor(&gm, "s02", "2026-04-02", &new_turns, &facts).await;
+        let (report, lines, _) =
+            run_tool_move(&gm, "s02", "2026-04-02", &new_turns, &facts, true).await;
+        assert!(open_use(&gm, "Northlamp").await);
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert!(lines.iter().all(|line| !line.contains("tool move")));
+        drop(tmp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_keeps_a_considered_edge_in_the_store() {
+        let (mut old, new) = project_component_facts();
+        old[0].status = "considered".into();
+        let (_tmp, gm, report, lines, _) =
+            play_move(&old, &new, "tidepool keeps a beacon", true).await;
+        assert!(open_use(&gm, "Northlamp").await);
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert!(lines.iter().all(|line| !line.contains("tool move")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_move_counts_a_read_error_and_closes_nothing() {
+        let (old, new) = project_component_facts();
+        let (tmp, gm) = open().await;
+        let old_turns = [user_turn(1, "harbor keeps a beacon")];
+        commit_harbor(&gm, "s01", "2026-04-01", &old_turns, &old).await;
+        let new_turns = [user_turn(2, "tidepool keeps a beacon")];
+        commit_harbor(&gm, "s02", "2026-04-02", &new_turns, &new).await;
+        gm.db()
+            .query("REMOVE TABLE relates_to")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (report, lines, _) =
+            run_tool_move(&gm, "s02", "2026-04-02", &new_turns, &new, true).await;
+        assert_eq!(report.consolidate.errors, 1);
+        assert!(report.consolidate.tool_move_closes.is_none());
+        assert!(lines.iter().all(|line| !line.contains("tool move")));
+        drop(tmp);
     }
 }
 

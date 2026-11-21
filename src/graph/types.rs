@@ -976,6 +976,18 @@ pub struct ConsolidateReport {
     /// None of those tools close. Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_takeover_ambiguous: Option<u32>,
+    /// Uses edges closed because a tool moved inside the project family.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_move_closes: Option<u32>,
+    /// Component uses closed because the project rejected or replaced that tool.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_move_sweeps: Option<u32>,
+    /// Moves with two or more candidates, or a sweep past the target cap.
+    /// None of those edges close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_move_ambiguous: Option<u32>,
     /// Rules closed because they still name a setting value that changed.
     /// Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1170,6 +1182,9 @@ impl ConsolidateReport {
             self.component_retire_ambiguous,
             self.component_takeover_closes,
             self.component_takeover_ambiguous,
+            self.tool_move_closes,
+            self.tool_move_sweeps,
+            self.tool_move_ambiguous,
             self.retire_reason_closes,
             self.retire_reason_ambiguous,
         ])

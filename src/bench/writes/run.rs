@@ -291,6 +291,9 @@ pub struct OptOuts {
     /// Write `consolidate_retire_reason = true` and imply `consolidate`.
     /// False leaves the key out. An opt-out run does not write it.
     pub consolidate_retire_reason: bool,
+    /// Write `consolidate_tool_move = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_tool_move: bool,
     /// Write `slot_forget = true`. False leaves the key out.
     /// Does not turn lasting forget on. An opt-out run does not write it.
     pub slot_forget: bool,
@@ -317,6 +320,7 @@ impl OptOuts {
             consolidate_retire_component: true,
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
+            consolidate_tool_move: false,
             slot_forget: false,
         }
     }
@@ -745,22 +749,25 @@ fn switch_lines(
     push_line(&mut lines, matched == KnownMatch::On, "known_match = true");
     push_switch(
         &mut lines,
-        with_component_takeover(
-            with_retire_reason(
-                writes_consolidate(
-                    consolidate,
-                    consolidate_links,
-                    consolidate_components,
-                    consolidate_key_rename,
-                    consolidate_replaces_cue,
-                    consolidate_replaces_departure,
-                    consolidate_orphan_sweep,
-                    consolidate_rule_fragments,
-                    consolidate_retire_component,
+        with_tool_move(
+            with_component_takeover(
+                with_retire_reason(
+                    writes_consolidate(
+                        consolidate,
+                        consolidate_links,
+                        consolidate_components,
+                        consolidate_key_rename,
+                        consolidate_replaces_cue,
+                        consolidate_replaces_departure,
+                        consolidate_orphan_sweep,
+                        consolidate_rule_fragments,
+                        consolidate_retire_component,
+                    ),
+                    opt_outs.consolidate_retire_reason,
                 ),
-                opt_outs.consolidate_retire_reason,
+                opt_outs.consolidate_component_takeover,
             ),
-            opt_outs.consolidate_component_takeover,
+            opt_outs.consolidate_tool_move,
         ),
         opt_outs.consolidate,
         "consolidate = true",
@@ -865,12 +872,21 @@ fn switch_lines(
         opt_outs.consolidate_retire_reason,
         "consolidate_retire_reason = true",
     );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_tool_move,
+        "consolidate_tool_move = true",
+    );
     push_line(&mut lines, opt_outs.slot_forget, "slot_forget = true");
     lines
 }
 
 fn with_component_takeover(consolidate: bool, takeover: bool) -> bool {
     consolidate || takeover
+}
+
+fn with_tool_move(consolidate: bool, tool_move: bool) -> bool {
+    consolidate || tool_move
 }
 
 fn with_retire_reason(consolidate: bool, retire_reason: bool) -> bool {
@@ -3533,6 +3549,73 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.component_takeover_apply());
         assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn consolidate_tool_move_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_tool_move: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(text.contains("consolidate_tool_move = true\n"), "{text}");
+        assert!(!text.contains("consolidate_component_takeover"), "{text}");
+        assert!(!text.contains("consolidate_retire_reason"), "{text}");
+        assert!(!text.contains("consolidate_retire_component"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.tool_move_apply());
+        assert!(graph.consolidate);
+
+        let quiet = tempfile::tempdir().unwrap();
+        let quiet_memory = quiet.path().join("memory");
+        fs::create_dir_all(&quiet_memory).unwrap();
+        apply_graph_switches(
+            &quiet_memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts::default(),
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&quiet_memory).exists());
     }
 
     #[test]

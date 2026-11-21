@@ -182,6 +182,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Close a project tool a component took over.
     /// Off leaves that pass unchanged and reads nothing for it.
     pub component_takeover_on: bool,
+    /// Close a live use when a tool moves inside the project family.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub tool_move_on: bool,
     /// Close a live rule that still names a replaced setting value.
     /// Off leaves that pass unchanged and reads nothing for it.
     pub retire_reason_on: bool,
@@ -218,6 +221,7 @@ impl<'a> WriteCtx<'a> {
             rule_fragments_on: false,
             retire_component_on: false,
             component_takeover_on: false,
+            tool_move_on: false,
             retire_reason_on: false,
         }
     }
