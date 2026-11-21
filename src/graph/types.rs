@@ -1258,6 +1258,16 @@ pub struct IngestionReport {
     /// Zero when the switch or the known block is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub known_key_bound: u32,
+    /// Settings whose trailing parenthetical detail was removed so the bare
+    /// value could pass the unchanged checks. Omitted when zero, including
+    /// when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub detail_tail_stripped: u32,
+    /// Candidates kept because a listed key-token form bound the key and no
+    /// earlier key-binding rule did. Omitted when zero, including when the
+    /// switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub key_form_bound: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
@@ -1476,6 +1486,21 @@ mod tests {
         assert_eq!(loaded.timing.unwrap().match_ms, None);
         assert_eq!(loaded.entities_created, 0);
         assert!(loaded.retirement_skips.is_empty());
+    }
+
+    #[test]
+    fn detail_and_key_form_counters_are_omitted_when_zero() {
+        let blank = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(blank.get("detail_tail_stripped").is_none(), "{blank}");
+        assert!(blank.get("key_form_bound").is_none(), "{blank}");
+        let report = IngestionReport {
+            detail_tail_stripped: 1,
+            key_form_bound: 2,
+            ..IngestionReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["detail_tail_stripped"], 1);
+        assert_eq!(encoded["key_form_bound"], 2);
     }
 
     #[test]

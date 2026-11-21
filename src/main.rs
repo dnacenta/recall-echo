@@ -333,6 +333,14 @@ enum BenchCommands {
         /// Implies nothing, and does not turn lasting forget on.
         #[arg(long)]
         slot_forget: bool,
+        /// Keep stated details inside the fact that owns them. Off unless set.
+        /// Implies nothing. Writes `extract_value_details = true` for this run only.
+        #[arg(long)]
+        extract_value_details: bool,
+        /// Bind listed key-token forms during pass-1 grounding. Off unless set.
+        /// Implies nothing. Writes `extract_key_forms = true` for this run only.
+        #[arg(long)]
+        extract_key_forms: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1175,6 +1183,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             ground_component_edges,
             recover_turns,
             slot_forget,
+            extract_value_details,
+            extract_key_forms,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1287,6 +1297,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_component_takeover,
                 consolidate_retire_reason,
                 slot_forget,
+                extract_value_details,
+                extract_key_forms,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2552,6 +2564,100 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn extract_value_details_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--extract-value-details",
+        ])
+        .expect("parse value details");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        extract_value_details,
+                        extract_key_forms,
+                        recover_turns,
+                        known_facts_context,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(extract_value_details);
+                assert!(!extract_key_forms);
+                assert!(!consolidate);
+                assert!(!recover_turns);
+                assert!(!known_facts_context);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--extract-value-details"), "{help}");
+        assert!(!help.contains("--no-extract-value-details"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn extract_key_forms_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--extract-key-forms",
+        ])
+        .expect("parse key forms");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        extract_value_details,
+                        extract_key_forms,
+                        recover_turns,
+                        known_facts_context,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(extract_key_forms);
+                assert!(!extract_value_details);
+                assert!(!consolidate);
+                assert!(!recover_turns);
+                assert!(!known_facts_context);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--extract-key-forms"), "{help}");
+        assert!(!help.contains("--no-extract-key-forms"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn known_key_binding_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2872,6 +2978,8 @@ mod tests {
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
             slot_forget: false,
+            extract_value_details: false,
+            extract_key_forms: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],
