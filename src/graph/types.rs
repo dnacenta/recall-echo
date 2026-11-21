@@ -984,6 +984,26 @@ pub struct ConsolidateReport {
     /// Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retire_reason_ambiguous: Option<u32>,
+    /// Settings closed because a new setting's `replaces` named them under another key.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_key_replaces_closes: Option<u32>,
+    /// New settings whose `replaces` named two or more earlier settings on other keys.
+    /// None of those settings close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_key_replaces_ambiguous: Option<u32>,
+    /// Cross-key matches skipped because the two keys name different units.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_key_replaces_unit_blocked: Option<u32>,
+    /// Rules closed because a new fact's `replaces` named them.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_replaces_closes: Option<u32>,
+    /// New facts whose `replaces` named two or more earlier rules.
+    /// None of those rules close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_replaces_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1172,6 +1192,11 @@ impl ConsolidateReport {
             self.component_takeover_ambiguous,
             self.retire_reason_closes,
             self.retire_reason_ambiguous,
+            self.cross_key_replaces_closes,
+            self.cross_key_replaces_ambiguous,
+            self.cross_key_replaces_unit_blocked,
+            self.rule_replaces_closes,
+            self.rule_replaces_ambiguous,
         ])
     }
 }
@@ -1741,6 +1766,37 @@ mod tests {
             ..ConsolidateReport::default()
         };
         assert!(zeros.is_blank());
+    }
+
+    #[test]
+    fn replaces_close_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("cross_key_replaces_closes").is_none());
+        assert!(encoded.get("cross_key_replaces_ambiguous").is_none());
+        assert!(encoded.get("cross_key_replaces_unit_blocked").is_none());
+        assert!(encoded.get("rule_replaces_closes").is_none());
+        assert!(encoded.get("rule_replaces_ambiguous").is_none());
+        let closed = ConsolidateReport {
+            cross_key_replaces_closes: Some(1),
+            rule_replaces_closes: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["cross_key_replaces_closes"], 1);
+        assert_eq!(encoded["rule_replaces_closes"], 1);
+        let zeros = ConsolidateReport {
+            cross_key_replaces_closes: Some(0),
+            cross_key_replaces_ambiguous: Some(0),
+            cross_key_replaces_unit_blocked: Some(0),
+            rule_replaces_closes: Some(0),
+            rule_replaces_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+        let encoded = serde_json::to_value(&zeros).unwrap();
+        assert_eq!(encoded["cross_key_replaces_unit_blocked"], 0);
+        assert_eq!(encoded["rule_replaces_ambiguous"], 0);
     }
 
     #[test]

@@ -354,6 +354,9 @@ pub(crate) async fn extract_session(
         write_ctx.retire_component_on = retire_component_enabled(memory_dir);
         write_ctx.component_takeover_on = component_takeover_enabled(memory_dir);
         write_ctx.retire_reason_on = retire_reason_enabled(memory_dir);
+        write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
+        write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
+        write_ctx.value_chars = known_value_chars(memory_dir);
         write_ctx.targets = targets;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
@@ -409,6 +412,9 @@ pub(crate) async fn extract_session(
         write_ctx.retire_component_on = retire_component_enabled(memory_dir);
         write_ctx.component_takeover_on = component_takeover_enabled(memory_dir);
         write_ctx.retire_reason_on = retire_reason_enabled(memory_dir);
+        write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
+        write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
+        write_ctx.value_chars = known_value_chars(memory_dir);
         let started = std::time::Instant::now();
         let stats = write::WriteStats::default();
         super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -577,6 +583,32 @@ fn retire_reason_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .retire_reason_apply()
+}
+
+fn cross_key_replaces_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .cross_key_replaces_apply()
+}
+
+fn rule_replaces_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .rule_replaces_apply()
+}
+
+fn known_value_chars(memory_dir: &Path) -> usize {
+    if crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .known_long_values_apply()
+    {
+        200
+    } else {
+        80
+    }
 }
 
 fn known_key_binding_enabled(memory_dir: &Path) -> bool {
@@ -2048,6 +2080,42 @@ mod tests {
         let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
         assert!(!encoded.contains("detail_tail_stripped"));
         assert!(!encoded.contains("key_form_bound"));
+    }
+
+    #[test]
+    fn replaces_closes_and_long_values_read_only_their_own_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!cross_key_replaces_enabled(dir.path()));
+        assert!(!rule_replaces_enabled(dir.path()));
+        assert_eq!(known_value_chars(dir.path()), 80);
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nconsolidate_cross_key_replaces = true\nconsolidate = false\n",
+        )
+        .unwrap();
+        assert!(!cross_key_replaces_enabled(dir.path()));
+        assert!(!rule_replaces_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nconsolidate_rule_replaces = true\n",
+        )
+        .unwrap();
+        assert!(!cross_key_replaces_enabled(dir.path()));
+        assert!(rule_replaces_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nknown_long_values = true\nknown_facts_context = false\n",
+        )
+        .unwrap();
+        assert_eq!(known_value_chars(dir.path()), 80);
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nknown_long_values = true\n",
+        )
+        .unwrap();
+        assert_eq!(known_value_chars(dir.path()), 200);
+        assert!(!cross_key_replaces_enabled(dir.path()));
+        assert!(!rule_replaces_enabled(dir.path()));
     }
 
     fn session(turns: Vec<Turn>) -> SessionInput {

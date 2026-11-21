@@ -300,6 +300,15 @@ pub struct OptOuts {
     /// Write `extract_key_forms = true`. False leaves the key out.
     /// Implies nothing, including `extract_value_details`. The prompt is unchanged.
     pub extract_key_forms: bool,
+    /// Write `consolidate_cross_key_replaces = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_cross_key_replaces: bool,
+    /// Write `consolidate_rule_replaces = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_rule_replaces: bool,
+    /// Write `known_long_values = true`. False leaves the key out.
+    /// Implies nothing. An opt-out run does not write it.
+    pub known_long_values: bool,
 }
 
 impl OptOuts {
@@ -326,6 +335,9 @@ impl OptOuts {
             slot_forget: false,
             extract_value_details: false,
             extract_key_forms: false,
+            consolidate_cross_key_replaces: false,
+            consolidate_rule_replaces: false,
+            known_long_values: false,
         }
     }
 }
@@ -757,22 +769,28 @@ fn switch_lines(
     push_line(&mut lines, matched == KnownMatch::On, "known_match = true");
     push_switch(
         &mut lines,
-        with_component_takeover(
-            with_retire_reason(
-                writes_consolidate(
-                    consolidate,
-                    consolidate_links,
-                    consolidate_components,
-                    consolidate_key_rename,
-                    consolidate_replaces_cue,
-                    consolidate_replaces_departure,
-                    consolidate_orphan_sweep,
-                    consolidate_rule_fragments,
-                    consolidate_retire_component,
+        with_rule_replaces(
+            with_cross_key_replaces(
+                with_component_takeover(
+                    with_retire_reason(
+                        writes_consolidate(
+                            consolidate,
+                            consolidate_links,
+                            consolidate_components,
+                            consolidate_key_rename,
+                            consolidate_replaces_cue,
+                            consolidate_replaces_departure,
+                            consolidate_orphan_sweep,
+                            consolidate_rule_fragments,
+                            consolidate_retire_component,
+                        ),
+                        opt_outs.consolidate_retire_reason,
+                    ),
+                    opt_outs.consolidate_component_takeover,
                 ),
-                opt_outs.consolidate_retire_reason,
+                opt_outs.consolidate_cross_key_replaces,
             ),
-            opt_outs.consolidate_component_takeover,
+            opt_outs.consolidate_rule_replaces,
         ),
         opt_outs.consolidate,
         "consolidate = true",
@@ -888,6 +906,21 @@ fn switch_lines(
         opt_outs.extract_key_forms,
         "extract_key_forms = true",
     );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_cross_key_replaces,
+        "consolidate_cross_key_replaces = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_rule_replaces,
+        "consolidate_rule_replaces = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.known_long_values,
+        "known_long_values = true",
+    );
     lines
 }
 
@@ -897,6 +930,14 @@ fn with_component_takeover(consolidate: bool, takeover: bool) -> bool {
 
 fn with_retire_reason(consolidate: bool, retire_reason: bool) -> bool {
     consolidate || retire_reason
+}
+
+fn with_cross_key_replaces(consolidate: bool, cross_key: bool) -> bool {
+    consolidate || cross_key
+}
+
+fn with_rule_replaces(consolidate: bool, rule_replaces: bool) -> bool {
+    consolidate || rule_replaces
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3716,6 +3757,132 @@ mod tests {
         assert!(graph.extract_key_forms);
         assert!(!graph.extract_value_details);
         assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn consolidate_cross_key_replaces_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_cross_key_replaces: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_cross_key_replaces = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_rule_replaces"), "{text}");
+        assert!(!text.contains("known_long_values"), "{text}");
+        assert!(!text.contains("consolidate_retire_reason"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.cross_key_replaces_apply());
+        assert!(!graph.rule_replaces_apply());
+        assert!(!graph.known_long_values_apply());
+    }
+
+    #[test]
+    fn consolidate_rule_replaces_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_rule_replaces: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_rule_replaces = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_cross_key_replaces"), "{text}");
+        assert!(!text.contains("known_long_values"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.rule_replaces_apply());
+        assert!(!graph.cross_key_replaces_apply());
+    }
+
+    #[test]
+    fn known_long_values_writes_only_its_key_and_implies_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                known_long_values: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nknown_long_values = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.known_long_values);
+        assert!(graph.known_long_values_apply());
+        assert!(graph.consolidate);
+        assert!(!text.contains("consolidate ="));
+        assert!(!graph.cross_key_replaces_apply());
+        assert!(!graph.rule_replaces_apply());
     }
 
     #[test]

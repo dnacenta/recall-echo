@@ -53,6 +53,9 @@ url = "ws://localhost:8787"   # server mode only
 # slot_forget = false         # forget every value of one subject and relation; off by default, ignored unless lasting_forget is on
 # extract_value_details = false # keep stated details inside the fact that owns them; off by default; implies nothing
 # extract_key_forms = false   # bind min/minimum, max/maximum, width/wide, license/licence in pass 1; off by default; implies nothing and does not change the prompt
+# consolidate_cross_key_replaces = false # close one earlier setting on another key that replaces names; off by default, ignored unless consolidate is on
+# consolidate_rule_replaces = false # close one earlier rule that replaces names; off by default, ignored unless consolidate is on
+# known_long_values = false   # show known-fact values up to 200 characters instead of 80; off by default, ignored unless known_facts_context is on
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

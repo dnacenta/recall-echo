@@ -972,6 +972,27 @@ pub struct GraphSection {
     /// on, and it does nothing unless that flag is also on.
     #[serde(default = "default_slot_forget", skip_serializing_if = "is_false")]
     pub slot_forget: bool,
+    /// Close one earlier setting on another key when `replaces` names its value.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_cross_key_replaces",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_cross_key_replaces: bool,
+    /// Close one earlier rule when a new fact's `replaces` names it.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    #[serde(
+        default = "default_consolidate_rule_replaces",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_rule_replaces: bool,
+    /// Show known-fact values up to 200 characters instead of 80.
+    /// Off unless set, and ignored unless [`Self::known_facts_context`] is also set.
+    #[serde(
+        default = "default_known_long_values",
+        skip_serializing_if = "is_false"
+    )]
+    pub known_long_values: bool,
     /// Keep stated details inside the fact that owns them.
     /// Off unless set. Stands alone: it does not turn any other switch on.
     #[serde(
@@ -1022,6 +1043,9 @@ impl Default for GraphSection {
             recover_turns: default_recover_turns(),
             lasting_forget: default_lasting_forget(),
             slot_forget: default_slot_forget(),
+            consolidate_cross_key_replaces: default_consolidate_cross_key_replaces(),
+            consolidate_rule_replaces: default_consolidate_rule_replaces(),
+            known_long_values: default_known_long_values(),
             extract_value_details: default_extract_value_details(),
             extract_key_forms: default_extract_key_forms(),
         }
@@ -1103,6 +1127,24 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn retire_reason_apply(&self) -> bool {
         self.consolidate && self.consolidate_retire_reason
+    }
+
+    /// A cross-key `replaces` close runs only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn cross_key_replaces_apply(&self) -> bool {
+        self.consolidate && self.consolidate_cross_key_replaces
+    }
+
+    /// A rule `replaces` close runs only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn rule_replaces_apply(&self) -> bool {
+        self.consolidate && self.consolidate_rule_replaces
+    }
+
+    /// Known values are shown at 200 characters only when the known block is on as well.
+    #[must_use]
+    pub(crate) fn known_long_values_apply(&self) -> bool {
+        self.known_facts_context && self.known_long_values
     }
 
     /// A shown known row can bind a decided setting key only when the known
@@ -1489,6 +1531,18 @@ fn default_lasting_forget() -> bool {
 }
 
 fn default_slot_forget() -> bool {
+    false
+}
+
+fn default_consolidate_cross_key_replaces() -> bool {
+    false
+}
+
+fn default_consolidate_rule_replaces() -> bool {
+    false
+}
+
+fn default_known_long_values() -> bool {
     false
 }
 
@@ -2042,6 +2096,15 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.recover_turns", flag_recover_turns),
     ("graph.lasting_forget", flag_lasting_forget),
     ("graph.slot_forget", flag_slot_forget),
+    (
+        "graph.consolidate_cross_key_replaces",
+        flag_consolidate_cross_key_replaces,
+    ),
+    (
+        "graph.consolidate_rule_replaces",
+        flag_consolidate_rule_replaces,
+    ),
+    ("graph.known_long_values", flag_known_long_values),
     ("graph.extract_value_details", flag_extract_value_details),
     ("graph.extract_key_forms", flag_extract_key_forms),
 ];
@@ -2141,6 +2204,18 @@ fn flag_lasting_forget(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_slot_forget(graph: &mut GraphSection) -> &mut bool {
     &mut graph.slot_forget
+}
+
+fn flag_consolidate_cross_key_replaces(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_cross_key_replaces
+}
+
+fn flag_consolidate_rule_replaces(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_rule_replaces
+}
+
+fn flag_known_long_values(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.known_long_values
 }
 
 fn flag_extract_value_details(graph: &mut GraphSection) -> &mut bool {
@@ -4067,6 +4142,142 @@ settle_secs = 300
         assert!(cfg.graph.as_ref().expect("graph").known_key_binding);
         assert!(cfg.set_key("graph.known_key_binding", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").known_key_binding);
+    }
+
+    #[test]
+    fn cross_key_replaces_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_cross_key_replaces());
+        assert!(!GraphSection::default().consolidate_cross_key_replaces);
+        assert!(!GraphSection::default().cross_key_replaces_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().cross_key_replaces_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_cross_key_replaces"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nconsolidate_cross_key_replaces = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.consolidate_cross_key_replaces);
+        assert!(true_graph.consolidate);
+        assert!(true_graph.cross_key_replaces_apply());
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("consolidate_cross_key_replaces = true"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_cross_key_replaces = false\n")
+                .expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_cross_key_replaces);
+        assert!(!false_graph.cross_key_replaces_apply());
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_cross_key_replaces"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_cross_key_replaces", "true")
+            .unwrap();
+        assert!(cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .cross_key_replaces_apply());
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .cross_key_replaces_apply());
+        assert!(
+            cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_cross_key_replaces
+        );
+        cfg.set_key("graph.consolidate", "true").unwrap();
+        assert!(cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .cross_key_replaces_apply());
+        cfg.set_key("graph.consolidate_cross_key_replaces", "false")
+            .unwrap();
+        assert!(!cfg
+            .graph
+            .as_ref()
+            .expect("graph")
+            .cross_key_replaces_apply());
+        assert!(cfg
+            .set_key("graph.consolidate_cross_key_replaces", "yes")
+            .is_err());
+        assert!(
+            !cfg.graph
+                .as_ref()
+                .expect("graph")
+                .consolidate_cross_key_replaces
+        );
+    }
+
+    #[test]
+    fn rule_replaces_defaults_off_round_trips_and_needs_consolidate() {
+        assert!(!default_consolidate_rule_replaces());
+        assert!(!GraphSection::default().consolidate_rule_replaces);
+        assert!(!GraphSection::default().rule_replaces_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().rule_replaces_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_rule_replaces"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nconsolidate_rule_replaces = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.consolidate_rule_replaces);
+        assert!(true_graph.rule_replaces_apply());
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_rule_replaces", "true")
+            .unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").rule_replaces_apply());
+        cfg.set_key("graph.consolidate", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").rule_replaces_apply());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_rule_replaces);
+        cfg.set_key("graph.consolidate_rule_replaces", "false")
+            .unwrap();
+        assert!(cfg
+            .set_key("graph.consolidate_rule_replaces", "yes")
+            .is_err());
+        assert!(!cfg.graph.as_ref().expect("graph").consolidate_rule_replaces);
+    }
+
+    #[test]
+    fn known_long_values_defaults_off_round_trips_and_needs_the_known_block() {
+        assert!(!default_known_long_values());
+        assert!(!GraphSection::default().known_long_values);
+        assert!(!GraphSection::default().known_long_values_apply());
+
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().known_long_values_apply());
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("known_long_values"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nknown_long_values = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.known_long_values);
+        assert!(true_graph.known_facts_context);
+        assert!(true_graph.known_long_values_apply());
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("known_long_values = true"));
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.known_long_values", "true").unwrap();
+        assert!(cfg.graph.as_ref().expect("graph").known_long_values_apply());
+        cfg.set_key("graph.known_facts_context", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").known_long_values_apply());
+        assert!(cfg.graph.as_ref().expect("graph").known_long_values);
+        cfg.set_key("graph.known_long_values", "false").unwrap();
+        assert!(cfg.set_key("graph.known_long_values", "yes").is_err());
+        assert!(!cfg.graph.as_ref().expect("graph").known_long_values);
     }
 
     #[test]

@@ -312,6 +312,18 @@ enum BenchCommands {
         /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
         #[arg(long)]
         consolidate_retire_reason: bool,
+        /// Close one earlier setting under a different key that replaces names.
+        /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
+        #[arg(long)]
+        consolidate_cross_key_replaces: bool,
+        /// Close one earlier rule that replaces names.
+        /// Implies `--consolidate`. Off unless set. Does not turn on any other switch.
+        #[arg(long)]
+        consolidate_rule_replaces: bool,
+        /// Show known-fact values up to 200 characters. Off unless set.
+        /// Implies nothing. Does not turn on `--known-facts-context`.
+        #[arg(long)]
+        known_long_values: bool,
         /// Bind a decided setting key from a shown known row. On unless
         /// `--no-known-key-binding`. Does not turn on `--known-facts-context`.
         #[arg(long)]
@@ -360,6 +372,8 @@ enum BenchCommands {
                 "consolidate_retire_component",
                 "consolidate_component_takeover",
                 "consolidate_retire_reason",
+                "consolidate_cross_key_replaces",
+                "consolidate_rule_replaces",
             ]
         )]
         no_consolidate: bool,
@@ -1185,6 +1199,9 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             slot_forget,
             extract_value_details,
             extract_key_forms,
+            consolidate_cross_key_replaces,
+            consolidate_rule_replaces,
+            known_long_values,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1299,6 +1316,9 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 slot_forget,
                 extract_value_details,
                 extract_key_forms,
+                consolidate_cross_key_replaces,
+                consolidate_rule_replaces,
+                known_long_values,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2522,6 +2542,145 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn consolidate_cross_key_replaces_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-cross-key-replaces",
+        ])
+        .expect("parse cross key replaces");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_cross_key_replaces,
+                        consolidate_rule_replaces,
+                        known_long_values,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_cross_key_replaces);
+                assert!(!consolidate);
+                assert!(!consolidate_rule_replaces);
+                assert!(!known_long_values);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let rejected = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--consolidate-cross-key-replaces",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "opt-out and cross key should be rejected"
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn consolidate_rule_replaces_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-rule-replaces",
+        ])
+        .expect("parse rule replaces");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_rule_replaces,
+                        consolidate_cross_key_replaces,
+                        known_long_values,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_rule_replaces);
+                assert!(!consolidate);
+                assert!(!consolidate_cross_key_replaces);
+                assert!(!known_long_values);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let rejected = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--consolidate-rule-replaces",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "opt-out and rule replaces should be rejected"
+        );
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn known_long_values_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--known-long-values",
+        ])
+        .expect("parse known long values");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        known_long_values,
+                        consolidate_rule_replaces,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(known_long_values);
+                assert!(!consolidate);
+                assert!(!consolidate_rule_replaces);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let accepted = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--known-long-values",
+        ]);
+        assert!(accepted.is_ok(), "long values imply nothing");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn slot_forget_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2980,6 +3139,9 @@ mod tests {
             slot_forget: false,
             extract_value_details: false,
             extract_key_forms: false,
+            consolidate_cross_key_replaces: false,
+            consolidate_rule_replaces: false,
+            known_long_values: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],
