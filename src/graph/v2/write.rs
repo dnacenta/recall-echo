@@ -191,11 +191,9 @@ pub(crate) struct WriteCtx<'a> {
     pub cross_key_replaces_on: bool,
     /// Close one earlier rule that `replaces` names.
     /// Off leaves that pass unchanged and reads nothing for it.
-    #[allow(dead_code)]
     pub rule_replaces_on: bool,
     /// Characters kept from a known value, and the cut width the replaces closes use.
     /// 80 unless the long-value switch applies.
-    #[allow(dead_code)]
     pub value_chars: usize,
 }
 
@@ -2199,7 +2197,7 @@ pub(crate) fn keys_match(left: &str, right: &str) -> bool {
 }
 
 /// The key stored on a new slot: trimmed and lower case.
-fn fold_key(key: &str) -> String {
+pub(crate) fn fold_key(key: &str) -> String {
     key.trim().to_lowercase()
 }
 

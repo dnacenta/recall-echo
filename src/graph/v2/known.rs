@@ -300,8 +300,23 @@ fn render_line(row: &KnownRow) -> String {
 /// Every stored field is one short line. A fake turn marker is rewritten before the
 /// role label is broken, because `[T2] USER:` is not a leading `USER:`.
 fn clean_value(raw: &str) -> String {
+    cut_value(raw, VALUE_CHARS)
+}
+
+/// The text the known-facts block shows for `raw` at `width`.
+///
+/// Subject, key and role stay at [`VALUE_CHARS`]. A replaces close matches this
+/// text, so the cut and the block cannot drift.
+#[must_use]
+pub(crate) fn cut_value(raw: &str, width: usize) -> String {
     let shown = neutralise_speaker(&rewrite_markers(&flatten(raw)));
-    shown.chars().take(VALUE_CHARS).collect()
+    shown.chars().take(width).collect()
+}
+
+/// True when `raw`, after [`flatten`], is longer than `width` and is therefore a cut.
+#[must_use]
+pub(crate) fn flattened_exceeds(raw: &str, width: usize) -> bool {
+    flatten(raw).chars().count() > width
 }
 
 fn flatten(raw: &str) -> String {
