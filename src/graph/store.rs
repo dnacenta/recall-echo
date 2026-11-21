@@ -377,6 +377,14 @@ pub(crate) async fn define_derived_from(db: &Surreal<Db>) -> Result<(), GraphErr
     Ok(())
 }
 
+/// Allow `details` on a `uses` edge. Called only when a row is about to store one.
+pub(crate) async fn define_edge_details(db: &Surreal<Db>) -> Result<(), GraphError> {
+    db.query("DEFINE FIELD IF NOT EXISTS details ON relates_to TYPE option<string>")
+        .await?
+        .check()?;
+    Ok(())
+}
+
 /// What one migration pass did. Both counts are zero on an already current
 /// store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

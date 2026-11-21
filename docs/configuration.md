@@ -51,6 +51,7 @@ url = "ws://localhost:8787"   # server mode only
 # recover_turns = false       # list raw-turn values missing from the store; off by default, because it makes extra model calls; never writes
 # lasting_forget = false      # keep a confirmed forget until --unforget; off by default; with it off the forget file is not read
 # slot_forget = false         # forget every value of one subject and relation; off by default, ignored unless lasting_forget is on
+# canonical_details = false   # copy a closed sibling detail onto the decided row; off by default; implies nothing
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

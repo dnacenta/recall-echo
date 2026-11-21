@@ -618,7 +618,7 @@ fn first_text<'a>(
 }
 
 fn value_field(key: &str) -> bool {
-    matches!(key, "to" | "value" | "object" | "object_name")
+    matches!(key, "to" | "value" | "object" | "object_name" | "details")
 }
 
 fn mask_slot_value(set: &ForgetSet, value: serde_json::Value) -> serde_json::Value {
@@ -654,6 +654,7 @@ fn text_field(key: &str) -> bool {
             | "name"
             | "from"
             | "to"
+            | "details"
     )
 }
 
@@ -1657,6 +1658,25 @@ mod tests {
         assert_eq!(masked["abstract_text"], "Ada uses [forgotten].");
         assert_eq!(masked["id"], "entity:rust");
         assert_eq!(masked["score"], 1);
+        let detailed = serde_json::json!({
+            "from": "Ada",
+            "rel_type": "uses",
+            "to": "Rust",
+            "details": "kept Rust beside Go"
+        });
+        let masked_row = mask_json(&set, detailed);
+        assert_eq!(masked_row["to"], "[forgotten]");
+        assert_eq!(masked_row["details"], "kept [forgotten] beside Go");
+        let slot = live_set(&[slot_record("Ada", "uses", &["Rust"], AT)]);
+        let slotted = serde_json::json!({
+            "from": "Ada",
+            "rel_type": "uses",
+            "to": "Rust",
+            "details": "kept Rust beside Go"
+        });
+        let masked_slot = mask_json(&slot, slotted);
+        assert_eq!(masked_slot["to"], "[forgotten]");
+        assert_eq!(masked_slot["details"], "[forgotten]");
         let entity = live_set(&[entity_record("Vim", AT)]);
         let named = serde_json::json!({"name": "Vim"});
         assert_eq!(mask_json(&entity, named)["name"], "Vim");

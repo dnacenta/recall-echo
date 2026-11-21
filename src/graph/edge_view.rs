@@ -63,7 +63,7 @@ impl EdgeView {
         Self {
             id: relationship.id_string(),
             from,
-            to,
+            to: super::util::render_detailed(&to, relationship.details.as_deref()),
             rel_type: relationship.rel_type.clone(),
             description: relationship.description.clone(),
             confidence: relationship.confidence,
@@ -210,6 +210,7 @@ mod tests {
             self_reinforcements,
             last_reinforced: None,
             source: Some("archive-log-007".into()),
+            details: None,
         }
     }
 
@@ -217,6 +218,13 @@ mod tests {
     fn a_view_carries_the_evidence_and_not_only_the_number() {
         let view = EdgeView::of(&relationship(0.9, Some(4)), "Rust".into(), "Cargo".into());
         assert_eq!(view.arrow(), "Rust —[USES]→ Cargo");
+        let mut detailed = relationship(0.9, Some(4));
+        detailed.details = Some("range-over-func iterators".into());
+        let view = EdgeView::of(&detailed, "Rust".into(), "1.23".into());
+        assert_eq!(
+            view.arrow(),
+            "Rust —[USES]→ 1.23 (range-over-func iterators)"
+        );
         assert_eq!(view.confidence, 0.9);
         assert_eq!(view.evidence, 20.0);
         assert_eq!(view.self_reinforcements, 4);

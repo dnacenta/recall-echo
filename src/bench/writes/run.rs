@@ -294,6 +294,9 @@ pub struct OptOuts {
     /// Write `slot_forget = true`. False leaves the key out.
     /// Does not turn lasting forget on. An opt-out run does not write it.
     pub slot_forget: bool,
+    /// Write `canonical_details = true`. False leaves the key out.
+    /// Implies nothing else. An opt-out run does not write it.
+    pub canonical_details: bool,
 }
 
 impl OptOuts {
@@ -318,6 +321,7 @@ impl OptOuts {
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
             slot_forget: false,
+            canonical_details: false,
         }
     }
 }
@@ -866,6 +870,11 @@ fn switch_lines(
         "consolidate_retire_reason = true",
     );
     push_line(&mut lines, opt_outs.slot_forget, "slot_forget = true");
+    push_line(
+        &mut lines,
+        opt_outs.canonical_details,
+        "canonical_details = true",
+    );
     lines
 }
 
@@ -1252,11 +1261,15 @@ async fn snapshot(
         let prior_alpha = starting_alpha(&id, beta, first_beta);
         let (assistant_steps, self_steps) = corroboration_steps(edge_evidence.get(&id));
         let live = relationship.valid_until.is_none() && !pending_edge_ids.contains(&id);
+        let object_name = names.name_of(gm.db(), &to_id).await?;
         edges.push(ObservedEdge {
             id,
             subject: names.name_of(gm.db(), &from_id).await?,
             relation: relationship.rel_type.clone(),
-            object: names.name_of(gm.db(), &to_id).await?,
+            object: crate::graph::util::render_detailed(
+                &object_name,
+                relationship.details.as_deref(),
+            ),
             live,
             alpha: evidence.alpha(),
             beta,
@@ -1329,7 +1342,7 @@ async fn snapshot(
                 id,
                 subject: entity.name.clone(),
                 relation: slot_relation(predicate, key),
-                object: value.to_string(),
+                object: crate::graph::util::render_detailed(value, slot_text_opt(slot, "details")),
                 live,
                 alpha: json_number(slot.get("alpha")),
                 beta,
@@ -1377,11 +1390,12 @@ async fn relationship_status_row(
     let to_id = crate::graph::edge_view::record_id(&relationship.to_id);
     let pending_row = pending.contains(&id);
     let status = stored.get(&id).map(String::as_str);
+    let object_name = names.name_of(gm.db(), &to_id).await?;
     Ok(StatusRow {
         id: id.clone(),
         subject: names.name_of(gm.db(), &from_id).await?,
         relation: relationship.rel_type.clone(),
-        object: names.name_of(gm.db(), &to_id).await?,
+        object: crate::graph::util::render_detailed(&object_name, relationship.details.as_deref()),
         live: relation_live(relationship.valid_until.is_none(), pending_row, status),
         status: status.map(str::to_string),
         pending: pending_row,
@@ -1481,7 +1495,7 @@ fn status_row_for_slot(
         id,
         subject: name.to_string(),
         relation: slot_relation(predicate, key),
-        object: value.to_string(),
+        object: crate::graph::util::render_detailed(value, slot_text_opt(slot, "details")),
         live: slot_live(slot),
         status: present_status(Some(status.to_string())),
         pending: slot_pending(slot),
@@ -1492,6 +1506,10 @@ fn slot_text<'a>(slot: &'a serde_json::Value, field: &str) -> &'a str {
     slot.get(field)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
+}
+
+fn slot_text_opt<'a>(slot: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    slot.get(field).and_then(serde_json::Value::as_str)
 }
 
 fn slot_status_text(slot: &serde_json::Value) -> &str {
@@ -3616,6 +3634,47 @@ mod tests {
         assert!(graph.consolidate, "the default consolidation stack stays");
         assert!(!text.contains("consolidate"));
         assert!(!text.contains("lasting_forget"));
+    }
+
+    #[test]
+    fn canonical_details_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                canonical_details: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\ncanonical_details = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.canonical_details);
+        assert!(!graph.slot_forget);
+        assert!(!graph.lasting_forget);
+        assert!(graph.consolidate, "the default consolidation stack stays");
+        assert!(!text.contains("consolidate"));
+        assert!(!text.contains("slot_forget"));
+        assert!(!text.contains("known_facts_context"));
     }
 
     #[test]

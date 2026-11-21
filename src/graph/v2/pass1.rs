@@ -581,6 +581,14 @@ fn recover_turns_enabled(memory_dir: &Path) -> bool {
         .recover_applies()
 }
 
+#[allow(dead_code)] // The merge pass calls this. Until then a flag-off run does not.
+fn canonical_details_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .canonical_details
+}
+
 /// Drop facts that match a live forget record. Flag off does not open the file.
 fn without_forgotten(
     memory_dir: &Path,
@@ -1437,6 +1445,7 @@ fn carrier(confidence: f64, cited: &super::ground::Cited) -> Fact {
         confidence,
         provenance: from_role(cited.role),
         replaces: String::new(),
+        details: String::new(),
     }
 }
 
@@ -1462,6 +1471,7 @@ fn slot_fact(subject: &str, kind: Kind, predicate: Predicate, value: &str, carri
         confidence: carrier.confidence,
         provenance: carrier.provenance,
         replaces: String::new(),
+        details: String::new(),
     }
 }
 
@@ -1487,6 +1497,7 @@ fn edge_fact(
         confidence: carrier.confidence,
         provenance: carrier.provenance,
         replaces: String::new(),
+        details: String::new(),
     }
 }
 
@@ -1683,6 +1694,24 @@ mod tests {
     /// The pass-1 system prompt from before the known-facts block (631c5dc).
     const SYSTEM_BEFORE_KNOWN_BLOCK: &str =
         include_str!("../../../tests/fixtures/pass1/system-pre-known-block.txt");
+
+    #[test]
+    fn canonical_details_enabled_reads_only_its_flag() {
+        let dir = tempfile::tempdir().expect("temp");
+        assert!(!canonical_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ncanonical_details = true\n",
+        )
+        .expect("config");
+        assert!(canonical_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\ncanonical_details = false\n",
+        )
+        .expect("config");
+        assert!(!canonical_details_enabled(dir.path()));
+    }
 
     #[test]
     fn off_system_prompt_matches_the_golden_pre_block_prompt() {
@@ -2586,6 +2615,7 @@ mod tests {
                 confidence: 0.9,
                 provenance: Provenance::User,
                 replaces: String::new(),
+                details: String::new(),
             },
             Fact {
                 subject_name: "export command".into(),
@@ -2601,6 +2631,7 @@ mod tests {
                 confidence: 0.9,
                 provenance: Provenance::User,
                 replaces: String::new(),
+                details: String::new(),
             },
         ];
         let tmp = tempfile::tempdir().unwrap();
@@ -4887,6 +4918,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         };
         let ctx = super::write::WriteCtx::new(&quiet, &project, "s1", "2026-04-01", &canvas_turns);
         super::write::write_facts(gm, &ctx, &[canvas])
@@ -4911,6 +4943,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         };
         let mut ctx =
             super::write::WriteCtx::new(&quiet, &project, "s2", "2026-04-02", &linen_turns);
@@ -5260,6 +5293,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -5993,6 +6027,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         };
         let quiet = Scripted(REPLY);
         let ctx = write::WriteCtx::new(&quiet, &project, "s0", "2026-01-01", &[]);
@@ -6056,6 +6091,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: replaces.into(),
+            details: String::new(),
         }
     }
 

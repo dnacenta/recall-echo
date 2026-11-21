@@ -1630,6 +1630,7 @@ mod tests {
             confidence: 0.9,
             provenance: crate::graph::Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 

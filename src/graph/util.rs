@@ -19,6 +19,16 @@ where
     Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
 }
 
+/// The object a reader sees. A bare value is unchanged. Details append as
+/// `value (details)`.
+#[must_use]
+pub(crate) fn render_detailed(value: &str, details: Option<&str>) -> String {
+    match details.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(details) => format!("{value} ({details})"),
+        None => value.to_string(),
+    }
+}
+
 /// Strip markdown code fencing (```json ... ```) from LLM responses.
 #[must_use]
 pub fn strip_markdown_fencing(text: &str) -> String {
@@ -107,6 +117,17 @@ pub fn merge_json_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_object_renders_unchanged_and_details_append() {
+        assert_eq!(render_detailed("1.23", None), "1.23");
+        assert_eq!(render_detailed("1.23", Some("")), "1.23");
+        assert_eq!(render_detailed("1.23", Some("   ")), "1.23");
+        assert_eq!(
+            render_detailed("1.23", Some("range-over-func iterators")),
+            "1.23 (range-over-func iterators)"
+        );
+    }
 
     #[test]
     fn strip_fencing_json() {

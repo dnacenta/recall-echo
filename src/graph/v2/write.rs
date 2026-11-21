@@ -26,7 +26,7 @@ use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Proven
 use super::super::crud;
 use super::super::error::GraphError;
 use super::super::llm::{LlmProvider, TokenUsage};
-use super::super::store::{define_derived_from, Db};
+use super::super::store::{define_derived_from, define_edge_details, Db};
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
 use super::ground::punctuation_literal;
@@ -365,6 +365,9 @@ pub(crate) async fn write_facts(
     // The field has to outlive a conflict rollback, or the retry cannot store a list.
     if ctx.links_on {
         define_derived_from(gm.db()).await?;
+    }
+    if facts.iter().any(fact_has_edge_details) {
+        define_edge_details(gm.db()).await?;
     }
     commit_writes(gm, ctx, facts, &resolution, resolve_ms).await
 }
@@ -908,6 +911,13 @@ impl<'a> Attempt<'a> {
         } else {
             ""
         };
+        let details = edge_details(fact);
+        // Empty keeps the statement byte-for-byte with a row that has no details.
+        let details_clause = if details.is_empty() {
+            String::new()
+        } else {
+            "\n                details = $details,".to_string()
+        };
         let statement = format!(
             r#"
             LET $from = type::record($from_id);
@@ -925,7 +935,7 @@ impl<'a> Attempt<'a> {
                 source = NONE,
                 status = $status,
                 provenance = $provenance,
-                ended_by = NONE,
+                ended_by = NONE,{details_clause}
                 {pending_line}
                 {links_line}
                 evidence = $evidence
@@ -949,6 +959,9 @@ impl<'a> Attempt<'a> {
         }
         if let Some(links) = links {
             request = request.bind(("derived_from", json!(links)));
+        }
+        if !details.is_empty() {
+            request = request.bind(("details", details));
         }
         request.await?.check()?;
         self.forget_edges(&subject.id, &object.id);
@@ -2733,7 +2746,7 @@ fn json_usize(value: Option<&Value>) -> Option<usize> {
 fn new_slot(session_id: &str, date: &str, fact: &Fact) -> Value {
     let (provenance, label) = provenance_of(fact.provenance);
     let evidence = prior_evidence(provenance);
-    json!({
+    let mut slot = json!({
         "predicate": fact.predicate.as_str(),
         "key": fact.key,
         "value": fact.object_name,
@@ -2746,7 +2759,34 @@ fn new_slot(session_id: &str, date: &str, fact: &Fact) -> Value {
         "beta": evidence.beta(),
         "self_reinforcements": 0,
         "evidence": [evidence_item(session_id, fact, label)],
-    })
+    });
+    if let Some(details) = filled_details(&fact.details) {
+        if let Some(object) = slot.as_object_mut() {
+            object.insert("details".to_string(), json!(details));
+        }
+    }
+    slot
+}
+
+/// Details stored on a `uses` edge. Other predicates, and an empty string, store none.
+fn edge_details(fact: &Fact) -> String {
+    if fact.predicate != Predicate::Uses {
+        return String::new();
+    }
+    filled_details(&fact.details).unwrap_or("").to_string()
+}
+
+fn fact_has_edge_details(fact: &Fact) -> bool {
+    !edge_details(fact).is_empty()
+}
+
+fn filled_details(details: &str) -> Option<&str> {
+    let trimmed = details.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn provenance_of(provenance: Provenance) -> (Provenance, &'static str) {
@@ -3375,6 +3415,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -3393,6 +3434,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -3464,7 +3506,71 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: replaces.into(),
+            details: String::new(),
         }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn a_write_omits_empty_details_and_keeps_a_set_detail_off_the_value() {
+        let (_tmp, gm) = open_store().await;
+        let mut bare = decided_slot("msrv", "1.23", 1);
+        bare.details = "   ".into();
+        let mut part = raw_edge(Predicate::PartOf, "worker", Kind::Component, "app");
+        part.details = "not an edge detail".into();
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-03",
+            &[
+                bare,
+                uses_named("app", Kind::Project, "cargo", "decided", "", 1),
+                part,
+            ],
+        )
+        .await
+        .unwrap();
+        let slots = slots_of(&gm, "app").await;
+        assert_eq!(slots.len(), 1, "{slots:?}");
+        assert_eq!(slots[0]["value"], "1.23");
+        assert!(slots[0].get("details").is_none(), "{slots:?}");
+        let rows = edge_rows(&gm).await;
+        assert!(
+            rows.iter().all(|row| row.get("details").is_none()),
+            "{rows:?}"
+        );
+
+        let (_tmp, gm) = open_store().await;
+        let mut setting = decided_slot("msrv", "1.23", 1);
+        setting.details = "range-over-func iterators".into();
+        let mut uses = uses_named("app", Kind::Project, "cargo", "decided", "", 1);
+        uses.details = "left http".into();
+        write_session(&gm, "s1", "2026-04-03", &[setting, uses])
+            .await
+            .unwrap();
+        let slots = slots_of(&gm, "app").await;
+        assert_eq!(slots[0]["value"], "1.23");
+        assert_eq!(slots[0]["details"], "range-over-func iterators");
+        let rows = edge_rows(&gm).await;
+        let detailed = rows
+            .iter()
+            .find(|row| row["rel_type"] == "uses")
+            .expect("uses");
+        assert_eq!(detailed["details"], "left http");
+        let rels = crud::list_all_relationships(gm.db()).await.unwrap();
+        let read = rels
+            .iter()
+            .find(|rel| rel.rel_type == "uses")
+            .expect("uses");
+        assert_eq!(read.details.as_deref(), Some("left http"));
+        assert!(values_equal("1.23", "1.23"));
+        assert!(!values_equal("1.23", "1.23 (range-over-func iterators)"));
+    }
+
+    #[cfg(feature = "embedded")]
+    async fn edge_rows(gm: &GraphMemory) -> Vec<Value> {
+        let mut response = gm.db().query("SELECT * FROM relates_to").await.unwrap();
+        crate::graph::deserialize_take(&mut response, 0).unwrap()
     }
 
     async fn write_turns(
@@ -3840,6 +3946,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         };
         write_session(
             &gm,
@@ -3933,6 +4040,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         };
         write_session(
             &gm,
@@ -4463,6 +4571,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         };
         write_session(
             &gm,
@@ -4878,6 +4987,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -5178,6 +5288,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -5216,6 +5327,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 

@@ -269,6 +269,9 @@ pub(crate) struct Fact {
     /// The value this fact replaces, when the model named one. Empty when
     /// it does not. A name that appears only here is not an entity.
     pub replaces: String,
+    /// Sibling text kept with the stored row. Empty unless canonical details
+    /// copied it. Identity, supersede and matching use [`Self::object_name`].
+    pub details: String,
 }
 
 /// A model mention, before the remap table runs.
@@ -463,6 +466,7 @@ fn finish(mention: Mention) -> Fact {
             TurnRole::Assistant => Provenance::Assistant,
         },
         replaces: String::new(),
+        details: String::new(),
     }
 }
 
@@ -1355,6 +1359,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 

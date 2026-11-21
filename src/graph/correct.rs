@@ -333,8 +333,14 @@ async fn correct_slot(
     let mut cache = NameCache::new();
     let mut views = edge_view::views(db, &mut cache, &matched).await?;
     let edit = slot_edit(db, &source.id, relation).await?;
-    for (index, value) in edit.values.iter().enumerate() {
-        views.push(slot_value_view(&source.name, relation, value, index));
+    for (index, shown) in edit.values.iter().enumerate() {
+        views.push(slot_value_view(
+            &source.name,
+            relation,
+            &shown.value,
+            shown.details.as_deref(),
+            index,
+        ));
     }
     let removal = Removal {
         entity: None,
@@ -352,8 +358,13 @@ async fn correct_slot(
     Ok(CorrectionReport::Removed { removal })
 }
 
+struct SlotShown {
+    value: String,
+    details: Option<String>,
+}
+
 struct SlotEdit {
-    values: Vec<String>,
+    values: Vec<SlotShown>,
     attributes: Option<serde_json::Value>,
 }
 
@@ -428,7 +439,7 @@ async fn store_attributes(
     Ok(())
 }
 
-fn drain_matching_slots(attributes: &mut serde_json::Value, relation: &str) -> Vec<String> {
+fn drain_matching_slots(attributes: &mut serde_json::Value, relation: &str) -> Vec<SlotShown> {
     let Some(slots) = attributes
         .pointer_mut("/v2/slots")
         .and_then(serde_json::Value::as_array_mut)
@@ -441,7 +452,14 @@ fn drain_matching_slots(attributes: &mut serde_json::Value, relation: &str) -> V
         if live_attribute_slot(&slot) && attribute_slot_hit(&slot, relation) {
             if let Some(value) = slot.get("value").and_then(serde_json::Value::as_str) {
                 if !value.is_empty() {
-                    removed.push(value.to_string());
+                    removed.push(SlotShown {
+                        value: value.to_string(),
+                        details: slot
+                            .get("details")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|text| !text.trim().is_empty())
+                            .map(str::to_string),
+                    });
                 }
             }
         } else {
@@ -487,11 +505,17 @@ fn relation_names_key(predicate: &str, key: &str, relation: &str) -> bool {
     super::aliases::fold(&format!("{predicate}:{key}")) == relation
 }
 
-fn slot_value_view(from: &str, relation: &str, value: &str, index: usize) -> EdgeView {
+fn slot_value_view(
+    from: &str,
+    relation: &str,
+    value: &str,
+    details: Option<&str>,
+    index: usize,
+) -> EdgeView {
     EdgeView {
         id: format!("slot:{index}"),
         from: from.to_string(),
-        to: value.to_string(),
+        to: super::util::render_detailed(value, details),
         rel_type: relation.to_string(),
         description: None,
         confidence: 1.0,

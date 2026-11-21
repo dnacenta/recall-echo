@@ -192,6 +192,10 @@ pub struct Relationship {
     #[serde(default)]
     pub last_reinforced: Option<serde_json::Value>,
     pub source: Option<String>,
+    /// Extra text kept with a `uses` edge. Absent when the row has none.
+    /// Identity and matching use the object name, not this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 impl Relationship {

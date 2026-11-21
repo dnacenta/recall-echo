@@ -333,6 +333,10 @@ enum BenchCommands {
         /// Implies nothing, and does not turn lasting forget on.
         #[arg(long)]
         slot_forget: bool,
+        /// Write `canonical_details = true` for this run. Off unless set.
+        /// Implies nothing.
+        #[arg(long)]
+        canonical_details: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1175,6 +1179,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             ground_component_edges,
             recover_turns,
             slot_forget,
+            canonical_details,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1287,6 +1292,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_component_takeover,
                 consolidate_retire_reason,
                 slot_forget,
+                canonical_details,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2552,6 +2558,48 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn canonical_details_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--canonical-details",
+        ])
+        .expect("parse canonical details");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        canonical_details,
+                        slot_forget,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(canonical_details);
+                assert!(!slot_forget);
+                assert!(!consolidate);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--canonical-details"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn known_key_binding_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -2872,6 +2920,7 @@ mod tests {
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
             slot_forget: false,
+            canonical_details: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],

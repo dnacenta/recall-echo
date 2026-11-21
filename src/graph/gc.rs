@@ -811,6 +811,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None,
             source: Some("ingest".to_string()),
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -840,6 +841,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -868,6 +870,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -896,6 +899,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -924,6 +928,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -954,6 +959,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None,
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -1161,6 +1167,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: None, // Never reinforced, so decays from valid_from
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();
@@ -1197,6 +1204,7 @@ mod tests {
             self_reinforcements: Some(0),
             last_reinforced: Some(serde_json::Value::String(recent_reinforce)),
             source: None,
+            details: None,
         }];
 
         let config = GcConfig::default();

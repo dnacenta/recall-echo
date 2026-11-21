@@ -7953,6 +7953,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -7977,6 +7978,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -16814,6 +16816,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -16832,6 +16835,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -16850,6 +16854,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -16868,6 +16873,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
@@ -17706,6 +17712,7 @@ mod tests {
             confidence: 0.9,
             provenance: Provenance::User,
             replaces: String::new(),
+            details: String::new(),
         }
     }
 
