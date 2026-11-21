@@ -35,6 +35,10 @@
 //! token must equal a whole normalised token. A digit-only token also matches
 //! when that same maximal number occurs in the raw text. Key tokens are whole
 //! tokens only: a four-character key token does not match inside a longer word.
+//! When key forms are on, `direct_key_bound` and `version_stem_ok` also accept
+//! a closed list of whole-word forms: `min`/`minimum`, `max`/`maximum`,
+//! `width`/`wide`, and `license`/`licence` either way. Agreement, value
+//! support and a punctuation literal stay on the exact token.
 //!
 //! The sentence that contains the quote runs from the previous boundary to the
 //! next, and it stops at a boundary the quote itself ends on. `.`, `!` and `?`
@@ -309,7 +313,7 @@ impl SessionGround {
             return false;
         };
         let sentence = sentence_containing(&cited.text, quote);
-        if direct_key_bound(key, &[quote, sentence]) {
+        if self.bind_key_direct(key, &[quote, sentence]) {
             return true;
         }
         match self
@@ -320,6 +324,38 @@ impl SessionGround {
             Some(cited_pos) => self.agreement_binds(key, value, cited_pos, quote),
             None => false,
         }
+    }
+
+    /// Exact tokens first. A listed form counts only when key forms are on and
+    /// the exact token missed.
+    fn bind_key_direct(&self, key: &str, texts: &[&str]) -> bool {
+        if direct_key_bound(key, texts, false) {
+            return true;
+        }
+        self.key_forms() && direct_key_bound(key, texts, true)
+    }
+
+    /// The form that kept this key when no exact direct rule did.
+    ///
+    /// `None` when the switch is off, the value has no number, the exact
+    /// tokens already bind, or a form still misses. Agreement is not a form.
+    pub(crate) fn keeping_form(
+        &self,
+        key: &str,
+        value: &str,
+        turn: usize,
+        quote: &str,
+    ) -> Option<(&'static str, &'static str)> {
+        if !self.key_forms() || numbers_in(value).is_empty() {
+            return None;
+        }
+        let cited = self.turn(turn)?;
+        let sentence = sentence_containing(&cited.text, quote);
+        let texts = [quote, sentence];
+        if direct_key_bound(key, &texts, false) || !direct_key_bound(key, &texts, true) {
+            return None;
+        }
+        form_that_bound(key, &texts)
     }
 
     /// A keyed setting whose value is a short punctuation literal the quote wraps.
@@ -347,7 +383,7 @@ impl SessionGround {
             return false;
         }
         let sentence = sentence_containing(&cited.text, quote);
-        direct_key_bound(key, &[quote, sentence])
+        direct_key_bound(key, &[quote, sentence], false)
     }
 
     /// User agreement: the cited sentence states only the value's numbers, the
@@ -626,21 +662,78 @@ fn version_stem(key: &str) -> Option<&str> {
     key.strip_suffix("_version")
 }
 
-fn direct_key_bound(key: &str, texts: &[&str]) -> bool {
-    if !version_stem_ok(key, texts) {
+fn direct_key_bound(key: &str, texts: &[&str], key_forms: bool) -> bool {
+    if !version_stem_ok(key, texts, key_forms) {
         return false;
     }
     let specific = specific_key_tokens(key);
-    !specific.is_empty() && specific.iter().any(|token| token_occurs(token, texts))
+    !specific.is_empty()
+        && specific
+            .iter()
+            .any(|token| token_hits(token, texts, key_forms))
 }
 
-fn version_stem_ok(key: &str, texts: &[&str]) -> bool {
+fn version_stem_ok(key: &str, texts: &[&str], key_forms: bool) -> bool {
     let Some(stem) = version_stem(key) else {
         return true;
     };
     let stem_tokens: Vec<&str> = stem.split('_').filter(|token| !token.is_empty()).collect();
-    !stem_tokens.is_empty() && stem_tokens.iter().all(|token| token_occurs(token, texts))
+    !stem_tokens.is_empty()
+        && stem_tokens
+            .iter()
+            .all(|token| token_hits(token, texts, key_forms))
 }
+
+/// The token, or one listed form when key forms are on. Forms are whole tokens.
+fn token_hits(token: &str, texts: &[&str], key_forms: bool) -> bool {
+    if token_occurs(token, texts) {
+        return true;
+    }
+    key_forms && form_occurs(token, texts)
+}
+
+fn form_occurs(token: &str, texts: &[&str]) -> bool {
+    let folded = normalise(token);
+    KEY_TOKEN_FORMS
+        .iter()
+        .any(|(word, form)| *word == folded && token_occurs(form, texts))
+}
+
+fn form_that_bound(key: &str, texts: &[&str]) -> Option<(&'static str, &'static str)> {
+    if let Some(stem) = version_stem(key) {
+        for token in stem.split('_').filter(|token| !token.is_empty()) {
+            if let Some(pair) = form_only(token, texts) {
+                return Some(pair);
+            }
+        }
+    }
+    for token in specific_key_tokens(key) {
+        if let Some(pair) = form_only(token, texts) {
+            return Some(pair);
+        }
+    }
+    None
+}
+
+fn form_only(token: &str, texts: &[&str]) -> Option<(&'static str, &'static str)> {
+    if token_occurs(token, texts) {
+        return None;
+    }
+    let folded = normalise(token);
+    KEY_TOKEN_FORMS
+        .iter()
+        .copied()
+        .find(|(word, form)| *word == folded && token_occurs(form, texts))
+}
+
+/// Closed list of a key token and one whole-word form that can stand in for it.
+const KEY_TOKEN_FORMS: &[(&str, &str)] = &[
+    ("min", "minimum"),
+    ("max", "maximum"),
+    ("width", "wide"),
+    ("license", "licence"),
+    ("licence", "license"),
+];
 
 pub(crate) fn specific_key_tokens(key: &str) -> Vec<&str> {
     key.split('_')
@@ -798,7 +891,8 @@ fn is_word_char(ch: char) -> bool {
 
 fn agreement_tokens(key: &str, sentence: &str) -> bool {
     let specific = specific_key_tokens(key);
-    if specific.is_empty() || !version_stem_ok(key, &[sentence]) {
+    // Agreement stays on exact tokens. Listed forms are direct binding only.
+    if specific.is_empty() || !version_stem_ok(key, &[sentence], false) {
         return false;
     }
     // Drop the trailing `version` token only when another specific token
@@ -1299,6 +1393,98 @@ mod tests {
             off.cite(0, "Port 9000").unwrap().quote,
             on.cite(0, "Port 9000").unwrap().quote
         );
+    }
+
+    fn covered(lines: &[(&str, TurnRole)]) -> SessionGround {
+        ground(lines).with_key_forms(true)
+    }
+
+    #[test]
+    fn key_forms_bind_listed_pairs_only_when_the_switch_is_on() {
+        let cases = [
+            (
+                "python_min_version",
+                "3.10",
+                "Python 3.10 minimum",
+                "min",
+                "minimum",
+            ),
+            (
+                "image_max_width_px",
+                "900",
+                "resize to 900px wide max",
+                "width",
+                "wide",
+            ),
+            (
+                "license",
+                "Apache-2.0",
+                "Licence Apache-2.0 for Harbor",
+                "license",
+                "licence",
+            ),
+            (
+                "licence",
+                "Apache-2.0",
+                "License Apache-2.0 for Harbor",
+                "licence",
+                "license",
+            ),
+        ];
+        for (key, value, quote, token, form) in cases {
+            let on = covered(&[(quote, TurnRole::User)]);
+            assert!(on.key_bound(key, value, 0, quote), "{key} on");
+            assert_eq!(
+                on.keeping_form(key, value, 0, quote),
+                Some((token, form)),
+                "{key}"
+            );
+            assert!(
+                on.supports_value(value, 0, quote, ValueShape::Literal),
+                "{key}"
+            );
+            let off = ground(&[(quote, TurnRole::User)]);
+            assert!(!off.key_bound(key, value, 0, quote), "{key} off");
+            assert_eq!(off.keeping_form(key, value, 0, quote), None, "{key}");
+        }
+        let quote = "Licence: MIT for Harbor";
+        let on = covered(&[(quote, TurnRole::User)]);
+        let off = ground(&[(quote, TurnRole::User)]);
+        assert!(on.key_bound("license", "MIT", 0, quote));
+        assert!(off.key_bound("license", "MIT", 0, quote));
+        assert_eq!(on.keeping_form("license", "MIT", 0, quote), None);
+        assert_eq!(off.keeping_form("license", "MIT", 0, quote), None);
+    }
+
+    #[test]
+    fn key_forms_reject_words_outside_the_closed_table() {
+        let maximal = covered(&[("the maximal size is 4", TurnRole::User)]);
+        assert!(!maximal.key_bound("max_jobs", "4", 0, "the maximal size is 4"));
+        assert_eq!(
+            maximal.keeping_form("max_jobs", "4", 0, "the maximal size is 4"),
+            None
+        );
+        let swapped = covered(&[("Python 3.11 minimum", TurnRole::User)]);
+        assert!(!swapped.key_bound("python_max_version", "3.11", 0, "Python 3.11 minimum"));
+        assert_eq!(
+            swapped.keeping_form("python_max_version", "3.11", 0, "Python 3.11 minimum"),
+            None
+        );
+        let generic = covered(&[("the minimum is 3", TurnRole::User)]);
+        assert!(!generic.key_bound("min", "3", 0, "the minimum is 3"));
+        assert_eq!(
+            generic.keeping_form("min", "3", 0, "the minimum is 3"),
+            None
+        );
+        let exact = covered(&[("Python 3.10 min is the floor", TurnRole::User)]);
+        let exact_quote = "Python 3.10 min is the floor";
+        assert!(exact.key_bound("python_min_version", "3.10", 0, exact_quote));
+        assert_eq!(
+            exact.keeping_form("python_min_version", "3.10", 0, exact_quote),
+            None
+        );
+        let off = ground(&[("Python 3.10 minimum", TurnRole::User)]);
+        assert!(!off.key_bound("python_min_version", "3.10", 0, "Python 3.10 minimum"));
     }
 
     #[test]

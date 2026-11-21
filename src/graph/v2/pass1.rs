@@ -238,7 +238,6 @@ pub(crate) async fn extract_session(
     let ground = SessionGround::prepare(&session.turns)
         .with_value_details(value_details)
         .with_key_forms(key_forms);
-    let _ = ground.key_forms();
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
@@ -1428,9 +1427,20 @@ fn bind_known_key(
     known: Option<&[super::known::KnownRow]>,
     report: &mut IngestionReport,
 ) -> Result<(), &'static str> {
-    if fact.predicate != Predicate::Setting
-        || ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
-    {
+    if fact.predicate != Predicate::Setting {
+        return Ok(());
+    }
+    if ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote) {
+        if let Some((token, form)) =
+            ground.keeping_form(&fact.key, &fact.object_name, fact.turn, &fact.quote)
+        {
+            report.key_form_bound += 1;
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                key_form_line(&fact.subject_name, &fact.key, token, form, fact.turn)
+            );
+        }
         return Ok(());
     }
     if !known_binds(fact, known) {
@@ -1442,6 +1452,14 @@ fn bind_known_key(
         known_key_line(&fact.subject_name, &fact.key, fact.turn)
     );
     Ok(())
+}
+
+fn key_form_line(subject: &str, key: &str, token: &str, form: &str, turn: usize) -> String {
+    format!(
+        "pass1 key form: {}:{} | {token}->{form} | turn {turn}",
+        log_plain(subject),
+        log_plain(key)
+    )
 }
 
 fn known_key_line(subject: &str, key: &str, turn: usize) -> String {
@@ -7453,6 +7471,16 @@ mod tests {
         turn: &str,
         item: Value,
     ) -> (Vec<Fact>, IngestionReport, String) {
+        admit_flags(details, false, project, turn, item)
+    }
+
+    fn admit_flags(
+        details: bool,
+        forms: bool,
+        project: &str,
+        turn: &str,
+        item: Value,
+    ) -> (Vec<Fact>, IngestionReport, String) {
         let input = SessionInput {
             session_id: "s".into(),
             date: "2026-01-02".into(),
@@ -7467,7 +7495,9 @@ mod tests {
             }],
             tool_lines: Vec::new(),
         };
-        let ground = SessionGround::prepare(&input.turns).with_value_details(details);
+        let ground = SessionGround::prepare(&input.turns)
+            .with_value_details(details)
+            .with_key_forms(forms);
         let reply = serde_json::json!({
             "facts": [item],
             "bugs": [],
@@ -7658,5 +7688,369 @@ mod tests {
         assert!(!serde_json::to_string(&off_report)
             .unwrap()
             .contains("detail_tail_stripped"));
+    }
+
+    fn admit_key(
+        forms: bool,
+        project: &str,
+        turn: &str,
+        key: &str,
+        object: &str,
+        quote: &str,
+    ) -> (Vec<Fact>, IngestionReport, String) {
+        admit_flags(
+            false,
+            forms,
+            project,
+            turn,
+            literal_item(project, "setting", key, object, "", quote),
+        )
+    }
+
+    #[test]
+    fn key_forms_are_admitted_only_when_the_switch_is_on() {
+        let cases = [
+            (
+                "Harbor",
+                "python_min_version",
+                "3.10",
+                "Python 3.10 minimum",
+                "min->minimum",
+            ),
+            (
+                "Tidepool",
+                "image_max_width_px",
+                "900",
+                "resize to 900px wide max",
+                "width->wide",
+            ),
+            (
+                "Lantern",
+                "license",
+                "Apache-2.0",
+                "Licence Apache-2.0 for Harbor",
+                "license->licence",
+            ),
+        ];
+        for (project, key, object, quote, pair) in cases {
+            let (off, off_report, off_logged) =
+                admit_key(false, project, quote, key, object, quote);
+            assert!(off.is_empty(), "{key} {:?}", off_report.drops);
+            assert_eq!(
+                off_report.drops.get(DROP_KEY_BINDING).copied(),
+                Some(1),
+                "{key}"
+            );
+            assert_eq!(off_report.key_form_bound, 0, "{key}");
+            assert!(!off_logged.contains("pass1 key form"), "{key}");
+
+            let (on, on_report, on_logged) = admit_key(true, project, quote, key, object, quote);
+            assert_eq!(on.len(), 1, "{key} {:?}", on_report.drops);
+            assert_eq!(on[0].object_name, object);
+            assert_eq!(on_report.key_form_bound, 1, "{key}");
+            assert!(on_logged.contains(&format!(
+                "pass1 key form: {project}:{key} | {pair} | turn 0"
+            )));
+            assert!(serde_json::to_string(&on_report)
+                .unwrap()
+                .contains("\"key_form_bound\":1"));
+        }
+
+        let (maximal, maximal_report, _) = admit_key(
+            true,
+            "Harbor",
+            "the maximal size is 4",
+            "max_jobs",
+            "4",
+            "the maximal size is 4",
+        );
+        assert!(maximal.is_empty(), "{:?}", maximal_report.drops);
+        assert_eq!(maximal_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(maximal_report.key_form_bound, 0);
+
+        let (swapped, swapped_report, _) = admit_key(
+            true,
+            "Tidepool",
+            "Python 3.11 minimum",
+            "python_max_version",
+            "3.11",
+            "Python 3.11 minimum",
+        );
+        assert!(swapped.is_empty(), "{:?}", swapped_report.drops);
+        assert_eq!(swapped_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(swapped_report.key_form_bound, 0);
+
+        let (generic, generic_report, _) = admit_key(
+            true,
+            "Lantern",
+            "the minimum is 3",
+            "min",
+            "3",
+            "the minimum is 3",
+        );
+        assert!(generic.is_empty(), "{:?}", generic_report.drops);
+        assert_eq!(generic_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(generic_report.key_form_bound, 0);
+
+        let exact_quote = "Python 3.10 min is the floor";
+        let (exact, exact_report, exact_logged) = admit_key(
+            true,
+            "Harbor",
+            exact_quote,
+            "python_min_version",
+            "3.10",
+            exact_quote,
+        );
+        assert_eq!(exact.len(), 1, "{:?}", exact_report.drops);
+        assert_eq!(exact_report.key_form_bound, 0);
+        assert!(!exact_logged.contains("pass1 key form"));
+
+        let (missing, missing_report, _) = admit_key(
+            true,
+            "Tidepool",
+            "Python 3.10 minimum",
+            "python_min_version",
+            "9.9",
+            "Python 3.10 minimum",
+        );
+        assert!(missing.is_empty(), "{:?}", missing_report.drops);
+        assert_eq!(
+            missing_report.drops.get(DROP_VALUE_SUPPORT).copied(),
+            Some(1)
+        );
+        assert_eq!(missing_report.key_form_bound, 0);
+
+        let mit = "Licence: MIT for Harbor.";
+        let mit_quote = "Licence: MIT for Harbor";
+        for forms in [false, true] {
+            let (facts, report, logged) =
+                admit_key(forms, "Lantern", mit, "license", "MIT", mit_quote);
+            assert_eq!(facts.len(), 1, "{forms} {:?}", report.drops);
+            assert_eq!(facts[0].object_name, "MIT");
+            assert_eq!(report.key_form_bound, 0);
+            assert!(!logged.contains("pass1 key form"));
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn value_details_and_key_forms_apply_alone_and_together() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        const TURN: &str = "Set go_version to 1.22 for Harbor. Keep Go at 1.22 because the build image ships it. retention_days stays 90 days. Python 3.10 minimum is the floor.";
+        let reply = serde_json::json!({
+            "facts": [
+                literal_item("Harbor", "setting", "go_version", "1.22", "", "go_version to 1.22"),
+                literal_item("Harbor", "rule", "", "Keep Go at 1.22 because the build image ships it", "", "Keep Go at 1.22 because the build image ships it"),
+                literal_item("Harbor", "setting", "retention_days", "90 (audit needs a quarter of history)", "", "retention_days stays 90 days"),
+                literal_item("Harbor", "setting", "python_min_version", "3.10", "", "Python 3.10 minimum")
+            ],
+            "bugs": [],
+            "releases": []
+        })
+        .to_string();
+
+        struct Fixed {
+            reply: String,
+            system: Mutex<String>,
+            user: Mutex<String>,
+            other: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Fixed {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                self.other.fetch_add(1, Ordering::SeqCst);
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                messages: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                *self.system.lock().expect("system") = system.to_string();
+                *self.user.lock().expect("user") = messages
+                    .last()
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default();
+                assert_eq!(messages[0].content, PASS1_EXAMPLE_USER);
+                assert_eq!(messages[1].content, PASS1_EXAMPLE_REPLY);
+                Ok(Completion::unmeasured(self.reply.clone()))
+            }
+        }
+
+        fn plant(config: &str) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("Harbor");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                dir.path(),
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    TURN.into(),
+                )],
+            )
+            .unwrap();
+            if !config.is_empty() {
+                std::fs::write(dir.path().join(".recall-echo.toml"), config).unwrap();
+            }
+            dir
+        }
+
+        fn run(config: &str, reply: &str) -> (IngestionReport, String, String, String, u64) {
+            let dir = plant(config);
+            let path = dir.path().to_path_buf();
+            let reply = reply.to_string();
+            let ((report, system, user, other), logged) = crate::file_lock::capture_stderr(|| {
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let gm = GraphMemory::open_embedded(&path.join("graph"))
+                            .await
+                            .unwrap();
+                        let provider = Fixed {
+                            reply,
+                            system: Mutex::new(String::new()),
+                            user: Mutex::new(String::new()),
+                            other: AtomicU64::new(0),
+                        };
+                        let report = extract_session(
+                            &gm,
+                            &path,
+                            1,
+                            &IngestContext::new("s", Some(1)),
+                            &provider,
+                        )
+                        .await
+                        .unwrap();
+                        let system = provider.system.lock().expect("system").clone();
+                        let user = provider.user.lock().expect("user").clone();
+                        let other = provider.other.load(Ordering::SeqCst);
+                        (report, system, user, other)
+                    })
+                })
+                .join()
+                .expect("session thread")
+            });
+            (report, system, user, logged, other)
+        }
+
+        let base = "[graph]\nconsolidate = false\nknown_facts_context = false\n";
+        let (off, off_system, off_user, off_logged, off_other) = run(base, &reply);
+        let (forms, forms_system, forms_user, forms_logged, _) =
+            run(&format!("{base}extract_key_forms = true\n"), &reply);
+        let (details, details_system, details_user, details_logged, _) =
+            run(&format!("{base}extract_value_details = true\n"), &reply);
+        let (both, both_system, both_user, both_logged, _) = run(
+            &format!("{base}extract_value_details = true\nextract_key_forms = true\n"),
+            &reply,
+        );
+
+        assert_eq!(off_other, 0, "{:?}", off.errors);
+        assert_eq!(off_system, PASS1_SYSTEM_BARE);
+        assert_eq!(forms_system, PASS1_SYSTEM_BARE);
+        assert_eq!(off_user, forms_user);
+        assert_eq!(details_system, pass1_system_text(false));
+        assert_eq!(both_system, pass1_system_text(false));
+        assert_eq!(
+            details_system.replacen(DETAIL_SENTENCES, "", 1),
+            PASS1_SYSTEM_BARE
+        );
+        assert_eq!(off_user, details_user);
+        assert_eq!(off_user, both_user);
+        assert!(off_user.contains(TURN));
+
+        assert!(
+            off.drops.contains_key(DROP_VALUE_SUPPORT),
+            "{:?}",
+            off.drops
+        );
+        assert_eq!(
+            off.drops.get(DROP_KEY_BINDING).copied(),
+            Some(1),
+            "{:?}",
+            off.drops
+        );
+        assert!(!off.drops.contains_key(DROP_DETAIL_ECHO));
+        assert_eq!(off.detail_tail_stripped, 0);
+        assert_eq!(off.key_form_bound, 0);
+        assert!(!off_logged.contains("pass1 detail"));
+        assert!(!off_logged.contains("pass1 key form"));
+
+        assert_eq!(
+            forms.drops.get(DROP_VALUE_SUPPORT).copied(),
+            Some(1),
+            "{:?}",
+            forms.drops
+        );
+        assert!(
+            !forms.drops.contains_key(DROP_KEY_BINDING),
+            "{:?}",
+            forms.drops
+        );
+        assert!(!forms.drops.contains_key(DROP_DETAIL_ECHO));
+        assert_eq!(forms.key_form_bound, 1);
+        assert_eq!(forms.detail_tail_stripped, 0);
+        assert!(forms_logged
+            .contains("pass1 key form: Harbor:python_min_version | min->minimum | turn 0"));
+        assert!(!forms_logged.contains("pass1 detail"));
+        assert_eq!(forms_system.as_bytes(), off_system.as_bytes());
+
+        assert_eq!(
+            details.drops.get(DROP_DETAIL_ECHO).copied(),
+            Some(1),
+            "{:?}",
+            details.drops
+        );
+        assert_eq!(
+            details.drops.get(DROP_KEY_BINDING).copied(),
+            Some(1),
+            "{:?}",
+            details.drops
+        );
+        assert_eq!(details.detail_tail_stripped, 1);
+        assert_eq!(details.key_form_bound, 0);
+        assert!(details_logged.contains("pass1 detail echo: Harbor rule | go_version | turn 0"));
+        assert!(
+            details_logged.contains("pass1 detail strip: Harbor:retention_days | support | turn 0")
+        );
+        assert!(!details_logged.contains("pass1 key form"));
+
+        assert_eq!(
+            both.drops.get(DROP_DETAIL_ECHO).copied(),
+            Some(1),
+            "{:?}",
+            both.drops
+        );
+        assert!(
+            !both.drops.contains_key(DROP_KEY_BINDING),
+            "{:?}",
+            both.drops
+        );
+        assert!(
+            !both.drops.contains_key(DROP_VALUE_SUPPORT),
+            "{:?}",
+            both.drops
+        );
+        assert_eq!(both.detail_tail_stripped, 1);
+        assert_eq!(both.key_form_bound, 1);
+        assert!(both_logged.contains("pass1 detail echo: Harbor rule | go_version | turn 0"));
+        assert!(
+            both_logged.contains("pass1 detail strip: Harbor:retention_days | support | turn 0")
+        );
+        assert!(both_logged
+            .contains("pass1 key form: Harbor:python_min_version | min->minimum | turn 0"));
     }
 }
