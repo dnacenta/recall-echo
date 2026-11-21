@@ -281,7 +281,7 @@ pub(crate) async fn extract_session(
         facts
     };
     let facts = if drop_generic_uses_enabled(memory_dir) {
-        drop_generic_uses(facts, &mut report)
+        drop_generic_uses(facts, &mut report, &mut std::io::stderr())
     } else {
         facts
     };
@@ -743,22 +743,27 @@ fn eligible_rule(fact: &Fact) -> bool {
     fact.predicate == Predicate::Rule && fact.status == "decided" && fact.replaces.trim().is_empty()
 }
 
-/// Drop decided language-role `uses` edges and decided planned release status.
+/// Drop a decided language-role `uses` with an empty `replaces`, and a
+/// decided release status whose trimmed value equals `planned`.
 ///
-/// A rule, a setting, any other `uses` role, and a release's contents and
-/// `part_of` rows stay. The drops map is left alone. A zero count stays off
-/// the report.
-fn drop_generic_uses(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
+/// A rule, a setting, a `uses` that names a replacement, any other `uses`
+/// role, and a release's contents and `part_of` rows stay. The drops map is
+/// left alone. A zero count stays off the report. Lines go to `out`.
+fn drop_generic_uses(
+    facts: Vec<Fact>,
+    report: &mut IngestionReport,
+    out: &mut impl Write,
+) -> Vec<Fact> {
     let mut kept = Vec::with_capacity(facts.len());
     for fact in facts {
         if language_uses(&fact) {
             report.generic_uses_drops += 1;
-            let _ = writeln!(std::io::stderr(), "{}", generic_uses_line(&fact));
+            let _ = writeln!(out, "{}", generic_uses_line(&fact));
             continue;
         }
         if planned_release(&fact) {
             report.planned_release_drops += 1;
-            let _ = writeln!(std::io::stderr(), "{}", planned_release_line(&fact));
+            let _ = writeln!(out, "{}", planned_release_line(&fact));
             continue;
         }
         kept.push(fact);
@@ -770,26 +775,13 @@ fn language_uses(fact: &Fact) -> bool {
     fact.predicate == Predicate::Uses
         && fact.status == "decided"
         && fact.role == Some(Role::Language)
+        && fact.replaces.trim().is_empty()
 }
 
 fn planned_release(fact: &Fact) -> bool {
     fact.predicate == Predicate::ReleaseStatus
         && fact.status == "decided"
-        && contains_whole_word(&fact.object_name, "planned")
-}
-
-fn contains_whole_word(text: &str, word: &str) -> bool {
-    let folded: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
-    let needle: Vec<char> = word.chars().flat_map(char::to_lowercase).collect();
-    if needle.is_empty() || folded.len() < needle.len() {
-        return false;
-    }
-    (0..=folded.len() - needle.len()).any(|start| {
-        let end = start + needle.len();
-        folded[start..end] == needle[..]
-            && (start == 0 || !folded[start - 1].is_alphanumeric())
-            && (end == folded.len() || !folded[end].is_alphanumeric())
-    })
+        && fact.object_name.trim().eq_ignore_ascii_case("planned")
 }
 
 fn generic_uses_line(fact: &Fact) -> String {
@@ -5369,10 +5361,11 @@ mod tests {
         fact
     }
 
-    fn apply_generic_uses(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport) {
+    fn apply_generic_uses(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport, Vec<u8>) {
         let mut report = IngestionReport::default();
-        let kept = drop_generic_uses(facts, &mut report);
-        (kept, report)
+        let mut out = Vec::new();
+        let kept = drop_generic_uses(facts, &mut report, &mut out);
+        (kept, report, out)
     }
 
     fn apply_restatements(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport) {
@@ -5692,7 +5685,7 @@ mod tests {
         ];
         let mut facts = vec![language];
         facts.extend(kept_shapes.iter().cloned());
-        let (logged, (kept, report)) = stderr_lines(|| apply_generic_uses(facts));
+        let (kept, report, logged) = apply_generic_uses(facts);
         assert!(kept.iter().all(|fact| !language_uses(fact)));
         assert_eq!(kept.len(), kept_shapes.len());
         assert_eq!(report.generic_uses_drops, 1);
@@ -5728,19 +5721,37 @@ mod tests {
             .any(|fact| { fact.predicate == Predicate::PartOf && fact.subject_name == "cache" }));
         assert_eq!(
             logged,
-            vec!["drop generic uses: harbor uses Zig role=language".to_string()]
+            b"drop generic uses: harbor uses Zig role=language\n".to_vec()
         );
         let text = serde_json::to_string(&report).expect("json");
         assert!(text.contains("\"generic_uses_drops\":1"), "{text}");
         assert!(!text.contains("\"drops\""), "{text}");
 
-        let (quiet, (kept, report)) = stderr_lines(|| apply_generic_uses(kept_shapes));
+        let (kept, report, quiet) = apply_generic_uses(kept_shapes);
         assert_eq!(kept.len(), 11);
         assert_eq!(report.generic_uses_drops, 0);
         assert!(report.drops.is_empty(), "{:?}", report.drops);
         assert!(quiet.is_empty(), "{quiet:?}");
         let text = serde_json::to_string(&report).expect("json");
         assert!(!text.contains("generic_uses_drops"), "{text}");
+    }
+
+    #[test]
+    fn a_language_use_that_names_a_replacement_stays() {
+        let mut replaced = harbor_uses("Zig", Some(Role::Language), "decided");
+        replaced.replaces = "Rust".into();
+        let mut blank = harbor_uses("Zig", Some(Role::Language), "decided");
+        blank.replaces = "   ".into();
+        let (kept, report, logged) = apply_generic_uses(vec![replaced, blank]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].role, Some(Role::Language));
+        assert_eq!(kept[0].replaces, "Rust");
+        assert_eq!(report.generic_uses_drops, 1);
+        assert!(report.drops.is_empty(), "{:?}", report.drops);
+        assert_eq!(
+            logged,
+            b"drop generic uses: harbor uses Zig role=language\n".to_vec()
+        );
     }
 
     fn release_row(name: &str, predicate: Predicate, value: &str, status: &str) -> Fact {
@@ -5814,6 +5825,18 @@ mod tests {
                 "decided",
             ),
             release_row(
+                "harbor v2.5",
+                Predicate::ReleaseStatus,
+                "not planned",
+                "decided",
+            ),
+            release_row(
+                "harbor v2.6",
+                Predicate::ReleaseStatus,
+                "planned for 2.0",
+                "decided",
+            ),
+            release_row(
                 "harbor v2.4",
                 Predicate::ReleaseStatus,
                 "planned",
@@ -5822,8 +5845,8 @@ mod tests {
             harbor_setting("release_status", "planned"),
             harbor_rule("Ship v2.0 next month."),
         ];
-        let (logged, (kept, report)) = stderr_lines(|| apply_generic_uses(facts));
-        assert_eq!(report.planned_release_drops, 3);
+        let (kept, report, logged) = apply_generic_uses(facts);
+        assert_eq!(report.planned_release_drops, 2);
         assert_eq!(report.generic_uses_drops, 0);
         assert!(report.drops.is_empty(), "{:?}", report.drops);
         assert!(kept.iter().all(|fact| !planned_release(fact)));
@@ -5833,6 +5856,11 @@ mod tests {
         assert!(kept.iter().any(|fact| fact.predicate == Predicate::PartOf));
         assert!(kept.iter().any(|fact| fact.object_name == "released"));
         assert!(kept.iter().any(|fact| fact.object_name == "current"));
+        assert!(kept.iter().any(|fact| fact.object_name == "still planned"));
+        assert!(kept.iter().any(|fact| fact.object_name == "not planned"));
+        assert!(kept
+            .iter()
+            .any(|fact| fact.object_name == "planned for 2.0"));
         assert!(kept.iter().any(|fact| fact.object_name == "unplanned"));
         assert!(kept
             .iter()
@@ -5845,14 +5873,12 @@ mod tests {
         }));
         assert_eq!(
             logged,
-            vec![
-                "drop planned release: harbor v2.0 release_status planned".to_string(),
-                "drop planned release: harbor v2.1 release_status PLANNED".to_string(),
-                "drop planned release: harbor v2.2 release_status still planned".to_string(),
-            ]
+            b"drop planned release: harbor v2.0 release_status planned\n\
+              drop planned release: harbor v2.1 release_status PLANNED\n"
+                .to_vec()
         );
         let text = serde_json::to_string(&report).expect("json");
-        assert!(text.contains("\"planned_release_drops\":3"), "{text}");
+        assert!(text.contains("\"planned_release_drops\":2"), "{text}");
         assert!(!text.contains("generic_uses_drops"), "{text}");
         assert!(!text.contains("\"drops\""), "{text}");
     }
@@ -5868,7 +5894,7 @@ mod tests {
         let mut version = harbor_setting("go_version", "1.22");
         version.subject_name = "tidepool".into();
         version.quote = "a Go 1.22 service".into();
-        let (kept, report) = apply_generic_uses(vec![uses, version]);
+        let (kept, report, _) = apply_generic_uses(vec![uses, version]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].predicate, Predicate::Setting);
         assert_eq!(kept[0].key, "go_version");
@@ -5882,7 +5908,7 @@ mod tests {
     fn a_reason_rule_and_an_environment_override_stay() {
         let version = harbor_setting("lang_version", "2.4");
         let rule = harbor_rule("Keep the language at 2.4 because the new loop form needs it.");
-        let (kept, report) = apply_generic_uses(vec![version, rule]);
+        let (kept, report, _) = apply_generic_uses(vec![version, rule]);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().any(|fact| fact.predicate == Predicate::Rule));
         assert!(kept.iter().any(|fact| fact.key == "lang_version"));
@@ -5892,7 +5918,7 @@ mod tests {
 
         let workers = harbor_setting("workers", "4");
         let env = harbor_setting("workers_env", "HARBOR_WORKERS");
-        let (kept, report) = apply_generic_uses(vec![workers, env]);
+        let (kept, report, _) = apply_generic_uses(vec![workers, env]);
         assert_eq!(fact_keys(&kept), vec!["workers", "workers_env"]);
         assert_eq!(kept[1].object_name, "HARBOR_WORKERS");
         assert_eq!(report.generic_uses_drops, 0);
@@ -6007,7 +6033,7 @@ mod tests {
         assert!(kept.iter().all(|fact| fact.predicate != Predicate::Rule));
         assert_eq!(report.drops.get(DROP_RESTATEMENT).copied(), Some(1));
 
-        let (kept_on, report_on) = apply_generic_uses(facts_on);
+        let (kept_on, report_on, _) = apply_generic_uses(facts_on);
         assert!(kept_on
             .iter()
             .all(|fact| fact.predicate != Predicate::ReleaseStatus));
@@ -6143,85 +6169,6 @@ mod tests {
         .unwrap();
         assert!(drop_generic_uses_enabled(dir.path()));
         assert!(!drop_restatements_enabled(dir.path()));
-    }
-
-    fn stderr_lines<T>(action: impl FnOnce() -> T) -> (Vec<String>, T) {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let capture = StderrCapture::start();
-        let value = action();
-        let text = capture.finish();
-        let lines = text.lines().map(str::to_string).collect();
-        (lines, value)
-    }
-
-    struct StderrCapture {
-        saved: libc::c_int,
-        read_end: libc::c_int,
-        write_end: libc::c_int,
-        restored: bool,
-    }
-
-    impl StderrCapture {
-        fn start() -> Self {
-            let mut pipe = [0; 2];
-            // SAFETY: `pipe` is a two-slot buffer for the POSIX pipe call.
-            let rc = unsafe { libc::pipe(pipe.as_mut_ptr()) };
-            assert_eq!(rc, 0);
-            // SAFETY: dup of stderr returns a new fd or -1.
-            let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-            assert!(saved >= 0);
-            let capture = Self {
-                saved,
-                read_end: pipe[0],
-                write_end: pipe[1],
-                restored: false,
-            };
-            // SAFETY: both fds are open. Drop restores stderr if this fails.
-            let swapped = unsafe { libc::dup2(capture.write_end, libc::STDERR_FILENO) };
-            assert_eq!(swapped, libc::STDERR_FILENO);
-            capture
-        }
-
-        fn finish(mut self) -> String {
-            let _ = std::io::stderr().flush();
-            self.restore();
-            let mut bytes = Vec::new();
-            let mut buf = [0u8; 512];
-            loop {
-                // SAFETY: `buf` is writable and `read_end` is this pipe.
-                let n = unsafe { libc::read(self.read_end, buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buf[..n as usize]);
-            }
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
-
-        fn restore(&mut self) {
-            if self.restored {
-                return;
-            }
-            // SAFETY: `saved` and `write_end` are fds this capture opened.
-            unsafe {
-                libc::dup2(self.saved, libc::STDERR_FILENO);
-                libc::close(self.saved);
-                libc::close(self.write_end);
-            }
-            self.restored = true;
-        }
-    }
-
-    impl Drop for StderrCapture {
-        fn drop(&mut self) {
-            self.restore();
-            if self.read_end >= 0 {
-                // SAFETY: `read_end` is the pipe read end, closed once.
-                unsafe { libc::close(self.read_end) };
-                self.read_end = -1;
-            }
-        }
     }
 
     #[cfg(feature = "embedded")]
