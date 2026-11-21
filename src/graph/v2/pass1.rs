@@ -302,6 +302,23 @@ pub(crate) async fn extract_session(
         (facts, Vec::new(), MatchReport::default(), None)
     };
     let (facts, targets) = without_forgotten(memory_dir, facts, targets, &mut report)?;
+    let mut canonical_retirements = Vec::new();
+    let (facts, targets) = if canonical_details_enabled(memory_dir) {
+        let applied = super::canonical::apply(
+            gm,
+            ctx.session_id(),
+            &session.date,
+            &session.project.name,
+            facts,
+            targets,
+            &mut report,
+        )
+        .await?;
+        canonical_retirements = applied.retirements;
+        (applied.facts, applied.targets)
+    } else {
+        (facts, targets)
+    };
 
     let mut resolve_ms = 0;
     let mut write_ms = 0;
@@ -389,6 +406,9 @@ pub(crate) async fn extract_session(
         consolidate_ms = Some(elapsed_ms(started));
     } else if consolidate_on {
         consolidate_ms = Some(0);
+    }
+    if !canonical_retirements.is_empty() {
+        report.retirements.extend(canonical_retirements);
     }
     report.known_match = match_report;
     report.timing = Some(StageTiming {
@@ -581,7 +601,6 @@ fn recover_turns_enabled(memory_dir: &Path) -> bool {
         .recover_applies()
 }
 
-#[allow(dead_code)] // The merge pass calls this. Until then a flag-off run does not.
 fn canonical_details_enabled(memory_dir: &Path) -> bool {
     crate::config::load_from_dir(memory_dir)
         .graph

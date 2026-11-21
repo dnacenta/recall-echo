@@ -7423,7 +7423,7 @@ fn reason_slot(raw: Option<&Vec<Value>>, view: SlotView) -> ReasonSlot {
 /// when the value has two or more alphanumeric runs.
 ///
 /// A single run uses the literal only, so `_site/` is not the word `site`.
-fn names_new_value(value: &str, text: &str) -> bool {
+pub(crate) fn names_new_value(value: &str, text: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return false;
@@ -7734,7 +7734,7 @@ fn names_chosen_value(prefix: &str) -> bool {
 /// Two or more runs use [`names_value`]. One run is a bounded literal.
 /// A one-run number also needs a word from the key, because the same digits
 /// show up in unrelated rules.
-fn names_old_value(key: &str, value: &str, text: &str) -> bool {
+pub(crate) fn names_old_value(key: &str, value: &str, text: &str) -> bool {
     let trimmed = value.trim();
     let runs = alphanumeric_runs(trimmed);
     if runs.len() >= 2 {

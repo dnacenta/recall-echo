@@ -1255,6 +1255,16 @@ pub struct IngestionReport {
     /// Omitted when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub forgotten_skips: u32,
+    /// Details copied onto a decided row. Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_detail_merges: Option<u32>,
+    /// Donor rules and env settings closed or removed. Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_detail_closes: Option<u32>,
+    /// Pairings that were not unique. Nothing merged or closed for those rows.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_detail_ambiguous: Option<u32>,
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
@@ -1694,6 +1704,23 @@ mod tests {
             ..ConsolidateReport::default()
         };
         assert!(zeros.is_blank());
+    }
+
+    #[test]
+    fn canonical_detail_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(encoded.get("canonical_detail_merges").is_none());
+        assert!(encoded.get("canonical_detail_closes").is_none());
+        assert!(encoded.get("canonical_detail_ambiguous").is_none());
+        let report = IngestionReport {
+            canonical_detail_merges: Some(1),
+            canonical_detail_closes: Some(1),
+            ..IngestionReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["canonical_detail_merges"], 1);
+        assert_eq!(encoded["canonical_detail_closes"], 1);
+        assert!(encoded.get("canonical_detail_ambiguous").is_none());
     }
 
     #[test]
