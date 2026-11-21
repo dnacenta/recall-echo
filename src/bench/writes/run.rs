@@ -294,6 +294,12 @@ pub struct OptOuts {
     /// Write `slot_forget = true`. False leaves the key out.
     /// Does not turn lasting forget on. An opt-out run does not write it.
     pub slot_forget: bool,
+    /// Write `extract_value_details = true`. False leaves the key out.
+    /// Implies nothing, including `extract_key_forms`.
+    pub extract_value_details: bool,
+    /// Write `extract_key_forms = true`. False leaves the key out.
+    /// Implies nothing, including `extract_value_details`. The prompt is unchanged.
+    pub extract_key_forms: bool,
 }
 
 impl OptOuts {
@@ -318,6 +324,8 @@ impl OptOuts {
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
             slot_forget: false,
+            extract_value_details: false,
+            extract_key_forms: false,
         }
     }
 }
@@ -442,6 +450,8 @@ async fn collect_sessions(
             kept: report.kept,
             drops: report.drops,
             known_key_bound: report.known_key_bound,
+            detail_tail_stripped: report.detail_tail_stripped,
+            key_form_bound: report.key_form_bound,
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
@@ -515,6 +525,8 @@ async fn ingest_v2(
     report.kept = extracted.kept;
     report.drops = extracted.drops;
     report.known_key_bound = extracted.known_key_bound;
+    report.detail_tail_stripped = extracted.detail_tail_stripped;
+    report.key_form_bound = extracted.key_form_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
     report.retirements_skipped = extracted.retirements_skipped;
@@ -866,6 +878,16 @@ fn switch_lines(
         "consolidate_retire_reason = true",
     );
     push_line(&mut lines, opt_outs.slot_forget, "slot_forget = true");
+    push_line(
+        &mut lines,
+        opt_outs.extract_value_details,
+        "extract_value_details = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.extract_key_forms,
+        "extract_key_forms = true",
+    );
     lines
 }
 
@@ -3619,6 +3641,84 @@ mod tests {
     }
 
     #[test]
+    fn extract_value_details_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                extract_value_details: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nextract_value_details = true\n");
+        assert!(!text.contains("extract_key_forms"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.extract_value_details);
+        assert!(!graph.extract_key_forms);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn extract_key_forms_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                extract_key_forms: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nextract_key_forms = true\n");
+        assert!(!text.contains("extract_value_details"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.extract_key_forms);
+        assert!(!graph.extract_value_details);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
     fn known_key_binding_writes_only_its_own_key() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
@@ -5947,6 +6047,8 @@ mod tests {
             kept: 0,
             drops: std::collections::HashMap::new(),
             known_key_bound: 0,
+            detail_tail_stripped: 0,
+            key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,

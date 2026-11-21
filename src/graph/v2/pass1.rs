@@ -10,6 +10,7 @@
 //! so it does not fail the window.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -27,9 +28,9 @@ use super::schema::{
     affects_target, component_of_project, component_project_candidate, component_subject_blocked,
     filter_fact, key_is_empty, map_subject, normalise, over_long, project_object, release_name,
     remap, restates_setting, Fact, Kind, Mention, Predicate, Role, DROP_CONFIDENCE,
-    DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_REJECTED, DROP_RESTATEMENT,
-    DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT, DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION,
-    MAX_ITEMS,
+    DROP_DETAIL_ECHO, DROP_KEY_BINDING, DROP_OVERFLOW, DROP_PARSE, DROP_QUOTE, DROP_REJECTED,
+    DROP_RESTATEMENT, DROP_TOO_LONG, DROP_UNRESOLVED, DROP_VALUE_SUPPORT,
+    DROP_VALUE_SUPPORT_PARTIAL, DROP_VERSION, MAX_ITEMS,
 };
 use super::write;
 use crate::graph::Provenance;
@@ -81,6 +82,22 @@ const fn bare_end() -> usize {
 
 /// Pass-1 instructions with those sentences removed.
 pub(crate) const PASS1_SYSTEM_BARE: &str = PASS1_SYSTEM.split_at(bare_end()).0;
+
+/// Details stay inside the fact that owns them. One source line, two leading newlines.
+const DETAIL_SENTENCES: &str = "\n\nKeep the details that make a fact exact inside that fact's value, never as a separate fact: numbers and counts, a measured value next to its limit, versions, identifiers, the file, script or test that carries it out, the exact class or API used, and a short reason when the turn you cite gives one. A rule says them in its own sentence. A setting puts them after its value in one pair of parentheses, for example `90 (audit needs a quarter of history)`. Never add a rule or any other fact only to explain or repeat a setting. Never repeat the old value inside the new one; the old value goes only in `replaces`. Use only details stated in the turn you cite, and keep every value under 200 characters. The do-not-extract list above still applies to whole facts; it does not remove details from a fact you keep.";
+
+/// System text when value details are on. The consts stay unchanged.
+fn pass1_system_text(known_on: bool) -> String {
+    let mut text = String::with_capacity(
+        PASS1_SYSTEM_BARE.len() + DETAIL_SENTENCES.len() + KNOWN_SENTENCES.len(),
+    );
+    text.push_str(PASS1_SYSTEM_BARE);
+    text.push_str(DETAIL_SENTENCES);
+    if known_on {
+        text.push_str(KNOWN_SENTENCES);
+    }
+    text
+}
 
 /// Worked example, in the same shape as [`user_message`].
 pub(crate) const PASS1_EXAMPLE_USER: &str = r#"Project: tidepool
@@ -216,11 +233,19 @@ pub(crate) async fn extract_session(
     let pass1_started = std::time::Instant::now();
     // The known block is opt-in model input, not a turn. Off does not read
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
-    let ground = SessionGround::prepare(&session.turns);
+    let value_details = value_details_enabled(memory_dir);
+    let key_forms = key_forms_enabled(memory_dir);
+    let ground = SessionGround::prepare(&session.turns)
+        .with_value_details(value_details)
+        .with_key_forms(key_forms);
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
-    let system = if known_on {
+    let system_text;
+    let system = if value_details {
+        system_text = pass1_system_text(known_on);
+        system_text.as_str()
+    } else if known_on {
         PASS1_SYSTEM
     } else {
         PASS1_SYSTEM_BARE
@@ -279,6 +304,7 @@ pub(crate) async fn extract_session(
     } else {
         facts
     };
+    let facts = apply_value_detail_echo(value_details, facts, &mut report);
     let pass1_ms = elapsed_ms(pass1_started);
 
     let match_started = std::time::Instant::now();
@@ -581,6 +607,20 @@ fn recover_turns_enabled(memory_dir: &Path) -> bool {
         .recover_applies()
 }
 
+fn value_details_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .extract_value_details
+}
+
+fn key_forms_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .extract_key_forms
+}
+
 /// Drop facts that match a live forget record. Flag off does not open the file.
 fn without_forgotten(
     memory_dir: &Path,
@@ -757,6 +797,279 @@ fn unite(parent: &mut [usize], left: usize, right: usize) {
     if left != right {
         parent[right] = left;
     }
+}
+
+fn apply_value_detail_echo(on: bool, facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
+    if on {
+        drop_detail_echoes(facts, report)
+    } else {
+        facts
+    }
+}
+
+/// Drop a decided rule that restates a same-subject setting and then gives a reason.
+///
+/// The setting may be from any turn. A setting is never dropped. Off does not call this.
+fn drop_detail_echoes(facts: Vec<Fact>, report: &mut IngestionReport) -> Vec<Fact> {
+    let mut drop = vec![false; facts.len()];
+    for (index, rule) in facts.iter().enumerate() {
+        let Some(setting) = echoing_setting(&facts, rule) else {
+            continue;
+        };
+        drop[index] = true;
+        count_drop(report, DROP_DETAIL_ECHO);
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            detail_echo_line(&rule.subject_name, &setting.key, rule.turn)
+        );
+    }
+    facts
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !drop[*index])
+        .map(|(_, fact)| fact)
+        .collect()
+}
+
+fn echoing_setting<'a>(facts: &'a [Fact], rule: &Fact) -> Option<&'a Fact> {
+    if rule.predicate != Predicate::Rule || rule.status != "decided" {
+        return None;
+    }
+    facts.iter().find(|setting| detail_echo_pair(setting, rule))
+}
+
+fn detail_echo_pair(setting: &Fact, rule: &Fact) -> bool {
+    if !anchor_setting(setting)
+        || setting.subject_kind != rule.subject_kind
+        || setting.subject_name != rule.subject_name
+    {
+        return false;
+    }
+    let value = setting.object_name.trim();
+    if !non_trivial_value(value) {
+        return false;
+    }
+    let value_tokens = write::alphanumeric_runs(value);
+    let rule_tokens = write::alphanumeric_runs(&rule.object_name);
+    if !contiguous_token_run(&value_tokens, &rule_tokens) {
+        return false;
+    }
+    let Some(lead_end) = connective_index(&rule.object_name) else {
+        return false;
+    };
+    lead_residue(&rule.object_name[..lead_end], value, &setting.key) <= 2
+}
+
+fn non_trivial_value(value: &str) -> bool {
+    value.chars().any(|ch| ch.is_ascii_digit()) || value.chars().count() >= 4
+}
+
+fn contiguous_token_run(needle: &[String], haystack: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+const DETAIL_CONNECTIVES: &[&str] = &[
+    "because",
+    "due to",
+    "given that",
+    "the reason",
+    "that is why",
+    "which is why",
+];
+
+const DETAIL_FILLERS: &[&str] = &[
+    "keep", "set", "use", "using", "default", "make", "stay", "at", "to", "the", "a", "an", "is",
+    "be", "of", "on", "for", "with", "in", "by", "as", "it", "its", "our", "we", "always",
+];
+
+fn connective_index(text: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (index, _) in text.char_indices() {
+        if !word_boundary_before(text, index) {
+            continue;
+        }
+        for phrase in DETAIL_CONNECTIVES {
+            let end = index + phrase.len();
+            if end <= text.len()
+                && phrase_at(&text[index..], phrase)
+                && word_boundary_after(text, end)
+            {
+                best = Some(best.map_or(index, |at| at.min(index)));
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn phrase_at(text: &str, phrase: &str) -> bool {
+    let mut chars = text.chars();
+    for expected in phrase.chars() {
+        match chars.next() {
+            Some(got) if got.to_ascii_lowercase() == expected => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn word_boundary_before(text: &str, index: usize) -> bool {
+    index == 0
+        || text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !ch.is_alphanumeric())
+}
+
+fn word_boundary_after(text: &str, end: usize) -> bool {
+    end >= text.len()
+        || text[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_alphanumeric())
+}
+
+fn lead_residue(lead: &str, value: &str, key: &str) -> usize {
+    let mut skip = HashSet::new();
+    for token in write::alphanumeric_runs(value) {
+        skip.insert(token);
+    }
+    for token in key.split('_') {
+        if !token.is_empty() {
+            skip.insert(token.to_lowercase());
+        }
+    }
+    for token in DETAIL_FILLERS {
+        skip.insert((*token).to_string());
+    }
+    write::alphanumeric_runs(lead)
+        .into_iter()
+        .filter(|token| !skip.contains(token))
+        .count()
+}
+
+fn detail_echo_line(subject: &str, key: &str, turn: usize) -> String {
+    format!(
+        "pass1 detail echo: {} rule | {} | turn {turn}",
+        log_plain(subject),
+        log_plain(key)
+    )
+}
+
+/// Keep a setting's bare value when only its trailing parenthetical fails.
+///
+/// The head is kept only when it passes value support and key binding, so the
+/// unchanged checks still decide. A rule is never edited. Off does nothing.
+fn strip_detail_tail(
+    swapped: bool,
+    fact: &mut Fact,
+    ground: &SessionGround,
+    report: &mut IngestionReport,
+) {
+    if !ground.value_details() || swapped || fact.predicate != Predicate::Setting {
+        return;
+    }
+    let Some((head, tail)) = trailing_detail(&fact.object_name) else {
+        return;
+    };
+    let full = fact.object_name.clone();
+    let full_support = object_supported(swapped, fact, ground);
+    let full_key = ground.key_bound(&fact.key, &full, fact.turn, &fact.quote);
+    fact.object_name.clone_from(&head);
+    let head_support = object_supported(swapped, fact, ground);
+    let head_key = ground.key_bound(&fact.key, &head, fact.turn, &fact.quote);
+    if !head_support || !head_key {
+        fact.object_name = full;
+        return;
+    }
+    let replaces_in_tail = !fact.replaces.trim().is_empty()
+        && contiguous_token_run(
+            &write::alphanumeric_runs(fact.replaces.trim()),
+            &write::alphanumeric_runs(&tail),
+        );
+    let reason = if !full_support {
+        "support"
+    } else if !full_key {
+        "key"
+    } else if replaces_in_tail {
+        "replaces"
+    } else {
+        fact.object_name = full;
+        return;
+    };
+    report.detail_tail_stripped += 1;
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        detail_strip_line(&fact.subject_name, &fact.key, reason, fact.turn)
+    );
+}
+
+fn trailing_detail(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.last().copied() != Some(')') || !parens_balanced(&chars) {
+        return None;
+    }
+    let open = matching_open(&chars)?;
+    if open == 0 || chars[open - 1] != ' ' {
+        return None;
+    }
+    let head: String = chars[..open - 1].iter().collect();
+    let tail: String = chars[open + 1..chars.len() - 1].iter().collect();
+    let head = head.trim().to_string();
+    if head.is_empty() || !head.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    Some((head, tail))
+}
+
+fn parens_balanced(chars: &[char]) -> bool {
+    let mut depth = 0i32;
+    for ch in chars {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn matching_open(chars: &[char]) -> Option<usize> {
+    let mut depth = 0i32;
+    for (index, ch) in chars.iter().enumerate().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn detail_strip_line(subject: &str, key: &str, reason: &str, turn: usize) -> String {
+    format!(
+        "pass1 detail strip: {}:{} | {reason} | turn {turn}",
+        log_plain(subject),
+        log_plain(key)
+    )
 }
 
 /// A decided setting, or a decided `uses` whose role can retire a stored edge.
@@ -973,6 +1286,7 @@ fn accept_fact(
         swapped,
     };
     bind_subject(&mut fact, swapped, &session.project)?;
+    strip_detail_tail(swapped, &mut fact, ground, report);
     let value_ok = object_supported(swapped, &fact, ground);
     let grounded = recover_unsupported(&mut fact, &prior, value_ok, ground)?;
     let kept = kept_component_object(&fact, &prior, value_ok);
@@ -1113,9 +1427,20 @@ fn bind_known_key(
     known: Option<&[super::known::KnownRow]>,
     report: &mut IngestionReport,
 ) -> Result<(), &'static str> {
-    if fact.predicate != Predicate::Setting
-        || ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote)
-    {
+    if fact.predicate != Predicate::Setting {
+        return Ok(());
+    }
+    if ground.key_bound(&fact.key, &fact.object_name, fact.turn, &fact.quote) {
+        if let Some((token, form)) =
+            ground.keeping_form(&fact.key, &fact.object_name, fact.turn, &fact.quote)
+        {
+            report.key_form_bound += 1;
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                key_form_line(&fact.subject_name, &fact.key, token, form, fact.turn)
+            );
+        }
         return Ok(());
     }
     if !known_binds(fact, known) {
@@ -1127,6 +1452,14 @@ fn bind_known_key(
         known_key_line(&fact.subject_name, &fact.key, fact.turn)
     );
     Ok(())
+}
+
+fn key_form_line(subject: &str, key: &str, token: &str, form: &str, turn: usize) -> String {
+    format!(
+        "pass1 key form: {}:{} | {token}->{form} | turn {turn}",
+        log_plain(subject),
+        log_plain(key)
+    )
 }
 
 fn known_key_line(subject: &str, key: &str, turn: usize) -> String {
@@ -1691,6 +2024,30 @@ mod tests {
             PASS1_SYSTEM,
             format!("{SYSTEM_BEFORE_KNOWN_BLOCK}{KNOWN_SENTENCES}")
         );
+    }
+
+    #[test]
+    fn value_details_and_key_forms_read_only_their_own_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!value_details_enabled(dir.path()));
+        assert!(!key_forms_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nextract_value_details = true\n",
+        )
+        .unwrap();
+        assert!(value_details_enabled(dir.path()));
+        assert!(!key_forms_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nextract_key_forms = true\nconsolidate = false\n",
+        )
+        .unwrap();
+        assert!(!value_details_enabled(dir.path()));
+        assert!(key_forms_enabled(dir.path()));
+        let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
+        assert!(!encoded.contains("detail_tail_stripped"));
+        assert!(!encoded.contains("key_form_bound"));
     }
 
     fn session(turns: Vec<Turn>) -> SessionInput {
@@ -6854,5 +7211,846 @@ mod tests {
         }
         values.sort();
         values
+    }
+
+    const VALUE_DETAILS_GOLDEN: &str =
+        include_str!("../../../tests/fixtures/pass1/system-value-details.txt");
+
+    #[test]
+    fn value_details_system_text_matches_the_golden_and_removes_back_to_bare() {
+        let on = pass1_system_text(false);
+        assert_eq!(on, VALUE_DETAILS_GOLDEN);
+        assert_eq!(on, format!("{PASS1_SYSTEM_BARE}{DETAIL_SENTENCES}"));
+        let known = pass1_system_text(true);
+        assert_eq!(known, format!("{on}{KNOWN_SENTENCES}"));
+        assert_eq!(on.replacen(DETAIL_SENTENCES, "", 1), PASS1_SYSTEM_BARE);
+        assert_eq!(known.replacen(DETAIL_SENTENCES, "", 1), PASS1_SYSTEM);
+        assert_eq!(PASS1_SYSTEM_BARE, SYSTEM_BEFORE_KNOWN_BLOCK);
+    }
+
+    #[test]
+    fn detail_sentences_omit_bench_vocabulary() {
+        let text = DETAIL_SENTENCES.to_lowercase();
+        for word in [
+            "msrv",
+            "1.74",
+            "1.80",
+            "lazylock",
+            "jobs",
+            "cpu",
+            "nas",
+            "spinning",
+            "thrash",
+            "coverage",
+            "88",
+            "85",
+            "feat",
+            "conventional",
+            "migrate",
+            "212",
+            "fix_tz",
+            "utc",
+            "test_export",
+            "asyncclient",
+            "httpx",
+            "clash",
+            "8080",
+            "aggregator",
+            "jsonhandler",
+            "licence",
+            "highlight",
+            "pygments",
+        ] {
+            assert!(!text.contains(word), "{word}");
+        }
+    }
+
+    fn detail_fact(
+        subject: &str,
+        predicate: Predicate,
+        key: &str,
+        object: &str,
+        turn: usize,
+    ) -> Fact {
+        Fact {
+            subject_name: subject.into(),
+            subject_kind: Kind::Project,
+            predicate,
+            role: None,
+            key: key.into(),
+            object_name: object.into(),
+            object_kind: None,
+            status: "decided".into(),
+            turn,
+            quote: "quoted".into(),
+            confidence: 0.9,
+            provenance: Provenance::User,
+            replaces: String::new(),
+        }
+    }
+
+    fn apply_echo(facts: Vec<Fact>) -> (Vec<Fact>, IngestionReport, String) {
+        let mut report = IngestionReport::default();
+        let (kept, logged) =
+            crate::file_lock::capture_stderr(|| drop_detail_echoes(facts, &mut report));
+        (kept, report, logged)
+    }
+
+    #[test]
+    fn echo_guard_drops_a_decided_reason_rule_that_restates_a_setting() {
+        let cases = [
+            (
+                "Harbor",
+                "go_version",
+                "1.22",
+                "Keep Go at 1.22 because the build image ships it",
+                "",
+                0,
+                0,
+            ),
+            (
+                "Tidepool",
+                "workers",
+                "4",
+                "Default to 4 workers because more threads overload the queue",
+                "",
+                0,
+                0,
+            ),
+            (
+                "Lantern",
+                "workers",
+                "4",
+                "Default to 4 workers because more threads overload the queue",
+                "2",
+                0,
+                0,
+            ),
+            (
+                "Harbor",
+                "go_version",
+                "1.22",
+                "Keep Go at 1.22 because the build image ships it",
+                "",
+                3,
+                1,
+            ),
+        ];
+        for (subject, key, value, rule, replaces, setting_turn, rule_turn) in cases {
+            let mut setting = detail_fact(subject, Predicate::Setting, key, value, setting_turn);
+            let mut rule_fact = detail_fact(subject, Predicate::Rule, "", rule, rule_turn);
+            rule_fact.replaces = replaces.into();
+            setting.replaces.clear();
+            let (kept, report, logged) = apply_echo(vec![setting, rule_fact]);
+            assert_eq!(kept.len(), 1, "{subject} {key}");
+            assert_eq!(kept[0].predicate, Predicate::Setting);
+            assert_eq!(report.drops.get(DROP_DETAIL_ECHO).copied(), Some(1));
+            assert!(logged.contains(&format!(
+                "pass1 detail echo: {subject} rule | {key} | turn {rule_turn}"
+            )));
+            let encoded = serde_json::to_string(&report).unwrap();
+            assert!(encoded.contains("\"detail_echo\":1"), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn echo_guard_keeps_rules_outside_its_closed_shape() {
+        let keep = [
+            (
+                "Harbor",
+                "Harbor",
+                "lint_mode",
+                "strict",
+                "Run the linter in strict mode",
+                "decided",
+            ),
+            (
+                "Harbor",
+                "Lantern",
+                "go_version",
+                "1.22",
+                "Keep Go at 1.22 because the build image ships it",
+                "decided",
+            ),
+            (
+                "Tidepool",
+                "Tidepool",
+                "config_source",
+                "environment variables",
+                "Configure from environment variables only, all prefixed HARBOR_, with no config file, because it runs in containers",
+                "decided",
+            ),
+            (
+                "Lantern",
+                "Lantern",
+                "go_version",
+                "1.22",
+                "Keep Go at 1.22 because the build image ships it",
+                "considered",
+            ),
+            (
+                "Harbor",
+                "Harbor",
+                "go_version",
+                "1.22",
+                "Keep Go at 1.22 because the build image ships it",
+                "rejected",
+            ),
+            (
+                "Tidepool",
+                "Tidepool",
+                "build_number",
+                "14",
+                "Use 140 because the queue grew",
+                "decided",
+            ),
+            (
+                "Lantern",
+                "Lantern",
+                "export_format",
+                "csv",
+                "Export csv because the sheet tool reads it",
+                "decided",
+            ),
+        ];
+        for (setting_subject, rule_subject, key, value, rule, status) in keep {
+            let setting = detail_fact(setting_subject, Predicate::Setting, key, value, 0);
+            let mut rule_fact = detail_fact(rule_subject, Predicate::Rule, "", rule, 0);
+            rule_fact.status = status.into();
+            let (kept, report, logged) = apply_echo(vec![setting, rule_fact]);
+            assert_eq!(kept.len(), 2, "{key} {status} {rule}");
+            assert!(!report.drops.contains_key(DROP_DETAIL_ECHO), "{key}");
+            assert!(!logged.contains("pass1 detail echo"), "{logged}");
+        }
+
+        let setting = detail_fact("Harbor", Predicate::Setting, "go_version", "1.22", 0);
+        let rule = detail_fact(
+            "Harbor",
+            Predicate::Rule,
+            "",
+            "Keep Go at 1.22 because the build image ships it",
+            0,
+        );
+        let mut report = IngestionReport::default();
+        let (kept, logged) = crate::file_lock::capture_stderr(|| {
+            apply_value_detail_echo(false, vec![setting, rule], &mut report)
+        });
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].predicate, Predicate::Rule);
+        assert!(report.drops.is_empty());
+        assert!(!logged.contains("pass1 detail echo"));
+    }
+
+    fn literal_item(
+        subject: &str,
+        predicate: &str,
+        key: &str,
+        object: &str,
+        replaces: &str,
+        quote: &str,
+    ) -> Value {
+        serde_json::json!({
+            "subject": subject,
+            "subject_type": "project",
+            "predicate": predicate,
+            "role": "none",
+            "key": key,
+            "object": object,
+            "object_type": "literal",
+            "status": "decided",
+            "replaces": replaces,
+            "turn": 0,
+            "quote": quote,
+            "confidence": 0.9
+        })
+    }
+
+    fn admit_details(
+        details: bool,
+        project: &str,
+        turn: &str,
+        item: Value,
+    ) -> (Vec<Fact>, IngestionReport, String) {
+        admit_flags(details, false, project, turn, item)
+    }
+
+    fn admit_flags(
+        details: bool,
+        forms: bool,
+        project: &str,
+        turn: &str,
+        item: Value,
+    ) -> (Vec<Fact>, IngestionReport, String) {
+        let input = SessionInput {
+            session_id: "s".into(),
+            date: "2026-01-02".into(),
+            project: ProjectIdentity {
+                name: project.into(),
+                aliases: vec![project.into()],
+            },
+            turns: vec![Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: turn.into(),
+            }],
+            tool_lines: Vec::new(),
+        };
+        let ground = SessionGround::prepare(&input.turns)
+            .with_value_details(details)
+            .with_key_forms(forms);
+        let reply = serde_json::json!({
+            "facts": [item],
+            "bugs": [],
+            "releases": []
+        });
+        let mut report = IngestionReport::default();
+        let (facts, logged) = crate::file_lock::capture_stderr(|| {
+            collect_facts(
+                reply.as_object().expect("object"),
+                &input,
+                &ground,
+                &mut report,
+                false,
+                None,
+            )
+        });
+        (facts, report, logged)
+    }
+
+    #[test]
+    fn detail_tail_keeps_the_head_when_only_the_parenthesis_fails() {
+        let (facts, report, logged) = admit_details(
+            true,
+            "Harbor",
+            "Harbor keeps retention_days at 90 days for the archive.",
+            literal_item(
+                "Harbor",
+                "setting",
+                "retention_days",
+                "90 (audit needs a quarter of history)",
+                "",
+                "retention_days at 90 days",
+            ),
+        );
+        assert_eq!(facts.len(), 1, "{:?}", report.drops);
+        assert_eq!(facts[0].object_name, "90");
+        assert_eq!(report.detail_tail_stripped, 1);
+        assert!(logged.contains("pass1 detail strip: Harbor:retention_days | support | turn 0"));
+        assert!(serde_json::to_string(&report)
+            .unwrap()
+            .contains("\"detail_tail_stripped\":1"));
+
+        let (key_facts, key_report, key_logged) = admit_details(
+            true,
+            "Tidepool",
+            "Tidepool stays quiet after the burst of 12.",
+            literal_item(
+                "Tidepool",
+                "setting",
+                "theme_mode",
+                "quiet (burst 12)",
+                "",
+                "stays quiet after the burst",
+            ),
+        );
+        assert_eq!(key_facts.len(), 1, "{:?}", key_report.drops);
+        assert_eq!(key_facts[0].object_name, "quiet");
+        assert_eq!(key_report.detail_tail_stripped, 1);
+        assert!(key_logged.contains("pass1 detail strip: Tidepool:theme_mode | key | turn 0"));
+
+        let (version_facts, version_report, version_logged) = admit_details(
+            true,
+            "Lantern",
+            "Lantern release_version is now 2.1 (was 2.0) after the cut.",
+            literal_item(
+                "Lantern",
+                "setting",
+                "release_version",
+                "2.1 (was 2.0)",
+                "2.0",
+                "release_version is now 2.1 (was 2.0)",
+            ),
+        );
+        assert_eq!(version_facts.len(), 1, "{:?}", version_report.drops);
+        assert_eq!(version_facts[0].object_name, "2.1");
+        assert_eq!(version_report.detail_tail_stripped, 1);
+        assert!(version_logged
+            .contains("pass1 detail strip: Lantern:release_version | replaces | turn 0"));
+    }
+
+    #[test]
+    fn detail_tail_leaves_a_passing_value_and_a_rule_unchanged() {
+        let (full, full_report, full_logged) = admit_details(
+            true,
+            "Harbor",
+            "Harbor release_version is now 2.1 (the cut) after review.",
+            literal_item(
+                "Harbor",
+                "setting",
+                "release_version",
+                "2.1 (the cut)",
+                "",
+                "release_version is now 2.1 (the cut)",
+            ),
+        );
+        assert_eq!(full.len(), 1, "{:?}", full_report.drops);
+        assert_eq!(full[0].object_name, "2.1 (the cut)");
+        assert_eq!(full_report.detail_tail_stripped, 0);
+        assert!(!full_logged.contains("pass1 detail strip"));
+
+        let (plain, plain_report, _) = admit_details(
+            true,
+            "Tidepool",
+            "Tidepool keeps retention_days at 90 days.",
+            literal_item(
+                "Tidepool",
+                "setting",
+                "retention_days",
+                "90 days",
+                "",
+                "retention_days at 90 days",
+            ),
+        );
+        assert_eq!(plain.len(), 1, "{:?}", plain_report.drops);
+        assert_eq!(plain[0].object_name, "90 days");
+        assert_eq!(plain_report.detail_tail_stripped, 0);
+
+        let (unbalanced, unbalanced_report, _) = admit_details(
+            true,
+            "Lantern",
+            "Lantern keeps retention_days at 90 days.",
+            literal_item(
+                "Lantern",
+                "setting",
+                "retention_days",
+                "90 (audit",
+                "",
+                "retention_days at 90 days",
+            ),
+        );
+        assert_eq!(unbalanced_report.detail_tail_stripped, 0);
+        if let Some(kept) = unbalanced.first() {
+            assert_eq!(kept.object_name, "90 (audit");
+        }
+
+        let (empty_head, empty_report, _) = admit_details(
+            true,
+            "Harbor",
+            "Harbor keeps retention_days at 90 days.",
+            literal_item(
+                "Harbor",
+                "setting",
+                "retention_days",
+                " (audit days)",
+                "",
+                "retention_days at 90 days",
+            ),
+        );
+        assert_eq!(empty_report.detail_tail_stripped, 0);
+        if let Some(kept) = empty_head.first() {
+            assert_eq!(kept.object_name, " (audit days)");
+        }
+
+        let (rule, rule_report, _) = admit_details(
+            true,
+            "Tidepool",
+            "Tidepool says keep 90 days (the archive rule) in the log.",
+            literal_item(
+                "Tidepool",
+                "rule",
+                "",
+                "Keep 90 days (the archive rule).",
+                "",
+                "keep 90 days (the archive rule)",
+            ),
+        );
+        assert_eq!(rule.len(), 1, "{:?}", rule_report.drops);
+        assert_eq!(rule[0].object_name, "Keep 90 days (the archive rule).");
+        assert_eq!(rule_report.detail_tail_stripped, 0);
+
+        let (off, off_report, off_logged) = admit_details(
+            false,
+            "Lantern",
+            "Lantern keeps retention_days at 90 days for the archive.",
+            literal_item(
+                "Lantern",
+                "setting",
+                "retention_days",
+                "90 (audit needs a quarter of history)",
+                "",
+                "retention_days at 90 days",
+            ),
+        );
+        assert!(off.is_empty(), "{:?}", off_report.drops);
+        assert_eq!(off_report.drops.get(DROP_VALUE_SUPPORT).copied(), Some(1));
+        assert_eq!(off_report.detail_tail_stripped, 0);
+        assert!(!off_logged.contains("pass1 detail strip"));
+        assert!(!serde_json::to_string(&off_report)
+            .unwrap()
+            .contains("detail_tail_stripped"));
+    }
+
+    fn admit_key(
+        forms: bool,
+        project: &str,
+        turn: &str,
+        key: &str,
+        object: &str,
+        quote: &str,
+    ) -> (Vec<Fact>, IngestionReport, String) {
+        admit_flags(
+            false,
+            forms,
+            project,
+            turn,
+            literal_item(project, "setting", key, object, "", quote),
+        )
+    }
+
+    #[test]
+    fn key_forms_are_admitted_only_when_the_switch_is_on() {
+        let cases = [
+            (
+                "Harbor",
+                "python_min_version",
+                "3.10",
+                "Python 3.10 minimum",
+                "min->minimum",
+            ),
+            (
+                "Tidepool",
+                "image_max_width_px",
+                "900",
+                "resize to 900px wide max",
+                "width->wide",
+            ),
+            (
+                "Lantern",
+                "license",
+                "Apache-2.0",
+                "Licence Apache-2.0 for Harbor",
+                "license->licence",
+            ),
+        ];
+        for (project, key, object, quote, pair) in cases {
+            let (off, off_report, off_logged) =
+                admit_key(false, project, quote, key, object, quote);
+            assert!(off.is_empty(), "{key} {:?}", off_report.drops);
+            assert_eq!(
+                off_report.drops.get(DROP_KEY_BINDING).copied(),
+                Some(1),
+                "{key}"
+            );
+            assert_eq!(off_report.key_form_bound, 0, "{key}");
+            assert!(!off_logged.contains("pass1 key form"), "{key}");
+
+            let (on, on_report, on_logged) = admit_key(true, project, quote, key, object, quote);
+            assert_eq!(on.len(), 1, "{key} {:?}", on_report.drops);
+            assert_eq!(on[0].object_name, object);
+            assert_eq!(on_report.key_form_bound, 1, "{key}");
+            assert!(on_logged.contains(&format!(
+                "pass1 key form: {project}:{key} | {pair} | turn 0"
+            )));
+            assert!(serde_json::to_string(&on_report)
+                .unwrap()
+                .contains("\"key_form_bound\":1"));
+        }
+
+        let (maximal, maximal_report, _) = admit_key(
+            true,
+            "Harbor",
+            "the maximal size is 4",
+            "max_jobs",
+            "4",
+            "the maximal size is 4",
+        );
+        assert!(maximal.is_empty(), "{:?}", maximal_report.drops);
+        assert_eq!(maximal_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(maximal_report.key_form_bound, 0);
+
+        let (swapped, swapped_report, _) = admit_key(
+            true,
+            "Tidepool",
+            "Python 3.11 minimum",
+            "python_max_version",
+            "3.11",
+            "Python 3.11 minimum",
+        );
+        assert!(swapped.is_empty(), "{:?}", swapped_report.drops);
+        assert_eq!(swapped_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(swapped_report.key_form_bound, 0);
+
+        let (generic, generic_report, _) = admit_key(
+            true,
+            "Lantern",
+            "the minimum is 3",
+            "min",
+            "3",
+            "the minimum is 3",
+        );
+        assert!(generic.is_empty(), "{:?}", generic_report.drops);
+        assert_eq!(generic_report.drops.get(DROP_KEY_BINDING).copied(), Some(1));
+        assert_eq!(generic_report.key_form_bound, 0);
+
+        let exact_quote = "Python 3.10 min is the floor";
+        let (exact, exact_report, exact_logged) = admit_key(
+            true,
+            "Harbor",
+            exact_quote,
+            "python_min_version",
+            "3.10",
+            exact_quote,
+        );
+        assert_eq!(exact.len(), 1, "{:?}", exact_report.drops);
+        assert_eq!(exact_report.key_form_bound, 0);
+        assert!(!exact_logged.contains("pass1 key form"));
+
+        let (missing, missing_report, _) = admit_key(
+            true,
+            "Tidepool",
+            "Python 3.10 minimum",
+            "python_min_version",
+            "9.9",
+            "Python 3.10 minimum",
+        );
+        assert!(missing.is_empty(), "{:?}", missing_report.drops);
+        assert_eq!(
+            missing_report.drops.get(DROP_VALUE_SUPPORT).copied(),
+            Some(1)
+        );
+        assert_eq!(missing_report.key_form_bound, 0);
+
+        let mit = "Licence: MIT for Harbor.";
+        let mit_quote = "Licence: MIT for Harbor";
+        for forms in [false, true] {
+            let (facts, report, logged) =
+                admit_key(forms, "Lantern", mit, "license", "MIT", mit_quote);
+            assert_eq!(facts.len(), 1, "{forms} {:?}", report.drops);
+            assert_eq!(facts[0].object_name, "MIT");
+            assert_eq!(report.key_form_bound, 0);
+            assert!(!logged.contains("pass1 key form"));
+        }
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn value_details_and_key_forms_apply_alone_and_together() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        const TURN: &str = "Set go_version to 1.22 for Harbor. Keep Go at 1.22 because the build image ships it. retention_days stays 90 days. Python 3.10 minimum is the floor.";
+        let reply = serde_json::json!({
+            "facts": [
+                literal_item("Harbor", "setting", "go_version", "1.22", "", "go_version to 1.22"),
+                literal_item("Harbor", "rule", "", "Keep Go at 1.22 because the build image ships it", "", "Keep Go at 1.22 because the build image ships it"),
+                literal_item("Harbor", "setting", "retention_days", "90 (audit needs a quarter of history)", "", "retention_days stays 90 days"),
+                literal_item("Harbor", "setting", "python_min_version", "3.10", "", "Python 3.10 minimum")
+            ],
+            "bugs": [],
+            "releases": []
+        })
+        .to_string();
+
+        struct Fixed {
+            reply: String,
+            system: Mutex<String>,
+            user: Mutex<String>,
+            other: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Fixed {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                self.other.fetch_add(1, Ordering::SeqCst);
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                messages: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                *self.system.lock().expect("system") = system.to_string();
+                *self.user.lock().expect("user") = messages
+                    .last()
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default();
+                assert_eq!(messages[0].content, PASS1_EXAMPLE_USER);
+                assert_eq!(messages[1].content, PASS1_EXAMPLE_REPLY);
+                Ok(Completion::unmeasured(self.reply.clone()))
+            }
+        }
+
+        fn plant(config: &str) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("Harbor");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                dir.path(),
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    TURN.into(),
+                )],
+            )
+            .unwrap();
+            if !config.is_empty() {
+                std::fs::write(dir.path().join(".recall-echo.toml"), config).unwrap();
+            }
+            dir
+        }
+
+        fn run(config: &str, reply: &str) -> (IngestionReport, String, String, String, u64) {
+            let dir = plant(config);
+            let path = dir.path().to_path_buf();
+            let reply = reply.to_string();
+            let ((report, system, user, other), logged) = crate::file_lock::capture_stderr(|| {
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let gm = GraphMemory::open_embedded(&path.join("graph"))
+                            .await
+                            .unwrap();
+                        let provider = Fixed {
+                            reply,
+                            system: Mutex::new(String::new()),
+                            user: Mutex::new(String::new()),
+                            other: AtomicU64::new(0),
+                        };
+                        let report = extract_session(
+                            &gm,
+                            &path,
+                            1,
+                            &IngestContext::new("s", Some(1)),
+                            &provider,
+                        )
+                        .await
+                        .unwrap();
+                        let system = provider.system.lock().expect("system").clone();
+                        let user = provider.user.lock().expect("user").clone();
+                        let other = provider.other.load(Ordering::SeqCst);
+                        (report, system, user, other)
+                    })
+                })
+                .join()
+                .expect("session thread")
+            });
+            (report, system, user, logged, other)
+        }
+
+        let base = "[graph]\nconsolidate = false\nknown_facts_context = false\n";
+        let (off, off_system, off_user, off_logged, off_other) = run(base, &reply);
+        let (forms, forms_system, forms_user, forms_logged, _) =
+            run(&format!("{base}extract_key_forms = true\n"), &reply);
+        let (details, details_system, details_user, details_logged, _) =
+            run(&format!("{base}extract_value_details = true\n"), &reply);
+        let (both, both_system, both_user, both_logged, _) = run(
+            &format!("{base}extract_value_details = true\nextract_key_forms = true\n"),
+            &reply,
+        );
+
+        assert_eq!(off_other, 0, "{:?}", off.errors);
+        assert_eq!(off_system, PASS1_SYSTEM_BARE);
+        assert_eq!(forms_system, PASS1_SYSTEM_BARE);
+        assert_eq!(off_user, forms_user);
+        assert_eq!(details_system, pass1_system_text(false));
+        assert_eq!(both_system, pass1_system_text(false));
+        assert_eq!(
+            details_system.replacen(DETAIL_SENTENCES, "", 1),
+            PASS1_SYSTEM_BARE
+        );
+        assert_eq!(off_user, details_user);
+        assert_eq!(off_user, both_user);
+        assert!(off_user.contains(TURN));
+
+        assert!(
+            off.drops.contains_key(DROP_VALUE_SUPPORT),
+            "{:?}",
+            off.drops
+        );
+        assert_eq!(
+            off.drops.get(DROP_KEY_BINDING).copied(),
+            Some(1),
+            "{:?}",
+            off.drops
+        );
+        assert!(!off.drops.contains_key(DROP_DETAIL_ECHO));
+        assert_eq!(off.detail_tail_stripped, 0);
+        assert_eq!(off.key_form_bound, 0);
+        assert!(!off_logged.contains("pass1 detail"));
+        assert!(!off_logged.contains("pass1 key form"));
+
+        assert_eq!(
+            forms.drops.get(DROP_VALUE_SUPPORT).copied(),
+            Some(1),
+            "{:?}",
+            forms.drops
+        );
+        assert!(
+            !forms.drops.contains_key(DROP_KEY_BINDING),
+            "{:?}",
+            forms.drops
+        );
+        assert!(!forms.drops.contains_key(DROP_DETAIL_ECHO));
+        assert_eq!(forms.key_form_bound, 1);
+        assert_eq!(forms.detail_tail_stripped, 0);
+        assert!(forms_logged
+            .contains("pass1 key form: Harbor:python_min_version | min->minimum | turn 0"));
+        assert!(!forms_logged.contains("pass1 detail"));
+        assert_eq!(forms_system.as_bytes(), off_system.as_bytes());
+
+        assert_eq!(
+            details.drops.get(DROP_DETAIL_ECHO).copied(),
+            Some(1),
+            "{:?}",
+            details.drops
+        );
+        assert_eq!(
+            details.drops.get(DROP_KEY_BINDING).copied(),
+            Some(1),
+            "{:?}",
+            details.drops
+        );
+        assert_eq!(details.detail_tail_stripped, 1);
+        assert_eq!(details.key_form_bound, 0);
+        assert!(details_logged.contains("pass1 detail echo: Harbor rule | go_version | turn 0"));
+        assert!(
+            details_logged.contains("pass1 detail strip: Harbor:retention_days | support | turn 0")
+        );
+        assert!(!details_logged.contains("pass1 key form"));
+
+        assert_eq!(
+            both.drops.get(DROP_DETAIL_ECHO).copied(),
+            Some(1),
+            "{:?}",
+            both.drops
+        );
+        assert!(
+            !both.drops.contains_key(DROP_KEY_BINDING),
+            "{:?}",
+            both.drops
+        );
+        assert!(
+            !both.drops.contains_key(DROP_VALUE_SUPPORT),
+            "{:?}",
+            both.drops
+        );
+        assert_eq!(both.detail_tail_stripped, 1);
+        assert_eq!(both.key_form_bound, 1);
+        assert!(both_logged.contains("pass1 detail echo: Harbor rule | go_version | turn 0"));
+        assert!(
+            both_logged.contains("pass1 detail strip: Harbor:retention_days | support | turn 0")
+        );
+        assert!(both_logged
+            .contains("pass1 key form: Harbor:python_min_version | min->minimum | turn 0"));
     }
 }

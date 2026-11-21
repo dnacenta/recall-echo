@@ -51,6 +51,8 @@ url = "ws://localhost:8787"   # server mode only
 # recover_turns = false       # list raw-turn values missing from the store; off by default, because it makes extra model calls; never writes
 # lasting_forget = false      # keep a confirmed forget until --unforget; off by default; with it off the forget file is not read
 # slot_forget = false         # forget every value of one subject and relation; off by default, ignored unless lasting_forget is on
+# extract_value_details = false # keep stated details inside the fact that owns them; off by default; implies nothing
+# extract_key_forms = false   # bind min/minimum, max/maximum, width/wide, license/licence in pass 1; off by default; implies nothing and does not change the prompt
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

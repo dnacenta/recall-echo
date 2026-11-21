@@ -972,6 +972,21 @@ pub struct GraphSection {
     /// on, and it does nothing unless that flag is also on.
     #[serde(default = "default_slot_forget", skip_serializing_if = "is_false")]
     pub slot_forget: bool,
+    /// Keep stated details inside the fact that owns them.
+    /// Off unless set. Stands alone: it does not turn any other switch on.
+    #[serde(
+        default = "default_extract_value_details",
+        skip_serializing_if = "is_false"
+    )]
+    pub extract_value_details: bool,
+    /// Let pass-1 grounding bind a closed list of key-token forms.
+    /// Off unless set. Stands alone: it does not turn any other switch on,
+    /// and it does not change the pass-1 prompt.
+    #[serde(
+        default = "default_extract_key_forms",
+        skip_serializing_if = "is_false"
+    )]
+    pub extract_key_forms: bool,
 }
 
 impl Default for GraphSection {
@@ -1007,6 +1022,8 @@ impl Default for GraphSection {
             recover_turns: default_recover_turns(),
             lasting_forget: default_lasting_forget(),
             slot_forget: default_slot_forget(),
+            extract_value_details: default_extract_value_details(),
+            extract_key_forms: default_extract_key_forms(),
         }
     }
 }
@@ -1472,6 +1489,14 @@ fn default_lasting_forget() -> bool {
 }
 
 fn default_slot_forget() -> bool {
+    false
+}
+
+fn default_extract_value_details() -> bool {
+    false
+}
+
+fn default_extract_key_forms() -> bool {
     false
 }
 
@@ -2017,6 +2042,8 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.recover_turns", flag_recover_turns),
     ("graph.lasting_forget", flag_lasting_forget),
     ("graph.slot_forget", flag_slot_forget),
+    ("graph.extract_value_details", flag_extract_value_details),
+    ("graph.extract_key_forms", flag_extract_key_forms),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2114,6 +2141,14 @@ fn flag_lasting_forget(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_slot_forget(graph: &mut GraphSection) -> &mut bool {
     &mut graph.slot_forget
+}
+
+fn flag_extract_value_details(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.extract_value_details
+}
+
+fn flag_extract_key_forms(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.extract_key_forms
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -4293,6 +4328,122 @@ settle_secs = 300
         cfg.set_key("graph.slot_forget", "true").unwrap();
         assert!(cfg.set_key("graph.slot_forget", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").slot_forget);
+    }
+
+    #[test]
+    fn extract_value_details_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_extract_value_details());
+        assert!(!GraphSection::default().extract_value_details);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().extract_value_details);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("extract_value_details"));
+        assert!(!rendered_default.contains("extract_key_forms"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nextract_value_details = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.extract_value_details);
+        assert!(!false_graph.extract_key_forms);
+        assert!(false_graph.consolidate);
+        assert!(false_graph.known_facts_context);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("extract_value_details"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nextract_value_details = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.extract_value_details);
+        assert!(!true_graph.extract_key_forms);
+        assert!(true_graph.consolidate);
+        assert!(!true_graph.known_match);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("extract_value_details = true"));
+        assert!(!rendered_true.contains("extract_key_forms"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.extract_value_details);
+        assert!(!again.extract_key_forms);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.extract_value_details", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.extract_value_details);
+        assert!(!graph.extract_key_forms);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("extract_value_details = true"));
+        assert!(!rendered.contains("extract_key_forms"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.extract_value_details);
+        assert!(!parsed_graph.extract_key_forms);
+
+        cfg.set_key("graph.extract_value_details", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").extract_value_details);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("extract_value_details"));
+        cfg.set_key("graph.extract_value_details", "true").unwrap();
+        assert!(cfg.set_key("graph.extract_value_details", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").extract_value_details);
+    }
+
+    #[test]
+    fn extract_key_forms_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_extract_key_forms());
+        assert!(!GraphSection::default().extract_key_forms);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().extract_key_forms);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("extract_key_forms"));
+        assert!(!rendered_default.contains("extract_value_details"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nextract_key_forms = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.extract_key_forms);
+        assert!(!false_graph.extract_value_details);
+        assert!(false_graph.consolidate);
+        assert!(false_graph.known_facts_context);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("extract_key_forms"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nextract_key_forms = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.extract_key_forms);
+        assert!(!true_graph.extract_value_details);
+        assert!(true_graph.consolidate);
+        assert!(!true_graph.known_match);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("extract_key_forms = true"));
+        assert!(!rendered_true.contains("extract_value_details"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.extract_key_forms);
+        assert!(!again.extract_value_details);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.extract_key_forms", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.extract_key_forms);
+        assert!(!graph.extract_value_details);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("extract_key_forms = true"));
+        assert!(!rendered.contains("extract_value_details"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.extract_key_forms);
+        assert!(!parsed_graph.extract_value_details);
+
+        cfg.set_key("graph.extract_key_forms", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").extract_key_forms);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("extract_key_forms"));
+        cfg.set_key("graph.extract_key_forms", "true").unwrap();
+        assert!(cfg.set_key("graph.extract_key_forms", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").extract_key_forms);
     }
 
     #[test]

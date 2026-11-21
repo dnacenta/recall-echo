@@ -95,6 +95,12 @@ pub struct SessionObservation {
     /// Decided settings kept because a shown known row bound the key.
     /// Zero when that switch or the known block is off.
     pub known_key_bound: u32,
+    /// Settings whose trailing parenthetical detail was removed.
+    /// Zero when that switch is off or nothing was stripped.
+    pub detail_tail_stripped: u32,
+    /// Candidates kept because a listed key-token form bound the key.
+    /// Zero when that switch is off or no form was needed.
+    pub key_form_bound: u32,
     /// Entity resolution for a v2 session. Blank on v1.
     pub resolve: crate::graph::types::ResolveStats,
     /// Facts this session closed. Empty on v1.
@@ -253,6 +259,14 @@ pub struct SessionReport {
     /// Zero, and omitted, when that switch or the known block is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub known_key_bound: u32,
+    /// Settings whose trailing parenthetical detail was removed.
+    /// Zero, and omitted, when the switch is off or nothing was stripped.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub detail_tail_stripped: u32,
+    /// Candidates kept because a listed key-token form bound the key.
+    /// Zero, and omitted, when the switch is off or no form was needed.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub key_form_bound: u32,
     /// Entity resolution. Blank on v1, and omitted from the printed report then.
     #[serde(
         default,
@@ -653,6 +667,8 @@ pub fn grade_with_pipeline(
                 kept: s.kept,
                 drops: s.drops.clone(),
                 known_key_bound: s.known_key_bound,
+                detail_tail_stripped: s.detail_tail_stripped,
+                key_form_bound: s.key_form_bound,
                 resolve: s.resolve.clone(),
                 retirements: s.retirements.clone(),
                 retirements_skipped: s.retirements_skipped,
@@ -2129,6 +2145,8 @@ mod tests {
             kept: 0,
             drops: HashMap::new(),
             known_key_bound: 0,
+            detail_tail_stripped: 0,
+            key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
@@ -2158,6 +2176,8 @@ mod tests {
             kept: session.kept,
             drops: session.drops.clone(),
             known_key_bound: session.known_key_bound,
+            detail_tail_stripped: session.detail_tail_stripped,
+            key_form_bound: session.key_form_bound,
             resolve: session.resolve.clone(),
             retirements: session.retirements.clone(),
             retirements_skipped: session.retirements_skipped,
