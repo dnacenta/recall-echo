@@ -7,7 +7,6 @@
 //! The result is optional text on the decided edge. Nothing is closed and no
 //! donor row is edited.
 
-use super::ground::sentence_containing;
 use super::input::Turn;
 use super::schema::{normalise, Fact, Predicate, Role};
 
@@ -147,7 +146,9 @@ fn named_in_donor_sentence(canon: &Fact, donor: &Fact, turns: &[Turn]) -> bool {
     let Some(turn) = turns.iter().find(|turn| turn.index == donor.turn) else {
         return false;
     };
-    let sentence = sentence_containing(&turn.text, &donor.quote);
+    let Some(sentence) = sentence_at_quote_start(&turn.text, &donor.quote) else {
+        return false;
+    };
     let needle = token_runs(&canon.object_name);
     if needle.is_empty() {
         return false;
@@ -155,6 +156,40 @@ fn named_in_donor_sentence(canon: &Fact, donor: &Fact, turns: &[Turn]) -> bool {
     token_runs(sentence)
         .windows(needle.len())
         .any(|window| window == needle.as_slice())
+}
+
+/// The sentence that contains the start of `quote`.
+///
+/// The window ends at the first sentence end after that start. A quote that
+/// is not in the turn does not search the rest of the turn.
+fn sentence_at_quote_start<'a>(text: &'a str, quote: &str) -> Option<&'a str> {
+    let start = text.find(quote)?;
+    let bytes = text.as_bytes();
+    let mut from = start;
+    while from > 0 && !sentence_end(bytes, from - 1) {
+        from -= 1;
+    }
+    let mut to = start;
+    while to < bytes.len() && !sentence_end(bytes, to) {
+        to += 1;
+    }
+    let sentence = text[from..to].trim();
+    if sentence.is_empty() {
+        None
+    } else {
+        Some(sentence)
+    }
+}
+
+fn sentence_end(bytes: &[u8], index: usize) -> bool {
+    match bytes[index] {
+        b'\n' => true,
+        b'.' | b'!' | b'?' => {
+            let next = index + 1;
+            next >= bytes.len() || bytes[next].is_ascii_whitespace()
+        }
+        _ => false,
+    }
 }
 
 /// Text and donors left after a live-edge filter.
@@ -352,6 +387,64 @@ mod tests {
         ];
         let pairing = pair(&facts, &[turn(0, "keep the current tool")]);
         assert!(pairing.details.iter().all(Option::is_none));
+        assert_eq!(pairing.ambiguous, 0);
+    }
+
+    #[test]
+    fn a_quote_crossing_a_sentence_end_does_not_attach() {
+        let quote = "No. Remove testcontainers. In CI";
+        let turn_text = "No. Remove testcontainers. In CI. GitHub Actions runs the suite.";
+        let facts = vec![
+            uses(
+                "acme",
+                "GitHub Actions",
+                "decided",
+                Role::Ci,
+                0,
+                "GitHub Actions runs the suite",
+                "",
+            ),
+            uses(
+                "acme",
+                "testcontainers-go",
+                "rejected",
+                Role::TestFramework,
+                0,
+                quote,
+                "",
+            ),
+        ];
+        let pairing = pair(&facts, &[turn(0, turn_text)]);
+        assert!(pairing.details.iter().all(Option::is_none));
+        assert!(pairing.parts.iter().all(Vec::is_empty));
+        assert_eq!(pairing.ambiguous, 0);
+    }
+
+    #[test]
+    fn a_quote_missing_from_the_turn_does_not_attach() {
+        let facts = vec![
+            uses(
+                "acme",
+                "GitHub Actions",
+                "decided",
+                Role::Ci,
+                0,
+                "GitHub Actions runs the suite",
+                "",
+            ),
+            uses(
+                "acme",
+                "testcontainers-go",
+                "rejected",
+                Role::TestFramework,
+                0,
+                "No. Remove testcontainers. In CI",
+                "",
+            ),
+        ];
+        let pairing = pair(&facts, &[turn(0, "The runner is GitHub Actions.")]);
+        assert!(pairing.details.iter().all(Option::is_none));
+        assert!(pairing.parts.iter().all(Vec::is_empty));
         assert_eq!(pairing.ambiguous, 0);
     }
 
