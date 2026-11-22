@@ -26,7 +26,7 @@ use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Proven
 use super::super::crud;
 use super::super::error::GraphError;
 use super::super::llm::{LlmProvider, TokenUsage};
-use super::super::store::{define_derived_from, Db};
+use super::super::store::{define_derived_from, define_edge_details, Db};
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
 use super::ground::punctuation_literal;
@@ -194,6 +194,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Characters kept from a known value, and the cut width the replaces closes use.
     /// 80 unless the long-value switch applies.
     pub value_chars: usize,
+    /// Optional details aligned with the fact slice. Empty leaves every create
+    /// statement as it is today.
+    pub alternative_details: Vec<Option<String>>,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -231,6 +234,7 @@ impl<'a> WriteCtx<'a> {
             cross_key_replaces_on: false,
             rule_replaces_on: false,
             value_chars: 80,
+            alternative_details: Vec::new(),
         }
     }
 
@@ -377,6 +381,13 @@ pub(crate) async fn write_facts(
     // The field has to outlive a conflict rollback, or the retry cannot store a list.
     if ctx.links_on {
         define_derived_from(gm.db()).await?;
+    }
+    if ctx
+        .alternative_details
+        .iter()
+        .any(|details| details.as_ref().is_some_and(|text| !text.is_empty()))
+    {
+        define_edge_details(gm.db()).await?;
     }
     commit_writes(gm, ctx, facts, &resolution, resolve_ms).await
 }
@@ -895,6 +906,19 @@ impl<'a> Attempt<'a> {
         }))
     }
 
+    fn attached_details(&self) -> Option<String> {
+        let text = self
+            .ctx
+            .alternative_details
+            .get(self.index)
+            .and_then(Option::as_ref)?;
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.clone())
+        }
+    }
+
     async fn create_edge(
         &mut self,
         fact: &Fact,
@@ -920,6 +944,12 @@ impl<'a> Attempt<'a> {
         } else {
             ""
         };
+        let details = self.attached_details();
+        let details_line = if details.is_some() {
+            "details = $details,"
+        } else {
+            ""
+        };
         let statement = format!(
             r#"
             LET $from = type::record($from_id);
@@ -940,6 +970,7 @@ impl<'a> Attempt<'a> {
                 ended_by = NONE,
                 {pending_line}
                 {links_line}
+                {details_line}
                 evidence = $evidence
             "#
         );
@@ -961,6 +992,9 @@ impl<'a> Attempt<'a> {
         }
         if let Some(links) = links {
             request = request.bind(("derived_from", json!(links)));
+        }
+        if let Some(details) = details {
+            request = request.bind(("details", details));
         }
         request.await?.check()?;
         self.forget_edges(&subject.id, &object.id);
@@ -3636,6 +3670,58 @@ mod tests {
         assert_eq!(old["ended_by"], "s2:replaced");
         assert!(live["valid_until"].is_null(), "{live}");
         assert!(live["ended_by"].is_null(), "{live}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn an_edge_with_details_stores_renders_and_is_masked_when_forgotten() {
+        let (_tmp, gm) = open_store().await;
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let mut ctx = WriteCtx::new(&llm, &project, "s1", "2026-04-03", &[]);
+        ctx.alternative_details = vec![Some("rejected: htmlkit".into())];
+        let stats = write_facts(
+            &gm,
+            &ctx,
+            &[uses_named(
+                "alpha",
+                Kind::Project,
+                "stdparser",
+                "decided",
+                "",
+                1,
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.edges, 1);
+        let rels = crud::list_all_relationships(gm.db()).await.unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].details.as_deref(), Some("rejected: htmlkit"));
+        let view =
+            crate::graph::edge_view::EdgeView::of(&rels[0], "alpha".into(), "stdparser".into());
+        assert_eq!(view.to, "stdparser (rejected: htmlkit)");
+        assert_eq!(view.arrow(), "alpha —[uses]→ stdparser (rejected: htmlkit)");
+        let memory = tempfile::tempdir().unwrap();
+        crate::graph::forgotten::append_forget_records(
+            memory.path(),
+            &[crate::graph::forgotten::fact_record(
+                "alpha",
+                "uses",
+                "htmlkit",
+                "2026-04-03T00:00:00Z",
+            )],
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let set = crate::graph::forgotten::load_forget_set(memory.path(), true).unwrap();
+        let masked =
+            crate::graph::forgotten::mask_json(&set, serde_json::to_value(&rels[0]).unwrap());
+        assert_eq!(masked["details"], "rejected: [forgotten]");
+        assert!(!masked["details"].as_str().unwrap().contains("htmlkit"));
     }
 
     /// Two settings with no usable key and different values both stay active.

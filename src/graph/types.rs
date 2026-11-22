@@ -192,6 +192,9 @@ pub struct Relationship {
     #[serde(default)]
     pub last_reinforced: Option<serde_json::Value>,
     pub source: Option<String>,
+    /// Free text on a `uses` edge. Absent when the edge was written without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 impl Relationship {

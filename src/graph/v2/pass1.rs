@@ -654,6 +654,15 @@ fn drop_generic_uses_enabled(memory_dir: &Path) -> bool {
         .drop_generic_uses
 }
 
+// Pairing calls this. Until that call lands, only the flag test reads it.
+#[allow(dead_code)]
+fn alternative_details_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .alternative_details
+}
+
 fn ground_component_edges_enabled(memory_dir: &Path) -> bool {
     crate::config::load_from_dir(memory_dir)
         .graph
@@ -6860,6 +6869,26 @@ mod tests {
         .unwrap();
         assert!(drop_generic_uses_enabled(dir.path()));
         assert!(!drop_restatements_enabled(dir.path()));
+    }
+
+    #[test]
+    fn alternative_details_reads_only_its_own_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!alternative_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nalternative_details = false\nextract_value_details = true\n",
+        )
+        .unwrap();
+        assert!(!alternative_details_enabled(dir.path()));
+        assert!(value_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nalternative_details = true\nextract_value_details = false\n",
+        )
+        .unwrap();
+        assert!(alternative_details_enabled(dir.path()));
+        assert!(!value_details_enabled(dir.path()));
     }
 
     #[cfg(feature = "embedded")]

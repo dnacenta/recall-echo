@@ -320,6 +320,9 @@ pub struct OptOuts {
     /// Write `known_long_values = true`. False leaves the key out.
     /// Implies nothing. An opt-out run does not write it.
     pub known_long_values: bool,
+    /// Write `alternative_details = true`. False leaves the key out.
+    /// Implies nothing.
+    pub alternative_details: bool,
 }
 
 impl OptOuts {
@@ -349,6 +352,7 @@ impl OptOuts {
             consolidate_cross_key_replaces: false,
             consolidate_rule_replaces: false,
             known_long_values: false,
+            alternative_details: false,
         }
     }
 }
@@ -950,6 +954,11 @@ fn switch_lines(
         opt_outs.known_long_values,
         "known_long_values = true",
     );
+    push_line(
+        &mut lines,
+        opt_outs.alternative_details,
+        "alternative_details = true",
+    );
     lines
 }
 
@@ -1348,7 +1357,10 @@ async fn snapshot(
             id,
             subject: names.name_of(gm.db(), &from_id).await?,
             relation: relationship.rel_type.clone(),
-            object: names.name_of(gm.db(), &to_id).await?,
+            object: crate::graph::edge_view::named_with_details(
+                &names.name_of(gm.db(), &to_id).await?,
+                relationship.details.as_deref(),
+            ),
             live,
             alpha: evidence.alpha(),
             beta,
@@ -1473,7 +1485,10 @@ async fn relationship_status_row(
         id: id.clone(),
         subject: names.name_of(gm.db(), &from_id).await?,
         relation: relationship.rel_type.clone(),
-        object: names.name_of(gm.db(), &to_id).await?,
+        object: crate::graph::edge_view::named_with_details(
+            &names.name_of(gm.db(), &to_id).await?,
+            relationship.details.as_deref(),
+        ),
         live: relation_live(relationship.valid_until.is_none(), pending_row, status),
         status: status.map(str::to_string),
         pending: pending_row,
@@ -3882,6 +3897,46 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.extract_key_forms);
+        assert!(!graph.extract_value_details);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn alternative_details_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                alternative_details: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nalternative_details = true\n");
+        assert!(!text.contains("extract_value_details"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.alternative_details);
         assert!(!graph.extract_value_details);
         assert!(graph.consolidate);
     }
