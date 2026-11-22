@@ -984,6 +984,26 @@ pub struct ConsolidateReport {
     /// Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retire_reason_ambiguous: Option<u32>,
+    /// Settings closed because a new setting's `replaces` named them under another key.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_key_replaces_closes: Option<u32>,
+    /// New settings whose `replaces` named two or more earlier settings on other keys.
+    /// None of those settings close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_key_replaces_ambiguous: Option<u32>,
+    /// Cross-key matches skipped because the two keys name different units.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_key_replaces_unit_blocked: Option<u32>,
+    /// Rules closed because a new fact's `replaces` named them.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_replaces_closes: Option<u32>,
+    /// New facts whose `replaces` named two or more earlier rules.
+    /// None of those rules close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_replaces_ambiguous: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1172,6 +1192,11 @@ impl ConsolidateReport {
             self.component_takeover_ambiguous,
             self.retire_reason_closes,
             self.retire_reason_ambiguous,
+            self.cross_key_replaces_closes,
+            self.cross_key_replaces_ambiguous,
+            self.cross_key_replaces_unit_blocked,
+            self.rule_replaces_closes,
+            self.rule_replaces_ambiguous,
         ])
     }
 }
@@ -1251,6 +1276,14 @@ pub struct IngestionReport {
     /// Omitted when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub forgotten_skips: u32,
+    /// Decided language-role `uses` edges this session dropped.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub generic_uses_drops: u32,
+    /// Decided planned release-status rows this session dropped.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub planned_release_drops: u32,
     /// Candidates dropped, keyed by the reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
@@ -1258,6 +1291,16 @@ pub struct IngestionReport {
     /// Zero when the switch or the known block is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub known_key_bound: u32,
+    /// Settings whose trailing parenthetical detail was removed so the bare
+    /// value could pass the unchanged checks. Omitted when zero, including
+    /// when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub detail_tail_stripped: u32,
+    /// Candidates kept because a listed key-token form bound the key and no
+    /// earlier key-binding rule did. Omitted when zero, including when the
+    /// switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub key_form_bound: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
@@ -1397,6 +1440,31 @@ mod tests {
         assert!(text.contains("\"forgotten_skips\":1"), "{text}");
     }
 
+    #[test]
+    fn generic_uses_drops_is_omitted_from_json_when_zero() {
+        let text = serde_json::to_string(&IngestionReport::default()).expect("json");
+        assert!(!text.contains("generic_uses_drops"), "{text}");
+        let report = IngestionReport {
+            generic_uses_drops: 1,
+            ..IngestionReport::default()
+        };
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"generic_uses_drops\":1"), "{text}");
+        assert!(!text.contains("planned_release_drops"), "{text}");
+    }
+
+    #[test]
+    fn planned_release_drops_is_omitted_from_json_when_zero() {
+        let text = serde_json::to_string(&IngestionReport::default()).expect("json");
+        assert!(!text.contains("planned_release_drops"), "{text}");
+        let report = IngestionReport {
+            planned_release_drops: 1,
+            ..IngestionReport::default()
+        };
+        let text = serde_json::to_string(&report).expect("json");
+        assert!(text.contains("\"planned_release_drops\":1"), "{text}");
+    }
+
     fn chunks(total: u32, failed: u32) -> IngestionReport {
         IngestionReport {
             chunks_total: total,
@@ -1476,6 +1544,21 @@ mod tests {
         assert_eq!(loaded.timing.unwrap().match_ms, None);
         assert_eq!(loaded.entities_created, 0);
         assert!(loaded.retirement_skips.is_empty());
+    }
+
+    #[test]
+    fn detail_and_key_form_counters_are_omitted_when_zero() {
+        let blank = serde_json::to_value(IngestionReport::default()).unwrap();
+        assert!(blank.get("detail_tail_stripped").is_none(), "{blank}");
+        assert!(blank.get("key_form_bound").is_none(), "{blank}");
+        let report = IngestionReport {
+            detail_tail_stripped: 1,
+            key_form_bound: 2,
+            ..IngestionReport::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["detail_tail_stripped"], 1);
+        assert_eq!(encoded["key_form_bound"], 2);
     }
 
     #[test]
@@ -1716,6 +1799,37 @@ mod tests {
             ..ConsolidateReport::default()
         };
         assert!(zeros.is_blank());
+    }
+
+    #[test]
+    fn replaces_close_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("cross_key_replaces_closes").is_none());
+        assert!(encoded.get("cross_key_replaces_ambiguous").is_none());
+        assert!(encoded.get("cross_key_replaces_unit_blocked").is_none());
+        assert!(encoded.get("rule_replaces_closes").is_none());
+        assert!(encoded.get("rule_replaces_ambiguous").is_none());
+        let closed = ConsolidateReport {
+            cross_key_replaces_closes: Some(1),
+            rule_replaces_closes: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["cross_key_replaces_closes"], 1);
+        assert_eq!(encoded["rule_replaces_closes"], 1);
+        let zeros = ConsolidateReport {
+            cross_key_replaces_closes: Some(0),
+            cross_key_replaces_ambiguous: Some(0),
+            cross_key_replaces_unit_blocked: Some(0),
+            rule_replaces_closes: Some(0),
+            rule_replaces_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+        let encoded = serde_json::to_value(&zeros).unwrap();
+        assert_eq!(encoded["cross_key_replaces_unit_blocked"], 0);
+        assert_eq!(encoded["rule_replaces_ambiguous"], 0);
     }
 
     #[test]

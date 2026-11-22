@@ -185,6 +185,15 @@ pub(crate) struct WriteCtx<'a> {
     /// Close a live rule that still names a replaced setting value.
     /// Off leaves that pass unchanged and reads nothing for it.
     pub retire_reason_on: bool,
+    /// Close one earlier setting under a different key that `replaces` names.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub cross_key_replaces_on: bool,
+    /// Close one earlier rule that `replaces` names.
+    /// Off leaves that pass unchanged and reads nothing for it.
+    pub rule_replaces_on: bool,
+    /// Characters kept from a known value, and the cut width the replaces closes use.
+    /// 80 unless the long-value switch applies.
+    pub value_chars: usize,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -219,6 +228,9 @@ impl<'a> WriteCtx<'a> {
             retire_component_on: false,
             component_takeover_on: false,
             retire_reason_on: false,
+            cross_key_replaces_on: false,
+            rule_replaces_on: false,
+            value_chars: 80,
         }
     }
 
@@ -2184,7 +2196,7 @@ pub(crate) fn keys_match(left: &str, right: &str) -> bool {
 }
 
 /// The key stored on a new slot: trimmed and lower case.
-fn fold_key(key: &str) -> String {
+pub(crate) fn fold_key(key: &str) -> String {
     key.trim().to_lowercase()
 }
 

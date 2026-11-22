@@ -89,10 +89,12 @@ pub(crate) async fn known_rows(
     gm: &GraphMemory,
     project: &ProjectIdentity,
     session_text: &str,
+    value_chars: usize,
 ) -> Result<Vec<KnownRow>, GraphError> {
     Ok(rank_known(
         read_live(gm, project, session_text).await,
         session_text,
+        value_chars,
     ))
 }
 
@@ -158,14 +160,14 @@ pub(crate) async fn live_rows(
 
 /// The block placed after the session date, or empty when `rows` is empty.
 #[must_use]
-pub(crate) fn render_known(rows: &[KnownRow]) -> String {
+pub(crate) fn render_known(rows: &[KnownRow], value_chars: usize) -> String {
     if rows.is_empty() {
         return String::new();
     }
     let mut block = String::from(HEADER);
     for row in rows {
         block.push('\n');
-        block.push_str(&render_line(row));
+        block.push_str(&render_line(row, value_chars));
     }
     block
 }
@@ -173,7 +175,11 @@ pub(crate) fn render_known(rows: &[KnownRow]) -> String {
 /// Rank, drop, and cap. Score is shared content tokens of the key, value
 /// and role, plus 2 when a setting key token occurs in the session.
 #[must_use]
-pub(crate) fn rank_known(rows: Vec<KnownRow>, session_text: &str) -> Vec<KnownRow> {
+pub(crate) fn rank_known(
+    rows: Vec<KnownRow>,
+    session_text: &str,
+    value_chars: usize,
+) -> Vec<KnownRow> {
     let session = token_set(session_text);
     let mut ranked = Vec::new();
     for row in rows {
@@ -192,7 +198,10 @@ pub(crate) fn rank_known(rows: Vec<KnownRow>, session_text: &str) -> Vec<KnownRo
             .then_with(|| left.row.value.cmp(&right.row.value))
             .then_with(|| left.row.id.cmp(&right.row.id))
     });
-    cap(ranked.into_iter().map(|ranked| ranked.row).collect())
+    cap(
+        ranked.into_iter().map(|ranked| ranked.row).collect(),
+        value_chars,
+    )
 }
 
 struct Ranked {
@@ -258,14 +267,14 @@ fn hits(text: &str, session: &HashSet<String>) -> bool {
     token_set(text).iter().any(|token| session.contains(token))
 }
 
-fn cap(rows: Vec<KnownRow>) -> Vec<KnownRow> {
+fn cap(rows: Vec<KnownRow>, value_chars: usize) -> Vec<KnownRow> {
     let mut kept = Vec::new();
     let mut bytes = 0usize;
     for row in rows {
         if kept.len() == MAX_ROWS {
             break;
         }
-        let line = render_line(&row);
+        let line = render_line(&row, value_chars);
         let extra = line.len() + usize::from(!kept.is_empty());
         if bytes.saturating_add(extra) / 4 > MAX_ESTIMATED_TOKENS {
             break;
@@ -276,32 +285,46 @@ fn cap(rows: Vec<KnownRow>) -> Vec<KnownRow> {
     kept
 }
 
-fn render_line(row: &KnownRow) -> String {
+fn render_line(row: &KnownRow, value_chars: usize) -> String {
     let mut line = format!(
         "- {} {}",
-        clean_value(&row.subject),
+        clean_value(&row.subject, VALUE_CHARS),
         flatten(&row.predicate)
     );
     if row.predicate == "setting" && !row.key.is_empty() {
         line.push(' ');
-        line.push_str(&clean_value(&row.key));
+        line.push_str(&clean_value(&row.key, VALUE_CHARS));
         line.push_str(" =");
     }
     line.push(' ');
-    line.push_str(&clean_value(&row.value));
+    line.push_str(&clean_value(&row.value, value_chars));
     if !row.role.is_empty() && row.role != "none" {
         line.push_str(" (");
-        line.push_str(&clean_value(&row.role));
+        line.push_str(&clean_value(&row.role, VALUE_CHARS));
         line.push(')');
     }
     line
 }
 
-/// Every stored field is one short line. A fake turn marker is rewritten before the
-/// role label is broken, because `[T2] USER:` is not a leading `USER:`.
-fn clean_value(raw: &str) -> String {
+/// One stored field, cut at `width` after the same flattening the block uses.
+fn clean_value(raw: &str, width: usize) -> String {
+    cut_value(raw, width)
+}
+
+/// The text the known-facts block shows for `raw` at `width`.
+///
+/// Subject, key and role stay at [`VALUE_CHARS`]. A replaces close matches this
+/// text, so the cut and the block cannot drift.
+#[must_use]
+pub(crate) fn cut_value(raw: &str, width: usize) -> String {
     let shown = neutralise_speaker(&rewrite_markers(&flatten(raw)));
-    shown.chars().take(VALUE_CHARS).collect()
+    shown.chars().take(width).collect()
+}
+
+/// True when `raw`, after [`flatten`], is longer than `width` and is therefore a cut.
+#[must_use]
+pub(crate) fn flattened_exceeds(raw: &str, width: usize) -> bool {
+    flatten(raw).chars().count() > width
 }
 
 fn flatten(raw: &str) -> String {
@@ -787,6 +810,26 @@ fn record_id(id: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rank_known(rows: Vec<KnownRow>, session: &str) -> Vec<KnownRow> {
+        super::rank_known(rows, session, VALUE_CHARS)
+    }
+
+    fn render_known(rows: &[KnownRow]) -> String {
+        super::render_known(rows, VALUE_CHARS)
+    }
+
+    fn render_line(row: &KnownRow) -> String {
+        super::render_line(row, VALUE_CHARS)
+    }
+
+    async fn known_rows(
+        gm: &GraphMemory,
+        project: &ProjectIdentity,
+        session_text: &str,
+    ) -> Result<Vec<KnownRow>, GraphError> {
+        super::known_rows(gm, project, session_text, VALUE_CHARS).await
+    }
 
     fn row(predicate: &str, key: &str, value: &str, id: &str) -> KnownRow {
         KnownRow {
@@ -1813,5 +1856,45 @@ mod tests {
                 assert!(notes.borrow().is_empty());
             });
         }
+    }
+
+    fn wide_row(value: &str) -> KnownRow {
+        KnownRow {
+            subject: "s".repeat(100),
+            predicate: "setting".into(),
+            key: "k".repeat(100),
+            value: value.into(),
+            role: "r".repeat(100),
+            id: "1".into(),
+            status: "decided".into(),
+        }
+    }
+
+    #[test]
+    fn the_value_width_keeps_short_rows_and_cuts_only_the_value() {
+        for len in [79usize, 80] {
+            let value = "v".repeat(len);
+            let off = super::render_known(&[wide_row(&value)], 80);
+            let on = super::render_known(&[wide_row(&value)], 200);
+            assert_eq!(off, on, "{len}");
+            assert!(off.contains(&format!("= {value} ")), "{len}");
+        }
+        let eighty_one = super::render_known(&[wide_row(&"v".repeat(81))], 80);
+        let two_fifty_off = super::render_known(&[wide_row(&"v".repeat(250))], 80);
+        let shown_80 = "v".repeat(80);
+        assert!(eighty_one.contains(&format!("= {shown_80} ")));
+        assert!(!eighty_one.contains(&format!("= {}", "v".repeat(81))));
+        assert_eq!(eighty_one, two_fifty_off);
+        let whole = super::render_known(&[wide_row(&"v".repeat(150))], 200);
+        assert!(whole.contains(&format!("= {} ", "v".repeat(150))));
+        let cut = super::render_known(&[wide_row(&"v".repeat(250))], 200);
+        assert!(cut.contains(&format!("= {} ", "v".repeat(200))));
+        assert!(!cut.contains(&"v".repeat(201)));
+        assert!(cut.contains(&"s".repeat(80)));
+        assert!(cut.contains(&"k".repeat(80)));
+        assert!(cut.contains(&"r".repeat(80)));
+        assert!(!cut.contains(&"s".repeat(81)));
+        assert!(!cut.contains(&"k".repeat(81)));
+        assert!(!cut.contains(&"r".repeat(81)));
     }
 }

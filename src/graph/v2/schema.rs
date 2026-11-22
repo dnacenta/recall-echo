@@ -35,6 +35,9 @@ pub(crate) const DROP_UNRESOLVED: &str = "unresolved";
 /// A decided rule removed because it restated one same-session setting.
 /// Counted outside `kept` plus the whole-candidate drops.
 pub(crate) const DROP_RESTATEMENT: &str = "restatement";
+/// A decided rule removed because it restated a same-subject setting and a reason.
+/// Counted outside `kept` plus the whole-candidate drops.
+pub(crate) const DROP_DETAIL_ECHO: &str = "detail_echo";
 
 /// Confidence below this is not a durable fact.
 const MIN_CONFIDENCE: f64 = 0.6;

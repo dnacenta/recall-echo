@@ -92,9 +92,19 @@ pub struct SessionObservation {
     pub kept: u32,
     /// Drops by reason. Empty on v1, and when nothing was dropped.
     pub drops: HashMap<String, u32>,
+    /// Decided language-role uses edges dropped. Zero when that switch is off.
+    pub generic_uses_drops: u32,
+    /// Decided planned release-status rows dropped. Zero when that switch is off.
+    pub planned_release_drops: u32,
     /// Decided settings kept because a shown known row bound the key.
     /// Zero when that switch or the known block is off.
     pub known_key_bound: u32,
+    /// Settings whose trailing parenthetical detail was removed.
+    /// Zero when that switch is off or nothing was stripped.
+    pub detail_tail_stripped: u32,
+    /// Candidates kept because a listed key-token form bound the key.
+    /// Zero when that switch is off or no form was needed.
+    pub key_form_bound: u32,
     /// Entity resolution for a v2 session. Blank on v1.
     pub resolve: crate::graph::types::ResolveStats,
     /// Facts this session closed. Empty on v1.
@@ -249,10 +259,26 @@ pub struct SessionReport {
     /// Drops by reason.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drops: HashMap<String, u32>,
+    /// Decided language-role uses edges dropped.
+    /// Zero, and omitted, when that switch is off or nothing was dropped.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub generic_uses_drops: u32,
+    /// Decided planned release-status rows dropped.
+    /// Zero, and omitted, when that switch is off or nothing was dropped.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub planned_release_drops: u32,
     /// Decided settings kept because a shown known row bound the key.
     /// Zero, and omitted, when that switch or the known block is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub known_key_bound: u32,
+    /// Settings whose trailing parenthetical detail was removed.
+    /// Zero, and omitted, when the switch is off or nothing was stripped.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub detail_tail_stripped: u32,
+    /// Candidates kept because a listed key-token form bound the key.
+    /// Zero, and omitted, when the switch is off or no form was needed.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub key_form_bound: u32,
     /// Entity resolution. Blank on v1, and omitted from the printed report then.
     #[serde(
         default,
@@ -652,7 +678,11 @@ pub fn grade_with_pipeline(
                 candidates: s.candidates,
                 kept: s.kept,
                 drops: s.drops.clone(),
+                generic_uses_drops: s.generic_uses_drops,
+                planned_release_drops: s.planned_release_drops,
                 known_key_bound: s.known_key_bound,
+                detail_tail_stripped: s.detail_tail_stripped,
+                key_form_bound: s.key_form_bound,
                 resolve: s.resolve.clone(),
                 retirements: s.retirements.clone(),
                 retirements_skipped: s.retirements_skipped,
@@ -2128,7 +2158,11 @@ mod tests {
             candidates: 0,
             kept: 0,
             drops: HashMap::new(),
+            generic_uses_drops: 0,
+            planned_release_drops: 0,
             known_key_bound: 0,
+            detail_tail_stripped: 0,
+            key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
@@ -2157,7 +2191,11 @@ mod tests {
             candidates: session.candidates,
             kept: session.kept,
             drops: session.drops.clone(),
+            generic_uses_drops: session.generic_uses_drops,
+            planned_release_drops: session.planned_release_drops,
             known_key_bound: session.known_key_bound,
+            detail_tail_stripped: session.detail_tail_stripped,
+            key_form_bound: session.key_form_bound,
             resolve: session.resolve.clone(),
             retirements: session.retirements.clone(),
             retirements_skipped: session.retirements_skipped,
@@ -2171,6 +2209,8 @@ mod tests {
         };
         let encoded = serde_json::to_value(&blank).unwrap();
         assert!(encoded.get("links").is_none(), "{encoded}");
+        assert!(encoded.get("generic_uses_drops").is_none(), "{encoded}");
+        assert!(encoded.get("planned_release_drops").is_none(), "{encoded}");
         let mut filled = blank;
         filled.links.links_written = 1;
         filled.links.premises_recorded = 2;

@@ -263,6 +263,17 @@ pub enum RecoverTurns {
     On,
 }
 
+/// Whether a bench run drops language-role uses and planned release status.
+///
+/// On writes `drop_generic_uses = true` and implies nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropGenericUses {
+    /// Leave the flag at its default.
+    Off,
+    /// Write `drop_generic_uses = true` for this run.
+    On,
+}
+
 /// Explicit `<key> = false` lines for the consolidation stack.
 ///
 /// A `false` field leaves that key out of the run config. A `true` field
@@ -294,6 +305,21 @@ pub struct OptOuts {
     /// Write `slot_forget = true`. False leaves the key out.
     /// Does not turn lasting forget on. An opt-out run does not write it.
     pub slot_forget: bool,
+    /// Write `extract_value_details = true`. False leaves the key out.
+    /// Implies nothing, including `extract_key_forms`.
+    pub extract_value_details: bool,
+    /// Write `extract_key_forms = true`. False leaves the key out.
+    /// Implies nothing, including `extract_value_details`. The prompt is unchanged.
+    pub extract_key_forms: bool,
+    /// Write `consolidate_cross_key_replaces = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_cross_key_replaces: bool,
+    /// Write `consolidate_rule_replaces = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_rule_replaces: bool,
+    /// Write `known_long_values = true`. False leaves the key out.
+    /// Implies nothing. An opt-out run does not write it.
+    pub known_long_values: bool,
 }
 
 impl OptOuts {
@@ -318,6 +344,11 @@ impl OptOuts {
             consolidate_component_takeover: false,
             consolidate_retire_reason: false,
             slot_forget: false,
+            extract_value_details: false,
+            extract_key_forms: false,
+            consolidate_cross_key_replaces: false,
+            consolidate_rule_replaces: false,
+            known_long_values: false,
         }
     }
 }
@@ -331,6 +362,7 @@ impl OptOuts {
 /// as `setup_millis`, so the first session is not charged for it.
 /// `known_facts_context` turns the experimental pass-1 block on or leaves it off.
 /// `drop_restatements` writes that opt-in for this run alone.
+/// `drop_generic_uses` writes that opt-in for this run alone.
 pub async fn run(
     script: &FactScript,
     work_dir: &Path,
@@ -344,6 +376,7 @@ pub async fn run(
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
+    drop_generic_uses: DropGenericUses,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
@@ -366,6 +399,7 @@ pub async fn run(
         ground_component_edges,
         consolidate_components,
         recover_turns,
+        drop_generic_uses,
         consolidate_key_rename,
         consolidate_replaces_cue,
         consolidate_replaces_departure,
@@ -441,7 +475,11 @@ async fn collect_sessions(
             candidates: report.candidates,
             kept: report.kept,
             drops: report.drops,
+            generic_uses_drops: report.generic_uses_drops,
+            planned_release_drops: report.planned_release_drops,
             known_key_bound: report.known_key_bound,
+            detail_tail_stripped: report.detail_tail_stripped,
+            key_form_bound: report.key_form_bound,
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
@@ -514,7 +552,11 @@ async fn ingest_v2(
     report.candidates = extracted.candidates;
     report.kept = extracted.kept;
     report.drops = extracted.drops;
+    report.generic_uses_drops = extracted.generic_uses_drops;
+    report.planned_release_drops = extracted.planned_release_drops;
     report.known_key_bound = extracted.known_key_bound;
+    report.detail_tail_stripped = extracted.detail_tail_stripped;
+    report.key_form_bound = extracted.key_form_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
     report.retirements_skipped = extracted.retirements_skipped;
@@ -601,6 +643,7 @@ fn add_reported(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
 /// report itself when repeat is 1.
 /// `known_facts_context` is passed to every run.
 /// `drop_restatements` is passed to every run.
+/// `drop_generic_uses` is passed to every run.
 pub async fn run_repeat(
     script: &FactScript,
     parent: &Path,
@@ -615,6 +658,7 @@ pub async fn run_repeat(
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
+    drop_generic_uses: DropGenericUses,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
@@ -649,6 +693,7 @@ pub async fn run_repeat(
                 ground_component_edges,
                 consolidate_components,
                 recover_turns,
+                drop_generic_uses,
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
@@ -676,6 +721,7 @@ fn apply_graph_switches(
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
+    drop_generic_uses: DropGenericUses,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
@@ -694,6 +740,7 @@ fn apply_graph_switches(
         ground_component_edges,
         consolidate_components,
         recover_turns,
+        drop_generic_uses,
         consolidate_key_rename,
         consolidate_replaces_cue,
         consolidate_replaces_departure,
@@ -725,6 +772,7 @@ fn switch_lines(
     ground_component_edges: GroundComponentEdges,
     consolidate_components: ConsolidateComponents,
     recover_turns: RecoverTurns,
+    drop_generic_uses: DropGenericUses,
     consolidate_key_rename: ConsolidateKeyRename,
     consolidate_replaces_cue: ConsolidateReplacesCue,
     consolidate_replaces_departure: ConsolidateReplacesDeparture,
@@ -745,22 +793,28 @@ fn switch_lines(
     push_line(&mut lines, matched == KnownMatch::On, "known_match = true");
     push_switch(
         &mut lines,
-        with_component_takeover(
-            with_retire_reason(
-                writes_consolidate(
-                    consolidate,
-                    consolidate_links,
-                    consolidate_components,
-                    consolidate_key_rename,
-                    consolidate_replaces_cue,
-                    consolidate_replaces_departure,
-                    consolidate_orphan_sweep,
-                    consolidate_rule_fragments,
-                    consolidate_retire_component,
+        with_rule_replaces(
+            with_cross_key_replaces(
+                with_component_takeover(
+                    with_retire_reason(
+                        writes_consolidate(
+                            consolidate,
+                            consolidate_links,
+                            consolidate_components,
+                            consolidate_key_rename,
+                            consolidate_replaces_cue,
+                            consolidate_replaces_departure,
+                            consolidate_orphan_sweep,
+                            consolidate_rule_fragments,
+                            consolidate_retire_component,
+                        ),
+                        opt_outs.consolidate_retire_reason,
+                    ),
+                    opt_outs.consolidate_component_takeover,
                 ),
-                opt_outs.consolidate_retire_reason,
+                opt_outs.consolidate_cross_key_replaces,
             ),
-            opt_outs.consolidate_component_takeover,
+            opt_outs.consolidate_rule_replaces,
         ),
         opt_outs.consolidate,
         "consolidate = true",
@@ -857,6 +911,11 @@ fn switch_lines(
     );
     push_line(
         &mut lines,
+        drop_generic_uses == DropGenericUses::On,
+        "drop_generic_uses = true",
+    );
+    push_line(
+        &mut lines,
         opt_outs.consolidate_component_takeover,
         "consolidate_component_takeover = true",
     );
@@ -866,6 +925,31 @@ fn switch_lines(
         "consolidate_retire_reason = true",
     );
     push_line(&mut lines, opt_outs.slot_forget, "slot_forget = true");
+    push_line(
+        &mut lines,
+        opt_outs.extract_value_details,
+        "extract_value_details = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.extract_key_forms,
+        "extract_key_forms = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_cross_key_replaces,
+        "consolidate_cross_key_replaces = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_rule_replaces,
+        "consolidate_rule_replaces = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.known_long_values,
+        "known_long_values = true",
+    );
     lines
 }
 
@@ -875,6 +959,14 @@ fn with_component_takeover(consolidate: bool, takeover: bool) -> bool {
 
 fn with_retire_reason(consolidate: bool, retire_reason: bool) -> bool {
     consolidate || retire_reason
+}
+
+fn with_cross_key_replaces(consolidate: bool, cross_key: bool) -> bool {
+    consolidate || cross_key
+}
+
+fn with_rule_replaces(consolidate: bool, rule_replaces: bool) -> bool {
+    consolidate || rule_replaces
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2303,6 +2395,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2324,6 +2417,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2349,6 +2443,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2381,6 +2476,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2403,6 +2499,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2441,6 +2538,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2476,6 +2574,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2508,6 +2607,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2549,6 +2649,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2571,6 +2672,7 @@ mod tests {
             GroundComponentEdges::On,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2610,6 +2712,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2632,6 +2735,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::On,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2654,6 +2758,71 @@ mod tests {
         assert!(graph.drop_restatements);
         assert!(!text.contains("consolidate"));
         assert!(!text.contains("ground_component_edges"));
+    }
+
+    #[test]
+    fn drop_generic_uses_is_written_only_when_passed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts::default(),
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::On,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts::default(),
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\ndrop_generic_uses = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.drop_generic_uses);
+        assert!(graph.drop_restatements);
+        assert!(graph.ground_component_edges);
+        assert!(graph.consolidate);
+        assert!(graph.known_facts_context);
+        assert!(!graph.known_match);
+        assert!(!graph.recover_turns);
+        assert!(!text.contains("recover_turns"));
+        assert!(!text.contains("drop_restatements"));
+        assert!(!text.contains("consolidate"));
     }
 
     #[cfg(feature = "embedded")]
@@ -2744,6 +2913,7 @@ mod tests {
             } else {
                 RecoverTurns::Off
             },
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2970,6 +3140,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -2992,6 +3163,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::On,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3029,6 +3201,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::On,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3063,6 +3236,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::On,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3104,6 +3278,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3126,6 +3301,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::On,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3165,6 +3341,7 @@ mod tests {
             GroundComponentEdges::On,
             ConsolidateComponents::On,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3209,6 +3386,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3231,6 +3409,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::On,
             ConsolidateReplacesDeparture::Off,
@@ -3277,6 +3456,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3299,6 +3479,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::On,
@@ -3347,6 +3528,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3369,6 +3551,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3418,6 +3601,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3463,6 +3647,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3507,6 +3692,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3550,6 +3736,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3594,6 +3781,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3619,6 +3807,215 @@ mod tests {
     }
 
     #[test]
+    fn extract_value_details_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                extract_value_details: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nextract_value_details = true\n");
+        assert!(!text.contains("extract_key_forms"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.extract_value_details);
+        assert!(!graph.extract_key_forms);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn extract_key_forms_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                extract_key_forms: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nextract_key_forms = true\n");
+        assert!(!text.contains("extract_value_details"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.extract_key_forms);
+        assert!(!graph.extract_value_details);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn consolidate_cross_key_replaces_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_cross_key_replaces: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_cross_key_replaces = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_rule_replaces"), "{text}");
+        assert!(!text.contains("known_long_values"), "{text}");
+        assert!(!text.contains("consolidate_retire_reason"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.cross_key_replaces_apply());
+        assert!(!graph.rule_replaces_apply());
+        assert!(!graph.known_long_values_apply());
+    }
+
+    #[test]
+    fn consolidate_rule_replaces_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_rule_replaces: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_rule_replaces = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_cross_key_replaces"), "{text}");
+        assert!(!text.contains("known_long_values"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.rule_replaces_apply());
+        assert!(!graph.cross_key_replaces_apply());
+    }
+
+    #[test]
+    fn known_long_values_writes_only_its_key_and_implies_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                known_long_values: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nknown_long_values = true\n");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.known_long_values);
+        assert!(graph.known_long_values_apply());
+        assert!(graph.consolidate);
+        assert!(!text.contains("consolidate ="));
+        assert!(!graph.cross_key_replaces_apply());
+        assert!(!graph.rule_replaces_apply());
+    }
+
+    #[test]
     fn known_key_binding_writes_only_its_own_key() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
@@ -3633,6 +4030,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3655,6 +4053,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3725,6 +4124,7 @@ mod tests {
                 GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
                 RecoverTurns::Off,
+                DropGenericUses::Off,
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
                 ConsolidateReplacesDeparture::Off,
@@ -3794,6 +4194,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -3962,6 +4363,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -4079,6 +4481,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -4114,6 +4517,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -4201,6 +4605,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -4518,6 +4923,7 @@ mod tests {
             ground,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -4677,6 +5083,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -4902,6 +5309,7 @@ mod tests {
                 GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
                 RecoverTurns::Off,
+                DropGenericUses::Off,
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
                 ConsolidateReplacesDeparture::Off,
@@ -4950,6 +5358,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -5257,6 +5666,7 @@ mod tests {
                 GroundComponentEdges::Off,
                 ConsolidateComponents::Off,
                 RecoverTurns::Off,
+                DropGenericUses::Off,
                 ConsolidateKeyRename::Off,
                 ConsolidateReplacesCue::Off,
                 ConsolidateReplacesDeparture::Off,
@@ -5305,6 +5715,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -5448,6 +5859,7 @@ mod tests {
             GroundComponentEdges::Off,
             ConsolidateComponents::Off,
             RecoverTurns::Off,
+            DropGenericUses::Off,
             ConsolidateKeyRename::Off,
             ConsolidateReplacesCue::Off,
             ConsolidateReplacesDeparture::Off,
@@ -5946,7 +6358,11 @@ mod tests {
             candidates: 0,
             kept: 0,
             drops: std::collections::HashMap::new(),
+            generic_uses_drops: 0,
+            planned_release_drops: 0,
             known_key_bound: 0,
+            detail_tail_stripped: 0,
+            key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
