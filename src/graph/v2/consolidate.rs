@@ -8068,7 +8068,9 @@ fn value_core(value: &str) -> String {
 
 fn strip_trailing_group(trimmed: &str) -> Option<String> {
     let chars: Vec<char> = trimmed.chars().collect();
-    if chars.last().copied() != Some(')') {
+    let opens = chars.iter().filter(|ch| **ch == '(').count();
+    let closes = chars.iter().filter(|ch| **ch == ')').count();
+    if opens != closes || chars.last().copied() != Some(')') {
         return None;
     }
     let mut depth = 0i32;
@@ -8117,7 +8119,7 @@ fn vnorm(value: &str) -> String {
     out
 }
 
-fn setting_value_matches(value: &str, replaces: &str, width: usize) -> bool {
+pub(crate) fn setting_value_matches(value: &str, replaces: &str, width: usize) -> bool {
     let left = vnorm(&value_core(value));
     let right = vnorm(&value_core(replaces));
     if !left.is_empty() && left == right {
@@ -8209,6 +8211,7 @@ fn record_cross_fact(
             && slot.predicate == "setting"
             && fold_key(&slot.key) == fold_key(&fact.key)
             && setting_value_matches(&slot.value, replaces, width)
+            && !own_live_slot(slot, fact, session)
     }) {
         return;
     }
@@ -22657,6 +22660,7 @@ mod tests {
     fn core_vnorm_and_unit_classes_follow_the_close_rules() {
         assert_eq!(super::value_core("25 (fits one screen)"), "25");
         assert_eq!(super::value_core("10 minutes"), "10 minutes");
+        assert_eq!(super::value_core("foo (bar (qux)"), "foo (bar (qux)");
         assert_eq!(super::vnorm("25 (fits one screen)"), "25 fits one screen");
         assert_eq!(
             super::vnorm(&super::value_core("25 (fits one screen)")),
@@ -22674,6 +22678,45 @@ mod tests {
             80
         ));
         assert!(!super::setting_value_matches(&long, &"a".repeat(50), 80));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_same_value_key_rename_closes_the_earlier_key() {
+        let screen = "25 (fits one screen)";
+        let (_tmp, gm) = open().await;
+        commit_named(
+            &gm,
+            "Harbor",
+            "s04",
+            "2026-04-04",
+            &[subject_setting("Harbor", "page_size", screen)],
+        )
+        .await;
+        let setting = harbor_setting("batch_limit", screen, screen);
+        commit_named(
+            &gm,
+            "Harbor",
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+        )
+        .await;
+        let (report, lines, _) = finish_cross(
+            &gm,
+            "s11",
+            "2026-04-11",
+            std::slice::from_ref(&setting),
+            true,
+        )
+        .await;
+        let rows = slots(&gm, "Harbor").await;
+        assert_eq!(
+            ended(setting_named(&rows, "page_size", screen)),
+            Some("s11:cross_key_replaces")
+        );
+        assert!(ended(setting_named(&rows, "batch_limit", screen)).is_none());
+        assert_eq!(report.consolidate.cross_key_replaces_closes, Some(1));
+        assert_eq!(cross_lines(&lines).len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

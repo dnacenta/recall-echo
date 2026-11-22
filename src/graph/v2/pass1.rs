@@ -266,6 +266,21 @@ pub(crate) async fn extract_session(
     )
     .await?;
     let known = shown_known.bind.then_some(shown_known.shown.as_slice());
+    // Stored rows are values already in the store. They are not quotes, and
+    // they are read only when a cross-key replaces close may need them.
+    let cross_rows = if cross_key_replaces_enabled(memory_dir) {
+        Some(match &shown_known.stored {
+            Some(rows) => rows.clone(),
+            None => super::known::read_live(gm, &session.project, &session_text).await,
+        })
+    } else {
+        None
+    };
+    let value_chars = known_value_chars(memory_dir);
+    let cross_keep = cross_rows.as_ref().map(|rows| StoredCross {
+        rows,
+        width: value_chars,
+    });
     let mut facts = Vec::new();
     for window in &windows {
         match call_window(
@@ -285,6 +300,7 @@ pub(crate) async fn extract_session(
                 &mut report,
                 ground_edges,
                 known,
+                cross_keep.as_ref(),
             )),
             Err(reason) => {
                 report.errors.push(reason);
@@ -1227,7 +1243,12 @@ fn facts_with_ground(
     ground_on: bool,
 ) -> Vec<Fact> {
     let ground = SessionGround::prepare(&session.turns);
-    collect_facts(reply, session, &ground, report, ground_on, None)
+    collect_facts(reply, session, &ground, report, ground_on, None, None)
+}
+
+struct StoredCross<'a> {
+    rows: &'a [super::known::KnownRow],
+    width: usize,
 }
 
 fn collect_facts(
@@ -1237,6 +1258,7 @@ fn collect_facts(
     report: &mut IngestionReport,
     ground_on: bool,
     known: Option<&[super::known::KnownRow]>,
+    cross: Option<&StoredCross<'_>>,
 ) -> Vec<Fact> {
     let mut facts = Vec::new();
     for section in ["facts", "bugs", "releases"] {
@@ -1249,7 +1271,9 @@ fn collect_facts(
                 count_drop(report, DROP_OVERFLOW);
                 continue;
             }
-            match accept_item(section, item, session, ground, report, ground_on, known) {
+            match accept_item(
+                section, item, session, ground, report, ground_on, known, cross,
+            ) {
                 Ok(batch) => {
                     report.kept += 1;
                     facts.extend(batch);
@@ -1261,6 +1285,7 @@ fn collect_facts(
     facts
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_item(
     section: &str,
     item: &Value,
@@ -1269,15 +1294,15 @@ fn accept_item(
     report: &mut IngestionReport,
     ground_on: bool,
     known: Option<&[super::known::KnownRow]>,
+    cross: Option<&StoredCross<'_>>,
 ) -> Result<Vec<Fact>, &'static str> {
     if !element_matches(section, item) {
         return Err(DROP_PARSE);
     }
     let object = item.as_object().ok_or(DROP_PARSE)?;
     match section {
-        "facts" => {
-            accept_fact(object, session, ground, ground_on, known, report).map(|fact| vec![fact])
-        }
+        "facts" => accept_fact(object, session, ground, ground_on, known, cross, report)
+            .map(|fact| vec![fact]),
         "bugs" => expand_bug(object, session, ground, report),
         "releases" => expand_release(object, session, ground, report),
         _ => Err(DROP_PARSE),
@@ -1304,6 +1329,7 @@ fn accept_fact(
     ground: &SessionGround,
     ground_on: bool,
     known: Option<&[super::known::KnownRow]>,
+    cross: Option<&StoredCross<'_>>,
     report: &mut IngestionReport,
 ) -> Result<Fact, &'static str> {
     let (mut fact, swapped) = open_fact(object, session, ground)?;
@@ -1323,7 +1349,7 @@ fn accept_fact(
     let value_ok = object_supported(swapped, &fact, ground);
     let grounded = recover_unsupported(&mut fact, &prior, value_ok, ground)?;
     let kept = kept_component_object(&fact, &prior, value_ok);
-    finish_fact(fact, ground, grounded, kept, known, report)
+    finish_fact(fact, ground, grounded, kept, known, cross, report)
 }
 
 fn open_fact(
@@ -1443,10 +1469,16 @@ fn finish_fact(
     grounded: bool,
     kept_object: bool,
     known: Option<&[super::known::KnownRow]>,
+    cross: Option<&StoredCross<'_>>,
     report: &mut IngestionReport,
 ) -> Result<Fact, &'static str> {
     bind_known_key(&fact, ground, known, report)?;
-    if !ground.replaces_grounded(&fact.replaces, &fact.status, fact.turn) {
+    // The cited turn still decides grounding. A stored value can keep `replaces`
+    // only when a cross-key close is on and that value is one it could close.
+    // The rendered known block is not a quote.
+    if !ground.replaces_grounded(&fact.replaces, &fact.status, fact.turn)
+        && !stored_cross_key_match(&fact, cross)
+    {
         fact.replaces.clear();
     }
     filter_fact(&fact)?;
@@ -1505,6 +1537,26 @@ fn known_key_line(subject: &str, key: &str, turn: usize) -> String {
 
 fn log_plain(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+fn stored_cross_key_match(fact: &Fact, cross: Option<&StoredCross<'_>>) -> bool {
+    let Some(cross) = cross else {
+        return false;
+    };
+    if fact.predicate != Predicate::Setting || fact.status != "decided" {
+        return false;
+    }
+    let replaces = fact.replaces.trim();
+    if replaces.is_empty() {
+        return false;
+    }
+    cross.rows.iter().any(|row| {
+        row.predicate == "setting"
+            && row.status == "decided"
+            && normalise(&row.subject) == normalise(&fact.subject_name)
+            && write::fold_key(&row.key) != write::fold_key(&fact.key)
+            && super::consolidate::setting_value_matches(&row.value, replaces, cross.width)
+    })
 }
 
 fn known_binds(fact: &Fact, known: Option<&[super::known::KnownRow]>) -> bool {
@@ -5268,6 +5320,225 @@ mod tests {
     }
 
     #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stored_cross_key_value_keeps_replaces_the_cited_turn_does_not_name() {
+        use crate::graph::llm::Completion;
+
+        const TURN: &str = "batch_limit is now 40.";
+        const OLD: &str = "20 (keep the last items)";
+        const MISSING: &str = "99 (spare marker)";
+
+        struct Scripted {
+            reply: String,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Scripted {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                _: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                if system.starts_with(PASS1_SYSTEM_BARE) {
+                    return Ok(Completion::unmeasured(self.reply.clone()));
+                }
+                Ok(Completion::unmeasured(r#"{"pairs":[]}"#))
+            }
+        }
+
+        struct Quiet;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Quiet {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Ok(r#"{"decision":"create","reason":"distinct"}"#.to_string())
+            }
+        }
+
+        fn reply(replaces: &str) -> String {
+            format!(
+                r#"{{"facts":[{{"subject":"Harbor","subject_type":"project","predicate":"setting","role":"none","key":"batch_limit","object":"40","object_type":"literal","status":"decided","replaces":"{replaces}","turn":0,"quote":"{TURN}","confidence":0.9}}],"bugs":[],"releases":[]}}"#
+            )
+        }
+
+        fn plant(memory: &std::path::Path, config: &str) {
+            let cwd = memory.join("Harbor");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                memory,
+                1,
+                "s11",
+                "2026-04-11",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    TURN.into(),
+                )],
+            )
+            .unwrap();
+            std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
+        }
+
+        async fn seed(gm: &GraphMemory) {
+            let quiet = Quiet;
+            let project = ProjectIdentity {
+                name: "Harbor".into(),
+                aliases: Vec::new(),
+            };
+            let turns = [Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "stored".into(),
+            }];
+            let old = Fact {
+                subject_name: "Harbor".into(),
+                subject_kind: Kind::Project,
+                predicate: Predicate::Setting,
+                role: None,
+                key: "page_size".into(),
+                object_name: OLD.into(),
+                object_kind: None,
+                status: "decided".into(),
+                turn: 0,
+                quote: "stored".into(),
+                confidence: 0.9,
+                provenance: Provenance::User,
+                replaces: String::new(),
+            };
+            let ctx = write::WriteCtx::new(&quiet, &project, "s04", "2026-04-04", &turns);
+            write::write_facts(gm, &ctx, &[old]).await.unwrap();
+        }
+
+        async fn page_size(gm: &GraphMemory) -> Value {
+            let entities = crate::graph::crud::list_entities(gm.db(), None)
+                .await
+                .unwrap();
+            let harbor = entities
+                .iter()
+                .find(|entity| entity.name == "Harbor")
+                .expect("Harbor");
+            harbor.attributes.as_ref().unwrap()["v2"]["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|slot| slot["key"] == "page_size")
+                .expect("page_size")
+                .clone()
+        }
+
+        fn kept_replaces(replaces: &str, rows: Option<&[super::super::known::KnownRow]>) -> String {
+            let input = SessionInput {
+                session_id: "s11".into(),
+                date: "2026-04-11".into(),
+                project: ProjectIdentity {
+                    name: "Harbor".into(),
+                    aliases: vec!["Harbor".into()],
+                },
+                turns: vec![Turn {
+                    index: 0,
+                    role: TurnRole::User,
+                    text: TURN.into(),
+                }],
+                tool_lines: Vec::new(),
+            };
+            let ground = SessionGround::prepare(&input.turns);
+            let parsed: Value = serde_json::from_str(&reply(replaces)).unwrap();
+            let mut report = IngestionReport::default();
+            let cross = rows.map(|rows| StoredCross { rows, width: 80 });
+            let facts = collect_facts(
+                parsed.as_object().unwrap(),
+                &input,
+                &ground,
+                &mut report,
+                false,
+                None,
+                cross.as_ref(),
+            );
+            assert_eq!(facts.len(), 1, "{replaces}");
+            facts[0].replaces.clone()
+        }
+
+        let stored = super::super::known::KnownRow {
+            subject: "Harbor".into(),
+            predicate: "setting".into(),
+            key: "page_size".into(),
+            value: OLD.into(),
+            role: String::new(),
+            id: "row".into(),
+            status: "decided".into(),
+        };
+        assert_eq!(kept_replaces(OLD, Some(std::slice::from_ref(&stored))), OLD);
+        assert!(kept_replaces(MISSING, Some(std::slice::from_ref(&stored))).is_empty());
+        assert!(kept_replaces(OLD, None).is_empty());
+
+        let on = stack_off_except(&["consolidate", "consolidate_cross_key_replaces"]);
+        let matched = tempfile::tempdir().unwrap();
+        plant(matched.path(), &on);
+        let gm = GraphMemory::open_embedded(&matched.path().join("graph"))
+            .await
+            .unwrap();
+        write::ensure_v2_store(&gm).await.unwrap();
+        seed(&gm).await;
+        let report = extract_session(
+            &gm,
+            matched.path(),
+            1,
+            &IngestContext::new("s11", Some(1)),
+            &Scripted { reply: reply(OLD) },
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(page_size(&gm).await["ended_by"], "s11:cross_key_replaces");
+
+        let missing = tempfile::tempdir().unwrap();
+        plant(missing.path(), &on);
+        let gm = GraphMemory::open_embedded(&missing.path().join("graph"))
+            .await
+            .unwrap();
+        write::ensure_v2_store(&gm).await.unwrap();
+        seed(&gm).await;
+        let report = extract_session(
+            &gm,
+            missing.path(),
+            1,
+            &IngestContext::new("s11", Some(1)),
+            &Scripted {
+                reply: reply(MISSING),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(page_size(&gm).await["ended_by"].is_null());
+
+        let off = stack_off_except(&["consolidate"]);
+        let untouched = tempfile::tempdir().unwrap();
+        plant(untouched.path(), &off);
+        let gm = GraphMemory::open_embedded(&untouched.path().join("graph"))
+            .await
+            .unwrap();
+        write::ensure_v2_store(&gm).await.unwrap();
+        seed(&gm).await;
+        let report = extract_session(
+            &gm,
+            untouched.path(),
+            1,
+            &IngestContext::new("s11", Some(1)),
+            &Scripted { reply: reply(OLD) },
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(page_size(&gm).await["ended_by"].is_null());
+    }
+
+    #[cfg(feature = "embedded")]
     fn write_archive(memory: &std::path::Path, text: &str) {
         std::fs::create_dir_all(memory.join("conversations")).unwrap();
         std::fs::write(
@@ -6517,7 +6788,7 @@ mod tests {
     ) -> (Result<Fact, &'static str>, IngestionReport) {
         let ground = marker_ground(turn);
         let mut report = IngestionReport::default();
-        let result = finish_fact(fact, &ground, false, false, rows, &mut report);
+        let result = finish_fact(fact, &ground, false, false, rows, None, &mut report);
         (result, report)
     }
 
@@ -7580,6 +7851,7 @@ mod tests {
                 &ground,
                 &mut report,
                 false,
+                None,
                 None,
             )
         });
