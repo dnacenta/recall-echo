@@ -3586,6 +3586,58 @@ mod tests {
         assert!((live["beta"].as_f64().unwrap() - prior.beta()).abs() < 1e-9);
     }
 
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn replacing_setting_with_echoed_old_value_is_written() {
+        let (_tmp, gm) = open_store().await;
+        write_turns(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[],
+            &[decided_slot("test_command", "runner -q", 0)],
+            None,
+        )
+        .await
+        .unwrap();
+        let sentence = "From now on the test command is `make check` (runs `runner -q --cov=pkg --fail-under=85`); CI calls `make check` too.";
+        let turns = [Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: sentence.into(),
+        }];
+        let mut next = decided_slot(
+            "test_command",
+            "make check (runs runner -q --cov=pkg --fail-under=85)",
+            0,
+        );
+        next.replaces = "runner -q".into();
+        next.quote = sentence.into();
+        let stats = write_turns(&gm, "s2", "2026-04-02", &turns, &[next], None)
+            .await
+            .unwrap();
+        assert_eq!(stats.drops_enumeration, 0, "{stats:?}");
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.retirements[0].reason, "replaced");
+        assert_eq!(stats.retirements[0].old_value, "runner -q");
+        assert_eq!(
+            stats.retirements[0].new_value,
+            "make check (runs runner -q --cov=pkg --fail-under=85)"
+        );
+        assert_eq!(stats.retirements[0].subject, "app");
+        let slots = app_slots(&gm).await;
+        let old = slot_named(&slots, "test_command", "runner -q");
+        let live = slot_named(
+            &slots,
+            "test_command",
+            "make check (runs runner -q --cov=pkg --fail-under=85)",
+        );
+        assert_eq!(old["valid_until"], "2026-04-02T00:00:00Z");
+        assert_eq!(old["ended_by"], "s2:replaced");
+        assert!(live["valid_until"].is_null(), "{live}");
+        assert!(live["ended_by"].is_null(), "{live}");
+    }
+
     /// Two settings with no usable key and different values both stay active.
     ///
     /// The stored fallback, a blank key, and whitespace are the same emptiness
