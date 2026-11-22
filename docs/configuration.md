@@ -56,6 +56,7 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_cross_key_replaces = false # close one earlier setting on another key that replaces names; off by default, ignored unless consolidate is on
 # consolidate_rule_replaces = false # close one earlier rule that replaces names; off by default, ignored unless consolidate is on
 # known_long_values = false   # show known-fact values up to 200 characters instead of 80; off by default, ignored unless known_facts_context is on
+# drop_generic_uses = false   # drop a decided language-role uses edge and a planned release status; off by default
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

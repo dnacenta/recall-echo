@@ -353,6 +353,10 @@ enum BenchCommands {
         /// Implies nothing. Writes `extract_key_forms = true` for this run only.
         #[arg(long)]
         extract_key_forms: bool,
+        /// Drop a decided language-role uses edge and a planned release status.
+        /// Off unless set. Implies nothing.
+        #[arg(long)]
+        drop_generic_uses: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1202,6 +1206,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_cross_key_replaces,
             consolidate_rule_replaces,
             known_long_values,
+            drop_generic_uses,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1260,6 +1265,11 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 recover_turns,
                 recall_echo::bench::writes::RecoverTurns::On,
                 recall_echo::bench::writes::RecoverTurns::Off,
+            ),
+            on_off(
+                drop_generic_uses,
+                recall_echo::bench::writes::DropGenericUses::On,
+                recall_echo::bench::writes::DropGenericUses::Off,
             ),
             on_off(
                 consolidate_key_rename,
@@ -1496,6 +1506,7 @@ fn run_writes(
     ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
     recover_turns: recall_echo::bench::writes::RecoverTurns,
+    drop_generic_uses: recall_echo::bench::writes::DropGenericUses,
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
@@ -1542,6 +1553,7 @@ fn run_writes(
             ground_component_edges,
             consolidate_components,
             recover_turns,
+            drop_generic_uses,
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
@@ -1568,6 +1580,7 @@ fn run_writes(
             ground_component_edges,
             consolidate_components,
             recover_turns,
+            drop_generic_uses,
             consolidate_key_rename,
             consolidate_replaces_cue,
             consolidate_replaces_departure,
@@ -1599,6 +1612,7 @@ async fn grade_once(
     ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
     recover_turns: recall_echo::bench::writes::RecoverTurns,
+    drop_generic_uses: recall_echo::bench::writes::DropGenericUses,
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
@@ -1628,6 +1642,7 @@ async fn grade_once(
                 ground_component_edges,
                 consolidate_components,
                 recover_turns,
+                drop_generic_uses,
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
@@ -1653,6 +1668,7 @@ async fn grade_once(
                 ground_component_edges,
                 consolidate_components,
                 recover_turns,
+                drop_generic_uses,
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
@@ -1684,6 +1700,7 @@ async fn grade_repeat(
     ground_component_edges: recall_echo::bench::writes::GroundComponentEdges,
     consolidate_components: recall_echo::bench::writes::ConsolidateComponents,
     recover_turns: recall_echo::bench::writes::RecoverTurns,
+    drop_generic_uses: recall_echo::bench::writes::DropGenericUses,
     consolidate_key_rename: recall_echo::bench::writes::ConsolidateKeyRename,
     consolidate_replaces_cue: recall_echo::bench::writes::ConsolidateReplacesCue,
     consolidate_replaces_departure: recall_echo::bench::writes::ConsolidateReplacesDeparture,
@@ -1714,6 +1731,7 @@ async fn grade_repeat(
                 ground_component_edges,
                 consolidate_components,
                 recover_turns,
+                drop_generic_uses,
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
@@ -1740,6 +1758,7 @@ async fn grade_repeat(
                 ground_component_edges,
                 consolidate_components,
                 recover_turns,
+                drop_generic_uses,
                 consolidate_key_rename,
                 consolidate_replaces_cue,
                 consolidate_replaces_departure,
@@ -2134,6 +2153,62 @@ mod tests {
             .expect("writes");
         let help = bench.render_long_help().to_string();
         assert!(help.contains("--recover-turns"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn drop_generic_uses_is_its_own_bench_flag() {
+        let parsed = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--drop-generic-uses",
+        ])
+        .expect("parse drop generic uses");
+        match parsed.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        consolidate_hold,
+                        consolidate_links,
+                        consolidate_components,
+                        drop_restatements,
+                        known_match,
+                        known_facts_context,
+                        ground_component_edges,
+                        recover_turns,
+                        drop_generic_uses,
+                        slot_forget,
+                        ..
+                    },
+            } => {
+                assert!(drop_generic_uses);
+                assert!(!recover_turns);
+                assert!(!slot_forget);
+                assert!(!ground_component_edges);
+                assert!(!consolidate);
+                assert!(!consolidate_hold);
+                assert!(!consolidate_links);
+                assert!(!consolidate_components);
+                assert!(!drop_restatements);
+                assert!(!known_match);
+                assert!(!known_facts_context);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--drop-generic-uses"), "{help}");
     }
 
     #[cfg(feature = "bench")]
@@ -3142,6 +3217,7 @@ mod tests {
             consolidate_cross_key_replaces: false,
             consolidate_rule_replaces: false,
             known_long_values: false,
+            drop_generic_uses: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],

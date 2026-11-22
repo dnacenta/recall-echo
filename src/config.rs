@@ -1008,6 +1008,14 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub extract_key_forms: bool,
+    /// Drop a decided `uses` edge whose role is language, and a decided
+    /// release status whose value is planned. Off unless set.
+    /// Stands alone: it does not turn any other switch on.
+    #[serde(
+        default = "default_drop_generic_uses",
+        skip_serializing_if = "is_false"
+    )]
+    pub drop_generic_uses: bool,
 }
 
 impl Default for GraphSection {
@@ -1048,6 +1056,7 @@ impl Default for GraphSection {
             known_long_values: default_known_long_values(),
             extract_value_details: default_extract_value_details(),
             extract_key_forms: default_extract_key_forms(),
+            drop_generic_uses: default_drop_generic_uses(),
         }
     }
 }
@@ -1551,6 +1560,10 @@ fn default_extract_value_details() -> bool {
 }
 
 fn default_extract_key_forms() -> bool {
+    false
+}
+
+fn default_drop_generic_uses() -> bool {
     false
 }
 
@@ -2107,6 +2120,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.known_long_values", flag_known_long_values),
     ("graph.extract_value_details", flag_extract_value_details),
     ("graph.extract_key_forms", flag_extract_key_forms),
+    ("graph.drop_generic_uses", flag_drop_generic_uses),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2224,6 +2238,10 @@ fn flag_extract_value_details(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_extract_key_forms(graph: &mut GraphSection) -> &mut bool {
     &mut graph.extract_key_forms
+}
+
+fn flag_drop_generic_uses(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.drop_generic_uses
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -4655,6 +4673,55 @@ settle_secs = 300
         cfg.set_key("graph.extract_key_forms", "true").unwrap();
         assert!(cfg.set_key("graph.extract_key_forms", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").extract_key_forms);
+    }
+
+    #[test]
+    fn drop_generic_uses_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_drop_generic_uses());
+        assert!(!GraphSection::default().drop_generic_uses);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().drop_generic_uses);
+        let explicit_false: Config =
+            toml::from_str("[graph]\ndrop_generic_uses = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.drop_generic_uses);
+        assert!(false_graph.drop_restatements);
+        assert!(!false_graph.recover_turns);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("drop_generic_uses"));
+        assert!(!rendered_false.contains("recover_turns"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\ndrop_generic_uses = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.drop_generic_uses);
+        assert!(true_graph.drop_restatements);
+        assert!(!true_graph.recover_turns);
+        assert!(true_graph.consolidate);
+        assert!(!true_graph.known_match);
+        let mut cfg = Config::default();
+        cfg.set_key("graph.drop_generic_uses", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.drop_generic_uses);
+        assert!(graph.drop_restatements);
+        assert!(!graph.recover_turns);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("drop_generic_uses = true"));
+        assert!(!rendered.contains("drop_restatements"));
+        assert!(!rendered.contains("recover_turns"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        assert!(parsed.graph.expect("graph").drop_generic_uses);
+
+        cfg.set_key("graph.drop_generic_uses", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").drop_generic_uses);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("drop_generic_uses"));
+        cfg.set_key("graph.drop_generic_uses", "true").unwrap();
+        assert!(cfg.set_key("graph.drop_generic_uses", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").drop_generic_uses);
+        assert!(cfg.graph.as_ref().expect("graph").drop_restatements);
     }
 
     #[test]
