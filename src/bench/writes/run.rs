@@ -483,6 +483,9 @@ async fn collect_sessions(
             planned_release_drops: report.planned_release_drops,
             known_key_bound: report.known_key_bound,
             detail_tail_stripped: report.detail_tail_stripped,
+            alternative_details_attached: report.alternative_details_attached,
+            alternative_details_ambiguous: report.alternative_details_ambiguous,
+            alternative_details_skipped_existing: report.alternative_details_skipped_existing,
             key_form_bound: report.key_form_bound,
             resolve: report.resolve,
             retirements: report.retirements,
@@ -560,6 +563,9 @@ async fn ingest_v2(
     report.planned_release_drops = extracted.planned_release_drops;
     report.known_key_bound = extracted.known_key_bound;
     report.detail_tail_stripped = extracted.detail_tail_stripped;
+    report.alternative_details_attached = extracted.alternative_details_attached;
+    report.alternative_details_ambiguous = extracted.alternative_details_ambiguous;
+    report.alternative_details_skipped_existing = extracted.alternative_details_skipped_existing;
     report.key_form_bound = extracted.key_form_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
@@ -6417,6 +6423,9 @@ mod tests {
             planned_release_drops: 0,
             known_key_bound: 0,
             detail_tail_stripped: 0,
+            alternative_details_attached: 0,
+            alternative_details_ambiguous: 0,
+            alternative_details_skipped_existing: 0,
             key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),

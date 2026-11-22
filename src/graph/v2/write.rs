@@ -15,6 +15,7 @@
 //! date and a reason. A record that is already closed keeps its first stamp.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -82,6 +83,10 @@ pub(crate) struct WriteStats {
     pub retirements_skipped: u32,
     pub retirement_skips: BTreeMap<String, u32>,
     pub drops_enumeration: u32,
+    /// Decided `uses` edges that stored alternative details.
+    pub alternative_details_attached: u32,
+    /// Details dropped because the edge already existed or the component guard skipped.
+    pub alternative_details_skipped_existing: u32,
     /// Milliseconds spent resolving mentions, measured around that call.
     pub resolve_ms: u64,
     /// Milliseconds spent committing edges, slots and retirements.
@@ -197,6 +202,8 @@ pub(crate) struct WriteCtx<'a> {
     /// Optional details aligned with the fact slice. Empty leaves every create
     /// statement as it is today.
     pub alternative_details: Vec<Option<String>>,
+    /// Donors that produced [`Self::alternative_details`], aligned with the facts.
+    pub alternative_detail_parts: Vec<Vec<super::alternatives::DetailPart>>,
 }
 
 impl<'a> WriteCtx<'a> {
@@ -235,6 +242,7 @@ impl<'a> WriteCtx<'a> {
             rule_replaces_on: false,
             value_chars: 80,
             alternative_details: Vec::new(),
+            alternative_detail_parts: Vec::new(),
         }
     }
 
@@ -488,6 +496,7 @@ async fn apply_all(
         held_edges: HashSet::new(),
         hold_conflicts: None,
         closed_rows: HashSet::new(),
+        live_uses: HashMap::new(),
     };
     for index in ordered_indexes(facts) {
         attempt.index = index;
@@ -572,6 +581,8 @@ struct Attempt<'a> {
     hold_conflicts: Option<String>,
     /// Row ids this fact closed. A restated pending value can clear against them.
     closed_rows: HashSet<String>,
+    /// Decided `uses` objects that were live for a subject before this attempt changed them.
+    live_uses: HashMap<String, HashSet<String>>,
 }
 
 fn drafts_of(facts: &[Fact]) -> Vec<MentionDraft> {
@@ -649,11 +660,20 @@ impl<'a> Attempt<'a> {
         };
         self.names
             .insert(subject.id.clone(), source.subject_name.clone());
+        if self
+            .ctx
+            .alternative_details
+            .iter()
+            .any(|details| details.is_some())
+        {
+            self.note_live_uses(&subject).await?;
+        }
         let mut fact = source.clone();
         fact.key = fold_key(&fact.key);
         // A rejection still retires. Any other status skips retire and promote
         // when the guard will not write the edge.
         if self.component_edge_blocked(&fact, &subject).await? {
+            self.note_details_skipped();
             return Ok(());
         }
         self.retire_then_write(&mut fact, &subject).await
@@ -788,15 +808,34 @@ impl<'a> Attempt<'a> {
             .find_edge(subject, object, fact, description.as_deref())
             .await?
         {
+            self.note_details_skipped();
             return self.reinforce_found(fact, subject, existing).await;
         }
         if self
             .skip_component_project_edge(fact, subject, object)
             .await?
         {
+            self.note_details_skipped();
             return Ok(());
         }
-        self.create_edge(fact, subject, object, description).await?;
+        let details = self.details_after_live_donors(subject).await?;
+        let stored = details.as_ref().map(|kept| kept.text.clone());
+        self.create_edge(fact, subject, object, description, stored)
+            .await?;
+        if let Some(kept) = details {
+            self.stats.alternative_details_attached += 1;
+            for part in &kept.parts {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "alternative detail: {} | {} <- {} | {} | {}",
+                    fact.subject_name,
+                    fact.object_name,
+                    part.name,
+                    part.status,
+                    part.reason
+                );
+            }
+        }
         self.stats.edges += 1;
         Ok(())
     }
@@ -919,12 +958,76 @@ impl<'a> Attempt<'a> {
         }
     }
 
+    fn note_details_skipped(&mut self) {
+        if self.attached_details().is_some() {
+            self.stats.alternative_details_skipped_existing += 1;
+        }
+    }
+
+    async fn details_after_live_donors(
+        &mut self,
+        subject: &Stored,
+    ) -> Result<Option<super::alternatives::KeptDetails>, GraphError> {
+        let Some(text) = self.attached_details() else {
+            return Ok(None);
+        };
+        let Some(parts) = self.ctx.alternative_detail_parts.get(self.index).cloned() else {
+            return Ok(Some(super::alternatives::KeptDetails {
+                text,
+                parts: Vec::new(),
+            }));
+        };
+        if parts.is_empty() {
+            return Ok(Some(super::alternatives::KeptDetails { text, parts }));
+        }
+        let mut kept = Vec::new();
+        for part in parts {
+            if !self.donor_was_live(&subject.id, &part.name) {
+                kept.push(part);
+            }
+        }
+        Ok(super::alternatives::rejoin(&kept))
+    }
+
+    async fn note_live_uses(&mut self, subject: &Stored) -> Result<(), GraphError> {
+        if self.live_uses.contains_key(&subject.id) {
+            return Ok(());
+        }
+        let edges = self.live_edges(&subject.id).await?;
+        let mut names = HashSet::new();
+        for edge in &edges {
+            if edge.rel_type != "uses" || edge.status.as_deref() != Some("decided") {
+                continue;
+            }
+            if edge.pending.as_ref().is_some_and(|value| !value.is_null()) {
+                continue;
+            }
+            let object = self.label(&record_id(&edge.to_id), "").await?;
+            let name = normalise(&object);
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        self.live_uses.insert(subject.id.clone(), names);
+        Ok(())
+    }
+
+    fn donor_was_live(&self, subject_id: &str, name: &str) -> bool {
+        let wanted = normalise(name);
+        !wanted.is_empty()
+            && self
+                .live_uses
+                .get(subject_id)
+                .is_some_and(|names| names.contains(&wanted))
+    }
+
     async fn create_edge(
         &mut self,
         fact: &Fact,
         subject: &Stored,
         object: &Stored,
         description: Option<String>,
+        details: Option<String>,
     ) -> Result<(), GraphError> {
         let (provenance, label) = provenance_of(fact.provenance);
         let evidence = prior_evidence(provenance);
@@ -944,14 +1047,9 @@ impl<'a> Attempt<'a> {
         } else {
             ""
         };
-        let details = self.attached_details();
-        let details_line = if details.is_some() {
-            "details = $details,"
-        } else {
-            ""
-        };
-        let statement = format!(
-            r#"
+        let statement = if details.is_some() {
+            format!(
+                r#"
             LET $from = type::record($from_id);
             LET $to = type::record($to_id);
             RELATE $from -> relates_to -> $to SET
@@ -970,10 +1068,35 @@ impl<'a> Attempt<'a> {
                 ended_by = NONE,
                 {pending_line}
                 {links_line}
-                {details_line}
+                details = $details,
                 evidence = $evidence
             "#
-        );
+            )
+        } else {
+            format!(
+                r#"
+            LET $from = type::record($from_id);
+            LET $to = type::record($to_id);
+            RELATE $from -> relates_to -> $to SET
+                rel_type = $rel_type,
+                description = $description,
+                valid_from = time::now(),
+                valid_until = NONE,
+                confidence = $confidence,
+                alpha = $alpha,
+                beta = $beta,
+                self_reinforcements = 0,
+                last_reinforced = time::now(),
+                source = NONE,
+                status = $status,
+                provenance = $provenance,
+                ended_by = NONE,
+                {pending_line}
+                {links_line}
+                evidence = $evidence
+            "#
+            )
+        };
         let mut request = self
             .tx
             .query(&statement)
@@ -3722,6 +3845,177 @@ mod tests {
             crate::graph::forgotten::mask_json(&set, serde_json::to_value(&rels[0]).unwrap());
         assert_eq!(masked["details"], "rejected: [forgotten]");
         assert!(!masked["details"].as_str().unwrap().contains("htmlkit"));
+    }
+
+    fn library_uses(subject: &str, object: &str, status: &str, turn: usize, quote: &str) -> Fact {
+        let mut fact = uses_named(subject, Kind::Project, object, status, "", turn);
+        fact.quote = quote.into();
+        fact
+    }
+
+    async fn uses_rows(gm: &GraphMemory) -> Vec<Value> {
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT status, details, valid_until, out.name AS object FROM relates_to WHERE rel_type = 'uses'",
+            )
+            .await
+            .unwrap();
+        deserialize_take(&mut response, 0).unwrap()
+    }
+
+    fn row_named<'a>(rows: &'a [Value], object: &str, status: &str) -> &'a Value {
+        rows.iter()
+            .find(|row| row["object"] == object && row["status"] == status)
+            .unwrap_or_else(|| panic!("missing {status} {object} in {rows:?}"))
+    }
+
+    async fn write_paired(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        turns: &[Turn],
+        facts: &[Fact],
+    ) -> WriteStats {
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let pairing = super::super::alternatives::pair(facts, turns);
+        let mut ctx = WriteCtx::new(&llm, &project, session_id, date, turns);
+        ctx.alternative_details = pairing.details;
+        ctx.alternative_detail_parts = pairing.parts;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn live_donor_edge_is_never_attached() {
+        let (_tmp, gm) = open_store().await;
+        crate::graph::store::define_edge_details(gm.db())
+            .await
+            .unwrap();
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[library_uses(
+                "acme",
+                "htmlkit",
+                "decided",
+                0,
+                "htmlkit stays",
+            )],
+        )
+        .await
+        .unwrap();
+        let sentence = "use stdparser, not htmlkit";
+        let turns = [Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: sentence.into(),
+        }];
+        let facts = [
+            library_uses("acme", "stdparser", "decided", 0, sentence),
+            library_uses("acme", "htmlkit", "rejected", 0, sentence),
+        ];
+        let stats = write_paired(&gm, "s2", "2026-04-02", &turns, &facts).await;
+        assert_eq!(stats.alternative_details_attached, 0, "{stats:?}");
+        assert_eq!(stats.alternative_details_skipped_existing, 0, "{stats:?}");
+        let rows = uses_rows(&gm).await;
+        let created = row_named(&rows, "stdparser", "decided");
+        assert!(
+            created.get("details").is_none_or(Value::is_null),
+            "{created}"
+        );
+        let donor = row_named(&rows, "htmlkit", "rejected");
+        assert!(donor["valid_until"].is_null(), "{donor}");
+        assert!(donor.get("details").is_none_or(Value::is_null), "{donor}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn reinforce_path_drops_details() {
+        let (_tmp, gm) = open_store().await;
+        crate::graph::store::define_edge_details(gm.db())
+            .await
+            .unwrap();
+        write_session(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[library_uses(
+                "acme",
+                "stdparser",
+                "decided",
+                0,
+                "stdparser stays",
+            )],
+        )
+        .await
+        .unwrap();
+        let sentence = "use stdparser, not htmlkit";
+        let turns = [Turn {
+            index: 0,
+            role: TurnRole::User,
+            text: sentence.into(),
+        }];
+        let facts = [
+            library_uses("acme", "stdparser", "decided", 0, sentence),
+            library_uses("acme", "htmlkit", "rejected", 0, sentence),
+        ];
+        let stats = write_paired(&gm, "s2", "2026-04-02", &turns, &facts).await;
+        assert_eq!(stats.alternative_details_attached, 0, "{stats:?}");
+        assert_eq!(stats.alternative_details_skipped_existing, 1, "{stats:?}");
+        assert_eq!(stats.reinforced, 1, "{stats:?}");
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let rows = uses_rows(&gm).await;
+        let canonical = row_named(&rows, "stdparser", "decided");
+        assert!(canonical["valid_until"].is_null(), "{canonical}");
+        assert!(
+            canonical.get("details").is_none_or(Value::is_null),
+            "{canonical}"
+        );
+        let donor = row_named(&rows, "htmlkit", "rejected");
+        assert!(donor["valid_until"].is_null(), "{donor}");
+        assert!(donor.get("details").is_none_or(Value::is_null), "{donor}");
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn rejected_same_turn_same_role_logs_the_attach() {
+        let (stats, logged) = crate::file_lock::capture_stderr(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (_tmp, gm) = open_store().await;
+                let sentence = "use stdparser, not htmlkit";
+                let turns = [Turn {
+                    index: 0,
+                    role: TurnRole::User,
+                    text: sentence.into(),
+                }];
+                let facts = [
+                    library_uses("acme", "stdparser", "decided", 0, sentence),
+                    library_uses("acme", "htmlkit", "rejected", 0, sentence),
+                ];
+                let stats = write_paired(&gm, "s1", "2026-04-01", &turns, &facts).await;
+                let rows = uses_rows(&gm).await;
+                let created = row_named(&rows, "stdparser", "decided");
+                assert_eq!(created["details"], "rejected: htmlkit");
+                let donor = row_named(&rows, "htmlkit", "rejected");
+                assert!(donor.get("details").is_none_or(Value::is_null), "{donor}");
+                stats
+            })
+        });
+        assert_eq!(stats.alternative_details_attached, 1, "{stats:?} {logged}");
+        assert!(
+            logged.contains("alternative detail: acme | stdparser <- htmlkit | rejected | R1"),
+            "{logged}"
+        );
     }
 
     /// Two settings with no usable key and different values both stay active.
