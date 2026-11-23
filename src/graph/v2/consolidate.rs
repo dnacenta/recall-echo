@@ -5200,7 +5200,7 @@ struct PostSnap {
     fragments: Option<FragmentSnap>,
     retire: Option<RetireSnap>,
     takeover: Option<TakeoverSnap>,
-    old_value: Option<RetireSnap>,
+    old_value: Option<OldValueSnap>,
     reason: Option<ReasonSnap>,
     rules: Option<ReplacesSnap>,
 }
@@ -5322,11 +5322,42 @@ async fn maybe_old_value(
     gm: &GraphMemory,
     ctx: &WriteCtx<'_>,
     rows: &[Value],
-) -> Result<Option<RetireSnap>, GraphError> {
+) -> Result<Option<OldValueSnap>, GraphError> {
     if !ctx.component_old_value_on {
         return Ok(None);
     }
-    Ok(Some(retire_snap(gm, ctx, rows).await?))
+    let retire = retire_snap(gm, ctx, rows).await?;
+    let first_part = read_first_parts(gm, retire.project_id.as_deref()).await?;
+    Ok(Some(OldValueSnap { retire, first_part }))
+}
+
+async fn read_first_parts(
+    gm: &GraphMemory,
+    project_id: Option<&str>,
+) -> Result<BTreeMap<String, String>, GraphError> {
+    note_post_read();
+    let mut response = gm.db().query(OPEN_PARTS_FIRST).await?;
+    let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
+    Ok(first_part_map(&rows, project_id))
+}
+
+fn first_part_map(rows: &[Value], project_id: Option<&str>) -> BTreeMap<String, String> {
+    let mut first_part = BTreeMap::new();
+    let Some(project_id) = project_id else {
+        return first_part;
+    };
+    for row in rows {
+        let Some(link) = part_link_view(row) else {
+            continue;
+        };
+        if link.to_id != project_id || !decided_link(&link) {
+            continue;
+        }
+        first_part
+            .entry(link.from_id)
+            .or_insert_with(|| first_evidence_session(row));
+    }
+    first_part
 }
 
 async fn maybe_takeover(
@@ -6155,6 +6186,9 @@ const RETIRE_CAP: usize = 8;
 const RETIRE_REASON: &str = "component_dropped";
 const OPEN_PARTS: &str = "\
 SELECT in, out, status, pending FROM relates_to \
+WHERE rel_type = 'part_of' AND valid_until = NONE";
+const OPEN_PARTS_FIRST: &str = "\
+SELECT in, out, status, pending, evidence FROM relates_to \
 WHERE rel_type = 'part_of' AND valid_until = NONE";
 const OPEN_USES: &str = "\
 SELECT id, in, out.name AS object, status, pending, evidence FROM relates_to \
@@ -7382,18 +7416,23 @@ struct OldValuePlan {
     overflows: Vec<OldValueOverflow>,
 }
 
+struct OldValueSnap {
+    retire: RetireSnap,
+    first_part: BTreeMap<String, String>,
+}
+
 struct OldValueSeen {
     slots: BTreeSet<(String, usize)>,
     edges: BTreeSet<String>,
 }
 
-fn plan_old_value(ctx: &WriteCtx<'_>, snap: &RetireSnap) -> OldValuePlan {
+fn plan_old_value(ctx: &WriteCtx<'_>, snap: &OldValueSnap) -> OldValuePlan {
     let mut plan = OldValuePlan {
         slots: Vec::new(),
         edges: Vec::new(),
         overflows: Vec::new(),
     };
-    let Some(project) = project_entity(snap) else {
+    let Some(project) = project_entity(&snap.retire) else {
         return plan;
     };
     let mut seen = OldValueSeen {
@@ -7401,8 +7440,16 @@ fn plan_old_value(ctx: &WriteCtx<'_>, snap: &RetireSnap) -> OldValuePlan {
         edges: BTreeSet::new(),
     };
     for slot in &project.slots {
-        push_old_value(&mut plan, snap, project, slot, ctx.session_id, &mut seen);
+        push_old_value(
+            &mut plan,
+            &snap.retire,
+            project,
+            slot,
+            ctx.session_id,
+            &mut seen,
+        );
     }
+    push_late_old_value(&mut plan, snap, project, ctx.session_id, &mut seen);
     sort_old_value(&mut plan);
     plan
 }
@@ -7418,6 +7465,68 @@ fn push_old_value(
     if !retire_trigger(slot, session) {
         return;
     }
+    let components: Vec<&RetireEntity> = snap
+        .entities
+        .iter()
+        .filter(|entity| linked(entity, snap))
+        .collect();
+    close_old_value_components(plan, snap, project, slot, session, &components, seen);
+}
+
+fn push_late_old_value(
+    plan: &mut OldValuePlan,
+    snap: &OldValueSnap,
+    project: &RetireEntity,
+    session: &str,
+    seen: &mut OldValueSeen,
+) {
+    for entity in &snap.retire.entities {
+        if !linked_this_session(entity, snap, session) {
+            continue;
+        }
+        let components = [entity];
+        for slot in &project.slots {
+            if !earlier_closed_setting(slot, session) {
+                continue;
+            }
+            close_old_value_components(
+                plan,
+                &snap.retire,
+                project,
+                slot,
+                session,
+                &components,
+                seen,
+            );
+        }
+    }
+}
+
+fn linked_this_session(entity: &RetireEntity, snap: &OldValueSnap, session: &str) -> bool {
+    linked(entity, &snap.retire)
+        && snap
+            .first_part
+            .get(&entity.id)
+            .is_some_and(|first| first == session)
+}
+
+fn earlier_closed_setting(slot: &RetireSlot, session: &str) -> bool {
+    slot.predicate == "setting"
+        && slot.status == "decided"
+        && !slot.live
+        && !slot.ended_by.is_empty()
+        && !ended_this_session(&slot.ended_by, session)
+}
+
+fn close_old_value_components(
+    plan: &mut OldValuePlan,
+    snap: &RetireSnap,
+    project: &RetireEntity,
+    slot: &RetireSlot,
+    session: &str,
+    components: &[&RetireEntity],
+    seen: &mut OldValueSeen,
+) {
     let successors = old_value_successors(project, slot);
     if successors.is_empty() {
         return;
@@ -7425,10 +7534,7 @@ fn push_old_value(
     let successor_words = successor_word_set(&successors);
     let mut slots = Vec::new();
     let mut edges = Vec::new();
-    for entity in &snap.entities {
-        if !linked(entity, snap) {
-            continue;
-        }
+    for entity in components {
         let words = old_words(&slot.value, &successors, &entity.name, &project.name);
         if words.is_empty() {
             continue;
@@ -23874,6 +23980,44 @@ mod tests {
         (report, super::take_post_lines(), super::post_reads())
     }
 
+    async fn finish_old_value_at(
+        gm: &GraphMemory,
+        session: &str,
+        date: &str,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let stub = Stub::new(Answer::Panic);
+        let mut ctx = WriteCtx::new(&stub, &project, session, date, &turns);
+        ctx.component_old_value_on = true;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, &[], &WriteStats::default(), &stub, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    fn grounded_part(subject: &str) -> Fact {
+        let mut fact = part_link(subject, "app", Kind::Project);
+        fact.provenance = Provenance::SelfGenerated;
+        fact
+    }
+
+    async fn part_evidence(gm: &GraphMemory, name: &str) -> Value {
+        let id = entity_id(gm, name).await;
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT evidence FROM relates_to \
+                 WHERE rel_type = 'part_of' AND in = type::record($id)",
+            )
+            .bind(("id", id))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        rows.into_iter().next().expect("part_of")["evidence"].clone()
+    }
+
     async fn find_use(gm: &GraphMemory, subject: &str, object: &str) -> Value {
         let id = entity_id(gm, subject).await;
         let mut response = gm
@@ -24171,6 +24315,266 @@ mod tests {
         let encoded = serde_json::to_value(&report.consolidate).unwrap();
         assert!(encoded.get("component_old_value_closes").is_none());
         assert!(encoded.get("component_old_value_overflow").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_closes_earlier_copies() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s5",
+            "2026-04-05",
+            &[part_link("store", "app", Kind::Project)],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        let store = slots(&gm, "store").await;
+        let path_index = store
+            .iter()
+            .position(|slot| slot["key"] == "storage_path")
+            .expect("storage_path");
+        assert_eq!(
+            ended_key(&store, "storage_path"),
+            Some("s5:component_old_value")
+        );
+        assert_eq!(
+            use_ended_by(&find_use(&gm, "store", "JSON").await),
+            Some("s5:component_old_value")
+        );
+        assert_eq!(report.consolidate.component_old_value_closes, Some(2));
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert_eq!(
+            lines,
+            vec![
+                format!("consolidate old value: store:storage_path | slot {path_index}"),
+                "consolidate old value: store:uses | edge".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_skips_rows_written_in_the_link_session() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[project_setting("storage", "JSON store", "decided")],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s5",
+            "2026-04-05",
+            &[part_link("store", "app", Kind::Project), storage_path()],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        assert!(ended_key(&slots(&gm, "store").await, "storage_path").is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_fires_once() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s5",
+            "2026-04-05",
+            &[
+                part_link("store", "app", Kind::Project),
+                setting_of("store", "storage_note", "JSON archive", "decided"),
+            ],
+        )
+        .await;
+        let (first, _, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        assert_eq!(first.consolidate.component_old_value_closes, Some(2));
+        let (report, lines, _) = finish_old_value_at(&gm, "s6", "2026-04-06").await;
+        let store = slots(&gm, "store").await;
+        assert_eq!(
+            ended_key(&store, "storage_path"),
+            Some("s5:component_old_value")
+        );
+        assert!(ended_key(&store, "storage_note").is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_needs_a_live_successor() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        mutate_slot(&gm, "app", "storage", "SQLite", |slot| {
+            slot["valid_until"] = json!("2026-04-04T00:00:00Z");
+            slot["ended_by"] = json!("s4:rejected");
+        })
+        .await;
+        commit_app(
+            &gm,
+            "s5",
+            "2026-04-05",
+            &[part_link("store", "app", Kind::Project)],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        assert!(ended_key(&slots(&gm, "store").await, "storage_path").is_none());
+        assert!(use_ended_by(&find_use(&gm, "store", "JSON").await).is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_overflow_closes_nothing() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                setting_of("store", "storage_one", "JSON archive", "decided"),
+                setting_of("store", "storage_two", "JSON archive", "decided"),
+                setting_of("store", "storage_three", "JSON archive", "decided"),
+                setting_of("store", "storage_four", "JSON archive", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s5",
+            "2026-04-05",
+            &[part_link("store", "app", Kind::Project)],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        let store = slots(&gm, "store").await;
+        for key in [
+            "storage_one",
+            "storage_two",
+            "storage_three",
+            "storage_four",
+        ] {
+            assert!(ended_key(&store, key).is_none(), "{key}");
+        }
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert_eq!(report.consolidate.component_old_value_overflow, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate old value overflow: app:storage | 4 targets".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_grounded_part_of_counts() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        commit_app(&gm, "s5", "2026-04-05", &[grounded_part("store")]).await;
+        let evidence = part_evidence(&gm, "store").await;
+        assert_eq!(evidence[0]["session"], "s5");
+        assert_eq!(evidence[0]["role"], "self");
+        let (report, lines, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        let store = slots(&gm, "store").await;
+        assert_eq!(
+            ended_key(&store, "storage_path"),
+            Some("s5:component_old_value")
+        );
+        assert_eq!(
+            use_ended_by(&find_use(&gm, "store", "JSON").await),
+            Some("s5:component_old_value")
+        );
+        assert_eq!(report.consolidate.component_old_value_closes, Some(2));
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("consolidate old value:")));
     }
 }
 
