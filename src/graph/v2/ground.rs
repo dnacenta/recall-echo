@@ -97,7 +97,7 @@ pub(crate) enum FieldCredit {
 /// The turn a quote was verified against.
 ///
 /// `quote` is the text to store: the trimmed reply after an exact match, or
-/// the turn's span after a separator match.
+/// the turn's span after a separator or backtick match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Cited {
     pub turn: usize,
@@ -115,6 +115,8 @@ pub(crate) struct SessionGround {
     key_forms: bool,
     value_suffix: bool,
     value_suffix_supports: Cell<u32>,
+    quote_strip_code: bool,
+    quote_strip_code_cites: Cell<u32>,
 }
 
 struct TurnGround {
@@ -162,6 +164,8 @@ impl SessionGround {
             key_forms: false,
             value_suffix: false,
             value_suffix_supports: Cell::new(0),
+            quote_strip_code: false,
+            quote_strip_code_cites: Cell::new(0),
         }
     }
 
@@ -214,11 +218,28 @@ impl SessionGround {
         self.value_suffix_supports.get()
     }
 
+    /// Turn the backtick-insensitive quote retry on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    /// The flag reaches the quote check only.
+    #[must_use]
+    pub(crate) fn with_quote_strip_code(mut self, on: bool) -> Self {
+        self.quote_strip_code = on;
+        self
+    }
+
+    /// Cites that held only after backticks were ignored on both sides.
+    pub(crate) fn quote_strip_code_cites(&self) -> u32 {
+        self.quote_strip_code_cites.get()
+    }
+
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
     ///
     /// An exact miss can still match when an underscore between two
     /// alphanumeric characters stands for one ASCII space. The stored quote
-    /// is then that span of the turn.
+    /// is then that span of the turn. With the backtick retry on, a quote
+    /// that still misses can match with every backtick ignored on both sides.
+    /// The stored quote is then the turn's own span, backticks kept.
     pub(crate) fn cite(&self, cited: usize, quote: &str) -> Result<Cited, &'static str> {
         let quote = quote.trim();
         if quote.chars().count() < MIN_QUOTE_CHARS || !quote.chars().any(char::is_alphanumeric) {
@@ -230,7 +251,10 @@ impl SessionGround {
         if let Some(turn) = self.turns.iter().find(|turn| turn.text.contains(quote)) {
             return Ok(with_quote(turn, quote));
         }
-        self.cite_separators(cited, quote).ok_or(DROP_QUOTE)
+        if let Some(found) = self.cite_separators(cited, quote) {
+            return Ok(found);
+        }
+        self.cite_stripped(cited, quote).ok_or(DROP_QUOTE)
     }
 
     /// First field that is an exact span of the cited turn, in the given order.
@@ -467,6 +491,25 @@ impl SessionGround {
             })
     }
 
+    /// Backtick pass, only when the session switch is on. The cited turn
+    /// wins, then the first turn in transcript order.
+    fn cite_stripped(&self, cited: usize, quote: &str) -> Option<Cited> {
+        if !self.quote_strip_code {
+            return None;
+        }
+        let want: String = quote.chars().filter(|ch| *ch != '`').collect();
+        if want.trim().is_empty() {
+            return None;
+        }
+        let found = self
+            .turn(cited)
+            .and_then(|turn| stripped_hit(turn, &want))
+            .or_else(|| self.turns.iter().find_map(|turn| stripped_hit(turn, &want)))?;
+        self.quote_strip_code_cites
+            .set(self.quote_strip_code_cites.get().saturating_add(1));
+        Some(found)
+    }
+
     fn turn(&self, index: usize) -> Option<&TurnGround> {
         self.turns.iter().find(|turn| turn.index == index)
     }
@@ -577,6 +620,33 @@ fn separator_hit(turn: &TurnGround, quote: &str) -> Option<Cited> {
         turn: turn.index,
         role: turn.role,
         quote: turn.text[start..end].to_string(),
+    })
+}
+
+/// First span of the turn that reads `want` once every backtick is ignored.
+///
+/// A turn without a backtick is skipped. The span runs from the first to the
+/// last matched character of the turn, so backticks inside it stay.
+fn stripped_hit(turn: &TurnGround, want: &str) -> Option<Cited> {
+    if !turn.text.contains('`') {
+        return None;
+    }
+    let mut kept = String::with_capacity(turn.text.len());
+    // Byte offset in the turn of each byte kept in `kept`.
+    let mut origin = Vec::with_capacity(turn.text.len());
+    for (at, ch) in turn.text.char_indices() {
+        if ch == '`' {
+            continue;
+        }
+        kept.push(ch);
+        origin.extend(at..at + ch.len_utf8());
+    }
+    let start = kept.find(want)?;
+    let last = start + want.len().checked_sub(1)?;
+    Some(Cited {
+        turn: turn.index,
+        role: turn.role,
+        quote: turn.text[origin[start]..=origin[last]].to_string(),
     })
 }
 
@@ -2504,5 +2574,106 @@ mod tests {
         let on = suffixed(text);
         assert!(!off.key_bound("line_length", "88", 0, text));
         assert!(!on.key_bound("line_length", "88", 0, text));
+    }
+
+    #[test]
+    fn quote_strip_code_defaults_off_and_stands_alone() {
+        let lines = [("Port 9000 is chosen.", TurnRole::User)];
+        let off = ground(&lines);
+        assert!(!off.quote_strip_code);
+        let on = ground(&lines).with_quote_strip_code(true);
+        assert!(on.quote_strip_code);
+        assert!(!on.value_details());
+        assert!(!on.key_forms());
+        assert!(!on.value_suffix());
+        assert!(!ground(&lines).with_value_suffix(true).quote_strip_code);
+    }
+
+    const CODE_TURN: &str = r#"Done: `md_ext = ["footnotes", "tables"]` in the config."#;
+
+    fn stripped(lines: &[(&str, TurnRole)]) -> SessionGround {
+        ground(lines).with_quote_strip_code(true)
+    }
+
+    #[test]
+    fn a_quote_that_dropped_the_backticks_cites_the_real_span() {
+        let quote = r#"md_ext = ["footnotes", "tables"] in the config"#;
+        let off = ground(&[(CODE_TURN, TurnRole::Assistant)]);
+        assert_eq!(off.cite(0, quote).unwrap_err(), DROP_QUOTE);
+        assert_eq!(off.quote_strip_code_cites(), 0);
+        let on = stripped(&[(CODE_TURN, TurnRole::Assistant)]);
+        let cited = on.cite(0, quote).unwrap();
+        assert_eq!((cited.turn, cited.role), (0, TurnRole::Assistant));
+        assert_eq!(
+            cited.quote,
+            r#"md_ext = ["footnotes", "tables"]` in the config"#
+        );
+        assert!(CODE_TURN.contains(&cited.quote));
+        assert_eq!(on.quote_strip_code_cites(), 1);
+    }
+
+    #[test]
+    fn a_quote_with_backticks_the_turn_lacks_cites_on() {
+        let turn = "Config: retry_limit is 5 (see `settings.toml`).";
+        let quote = "`retry_limit` is 5";
+        assert_eq!(
+            ground(&[(turn, TurnRole::User)])
+                .cite(0, quote)
+                .unwrap_err(),
+            DROP_QUOTE
+        );
+        let on = stripped(&[(turn, TurnRole::User)]);
+        assert_eq!(on.cite(0, quote).unwrap().quote, "retry_limit is 5");
+        assert_eq!(on.quote_strip_code_cites(), 1);
+        // A turn without any backtick is skipped by this step.
+        let bare = stripped(&[("retry_limit is 5", TurnRole::User)]);
+        assert_eq!(bare.cite(0, quote).unwrap_err(), DROP_QUOTE);
+        assert_eq!(bare.quote_strip_code_cites(), 0);
+    }
+
+    #[test]
+    fn the_cited_turn_wins_over_an_earlier_stripped_match() {
+        let quote = r#"md_ext = ["footnotes", "tables"] in the config"#;
+        let on = stripped(&[
+            (CODE_TURN, TurnRole::Assistant),
+            (CODE_TURN, TurnRole::User),
+        ]);
+        let cited = on.cite(1, quote).unwrap();
+        assert_eq!((cited.turn, cited.role), (1, TurnRole::User));
+        assert_eq!(on.cite(9, quote).unwrap().turn, 0);
+    }
+
+    #[test]
+    fn an_exact_match_still_wins_and_is_not_counted() {
+        let quote = r#"`md_ext = ["footnotes", "tables"]` in the config"#;
+        let on = stripped(&[(CODE_TURN, TurnRole::Assistant)]);
+        assert_eq!(on.cite(0, quote).unwrap().quote, quote);
+        assert_eq!(on.quote_strip_code_cites(), 0);
+    }
+
+    #[test]
+    fn a_quote_of_only_backticks_and_spaces_fails() {
+        let on = stripped(&[(CODE_TURN, TurnRole::Assistant)]);
+        assert_eq!(on.cite(0, "` ` `").unwrap_err(), DROP_QUOTE);
+        assert_eq!(on.cite(0, "``` ```").unwrap_err(), DROP_QUOTE);
+        assert_eq!(on.quote_strip_code_cites(), 0);
+    }
+
+    #[test]
+    fn words_missing_from_the_turn_still_fail() {
+        let on = stripped(&[(CODE_TURN, TurnRole::Assistant)]);
+        let quote = r#"md_ext = ["footnotes", "toc"] in the config"#;
+        assert_eq!(on.cite(0, quote).unwrap_err(), DROP_QUOTE);
+        assert_eq!(on.quote_strip_code_cites(), 0);
+    }
+
+    #[test]
+    fn a_multi_byte_character_beside_a_backtick_keeps_a_valid_span() {
+        let turn = "Mode: `été` reste actif, `café`.";
+        let on = stripped(&[(turn, TurnRole::User)]);
+        let cited = on.cite(0, "été reste actif, café").unwrap();
+        assert_eq!(cited.quote, "été` reste actif, `café");
+        assert!(turn.contains(&cited.quote));
+        assert_eq!(on.quote_strip_code_cites(), 1);
     }
 }

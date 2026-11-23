@@ -202,6 +202,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Count a cut-off rule `replaces` as the match on the cue and departure paths.
     /// Off leaves that match unchanged.
     pub replaces_prefix_on: bool,
+    /// Close one earlier setting whose key abbreviates the new key.
+    /// Off leaves consolidation unchanged and reads nothing for it.
+    pub near_key_on: bool,
     /// Characters kept from a known value, and the cut width the replaces closes use.
     /// 80 unless the long-value switch applies.
     pub value_chars: usize,
@@ -248,6 +251,7 @@ impl<'a> WriteCtx<'a> {
             cross_key_replaces_on: false,
             rule_replaces_on: false,
             replaces_prefix_on: false,
+            near_key_on: false,
             value_chars: 80,
             alternative_details: Vec::new(),
             alternative_detail_parts: Vec::new(),

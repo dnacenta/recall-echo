@@ -176,6 +176,9 @@ async fn run_main(
     if ctx.rename_on {
         arm_rename_counts(&mut report.consolidate);
     }
+    if ctx.near_key_on {
+        report.consolidate.near_key.get_or_insert(0);
+    }
     if rough.is_empty() && ambiguous.is_empty() && dependents.is_empty() {
         return;
     }
@@ -492,6 +495,339 @@ async fn run_main(
             }
         }
     }
+    if ctx.near_key_on {
+        close_near_keys(gm, ctx, &anchors, &loaded, &mut gone, report).await;
+    }
+}
+
+/// Why the near-key step kept its one candidate live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NearKeyGuard {
+    /// This pass already closed it.
+    Gone,
+    /// Its near-key class differs from the new value's.
+    Class,
+    /// Its value equals the new value.
+    SameValue,
+    /// The anchor's cited turn names the old key.
+    Named,
+    /// The cited turn lists the old value or keeps both values.
+    Listed,
+    /// Another anchor of this pass is a setting of the same subject on the old key.
+    Rewritten,
+}
+
+impl NearKeyGuard {
+    fn count(self, report: &mut crate::graph::types::ConsolidateReport) {
+        add_count(match self {
+            Self::Gone => &mut report.near_key_skip_gone,
+            Self::Class => &mut report.near_key_skip_class,
+            Self::SameValue => &mut report.near_key_skip_same_value,
+            Self::Named => &mut report.near_key_skip_named,
+            Self::Listed => &mut report.near_key_skip_listed,
+            Self::Rewritten => &mut report.near_key_skip_rewritten,
+        });
+    }
+}
+
+/// What the near-key step does for one anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NearKey {
+    /// Not a near-key anchor, no candidate, or an earlier row already has the new key.
+    Pass,
+    /// Two or more candidates. None of them close.
+    Ambiguous,
+    /// One candidate, kept live by a guard.
+    Guard(NearKeyGuard),
+    /// Close this row.
+    Close(usize),
+}
+
+struct NearKeyLook<'a> {
+    ctx: &'a WriteCtx<'a>,
+    anchors: &'a [Anchor],
+    rows: &'a [Row],
+    neighbourhood: &'a BTreeSet<String>,
+}
+
+/// Close an earlier setting whose key abbreviates a new key, after every judged close.
+///
+/// Deterministic: no judge call. A close is a supersede and is recorded like
+/// a judged one. Each close, ambiguity and guard skip is counted.
+async fn close_near_keys(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    loaded: &Loaded,
+    gone: &mut BTreeSet<usize>,
+    report: &mut IngestionReport,
+) {
+    let neighbourhood = neighbourhood(anchors, loaded, ctx);
+    let look = NearKeyLook {
+        ctx,
+        anchors,
+        rows: &loaded.rows,
+        neighbourhood: &neighbourhood,
+    };
+    for index in 0..anchors.len() {
+        match near_key_step(&look, gone, index) {
+            NearKey::Pass => {}
+            NearKey::Ambiguous => add_count(&mut report.consolidate.near_key_ambiguous),
+            NearKey::Guard(guard) => guard.count(&mut report.consolidate),
+            NearKey::Close(partner) => {
+                let pair = near_key_pair(index, partner);
+                close_near_key(gm, ctx, anchors, &loaded.rows, &pair, gone, report).await;
+            }
+        }
+    }
+}
+
+fn near_key_step(look: &NearKeyLook<'_>, gone: &BTreeSet<usize>, index: usize) -> NearKey {
+    let anchor = &look.anchors[index];
+    if !near_key_anchor(anchor) {
+        return NearKey::Pass;
+    }
+    let earlier: Vec<usize> = (0..look.rows.len())
+        .filter(|&at| near_key_row(&look.rows[at], anchor, look.neighbourhood))
+        .collect();
+    if earlier
+        .iter()
+        .any(|&at| keys_match(&look.rows[at].key, &anchor.key))
+    {
+        return NearKey::Pass;
+    }
+    // No earlier row matches the new key past this point.
+    let candidates: Vec<usize> = earlier
+        .into_iter()
+        .filter(|&at| near_key(&anchor.key, &look.rows[at].key))
+        .collect();
+    let partner = match candidates.as_slice() {
+        [] => return NearKey::Pass,
+        [only] => *only,
+        _ => return NearKey::Ambiguous,
+    };
+    match near_key_guard(look, gone, index, partner) {
+        Some(guard) => NearKey::Guard(guard),
+        None => NearKey::Close(partner),
+    }
+}
+
+/// A setting with a key and a live, non-prose new value, and no writer close.
+fn near_key_anchor(anchor: &Anchor) -> bool {
+    anchor.pred == "setting"
+        && !anchor.key.trim().is_empty()
+        && !anchor.earlier_turn
+        && anchor.live.is_some()
+        && anchor.closed_row.is_none()
+        && !anchor.new_value.trim().is_empty()
+        && near_key_class(&anchor.new_value) != "prose"
+}
+
+/// An earlier live setting of the anchor's subject, inside the neighbourhood.
+fn near_key_row(row: &Row, anchor: &Anchor, neighbourhood: &BTreeSet<String>) -> bool {
+    !row.here
+        && !row.pending
+        && row.pred == "setting"
+        && !row.key.trim().is_empty()
+        && neighbourhood.contains(&row.entity)
+        && same_name(&row.subject, &anchor.subject)
+}
+
+fn near_key_guard(
+    look: &NearKeyLook<'_>,
+    gone: &BTreeSet<usize>,
+    index: usize,
+    partner: usize,
+) -> Option<NearKeyGuard> {
+    let anchor = &look.anchors[index];
+    let old = &look.rows[partner];
+    let turn = cited(look.ctx, anchor);
+    if gone.contains(&partner) {
+        Some(NearKeyGuard::Gone)
+    } else if near_key_class(&old.value) != near_key_class(&anchor.new_value) {
+        Some(NearKeyGuard::Class)
+    } else if values_equal(&old.value, &anchor.new_value) {
+        Some(NearKeyGuard::SameValue)
+    } else if names_old_key(turn, &old.key) {
+        Some(NearKeyGuard::Named)
+    } else if listed_partner(turn, &old.value) || coexist_partner(anchor, old, turn) {
+        Some(NearKeyGuard::Listed)
+    } else if rewritten_elsewhere(look.anchors, index, &old.key) {
+        Some(NearKeyGuard::Rewritten)
+    } else {
+        None
+    }
+}
+
+/// The lower-cased turn holds the key, its words joined by `_`, or its words
+/// joined by spaces.
+fn names_old_key(turn: &str, key: &str) -> bool {
+    let turn = turn.to_lowercase();
+    let words = key_words(key);
+    turn.contains(&key.trim().to_lowercase())
+        || (!words.is_empty()
+            && (turn.contains(&words.join("_")) || turn.contains(&words.join(" "))))
+}
+
+/// Another anchor of this pass is a setting of the same subject on `old_key`.
+fn rewritten_elsewhere(anchors: &[Anchor], index: usize, old_key: &str) -> bool {
+    let anchor = &anchors[index];
+    anchors.iter().enumerate().any(|(at, other)| {
+        at != index
+            && other.pred == "setting"
+            && same_name(&other.subject, &anchor.subject)
+            && keys_match(&other.key, old_key)
+    })
+}
+
+fn near_key_pair(anchor: usize, partner: usize) -> Pair {
+    Pair {
+        anchor,
+        partner,
+        score: 0,
+        evidence: String::new(),
+        stored: String::new(),
+        hold: false,
+        via_replaces: false,
+        named_object: false,
+    }
+}
+
+async fn close_near_key(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    anchors: &[Anchor],
+    rows: &[Row],
+    pair: &Pair,
+    gone: &mut BTreeSet<usize>,
+    report: &mut IngestionReport,
+) {
+    let before = report.consolidate.closes_sup;
+    let why = CloseWhy {
+        reason: "consolidated",
+        quote: None,
+        tally: CueTally::none(),
+    };
+    // A refused close leaves the row as it was and is not a near-key close.
+    let _ = close_partner(gm, ctx, anchors, rows, pair, why, report).await;
+    if report.consolidate.closes_sup == before {
+        return;
+    }
+    gone.insert(pair.partner);
+    add_count(&mut report.consolidate.near_key);
+    let anchor = &anchors[pair.anchor];
+    let old = &rows[pair.partner];
+    eprintln!(
+        "{}",
+        near_key_line(
+            &format!("{}:{}", old.subject, old.key),
+            &format!("{}:{}", anchor.subject, anchor.key),
+        )
+    );
+}
+
+fn near_key_line(old_key: &str, new_key: &str) -> String {
+    format!("consolidate close: near key | {old_key} | {new_key}")
+}
+
+/// `list` for a bracketed value or a bare comma list of plain items.
+/// Otherwise the ordinary value class.
+fn near_key_class(value: &str) -> &'static str {
+    let value = value.trim();
+    if value.starts_with('[') || bare_list(value) {
+        "list"
+    } else {
+        value_class(value)
+    }
+}
+
+/// Two or more comma items, each non-empty and only alphanumerics, `_`, `-` or `.`.
+fn bare_list(value: &str) -> bool {
+    let items: Vec<&str> = value.split(',').map(str::trim).collect();
+    items.len() >= 2
+        && items.iter().all(|item| {
+            !item.is_empty()
+                && item
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        })
+}
+
+/// Same word count, not the same words, and every differing word pair is an
+/// abbreviation one way or the other. A differing pair always exists, so at
+/// least one pair abbreviates.
+fn near_key(left: &str, right: &str) -> bool {
+    let left = key_words(left);
+    let right = key_words(right);
+    !left.is_empty()
+        && left.len() == right.len()
+        && left != right
+        && left
+            .iter()
+            .zip(&right)
+            .all(|(one, two)| one == two || abbreviates(one, two) || abbreviates(two, one))
+}
+
+/// Split the trimmed key on every non-alphanumeric character and before an
+/// upper-case letter that follows a lower-case letter or a digit. Lower-cased.
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut previous: Option<char> = None;
+    for ch in key.trim().chars() {
+        if !ch.is_alphanumeric() {
+            push_word(&mut words, &mut word);
+            previous = None;
+            continue;
+        }
+        if ch.is_uppercase()
+            && previous.is_some_and(|last| last.is_lowercase() || last.is_numeric())
+        {
+            push_word(&mut words, &mut word);
+        }
+        word.push(ch);
+        previous = Some(ch);
+    }
+    push_word(&mut words, &mut word);
+    words
+}
+
+fn push_word(words: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word).to_lowercase());
+    }
+}
+
+/// `short` stands for `long`: ASCII letters only, at least two letters, two
+/// shorter than `long`, and the same first letter. Then a clipped word
+/// (`ext` / `extensions`) or a consonant skeleton (`md` / `markdown`).
+fn abbreviates(short: &str, long: &str) -> bool {
+    let letters = |word: &str| word.bytes().all(|byte| byte.is_ascii_alphabetic());
+    if !letters(short)
+        || !letters(long)
+        || short.len() < 2
+        || long.len() < short.len() + 2
+        || short.as_bytes()[0] != long.as_bytes()[0]
+    {
+        return false;
+    }
+    clipped_word(short, long) || consonant_skeleton(short, long)
+}
+
+fn clipped_word(short: &str, long: &str) -> bool {
+    short.len() >= 3 && long.starts_with(short)
+}
+
+/// At most four letters, no vowel after the first, and a subsequence of `long`.
+fn consonant_skeleton(short: &str, long: &str) -> bool {
+    short.len() <= 4
+        && !short[1..].bytes().any(|byte| b"aeiou".contains(&byte))
+        && subsequence(short, long)
+}
+
+fn subsequence(short: &str, long: &str) -> bool {
+    let mut rest = long.bytes();
+    short.bytes().all(|byte| rest.any(|have| have == byte))
 }
 
 fn rough_anchors(
@@ -24924,6 +25260,364 @@ mod tests {
         assert!(rule_replaces_match(&ordered, &partner, true));
         assert!(!rule_replaces_match(&reordered, &partner, false));
         assert!(!rule_replaces_match(&reordered, &partner, true));
+    }
+
+    const MD_OLD: &str = r#"["footnotes", "tables"]"#;
+    const MD_NEW: &str = r#"["admonition", "toc", "def_list"]"#;
+
+    #[test]
+    fn near_key_pairs_abbreviated_words_only() {
+        assert!(near_key("md_ext", "markdown_extensions"));
+        assert!(near_key("markdown_extensions", "md_ext"));
+        assert!(near_key("cache_dir", "cache_directory"));
+        assert!(near_key("cfg_path", "config_path"));
+        assert!(near_key("dbUrl", "database_url"));
+        assert!(!near_key("main_path", "migrations_path"));
+        assert!(!near_key("port", "port2"));
+        assert!(!near_key("max_retries", "min_retries"));
+        assert!(!near_key("md_ext", "markdown"));
+        assert!(!near_key("md_ext", "md_ext"));
+        assert!(!near_key("cache_dir", "Cache-Dir"));
+        // Known risk: a two-letter consonant skeleton matches an unrelated word.
+        assert!(near_key("db_port", "debug_port"));
+        assert_eq!(key_words("dbUrl"), ["db", "url"]);
+        assert_eq!(key_words(" v2Api-key "), ["v2", "api", "key"]);
+        assert_eq!(key_words("port2"), ["port2"]);
+    }
+
+    #[test]
+    fn near_key_class_treats_brackets_and_bare_lists_as_lists() {
+        assert_eq!(near_key_class(MD_OLD), "list");
+        assert_eq!(near_key_class("admonition, toc, def_list"), "list");
+        assert_eq!(near_key_class("a.b, c-d"), "list");
+        assert_eq!(near_key_class("3"), "number");
+        assert_ne!(near_key_class("the admonition and toc extensions"), "list");
+        assert_ne!(near_key_class("admonition, , toc"), "list");
+        assert_ne!(near_key_class("use toc, then admonition"), "list");
+    }
+
+    struct NearKeyRun {
+        report: IngestionReport,
+        calls: u32,
+        rows: Vec<Value>,
+    }
+
+    /// Session 1 writes `earlier`, session 2 writes `later` from one turn,
+    /// then consolidation runs with the near-key switch as given.
+    async fn near_key_run(earlier: &[Fact], later: &[Fact], text: &str, on: bool) -> NearKeyRun {
+        let (_tmp, gm) = open().await;
+        if !earlier.is_empty() {
+            let quotes: Vec<&str> = earlier.iter().map(|fact| fact.quote.as_str()).collect();
+            let first = [turn(&quotes.join(" "))];
+            commit(&gm, "s1", "2026-03-01", &first, earlier).await;
+        }
+        let turns = [turn(text)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, later).await;
+        let stub = Stub::new(Answer::Reply(judged(&[])));
+        let project = project();
+        let mut ctx = WriteCtx::new(&stub, &project, "s2", "2026-03-02", &turns);
+        ctx.near_key_on = on;
+        let mut report = IngestionReport::default();
+        run(&gm, &ctx, later, &stats, &stub, &mut report).await;
+        NearKeyRun {
+            report,
+            calls: stub.calls(),
+            rows: slots(&gm, "acme").await,
+        }
+    }
+
+    fn acme(key: &str, value: &str, quote: &str) -> Fact {
+        setting("acme", Kind::Project, key, value, quote)
+    }
+
+    fn md_old() -> Fact {
+        acme("md_ext", MD_OLD, &format!("md_ext = {MD_OLD}"))
+    }
+
+    #[tokio::test]
+    async fn an_abbreviated_key_closes_only_when_the_switch_is_on() {
+        let text = format!("Set markdown_extensions = {MD_NEW} for the docs build.");
+        let new = acme("markdown_extensions", MD_NEW, &text);
+        let off = near_key_run(&[md_old()], std::slice::from_ref(&new), &text, false).await;
+        let on = near_key_run(&[md_old()], &[new], &text, true).await;
+        assert!(ended(live_any(&off.rows, "md_ext", MD_OLD)).is_none());
+        assert!(off.report.consolidate.near_key.is_none());
+        assert_eq!(
+            ended(live_any(&on.rows, "md_ext", MD_OLD)),
+            Some("s2:consolidated")
+        );
+        assert!(ended(live_any(&on.rows, "markdown_extensions", MD_NEW)).is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(1));
+        assert_eq!(on.calls, off.calls);
+        assert!(on.report.retirements.iter().any(|retirement| {
+            retirement.reason == "consolidated"
+                && retirement.key == "md_ext"
+                && retirement.old_value == MD_OLD
+                && retirement.new_value == MD_NEW
+        }));
+        let mut without = on.report.consolidate.clone();
+        without.near_key = None;
+        without.closes_sup -= 1;
+        assert_eq!(without, off.report.consolidate);
+        assert_eq!(
+            on.report.retirements.len(),
+            off.report.retirements.len() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_list_value_closes_the_abbreviated_key() {
+        let text = "Set markdown_extensions to admonition, toc, def_list.";
+        let new = acme("markdown_extensions", "admonition, toc, def_list", text);
+        let on = near_key_run(&[md_old()], &[new], text, true).await;
+        assert_eq!(
+            ended(live_any(&on.rows, "md_ext", MD_OLD)),
+            Some("s2:consolidated")
+        );
+        assert_eq!(on.report.consolidate.near_key, Some(1));
+    }
+
+    #[tokio::test]
+    async fn two_near_key_rows_are_ambiguous_and_stay_live() {
+        let other = acme(
+            "md_extensions",
+            r#"["abbr", "attr_list"]"#,
+            r#"md_extensions = ["abbr", "attr_list"]"#,
+        );
+        let text = format!("Set markdown_extensions = {MD_NEW} for the docs build.");
+        let new = acme("markdown_extensions", MD_NEW, &text);
+        let on = near_key_run(&[md_old(), other], &[new], &text, true).await;
+        assert!(ended(live_any(&on.rows, "md_ext", MD_OLD)).is_none());
+        assert!(ended(live_any(
+            &on.rows,
+            "md_extensions",
+            r#"["abbr", "attr_list"]"#
+        ))
+        .is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(0));
+        assert_eq!(on.report.consolidate.near_key_ambiguous, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_names_the_old_key_keeps_it_live() {
+        let text =
+            format!("Set markdown_extensions = {MD_NEW}; md_ext stays for the old renderer.");
+        let new = acme("markdown_extensions", MD_NEW, &text);
+        let on = near_key_run(&[md_old()], &[new], &text, true).await;
+        assert!(ended(live_any(&on.rows, "md_ext", MD_OLD)).is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(0));
+        assert_eq!(on.report.consolidate.near_key_skip_named, Some(1));
+        assert!(names_old_key("the MD EXT flag", "md_ext"));
+        assert!(names_old_key("db url is set", "dbUrl"));
+        assert!(names_old_key("set db_url", "dbUrl"));
+        assert!(!names_old_key("markdown_extensions only", "md_ext"));
+    }
+
+    #[tokio::test]
+    async fn a_number_beside_a_list_is_not_a_near_key_close() {
+        let old = acme("md_ext", "3", "md_ext = 3");
+        let text = format!("Set markdown_extensions = {MD_NEW} for the docs build.");
+        let new = acme("markdown_extensions", MD_NEW, &text);
+        let on = near_key_run(&[old], &[new], &text, true).await;
+        assert!(ended(live_any(&on.rows, "md_ext", "3")).is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(0));
+        assert_eq!(on.report.consolidate.near_key_skip_class, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_prose_value_is_not_a_near_key_anchor() {
+        let text = "Set markdown_extensions to the admonition and toc extensions.";
+        let new = acme(
+            "markdown_extensions",
+            "the admonition and toc extensions",
+            text,
+        );
+        let on = near_key_run(&[md_old()], &[new], text, true).await;
+        assert!(ended(live_any(&on.rows, "md_ext", MD_OLD)).is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(0));
+        assert_eq!(near_key_skips(&on.report), [None; 7]);
+    }
+
+    fn near_key_skips(report: &IngestionReport) -> [Option<u32>; 7] {
+        let counts = &report.consolidate;
+        [
+            counts.near_key_ambiguous,
+            counts.near_key_skip_gone,
+            counts.near_key_skip_class,
+            counts.near_key_skip_same_value,
+            counts.near_key_skip_named,
+            counts.near_key_skip_listed,
+            counts.near_key_skip_rewritten,
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_old_key_from_this_session_is_not_closed() {
+        let text = format!("Set md_ext = {MD_OLD} and markdown_extensions = {MD_NEW}.");
+        let old = acme("md_ext", MD_OLD, &text);
+        let new = acme("markdown_extensions", MD_NEW, &text);
+        let on = near_key_run(&[], &[old, new], &text, true).await;
+        assert!(ended(live_any(&on.rows, "md_ext", MD_OLD)).is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(0));
+        assert_eq!(near_key_skips(&on.report), [None; 7]);
+    }
+
+    #[tokio::test]
+    async fn a_named_db_port_stays_live_beside_a_new_debug_port() {
+        let old = acme("db_port", "5432", "db_port = 5432");
+        let text = "debug_port is 9229 and db_port stays 5432.";
+        let new = acme("debug_port", "9229", text);
+        let on = near_key_run(&[old], &[new], text, true).await;
+        assert!(ended(live_any(&on.rows, "db_port", "5432")).is_none());
+        assert_eq!(on.report.consolidate.near_key, Some(0));
+        assert_eq!(on.report.consolidate.near_key_skip_named, Some(1));
+    }
+
+    const NEAR_HOOD: &str = "entity:acme";
+
+    fn near_anchor(key: &str, value: &str, live: usize) -> Anchor {
+        let mut anchor = anchor_named("acme", key, value);
+        anchor.live = Some(live);
+        anchor
+    }
+
+    fn near_row(key: &str, value: &str, here: bool) -> Row {
+        let mut row = row_named("acme", NEAR_HOOD, key, value);
+        row.here = here;
+        row
+    }
+
+    fn near_step(
+        text: &str,
+        anchors: &[Anchor],
+        rows: &[Row],
+        gone: &[usize],
+        index: usize,
+    ) -> NearKey {
+        let project = project();
+        let turns = [turn(text)];
+        let ctx = WriteCtx::new(&Quiet, &project, "s2", "2026-03-02", &turns);
+        let neighbourhood: BTreeSet<String> = [NEAR_HOOD.to_string()].into_iter().collect();
+        let look = NearKeyLook {
+            ctx: &ctx,
+            anchors,
+            rows,
+            neighbourhood: &neighbourhood,
+        };
+        let gone: BTreeSet<usize> = gone.iter().copied().collect();
+        near_key_step(&look, &gone, index)
+    }
+
+    const NEAR_TEXT: &str = "Set markdown_extensions for the docs build.";
+
+    #[test]
+    fn near_key_step_closes_one_earlier_abbreviated_row() {
+        let anchors = [near_anchor("markdown_extensions", MD_NEW, 1)];
+        let rows = [
+            near_row("md_ext", MD_OLD, false),
+            near_row("markdown_extensions", MD_NEW, true),
+        ];
+        assert_eq!(
+            near_step(NEAR_TEXT, &anchors, &rows, &[], 0),
+            NearKey::Close(0)
+        );
+        assert_eq!(
+            near_step(NEAR_TEXT, &anchors, &rows, &[0], 0),
+            NearKey::Guard(NearKeyGuard::Gone)
+        );
+        let mut pending = rows.clone();
+        pending[0].pending = true;
+        assert_eq!(
+            near_step(NEAR_TEXT, &anchors, &pending, &[], 0),
+            NearKey::Pass
+        );
+        let mut outside = rows.clone();
+        outside[0].entity = "entity:other".into();
+        assert_eq!(
+            near_step(NEAR_TEXT, &anchors, &outside, &[], 0),
+            NearKey::Pass
+        );
+        let mut earlier = anchors.clone();
+        earlier[0].earlier_turn = true;
+        assert_eq!(near_step(NEAR_TEXT, &earlier, &rows, &[], 0), NearKey::Pass);
+        let mut writer = anchors.clone();
+        writer[0].closed_row = Some("s:entity:acme:9".into());
+        assert_eq!(near_step(NEAR_TEXT, &writer, &rows, &[], 0), NearKey::Pass);
+        let mut dead = anchors.clone();
+        dead[0].live = None;
+        assert_eq!(near_step(NEAR_TEXT, &dead, &rows, &[], 0), NearKey::Pass);
+    }
+
+    #[test]
+    fn equal_values_are_not_a_near_key_close() {
+        let anchors = [near_anchor("markdown_extensions", MD_NEW, 1)];
+        let rows = [
+            near_row("md_ext", MD_NEW, false),
+            near_row("markdown_extensions", MD_NEW, true),
+        ];
+        assert_eq!(
+            near_step(NEAR_TEXT, &anchors, &rows, &[], 0),
+            NearKey::Guard(NearKeyGuard::SameValue)
+        );
+    }
+
+    #[test]
+    fn another_anchor_on_the_old_key_keeps_it_live() {
+        let anchors = [
+            near_anchor("markdown_extensions", MD_NEW, 1),
+            near_anchor("md_ext", r#"["abbr"]"#, 2),
+        ];
+        let rows = [
+            near_row("md_ext", MD_OLD, false),
+            near_row("markdown_extensions", MD_NEW, true),
+            near_row("md_ext", r#"["abbr"]"#, true),
+        ];
+        assert_eq!(
+            near_step(NEAR_TEXT, &anchors, &rows, &[], 0),
+            NearKey::Guard(NearKeyGuard::Rewritten)
+        );
+    }
+
+    #[test]
+    fn an_earlier_row_on_the_new_key_leaves_near_key_idle() {
+        let anchors = [near_anchor("markdown_extensions", MD_NEW, 2)];
+        let rows = [
+            near_row("markdown_extensions", r#"["abbr"]"#, false),
+            near_row("md_ext", MD_OLD, false),
+            near_row("markdown_extensions", MD_NEW, true),
+        ];
+        assert_eq!(near_step(NEAR_TEXT, &anchors, &rows, &[], 0), NearKey::Pass);
+    }
+
+    #[test]
+    fn an_owned_debug_port_keeps_db_port_live() {
+        let text = "debug_port is 9230 now.";
+        let anchors = [near_anchor("debug_port", "9230", 2)];
+        let rows = [
+            near_row("db_port", "5432", false),
+            near_row("debug_port", "9229", false),
+            near_row("debug_port", "9230", true),
+        ];
+        assert_eq!(near_step(text, &anchors, &rows, &[], 0), NearKey::Pass);
+        let unowned = [rows[0].clone(), rows[2].clone()];
+        let anchors = [near_anchor("debug_port", "9230", 1)];
+        assert_eq!(
+            near_step(text, &anchors, &unowned, &[], 0),
+            NearKey::Close(0)
+        );
+        let named = "debug_port is 9230 and db_port stays 5432.";
+        assert_eq!(
+            near_step(named, &anchors, &unowned, &[], 0),
+            NearKey::Guard(NearKeyGuard::Named)
+        );
+    }
+
+    #[test]
+    fn a_near_key_close_line_names_both_keys() {
+        assert_eq!(
+            near_key_line("acme:md_ext", "acme:markdown_extensions"),
+            "consolidate close: near key | acme:md_ext | acme:markdown_extensions"
+        );
     }
 }
 
