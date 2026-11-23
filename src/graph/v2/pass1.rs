@@ -349,6 +349,12 @@ pub(crate) async fn extract_session(
         (facts, Vec::new(), MatchReport::default(), None)
     };
     let (facts, targets) = without_forgotten(memory_dir, facts, targets, &mut report)?;
+    let pairing = super::alternatives::pair_for_ingest(
+        alternative_details_enabled(memory_dir),
+        &facts,
+        &session.turns,
+    );
+    report.alternative_details_ambiguous = pairing.ambiguous;
 
     let mut resolve_ms = 0;
     let mut write_ms = 0;
@@ -379,6 +385,8 @@ pub(crate) async fn extract_session(
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
         write_ctx.value_chars = known_value_chars(memory_dir);
         write_ctx.targets = targets;
+        write_ctx.alternative_details = pairing.details;
+        write_ctx.alternative_detail_parts = pairing.parts;
         let stats = write::write_facts(gm, &write_ctx, &facts).await?;
         if match_on {
             for (reason, count) in &stats.match_skips {
@@ -407,6 +415,8 @@ pub(crate) async fn extract_session(
         // Consolidation may add derived-anchor counts on top of the write totals.
         report.links = stats.links;
         report.component_edges.add(stats.component_edges);
+        report.alternative_details_attached = stats.alternative_details_attached;
+        report.alternative_details_skipped_existing = stats.alternative_details_skipped_existing;
         if consolidate_on {
             let started = std::time::Instant::now();
             super::consolidate::run(gm, &write_ctx, &facts, &stats, llm, &mut report).await;
@@ -652,6 +662,13 @@ fn drop_generic_uses_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .drop_generic_uses
+}
+
+fn alternative_details_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .alternative_details
 }
 
 fn ground_component_edges_enabled(memory_dir: &Path) -> bool {
@@ -1094,7 +1111,7 @@ fn strip_detail_tail(
     if !ground.value_details() || swapped || fact.predicate != Predicate::Setting {
         return;
     }
-    let Some((head, tail)) = trailing_detail(&fact.object_name) else {
+    let Some((head, _tail)) = trailing_detail(&fact.object_name) else {
         return;
     };
     let full = fact.object_name.clone();
@@ -1107,17 +1124,12 @@ fn strip_detail_tail(
         fact.object_name = full;
         return;
     }
-    let replaces_in_tail = !fact.replaces.trim().is_empty()
-        && contiguous_token_run(
-            &write::alphanumeric_runs(fact.replaces.trim()),
-            &write::alphanumeric_runs(&tail),
-        );
+    // A tail that only repeats `replaces` stays. Closing the old value does
+    // not need the head, and stripping it makes the head look listed.
     let reason = if !full_support {
         "support"
     } else if !full_key {
         "key"
-    } else if replaces_in_tail {
-        "replaces"
     } else {
         fact.object_name = full;
         return;
@@ -6867,6 +6879,26 @@ mod tests {
         assert!(!drop_restatements_enabled(dir.path()));
     }
 
+    #[test]
+    fn alternative_details_reads_only_its_own_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!alternative_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nalternative_details = false\nextract_value_details = true\n",
+        )
+        .unwrap();
+        assert!(!alternative_details_enabled(dir.path()));
+        assert!(value_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nalternative_details = true\nextract_value_details = false\n",
+        )
+        .unwrap();
+        assert!(alternative_details_enabled(dir.path()));
+        assert!(!value_details_enabled(dir.path()));
+    }
+
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     async fn scripted_pair_writes_the_setting_without_a_rule() {
@@ -8432,10 +8464,35 @@ mod tests {
             ),
         );
         assert_eq!(version_facts.len(), 1, "{:?}", version_report.drops);
-        assert_eq!(version_facts[0].object_name, "2.1");
-        assert_eq!(version_report.detail_tail_stripped, 1);
-        assert!(version_logged
-            .contains("pass1 detail strip: Lantern:release_version | replaces | turn 0"));
+        assert_eq!(version_facts[0].object_name, "2.1 (was 2.0)");
+        assert_eq!(version_report.detail_tail_stripped, 0);
+        assert!(!version_logged.contains("pass1 detail strip"));
+    }
+
+    #[test]
+    fn detail_tail_repeating_replaces_is_kept() {
+        let sentence = "From now on the test command is `make check` (runs `runner -q --cov=pkg --fail-under=85`); CI calls `make check` too.";
+        let (facts, report, logged) = admit_details(
+            true,
+            "Harbor",
+            sentence,
+            literal_item(
+                "Harbor",
+                "setting",
+                "test_command",
+                "make check (runs runner -q --cov=pkg --fail-under=85)",
+                "runner -q",
+                "the test command is `make check` (runs `runner -q --cov=pkg --fail-under=85`)",
+            ),
+        );
+        assert_eq!(facts.len(), 1, "{:?} {logged}", report.drops);
+        assert_eq!(
+            facts[0].object_name,
+            "make check (runs runner -q --cov=pkg --fail-under=85)"
+        );
+        assert_eq!(facts[0].replaces, "runner -q");
+        assert_eq!(report.detail_tail_stripped, 0);
+        assert!(!logged.contains("pass1 detail strip"));
     }
 
     #[test]

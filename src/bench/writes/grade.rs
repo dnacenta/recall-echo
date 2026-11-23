@@ -102,6 +102,12 @@ pub struct SessionObservation {
     /// Settings whose trailing parenthetical detail was removed.
     /// Zero when that switch is off or nothing was stripped.
     pub detail_tail_stripped: u32,
+    /// Decided uses edges that stored alternative details.
+    pub alternative_details_attached: u32,
+    /// Donors that matched more than one decided uses edge.
+    pub alternative_details_ambiguous: u32,
+    /// Details dropped because the edge already existed or a guard skipped it.
+    pub alternative_details_skipped_existing: u32,
     /// Candidates kept because a listed key-token form bound the key.
     /// Zero when that switch is off or no form was needed.
     pub key_form_bound: u32,
@@ -275,6 +281,18 @@ pub struct SessionReport {
     /// Zero, and omitted, when the switch is off or nothing was stripped.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub detail_tail_stripped: u32,
+    /// Decided uses edges that stored alternative details.
+    /// Zero, and omitted, when that switch is off or nothing was stored.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub alternative_details_attached: u32,
+    /// Donors that matched more than one decided uses edge.
+    /// Zero, and omitted, when that switch is off or nothing was ambiguous.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub alternative_details_ambiguous: u32,
+    /// Details dropped because the edge already existed or a guard skipped it.
+    /// Zero, and omitted, when that switch is off or nothing was skipped.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub alternative_details_skipped_existing: u32,
     /// Candidates kept because a listed key-token form bound the key.
     /// Zero, and omitted, when the switch is off or no form was needed.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
@@ -682,6 +700,9 @@ pub fn grade_with_pipeline(
                 planned_release_drops: s.planned_release_drops,
                 known_key_bound: s.known_key_bound,
                 detail_tail_stripped: s.detail_tail_stripped,
+                alternative_details_attached: s.alternative_details_attached,
+                alternative_details_ambiguous: s.alternative_details_ambiguous,
+                alternative_details_skipped_existing: s.alternative_details_skipped_existing,
                 key_form_bound: s.key_form_bound,
                 resolve: s.resolve.clone(),
                 retirements: s.retirements.clone(),
@@ -2162,6 +2183,9 @@ mod tests {
             planned_release_drops: 0,
             known_key_bound: 0,
             detail_tail_stripped: 0,
+            alternative_details_attached: 0,
+            alternative_details_ambiguous: 0,
+            alternative_details_skipped_existing: 0,
             key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
@@ -2195,6 +2219,9 @@ mod tests {
             planned_release_drops: session.planned_release_drops,
             known_key_bound: session.known_key_bound,
             detail_tail_stripped: session.detail_tail_stripped,
+            alternative_details_attached: session.alternative_details_attached,
+            alternative_details_ambiguous: session.alternative_details_ambiguous,
+            alternative_details_skipped_existing: session.alternative_details_skipped_existing,
             key_form_bound: session.key_form_bound,
             resolve: session.resolve.clone(),
             retirements: session.retirements.clone(),

@@ -192,6 +192,9 @@ pub struct Relationship {
     #[serde(default)]
     pub last_reinforced: Option<serde_json::Value>,
     pub source: Option<String>,
+    /// Free text on a `uses` edge. Absent when the edge was written without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 impl Relationship {
@@ -1296,6 +1299,18 @@ pub struct IngestionReport {
     /// when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub detail_tail_stripped: u32,
+    /// Decided `uses` edges that stored an alternative-detail string.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub alternative_details_attached: u32,
+    /// Donors that matched more than one decided `uses` edge.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub alternative_details_ambiguous: u32,
+    /// Details dropped because the edge already existed or a guard skipped the create.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub alternative_details_skipped_existing: u32,
     /// Candidates kept because a listed key-token form bound the key and no
     /// earlier key-binding rule did. Omitted when zero, including when the
     /// switch is off.
@@ -1559,6 +1574,28 @@ mod tests {
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["detail_tail_stripped"], 1);
         assert_eq!(encoded["key_form_bound"], 2);
+        assert!(
+            blank.get("alternative_details_attached").is_none(),
+            "{blank}"
+        );
+        assert!(
+            blank.get("alternative_details_ambiguous").is_none(),
+            "{blank}"
+        );
+        assert!(
+            blank.get("alternative_details_skipped_existing").is_none(),
+            "{blank}"
+        );
+        let counted = IngestionReport {
+            alternative_details_attached: 1,
+            alternative_details_ambiguous: 2,
+            alternative_details_skipped_existing: 3,
+            ..IngestionReport::default()
+        };
+        let encoded = serde_json::to_value(&counted).unwrap();
+        assert_eq!(encoded["alternative_details_attached"], 1);
+        assert_eq!(encoded["alternative_details_ambiguous"], 2);
+        assert_eq!(encoded["alternative_details_skipped_existing"], 3);
     }
 
     #[test]

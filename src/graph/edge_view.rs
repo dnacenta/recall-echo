@@ -63,7 +63,7 @@ impl EdgeView {
         Self {
             id: relationship.id_string(),
             from,
-            to,
+            to: named_with_details(&to, relationship.details.as_deref()),
             rel_type: relationship.rel_type.clone(),
             description: relationship.description.clone(),
             confidence: relationship.confidence,
@@ -71,6 +71,15 @@ impl EdgeView {
             self_reinforcements: relationship.self_reinforcements.unwrap_or(0).max(0),
             superseded: relationship.valid_until.is_some(),
         }
+    }
+}
+
+/// `<name> (<details>)` when details are stored, otherwise `name`.
+#[must_use]
+pub(crate) fn named_with_details(name: &str, details: Option<&str>) -> String {
+    match details {
+        Some(details) if !details.is_empty() => format!("{name} ({details})"),
+        _ => name.to_string(),
     }
 }
 
@@ -210,6 +219,7 @@ mod tests {
             self_reinforcements,
             last_reinforced: None,
             source: Some("archive-log-007".into()),
+            details: None,
         }
     }
 
