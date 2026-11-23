@@ -979,6 +979,14 @@ pub struct ConsolidateReport {
     /// None of those tools close. Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_takeover_ambiguous: Option<u32>,
+    /// Component rows closed because they still carry a replaced project value.
+    /// Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_old_value_closes: Option<u32>,
+    /// Replaced project values with more than three component copies.
+    /// None of those copies close. Absent when unset, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_old_value_overflow: Option<u32>,
     /// Rules closed because they still name a setting value that changed.
     /// Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1193,6 +1201,8 @@ impl ConsolidateReport {
             self.component_retire_ambiguous,
             self.component_takeover_closes,
             self.component_takeover_ambiguous,
+            self.component_old_value_closes,
+            self.component_old_value_overflow,
             self.retire_reason_closes,
             self.retire_reason_ambiguous,
             self.cross_key_replaces_closes,
@@ -1807,6 +1817,32 @@ mod tests {
         let zeros = ConsolidateReport {
             component_takeover_closes: Some(0),
             component_takeover_ambiguous: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+    }
+
+    #[test]
+    fn component_old_value_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("component_old_value_closes").is_none());
+        assert!(encoded.get("component_old_value_overflow").is_none());
+        let closed = ConsolidateReport {
+            component_old_value_closes: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["component_old_value_closes"], 1);
+        assert!(encoded.get("component_old_value_overflow").is_none());
+        let overflow = ConsolidateReport {
+            component_old_value_overflow: Some(2),
+            ..ConsolidateReport::default()
+        };
+        assert!(!overflow.is_blank());
+        let zeros = ConsolidateReport {
+            component_old_value_closes: Some(0),
+            component_old_value_overflow: Some(0),
             ..ConsolidateReport::default()
         };
         assert!(zeros.is_blank());

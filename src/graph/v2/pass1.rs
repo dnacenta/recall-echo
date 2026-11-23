@@ -380,6 +380,7 @@ pub(crate) async fn extract_session(
         write_ctx.rule_fragments_on = rule_fragments_enabled(memory_dir);
         write_ctx.retire_component_on = retire_component_enabled(memory_dir);
         write_ctx.component_takeover_on = component_takeover_enabled(memory_dir);
+        write_ctx.component_old_value_on = component_old_value_enabled(memory_dir);
         write_ctx.retire_reason_on = retire_reason_enabled(memory_dir);
         write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
@@ -442,6 +443,7 @@ pub(crate) async fn extract_session(
         write_ctx.rule_fragments_on = rule_fragments_enabled(memory_dir);
         write_ctx.retire_component_on = retire_component_enabled(memory_dir);
         write_ctx.component_takeover_on = component_takeover_enabled(memory_dir);
+        write_ctx.component_old_value_on = component_old_value_enabled(memory_dir);
         write_ctx.retire_reason_on = retire_reason_enabled(memory_dir);
         write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
@@ -608,6 +610,13 @@ fn component_takeover_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .component_takeover_apply()
+}
+
+fn component_old_value_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .component_old_value_apply()
 }
 
 fn retire_reason_enabled(memory_dir: &Path) -> bool {

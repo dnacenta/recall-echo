@@ -299,6 +299,9 @@ pub struct OptOuts {
     /// False leaves the key out. Unlike the fields above, this is an opt-in:
     /// [`Self::stack_off`] leaves it false so an opt-out run does not write it.
     pub consolidate_component_takeover: bool,
+    /// Write `consolidate_component_old_value = true` and imply `consolidate`.
+    /// False leaves the key out. An opt-out run does not write it.
+    pub consolidate_component_old_value: bool,
     /// Write `consolidate_retire_reason = true` and imply `consolidate`.
     /// False leaves the key out. An opt-out run does not write it.
     pub consolidate_retire_reason: bool,
@@ -345,6 +348,7 @@ impl OptOuts {
             consolidate_rule_fragments: true,
             consolidate_retire_component: true,
             consolidate_component_takeover: false,
+            consolidate_component_old_value: false,
             consolidate_retire_reason: false,
             slot_forget: false,
             extract_value_details: false,
@@ -805,22 +809,25 @@ fn switch_lines(
         &mut lines,
         with_rule_replaces(
             with_cross_key_replaces(
-                with_component_takeover(
-                    with_retire_reason(
-                        writes_consolidate(
-                            consolidate,
-                            consolidate_links,
-                            consolidate_components,
-                            consolidate_key_rename,
-                            consolidate_replaces_cue,
-                            consolidate_replaces_departure,
-                            consolidate_orphan_sweep,
-                            consolidate_rule_fragments,
-                            consolidate_retire_component,
+                with_component_old_value(
+                    with_component_takeover(
+                        with_retire_reason(
+                            writes_consolidate(
+                                consolidate,
+                                consolidate_links,
+                                consolidate_components,
+                                consolidate_key_rename,
+                                consolidate_replaces_cue,
+                                consolidate_replaces_departure,
+                                consolidate_orphan_sweep,
+                                consolidate_rule_fragments,
+                                consolidate_retire_component,
+                            ),
+                            opt_outs.consolidate_retire_reason,
                         ),
-                        opt_outs.consolidate_retire_reason,
+                        opt_outs.consolidate_component_takeover,
                     ),
-                    opt_outs.consolidate_component_takeover,
+                    opt_outs.consolidate_component_old_value,
                 ),
                 opt_outs.consolidate_cross_key_replaces,
             ),
@@ -931,6 +938,11 @@ fn switch_lines(
     );
     push_line(
         &mut lines,
+        opt_outs.consolidate_component_old_value,
+        "consolidate_component_old_value = true",
+    );
+    push_line(
+        &mut lines,
         opt_outs.consolidate_retire_reason,
         "consolidate_retire_reason = true",
     );
@@ -970,6 +982,10 @@ fn switch_lines(
 
 fn with_component_takeover(consolidate: bool, takeover: bool) -> bool {
     consolidate || takeover
+}
+
+fn with_component_old_value(consolidate: bool, old_value: bool) -> bool {
+    consolidate || old_value
 }
 
 fn with_retire_reason(consolidate: bool, retire_reason: bool) -> bool {
@@ -3740,6 +3756,81 @@ mod tests {
         let graph = loaded.graph.expect("graph");
         assert!(graph.component_takeover_apply());
         assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn consolidate_component_old_value_implies_consolidate_and_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_component_old_value: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("consolidate = true\n"), "{text}");
+        assert!(
+            text.contains("consolidate_component_old_value = true\n"),
+            "{text}"
+        );
+        assert!(!text.contains("consolidate_component_takeover"), "{text}");
+        assert!(!text.contains("consolidate_retire_component"), "{text}");
+        assert!(!text.contains("ground_component_edges"), "{text}");
+        assert!(!text.contains("known_facts_context"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.component_old_value_apply());
+        assert!(graph.consolidate);
+
+        let off = tempfile::tempdir().unwrap();
+        let off_memory = off.path().join("memory");
+        fs::create_dir_all(&off_memory).unwrap();
+        apply_graph_switches(
+            &off_memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts::stack_off(),
+        )
+        .unwrap();
+        let off_text = fs::read_to_string(crate::config::config_path(&off_memory)).unwrap();
+        assert!(
+            !off_text.contains("consolidate_component_old_value"),
+            "{off_text}"
+        );
     }
 
     #[test]
