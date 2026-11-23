@@ -361,6 +361,10 @@ enum BenchCommands {
         /// Off unless set. Implies nothing.
         #[arg(long)]
         drop_generic_uses: bool,
+        /// Write `alternative_details = true` for this run only.
+        /// Off unless set. Implies nothing.
+        #[arg(long)]
+        alternative_details: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1212,6 +1216,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             consolidate_rule_replaces,
             known_long_values,
             drop_generic_uses,
+            alternative_details,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1336,6 +1341,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_cross_key_replaces,
                 consolidate_rule_replaces,
                 known_long_values,
+                alternative_details,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2898,6 +2904,53 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn alternative_details_is_its_own_bench_flag() {
+        let only = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--alternative-details",
+        ])
+        .expect("parse alternative details");
+        match only.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        alternative_details,
+                        extract_value_details,
+                        recover_turns,
+                        known_facts_context,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(alternative_details);
+                assert!(!extract_value_details);
+                assert!(!consolidate);
+                assert!(!recover_turns);
+                assert!(!known_facts_context);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--alternative-details"), "{help}");
+        assert!(!help.contains("--no-alternative-details"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn extract_key_forms_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -3272,6 +3325,7 @@ mod tests {
             consolidate_rule_replaces: false,
             known_long_values: false,
             drop_generic_uses: false,
+            alternative_details: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],

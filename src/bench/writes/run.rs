@@ -323,6 +323,9 @@ pub struct OptOuts {
     /// Write `known_long_values = true`. False leaves the key out.
     /// Implies nothing. An opt-out run does not write it.
     pub known_long_values: bool,
+    /// Write `alternative_details = true`. False leaves the key out.
+    /// Implies nothing.
+    pub alternative_details: bool,
 }
 
 impl OptOuts {
@@ -353,6 +356,7 @@ impl OptOuts {
             consolidate_cross_key_replaces: false,
             consolidate_rule_replaces: false,
             known_long_values: false,
+            alternative_details: false,
         }
     }
 }
@@ -483,6 +487,9 @@ async fn collect_sessions(
             planned_release_drops: report.planned_release_drops,
             known_key_bound: report.known_key_bound,
             detail_tail_stripped: report.detail_tail_stripped,
+            alternative_details_attached: report.alternative_details_attached,
+            alternative_details_ambiguous: report.alternative_details_ambiguous,
+            alternative_details_skipped_existing: report.alternative_details_skipped_existing,
             key_form_bound: report.key_form_bound,
             resolve: report.resolve,
             retirements: report.retirements,
@@ -560,6 +567,9 @@ async fn ingest_v2(
     report.planned_release_drops = extracted.planned_release_drops;
     report.known_key_bound = extracted.known_key_bound;
     report.detail_tail_stripped = extracted.detail_tail_stripped;
+    report.alternative_details_attached = extracted.alternative_details_attached;
+    report.alternative_details_ambiguous = extracted.alternative_details_ambiguous;
+    report.alternative_details_skipped_existing = extracted.alternative_details_skipped_existing;
     report.key_form_bound = extracted.key_form_bound;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
@@ -961,6 +971,11 @@ fn switch_lines(
         &mut lines,
         opt_outs.known_long_values,
         "known_long_values = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.alternative_details,
+        "alternative_details = true",
     );
     lines
 }
@@ -1364,7 +1379,10 @@ async fn snapshot(
             id,
             subject: names.name_of(gm.db(), &from_id).await?,
             relation: relationship.rel_type.clone(),
-            object: names.name_of(gm.db(), &to_id).await?,
+            object: crate::graph::edge_view::named_with_details(
+                &names.name_of(gm.db(), &to_id).await?,
+                relationship.details.as_deref(),
+            ),
             live,
             alpha: evidence.alpha(),
             beta,
@@ -1489,7 +1507,10 @@ async fn relationship_status_row(
         id: id.clone(),
         subject: names.name_of(gm.db(), &from_id).await?,
         relation: relationship.rel_type.clone(),
-        object: names.name_of(gm.db(), &to_id).await?,
+        object: crate::graph::edge_view::named_with_details(
+            &names.name_of(gm.db(), &to_id).await?,
+            relationship.details.as_deref(),
+        ),
         live: relation_live(relationship.valid_until.is_none(), pending_row, status),
         status: status.map(str::to_string),
         pending: pending_row,
@@ -3978,6 +3999,46 @@ mod tests {
     }
 
     #[test]
+    fn alternative_details_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                alternative_details: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nalternative_details = true\n");
+        assert!(!text.contains("extract_value_details"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.alternative_details);
+        assert!(!graph.extract_value_details);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
     fn consolidate_cross_key_replaces_implies_consolidate_and_writes_only_its_key() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
@@ -6453,6 +6514,9 @@ mod tests {
             planned_release_drops: 0,
             known_key_bound: 0,
             detail_tail_stripped: 0,
+            alternative_details_attached: 0,
+            alternative_details_ambiguous: 0,
+            alternative_details_skipped_existing: 0,
             key_form_bound: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),

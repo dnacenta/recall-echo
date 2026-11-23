@@ -377,6 +377,17 @@ pub(crate) async fn define_derived_from(db: &Surreal<Db>) -> Result<(), GraphErr
     Ok(())
 }
 
+/// Optional text on a `uses` edge.
+///
+/// Callers run this only when a write is about to store details. An off store
+/// never gains the field, and there is no version bump or backfill.
+pub(crate) async fn define_edge_details(db: &Surreal<Db>) -> Result<(), GraphError> {
+    db.query("DEFINE FIELD IF NOT EXISTS details ON relates_to TYPE option<string>")
+        .await?
+        .check()?;
+    Ok(())
+}
+
 /// What one migration pass did. Both counts are zero on an already current
 /// store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

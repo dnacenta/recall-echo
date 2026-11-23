@@ -1023,6 +1023,13 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub drop_generic_uses: bool,
+    /// Attach a related rejected or considered `uses` alternative as details
+    /// on a newly created decided `uses` edge. Off unless set. Stands alone.
+    #[serde(
+        default = "default_alternative_details",
+        skip_serializing_if = "is_false"
+    )]
+    pub alternative_details: bool,
 }
 
 impl Default for GraphSection {
@@ -1065,6 +1072,7 @@ impl Default for GraphSection {
             extract_value_details: default_extract_value_details(),
             extract_key_forms: default_extract_key_forms(),
             drop_generic_uses: default_drop_generic_uses(),
+            alternative_details: default_alternative_details(),
         }
     }
 }
@@ -1583,6 +1591,10 @@ fn default_extract_key_forms() -> bool {
 }
 
 fn default_drop_generic_uses() -> bool {
+    false
+}
+
+fn default_alternative_details() -> bool {
     false
 }
 
@@ -2144,6 +2156,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.extract_value_details", flag_extract_value_details),
     ("graph.extract_key_forms", flag_extract_key_forms),
     ("graph.drop_generic_uses", flag_drop_generic_uses),
+    ("graph.alternative_details", flag_alternative_details),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2269,6 +2282,10 @@ fn flag_extract_key_forms(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_drop_generic_uses(graph: &mut GraphSection) -> &mut bool {
     &mut graph.drop_generic_uses
+}
+
+fn flag_alternative_details(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.alternative_details
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -4830,6 +4847,54 @@ settle_secs = 300
         assert!(cfg.set_key("graph.drop_generic_uses", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").drop_generic_uses);
         assert!(cfg.graph.as_ref().expect("graph").drop_restatements);
+    }
+
+    #[test]
+    fn alternative_details_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_alternative_details());
+        assert!(!GraphSection::default().alternative_details);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().alternative_details);
+        let explicit_false: Config =
+            toml::from_str("[graph]\nalternative_details = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.alternative_details);
+        assert!(!false_graph.extract_value_details);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("alternative_details"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nalternative_details = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.alternative_details);
+        assert!(!true_graph.extract_value_details);
+        assert!(true_graph.consolidate);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("alternative_details = true"));
+        assert!(!rendered_true.contains("extract_value_details"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse");
+        assert!(again.alternative_details);
+        assert!(!again.extract_value_details);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.alternative_details", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.alternative_details);
+        assert!(!graph.extract_value_details);
+        let rendered = toml::to_string_pretty(&cfg).expect("render set");
+        assert!(rendered.contains("alternative_details = true"));
+        assert!(!rendered.contains("extract_value_details"));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse set");
+        assert!(parsed.graph.expect("graph").alternative_details);
+
+        cfg.set_key("graph.alternative_details", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").alternative_details);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("alternative_details"));
+        cfg.set_key("graph.alternative_details", "true").unwrap();
+        assert!(cfg.set_key("graph.alternative_details", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").alternative_details);
     }
 
     #[test]

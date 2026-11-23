@@ -654,6 +654,7 @@ fn text_field(key: &str) -> bool {
             | "name"
             | "from"
             | "to"
+            | "details"
     )
 }
 

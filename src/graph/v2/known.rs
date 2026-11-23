@@ -1856,6 +1856,32 @@ mod tests {
                 assert!(notes.borrow().is_empty());
             });
         }
+
+        #[tokio::test]
+        async fn known_facts_block_is_unchanged_when_details_exist() {
+            let (_tmp, gm) = open().await;
+            crate::graph::store::define_edge_details(gm.db())
+                .await
+                .unwrap();
+            let acme = make(&gm, "acme", Kind::Project, Vec::new()).await;
+            let tool = make(&gm, "stdparser", Kind::Technology, Vec::new()).await;
+            link(&gm, &acme, &tool, "uses", Some("library"), "decided", true).await;
+            gm.db()
+                .query("UPDATE relates_to SET details = $details WHERE rel_type = 'uses'")
+                .bind(("details", "rejected: htmlkit".to_string()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            let block = render_known(
+                &known_rows(&gm, &project("acme"), "acme uses a parser")
+                    .await
+                    .unwrap(),
+            );
+            assert!(block.contains("- acme uses stdparser (library)"), "{block}");
+            assert!(!block.contains("htmlkit"), "{block}");
+            assert!(!block.contains("rejected:"), "{block}");
+        }
     }
 
     fn wide_row(value: &str) -> KnownRow {
