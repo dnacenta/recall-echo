@@ -5200,6 +5200,7 @@ struct PostSnap {
     fragments: Option<FragmentSnap>,
     retire: Option<RetireSnap>,
     takeover: Option<TakeoverSnap>,
+    old_value: Option<RetireSnap>,
     reason: Option<ReasonSnap>,
     rules: Option<ReplacesSnap>,
 }
@@ -5279,6 +5280,7 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
             fragments: None,
             retire: None,
             takeover: None,
+            old_value: None,
             reason: None,
             rules: None,
         });
@@ -5302,6 +5304,7 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
         None
     };
     let takeover = maybe_takeover(gm, ctx, &rows).await?;
+    let old_value = maybe_old_value(gm, ctx, &rows).await?;
     let reason = maybe_reason(ctx, &rows);
     let rules = maybe_rules(ctx, &rows);
     Ok(PostSnap {
@@ -5309,9 +5312,21 @@ async fn read_post_snapshot(gm: &GraphMemory, ctx: &WriteCtx<'_>) -> Result<Post
         fragments,
         retire,
         takeover,
+        old_value,
         reason,
         rules,
     })
+}
+
+async fn maybe_old_value(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    rows: &[Value],
+) -> Result<Option<RetireSnap>, GraphError> {
+    if !ctx.component_old_value_on {
+        return Ok(None);
+    }
+    Ok(Some(retire_snap(gm, ctx, rows).await?))
 }
 
 async fn maybe_takeover(
@@ -5348,6 +5363,10 @@ async fn apply_post(
     if let Some(takeover) = &snap.takeover {
         let plan = plan_takeover(ctx, takeover);
         apply_takeover(gm, ctx, &plan, report).await;
+    }
+    if let Some(old_value) = &snap.old_value {
+        let plan = plan_old_value(ctx, old_value);
+        apply_old_value(gm, ctx, &plan, report).await;
     }
     if let Some(reason) = &snap.reason {
         let plan = plan_retire_reason(ctx, reason);
@@ -7345,6 +7364,340 @@ fn takeover_ambiguous_line(note: &TakeoverAmbiguous) -> String {
         quote_head(&note.component),
         quote_head(&note.new_tool),
         note.count
+    )
+}
+
+const OLD_VALUE_CAP: usize = 3;
+const OLD_VALUE_REASON: &str = "component_old_value";
+
+struct OldValueOverflow {
+    project: String,
+    key: String,
+    count: usize,
+}
+
+struct OldValuePlan {
+    slots: Vec<SweepClose>,
+    edges: Vec<RetireEdge>,
+    overflows: Vec<OldValueOverflow>,
+}
+
+struct OldValueSeen {
+    slots: BTreeSet<(String, usize)>,
+    edges: BTreeSet<String>,
+}
+
+fn plan_old_value(ctx: &WriteCtx<'_>, snap: &RetireSnap) -> OldValuePlan {
+    let mut plan = OldValuePlan {
+        slots: Vec::new(),
+        edges: Vec::new(),
+        overflows: Vec::new(),
+    };
+    let Some(project) = project_entity(snap) else {
+        return plan;
+    };
+    let mut seen = OldValueSeen {
+        slots: BTreeSet::new(),
+        edges: BTreeSet::new(),
+    };
+    for slot in &project.slots {
+        push_old_value(&mut plan, snap, project, slot, ctx.session_id, &mut seen);
+    }
+    sort_old_value(&mut plan);
+    plan
+}
+
+fn push_old_value(
+    plan: &mut OldValuePlan,
+    snap: &RetireSnap,
+    project: &RetireEntity,
+    slot: &RetireSlot,
+    session: &str,
+    seen: &mut OldValueSeen,
+) {
+    if !retire_trigger(slot, session) {
+        return;
+    }
+    let successors = old_value_successors(project, slot);
+    if successors.is_empty() {
+        return;
+    }
+    let successor_words = successor_word_set(&successors);
+    let mut slots = Vec::new();
+    let mut edges = Vec::new();
+    for entity in &snap.entities {
+        if !linked(entity, snap) {
+            continue;
+        }
+        let words = old_words(&slot.value, &successors, &entity.name, &project.name);
+        if words.is_empty() {
+            continue;
+        }
+        let trigger = OldValueTrigger {
+            session,
+            key: &slot.key,
+            value: &slot.value,
+            words: &words,
+            successor_words: &successor_words,
+        };
+        push_component_old_value(&mut slots, &mut edges, entity, snap, &trigger);
+    }
+    let count = slots.len().saturating_add(edges.len());
+    if count > OLD_VALUE_CAP {
+        plan.overflows.push(OldValueOverflow {
+            project: project.name.clone(),
+            key: slot.key.clone(),
+            count,
+        });
+        return;
+    }
+    keep_new_slots(&mut plan.slots, slots, seen);
+    keep_new_edges(&mut plan.edges, edges, seen);
+}
+
+fn old_value_successors<'a>(project: &'a RetireEntity, trigger: &RetireSlot) -> Vec<&'a str> {
+    project
+        .slots
+        .iter()
+        .filter(|slot| old_value_successor(slot, trigger))
+        .map(|slot| slot.value.as_str())
+        .collect()
+}
+
+fn old_value_successor(slot: &RetireSlot, trigger: &RetireSlot) -> bool {
+    open_successor(slot, trigger) && !values_equal(&slot.value, &trigger.value)
+}
+
+fn successor_word_set(successors: &[&str]) -> BTreeSet<String> {
+    successors.iter().flat_map(|value| tokens(value)).collect()
+}
+
+fn old_words(value: &str, successors: &[&str], component: &str, project: &str) -> BTreeSet<String> {
+    let mut words: BTreeSet<String> = tokens(value).into_iter().collect();
+    for successor in successors {
+        for token in tokens(successor) {
+            words.remove(&token);
+        }
+    }
+    for token in tokens(component).into_iter().chain(tokens(project)) {
+        words.remove(&token);
+    }
+    words.retain(|token| !is_generic_key(token));
+    words
+}
+
+struct OldValueTrigger<'a> {
+    session: &'a str,
+    key: &'a str,
+    value: &'a str,
+    words: &'a BTreeSet<String>,
+    successor_words: &'a BTreeSet<String>,
+}
+
+fn push_component_old_value(
+    slots: &mut Vec<SweepClose>,
+    edges: &mut Vec<RetireEdge>,
+    entity: &RetireEntity,
+    snap: &RetireSnap,
+    trigger: &OldValueTrigger<'_>,
+) {
+    for slot in &entity.slots {
+        if old_value_setting(slot, trigger) {
+            slots.push(retire_sweep(entity, slot));
+        }
+    }
+    for edge in &snap.uses {
+        if old_value_use(edge, &entity.id, trigger, snap) {
+            edges.push(RetireEdge {
+                id: edge.id.clone(),
+                subject: entity.name.clone(),
+                object: edge.object.clone(),
+            });
+        }
+    }
+}
+
+fn old_value_setting(slot: &RetireSlot, trigger: &OldValueTrigger<'_>) -> bool {
+    slot.predicate == "setting"
+        && open_decided(slot)
+        && earlier_session(&slot.first_session, trigger.session)
+        && shared_old_value_key(&slot.key, trigger.key)
+        && token_in(&slot.value, trigger.words)
+        && !token_in(&slot.value, trigger.successor_words)
+}
+
+fn shared_old_value_key(slot_key: &str, trigger_key: &str) -> bool {
+    let trigger_tokens = key_tokens(trigger_key);
+    let slot_tokens = key_tokens(slot_key);
+    slot_tokens.iter().any(|slot| {
+        !old_value_key_stop(slot)
+            && trigger_tokens
+                .iter()
+                .any(|trigger| trigger == slot && !old_value_key_stop(trigger))
+    })
+}
+
+fn old_value_key_stop(token: &str) -> bool {
+    matches!(
+        token,
+        "path"
+            | "dir"
+            | "file"
+            | "format"
+            | "mode"
+            | "type"
+            | "name"
+            | "kind"
+            | "url"
+            | "size"
+            | "version"
+    )
+}
+
+fn token_in(value: &str, words: &BTreeSet<String>) -> bool {
+    tokens(value).iter().any(|token| words.contains(token))
+}
+
+fn old_value_use(
+    edge: &UseLink,
+    entity_id: &str,
+    trigger: &OldValueTrigger<'_>,
+    snap: &RetireSnap,
+) -> bool {
+    edge.from_id == entity_id
+        && edge.status == "decided"
+        && !edge.pending
+        && earlier_session(&edge.first_session, trigger.session)
+        && (old_word_object(&edge.object, trigger.words)
+            || values_equal(&edge.object, trigger.value))
+        && !project_uses_object(snap, &edge.object)
+}
+
+fn old_word_object(object: &str, words: &BTreeSet<String>) -> bool {
+    words.contains(normalise(object).as_str())
+}
+
+fn project_uses_object(snap: &RetireSnap, object: &str) -> bool {
+    let Some(project) = snap.project_id.as_deref() else {
+        return false;
+    };
+    snap.uses.iter().any(|edge| {
+        edge.from_id == project
+            && edge.status == "decided"
+            && !edge.pending
+            && values_equal(&edge.object, object)
+    })
+}
+
+fn keep_new_slots(plan: &mut Vec<SweepClose>, slots: Vec<SweepClose>, seen: &mut OldValueSeen) {
+    for close in slots {
+        let key = (close.entity_id.clone(), close.index);
+        if seen.slots.insert(key) {
+            plan.push(close);
+        }
+    }
+}
+
+fn keep_new_edges(plan: &mut Vec<RetireEdge>, edges: Vec<RetireEdge>, seen: &mut OldValueSeen) {
+    for edge in edges {
+        if seen.edges.insert(edge.id.clone()) {
+            plan.push(edge);
+        }
+    }
+}
+
+fn sort_old_value(plan: &mut OldValuePlan) {
+    plan.slots.sort_by(|left, right| {
+        left.entity_id
+            .cmp(&right.entity_id)
+            .then(left.index.cmp(&right.index))
+    });
+    plan.edges.sort_by(|left, right| left.id.cmp(&right.id));
+}
+
+async fn apply_old_value(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    plan: &OldValuePlan,
+    report: &mut IngestionReport,
+) {
+    note_old_value_overflows(&plan.overflows, report);
+    for close in &plan.slots {
+        let line = old_value_slot_line(&close.subject, &close.key, close.index);
+        if close_sweep_slot(gm, ctx, close, OLD_VALUE_REASON, &line, report).await {
+            add_count(&mut report.consolidate.component_old_value_closes);
+        }
+    }
+    for edge in &plan.edges {
+        if close_old_value_edge(gm, ctx, edge, report).await {
+            add_count(&mut report.consolidate.component_old_value_closes);
+        }
+    }
+}
+
+fn note_old_value_overflows(overflows: &[OldValueOverflow], report: &mut IngestionReport) {
+    for overflow in overflows {
+        add_count(&mut report.consolidate.component_old_value_overflow);
+        emit_post_line(old_value_overflow_line(
+            &overflow.project,
+            &overflow.key,
+            overflow.count,
+        ));
+    }
+}
+
+async fn close_old_value_edge(
+    gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
+    edge: &RetireEdge,
+    report: &mut IngestionReport,
+) -> bool {
+    let Some(until) = session_midnight(ctx.date) else {
+        return false;
+    };
+    let ended = format!("{}:{OLD_VALUE_REASON}", ctx.session_id);
+    match close_row(gm, &retire_edge_row(edge), &until, &ended).await {
+        Ok(true) => {
+            report.retirements.push(old_value_edge_retirement(edge));
+            emit_post_line(old_value_edge_line(&edge.subject));
+            true
+        }
+        Ok(false) => false,
+        Err(_) => {
+            report.consolidate.errors += 1;
+            false
+        }
+    }
+}
+
+fn old_value_edge_retirement(edge: &RetireEdge) -> Retirement {
+    Retirement {
+        reason: OLD_VALUE_REASON.to_string(),
+        subject: edge.subject.clone(),
+        predicate: "uses".into(),
+        key: String::new(),
+        old_value: edge.object.clone(),
+        new_value: String::new(),
+    }
+}
+
+fn old_value_slot_line(subject: &str, key: &str, index: usize) -> String {
+    format!(
+        "consolidate old value: {}:{} | slot {index}",
+        quote_head(subject),
+        quote_head(key)
+    )
+}
+
+fn old_value_edge_line(subject: &str) -> String {
+    format!("consolidate old value: {}:uses | edge", quote_head(subject))
+}
+
+fn old_value_overflow_line(project: &str, key: &str, count: usize) -> String {
+    format!(
+        "consolidate old value overflow: {}:{} | {count} targets",
+        quote_head(project),
+        quote_head(key)
     )
 }
 
@@ -23497,6 +23850,327 @@ mod tests {
                 assert!(encoded.get("rule_replaces_closes").is_none());
             }
         }
+    }
+
+    async fn finish_old_value(
+        gm: &GraphMemory,
+        on: bool,
+        orphan: bool,
+        fragments: bool,
+        retire: bool,
+    ) -> (IngestionReport, Vec<String>, u32) {
+        super::begin_post_lines();
+        super::reset_post_reads();
+        let project = app_project(&[]);
+        let turns = [turn("session")];
+        let stub = Stub::new(Answer::Panic);
+        let mut ctx = WriteCtx::new(&stub, &project, "s3", "2026-04-03", &turns);
+        ctx.component_old_value_on = on;
+        ctx.orphan_sweep_on = orphan;
+        ctx.rule_fragments_on = fragments;
+        ctx.retire_component_on = retire;
+        let mut report = IngestionReport::default();
+        run(gm, &ctx, &[], &WriteStats::default(), &stub, &mut report).await;
+        (report, super::take_post_lines(), super::post_reads())
+    }
+
+    async fn find_use(gm: &GraphMemory, subject: &str, object: &str) -> Value {
+        let id = entity_id(gm, subject).await;
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT ended_by, out.name AS object FROM relates_to \
+                 WHERE rel_type = 'uses' AND in = type::record($id)",
+            )
+            .bind(("id", id))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        rows.into_iter()
+            .find(|row| row["object"] == object)
+            .unwrap_or_else(|| panic!("missing use {subject} -> {object}"))
+    }
+
+    fn use_ended_by(row: &Value) -> Option<&str> {
+        row.get("ended_by").and_then(Value::as_str)
+    }
+
+    fn storage_path() -> Fact {
+        setting_of(
+            "store",
+            "storage_path",
+            "~/.local/share/app/data.json",
+            "decided",
+        )
+    }
+
+    fn json_use(subject: &str, kind: Kind) -> Fact {
+        use_of(subject, kind, "JSON", "decided")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_closes_component_copies_of_a_replaced_project_setting() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                part_link("store", "app", Kind::Project),
+                storage_path(),
+                setting_of("store", "added_at", "utc now", "decided"),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        let store = slots(&gm, "store").await;
+        let path_index = store
+            .iter()
+            .position(|slot| slot["key"] == "storage_path")
+            .expect("storage_path");
+        assert_eq!(
+            ended_key(&store, "storage_path"),
+            Some("s3:component_old_value")
+        );
+        assert!(ended_key(&store, "added_at").is_none());
+        assert_eq!(
+            use_ended_by(&find_use(&gm, "store", "JSON").await),
+            Some("s3:component_old_value")
+        );
+        assert_eq!(report.consolidate.component_old_value_closes, Some(2));
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert_eq!(
+            lines,
+            vec![
+                format!("consolidate old value: store:storage_path | slot {path_index}"),
+                "consolidate old value: store:uses | edge".to_string(),
+            ]
+        );
+        assert_eq!(report.retirements.len(), 2);
+        assert!(report
+            .retirements
+            .iter()
+            .all(|item| item.reason == "component_old_value"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_needs_a_shared_key_word() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("code_highlighting", "build time", "decided"),
+                part_link("search", "app", Kind::Project),
+                setting_of("search", "index", "JSON written by the build", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("code_highlighting", "browser", "decided")],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        assert!(ended_key(&slots(&gm, "search").await, "index").is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_keeps_a_use_the_project_still_has() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                json_use("app", Kind::Project),
+                part_link("store", "app", Kind::Project),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        assert!(use_ended_by(&find_use(&gm, "store", "JSON").await).is_none());
+        assert!(use_ended_by(&find_use(&gm, "app", "JSON").await).is_none());
+        let store = slots(&gm, "store").await;
+        assert_eq!(
+            ended_key(&store, "storage_path"),
+            Some("s3:component_old_value")
+        );
+        assert_eq!(report.consolidate.component_old_value_closes, Some(1));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("consolidate old value: store:storage_path | slot "));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_skips_unlinked_and_same_session_rows() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                setting_of(
+                    "loose",
+                    "storage_path",
+                    "~/.local/share/app/data.json",
+                    "decided",
+                ),
+                json_use("loose", Kind::Component),
+                part_link("store", "app", Kind::Project),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[
+                project_setting("storage", "SQLite", "decided"),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        assert!(ended_key(&slots(&gm, "loose").await, "storage_path").is_none());
+        assert!(use_ended_by(&find_use(&gm, "loose", "JSON").await).is_none());
+        assert!(ended_key(&slots(&gm, "store").await, "storage_path").is_none());
+        assert!(use_ended_by(&find_use(&gm, "store", "JSON").await).is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_word_in_successor_is_not_distinctive() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON", "decided"),
+                part_link("store", "app", Kind::Project),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "JSON lines", "decided")],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        assert!(ended_key(&slots(&gm, "store").await, "storage_path").is_none());
+        assert!(use_ended_by(&find_use(&gm, "store", "JSON").await).is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_overflow_closes_nothing() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                part_link("store", "app", Kind::Project),
+                setting_of("store", "storage_one", "JSON archive", "decided"),
+                setting_of("store", "storage_two", "JSON archive", "decided"),
+                setting_of("store", "storage_three", "JSON archive", "decided"),
+                setting_of("store", "storage_four", "JSON archive", "decided"),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        let (report, lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        let store = slots(&gm, "store").await;
+        for key in [
+            "storage_one",
+            "storage_two",
+            "storage_three",
+            "storage_four",
+        ] {
+            assert!(ended_key(&store, key).is_none(), "{key}");
+        }
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert_eq!(report.consolidate.component_old_value_overflow, Some(1));
+        assert_eq!(
+            lines,
+            vec!["consolidate old value overflow: app:storage | 4 targets".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_off_reads_nothing_and_adds_no_key() {
+        let (_tmp, gm) = open().await;
+        commit_app(
+            &gm,
+            "s1",
+            "2026-04-01",
+            &[
+                project_setting("storage", "JSON store", "decided"),
+                part_link("store", "app", Kind::Project),
+                storage_path(),
+                json_use("store", Kind::Component),
+            ],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        let (report, lines, reads) = finish_old_value(&gm, false, true, true, true).await;
+        assert_eq!(reads, 6);
+        assert!(ended_key(&slots(&gm, "store").await, "storage_path").is_none());
+        assert!(use_ended_by(&find_use(&gm, "store", "JSON").await).is_none());
+        assert!(report.consolidate.component_old_value_closes.is_none());
+        assert!(report.consolidate.component_old_value_overflow.is_none());
+        assert!(lines.iter().all(|line| !line.contains("old value")));
+        let encoded = serde_json::to_value(&report.consolidate).unwrap();
+        assert!(encoded.get("component_old_value_closes").is_none());
+        assert!(encoded.get("component_old_value_overflow").is_none());
     }
 }
 
