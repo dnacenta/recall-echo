@@ -66,6 +66,8 @@
 //! One sentence of that assistant turn has to name the key and those numbers,
 //! and no other number. The citation stays on the user turn.
 
+use std::cell::Cell;
+
 use super::input::{Turn, TurnRole};
 use super::schema::{key_is_empty, normalise, over_long, DROP_QUOTE};
 
@@ -111,6 +113,8 @@ pub(crate) struct SessionGround {
     session_numbers: Vec<String>,
     value_details: bool,
     key_forms: bool,
+    value_suffix: bool,
+    value_suffix_supports: Cell<u32>,
 }
 
 struct TurnGround {
@@ -156,6 +160,8 @@ impl SessionGround {
             session_numbers,
             value_details: false,
             key_forms: false,
+            value_suffix: false,
+            value_suffix_supports: Cell::new(0),
         }
     }
 
@@ -186,6 +192,26 @@ impl SessionGround {
     /// Whether key-form binding is on for this session.
     pub(crate) fn key_forms(&self) -> bool {
         self.key_forms
+    }
+
+    /// Turn suffix variants on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    /// The flag reaches value support only. It does not change key binding.
+    #[must_use]
+    pub(crate) fn with_value_suffix(mut self, on: bool) -> Self {
+        self.value_suffix = on;
+        self
+    }
+
+    /// Whether suffix variants are on for this session.
+    pub(crate) fn value_suffix(&self) -> bool {
+        self.value_suffix
+    }
+
+    /// Support checks that missed strictly and passed only through a suffix variant.
+    pub(crate) fn value_suffix_supports(&self) -> u32 {
+        self.value_suffix_supports.get()
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -251,14 +277,15 @@ impl SessionGround {
         let Some(turn) = self.turn(turn) else {
             return false;
         };
-        supported(
+        self.record(supported(
             value,
             &turn.normalised,
             &turn.words,
             &turn.numbers,
             Some(quote),
             shape,
-        )
+            self.value_suffix(),
+        ))
     }
 
     /// Cause, fix and release contents: the cited turn, else the session.
@@ -420,7 +447,7 @@ impl SessionGround {
         };
         content_tokens(replaces)
             .iter()
-            .any(|token| token_in(token, &turn.normalised, &turn.words, &turn.numbers))
+            .any(|token| token_in(token, &turn.normalised, &turn.words, &turn.numbers, false))
     }
 
     fn found(&self, index: usize, quote: &str) -> Option<&TurnGround> {
@@ -450,14 +477,15 @@ impl SessionGround {
     }
 
     fn session_supports(&self, value: &str) -> bool {
-        supported(
+        self.record(supported(
             value,
             &self.session_norm,
             &self.session_words,
             &self.session_numbers,
             None,
             ValueShape::Literal,
-        )
+            self.value_suffix(),
+        ))
     }
 
     /// The cited turn and every turn with a smaller index. Later turns are left out.
@@ -476,14 +504,27 @@ impl SessionGround {
             words.extend(turn.words.iter().cloned());
             numbers.extend(turn.numbers.iter().cloned());
         }
-        supported(
+        self.record(supported(
             value,
             &normalised,
             &words,
             &numbers,
             None,
             ValueShape::Literal,
-        )
+            self.value_suffix(),
+        ))
+    }
+
+    fn record(&self, support: Support) -> bool {
+        match support {
+            Support::Hit => true,
+            Support::Variant => {
+                self.value_suffix_supports
+                    .set(self.value_suffix_supports.get().saturating_add(1));
+                true
+            }
+            Support::Miss => false,
+        }
     }
 
     /// The cited turn states `value` as one run of whole words.
@@ -585,6 +626,12 @@ fn match_separator_at(text: &str, start: usize, pattern: &[char]) -> Option<usiz
     Some(index)
 }
 
+enum Support {
+    Hit,
+    Variant,
+    Miss,
+}
+
 fn supported(
     value: &str,
     normalised: &str,
@@ -592,22 +639,42 @@ fn supported(
     numbers: &[String],
     quote: Option<&str>,
     shape: ValueShape,
-) -> bool {
+    suffix: bool,
+) -> Support {
     if !numbers_ok(value, numbers) {
-        return false;
+        return Support::Miss;
     }
     let tokens = content_tokens(value);
     if tokens.is_empty() {
-        return false;
+        return Support::Miss;
     }
+    if support_tokens(&tokens, normalised, words, numbers, quote, shape, false) {
+        return Support::Hit;
+    }
+    if suffix && support_tokens(&tokens, normalised, words, numbers, quote, shape, true) {
+        Support::Variant
+    } else {
+        Support::Miss
+    }
+}
+
+fn support_tokens(
+    tokens: &[String],
+    normalised: &str,
+    words: &[String],
+    numbers: &[String],
+    quote: Option<&str>,
+    shape: ValueShape,
+    suffix: bool,
+) -> bool {
     if tokens.len() <= 3 {
-        let quoted = quote.is_none_or(|quote| one_in_quote(&tokens, quote));
-        return fraction_met(&tokens, normalised, words, numbers) && quoted;
+        let quoted = quote.is_none_or(|quote| one_in_quote(tokens, quote, suffix));
+        return fraction_met(tokens, normalised, words, numbers, suffix) && quoted;
     }
     // A long entity needs the same half-token support as a long literal.
     match shape {
         ValueShape::Entity | ValueShape::Literal => {
-            fraction_met(&tokens, normalised, words, numbers)
+            fraction_met(tokens, normalised, words, numbers, suffix)
         }
     }
 }
@@ -618,24 +685,43 @@ fn numbers_ok(value: &str, numbers: &[String]) -> bool {
         .all(|number| numbers.iter().any(|have| have == number))
 }
 
-fn fraction_met(tokens: &[String], normalised: &str, words: &[String], numbers: &[String]) -> bool {
+fn fraction_met(
+    tokens: &[String],
+    normalised: &str,
+    words: &[String],
+    numbers: &[String],
+    suffix: bool,
+) -> bool {
     let matched = tokens
         .iter()
-        .filter(|token| token_in(token, normalised, words, numbers))
+        .filter(|token| token_in(token, normalised, words, numbers, suffix))
         .count();
     matched * 2 >= tokens.len()
 }
 
-fn one_in_quote(tokens: &[String], quote: &str) -> bool {
+fn one_in_quote(tokens: &[String], quote: &str, suffix: bool) -> bool {
     let normalised = normalise(quote);
     let words = words_of(&normalised);
     let numbers = numbers_in(quote);
     tokens
         .iter()
-        .any(|token| token_in(token, &normalised, &words, &numbers))
+        .any(|token| token_in(token, &normalised, &words, &numbers, suffix))
 }
 
-fn token_in(token: &str, normalised: &str, words: &[String], numbers: &[String]) -> bool {
+fn token_in(
+    token: &str,
+    normalised: &str,
+    words: &[String],
+    numbers: &[String],
+    suffix: bool,
+) -> bool {
+    if strict_token_in(token, normalised, words, numbers) {
+        return true;
+    }
+    suffix && suffix_variant(token, words)
+}
+
+fn strict_token_in(token: &str, normalised: &str, words: &[String], numbers: &[String]) -> bool {
     let digit = !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit());
     if digit && numbers.iter().any(|number| number == token) {
         return true;
@@ -645,6 +731,39 @@ fn token_in(token: &str, normalised: &str, words: &[String], numbers: &[String])
     } else {
         words.iter().any(|word| word == token)
     }
+}
+
+/// Suffix variants after a strict miss. Numbers and non-ASCII tokens stay exact.
+fn suffix_variant(token: &str, words: &[String]) -> bool {
+    if token.is_empty() || !token.is_ascii() || token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if token.chars().count() <= 3 {
+        let with_s = format!("{token}s");
+        let with_es = format!("{token}es");
+        return words.iter().any(|word| word == &with_s || word == &with_es);
+    }
+    suffix_stems(token)
+        .iter()
+        .any(|stem| stem.chars().count() >= 4 && words.iter().any(|word| word.starts_with(stem)))
+}
+
+fn suffix_stems(token: &str) -> Vec<&str> {
+    let mut stems = Vec::new();
+    if let Some(stem) = token.strip_suffix('s') {
+        if !token.ends_with("ss") {
+            stems.push(stem);
+        }
+    }
+    if let Some(stem) = token.strip_suffix("es") {
+        stems.push(stem);
+    } else if let Some(stem) = token.strip_suffix("ed") {
+        stems.push(stem);
+    }
+    if let Some(stem) = token.strip_suffix("ing") {
+        stems.push(stem);
+    }
+    stems
 }
 
 fn token_occurs(token: &str, texts: &[&str]) -> bool {
@@ -1385,8 +1504,13 @@ mod tests {
         let on = ground(&lines).with_value_details(true).with_key_forms(true);
         assert!(!off.value_details());
         assert!(!off.key_forms());
+        assert!(!off.value_suffix());
         assert!(on.value_details());
         assert!(on.key_forms());
+        assert!(!on.value_suffix());
+        let suffixed = ground(&lines).with_value_suffix(true);
+        assert!(suffixed.value_suffix());
+        assert!(!suffixed.key_forms());
         assert!(off.key_bound("port", "9000", 0, "Port 9000 is chosen."));
         assert!(on.key_bound("port", "9000", 0, "Port 9000 is chosen."));
         assert_eq!(
@@ -2279,5 +2403,106 @@ mod tests {
             widget().credit_field("froze on a large archive", 0, "TimeoutError"),
             FieldCredit::Session
         );
+    }
+
+    fn suffixed(text: &str) -> SessionGround {
+        ground(&[(text, TurnRole::User)]).with_value_suffix(true)
+    }
+
+    #[test]
+    fn a_cut_off_value_is_supported_only_through_suffix_variants() {
+        let text =
+            "size the pool to the number of logical CPUs by default and add `--jobs N` to override";
+        let value = "logical CPU count (--jobs N overrides)";
+        let off = ground(&[(text, TurnRole::User)]);
+        let on = suffixed(text);
+        assert!(!off.supports_value(value, 0, text, ValueShape::Literal));
+        assert_eq!(off.value_suffix_supports(), 0);
+        assert!(on.supports_value(value, 0, text, ValueShape::Literal));
+        assert_eq!(on.value_suffix_supports(), 1);
+    }
+
+    #[test]
+    fn a_short_token_matches_s_and_es_but_not_a_longer_word() {
+        let cpus = suffixed("logical cpus");
+        let plain = ground(&[("logical cpus", TurnRole::User)]);
+        assert!(cpus.supports_value("cpu", 0, "logical cpus", ValueShape::Literal));
+        assert!(!plain.supports_value("cpu", 0, "logical cpus", ValueShape::Literal));
+        assert!(!suffixed("the cpuset").supports_value(
+            "cpu",
+            0,
+            "the cpuset",
+            ValueShape::Literal
+        ));
+    }
+
+    #[test]
+    fn overrides_matches_override_and_overridden() {
+        let quote = "to override the pool";
+        assert!(suffixed(quote).supports_value("overrides", 0, quote, ValueShape::Literal));
+        assert!(!ground(&[(quote, TurnRole::User)]).supports_value(
+            "overrides",
+            0,
+            quote,
+            ValueShape::Literal
+        ));
+        let ridden = "it was overridden";
+        assert!(suffixed(ridden).supports_value("overrides", 0, ridden, ValueShape::Literal));
+    }
+
+    #[test]
+    fn short_tokens_gain_only_s_and_es() {
+        assert!(!token_in("as", "aside", &["aside".into()], &[], true));
+        assert!(!token_in("is", "issue", &["issue".into()], &[], true));
+        assert!(token_in("as", "ass", &["ass".into()], &[], true));
+        assert!(token_in("is", "ises", &["ises".into()], &[], true));
+        assert!(!token_in("as", "ass", &["ass".into()], &[], false));
+        assert!(!suffixed("the oxen").supports_value("ox", 0, "the oxen", ValueShape::Literal));
+        assert!(suffixed("the oxes").supports_value("ox", 0, "the oxes", ValueShape::Literal));
+    }
+
+    #[test]
+    fn a_different_number_still_fails_with_suffix_variants() {
+        let text = "listen on 8080";
+        let off = ground(&[(text, TurnRole::User)]);
+        let on = suffixed(text);
+        assert!(!off.supports_value("8081", 0, text, ValueShape::Literal));
+        assert!(!on.supports_value("8081", 0, text, ValueShape::Literal));
+        assert_eq!(on.value_suffix_supports(), 0);
+    }
+
+    #[test]
+    fn an_ss_ending_is_not_stripped() {
+        let text = "the clasp held";
+        assert!(!ground(&[(text, TurnRole::User)]).supports_value(
+            "class",
+            0,
+            text,
+            ValueShape::Literal
+        ));
+        assert!(!suffixed(text).supports_value("class", 0, text, ValueShape::Literal));
+    }
+
+    #[test]
+    fn a_non_ascii_token_is_unchanged() {
+        let text = "send the resumes today";
+        assert!(!ground(&[(text, TurnRole::User)]).supports_value(
+            "résumé",
+            0,
+            text,
+            ValueShape::Literal
+        ));
+        assert!(!suffixed(text).supports_value("résumé", 0, text, ValueShape::Literal));
+        assert!(!token_in("né", "nes", &["nés".into()], &[], false));
+        assert!(!token_in("né", "nes", &["nés".into()], &[], true));
+    }
+
+    #[test]
+    fn value_suffix_does_not_change_key_binding() {
+        let text = "Coverage is 88%.";
+        let off = ground(&[(text, TurnRole::User)]);
+        let on = suffixed(text);
+        assert!(!off.key_bound("line_length", "88", 0, text));
+        assert!(!on.key_bound("line_length", "88", 0, text));
     }
 }

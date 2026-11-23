@@ -923,6 +923,10 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_departure: Option<u32>,
+    /// Closes whose rule match held only through a cut-off prefix.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_prefix: Option<u32>,
     /// Anchors added because `replaces` was named in an earlier turn.
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1182,6 +1186,7 @@ impl ConsolidateReport {
             self.pair_via_replaces,
             self.replaces_cue_uses,
             self.replaces_departure,
+            self.replaces_prefix,
             self.anchor_earlier_turn,
             self.pair_via_earlier_turn,
             self.anchor_earlier_turn_skipped,
@@ -1326,6 +1331,10 @@ pub struct IngestionReport {
     /// switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub key_form_bound: u32,
+    /// Support checks that missed strictly and passed only through a suffix variant.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub value_suffix_supports: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
@@ -1576,14 +1585,17 @@ mod tests {
         let blank = serde_json::to_value(IngestionReport::default()).unwrap();
         assert!(blank.get("detail_tail_stripped").is_none(), "{blank}");
         assert!(blank.get("key_form_bound").is_none(), "{blank}");
+        assert!(blank.get("value_suffix_supports").is_none(), "{blank}");
         let report = IngestionReport {
             detail_tail_stripped: 1,
             key_form_bound: 2,
+            value_suffix_supports: 3,
             ..IngestionReport::default()
         };
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["detail_tail_stripped"], 1);
         assert_eq!(encoded["key_form_bound"], 2);
+        assert_eq!(encoded["value_suffix_supports"], 3);
         assert!(
             blank.get("alternative_details_attached").is_none(),
             "{blank}"
@@ -1903,6 +1915,26 @@ mod tests {
         let encoded = serde_json::to_value(&zeros).unwrap();
         assert_eq!(encoded["cross_key_replaces_unit_blocked"], 0);
         assert_eq!(encoded["rule_replaces_ambiguous"], 0);
+    }
+
+    #[test]
+    fn replaces_prefix_counter_is_omitted_when_zero() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("replaces_prefix").is_none());
+        let closed = ConsolidateReport {
+            replaces_prefix: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["replaces_prefix"], 1);
+        let zeros = ConsolidateReport {
+            replaces_prefix: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+        let encoded = serde_json::to_value(&zeros).unwrap();
+        assert_eq!(encoded["replaces_prefix"], 0);
     }
 
     #[test]

@@ -330,6 +330,12 @@ pub struct OptOuts {
     /// Write `alternative_details = false`. False leaves the key out.
     /// [`Self::alternative_details`] wins when both are set.
     pub no_alternative_details: bool,
+    /// Write `replaces_prefix = true`. False leaves the key out.
+    /// Implies nothing. An opt-out run does not write it.
+    pub replaces_prefix: bool,
+    /// Write `value_suffix = true`. False leaves the key out.
+    /// Implies nothing, including `replaces_prefix`. An opt-out run does not write it.
+    pub value_suffix: bool,
 }
 
 impl OptOuts {
@@ -362,6 +368,8 @@ impl OptOuts {
             known_long_values: false,
             alternative_details: false,
             no_alternative_details: true,
+            replaces_prefix: false,
+            value_suffix: false,
         }
     }
 }
@@ -496,6 +504,7 @@ async fn collect_sessions(
             alternative_details_ambiguous: report.alternative_details_ambiguous,
             alternative_details_skipped_existing: report.alternative_details_skipped_existing,
             key_form_bound: report.key_form_bound,
+            value_suffix_supports: report.value_suffix_supports,
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
@@ -576,6 +585,7 @@ async fn ingest_v2(
     report.alternative_details_ambiguous = extracted.alternative_details_ambiguous;
     report.alternative_details_skipped_existing = extracted.alternative_details_skipped_existing;
     report.key_form_bound = extracted.key_form_bound;
+    report.value_suffix_supports = extracted.value_suffix_supports;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
     report.retirements_skipped = extracted.retirements_skipped;
@@ -977,6 +987,12 @@ fn switch_lines(
         opt_outs.known_long_values,
         "known_long_values = true",
     );
+    push_line(
+        &mut lines,
+        opt_outs.replaces_prefix,
+        "replaces_prefix = true",
+    );
+    push_line(&mut lines, opt_outs.value_suffix, "value_suffix = true");
     push_switch(
         &mut lines,
         opt_outs.alternative_details,
@@ -4244,6 +4260,88 @@ mod tests {
     }
 
     #[test]
+    fn replaces_prefix_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                replaces_prefix: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nreplaces_prefix = true\n");
+        assert!(!text.contains("value_suffix"), "{text}");
+        assert!(!text.contains("consolidate ="), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.replaces_prefix);
+        assert!(graph.replaces_prefix_apply());
+        assert!(!graph.value_suffix);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn value_suffix_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                value_suffix: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nvalue_suffix = true\n");
+        assert!(!text.contains("replaces_prefix"), "{text}");
+        assert!(!text.contains("consolidate ="), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.value_suffix);
+        assert!(!graph.replaces_prefix);
+        assert!(!graph.replaces_prefix_apply());
+        assert!(graph.consolidate);
+    }
+
+    #[test]
     fn known_key_binding_writes_only_its_own_key() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
@@ -6594,6 +6692,7 @@ mod tests {
             alternative_details_ambiguous: 0,
             alternative_details_skipped_existing: 0,
             key_form_bound: 0,
+            value_suffix_supports: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,

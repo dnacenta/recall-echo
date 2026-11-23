@@ -235,9 +235,11 @@ pub(crate) async fn extract_session(
     // the store, leaves `WriteCtx.known` empty, and omits the block's sentences.
     let value_details = value_details_enabled(memory_dir);
     let key_forms = key_forms_enabled(memory_dir);
+    let value_suffix = value_suffix_enabled(memory_dir);
     let ground = SessionGround::prepare(&session.turns)
         .with_value_details(value_details)
-        .with_key_forms(key_forms);
+        .with_key_forms(key_forms)
+        .with_value_suffix(value_suffix);
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
@@ -384,6 +386,7 @@ pub(crate) async fn extract_session(
         write_ctx.retire_reason_on = retire_reason_enabled(memory_dir);
         write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
+        write_ctx.replaces_prefix_on = replaces_prefix_enabled(memory_dir);
         write_ctx.value_chars = known_value_chars(memory_dir);
         write_ctx.targets = targets;
         write_ctx.alternative_details = pairing.details;
@@ -447,6 +450,7 @@ pub(crate) async fn extract_session(
         write_ctx.retire_reason_on = retire_reason_enabled(memory_dir);
         write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
+        write_ctx.replaces_prefix_on = replaces_prefix_enabled(memory_dir);
         write_ctx.value_chars = known_value_chars(memory_dir);
         let started = std::time::Instant::now();
         let stats = write::WriteStats::default();
@@ -474,6 +478,7 @@ pub(crate) async fn extract_session(
         &mut report,
     )
     .await?;
+    report.value_suffix_supports = ground.value_suffix_supports();
     Ok(report)
 }
 
@@ -638,6 +643,20 @@ fn rule_replaces_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .rule_replaces_apply()
+}
+
+fn replaces_prefix_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .replaces_prefix_apply()
+}
+
+fn value_suffix_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .value_suffix
 }
 
 fn known_value_chars(memory_dir: &Path) -> usize {
@@ -6913,6 +6932,43 @@ mod tests {
         .unwrap();
         assert!(alternative_details_enabled(dir.path()));
         assert!(!value_details_enabled(dir.path()));
+    }
+
+    #[test]
+    fn replaces_prefix_and_value_suffix_read_only_their_own_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!replaces_prefix_enabled(dir.path()));
+        assert!(!value_suffix_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nreplaces_prefix = true\nconsolidate = false\n",
+        )
+        .unwrap();
+        assert!(!replaces_prefix_enabled(dir.path()));
+        assert!(!value_suffix_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nreplaces_prefix = true\n",
+        )
+        .unwrap();
+        assert!(replaces_prefix_enabled(dir.path()));
+        assert!(!value_suffix_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nvalue_suffix = true\nconsolidate = false\n",
+        )
+        .unwrap();
+        assert!(!replaces_prefix_enabled(dir.path()));
+        assert!(value_suffix_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nvalue_suffix = true\nreplaces_prefix = false\n",
+        )
+        .unwrap();
+        assert!(!replaces_prefix_enabled(dir.path()));
+        assert!(value_suffix_enabled(dir.path()));
+        let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
+        assert!(!encoded.contains("value_suffix_supports"), "{encoded}");
     }
 
     #[cfg(feature = "embedded")]

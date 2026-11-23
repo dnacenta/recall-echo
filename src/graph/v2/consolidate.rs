@@ -448,6 +448,7 @@ async fn run_main(
                 }
                 count_replaces_close(ctx, report, tally);
                 count_departure_close(ctx, &anchors, &loaded.rows, pair, quote, tally, report);
+                count_prefix_close(&loaded.rows, pair, quote, tally, report);
                 gone.insert(pair.partner);
                 if pair.hold {
                     report.hold.holds_confirmed += 1;
@@ -2055,6 +2056,8 @@ struct CueTally {
     replaces_floor: bool,
     uses: bool,
     departure: bool,
+    /// The rule match held only through a cut-off prefix.
+    prefix: bool,
 }
 
 impl CueTally {
@@ -2068,6 +2071,7 @@ impl CueTally {
             replaces_floor: false,
             uses: false,
             departure: false,
+            prefix: false,
         }
     }
 }
@@ -2148,12 +2152,20 @@ fn mark_replaces(
     mut tally: CueTally,
 ) -> (bool, CueTally) {
     let area = neighbourhood(look.anchors, loaded, ctx);
-    let Some(uses) = replaces_hit_kind(anchor, partner, loaded, &area, quote) else {
+    let Some(uses) = replaces_hit_kind(
+        anchor,
+        partner,
+        loaded,
+        &area,
+        quote,
+        ctx.replaces_prefix_on,
+    ) else {
         return (false, tally);
     };
     tally.replaces = true;
     tally.replaces_floor = !quote_span(quote);
     tally.uses = uses;
+    tally.prefix = ctx.replaces_prefix_on && rule_prefix_only(anchor, partner);
     (true, tally)
 }
 
@@ -2164,11 +2176,17 @@ fn replaces_hit_kind(
     loaded: &Loaded,
     area: &BTreeSet<String>,
     quote: &str,
+    prefix: bool,
 ) -> Option<bool> {
     if anchor.pred == "uses" {
         return uses_replaces_cue(anchor, partner, loaded, area, quote).then_some(true);
     }
-    replaces_cue(anchor, partner, loaded, area, quote).then_some(false)
+    let matched = if prefix {
+        replaces_cue_at(anchor, partner, loaded, area, quote, true)
+    } else {
+        replaces_cue(anchor, partner, loaded, area, quote)
+    };
+    matched.then_some(false)
 }
 
 fn replaces_relaxed(ctx: &WriteCtx<'_>, tally: &CueTally) -> bool {
@@ -2213,6 +2231,31 @@ fn count_departure_close(
     );
 }
 
+fn count_prefix_close(
+    rows: &[Row],
+    pair: &Pair,
+    quote: &str,
+    tally: &CueTally,
+    report: &mut IngestionReport,
+) {
+    if !tally.prefix {
+        return;
+    }
+    add_count(&mut report.consolidate.replaces_prefix);
+    let partner = &rows[pair.partner];
+    eprintln!(
+        "{}",
+        prefix_line(&format!("{}:{}", partner.subject, partner.key), quote)
+    );
+}
+
+fn prefix_line(partner: &str, quote: &str) -> String {
+    format!(
+        "consolidate replaces prefix: {partner} | {}",
+        quote_head(quote)
+    )
+}
+
 fn departure_line(old_key: &str, new_key: &str, quote: &str) -> String {
     format!(
         "consolidate departure: {old_key} | {new_key} | {}",
@@ -2230,10 +2273,16 @@ fn mark_departure(
     mut tally: CueTally,
 ) -> (bool, CueTally) {
     let area = neighbourhood(look.anchors, loaded, ctx);
-    if !departure_cue(anchor, partner, loaded, &area, quote) {
+    let matched = if ctx.replaces_prefix_on {
+        departure_cue_at(anchor, partner, loaded, &area, quote, true)
+    } else {
+        departure_cue(anchor, partner, loaded, &area, quote)
+    };
+    if !matched {
         return (false, tally);
     }
     tally.departure = true;
+    tally.prefix = ctx.replaces_prefix_on && exact_prefix_only(anchor, partner);
     (true, tally)
 }
 
@@ -2248,7 +2297,18 @@ fn departure_cue(
     area: &BTreeSet<String>,
     quote: &str,
 ) -> bool {
-    departure_rule_pair(anchor, partner, loaded, area)
+    departure_cue_at(anchor, partner, loaded, area, quote, false)
+}
+
+fn departure_cue_at(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    quote: &str,
+    prefix: bool,
+) -> bool {
+    departure_rule_pair(anchor, partner, loaded, area, prefix)
         && quote_span(quote)
         && departure_quote_clear(quote)
         && departure_word_in(quote)
@@ -2259,17 +2319,36 @@ fn departure_rule_pair(
     partner: &Row,
     loaded: &Loaded,
     area: &BTreeSet<String>,
+    prefix: bool,
 ) -> bool {
-    exact_rule_replaces(anchor, partner)
+    exact_rule_replaces(anchor, partner, prefix)
         && replaces_linked(anchor, partner, loaded)
-        && replaces_unique_row(anchor, partner, loaded, area)
+        && replaces_unique_row(anchor, partner, loaded, area, prefix)
 }
 
-fn exact_rule_replaces(anchor: &Anchor, partner: &Row) -> bool {
+fn exact_rule_replaces(anchor: &Anchor, partner: &Row, prefix: bool) -> bool {
     anchor.pred == "rule"
         && partner.pred == "rule"
         && !anchor.replaces.trim().is_empty()
-        && values_equal(&anchor.replaces, &partner.value)
+        && (values_equal(&anchor.replaces, &partner.value)
+            || (prefix && cut_off_departure(anchor, partner)))
+}
+
+fn exact_prefix_only(anchor: &Anchor, partner: &Row) -> bool {
+    anchor.pred == "rule"
+        && partner.pred == "rule"
+        && !values_equal(&anchor.replaces, &partner.value)
+        && cut_off_departure(anchor, partner)
+}
+
+/// A trimmed `replaces` of at least 40 characters that the partner value starts with.
+fn cut_off_departure(anchor: &Anchor, partner: &Row) -> bool {
+    let replaces = anchor.replaces.trim();
+    replaces.chars().count() >= 40
+        && partner
+            .value
+            .to_lowercase()
+            .starts_with(&replaces.to_lowercase())
 }
 
 fn departure_quote_clear(quote: &str) -> bool {
@@ -2309,10 +2388,21 @@ fn replaces_cue(
     area: &BTreeSet<String>,
     quote: &str,
 ) -> bool {
+    replaces_cue_at(anchor, partner, loaded, area, quote, false)
+}
+
+fn replaces_cue_at(
+    anchor: &Anchor,
+    partner: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    quote: &str,
+    prefix: bool,
+) -> bool {
     replaces_open(anchor, quote)
-        && replaces_match(anchor, partner)
+        && replaces_match(anchor, partner, prefix)
         && replaces_linked(anchor, partner, loaded)
-        && replaces_unique_row(anchor, partner, loaded, area)
+        && replaces_unique_row(anchor, partner, loaded, area, prefix)
 }
 
 fn replaces_open(anchor: &Anchor, quote: &str) -> bool {
@@ -2691,10 +2781,10 @@ fn hedge_phrase(words: &[&str]) -> bool {
     })
 }
 
-fn replaces_match(anchor: &Anchor, partner: &Row) -> bool {
+fn replaces_match(anchor: &Anchor, partner: &Row, prefix: bool) -> bool {
     match partner.pred.as_str() {
         "setting" => setting_replaces_match(anchor, partner),
-        "rule" => rule_replaces_match(anchor, partner),
+        "rule" => rule_replaces_match(anchor, partner, prefix),
         _ => false,
     }
 }
@@ -2815,9 +2905,42 @@ fn setting_keys(anchor: &Anchor, partner: &Row) -> bool {
     keys_match(&anchor.key, &partner.key) || key_overlap(&anchor.key, &partner.key, &names)
 }
 
-fn rule_replaces_match(anchor: &Anchor, partner: &Row) -> bool {
+fn rule_replaces_match(anchor: &Anchor, partner: &Row, prefix: bool) -> bool {
     let left = tokens(&anchor.replaces);
-    left.len() >= 2 && token_subset(&left, &tokens(&partner.value))
+    let right = tokens(&partner.value);
+    (left.len() >= 2 && token_subset(&left, &right))
+        || (prefix && cut_off_rule_replaces(&left, &right, &anchor.replaces, &partner.value))
+}
+
+fn rule_prefix_only(anchor: &Anchor, partner: &Row) -> bool {
+    if partner.pred != "rule" {
+        return false;
+    }
+    let left = tokens(&anchor.replaces);
+    let right = tokens(&partner.value);
+    let strict = left.len() >= 2 && token_subset(&left, &right);
+    !strict && cut_off_rule_replaces(&left, &right, &anchor.replaces, &partner.value)
+}
+
+/// Five or more tokens, a strict-prefix last token, and the cut-off text verbatim.
+fn cut_off_rule_replaces(left: &[String], right: &[String], replaces: &str, value: &str) -> bool {
+    if left.len() < 5 {
+        return false;
+    }
+    let Some((last, head)) = left.split_last() else {
+        return false;
+    };
+    last.chars().count() >= 3
+        && token_subset(head, right)
+        && right
+            .iter()
+            .any(|token| token != last && token.starts_with(last.as_str()))
+        && replaces_substring(replaces, value)
+}
+
+fn replaces_substring(replaces: &str, value: &str) -> bool {
+    let replaces = replaces.trim().to_lowercase();
+    !replaces.is_empty() && value.to_lowercase().contains(&replaces)
 }
 
 fn token_subset(left: &[String], right: &[String]) -> bool {
@@ -2835,18 +2958,25 @@ fn replaces_unique_row(
     partner: &Row,
     loaded: &Loaded,
     area: &BTreeSet<String>,
+    prefix: bool,
 ) -> bool {
     let hits = loaded
         .rows
         .iter()
-        .filter(|row| replaces_hit(anchor, row, loaded, area))
+        .filter(|row| replaces_hit(anchor, row, loaded, area, prefix))
         .count();
-    hits == 1 && replaces_hit(anchor, partner, loaded, area)
+    hits == 1 && replaces_hit(anchor, partner, loaded, area, prefix)
 }
 
-fn replaces_hit(anchor: &Anchor, row: &Row, loaded: &Loaded, area: &BTreeSet<String>) -> bool {
+fn replaces_hit(
+    anchor: &Anchor,
+    row: &Row,
+    loaded: &Loaded,
+    area: &BTreeSet<String>,
+    prefix: bool,
+) -> bool {
     replaces_candidate(row, area)
-        && replaces_match(anchor, row)
+        && replaces_match(anchor, row, prefix)
         && replaces_linked(anchor, row, loaded)
 }
 
@@ -2919,6 +3049,7 @@ fn kept_tally(links: &PairLinks, branch: Option<CueBranch>, made: bool) -> CueTa
         replaces_floor: false,
         uses: false,
         departure: false,
+        prefix: false,
     }
 }
 
@@ -13243,6 +13374,7 @@ mod tests {
         rename_on: bool,
         replaces_cue_on: bool,
         replaces_departure_on: bool,
+        replaces_prefix_on: bool,
     }
 
     async fn commit_mode(
@@ -13278,6 +13410,7 @@ mod tests {
         ctx.rename_on = flags.rename_on;
         ctx.replaces_cue_on = flags.replaces_cue_on;
         ctx.replaces_departure_on = flags.replaces_departure_on;
+        ctx.replaces_prefix_on = flags.replaces_prefix_on;
         let mut report = IngestionReport {
             links: stats.links,
             ..IngestionReport::default()
@@ -13294,6 +13427,7 @@ mod tests {
             rename_on: false,
             replaces_cue_on: false,
             replaces_departure_on: false,
+            replaces_prefix_on: false,
         }
     }
 
@@ -13357,6 +13491,7 @@ mod tests {
                 rename_on,
                 replaces_cue_on: false,
                 replaces_departure_on: false,
+                replaces_prefix_on: false,
             },
         )
         .await;
@@ -13775,6 +13910,7 @@ mod tests {
                 rename_on: false,
                 replaces_cue_on: false,
                 replaces_departure_on: false,
+                replaces_prefix_on: false,
             },
         )
         .await;
@@ -14164,6 +14300,7 @@ mod tests {
                     replaces_floor: false,
                     uses: false,
                     departure: false,
+                    prefix: false,
                 },
                 false
             ),
@@ -14180,6 +14317,7 @@ mod tests {
                     replaces_floor: false,
                     uses: false,
                     departure: false,
+                    prefix: false,
                 },
                 false
             ),
@@ -14533,6 +14671,7 @@ mod tests {
             rename_on,
             replaces_cue_on: false,
             replaces_departure_on: false,
+            replaces_prefix_on: false,
         }
     }
 
@@ -15207,6 +15346,7 @@ mod tests {
                 rename_on,
                 replaces_cue_on: false,
                 replaces_departure_on: false,
+                replaces_prefix_on: false,
             },
         )
         .await;
@@ -15610,6 +15750,7 @@ mod tests {
             rename_on: false,
             replaces_cue_on: on,
             replaces_departure_on: false,
+            replaces_prefix_on: false,
         }
     }
 
@@ -17276,6 +17417,7 @@ mod tests {
             rename_on: false,
             replaces_cue_on,
             replaces_departure_on: departure_on,
+            replaces_prefix_on: false,
         }
     }
 
@@ -24575,6 +24717,213 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.starts_with("consolidate old value:")));
+    }
+
+    const CUT_OFF: &str =
+        "Sign every request with HMAC-SHA256 over the body using the subscription's secre";
+    const FULL_RULE: &str = "Sign every request with HMAC-SHA256 over the body using the subscription's secret and send X-Sig: sha256=<hex>.";
+    const FRESH_RULE: &str =
+        "Verify the nonce before signing and send the tag only after that check.";
+
+    fn prefix_flags(cue_on: bool, departure_on: bool, prefix_on: bool) -> PassFlags {
+        PassFlags {
+            links_on: false,
+            components_on: false,
+            hold_on: false,
+            rename_on: false,
+            replaces_cue_on: cue_on,
+            replaces_departure_on: departure_on,
+            replaces_prefix_on: prefix_on,
+        }
+    }
+
+    async fn run_cut_off(prefix_on: bool, extras: &[&str]) -> DepartureRun {
+        let (_tmp, gm) = open().await;
+        let mut facts = vec![rule("svc", Kind::Project, FULL_RULE, FULL_RULE)];
+        for value in extras {
+            facts.push(rule("svc", Kind::Project, value, value));
+        }
+        let spoken = facts
+            .iter()
+            .map(|fact| fact.object_name.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        commit(&gm, "s1", "2026-03-01", &[turn(&spoken)], &facts).await;
+        let mut next = rule("svc", Kind::Project, FRESH_RULE, FRESH_RULE);
+        next.replaces = CUT_OFF.into();
+        let turns = [turn(FRESH_RULE)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", FRESH_RULE),
+            (2, "supersedes", FRESH_RULE),
+        ])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            prefix_flags(true, false, prefix_on),
+        )
+        .await;
+        let rows = slots(&gm, "svc").await;
+        let ended = rows
+            .iter()
+            .find(|slot| slot["key"] == "" && slot["value"] == FULL_RULE)
+            .and_then(ended)
+            .map(str::to_string);
+        DepartureRun {
+            report,
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_replaces_closes_only_when_the_prefix_flag_is_on() {
+        let off = run_cut_off(false, &[]).await;
+        let on = run_cut_off(true, &[]).await;
+        assert_eq!(dropped(&off.report, "no departure cue"), 1);
+        assert!(off.ended.is_none());
+        assert!(off.report.consolidate.replaces_prefix.is_none());
+        assert_eq!(off.report.consolidate.closes_sup, 0);
+        assert_eq!(on.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(on.report.consolidate.closes_sup, 1);
+        assert_eq!(on.report.consolidate.replaces_prefix, Some(1));
+        assert!(on.calls >= 1);
+        assert_eq!(
+            prefix_line("svc:", FRESH_RULE),
+            format!("consolidate replaces prefix: svc: | {FRESH_RULE}")
+        );
+    }
+
+    #[tokio::test]
+    async fn two_live_rules_sharing_the_prefix_do_not_close() {
+        let other = "Sign every request with HMAC-SHA256 over the body using the subscription's secret and send X-Request-Id.";
+        let on = run_cut_off(true, &[other]).await;
+        assert_eq!(on.report.consolidate.closes_sup, 0);
+        assert!(on.ended.is_none());
+        assert!(on.report.consolidate.replaces_prefix.is_none());
+        assert!(dropped(&on.report, "no departure cue") >= 1);
+    }
+
+    #[test]
+    fn a_four_token_cut_off_is_not_a_prefix_match() {
+        let anchor = cue_anchor("rule", "", FRESH_RULE, "sign every request secre");
+        let partner = cue_row(
+            "ent",
+            "rule",
+            "",
+            "sign every request secret and send the tag",
+        );
+        assert!(!rule_replaces_match(&anchor, &partner, false));
+        assert!(!rule_replaces_match(&anchor, &partner, true));
+    }
+
+    #[test]
+    fn an_equal_last_token_falls_back_to_the_subset_rule() {
+        let partner = cue_row(
+            "ent",
+            "rule",
+            "",
+            "sign every request secret and send the tag",
+        );
+        let differ = cue_anchor("rule", "", FRESH_RULE, "sign every zebra request secret");
+        assert!(!rule_replaces_match(&differ, &partner, false));
+        assert!(!rule_replaces_match(&differ, &partner, true));
+        let subset = cue_anchor("rule", "", FRESH_RULE, "sign every request secret");
+        assert!(rule_replaces_match(&subset, &partner, false));
+        assert!(rule_replaces_match(&subset, &partner, true));
+    }
+
+    fn counted_prefix(len: usize) -> String {
+        let mut out: String = "alpha bravo charlie delta echo foxtrot golf "
+            .chars()
+            .cycle()
+            .take(len)
+            .collect();
+        if out.ends_with(' ') {
+            out.pop();
+            out.push('x');
+        }
+        out
+    }
+
+    async fn run_departure_prefix(len: usize) -> DepartureRun {
+        let prefix = counted_prefix(len);
+        let stored = format!("{prefix} and keep the original name.");
+        let (_tmp, gm) = open().await;
+        commit(
+            &gm,
+            "s1",
+            "2026-03-01",
+            &[turn(&stored)],
+            &[rule("svc", Kind::Project, &stored, &stored)],
+        )
+        .await;
+        let mut next = rule("svc", Kind::Project, NEW_RULE, DEPARTURE_QUOTE);
+        next.replaces = prefix;
+        let turns = [turn(DEPARTURE_QUOTE)];
+        let stats = commit(&gm, "s2", "2026-03-02", &turns, std::slice::from_ref(&next)).await;
+        let stub = Stub::new(Answer::Reply(judged(&[
+            (1, "supersedes", DEPARTURE_QUOTE),
+            (2, "supersedes", DEPARTURE_QUOTE),
+        ])));
+        let report = pass_switches(
+            &gm,
+            "s2",
+            "2026-03-02",
+            &turns,
+            &[next],
+            &stats,
+            &stub,
+            prefix_flags(false, true, true),
+        )
+        .await;
+        let rows = slots(&gm, "svc").await;
+        let ended = rows
+            .iter()
+            .find(|slot| slot["key"] == "" && slot["value"] == stored)
+            .and_then(ended)
+            .map(str::to_string);
+        DepartureRun {
+            report,
+            calls: stub.calls(),
+            ended,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forty_char_prefix_closes_on_the_departure_path_and_thirty_nine_does_not() {
+        let short = run_departure_prefix(39).await;
+        let long = run_departure_prefix(40).await;
+        assert_eq!(counted_prefix(39).chars().count(), 39);
+        assert_eq!(counted_prefix(40).trim().chars().count(), 40);
+        assert_eq!(dropped(&short.report, "no departure cue"), 1);
+        assert!(short.ended.is_none());
+        assert!(short.report.consolidate.replaces_prefix.is_none());
+        assert!(short.report.consolidate.replaces_departure.is_none());
+        assert_eq!(long.ended.as_deref(), Some("s2:consolidated"));
+        assert_eq!(long.report.consolidate.replaces_departure, Some(1));
+        assert_eq!(long.report.consolidate.replaces_prefix, Some(1));
+    }
+
+    #[test]
+    fn a_reordered_prefix_is_not_verbatim() {
+        let partner = cue_row("ent", "rule", "", FULL_RULE);
+        let ordered = cue_anchor("rule", "", FRESH_RULE, CUT_OFF);
+        let reordered = cue_anchor(
+            "rule",
+            "",
+            FRESH_RULE,
+            "body using the subscription secre sign every request with hmac",
+        );
+        assert!(!rule_replaces_match(&ordered, &partner, false));
+        assert!(rule_replaces_match(&ordered, &partner, true));
+        assert!(!rule_replaces_match(&reordered, &partner, false));
+        assert!(!rule_replaces_match(&reordered, &partner, true));
     }
 }
 
