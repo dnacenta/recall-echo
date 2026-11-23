@@ -199,6 +199,10 @@ pub(crate) struct WriteCtx<'a> {
     /// Close one earlier rule that `replaces` names.
     /// Off leaves that pass unchanged and reads nothing for it.
     pub rule_replaces_on: bool,
+    /// Count a cut-off rule `replaces` as the match on the cue and departure paths.
+    /// Off leaves that match unchanged.
+    #[allow(dead_code)]
+    pub replaces_prefix_on: bool,
     /// Characters kept from a known value, and the cut width the replaces closes use.
     /// 80 unless the long-value switch applies.
     pub value_chars: usize,
@@ -244,6 +248,7 @@ impl<'a> WriteCtx<'a> {
             retire_reason_on: false,
             cross_key_replaces_on: false,
             rule_replaces_on: false,
+            replaces_prefix_on: false,
             value_chars: 80,
             alternative_details: Vec::new(),
             alternative_detail_parts: Vec::new(),

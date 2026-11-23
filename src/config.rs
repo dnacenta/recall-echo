@@ -1031,6 +1031,15 @@ pub struct GraphSection {
         skip_serializing_if = "is_true"
     )]
     pub alternative_details: bool,
+    /// Count a cut-off rule `replaces` as the match.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// Stands alone: it does not turn any other switch on.
+    #[serde(default = "default_replaces_prefix", skip_serializing_if = "is_false")]
+    pub replaces_prefix: bool,
+    /// Accept simple suffix variants when a value token misses the turn.
+    /// Off unless set. Stands alone: it does not turn any other switch on.
+    #[serde(default = "default_value_suffix", skip_serializing_if = "is_false")]
+    pub value_suffix: bool,
 }
 
 impl Default for GraphSection {
@@ -1074,6 +1083,8 @@ impl Default for GraphSection {
             extract_key_forms: default_extract_key_forms(),
             drop_generic_uses: default_drop_generic_uses(),
             alternative_details: default_alternative_details(),
+            replaces_prefix: default_replaces_prefix(),
+            value_suffix: default_value_suffix(),
         }
     }
 }
@@ -1185,6 +1196,15 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn known_key_binding_apply(&self) -> bool {
         self.known_facts_context && self.known_key_binding
+    }
+
+    /// A cut-off rule `replaces` counts only when consolidation is on as well.
+    ///
+    /// The match itself still runs only on the paths already gated by the
+    /// replaces cue and the exact-rule departure cue.
+    #[must_use]
+    pub(crate) fn replaces_prefix_apply(&self) -> bool {
+        self.consolidate && self.replaces_prefix
     }
 }
 
@@ -1597,6 +1617,14 @@ fn default_drop_generic_uses() -> bool {
 
 fn default_alternative_details() -> bool {
     true
+}
+
+fn default_replaces_prefix() -> bool {
+    false
+}
+
+fn default_value_suffix() -> bool {
+    false
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2158,6 +2186,8 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.extract_key_forms", flag_extract_key_forms),
     ("graph.drop_generic_uses", flag_drop_generic_uses),
     ("graph.alternative_details", flag_alternative_details),
+    ("graph.replaces_prefix", flag_replaces_prefix),
+    ("graph.value_suffix", flag_value_suffix),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2287,6 +2317,14 @@ fn flag_drop_generic_uses(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_alternative_details(graph: &mut GraphSection) -> &mut bool {
     &mut graph.alternative_details
+}
+
+fn flag_replaces_prefix(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.replaces_prefix
+}
+
+fn flag_value_suffix(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.value_suffix
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -4902,6 +4940,134 @@ settle_secs = 300
         assert!(cfg.set_key("graph.alternative_details", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").alternative_details);
         assert!(!cfg.graph.as_ref().expect("graph").extract_value_details);
+    }
+
+    #[test]
+    fn replaces_prefix_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_replaces_prefix());
+        assert!(!GraphSection::default().replaces_prefix);
+        assert!(!GraphSection::default().replaces_prefix_apply());
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().replaces_prefix);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("replaces_prefix"));
+        assert!(!rendered_default.contains("value_suffix"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nreplaces_prefix = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.replaces_prefix);
+        assert!(!false_graph.replaces_prefix_apply());
+        assert!(!false_graph.value_suffix);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("replaces_prefix"));
+        assert!(!rendered_false.contains("value_suffix"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nreplaces_prefix = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.replaces_prefix);
+        assert!(true_graph.replaces_prefix_apply());
+        assert!(!true_graph.value_suffix);
+        assert!(true_graph.consolidate);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("replaces_prefix = true"));
+        assert!(!rendered_true.contains("value_suffix"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.replaces_prefix);
+        assert!(!again.value_suffix);
+
+        let blocked = GraphSection {
+            replaces_prefix: true,
+            consolidate: false,
+            ..GraphSection::default()
+        };
+        assert!(!blocked.replaces_prefix_apply());
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.replaces_prefix", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.replaces_prefix);
+        assert!(graph.replaces_prefix_apply());
+        assert!(!graph.value_suffix);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("replaces_prefix = true"));
+        assert!(!rendered.contains("value_suffix"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.replaces_prefix);
+        assert!(!parsed_graph.value_suffix);
+
+        cfg.set_key("graph.replaces_prefix", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").replaces_prefix);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("replaces_prefix"));
+        cfg.set_key("graph.replaces_prefix", "true").unwrap();
+        assert!(cfg.set_key("graph.replaces_prefix", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").replaces_prefix);
+        assert!(!cfg.graph.as_ref().expect("graph").value_suffix);
+    }
+
+    #[test]
+    fn value_suffix_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_value_suffix());
+        assert!(!GraphSection::default().value_suffix);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().value_suffix);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("value_suffix"));
+        assert!(!rendered_default.contains("replaces_prefix"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nvalue_suffix = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.value_suffix);
+        assert!(!false_graph.replaces_prefix);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("value_suffix"));
+        assert!(!rendered_false.contains("replaces_prefix"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nvalue_suffix = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.value_suffix);
+        assert!(!true_graph.replaces_prefix);
+        assert!(!true_graph.replaces_prefix_apply());
+        assert!(true_graph.consolidate);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("value_suffix = true"));
+        assert!(!rendered_true.contains("replaces_prefix"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.value_suffix);
+        assert!(!again.replaces_prefix);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.value_suffix", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.value_suffix);
+        assert!(!graph.replaces_prefix);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("value_suffix = true"));
+        assert!(!rendered.contains("replaces_prefix"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.value_suffix);
+        assert!(!parsed_graph.replaces_prefix);
+
+        cfg.set_key("graph.value_suffix", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").value_suffix);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("value_suffix"));
+        cfg.set_key("graph.value_suffix", "true").unwrap();
+        assert!(cfg.set_key("graph.value_suffix", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").value_suffix);
+        assert!(!cfg.graph.as_ref().expect("graph").replaces_prefix);
     }
 
     #[test]

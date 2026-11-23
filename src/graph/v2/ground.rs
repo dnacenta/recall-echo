@@ -111,6 +111,9 @@ pub(crate) struct SessionGround {
     session_numbers: Vec<String>,
     value_details: bool,
     key_forms: bool,
+    /// Read when suffix variants are applied. Off leaves every check unchanged.
+    #[allow(dead_code)]
+    value_suffix: bool,
 }
 
 struct TurnGround {
@@ -156,6 +159,7 @@ impl SessionGround {
             session_numbers,
             value_details: false,
             key_forms: false,
+            value_suffix: false,
         }
     }
 
@@ -186,6 +190,22 @@ impl SessionGround {
     /// Whether key-form binding is on for this session.
     pub(crate) fn key_forms(&self) -> bool {
         self.key_forms
+    }
+
+    /// Turn suffix variants on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    /// The flag reaches value support only. It does not change key binding.
+    #[must_use]
+    pub(crate) fn with_value_suffix(mut self, on: bool) -> Self {
+        self.value_suffix = on;
+        self
+    }
+
+    /// Whether suffix variants are on for this session.
+    #[allow(dead_code)]
+    pub(crate) fn value_suffix(&self) -> bool {
+        self.value_suffix
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -1385,8 +1405,13 @@ mod tests {
         let on = ground(&lines).with_value_details(true).with_key_forms(true);
         assert!(!off.value_details());
         assert!(!off.key_forms());
+        assert!(!off.value_suffix());
         assert!(on.value_details());
         assert!(on.key_forms());
+        assert!(!on.value_suffix());
+        let suffixed = ground(&lines).with_value_suffix(true);
+        assert!(suffixed.value_suffix());
+        assert!(!suffixed.key_forms());
         assert!(off.key_bound("port", "9000", 0, "Port 9000 is chosen."));
         assert!(on.key_bound("port", "9000", 0, "Port 9000 is chosen."));
         assert_eq!(

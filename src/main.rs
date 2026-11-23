@@ -366,6 +366,14 @@ enum BenchCommands {
         /// `alternative_details = true` for this run. Implies nothing.
         #[arg(long)]
         alternative_details: bool,
+        /// Count a cut-off rule replaces as the match. Off unless set.
+        /// Implies nothing. Writes `replaces_prefix = true` for this run only.
+        #[arg(long)]
+        replaces_prefix: bool,
+        /// Accept simple suffix variants when a value token misses the turn.
+        /// Off unless set. Implies nothing. Writes `value_suffix = true` for this run only.
+        #[arg(long)]
+        value_suffix: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1221,6 +1229,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             known_long_values,
             drop_generic_uses,
             alternative_details,
+            replaces_prefix,
+            value_suffix,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1348,6 +1358,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 known_long_values,
                 alternative_details,
                 no_alternative_details,
+                replaces_prefix,
+                value_suffix,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2996,6 +3008,95 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn replaces_prefix_and_value_suffix_are_their_own_bench_flags() {
+        let prefix = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--replaces-prefix",
+        ])
+        .expect("parse replaces prefix");
+        match prefix.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        replaces_prefix,
+                        value_suffix,
+                        consolidate_replaces_cue,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(replaces_prefix);
+                assert!(!value_suffix);
+                assert!(!consolidate);
+                assert!(!consolidate_replaces_cue);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let suffix = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--value-suffix",
+        ])
+        .expect("parse value suffix");
+        match suffix.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        replaces_prefix,
+                        value_suffix,
+                        extract_value_details,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(value_suffix);
+                assert!(!replaces_prefix);
+                assert!(!consolidate);
+                assert!(!extract_value_details);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let with_opt_out = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--replaces-prefix",
+            "--value-suffix",
+        ]);
+        assert!(with_opt_out.is_ok(), "neither flag implies consolidate");
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--replaces-prefix"), "{help}");
+        assert!(help.contains("--value-suffix"), "{help}");
+        assert!(!help.contains("--no-replaces-prefix"), "{help}");
+        assert!(!help.contains("--no-value-suffix"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn extract_key_forms_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -3372,6 +3473,8 @@ mod tests {
             drop_generic_uses: false,
             alternative_details: false,
             no_alternative_details: false,
+            replaces_prefix: false,
+            value_suffix: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],
