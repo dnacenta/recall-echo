@@ -1019,6 +1019,38 @@ pub struct ConsolidateReport {
     /// None of those rules close. Absent when unset, including when the switch is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_replaces_ambiguous: Option<u32>,
+    /// Earlier settings closed because their key abbreviates a new key on the
+    /// same subject. Absent when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key: Option<u32>,
+    /// New settings with two or more near-key candidates. None of those
+    /// candidates close. Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_ambiguous: Option<u32>,
+    /// Near-key candidates kept live because this pass had already closed them.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_skip_gone: Option<u32>,
+    /// Near-key candidates kept live because their value class differs.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_skip_class: Option<u32>,
+    /// Near-key candidates kept live because their value equals the new value.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_skip_same_value: Option<u32>,
+    /// Near-key candidates kept live because the new value's turn names the old key.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_skip_named: Option<u32>,
+    /// Near-key candidates kept live because the new value's turn lists the old
+    /// value or keeps both values. Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_skip_listed: Option<u32>,
+    /// Near-key candidates kept live because another anchor of the pass writes
+    /// the old key. Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_key_skip_rewritten: Option<u32>,
 }
 
 /// Counts from the opt-in contradiction hold.
@@ -1142,6 +1174,7 @@ impl ConsolidateReport {
             && self.rename_counts_blank()
             && self.replaces_counts_blank()
             && self.post_counts_blank()
+            && self.near_key_counts_blank()
     }
 
     fn pass_blank(&self) -> bool {
@@ -1215,6 +1248,19 @@ impl ConsolidateReport {
             self.cross_key_replaces_unit_blocked,
             self.rule_replaces_closes,
             self.rule_replaces_ambiguous,
+        ])
+    }
+
+    fn near_key_counts_blank(&self) -> bool {
+        all_zero(&[
+            self.near_key,
+            self.near_key_ambiguous,
+            self.near_key_skip_gone,
+            self.near_key_skip_class,
+            self.near_key_skip_same_value,
+            self.near_key_skip_named,
+            self.near_key_skip_listed,
+            self.near_key_skip_rewritten,
         ])
     }
 }
@@ -1922,6 +1968,43 @@ mod tests {
         let encoded = serde_json::to_value(&zeros).unwrap();
         assert_eq!(encoded["cross_key_replaces_unit_blocked"], 0);
         assert_eq!(encoded["rule_replaces_ambiguous"], 0);
+    }
+
+    #[test]
+    fn near_key_counters_are_omitted_when_unset() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        for name in [
+            "near_key",
+            "near_key_ambiguous",
+            "near_key_skip_gone",
+            "near_key_skip_class",
+            "near_key_skip_same_value",
+            "near_key_skip_named",
+            "near_key_skip_listed",
+            "near_key_skip_rewritten",
+        ] {
+            assert!(encoded.get(name).is_none(), "{name}");
+        }
+        let armed = ConsolidateReport {
+            near_key: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(armed.is_blank());
+        assert_eq!(serde_json::to_value(&armed).unwrap()["near_key"], 0);
+        let closed = ConsolidateReport {
+            near_key: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let skipped = ConsolidateReport {
+            near_key_skip_named: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!skipped.is_blank());
+        assert_eq!(
+            serde_json::to_value(&skipped).unwrap()["near_key_skip_named"],
+            1
+        );
     }
 
     #[test]
