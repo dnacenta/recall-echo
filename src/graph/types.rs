@@ -1335,6 +1335,10 @@ pub struct IngestionReport {
     /// Omitted when zero, including when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub value_suffix_supports: u32,
+    /// Quotes cited only after backticks were ignored on both sides.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub quote_strip_code_cites: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
@@ -1586,16 +1590,19 @@ mod tests {
         assert!(blank.get("detail_tail_stripped").is_none(), "{blank}");
         assert!(blank.get("key_form_bound").is_none(), "{blank}");
         assert!(blank.get("value_suffix_supports").is_none(), "{blank}");
+        assert!(blank.get("quote_strip_code_cites").is_none(), "{blank}");
         let report = IngestionReport {
             detail_tail_stripped: 1,
             key_form_bound: 2,
             value_suffix_supports: 3,
+            quote_strip_code_cites: 4,
             ..IngestionReport::default()
         };
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["detail_tail_stripped"], 1);
         assert_eq!(encoded["key_form_bound"], 2);
         assert_eq!(encoded["value_suffix_supports"], 3);
+        assert_eq!(encoded["quote_strip_code_cites"], 4);
         assert!(
             blank.get("alternative_details_attached").is_none(),
             "{blank}"

@@ -513,6 +513,7 @@ async fn collect_sessions(
             alternative_details_skipped_existing: report.alternative_details_skipped_existing,
             key_form_bound: report.key_form_bound,
             value_suffix_supports: report.value_suffix_supports,
+            quote_strip_code_cites: report.quote_strip_code_cites,
             resolve: report.resolve,
             retirements: report.retirements,
             retirements_skipped: report.retirements_skipped,
@@ -594,6 +595,7 @@ async fn ingest_v2(
     report.alternative_details_skipped_existing = extracted.alternative_details_skipped_existing;
     report.key_form_bound = extracted.key_form_bound;
     report.value_suffix_supports = extracted.value_suffix_supports;
+    report.quote_strip_code_cites = extracted.quote_strip_code_cites;
     report.resolve = extracted.resolve;
     report.retirements = extracted.retirements;
     report.retirements_skipped = extracted.retirements_skipped;
@@ -6795,6 +6797,7 @@ mod tests {
             alternative_details_skipped_existing: 0,
             key_form_bound: 0,
             value_suffix_supports: 0,
+            quote_strip_code_cites: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,

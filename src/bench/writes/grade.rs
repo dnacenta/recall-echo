@@ -114,6 +114,9 @@ pub struct SessionObservation {
     /// Support checks that missed strictly and passed only through a suffix variant.
     /// Zero when that switch is off.
     pub value_suffix_supports: u32,
+    /// Quotes cited only after backticks were ignored on both sides.
+    /// Zero when that switch is off.
+    pub quote_strip_code_cites: u32,
     /// Entity resolution for a v2 session. Blank on v1.
     pub resolve: crate::graph::types::ResolveStats,
     /// Facts this session closed. Empty on v1.
@@ -304,6 +307,10 @@ pub struct SessionReport {
     /// Zero, and omitted, when the switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub value_suffix_supports: u32,
+    /// Quotes cited only after backticks were ignored on both sides.
+    /// Zero, and omitted, when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub quote_strip_code_cites: u32,
     /// Entity resolution. Blank on v1, and omitted from the printed report then.
     #[serde(
         default,
@@ -712,6 +719,7 @@ pub fn grade_with_pipeline(
                 alternative_details_skipped_existing: s.alternative_details_skipped_existing,
                 key_form_bound: s.key_form_bound,
                 value_suffix_supports: s.value_suffix_supports,
+                quote_strip_code_cites: s.quote_strip_code_cites,
                 resolve: s.resolve.clone(),
                 retirements: s.retirements.clone(),
                 retirements_skipped: s.retirements_skipped,
@@ -2196,6 +2204,7 @@ mod tests {
             alternative_details_skipped_existing: 0,
             key_form_bound: 0,
             value_suffix_supports: 0,
+            quote_strip_code_cites: 0,
             resolve: crate::graph::types::ResolveStats::default(),
             retirements: Vec::new(),
             retirements_skipped: 0,
@@ -2233,6 +2242,7 @@ mod tests {
             alternative_details_skipped_existing: session.alternative_details_skipped_existing,
             key_form_bound: session.key_form_bound,
             value_suffix_supports: session.value_suffix_supports,
+            quote_strip_code_cites: session.quote_strip_code_cites,
             resolve: session.resolve.clone(),
             retirements: session.retirements.clone(),
             retirements_skipped: session.retirements_skipped,

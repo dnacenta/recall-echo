@@ -483,6 +483,7 @@ pub(crate) async fn extract_session(
     )
     .await?;
     report.value_suffix_supports = ground.value_suffix_supports();
+    report.quote_strip_code_cites = ground.quote_strip_code_cites();
     Ok(report)
 }
 
@@ -7024,6 +7025,8 @@ mod tests {
         .unwrap();
         assert!(!quote_strip_code_enabled(dir.path()));
         assert!(!near_key_enabled(dir.path()));
+        let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
+        assert!(!encoded.contains("quote_strip_code_cites"), "{encoded}");
     }
 
     #[cfg(feature = "embedded")]
