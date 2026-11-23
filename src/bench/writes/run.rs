@@ -336,6 +336,12 @@ pub struct OptOuts {
     /// Write `value_suffix = true`. False leaves the key out.
     /// Implies nothing, including `replaces_prefix`. An opt-out run does not write it.
     pub value_suffix: bool,
+    /// Write `quote_strip_code = true`. False leaves the key out.
+    /// Implies nothing, including `consolidate_near_key`. An opt-out run does not write it.
+    pub quote_strip_code: bool,
+    /// Write `consolidate_near_key = true`. False leaves the key out.
+    /// Implies nothing, including `quote_strip_code`. An opt-out run does not write it.
+    pub consolidate_near_key: bool,
 }
 
 impl OptOuts {
@@ -370,6 +376,8 @@ impl OptOuts {
             no_alternative_details: true,
             replaces_prefix: false,
             value_suffix: false,
+            quote_strip_code: false,
+            consolidate_near_key: false,
         }
     }
 }
@@ -993,6 +1001,16 @@ fn switch_lines(
         "replaces_prefix = true",
     );
     push_line(&mut lines, opt_outs.value_suffix, "value_suffix = true");
+    push_line(
+        &mut lines,
+        opt_outs.quote_strip_code,
+        "quote_strip_code = true",
+    );
+    push_line(
+        &mut lines,
+        opt_outs.consolidate_near_key,
+        "consolidate_near_key = true",
+    );
     push_switch(
         &mut lines,
         opt_outs.alternative_details,
@@ -4338,6 +4356,90 @@ mod tests {
         assert!(graph.value_suffix);
         assert!(!graph.replaces_prefix);
         assert!(!graph.replaces_prefix_apply());
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn quote_strip_code_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                quote_strip_code: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nquote_strip_code = true\n");
+        assert!(!text.contains("consolidate_near_key"), "{text}");
+        assert!(!text.contains("consolidate ="), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.quote_strip_code);
+        assert!(!graph.consolidate_near_key);
+        assert!(!graph.consolidate_near_key_apply());
+        assert!(!graph.value_suffix);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn consolidate_near_key_writes_only_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                consolidate_near_key: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nconsolidate_near_key = true\n");
+        assert!(!text.contains("quote_strip_code"), "{text}");
+        assert!(!text.contains("consolidate ="), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(graph.consolidate_near_key);
+        assert!(graph.consolidate_near_key_apply());
+        assert!(!graph.quote_strip_code);
+        assert!(!graph.replaces_prefix);
         assert!(graph.consolidate);
     }
 

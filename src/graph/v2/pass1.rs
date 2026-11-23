@@ -236,10 +236,12 @@ pub(crate) async fn extract_session(
     let value_details = value_details_enabled(memory_dir);
     let key_forms = key_forms_enabled(memory_dir);
     let value_suffix = value_suffix_enabled(memory_dir);
+    let quote_strip_code = quote_strip_code_enabled(memory_dir);
     let ground = SessionGround::prepare(&session.turns)
         .with_value_details(value_details)
         .with_key_forms(key_forms)
-        .with_value_suffix(value_suffix);
+        .with_value_suffix(value_suffix)
+        .with_quote_strip_code(quote_strip_code);
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
@@ -387,6 +389,7 @@ pub(crate) async fn extract_session(
         write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
         write_ctx.replaces_prefix_on = replaces_prefix_enabled(memory_dir);
+        write_ctx.near_key_on = near_key_enabled(memory_dir);
         write_ctx.value_chars = known_value_chars(memory_dir);
         write_ctx.targets = targets;
         write_ctx.alternative_details = pairing.details;
@@ -451,6 +454,7 @@ pub(crate) async fn extract_session(
         write_ctx.cross_key_replaces_on = cross_key_replaces_enabled(memory_dir);
         write_ctx.rule_replaces_on = rule_replaces_enabled(memory_dir);
         write_ctx.replaces_prefix_on = replaces_prefix_enabled(memory_dir);
+        write_ctx.near_key_on = near_key_enabled(memory_dir);
         write_ctx.value_chars = known_value_chars(memory_dir);
         let started = std::time::Instant::now();
         let stats = write::WriteStats::default();
@@ -657,6 +661,20 @@ fn value_suffix_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .value_suffix
+}
+
+fn quote_strip_code_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .quote_strip_code
+}
+
+fn near_key_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .consolidate_near_key_apply()
 }
 
 fn known_value_chars(memory_dir: &Path) -> usize {
@@ -6969,6 +6987,43 @@ mod tests {
         assert!(value_suffix_enabled(dir.path()));
         let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
         assert!(!encoded.contains("value_suffix_supports"), "{encoded}");
+    }
+
+    #[test]
+    fn quote_strip_code_and_near_key_read_only_their_own_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!quote_strip_code_enabled(dir.path()));
+        assert!(!near_key_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nquote_strip_code = true\n",
+        )
+        .unwrap();
+        assert!(quote_strip_code_enabled(dir.path()));
+        assert!(!near_key_enabled(dir.path()));
+        assert!(!value_suffix_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nconsolidate_near_key = true\nconsolidate = false\n",
+        )
+        .unwrap();
+        assert!(!near_key_enabled(dir.path()));
+        assert!(!quote_strip_code_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nconsolidate_near_key = true\n",
+        )
+        .unwrap();
+        assert!(near_key_enabled(dir.path()));
+        assert!(!quote_strip_code_enabled(dir.path()));
+        assert!(!replaces_prefix_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nvalue_suffix = true\nreplaces_prefix = true\n",
+        )
+        .unwrap();
+        assert!(!quote_strip_code_enabled(dir.path()));
+        assert!(!near_key_enabled(dir.path()));
     }
 
     #[cfg(feature = "embedded")]

@@ -1040,6 +1040,18 @@ pub struct GraphSection {
     /// Off unless set. Stands alone: it does not turn any other switch on.
     #[serde(default = "default_value_suffix", skip_serializing_if = "is_false")]
     pub value_suffix: bool,
+    /// Retry a missed quote with backticks ignored on both sides.
+    /// Off unless set. Stands alone: it does not turn any other switch on.
+    #[serde(default = "default_quote_strip_code", skip_serializing_if = "is_false")]
+    pub quote_strip_code: bool,
+    /// Close an earlier setting whose key abbreviates the new key.
+    /// Off unless set, and ignored unless [`Self::consolidate`] is also set.
+    /// Stands alone: it does not turn any other switch on.
+    #[serde(
+        default = "default_consolidate_near_key",
+        skip_serializing_if = "is_false"
+    )]
+    pub consolidate_near_key: bool,
 }
 
 impl Default for GraphSection {
@@ -1085,6 +1097,8 @@ impl Default for GraphSection {
             alternative_details: default_alternative_details(),
             replaces_prefix: default_replaces_prefix(),
             value_suffix: default_value_suffix(),
+            quote_strip_code: default_quote_strip_code(),
+            consolidate_near_key: default_consolidate_near_key(),
         }
     }
 }
@@ -1205,6 +1219,12 @@ impl GraphSection {
     #[must_use]
     pub(crate) fn replaces_prefix_apply(&self) -> bool {
         self.consolidate && self.replaces_prefix
+    }
+
+    /// The near-key close runs only when consolidation is on as well.
+    #[must_use]
+    pub(crate) fn consolidate_near_key_apply(&self) -> bool {
+        self.consolidate && self.consolidate_near_key
     }
 }
 
@@ -1624,6 +1644,14 @@ fn default_replaces_prefix() -> bool {
 }
 
 fn default_value_suffix() -> bool {
+    false
+}
+
+fn default_quote_strip_code() -> bool {
+    false
+}
+
+fn default_consolidate_near_key() -> bool {
     false
 }
 
@@ -2188,6 +2216,8 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.alternative_details", flag_alternative_details),
     ("graph.replaces_prefix", flag_replaces_prefix),
     ("graph.value_suffix", flag_value_suffix),
+    ("graph.quote_strip_code", flag_quote_strip_code),
+    ("graph.consolidate_near_key", flag_consolidate_near_key),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2325,6 +2355,14 @@ fn flag_replaces_prefix(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_value_suffix(graph: &mut GraphSection) -> &mut bool {
     &mut graph.value_suffix
+}
+
+fn flag_quote_strip_code(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.quote_strip_code
+}
+
+fn flag_consolidate_near_key(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.consolidate_near_key
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -5068,6 +5106,134 @@ settle_secs = 300
         assert!(cfg.set_key("graph.value_suffix", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").value_suffix);
         assert!(!cfg.graph.as_ref().expect("graph").replaces_prefix);
+    }
+
+    #[test]
+    fn quote_strip_code_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_quote_strip_code());
+        assert!(!GraphSection::default().quote_strip_code);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().quote_strip_code);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("quote_strip_code"));
+        assert!(!rendered_default.contains("consolidate_near_key"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nquote_strip_code = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.quote_strip_code);
+        assert!(!false_graph.consolidate_near_key);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("quote_strip_code"));
+        assert!(!rendered_false.contains("consolidate_near_key"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nquote_strip_code = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.quote_strip_code);
+        assert!(!true_graph.consolidate_near_key);
+        assert!(!true_graph.consolidate_near_key_apply());
+        assert!(true_graph.consolidate);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("quote_strip_code = true"));
+        assert!(!rendered_true.contains("consolidate_near_key"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.quote_strip_code);
+        assert!(!again.consolidate_near_key);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.quote_strip_code", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.quote_strip_code);
+        assert!(!graph.consolidate_near_key);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("quote_strip_code = true"));
+        assert!(!rendered.contains("consolidate_near_key"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.quote_strip_code);
+        assert!(!parsed_graph.consolidate_near_key);
+
+        cfg.set_key("graph.quote_strip_code", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").quote_strip_code);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("quote_strip_code"));
+        cfg.set_key("graph.quote_strip_code", "true").unwrap();
+        assert!(cfg.set_key("graph.quote_strip_code", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").quote_strip_code);
+        assert!(!cfg.graph.as_ref().expect("graph").consolidate_near_key);
+    }
+
+    #[test]
+    fn consolidate_near_key_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_consolidate_near_key());
+        assert!(!GraphSection::default().consolidate_near_key);
+        assert!(!GraphSection::default().consolidate_near_key_apply());
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().consolidate_near_key);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("consolidate_near_key"));
+        assert!(!rendered_default.contains("quote_strip_code"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nconsolidate_near_key = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.consolidate_near_key);
+        assert!(!false_graph.consolidate_near_key_apply());
+        assert!(!false_graph.quote_strip_code);
+        assert!(false_graph.consolidate);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("consolidate_near_key"));
+        assert!(!rendered_false.contains("quote_strip_code"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nconsolidate_near_key = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.consolidate_near_key);
+        assert!(true_graph.consolidate_near_key_apply());
+        assert!(!true_graph.quote_strip_code);
+        assert!(true_graph.consolidate);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("consolidate_near_key = true"));
+        assert!(!rendered_true.contains("quote_strip_code"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.consolidate_near_key);
+        assert!(!again.quote_strip_code);
+
+        let blocked = GraphSection {
+            consolidate_near_key: true,
+            consolidate: false,
+            ..GraphSection::default()
+        };
+        assert!(!blocked.consolidate_near_key_apply());
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.consolidate_near_key", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.consolidate_near_key);
+        assert!(graph.consolidate_near_key_apply());
+        assert!(!graph.quote_strip_code);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("consolidate_near_key = true"));
+        assert!(!rendered.contains("quote_strip_code"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        let parsed_graph = parsed.graph.expect("graph");
+        assert!(parsed_graph.consolidate_near_key);
+        assert!(!parsed_graph.quote_strip_code);
+
+        cfg.set_key("graph.consolidate_near_key", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").consolidate_near_key);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("consolidate_near_key"));
+        cfg.set_key("graph.consolidate_near_key", "true").unwrap();
+        assert!(cfg.set_key("graph.consolidate_near_key", "yes").is_err());
+        assert!(cfg.graph.as_ref().expect("graph").consolidate_near_key);
+        assert!(!cfg.graph.as_ref().expect("graph").quote_strip_code);
     }
 
     #[test]

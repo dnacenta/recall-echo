@@ -115,6 +115,7 @@ pub(crate) struct SessionGround {
     key_forms: bool,
     value_suffix: bool,
     value_suffix_supports: Cell<u32>,
+    quote_strip_code: bool,
 }
 
 struct TurnGround {
@@ -162,6 +163,7 @@ impl SessionGround {
             key_forms: false,
             value_suffix: false,
             value_suffix_supports: Cell::new(0),
+            quote_strip_code: false,
         }
     }
 
@@ -212,6 +214,16 @@ impl SessionGround {
     /// Support checks that missed strictly and passed only through a suffix variant.
     pub(crate) fn value_suffix_supports(&self) -> u32 {
         self.value_suffix_supports.get()
+    }
+
+    /// Turn the backtick-insensitive quote retry on for this session.
+    ///
+    /// Off leaves every check on the path [`SessionGround::prepare`] built.
+    /// The flag reaches the quote check only.
+    #[must_use]
+    pub(crate) fn with_quote_strip_code(mut self, on: bool) -> Self {
+        self.quote_strip_code = on;
+        self
     }
 
     /// Keep the cited turn when the quote is there. Otherwise re-cite.
@@ -2504,5 +2516,18 @@ mod tests {
         let on = suffixed(text);
         assert!(!off.key_bound("line_length", "88", 0, text));
         assert!(!on.key_bound("line_length", "88", 0, text));
+    }
+
+    #[test]
+    fn quote_strip_code_defaults_off_and_stands_alone() {
+        let lines = [("Port 9000 is chosen.", TurnRole::User)];
+        let off = ground(&lines);
+        assert!(!off.quote_strip_code);
+        let on = ground(&lines).with_quote_strip_code(true);
+        assert!(on.quote_strip_code);
+        assert!(!on.value_details());
+        assert!(!on.key_forms());
+        assert!(!on.value_suffix());
+        assert!(!ground(&lines).with_value_suffix(true).quote_strip_code);
     }
 }

@@ -374,6 +374,14 @@ enum BenchCommands {
         /// Off unless set. Implies nothing. Writes `value_suffix = true` for this run only.
         #[arg(long)]
         value_suffix: bool,
+        /// Retry a missed quote with backticks ignored on both sides. Off unless set.
+        /// Implies nothing. Writes `quote_strip_code = true` for this run only.
+        #[arg(long)]
+        quote_strip_code: bool,
+        /// Close an earlier setting whose key abbreviates the new key. Off unless set.
+        /// Implies nothing. Writes `consolidate_near_key = true` for this run only.
+        #[arg(long)]
+        consolidate_near_key: bool,
         /// Turn the known-facts block off for this run.
         #[arg(long, conflicts_with = "known_facts_context")]
         no_known_facts_context: bool,
@@ -1231,6 +1239,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             alternative_details,
             replaces_prefix,
             value_suffix,
+            quote_strip_code,
+            consolidate_near_key,
             no_known_facts_context,
             no_consolidate,
             no_consolidate_hold,
@@ -1360,6 +1370,8 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 no_alternative_details,
                 replaces_prefix,
                 value_suffix,
+                quote_strip_code,
+                consolidate_near_key,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -3097,6 +3109,95 @@ mod tests {
 
     #[cfg(feature = "bench")]
     #[test]
+    fn quote_strip_code_and_consolidate_near_key_are_their_own_bench_flags() {
+        let strip = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--quote-strip-code",
+        ])
+        .expect("parse quote strip code");
+        match strip.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        quote_strip_code,
+                        consolidate_near_key,
+                        value_suffix,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(quote_strip_code);
+                assert!(!consolidate_near_key);
+                assert!(!consolidate);
+                assert!(!value_suffix);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let near = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--consolidate-near-key",
+        ])
+        .expect("parse consolidate near key");
+        match near.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        consolidate,
+                        quote_strip_code,
+                        consolidate_near_key,
+                        consolidate_key_rename,
+                        no_consolidate,
+                        ..
+                    },
+            } => {
+                assert!(consolidate_near_key);
+                assert!(!quote_strip_code);
+                assert!(!consolidate);
+                assert!(!consolidate_key_rename);
+                assert!(!no_consolidate);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let with_opt_out = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-consolidate",
+            "--quote-strip-code",
+            "--consolidate-near-key",
+        ]);
+        assert!(with_opt_out.is_ok(), "neither flag implies consolidate");
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bench")
+            .expect("bench")
+            .find_subcommand_mut("writes")
+            .expect("writes")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--quote-strip-code"), "{help}");
+        assert!(help.contains("--consolidate-near-key"), "{help}");
+        assert!(!help.contains("--no-quote-strip-code"), "{help}");
+        assert!(!help.contains("--no-consolidate-near-key"), "{help}");
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
     fn extract_key_forms_is_its_own_bench_flag() {
         let only = Cli::try_parse_from([
             "recall-echo",
@@ -3475,6 +3576,8 @@ mod tests {
             no_alternative_details: false,
             replaces_prefix: false,
             value_suffix: false,
+            quote_strip_code: false,
+            consolidate_near_key: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],
