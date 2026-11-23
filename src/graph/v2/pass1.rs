@@ -478,6 +478,7 @@ pub(crate) async fn extract_session(
         &mut report,
     )
     .await?;
+    report.value_suffix_supports = ground.value_suffix_supports();
     Ok(report)
 }
 
@@ -6966,6 +6967,8 @@ mod tests {
         .unwrap();
         assert!(!replaces_prefix_enabled(dir.path()));
         assert!(value_suffix_enabled(dir.path()));
+        let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
+        assert!(!encoded.contains("value_suffix_supports"), "{encoded}");
     }
 
     #[cfg(feature = "embedded")]

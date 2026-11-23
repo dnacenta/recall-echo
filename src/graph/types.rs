@@ -1331,6 +1331,10 @@ pub struct IngestionReport {
     /// switch is off.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub key_form_bound: u32,
+    /// Support checks that missed strictly and passed only through a suffix variant.
+    /// Omitted when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub value_suffix_supports: u32,
     /// Entity resolution for this session. Blank on v1.
     #[serde(default, skip_serializing_if = "ResolveStats::is_blank")]
     pub resolve: ResolveStats,
@@ -1581,14 +1585,17 @@ mod tests {
         let blank = serde_json::to_value(IngestionReport::default()).unwrap();
         assert!(blank.get("detail_tail_stripped").is_none(), "{blank}");
         assert!(blank.get("key_form_bound").is_none(), "{blank}");
+        assert!(blank.get("value_suffix_supports").is_none(), "{blank}");
         let report = IngestionReport {
             detail_tail_stripped: 1,
             key_form_bound: 2,
+            value_suffix_supports: 3,
             ..IngestionReport::default()
         };
         let encoded = serde_json::to_value(&report).unwrap();
         assert_eq!(encoded["detail_tail_stripped"], 1);
         assert_eq!(encoded["key_form_bound"], 2);
+        assert_eq!(encoded["value_suffix_supports"], 3);
         assert!(
             blank.get("alternative_details_attached").is_none(),
             "{blank}"
