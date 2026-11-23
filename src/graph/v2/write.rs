@@ -201,7 +201,6 @@ pub(crate) struct WriteCtx<'a> {
     pub rule_replaces_on: bool,
     /// Count a cut-off rule `replaces` as the match on the cue and departure paths.
     /// Off leaves that match unchanged.
-    #[allow(dead_code)]
     pub replaces_prefix_on: bool,
     /// Characters kept from a known value, and the cut width the replaces closes use.
     /// 80 unless the long-value switch applies.

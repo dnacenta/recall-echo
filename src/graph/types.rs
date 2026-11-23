@@ -923,6 +923,10 @@ pub struct ConsolidateReport {
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_departure: Option<u32>,
+    /// Closes whose rule match held only through a cut-off prefix.
+    /// Absent when zero, including when the switch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_prefix: Option<u32>,
     /// Anchors added because `replaces` was named in an earlier turn.
     /// Absent when zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1182,6 +1186,7 @@ impl ConsolidateReport {
             self.pair_via_replaces,
             self.replaces_cue_uses,
             self.replaces_departure,
+            self.replaces_prefix,
             self.anchor_earlier_turn,
             self.pair_via_earlier_turn,
             self.anchor_earlier_turn_skipped,
@@ -1903,6 +1908,26 @@ mod tests {
         let encoded = serde_json::to_value(&zeros).unwrap();
         assert_eq!(encoded["cross_key_replaces_unit_blocked"], 0);
         assert_eq!(encoded["rule_replaces_ambiguous"], 0);
+    }
+
+    #[test]
+    fn replaces_prefix_counter_is_omitted_when_zero() {
+        let encoded = serde_json::to_value(ConsolidateReport::default()).unwrap();
+        assert!(encoded.get("replaces_prefix").is_none());
+        let closed = ConsolidateReport {
+            replaces_prefix: Some(1),
+            ..ConsolidateReport::default()
+        };
+        assert!(!closed.is_blank());
+        let encoded = serde_json::to_value(&closed).unwrap();
+        assert_eq!(encoded["replaces_prefix"], 1);
+        let zeros = ConsolidateReport {
+            replaces_prefix: Some(0),
+            ..ConsolidateReport::default()
+        };
+        assert!(zeros.is_blank());
+        let encoded = serde_json::to_value(&zeros).unwrap();
+        assert_eq!(encoded["replaces_prefix"], 0);
     }
 
     #[test]
