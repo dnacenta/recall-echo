@@ -5247,6 +5247,7 @@ fn post_switches(ctx: &WriteCtx<'_>) -> bool {
         || ctx.rule_fragments_on
         || ctx.retire_component_on
         || ctx.component_takeover_on
+        || ctx.component_old_value_on
         || ctx.retire_reason_on
         || ctx.cross_key_replaces_on
         || ctx.rule_replaces_on
