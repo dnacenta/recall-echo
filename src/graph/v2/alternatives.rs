@@ -448,8 +448,7 @@ mod tests {
         assert_eq!(pairing.ambiguous, 0);
     }
 
-    #[test]
-    fn flag_off_pairs_nothing() {
+    fn library_alternative() -> (Vec<Fact>, Vec<Turn>) {
         let facts = vec![
             uses(
                 "acme",
@@ -471,11 +470,32 @@ mod tests {
             ),
         ];
         let turns = vec![turn(0, "use the stdparser, not htmlkit")];
+        (facts, turns)
+    }
+
+    #[test]
+    fn default_on_attaches_the_related_alternative() {
+        let (facts, turns) = library_alternative();
+        let pairing = pair_for_ingest(true, &facts, &turns);
+        assert_eq!(pairing.ambiguous, 0);
+        assert_eq!(
+            pairing.details,
+            vec![Some("rejected: htmlkit".into()), None]
+        );
+        assert_eq!(pairing.parts[0][0].reason, "R1");
+    }
+
+    #[test]
+    fn opt_out_pairs_nothing() {
+        let (facts, turns) = library_alternative();
         let off = pair_for_ingest(false, &facts, &turns);
         assert!(off.details.iter().all(Option::is_none));
         assert!(off.parts.iter().all(Vec::is_empty));
         assert_eq!(off.ambiguous, 0);
-        assert!(pair(&facts, &turns).details[0].is_some());
+        assert_eq!(
+            pair(&facts, &turns).details[0].as_deref(),
+            Some("rejected: htmlkit")
+        );
     }
 
     #[test]

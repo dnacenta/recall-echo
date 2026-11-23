@@ -324,8 +324,12 @@ pub struct OptOuts {
     /// Implies nothing. An opt-out run does not write it.
     pub known_long_values: bool,
     /// Write `alternative_details = true`. False leaves the key out.
-    /// Implies nothing.
+    /// The default is on, so an omitted key stays on. Implies nothing.
+    /// An opt-out run does not set this; it sets [`Self::no_alternative_details`].
     pub alternative_details: bool,
+    /// Write `alternative_details = false`. False leaves the key out.
+    /// [`Self::alternative_details`] wins when both are set.
+    pub no_alternative_details: bool,
 }
 
 impl OptOuts {
@@ -357,6 +361,7 @@ impl OptOuts {
             consolidate_rule_replaces: false,
             known_long_values: false,
             alternative_details: false,
+            no_alternative_details: true,
         }
     }
 }
@@ -972,10 +977,12 @@ fn switch_lines(
         opt_outs.known_long_values,
         "known_long_values = true",
     );
-    push_line(
+    push_switch(
         &mut lines,
         opt_outs.alternative_details,
+        opt_outs.no_alternative_details,
         "alternative_details = true",
+        "alternative_details = false",
     );
     lines
 }
@@ -4034,6 +4041,75 @@ mod tests {
         let loaded: crate::config::Config = toml::from_str(&text).unwrap();
         let graph = loaded.graph.expect("graph");
         assert!(graph.alternative_details);
+        assert!(!graph.extract_value_details);
+        assert!(graph.consolidate);
+    }
+
+    #[test]
+    fn alternative_details_defaults_on_and_opt_out_writes_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts::default(),
+        )
+        .unwrap();
+        assert!(!crate::config::config_path(&memory).exists());
+        assert!(
+            crate::config::load_from_dir(&memory)
+                .graph
+                .unwrap_or_default()
+                .alternative_details
+        );
+
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts {
+                no_alternative_details: true,
+                ..OptOuts::default()
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert_eq!(text, "[graph]\nalternative_details = false\n");
+        assert!(!text.contains("extract_value_details"), "{text}");
+        assert!(!text.contains("consolidate"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        let graph = loaded.graph.expect("graph");
+        assert!(!graph.alternative_details);
         assert!(!graph.extract_value_details);
         assert!(graph.consolidate);
     }

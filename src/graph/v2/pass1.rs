@@ -6891,7 +6891,7 @@ mod tests {
     #[test]
     fn alternative_details_reads_only_its_own_flag() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!alternative_details_enabled(dir.path()));
+        assert!(alternative_details_enabled(dir.path()));
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
             "[graph]\nalternative_details = false\nextract_value_details = true\n",
@@ -6899,6 +6899,13 @@ mod tests {
         .unwrap();
         assert!(!alternative_details_enabled(dir.path()));
         assert!(value_details_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nextract_value_details = false\n",
+        )
+        .unwrap();
+        assert!(alternative_details_enabled(dir.path()));
+        assert!(!value_details_enabled(dir.path()));
         std::fs::write(
             dir.path().join(".recall-echo.toml"),
             "[graph]\nalternative_details = true\nextract_value_details = false\n",
