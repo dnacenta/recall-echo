@@ -35,6 +35,7 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate = true          # post-write consolidation; on by default; set false to opt out
 # consolidate_hold = true     # hold a conflicting write; on by default, ignored unless consolidate is on
 # drop_restatements = true    # drop a decided rule that only restates a same-session setting; on by default
+# alternative_details = true  # store an optional details string on a new uses edge; on by default; set false to opt out; implies nothing
 # consolidate_links = true    # record derived_from on new settings and rules; on by default, ignored unless consolidate is on
 # ground_component_edges = true # accept a decided component part_of the session project when the turn names the component; on by default
 # consolidate_components = true # close a sibling or derived-from partner after the judge; on by default, ignored unless consolidate is on
@@ -57,7 +58,6 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_rule_replaces = false # close one earlier rule that replaces names; off by default, ignored unless consolidate is on
 # known_long_values = false   # show known-fact values up to 200 characters instead of 80; off by default, ignored unless known_facts_context is on
 # drop_generic_uses = false   # drop a decided language-role uses edge and a planned release status; off by default
-# alternative_details = false # store an optional details string on a new uses edge; off by default; implies nothing
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call

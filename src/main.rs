@@ -361,8 +361,9 @@ enum BenchCommands {
         /// Off unless set. Implies nothing.
         #[arg(long)]
         drop_generic_uses: bool,
-        /// Write `alternative_details = true` for this run only.
-        /// Off unless set. Implies nothing.
+        /// Attach a related uses alternative as details on a new uses edge.
+        /// On unless `--no-alternative-details`. Writes
+        /// `alternative_details = true` for this run. Implies nothing.
         #[arg(long)]
         alternative_details: bool,
         /// Turn the known-facts block off for this run.
@@ -426,6 +427,9 @@ enum BenchCommands {
         /// Turn component-edge grounding off for this run.
         #[arg(long, conflicts_with = "ground_component_edges")]
         no_ground_component_edges: bool,
+        /// Turn alternative details off for this run.
+        #[arg(long, conflicts_with = "alternative_details")]
+        no_alternative_details: bool,
     },
     /// List raw-turn values missing from a store. Writes nothing.
     RecoverReplay {
@@ -1234,6 +1238,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
             no_known_key_binding,
             no_drop_restatements,
             no_ground_component_edges,
+            no_alternative_details,
         } => run_writes(
             script,
             work_dir,
@@ -1342,6 +1347,7 @@ fn run_bench(command: BenchCommands) -> Result<(), recall_echo::error::RecallErr
                 consolidate_rule_replaces,
                 known_long_values,
                 alternative_details,
+                no_alternative_details,
             },
         ),
         BenchCommands::RecoverReplay { memory_dir } => bench_recover_replay(memory_dir),
@@ -2920,6 +2926,7 @@ mod tests {
                     BenchCommands::Writes {
                         consolidate,
                         alternative_details,
+                        no_alternative_details,
                         extract_value_details,
                         recover_turns,
                         known_facts_context,
@@ -2928,6 +2935,7 @@ mod tests {
                     },
             } => {
                 assert!(alternative_details);
+                assert!(!no_alternative_details);
                 assert!(!extract_value_details);
                 assert!(!consolidate);
                 assert!(!recover_turns);
@@ -2936,6 +2944,43 @@ mod tests {
             }
             _ => panic!("bench writes"),
         }
+
+        let opted_out = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--no-alternative-details",
+        ])
+        .expect("parse opt-out");
+        match opted_out.command.expect("command") {
+            Commands::Bench {
+                command:
+                    BenchCommands::Writes {
+                        alternative_details,
+                        no_alternative_details,
+                        extract_value_details,
+                        ..
+                    },
+            } => {
+                assert!(!alternative_details);
+                assert!(no_alternative_details);
+                assert!(!extract_value_details);
+            }
+            _ => panic!("bench writes"),
+        }
+
+        let both = Cli::try_parse_from([
+            "recall-echo",
+            "bench",
+            "writes",
+            "--script",
+            "facts.toml",
+            "--alternative-details",
+            "--no-alternative-details",
+        ]);
+        assert!(both.is_err(), "on and opt-out together should be rejected");
 
         let mut command = Cli::command();
         let help = command
@@ -2946,7 +2991,7 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("--alternative-details"), "{help}");
-        assert!(!help.contains("--no-alternative-details"), "{help}");
+        assert!(help.contains("--no-alternative-details"), "{help}");
     }
 
     #[cfg(feature = "bench")]
@@ -3326,6 +3371,7 @@ mod tests {
             known_long_values: false,
             drop_generic_uses: false,
             alternative_details: false,
+            no_alternative_details: false,
             known_key_binding: f[12],
             drop_restatements: f[13],
             ground_component_edges: f[14],
