@@ -4286,6 +4286,36 @@ fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     }
 }
 
+/// List issue records still open, oldest first. Reads only.
+pub async fn open_items(memory_dir: &Path, include_closed: bool) -> Result<(), RecallError> {
+    print!("{}", render_open_items(memory_dir, include_closed).await?);
+    Ok(())
+}
+
+/// The text [`open_items`] prints. Forgotten values are masked when the flag is on.
+pub async fn render_open_items(
+    memory_dir: &Path,
+    include_closed: bool,
+) -> Result<String, RecallError> {
+    if !memory_dir.join("graph").exists() {
+        return Err(RecallError::NotInitialized(
+            "Graph store not initialized. Run `recall-echo graph init` first.".into(),
+        ));
+    }
+    serve_client::exclusive(memory_dir, |gm| async move {
+        let mask = crate::graph::forgotten::read_mask(memory_dir)?;
+        let items = gm.open_items(include_closed).await?;
+        let mut out = String::new();
+        push_masked(
+            &mut out,
+            mask.as_ref(),
+            &crate::inspect_cli::render_open_items(&items, include_closed),
+        );
+        Ok(out)
+    })
+    .await
+}
+
 /// Show relationship decay report — lists all relationships with their stored vs effective confidence.
 pub async fn decay_report(
     memory_dir: &Path,

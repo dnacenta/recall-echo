@@ -530,7 +530,11 @@ async fn execute_graph(
         )?,
         Request::Correct(args) => serde_json::to_value(correct_guarded(graph, args).await?)?,
         Request::Overview(args) => {
-            serde_json::to_value(graph.overview(clamp_per_type(args.per_type)).await?)?
+            let mut overview = graph.overview(clamp_per_type(args.per_type)).await?;
+            if open_loops_on(memory_of(graph)) {
+                overview.open_items = Some(graph.open_items(false).await?);
+            }
+            serde_json::to_value(overview)?
         }
         Request::About(args) => {
             serde_json::to_value(graph.about(&args.topic, clamp_limit(args.limit)).await?)?
@@ -569,6 +573,14 @@ fn request_returns_text(request: &Request) -> bool {
 
 fn memory_of(graph: &GraphMemory) -> &Path {
     graph.path().parent().unwrap_or(graph.path())
+}
+
+/// The overview lists open items only when `graph.open_loops` is on.
+fn open_loops_on(memory: &Path) -> bool {
+    crate::config::load_from_dir(memory)
+        .graph
+        .unwrap_or_default()
+        .open_loops
 }
 
 async fn correct_guarded(
@@ -2247,6 +2259,73 @@ mod tests {
         assert!(message.contains("stamped pipeline v2"), "{message}");
         assert_eq!(gm.stats().await.unwrap().relationship_count, 0);
         assert_eq!(gm.stats().await.unwrap().entity_count, 2);
+    }
+
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    async fn the_overview_lists_open_items_only_with_open_loops_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = dir.path().join("memory");
+        let graph = memory.join("graph");
+        std::fs::create_dir_all(&graph).unwrap();
+        let gm = GraphMemory::open_embedded(&graph).await.unwrap();
+        let slot = |value: &str, since: &str| {
+            serde_json::json!({
+                "predicate": "issue_status", "key": "", "value": value,
+                "status": "decided", "provenance": "self", "valid_from": since,
+                "valid_until": null, "ended_by": null,
+                "evidence": [{"session": "s1", "turn": 1, "quote": "q", "role": "self"}],
+            })
+        };
+        for (id, name, value, since) in [
+            ("login", "login fails", "open", "2026-03-01"),
+            ("export", "export drops rows", "fixed", "2026-03-02"),
+        ] {
+            gm.db()
+                .query(format!(
+                    "CREATE entity:{id} SET name = $name, entity_type = 'issue', abstract = '', overview = '', attributes = $attributes"
+                ))
+                .bind(("name", name.to_string()))
+                .bind((
+                    "attributes",
+                    serde_json::json!({"v2": {"kind": "issue", "slots": [slot(value, since)]}}),
+                ))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        let request = Request::Overview(OverviewArgs { per_type: 3 });
+
+        let off = dispatch_graph(&gm, &request).await;
+        assert!(off.ok, "{off:?}");
+        let data = off.data.expect("data");
+        assert!(data.get("open_items").is_none(), "{data}");
+        let text = crate::inspect_cli::render_overview(&serde_json::from_value(data).unwrap());
+        assert!(!text.contains("Open items"), "{text}");
+
+        std::fs::write(
+            memory.join(".recall-echo.toml"),
+            "[graph]\nopen_loops = true\n",
+        )
+        .unwrap();
+        let on = dispatch_graph(&gm, &request).await;
+        assert!(on.ok, "{on:?}");
+        let overview: crate::graph::inspect::MemoryOverview =
+            serde_json::from_value(on.data.expect("data")).unwrap();
+        let names: Vec<&str> = overview
+            .open_items
+            .as_deref()
+            .expect("open items")
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert_eq!(names, ["login fails"]);
+        let text = crate::inspect_cli::render_overview(&overview);
+        assert!(text.contains("Open items"), "{text}");
+        assert!(text.contains("— open since 2026-03-01"), "{text}");
+        // The closed item is still an entity, but not an open item.
+        assert!(!text.contains("fixed since"), "{text}");
     }
 
     #[cfg(feature = "embedded")]
