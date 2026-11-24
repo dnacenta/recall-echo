@@ -1622,6 +1622,14 @@ kind = "latest"
         assert_eq!(question.needs, ["F02"]);
         assert_eq!(question.absent, ["F01"]);
         assert_eq!(question.answer, new.object);
+        // A current-value question. `stale` is left out and filled from the
+        // pair, so the old value is the one the recall window is scanned for.
+        assert_eq!(question.kind, QuestionKind::CurrentValue);
+        assert!(question.stale.is_none());
+        assert_eq!(
+            script.stale_values(question).unwrap(),
+            [old.object.as_str()]
+        );
     }
 
     #[test]

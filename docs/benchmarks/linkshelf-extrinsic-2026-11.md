@@ -87,3 +87,15 @@ v1 9 / 4 / 5, v2 6 / 3 / 3.
   tried and removed, so yes means memory still offers it. v2 refuses it; v1
   keeps it live.
 - On this fixture the 8k and 24k columns agree on every row.
+
+## Silent setting change (eval case)
+
+`tests/fixtures/writes/silent-change/script.toml` is an eval case, not a
+close. s1 states a 12-second client timeout and a 50-item batch size; s2
+states a 48-second timeout with no replacement cue and without naming the old
+value. The gold wants only the new timeout and the batch size live. Its one
+current-value question takes its stale value (`12 seconds`) from the
+superseded pair. On current main the pipeline is expected to leave the old
+value live, so a real run is expected to miss this case. Unit tests keep s2
+cue-free and pin the grader on two synthetic stores, a clean close and one
+with the old value still live. No run is recorded here.

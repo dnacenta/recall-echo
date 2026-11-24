@@ -88,5 +88,6 @@ retire_in = "s2"
 [[questions]]
 text = "what is the client timeout"
 answer = "48 seconds"
+kind = "current_value"
 needs = ["F02"]
 absent = ["F01"]

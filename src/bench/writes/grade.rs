@@ -2969,6 +2969,103 @@ mod tests {
         assert!(!report.questions[0].graph_hit);
     }
 
+    fn silent_change() -> FactScript {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/silent-change/script.toml");
+        super::super::script::load_script(&path).unwrap()
+    }
+
+    /// The store edge for fact `id`, under that fact's own key and value.
+    fn fact_edge(script: &FactScript, id: &str, live: bool) -> ObservedEdge {
+        let fact = script.fact(id).unwrap();
+        ObservedEdge {
+            subject: fact.subject.clone(),
+            relation: fact.relation.clone(),
+            ..edge(id, &fact.object, live, 9.0, 1.0, 0)
+        }
+    }
+
+    /// s1 writes the old timeout and the batch size. s2 writes the new
+    /// timeout and, when `retired`, closes the old one.
+    fn grade_silent_change(retired: bool) -> WriteReport {
+        let script = silent_change();
+        let after_s1 = vec![
+            fact_edge(&script, "F01", true),
+            fact_edge(&script, "F03", true),
+        ];
+        let after_s2 = vec![
+            fact_edge(&script, "F01", !retired),
+            fact_edge(&script, "F02", true),
+            fact_edge(&script, "F03", true),
+        ];
+        let sessions = vec![
+            obs("s1", vec![], after_s1.clone()),
+            obs("s2", after_s1, after_s2),
+        ];
+        grade(
+            &script,
+            &sessions,
+            &weights(),
+            &[false],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_silent_change_that_closes_the_old_value_grades_clean() {
+        let report = grade_silent_change(true);
+        let patterns = report.patterns.as_ref().expect("pattern section");
+        assert_eq!(patterns.retired.ids, ids(&["F01->F02"]));
+        assert!(patterns.premature.ids.is_empty());
+        // The old value is found on its closed row, so all three are complete.
+        assert_eq!(patterns.complete.ids, ids(&["F01", "F02", "F03"]));
+        assert!(patterns.wrong.ids.is_empty());
+        assert!(patterns.unmatched.ids.is_empty());
+        // Every expect line holds: the old timeout is closed, the new one
+        // and the batch size are live.
+        assert!(report.wrong_facts.is_empty(), "{:?}", report.wrong_facts);
+        assert!(report.junk_edges.is_empty());
+        assert_eq!(report.operations.create, full(2));
+        assert_eq!(report.operations.supersede, full(1));
+        assert!(report.steps.iter().all(|step| step.matched));
+        let question = &report.questions[0];
+        assert!(question.graph_hit);
+        assert!(question.store_hit);
+        assert!(!super::super::extrinsic::store_hit(
+            &report.final_edges,
+            "12 seconds"
+        ));
+    }
+
+    #[test]
+    fn a_silent_change_that_leaves_the_old_value_live_fails() {
+        let report = grade_silent_change(false);
+        let patterns = report.patterns.as_ref().expect("pattern section");
+        assert!(patterns.retired.ids.is_empty());
+        assert!(patterns.premature.ids.is_empty());
+        assert_eq!(patterns.wrong.ids, ids(&["F01"]));
+        assert_eq!(patterns.wrong.reasons, vec![PatternWrongReason::StillLive]);
+        assert_eq!(
+            report.wrong_facts,
+            vec![WrongFact {
+                fact: "F01".into(),
+                reason: WrongReason::StillLive,
+            }]
+        );
+        assert_eq!(report.operations.supersede.tp, 0);
+        assert_eq!(report.operations.supersede.missed, 1);
+        let question = &report.questions[0];
+        assert!(!question.graph_hit);
+        // The store channel only looks for the answer, and the new value is
+        // live. The old value is live beside it.
+        assert!(question.store_hit);
+        assert!(super::super::extrinsic::store_hit(
+            &report.final_edges,
+            "12 seconds"
+        ));
+    }
+
     #[test]
     fn an_unknown_edge_is_junk_and_a_false_create() {
         let user = weights().weight_user;
