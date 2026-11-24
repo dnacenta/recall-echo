@@ -31,6 +31,7 @@ use tokio::sync::Notify;
 
 use crate::error::RecallError;
 use crate::graph::correct::{CorrectTarget, Correction, CorrectionReport, Removal};
+use crate::graph::embed;
 use crate::graph::error::GraphError;
 use crate::graph::forgotten::{self, ForgetLock, ManualWrite};
 use crate::graph::types::{
@@ -1264,12 +1265,12 @@ async fn release_store(graph: Arc<GraphMemory>, log: &DaemonLog) {
 /// Load the ONNX embedding model in the background, so the first request that
 /// needs an embedding does not pay for it inline.
 ///
-/// Skipped while the model cache is empty: warming a cold cache downloads the
-/// model, which must stay tied to a request that actually needs it rather than
-/// happening on every daemon start.
+/// Skipped unless the model is fully cached where the loader reads it:
+/// warming a cold cache downloads the model, which must stay tied to a request
+/// that actually needs it rather than happening on every daemon start.
 fn warm_embedder(graph: Arc<GraphMemory>, log: Arc<DaemonLog>) {
-    let models_dir = crate::graph::embed::models_dir(graph.path());
-    if !has_cached_model(&models_dir) {
+    let models_dir = embed::models_dir(graph.path());
+    if !embed::model_cached(&embed::effective_cache_dir(&models_dir)) {
         return;
     }
     tokio::task::spawn_blocking(move || {
@@ -1368,10 +1369,6 @@ async fn stop_background_extraction(worker: Option<tokio::task::JoinHandle<()>>,
         worker.abort();
         log.log("background extraction did not stop in time — abandoned mid-archive");
     }
-}
-
-fn has_cached_model(models_dir: &Path) -> bool {
-    std::fs::read_dir(models_dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 async fn accept_loop(

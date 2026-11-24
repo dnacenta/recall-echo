@@ -61,6 +61,7 @@ use crate::agent_cli::{self, AgentCli, McpReport, McpStatus};
 use crate::claude_settings;
 use crate::config::{self, Config, LlmSection, Provider};
 use crate::error::RecallError;
+use crate::graph::embed;
 use crate::paths;
 use crate::rules_file;
 use crate::theme::{BAD, BOLD, DIM, GOOD, RESET, WARN};
@@ -410,13 +411,12 @@ fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOu
         return WarmOutcome::Skipped("sandboxed configuration roots");
     }
 
-    let models_dir = crate::graph::embed::models_dir(&memory_dir.join("graph"));
+    let models_dir = embed::models_dir(&memory_dir.join("graph"));
     if let Err(e) = fs::create_dir_all(&models_dir) {
         return WarmOutcome::Failed(format!("could not create {}: {e}", models_dir.display()));
     }
 
-    let cached = fs::read_dir(&models_dir).is_ok_and(|mut entries| entries.next().is_some());
-    if cached {
+    if embed::model_cached(&embed::effective_cache_dir(&models_dir)) {
         eprintln!("  {DIM}… loading the embedding model{RESET}");
     } else {
         eprintln!(
@@ -425,7 +425,7 @@ fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOu
         );
     }
 
-    match crate::graph::embed::FastEmbedder::new(&models_dir) {
+    match embed::FastEmbedder::new(&models_dir) {
         Ok(_) => WarmOutcome::Ready,
         Err(e) => WarmOutcome::Failed(e.to_string()),
     }

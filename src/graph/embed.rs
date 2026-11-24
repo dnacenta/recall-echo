@@ -41,17 +41,30 @@ pub fn models_dir(store: &Path) -> PathBuf {
     resolve_models_dir(store, std::env::var_os(MODELS_DIR_ENV).as_deref())
 }
 
+/// The cache the embedding crate reads for `cache_dir`: `HF_HOME` when it is
+/// set, else `cache_dir`.
+pub(crate) fn effective_cache_dir(cache_dir: &Path) -> PathBuf {
+    resolve_effective_cache_dir(cache_dir, std::env::var("HF_HOME").ok().as_deref())
+}
+
+/// [`effective_cache_dir`] with the `HF_HOME` value passed in.
+fn resolve_effective_cache_dir(cache_dir: &Path, hf_home: Option<&str>) -> PathBuf {
+    hf_home.map_or_else(|| cache_dir.to_path_buf(), PathBuf::from)
+}
+
+/// Whether every model and tokenizer file is in the hub cache at `dir`.
+pub(crate) fn model_cached(dir: &Path) -> bool {
+    let repo = hf_hub::Cache::new(dir.to_path_buf()).model(MODEL_REPO.to_string());
+    MODEL_FILES.iter().all(|file| repo.get(file).is_some())
+}
+
 /// The error for an offline run whose cache in `dir` lacks a model or
 /// tokenizer file; `None` when the embedding crate may be called.
 ///
 /// The hub client does not honour `HF_HUB_OFFLINE`: handed an empty cache,
 /// it downloads the model anyway.
 pub fn offline_cache_missing(dir: &Path, offline: bool) -> Option<String> {
-    if !offline {
-        return None;
-    }
-    let repo = hf_hub::Cache::new(dir.to_path_buf()).model(MODEL_REPO.to_string());
-    if MODEL_FILES.iter().all(|file| repo.get(file).is_some()) {
+    if !offline || model_cached(dir) {
         return None;
     }
     Some(format!(
@@ -86,9 +99,7 @@ impl FastEmbedder {
     pub fn new(cache_dir: &Path) -> Result<Self, GraphError> {
         // The embedding crate reads HF_HOME in place of `cache_dir`, so that
         // is the cache to check.
-        let effective_dir = std::env::var("HF_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| cache_dir.to_path_buf());
+        let effective_dir = effective_cache_dir(cache_dir);
         if let Some(message) = offline_cache_missing(&effective_dir, hub_offline()) {
             return Err(GraphError::Embed(message));
         }
@@ -217,10 +228,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn offline_cache_missing_is_none_for_a_complete_cache_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("models--Xenova--bge-small-en-v1.5");
+    /// A hub cache layout under `dir` with every model file present and empty.
+    fn write_complete_cache_layout(dir: &Path) {
+        let repo = dir.join("models--Xenova--bge-small-en-v1.5");
         let commit = "0123456789abcdef";
         std::fs::create_dir_all(repo.join("refs")).unwrap();
         std::fs::write(repo.join("refs").join("main"), commit).unwrap();
@@ -229,6 +239,45 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
         }
+    }
+
+    #[test]
+    fn offline_cache_missing_is_none_for_a_complete_cache_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_complete_cache_layout(tmp.path());
         assert_eq!(offline_cache_missing(tmp.path(), true), None);
+    }
+
+    #[test]
+    fn model_cached_is_false_for_an_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!model_cached(tmp.path()));
+    }
+
+    #[test]
+    fn model_cached_is_false_for_a_dir_with_an_unrelated_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cache.bin"), b"model").unwrap();
+        assert!(!model_cached(tmp.path()));
+    }
+
+    #[test]
+    fn model_cached_is_true_for_a_complete_cache_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_complete_cache_layout(tmp.path());
+        assert!(model_cached(tmp.path()));
+    }
+
+    #[test]
+    fn effective_cache_dir_prefers_hf_home_when_it_is_set() {
+        let cache_dir = Path::new("/srv/memory/graph/models");
+        assert_eq!(
+            resolve_effective_cache_dir(cache_dir, None),
+            cache_dir.to_path_buf()
+        );
+        assert_eq!(
+            resolve_effective_cache_dir(cache_dir, Some("/var/cache/hf")),
+            PathBuf::from("/var/cache/hf")
+        );
     }
 }
