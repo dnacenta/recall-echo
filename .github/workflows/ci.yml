@@ -42,10 +42,20 @@ jobs:
           path: ${{ github.workspace }}/.hf-cache
           key: hf-${{ runner.os }}-Xenova-bge-small-en-v1.5-v1
 
+      # One download into the shared dir on a cache miss; the test steps below
+      # are offline.
+      - name: Seed embedding model
+        if: steps.hf-cache.outputs.cache-hit != 'true'
+        run: cargo test --test graph_crud add_and_get_entity_by_name -- --exact --test-threads=1
+
       - name: Test
+        env:
+          HF_HUB_OFFLINE: "1"
         run: cargo test
 
       - name: Test (bench bin)
+        env:
+          HF_HUB_OFFLINE: "1"
         run: cargo test --features bench --bin recall-echo
 
       - name: Save embedding model
@@ -57,6 +67,11 @@ jobs:
 
       - name: E9 check
         run: cargo run --example e9_provenance_ablation -- check
+
+      # Plain `cargo test` must reach no embedder: an ungated embedding test
+      # fails on the offline guard here instead of downloading.
+      - name: Test (no models dir)
+        run: env -u RECALL_ECHO_MODELS_DIR HF_HUB_OFFLINE=1 cargo test
 
   dco:
     name: dco
