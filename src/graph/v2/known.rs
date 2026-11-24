@@ -1553,7 +1553,7 @@ mod tests {
                  consolidate_replaces_cue = false\n\
                  consolidate_replaces_departure = false\nknown_key_binding = false\n\
                  consolidate_orphan_sweep = false\nconsolidate_rule_fragments = false\n\
-                 consolidate_retire_component = false\n",
+                 consolidate_retire_component = false\nalternative_details = false\n",
             )
             .unwrap();
         }

@@ -27,7 +27,7 @@ use super::super::confidence::{EdgeEvidence, Evidence, ExtractionContext, Proven
 use super::super::crud;
 use super::super::error::GraphError;
 use super::super::llm::{LlmProvider, TokenUsage};
-use super::super::store::{define_derived_from, define_edge_details, Db};
+use super::super::store::{define_decided_in, define_derived_from, define_edge_details, Db};
 use super::super::types::Retirement;
 use super::super::{deserialize_take, GraphMemory};
 use super::ground::punctuation_literal;
@@ -408,6 +408,9 @@ pub(crate) async fn write_facts(
         .any(|details| details.as_ref().is_some_and(|text| !text.is_empty()))
     {
         define_edge_details(gm.db()).await?;
+    }
+    if ctx.component_old_value_on {
+        define_decided_in(gm.db()).await?;
     }
     commit_writes(gm, ctx, facts, &resolution, resolve_ms).await
 }
@@ -2059,6 +2062,18 @@ impl<'a> Attempt<'a> {
         if !id.starts_with("relates_to:") {
             self.stats.retirements_skipped += 1;
             return Ok(false);
+        }
+        if self.ctx.component_old_value_on {
+            // The component old-value pass reads the release session as the link's first.
+            self.tx
+                .query(
+                    "UPDATE type::record($id) SET pending = NONE, decided_in = $decided_in WHERE pending != NONE",
+                )
+                .bind(("id", id.to_string()))
+                .bind(("decided_in", self.ctx.session_id.to_string()))
+                .await?
+                .check()?;
+            return Ok(true);
         }
         self.tx
             .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE")

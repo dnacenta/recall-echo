@@ -498,7 +498,7 @@ impl SessionGround {
             return None;
         }
         let want: String = quote.chars().filter(|ch| *ch != '`').collect();
-        if want.trim().is_empty() {
+        if want.trim().chars().count() < MIN_QUOTE_CHARS {
             return None;
         }
         let found = self
@@ -2657,6 +2657,15 @@ mod tests {
         assert_eq!(on.cite(0, "` ` `").unwrap_err(), DROP_QUOTE);
         assert_eq!(on.cite(0, "``` ```").unwrap_err(), DROP_QUOTE);
         assert_eq!(on.quote_strip_code_cites(), 0);
+    }
+
+    #[test]
+    fn a_stripped_quote_under_three_characters_fails() {
+        let on = stripped(&[("Set `a` and `abc` as flags.", TurnRole::User)]);
+        assert_eq!(on.cite(0, "``a``").unwrap_err(), DROP_QUOTE);
+        assert_eq!(on.quote_strip_code_cites(), 0);
+        assert_eq!(on.cite(0, "``abc``").unwrap().quote, "abc");
+        assert_eq!(on.quote_strip_code_cites(), 1);
     }
 
     #[test]

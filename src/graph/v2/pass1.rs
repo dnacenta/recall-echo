@@ -5430,6 +5430,7 @@ mod tests {
             "consolidate_orphan_sweep",
             "consolidate_rule_fragments",
             "consolidate_retire_component",
+            "alternative_details",
         ];
         let mut body = String::from("[graph]\n");
         for key in KEYS {

@@ -58,6 +58,10 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_rule_replaces = false # close one earlier rule that replaces names; off by default, ignored unless consolidate is on
 # known_long_values = false   # show known-fact values up to 200 characters instead of 80; off by default, ignored unless known_facts_context is on
 # drop_generic_uses = false   # drop a decided language-role uses edge and a planned release status; off by default
+# replaces_prefix = false     # count a cut-off rule replaces as the match; off by default, ignored unless consolidate is on; implies nothing
+# value_suffix = false        # accept simple suffix variants when a value token misses the turn; off by default; implies nothing
+# quote_strip_code = false    # retry a missed quote with backticks ignored; off by default; implies nothing; enable only together with consolidate_near_key
+# consolidate_near_key = false # close an earlier setting whose key abbreviates the new key; off by default, ignored unless consolidate is on
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call
