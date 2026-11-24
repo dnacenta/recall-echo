@@ -1423,7 +1423,9 @@ async fn a_v1_store_with_a_symlinked_models_dir_rebuilds() {
     let outside = tempfile::tempdir().expect("models");
     std::fs::write(outside.path().join("cache.bin"), b"model").expect("cache");
     let models = memory.join("graph/models");
-    std::fs::remove_dir_all(&models).expect("remove models");
+    if models.exists() {
+        std::fs::remove_dir_all(&models).expect("remove models");
+    }
     std::os::unix::fs::symlink(outside.path(), &models).expect("symlink");
 
     rebuild(

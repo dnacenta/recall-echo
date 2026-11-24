@@ -135,7 +135,7 @@ impl GraphMemory {
             eprintln!("recall-echo: {}", migration.summary());
         }
 
-        let models_dir = path.join("models");
+        let models_dir = embed::models_dir(path);
         std::fs::create_dir_all(&models_dir)?;
         let embedder = LazyEmbedder::new(&models_dir);
 
@@ -195,7 +195,7 @@ impl GraphMemory {
             database: graph_section.database,
         };
 
-        let models_dir = path.join("models");
+        let models_dir = embed::models_dir(path);
         let mut gm = Self::connect(&server_config, &models_dir).await?;
         gm.scoring = scoring;
         gm.provenance = provenance;

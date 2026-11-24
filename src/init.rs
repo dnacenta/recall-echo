@@ -410,7 +410,7 @@ fn warm_embedding_model(memory_dir: &Path, roots: &paths::ConfigRoots) -> WarmOu
         return WarmOutcome::Skipped("sandboxed configuration roots");
     }
 
-    let models_dir = memory_dir.join("graph").join("models");
+    let models_dir = crate::graph::embed::models_dir(&memory_dir.join("graph"));
     if let Err(e) = fs::create_dir_all(&models_dir) {
         return WarmOutcome::Failed(format!("could not create {}: {e}", models_dir.display()));
     }

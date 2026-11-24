@@ -1268,7 +1268,7 @@ async fn release_store(graph: Arc<GraphMemory>, log: &DaemonLog) {
 /// model, which must stay tied to a request that actually needs it rather than
 /// happening on every daemon start.
 fn warm_embedder(graph: Arc<GraphMemory>, log: Arc<DaemonLog>) {
-    let models_dir = graph.path().join("models");
+    let models_dir = crate::graph::embed::models_dir(graph.path());
     if !has_cached_model(&models_dir) {
         return;
     }
