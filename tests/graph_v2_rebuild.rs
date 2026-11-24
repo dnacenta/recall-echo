@@ -396,6 +396,10 @@ async fn assert_swapped(memory: &Path) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn rebuild_swaps_and_keeps_backup() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -414,6 +418,10 @@ async fn rebuild_swaps_and_keeps_backup() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn failure_midway_keeps_graph() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -446,6 +454,10 @@ async fn failure_midway_keeps_graph() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn existing_build_dir_resumes() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -640,6 +652,10 @@ async fn an_unstamped_build_directory_is_refused() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_concurrent_exclusive_blocks_and_a_mid_build_log_is_in_the_new_store() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -754,6 +770,10 @@ fn extracted(row: &serde_json::Value) -> bool {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_half_finished_swap_is_refused_with_the_commands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -846,6 +866,10 @@ async fn a_removed_llm_key_and_server_mode_refuse_before_the_daemon_stops() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_short_episode_count_is_filled_on_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -919,6 +943,10 @@ async fn a_short_episode_count_is_filled_on_resume() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_zero_chunk_log_is_not_extracted_again_on_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -1051,6 +1079,10 @@ fn assert_contents(stored: &[String], expected: &[String]) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_missing_middle_chunk_is_filled_on_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -1085,6 +1117,10 @@ async fn a_missing_middle_chunk_is_filled_on_resume() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn identical_chunks_stay_two_episodes_on_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -1121,6 +1157,10 @@ async fn identical_chunks_stay_two_episodes_on_resume() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_leftover_episode_remains_when_resume_fills_current_chunks() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -1225,6 +1265,10 @@ async fn a_failed_stop_releases_the_admin_lock() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_second_rebuild_plans_after_it_takes_the_lock() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path().to_path_buf();
@@ -1337,6 +1381,10 @@ async fn a_v2_store_is_refused_without_force() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_forced_rebuild_of_a_v2_store_swaps_and_keeps_a_backup() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -1379,6 +1427,10 @@ async fn a_dry_run_on_a_v2_store_without_a_daemon_writes_nothing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_build_dir_resumes_without_a_stamp_check() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();
@@ -1416,6 +1468,10 @@ async fn a_build_dir_resumes_without_a_stamp_check() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_v1_store_with_a_symlinked_models_dir_rebuilds() {
     let dir = tempfile::tempdir().expect("temp dir");
     let memory = dir.path();

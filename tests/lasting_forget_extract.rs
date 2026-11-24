@@ -187,6 +187,10 @@ async fn slot_values(graph: &Path) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn rebuild_counts_a_forgotten_skip() {
     let dir = tempfile::tempdir().expect("temp");
     let memory = dir.path();
@@ -210,6 +214,10 @@ async fn rebuild_counts_a_forgotten_skip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn resume_counts_a_forgotten_skip() {
     let dir = tempfile::tempdir().expect("temp");
     let memory = dir.path();
@@ -248,6 +256,10 @@ async fn resume_counts_a_forgotten_skip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn extract_after_graph_ingest_skips_the_fact_and_consolidation_leaves_it_out() {
     let dir = tempfile::tempdir().expect("temp");
     let memory = dir.path();
@@ -286,6 +298,10 @@ async fn extract_after_graph_ingest_skips_the_fact_and_consolidation_leaves_it_o
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn an_ingested_transcript_skips_a_forgotten_fact_and_counts_it() {
     let dir = tempfile::tempdir().expect("temp");
     let memory = dir.path().to_path_buf();

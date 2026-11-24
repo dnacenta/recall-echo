@@ -356,6 +356,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_unstamped_store_still_syncs_pipeline_documents() {
         let tmp = tempfile::tempdir().unwrap();
         let gm = super::super::GraphMemory::open_embedded(&tmp.path().join("graph"))

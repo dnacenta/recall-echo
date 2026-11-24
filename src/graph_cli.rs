@@ -5283,6 +5283,10 @@ mod tests {
     /// clears, and a log that was never ingested has neither.
     #[cfg(all(feature = "llm", feature = "embedded"))]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn v2_extract_state_reads_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let gm = crate::graph::GraphMemory::open_embedded(&tmp.path().join("graph"))

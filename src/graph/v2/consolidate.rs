@@ -9478,6 +9478,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn no_anchors_does_not_call_or_define_the_table() {
         let (_tmp, gm) = open().await;
         let facts = [edge(
@@ -9505,6 +9509,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn prefilter_replaces_token_closes_without_a_call() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -9545,6 +9553,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn equal_values_are_not_superseded() {
         let (_tmp, gm) = open().await;
         let link = edge(
@@ -9586,6 +9598,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn verbatim_quote_and_cue_closes_only_the_stamp() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -9628,6 +9644,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn quote_missing_from_evidence_closes_nothing() {
         let report = judge_layout(
             "instead of plain text is not what was said",
@@ -9640,6 +9660,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn missing_departure_cue_closes_nothing() {
         let report = judge_layout(
             "plain text",
@@ -9675,6 +9699,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_supersedes_on_one_quote_close_nothing() {
         let (_tmp, gm) = open().await;
         let plank = setting(
@@ -9726,6 +9754,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_partner_outside_the_neighbourhood_is_not_paired() {
         let (_tmp, gm) = open().await;
         let link = edge(
@@ -9785,6 +9817,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn cap_sends_six_of_nine_in_a_stable_order() {
         let first = capped(9).await;
         let second = capped(9).await;
@@ -9803,6 +9839,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn four_pairs_make_one_structured_call() {
         let run = capped(4).await;
         assert_eq!(run.calls, 1);
@@ -9861,6 +9901,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_cached_pair_is_not_judged_again() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -9904,6 +9948,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn opened_here_and_enumerated_partners_are_not_paired() {
         let (_tmp, gm) = open().await;
         let listed = setting("acme", Kind::Project, "ink", "scarlet", "ink is scarlet");
@@ -9923,6 +9971,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn provider_error_and_bad_json_close_nothing() {
         for answer in [Answer::Err, Answer::Bad] {
             let (_tmp, gm) = open().await;
@@ -9948,6 +10000,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ingest_survives_a_judge_error_and_bad_json() {
         for answer in [Answer::Err, Answer::Bad] {
             let tmp = tempfile::tempdir().unwrap();
@@ -10009,6 +10065,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn hold_on_without_consolidate_opens_no_pending_row() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -10092,6 +10152,10 @@ mod tests {
     /// The probe: a one-letter duplicate quote, and a longer one, against the
     /// only live copy. Neither closes it.
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_duplicate_quote_does_not_close_the_only_live_copy() {
         for quote in ["p", "plain grid layout"] {
             let (_tmp, gm) = open().await;
@@ -10142,6 +10206,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_one_character_quote_closes_nothing() {
         let (report, slot) = judge_layout("t", "Switch to rich text instead of plain text.").await;
         assert_eq!(report.consolidate.calls, 1);
@@ -10154,6 +10222,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn quote_too_short_is_counted() {
         let (report, slot) =
             judge_layout("plain text", "Switch to rich text instead of plain text.").await;
@@ -10163,6 +10235,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn quote_not_verbatim_is_counted() {
         let (report, slot) = judge_layout(
             "instead of plain text is not what was said",
@@ -10176,6 +10252,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn missing_departure_cue_is_counted() {
         let (report, slot) = judge_layout(
             "plain text is still stored",
@@ -10214,6 +10294,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn replacement_phrase_closes_when_the_quote_names_the_new_value() {
         for quote in [
             "The layout is now sqlite for the index rows.",
@@ -10232,6 +10316,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn replacement_phrase_without_the_new_value_stays_dropped() {
         for quote in [
             "The layout is now ready for the index rows.",
@@ -10258,6 +10346,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn dry_run_wording_stays_dropped() {
         let quote = "dry run by default with --apply";
         let (report, slot) =
@@ -10269,6 +10361,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn additive_wording_stays_dropped() {
         for quote in [
             "also now supports sqlite in production",
@@ -10284,6 +10380,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_list_item_or_a_second_setting_stays_dropped() {
         let listed = "New layout: cedar, oak and pine for the rows.";
         let (report, slot) =
@@ -10310,6 +10410,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_phrase_outside_the_quote_does_not_count() {
         let quote = "Keep sqlite for the index rows.";
         let turn_text = "The layout is now ready today. Keep sqlite for the index rows.";
@@ -10330,6 +10434,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_replacement_supersedes_on_one_anchor_close_none() {
         let (_tmp, gm) = open().await;
         let walnut = setting(
@@ -10385,6 +10493,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_component_with_the_same_key_accepts_the_phrase() {
         let (_tmp, gm) = open().await;
         let link = edge(
@@ -10430,6 +10542,10 @@ mod tests {
     /// Negated, additive, questioned, hedged, listed or off-key phrasing
     /// never closes, even when the judge says supersedes.
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn hedged_or_off_key_phrasing_stays_dropped() {
         for quote in [
             "The layout is now not sqlite for the rows.",
@@ -10472,6 +10588,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn plain_replacements_still_close() {
         for (quote, new_key, new_value, old_key, old_value) in [
             (
@@ -10508,6 +10628,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn no_longer_before_the_new_value_still_closes() {
         for quote in [
             "The layout is no longer walnut; it is now sqlite.",
@@ -10547,6 +10671,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn second_supersede_on_one_anchor_is_counted() {
         let (_tmp, gm) = open().await;
         let plank = setting(
@@ -10586,6 +10714,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn duplicate_without_a_kept_copy_is_counted() {
         let (_tmp, gm) = open().await;
         let grid = setting(
@@ -10634,6 +10766,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_row_opened_this_session_is_counted() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -10664,6 +10800,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_row_already_closed_is_counted() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -10691,6 +10831,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_supersedes_with_different_quotes_close_none() {
         let (_tmp, gm) = open().await;
         let plank = setting(
@@ -10742,6 +10886,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_changed_partner_value_is_judged_again() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -10784,6 +10932,10 @@ mod tests {
 
     /// Two live copies, each judged a duplicate in one pass: one stays live.
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_duplicate_copies_keep_one_live() {
         let (_tmp, gm) = open().await;
         let layout = setting(
@@ -10846,6 +10998,10 @@ mod tests {
 
     /// A dependent past the row cap is still loaded when its owner was already seen.
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_selected_dependent_is_loaded_when_its_owner_is_already_seen() {
         let (_tmp, gm) = open().await;
         let quote = "delay is north pier marker";
@@ -10902,6 +11058,10 @@ mod tests {
 
     /// The part_of cap keeps the lowest edge ids, not an arbitrary 16.
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn neighbourhood_cap_keeps_the_lowest_edge_ids() {
         let (_tmp, gm) = open().await;
         let mut facts = vec![setting("acme", Kind::Project, "note", "acme note", "note")];
@@ -10954,6 +11114,10 @@ mod tests {
 
     /// A full incoming page counts only while component grounding is on.
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn part_of_children_truncated_counts_a_full_page_when_grounding() {
         let (_tmp, gm) = open().await;
         store_parts(&gm, 17).await;
@@ -11044,6 +11208,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn fenced_wrapped_and_prose_follow_the_count() {
         let turn_text = "Switch to rich text instead of plain text.";
         let fenced = format!(
@@ -11161,6 +11329,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn hold_off_writes_no_pending_field() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11185,6 +11357,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn hold_stores_the_new_value_pending_and_keeps_the_old_live() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11220,6 +11396,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_second_conflict_is_counted_as_a_skip() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11262,6 +11442,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_restatement_keeps_the_pending_value_and_records_evidence() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11303,6 +11487,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_mismatched_hold_reference_is_not_written() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11358,6 +11546,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_turn_cue_confirms_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11404,6 +11596,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_departure_confirms_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11457,6 +11653,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_reassertion_drops_the_pending_row() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11499,6 +11699,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ambiguous_evidence_keeps_the_hold_in_the_consolidation_batch() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11546,6 +11750,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_restated_replace_confirms_the_hold() {
         let (tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11626,6 +11834,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_third_value_does_not_promote_the_pending_rival() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11706,6 +11918,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_shared_short_value_does_not_bind_another_subject() {
         let (_tmp, gm) = open().await;
         let on = [turn("The flag is on.")];
@@ -11805,6 +12021,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_cue_without_a_close_leaves_the_row_pending() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11844,6 +12064,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_unrelated_replaces_name_does_not_release_an_edge_hold() {
         let (_tmp, gm) = open().await;
         let turns = [turn("acme links canvas")];
@@ -11907,6 +12131,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_live_copy_drops_the_pending_duplicate() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -11973,6 +12201,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_pending_uses_edge_stays_out_of_live_reads() {
         let (_tmp, gm) = open().await;
         let turns = [turn("acme links canvas")];
@@ -12013,6 +12245,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_unrelated_uses_edge_does_not_drop_a_roleless_hold() {
         let (_tmp, gm) = open().await;
         let turns = [turn("acme links canvas and rust")];
@@ -12077,6 +12313,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_same_role_uses_edge_drops_the_pending_hold() {
         let (_tmp, gm) = open().await;
         let mut canvas = edge(
@@ -12216,6 +12456,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_closed_conflict_releases_a_roleless_edge_hold() {
         let (_tmp, gm) = open().await;
         let canvas = edge(
@@ -12296,6 +12540,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_same_role_live_peer_does_not_release_an_edge_hold() {
         let (_tmp, gm) = open().await;
         let mut canvas = edge(
@@ -12485,6 +12733,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_mentioned_rival_is_dropped_beside_the_new_value() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12529,6 +12781,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn clearing_an_edge_without_pending_is_not_success() {
         let (_tmp, gm) = open().await;
         commit_flags(
@@ -12556,6 +12812,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_empty_hold_does_not_load_every_entity() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12569,6 +12829,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_split_turn_does_not_confirm_a_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12632,6 +12896,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_mention_drops_the_rival_beside_the_live_value() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12693,6 +12961,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_ambiguous_hold_reaches_the_judge_without_session_anchors() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12730,6 +13002,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_failed_consolidation_batch_leaves_the_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12776,6 +13052,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_failed_old_stamp_recovers_through_settle() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12828,6 +13108,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_failed_partner_close_recovers_through_the_judge() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12908,6 +13192,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_failed_pending_restore_does_not_leave_two_live_values() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -12961,6 +13249,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_supersedes_on_one_old_row_promote_one_hold() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -13069,6 +13361,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_rule_opened_this_session_keeps_its_new_anchor_only() {
         let (_tmp, gm) = open().await;
         let premise = uses("harbor", "queue", "harbor uses queue");
@@ -13147,6 +13443,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_rejected_premise_adds_a_live_dependent_anchor() {
         let (_tmp, gm) = open().await;
         let premise = uses("harbor", "queue", "harbor uses queue");
@@ -13211,6 +13511,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_superseded_premise_adds_a_live_dependent_anchor() {
         let (_tmp, gm) = open().await;
         let original = setting(
@@ -13274,6 +13578,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_replaced_premise_adds_a_live_dependent_anchor() {
         let (_tmp, gm) = open().await;
         let original = setting(
@@ -13324,6 +13632,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_dependent_without_a_partner_stays_live() {
         let (_tmp, gm) = open().await;
         let premise = uses("harbor", "queue", "harbor uses queue");
@@ -13370,6 +13682,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn promoted_and_consolidation_closes_add_no_derived_anchor() {
         let (_tmp, gm) = open().await;
         let mut considered = uses("harbor", "queue", "harbor might use queue");
@@ -13468,6 +13784,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn derived_anchors_keep_the_first_four_ids_and_share_the_pair_cap() {
         let (_tmp, gm) = open().await;
         let names = ["maple", "birch", "holly", "ivory", "ochre"];
@@ -13550,6 +13870,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn the_earliest_writer_close_supplies_turn_and_quote() {
         let (_tmp, gm) = open().await;
         let queue = uses("harbor", "queue", "harbor uses queue");
@@ -13629,6 +13953,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn hold_confirmation_still_runs_when_links_are_on() {
         let (_tmp, gm) = open().await;
         seed_binder(&gm).await;
@@ -13845,6 +14173,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_sibling_under_the_project_closes_when_components_are_on() {
         let off = sibling_port(false).await;
         let on = sibling_port(true).await;
@@ -13867,6 +14199,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_component_close_still_counts_when_key_rename_is_on() {
         let (judged, ended) = sibling_verdict(true, true, "supersedes").await;
         assert_eq!(judged.calls, 1, "{}", judged.message);
@@ -13971,6 +14307,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_derived_from_partner_closes_only_when_links_and_components_are_on() {
         let off = derived_storage(true, false, false).await;
         let on = derived_storage(true, true, false).await;
@@ -13995,6 +14335,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_ambiguous_close_event_makes_no_derived_link() {
         let judged = derived_storage(true, true, true).await;
         assert_eq!(judged.calls, 1);
@@ -14106,6 +14450,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_non_project_or_inactive_parent_is_not_a_sibling() {
         for kind in ["panel", "considered", "rejected", "closed"] {
             let judged = loose_parent(kind).await;
@@ -14118,6 +14466,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_sibling_supersedes_on_one_anchor_close_none() {
         let (_tmp, gm) = open().await;
         let mut facts = Vec::new();
@@ -14184,6 +14536,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_non_supersede_leaves_component_counters_at_zero() {
         for verdict in ["unrelated", "duplicate", "unsure"] {
             let (judged, ended) = sibling_verdict(true, false, verdict).await;
@@ -14200,6 +14556,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_pending_sibling_is_skipped_and_arms_no_hold() {
         let (_tmp, gm) = open().await;
         let widget = edge(
@@ -14280,6 +14640,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_partner_outside_the_neighbourhood_is_not_paired_with_components_on() {
         let (_tmp, gm) = open().await;
         let link = edge(
@@ -14469,6 +14833,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_same_named_component_in_another_project_is_not_closed() {
         let (_tmp, gm) = open().await;
         let widget = edge(
@@ -14801,6 +15169,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_linked_same_slot_number_closes_on_a_trailing_quote() {
         let quote = "Outbound timeout is 15 seconds now.";
         let off = quote_case(
@@ -14838,6 +15210,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn coverage_is_not_a_trailing_close() {
         for (value, quote) in [
             ("88%", "Coverage is 88% now."),
@@ -14864,6 +15240,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_unit_only_key_overlap_is_not_a_trailing_close() {
         let quote = "The shutdown wait is 15 seconds now.";
         let judged = quote_case(
@@ -14884,6 +15264,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn trailing_hedged_or_off_key_phrasing_stays_dropped() {
         for quote in [
             "Maybe the outbound timeout is 15 seconds now.",
@@ -14913,6 +15297,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_same_subject_pair_gets_no_trailing_waiver() {
         let quote = "The timeout is 15 seconds now.";
         let off = quote_case(
@@ -15296,6 +15684,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_path_key_rename_closes_only_when_the_flag_is_on() {
         let off = setting_rename(
             "layout",
@@ -15332,6 +15724,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_version_key_rename_needs_replaces_evidence() {
         let quote = "rust-version is now 1.80.";
         let on = setting_rename("rust_version", "1.80", "1.74", "msrv", "1.74", quote, true).await;
@@ -15353,6 +15749,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_key_overlapping_quote_adds_no_rename_counter() {
         let quote = "The layout is now sqlite for the index rows.";
         let off = setting_rename(
@@ -15376,6 +15776,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn key_rename_guards_stay_dropped() {
         let new_value = NEW_PATH;
         let old_value = OLD_PATH;
@@ -15424,6 +15828,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_restatement_stays_identical_with_the_flag_on() {
         let quote = "New layout: per-project folders under data.";
         let value = "per-project folders under data";
@@ -15446,6 +15854,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_key_disjoint_supersedes_close_none() {
         let (_tmp, gm) = open().await;
         let first = setting(
@@ -15503,6 +15915,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_component_subject_is_not_a_key_rename() {
         let (_tmp, gm) = open().await;
         let link = edge(
@@ -15554,6 +15970,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_pending_partner_is_skipped_and_arms_no_hold() {
         let (_tmp, gm) = open().await;
         let old = setting(
@@ -15615,6 +16035,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_becomes_quote_closes_only_when_the_flag_is_on() {
         let off = becomes_case(false, false).await;
         let on = becomes_case(true, false).await;
@@ -15701,6 +16125,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_becomes_quote_with_components_on_does_not_move_component_counters() {
         let off = becomes_case(false, true).await;
         let on = becomes_case(true, true).await;
@@ -15733,6 +16161,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn becomes_guards_and_a_different_number_slot_stay_dropped() {
         let old_value = "X-Acme-Signature: sha256=<hex>";
         let new_value = "t=<ts>,v1=<hex>";
@@ -15870,6 +16302,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_dropped_entity_closes_only_when_the_flag_is_on() {
         let quote = "Do that and drop Redis completely.";
         let off = entity_case(false, "acme", "Keep one Redis list per endpoint.", quote).await;
@@ -15887,6 +16323,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn entity_drop_guards_stay_dropped() {
         for quote in [
             "Maybe drop Redis completely now.",
@@ -16401,6 +16841,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_unique_replaces_match_keeps_a_short_quote_only_when_the_flag_is_on() {
         let quote = "8 attempts";
         let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
@@ -16429,6 +16873,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_long_quote_kept_by_replaces_does_not_count_the_relaxed_floor() {
         let quote = "Use 8 attempts from now on.";
         let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
@@ -16443,6 +16891,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_second_live_row_drops_the_replaces_pair_as_on_main() {
         let quote = "8 attempts";
         let extra = [("max_retries", "5")];
@@ -16462,6 +16914,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_disjoint_key_does_not_take_the_replaces_cue() {
         let quote = "Set the limit to 8 attempts total.";
         let off = run_setting_cue(quote, "workers", "5", &[], false).await;
@@ -16476,6 +16932,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_hedged_quote_does_not_take_the_replaces_cue() {
         let quote = "maybe 8 attempts";
         let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
@@ -16489,6 +16949,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_quote_that_misses_the_new_value_is_not_a_replaces_cue() {
         let quote = "the attempts";
         let off = run_setting_cue(quote, "retry_attempts", "5", &[], false).await;
@@ -16620,6 +17084,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_rule_replaces_pair_is_judged_and_closed_only_when_the_flag_is_on() {
         let off = run_rule_pair(false).await;
         let again = run_rule_pair(false).await;
@@ -16878,6 +17346,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_exact_replaces_closes_when_not_and_would_sit_away_from_the_value() {
         let off = run_exact_replaces(false).await;
         let again = run_exact_replaces(false).await;
@@ -16995,6 +17467,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac1_uses_setting_partner_cues_only_when_the_flag_is_on() {
         let off = sqlite_setting_case(false).await;
         let on = sqlite_setting_case(true).await;
@@ -17076,6 +17552,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac2_one_linked_uses_partner_cues_and_a_second_does_not() {
         let one = httpx_case(false, true).await;
         assert_eq!(one.calls, 1);
@@ -17137,6 +17617,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn out_of_set_uses_partners_keep_distinct_cache_keys() {
         let (_tmp, gm) = open().await;
         let facts = [
@@ -17287,6 +17771,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac5_earlier_turn_anchor_pairs_the_stored_row() {
         let on = earlier_json_case(true, true).await;
         assert_eq!(on.report.consolidate.anchor_earlier_turn, Some(1));
@@ -17425,6 +17913,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac9_flag_off_snapshots_match_for_uses_and_earlier_fixtures() {
         let setting_off = sqlite_setting_case(false).await;
         let setting_again = sqlite_setting_case(false).await;
@@ -17715,6 +18207,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_unloaded_earlier_subject_adds_no_anchor_and_no_pairs() {
         let off = unloaded_subject_case(false).await;
         let on = unloaded_subject_case(true).await;
@@ -17909,6 +18405,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t1_exact_replaces_departure_closes_without_relaxing_the_floor() {
         let off = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
         let on = run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", true, false).await;
@@ -17951,6 +18451,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t2_a_second_linked_rule_drops_as_on_main() {
         let off = run_rule_departure(
             "svc",
@@ -18000,6 +18504,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t3_another_subject_without_part_of_drops_as_on_main() {
         let off =
             run_rule_departure("acme", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
@@ -18016,6 +18524,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t4_unrelated_and_unsure_do_not_count_and_duplicate_matches_main() {
         for verdict in ["unrelated", "unsure"] {
             let on = run_rule_departure("svc", &[], DEPARTURE_QUOTE, verdict, true, false).await;
@@ -18072,6 +18584,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t7_a_short_departure_quote_is_dropped_as_too_short() {
         let quote = "Gone now.";
         let on = run_rule_departure("svc", &[], quote, "supersedes", true, false).await;
@@ -18137,6 +18653,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t10_departure_closes_without_the_replaces_cue() {
         let both_off =
             run_rule_departure("svc", &[], DEPARTURE_QUOTE, "supersedes", false, false).await;
@@ -18166,6 +18686,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_t11_departure_off_matches_main_for_the_same_inputs() {
         const ONE_PAIR: &str = r#"{"anchors":1,"pairs":1,"overflow":0,"prefilter":{"dup":0,"sup":0,"drop":0},"judged":1,"cache_hits":0,"closes_sup":0,"closes_dup":0,"dropped":{"no departure cue":1},"calls":1,"errors":0}"#;
         const TWO_PAIRS: &str = r#"{"anchors":1,"pairs":2,"overflow":0,"prefilter":{"dup":0,"sup":0,"drop":0},"judged":2,"cache_hits":0,"closes_sup":0,"closes_dup":0,"dropped":{"no departure cue":2},"calls":1,"errors":0}"#;
@@ -18529,6 +19053,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o1_switch_off_reads_nothing_and_leaves_the_rows() {
         let (_tmp, gm) = open().await;
         seed_orphan_pair(&gm).await;
@@ -18549,6 +19077,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o2_rejected_use_closes_both_orphan_settings() {
         let (_tmp, gm) = open().await;
         seed_orphan_pair(&gm).await;
@@ -18586,6 +19118,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o3_open_part_of_either_way_any_status_or_pending_protects() {
         for (incoming, status, pending) in [
             (false, "decided", false),
@@ -18649,6 +19185,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o4_only_a_rejected_project_use_is_a_trigger() {
         for status in ["considered", "decided"] {
             let (_tmp, gm) = open().await;
@@ -18684,6 +19224,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o5_a_slot_opened_this_session_stays_live() {
         let (_tmp, gm) = open().await;
         let facts = [
@@ -18697,6 +19241,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o6_a_one_character_or_empty_value_is_skipped() {
         for object in ["C", ""] {
             let (_tmp, gm) = open().await;
@@ -18719,6 +19267,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o7_json_matches_a_whole_token_and_not_a_longer_run() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -18747,6 +19299,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o8_a_live_decided_use_blocks_the_sweep() {
         let (_tmp, gm) = open().await;
         seed_orphan_pair(&gm).await;
@@ -18770,6 +19326,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_considered_or_pending_use_does_not_keep_the_value_in_use() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -18838,6 +19398,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o9_rules_uses_considered_and_pending_slots_stay_live() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -18877,6 +19441,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o10_five_targets_close_none_and_count_overflow() {
         let (_tmp, gm) = open().await;
         let mut facts = Vec::new();
@@ -18912,6 +19480,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o11_ground_off_leaves_the_sweep_unread() {
         let section = crate::config::GraphSection {
             consolidate: true,
@@ -18937,6 +19509,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_o12_the_orphan_page_stops_at_forty_eight() {
         let (_tmp, gm) = open().await;
         let mut facts = vec![use_of("app", Kind::Project, "Blobfmt", "decided")];
@@ -18989,6 +19565,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn exactly_forty_eight_orphans_are_not_truncated() {
         let (_tmp, gm) = open().await;
         let mut facts = vec![use_of("app", Kind::Project, "Blobfmt", "decided")];
@@ -19035,6 +19615,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn linked_components_do_not_fill_the_orphan_page() {
         let (_tmp, gm) = open().await;
         let mut facts = vec![use_of("app", Kind::Project, "Blobfmt", "decided")];
@@ -19055,6 +19639,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_c2_the_post_pass_runs_when_the_main_pass_has_no_anchors() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -19079,6 +19667,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_project_alias_rejects_the_same_orphan_copy() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -19212,6 +19804,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f1_a_nested_same_turn_rule_closes_for_three_reasons() {
         for reason in ["consolidated", "superseded", "replaced"] {
             let (_tmp, gm) = open().await;
@@ -19250,6 +19846,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f2_same_turn_quotes_that_are_not_nested_stay_live() {
         let (_tmp, gm) = open().await;
         seed_pair(&gm, "Keep the cache warm overnight.", 4).await;
@@ -19269,6 +19869,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f3_a_different_turn_or_session_stays_live() {
         let (_tmp, gm) = open().await;
         seed_pair(&gm, SHORT_QUOTE, 5).await;
@@ -19308,6 +19912,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f4_a_sibling_opened_this_session_stays_live() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -19341,6 +19949,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f5_equal_quotes_stay_live() {
         let (_tmp, gm) = open().await;
         seed_pair(&gm, LONG_QUOTE, 4).await;
@@ -19360,6 +19972,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f6_a_character_substring_or_a_short_quote_stays_live() {
         for quote in ["hem at the", "them at"] {
             let (_tmp, gm) = open().await;
@@ -19393,6 +20009,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f7_two_siblings_close_none_and_count_ambiguous() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -19434,6 +20054,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f8_other_close_reasons_and_a_closed_edge_are_not_triggers() {
         for reason in [
             "rejected",
@@ -19502,6 +20126,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f9_another_entity_or_a_setting_stays_live() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -19575,6 +20203,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f10_missing_evidence_or_an_empty_quote_stays_live() {
         let (_tmp, gm) = open().await;
         seed_pair(&gm, SHORT_QUOTE, 4).await;
@@ -19678,6 +20310,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_pending_or_considered_partner_rule_stays_live() {
         let (_tmp, gm) = open().await;
         seed_pair(&gm, SHORT_QUOTE, 4).await;
@@ -19721,6 +20357,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_f11_switch_off_reads_nothing_and_leaves_the_rows() {
         let (_tmp, gm) = open().await;
         seed_pair(&gm, SHORT_QUOTE, 4).await;
@@ -19745,6 +20385,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_c3_each_switch_closes_only_its_own_rows() {
         async fn seed_both(gm: &GraphMemory) {
             commit_app(
@@ -19810,6 +20454,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_c4_orphan_closes_precede_fragments_and_do_not_chain() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -20091,6 +20739,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_u1_base_records_component_dropped_without_values_in_the_lines() {
         let (_tmp, gm) = open().await;
         seed_base(&gm).await;
@@ -20160,6 +20812,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_u5_a_session_with_no_anchors_still_runs_retire() {
         let (_tmp, gm) = open().await;
         seed_base(&gm).await;
@@ -20171,6 +20827,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g1_trigger_must_be_a_decided_setting_closed_this_session() {
         // T1 (a): the old setting is still open.
         let (_tmp, gm) = open().await;
@@ -20280,6 +20940,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g2_exactly_one_linked_component() {
         // T2: a technology is not a component candidate, even with a decided part_of.
         let (_tmp, gm) = open().await;
@@ -20438,6 +21102,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g3_successor_must_name_one_other_linked_component() {
         // (a) no open project skin.
         let (_tmp, gm) = open().await;
@@ -20572,6 +21240,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g4_only_eligible_rows_on_the_dropped_component_close() {
         let (_tmp, gm) = open().await;
         let mut facts = vec![
@@ -20682,6 +21354,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g5_component_names_match_the_whole_normalised_value() {
         for value in ["alp", "alpha theme"] {
             let (_tmp, gm) = open().await;
@@ -20705,6 +21381,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g6_more_than_eight_targets_close_none() {
         async fn seed_cap(extra_use: bool) -> (tempfile::TempDir, GraphMemory) {
             let (tmp, gm) = open().await;
@@ -20827,6 +21507,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g7_retire_off_adds_no_read_and_no_report_key() {
         let (_tmp, gm) = open().await;
         seed_base(&gm).await;
@@ -20878,6 +21562,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_g8_one_snapshot_orders_closes_and_a_shared_row_closes_once() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -21046,6 +21734,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn one_entity_read_serves_o_f_and_r() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -21110,6 +21802,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_u2_one_component_is_planned_once() {
         async fn seed_two(gm: &GraphMemory) {
             let mut facts = vec![
@@ -21165,6 +21861,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_missing_midnight_closes_nothing() {
         let (_tmp, gm) = open().await;
         seed_base(&gm).await;
@@ -21176,6 +21876,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_u4_hold_only_context_runs_retire_with_nothing_to_close() {
         async fn plant(memory: &std::path::Path, config: &str, text: &str) -> GraphMemory {
             std::fs::write(memory.join(".recall-echo.toml"), config).unwrap();
@@ -21276,6 +21980,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn pin_component_takeover_off_leaves_the_project_tool_live() {
         let (_tmp, gm) = open().await;
         let old_turns = [Turn {
@@ -21465,6 +22173,10 @@ mod tests {
     const QUIET_TURN: &str = "nightjar highlights code in the browser";
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_closes_a_setting_job() {
         let (old, new) = setting_pair();
         let (_tmp, gm, report, lines, reads) =
@@ -21492,6 +22204,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_closes_a_rule_job() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21523,6 +22239,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_closes_a_rule_and_setting_job() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21554,6 +22274,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_skips_a_tool_named_in_the_session() {
         let (old, new) = setting_pair();
         let (_tmp, gm, report, lines, _) =
@@ -21564,6 +22288,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_needs_a_co_cited_job_row() {
         let old = vec![library_use("quillpress", Kind::Project, "Pygments", 2)];
         let new = vec![
@@ -21612,6 +22340,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_keeps_a_five_character_job_token() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21632,6 +22364,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_drops_a_short_shared_token() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21648,6 +22384,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_drops_a_stop_word_token() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21664,6 +22404,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_drops_a_generic_key_token() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21680,6 +22424,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_drops_a_party_name_token() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21696,6 +22444,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_drops_a_whole_tool_name() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21712,6 +22464,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_skips_equal_job_values() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21728,6 +22484,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_needs_the_same_role() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21772,6 +22532,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_only_closes_a_project_tool() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21820,6 +22584,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_ignores_a_non_component_anchor() {
         let (old, _) = setting_pair();
         let new = vec![
@@ -21833,6 +22601,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_skips_a_pending_part_link() {
         let (old, new) = setting_pair();
         let (_tmp, gm, report, _, _) = seed_and_run(&old, &new, QUIET_TURN, true, true).await;
@@ -21841,6 +22613,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_skips_a_tool_first_seen_this_session() {
         let new = vec![
             library_use("quillpress", Kind::Project, "Pygments", 3),
@@ -21861,6 +22637,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_leaves_two_candidates_open() {
         let old = vec![
             library_use("quillpress", Kind::Project, "Pygments", 2),
@@ -21887,6 +22667,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_off_does_not_close_when_another_post_pass_runs() {
         let (old, new) = setting_pair();
         let (_tmp, gm) = open().await;
@@ -21911,6 +22695,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_off_reads_nothing() {
         let (old, new) = setting_pair();
         let (_tmp, gm, report, lines, reads) =
@@ -21923,6 +22711,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_takeover_counts_a_read_error_and_closes_nothing() {
         let (old, new) = setting_pair();
         let (tmp, gm) = open().await;
@@ -22046,6 +22838,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_changed_msrv_closes_the_old_reason_and_leaves_the_new_one() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22093,6 +22889,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn retire_reason_off_leaves_both_msrv_rules_live_and_reads_nothing() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22132,6 +22932,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_pool_rule_closes_and_the_four_job_reason_stays() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22168,6 +22972,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_public_output_rule_closes_and_the_site_rule_stays() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22204,6 +23012,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_sha256_signature_rule_closes_when_the_format_changes() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22240,6 +23052,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_comma_separated_tag_rule_closes_when_tags_move_to_a_join_table() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22272,6 +23088,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn catch_up_closes_the_old_reason_in_a_later_session() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22309,6 +23129,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_key_name_alone_does_not_close_the_mvhd_rule() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22338,6 +23162,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_date_rule_stays_when_no_mtime_setting_changed() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22374,6 +23202,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_sqlite_reason_stays_when_it_names_the_new_value() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22403,6 +23235,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_rule_on_another_subject_is_not_a_candidate() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22432,6 +23268,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_setting_or_a_use_is_not_closed_as_a_reason() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22473,6 +23313,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_changes_that_name_one_rule_close_nothing() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -22507,6 +23351,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn retire_reason_counts_a_read_error_and_closes_nothing() {
         let (tmp, gm) = open().await;
         commit_named(
@@ -22543,6 +23391,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn retire_reason_off_does_not_close_when_another_post_pass_runs() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -23253,6 +24105,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_cut_replaces_closes_the_earlier_rule() {
         let (_tmp, gm) = open().await;
         commit_tidepool(
@@ -23287,6 +24143,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_new_rule_closes_on_ellipsis_or_on_case_and_final_punctuation() {
         for replaces in [
             format!("{}…", tidepool_cut()),
@@ -23323,6 +24183,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_rules_that_share_the_cut_stay_open() {
         let (_tmp, gm) = open().await;
         let second = format!("{} and then archive the old key for a week", tidepool_cut());
@@ -23351,6 +24215,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rule_replaces_keeps_a_setting_a_same_session_row_another_subject_and_a_short_prefix() {
         let (_tmp, gm) = open().await;
         commit_tidepool(
@@ -23429,6 +24297,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rule_replaces_skips_a_considered_pending_or_closed_rule() {
         let (_tmp, gm) = open().await;
         commit_tidepool(
@@ -23502,6 +24374,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rule_replaces_off_reads_nothing_and_omits_the_counters() {
         let (_tmp, gm) = open().await;
         commit_tidepool(
@@ -23619,6 +24495,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_same_value_key_rename_closes_the_earlier_key() {
         let screen = "25 (fits one screen)";
         let (_tmp, gm) = open().await;
@@ -23658,6 +24538,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_cross_key_replaces_closes_the_detail_and_its_core() {
         for replaces in ["25 (fits one screen)", "25"] {
             let (_tmp, gm) = open().await;
@@ -23706,6 +24590,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_shown_cut_and_the_cut_without_its_comma_close() {
         let long = long_page();
         let cut = super::super::known::cut_value(&long, 80);
@@ -23747,6 +24635,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn loose_text_and_a_unit_conflict_and_two_matches_stay_open() {
         let (_tmp, gm) = open().await;
         commit_named(
@@ -23858,6 +24750,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn unit_classes_block_only_a_disjoint_pair() {
         for (old_key, new_key, blocked) in [
             ("wait_secs", "wait_ms", true),
@@ -23911,6 +24807,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn cross_key_replaces_keeps_the_listed_negative_rows() {
         let screen = "25 (fits one screen)";
         let (_tmp, gm) = open().await;
@@ -24293,6 +25193,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_wider_cut_matches_two_hundred_characters_and_not_eighty() {
         let rule = wide_rule();
         assert!(rule.chars().count() > 200);
@@ -24362,6 +25266,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn each_flag_alone_and_together_closes_only_its_rows() {
         let screen = "25 (fits one screen)";
         let rule = TIDEPOOL_RULE;
@@ -24531,6 +25439,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_closes_component_copies_of_a_replaced_project_setting() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24585,6 +25497,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_needs_a_shared_key_word() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24613,6 +25529,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_keeps_a_use_the_project_still_has() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24649,6 +25569,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_skips_unlinked_and_same_session_rows() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24690,6 +25614,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_word_in_successor_is_not_distinctive() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24720,6 +25648,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_overflow_closes_nothing() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24762,6 +25694,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_off_reads_nothing_and_adds_no_key() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24796,6 +25732,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_late_link_closes_earlier_copies() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24849,6 +25789,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_late_link_skips_rows_written_in_the_link_session() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24880,6 +25824,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_late_link_fires_once() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24925,6 +25873,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_late_link_needs_a_live_successor() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -24966,6 +25918,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_late_link_overflow_closes_nothing() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -25014,6 +25970,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn old_value_late_link_grounded_part_of_counts() {
         let (_tmp, gm) = open().await;
         commit_app(
@@ -25118,6 +26078,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_cut_off_replaces_closes_only_when_the_prefix_flag_is_on() {
         let off = run_cut_off(false, &[]).await;
         let on = run_cut_off(true, &[]).await;
@@ -25136,6 +26100,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_live_rules_sharing_the_prefix_do_not_close() {
         let other = "Sign every request with HMAC-SHA256 over the body using the subscription's secret and send X-Request-Id.";
         let on = run_cut_off(true, &[other]).await;
@@ -25232,6 +26200,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_forty_char_prefix_closes_on_the_departure_path_and_thirty_nine_does_not() {
         let short = run_departure_prefix(39).await;
         let long = run_departure_prefix(40).await;
@@ -25335,6 +26307,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_abbreviated_key_closes_only_when_the_switch_is_on() {
         let text = format!("Set markdown_extensions = {MD_NEW} for the docs build.");
         let new = acme("markdown_extensions", MD_NEW, &text);
@@ -25366,6 +26342,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_bare_list_value_closes_the_abbreviated_key() {
         let text = "Set markdown_extensions to admonition, toc, def_list.";
         let new = acme("markdown_extensions", "admonition, toc, def_list", text);
@@ -25378,6 +26358,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn two_near_key_rows_are_ambiguous_and_stay_live() {
         let other = acme(
             "md_extensions",
@@ -25399,6 +26383,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_turn_that_names_the_old_key_keeps_it_live() {
         let text =
             format!("Set markdown_extensions = {MD_NEW}; md_ext stays for the old renderer.");
@@ -25414,6 +26402,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_number_beside_a_list_is_not_a_near_key_close() {
         let old = acme("md_ext", "3", "md_ext = 3");
         let text = format!("Set markdown_extensions = {MD_NEW} for the docs build.");
@@ -25425,6 +26417,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_prose_value_is_not_a_near_key_anchor() {
         let text = "Set markdown_extensions to the admonition and toc extensions.";
         let new = acme(
@@ -25452,6 +26448,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_old_key_from_this_session_is_not_closed() {
         let text = format!("Set md_ext = {MD_OLD} and markdown_extensions = {MD_NEW}.");
         let old = acme("md_ext", MD_OLD, &text);
@@ -25463,6 +26463,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_named_db_port_stays_live_beside_a_new_debug_port() {
         let old = acme("db_port", "5432", "db_port = 5432");
         let text = "debug_port is 9229 and db_port stays 5432.";

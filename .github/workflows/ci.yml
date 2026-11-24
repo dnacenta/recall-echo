@@ -12,6 +12,10 @@ jobs:
   test:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    env:
+      # Job-wide so every step compiles with the same cfg: build.rs turns the
+      # embedding tests on, and every store shares this one model cache.
+      RECALL_ECHO_MODELS_DIR: ${{ github.workspace }}/.hf-cache
     steps:
       - uses: actions/checkout@v4
 
@@ -39,13 +43,9 @@ jobs:
           key: hf-${{ runner.os }}-Xenova-bge-small-en-v1.5-v1
 
       - name: Test
-        env:
-          HF_HOME: ${{ github.workspace }}/.hf-cache
         run: cargo test
 
       - name: Test (bench bin)
-        env:
-          HF_HOME: ${{ github.workspace }}/.hf-cache
         run: cargo test --features bench --bin recall-echo
 
       - name: Save embedding model

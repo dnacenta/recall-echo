@@ -13,6 +13,10 @@ use recall_echo::graph::IngestContext;
 const CHUNK_TOKENS: usize = 500;
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn add_and_retrieve_episode() {
     let db = TestDb::new().await;
 
@@ -39,6 +43,10 @@ async fn add_and_retrieve_episode() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn get_episode_by_log_number() {
     let db = TestDb::new().await;
 
@@ -64,6 +72,10 @@ async fn get_episode_nonexistent_log_number() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn multiple_episodes_per_session() {
     let db = TestDb::new().await;
 
@@ -87,6 +99,10 @@ async fn multiple_episodes_per_session() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn episodes_count_in_stats() {
     let db = TestDb::new().await;
 
@@ -117,6 +133,10 @@ fn sorted_contents(episodes: Vec<recall_echo::graph::types::Episode>) -> Vec<Str
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_first_ingest_writes_one_episode_per_chunk() {
     let db = TestDb::new().await;
     db.graph
@@ -155,6 +175,10 @@ async fn a_first_ingest_writes_one_episode_per_chunk() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_second_ingest_without_a_model_writes_no_episodes() {
     let db = TestDb::new().await;
     let text = wide("The shelf keeps one note.");
@@ -186,6 +210,10 @@ async fn a_second_ingest_without_a_model_writes_no_episodes() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn an_ingest_without_a_log_number_writes_every_chunk_again() {
     let db = TestDb::new().await;
     let text = wide("A document with no log number.");
@@ -213,6 +241,10 @@ async fn an_ingest_without_a_log_number_writes_every_chunk_again() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn two_identical_chunks_stay_two_episodes_after_a_second_ingest() {
     let db = TestDb::new().await;
     let segment = wide("The shelf keeps the same note twice.");
