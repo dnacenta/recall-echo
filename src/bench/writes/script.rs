@@ -1483,6 +1483,258 @@ kind = "latest"
         assert_eq!(script.fact("F42").unwrap().end_state, EndState::Rejected);
     }
 
+    fn silent_change() -> FactScript {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/silent-change/script.toml");
+        load_script(&path).unwrap()
+    }
+
+    /// Words and phrases that announce a replacement. s2 of the silent-change
+    /// fixture must use none of them. `new` before the setting's key words is
+    /// checked by [`departure_cues`] as well.
+    const DEPARTURE_CUES: &[&str] = &[
+        "now",
+        "is now",
+        "no longer",
+        "anymore",
+        "instead",
+        "rather than",
+        "drop",
+        "dropped",
+        "switch",
+        "switched",
+        "replace",
+        "replaced",
+        "becomes",
+        "became",
+        "change",
+        "changed",
+        "bump",
+        "bumped",
+        "rename",
+        "renamed",
+        "move to",
+        "moved to",
+        "migrate",
+        "migrated",
+        "update",
+        "updated",
+        "upgrade",
+        "upgraded",
+        "remove",
+        "removed",
+        "deprecate",
+        "old",
+        "previous",
+        "previously",
+        "used to",
+        "stop using",
+    ];
+
+    /// The cues in `text`, as whole words or phrases, ignoring case. `new`
+    /// directly before one of `key` is a cue too.
+    fn departure_cues(text: &str, key: &[&str]) -> Vec<String> {
+        let mut found: Vec<String> = DEPARTURE_CUES
+            .iter()
+            .filter(|cue| has_phrase(text, cue))
+            .map(|cue| (*cue).to_string())
+            .collect();
+        for word in key {
+            let cue = format!("new {word}");
+            if has_phrase(text, &cue) {
+                found.push(cue);
+            }
+        }
+        found
+    }
+
+    /// Whether `phrase` stands in `text` as whole words, ignoring case and
+    /// the spacing between words.
+    fn has_phrase(text: &str, phrase: &str) -> bool {
+        let words: Vec<String> = phrase.split_whitespace().map(regex::escape).collect();
+        compile_pattern(&format!(r"\b{}\b", words.join(r"\s+")))
+            .unwrap()
+            .is_match(text)
+    }
+
+    /// The setting's key words: the subject, then the key after `setting:`.
+    fn key_words(fact: &ScriptFact) -> Vec<&str> {
+        let key = fact
+            .relation
+            .strip_prefix("setting:")
+            .unwrap_or(&fact.relation);
+        std::iter::once(fact.subject.as_str())
+            .chain(key.split('_'))
+            .collect()
+    }
+
+    #[test]
+    fn silent_change_fixture_declares_its_gold() {
+        let script = silent_change();
+        assert_eq!(script.name, "silent-change");
+        assert_eq!(script.sessions.len(), 2);
+        assert!(script
+            .sessions
+            .iter()
+            .all(|session| session.transcript.is_none() && !session.turns.is_empty()));
+        assert_eq!(script.facts.len(), 3);
+        assert_eq!(
+            script.superseded_pairs,
+            vec![SupersededPair {
+                old: "F01".into(),
+                new: "F02".into(),
+                retire_in: "s2".into(),
+            }]
+        );
+        let state = |id: &str| script.fact(id).unwrap().end_state;
+        assert_eq!(state("F01"), EndState::Superseded);
+        assert_eq!(
+            script.fact("F01").unwrap().superseded_in.as_deref(),
+            Some("s2")
+        );
+        assert_eq!(state("F02"), EndState::Live);
+        assert_eq!(state("F03"), EndState::Live);
+        let live: Vec<(&str, bool)> = script
+            .expect
+            .iter()
+            .map(|expected| (expected.fact.as_str(), expected.live))
+            .collect();
+        assert_eq!(live, [("F01", false), ("F02", true), ("F03", true)]);
+
+        // Old and new are two values of one setting. The sibling is another
+        // setting and is in no pair.
+        let old = script.fact("F01").unwrap();
+        let new = script.fact("F02").unwrap();
+        let sibling = script.fact("F03").unwrap();
+        assert_eq!((&old.subject, &old.relation), (&new.subject, &new.relation));
+        assert_ne!(old.object, new.object);
+        assert_ne!(
+            (&sibling.subject, &sibling.relation),
+            (&old.subject, &old.relation)
+        );
+        assert!(script
+            .superseded_pairs
+            .iter()
+            .all(|pair| pair.old != sibling.id && pair.new != sibling.id));
+
+        assert_eq!(script.questions.len(), 1);
+        let question = &script.questions[0];
+        assert_eq!(question.needs, ["F02"]);
+        assert_eq!(question.absent, ["F01"]);
+        assert_eq!(question.answer, new.object);
+        // A current-value question. `stale` is left out and filled from the
+        // pair, so the old value is the one the recall window is scanned for.
+        assert_eq!(question.kind, QuestionKind::CurrentValue);
+        assert!(question.stale.is_none());
+        assert_eq!(
+            script.stale_values(question).unwrap(),
+            [old.object.as_str()]
+        );
+    }
+
+    #[test]
+    fn silent_change_cores_tell_the_two_values_apart() {
+        let script = silent_change();
+        let lines: Vec<String> = script
+            .facts
+            .iter()
+            .map(|fact| format!("{} | {} | {}", fact.subject, fact.relation, fact.object))
+            .collect();
+        for fact in &script.facts {
+            let pattern = fact.pattern.as_ref().expect("every fact has a match");
+            assert!(!pattern.core_all.is_empty(), "{}", fact.id);
+            let core: Vec<regex::Regex> = pattern
+                .core_all
+                .iter()
+                .map(|source| compile_pattern(source).unwrap())
+                .collect();
+            // Each core matches its own gold record and no other fact's.
+            for (other, line) in script.facts.iter().zip(&lines) {
+                let hit = core.iter().all(|regex| regex.is_match(line));
+                assert_eq!(hit, other.id == fact.id, "{} core on '{line}'", fact.id);
+            }
+        }
+    }
+
+    #[test]
+    fn silent_change_s2_has_no_departure_cue_and_no_old_value() {
+        let script = silent_change();
+        let old = script.fact("F01").unwrap();
+        let new = script.fact("F02").unwrap();
+        let key = key_words(old);
+        assert_eq!(key, ["client", "timeout"]);
+        // "12 seconds", and the bare number on its own.
+        let number = old.object.split_whitespace().next().unwrap();
+        assert_eq!(number, "12");
+        let s2 = script
+            .sessions
+            .iter()
+            .find(|session| session.id == "s2")
+            .unwrap();
+        assert!(!s2.turns.is_empty());
+        for turn in &s2.turns {
+            assert_eq!(
+                departure_cues(&turn.text, &key),
+                Vec::<String>::new(),
+                "{}",
+                turn.text
+            );
+            for value in [old.object.as_str(), number] {
+                assert!(
+                    !has_phrase(&turn.text, value),
+                    "s2 names the old value '{value}': {}",
+                    turn.text
+                );
+            }
+        }
+        // s2 still states the new value.
+        assert!(s2
+            .turns
+            .iter()
+            .any(|turn| has_phrase(&turn.text, &new.object)));
+    }
+
+    #[test]
+    fn the_s2_checks_catch_every_cue_and_the_old_value() {
+        let key = ["client", "timeout"];
+        assert!(departure_cues("The client timeout is 48 seconds.", &key).is_empty());
+        for cue in DEPARTURE_CUES {
+            let text = format!("The client timeout {cue} 48 seconds.");
+            assert!(
+                departure_cues(&text, &key).iter().any(|hit| hit == cue),
+                "{text}"
+            );
+            let shouted = text.to_uppercase();
+            assert!(
+                departure_cues(&shouted, &key).iter().any(|hit| hit == cue),
+                "{shouted}"
+            );
+        }
+        assert_eq!(
+            departure_cues("The new client timeout is 48 seconds.", &key),
+            ["new client"]
+        );
+        assert_eq!(
+            departure_cues("The New  Timeout is 48 seconds.", &key),
+            ["new timeout"]
+        );
+        // Whole words only, and bare `is` is allowed.
+        assert!(departure_cues(
+            "A known, bold, unchanged client timeout is renewed at 48 seconds.",
+            &key
+        )
+        .is_empty());
+        assert!(departure_cues("A new batch size is 50 items.", &key).is_empty());
+
+        assert!(has_phrase("The client timeout is 12 seconds.", "12"));
+        assert!(has_phrase(
+            "The client timeout is 12  Seconds.",
+            "12 seconds"
+        ));
+        assert!(!has_phrase("The client timeout is 48 seconds.", "12"));
+        assert!(!has_phrase("The client timeout is 120 seconds.", "12"));
+    }
+
     fn write_transcript_script(dir: &Path, name: &str, date_line: &str, quote: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(

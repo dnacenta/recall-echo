@@ -1,0 +1,93 @@
+# Silent setting change: an eval case, not a product close.
+# s1 states the client timeout and the batch size. s2 restates only the
+# timeout, with a new value, no replacement cue and no mention of the old
+# value. Only the new timeout and the batch size should be live at the end.
+# On current main the pipeline is expected to leave the old value live.
+name = "silent-change"
+
+[[sessions]]
+id = "s1"
+date = "2026-01-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The client timeout is 12 seconds. The batch size is 50 items."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "F01"
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "F03"
+
+[[sessions]]
+id = "s2"
+date = "2026-01-02T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The client timeout is 48 seconds."
+
+[[sessions.turns.claims]]
+op = "supersede"
+fact = "F01"
+replacement = "F02"
+
+[[facts]]
+id = "F01"
+subject = "client"
+relation = "setting:timeout"
+object = "12 seconds"
+subject_type = "concept"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s2"
+[facts.match]
+core_all = ["timeout\\D{0,30}\\b12\\b|\\b12 ?(s|sec|secs|seconds?)\\b.{0,20}timeout"]
+
+[[facts]]
+id = "F02"
+subject = "client"
+relation = "setting:timeout"
+object = "48 seconds"
+subject_type = "concept"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["timeout\\D{0,30}\\b48\\b|\\b48 ?(s|sec|secs|seconds?)\\b.{0,20}timeout"]
+
+[[facts]]
+id = "F03"
+subject = "batch"
+relation = "setting:size"
+object = "50 items"
+subject_type = "concept"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["batch\\D{0,30}\\b50\\b|\\b50 ?items?\\b.{0,20}batch"]
+
+[[expect]]
+fact = "F01"
+live = false
+
+[[expect]]
+fact = "F02"
+live = true
+
+[[expect]]
+fact = "F03"
+live = true
+
+[[superseded_pairs]]
+old = "F01"
+new = "F02"
+retire_in = "s2"
+
+[[questions]]
+text = "what is the client timeout"
+answer = "48 seconds"
+kind = "current_value"
+needs = ["F02"]
+absent = ["F01"]
