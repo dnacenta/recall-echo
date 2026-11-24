@@ -4151,6 +4151,39 @@ mod tests {
     }
 
     #[test]
+    fn stack_off_writes_alternative_details_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        apply_graph_switches(
+            &memory,
+            KnownFactsContext::Off,
+            KnownMatch::Off,
+            Consolidate::Off,
+            DropRestatements::Off,
+            ConsolidateLinks::Off,
+            GroundComponentEdges::Off,
+            ConsolidateComponents::Off,
+            RecoverTurns::Off,
+            DropGenericUses::Off,
+            ConsolidateKeyRename::Off,
+            ConsolidateReplacesCue::Off,
+            ConsolidateReplacesDeparture::Off,
+            ConsolidateOrphanSweep::Off,
+            ConsolidateRuleFragments::Off,
+            ConsolidateRetireComponent::Off,
+            KnownKeyBinding::Off,
+            OptOuts::stack_off(),
+        )
+        .unwrap();
+        let text = fs::read_to_string(crate::config::config_path(&memory)).unwrap();
+        assert!(text.contains("\nalternative_details = false\n"), "{text}");
+        assert!(!text.contains("alternative_details = true"), "{text}");
+        let loaded: crate::config::Config = toml::from_str(&text).unwrap();
+        assert!(!loaded.graph.expect("graph").alternative_details);
+    }
+
+    #[test]
     fn consolidate_cross_key_replaces_implies_consolidate_and_writes_only_its_key() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path().join("memory");
