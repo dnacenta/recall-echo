@@ -111,8 +111,9 @@ provider will run. `recall-echo config set KEY VALUE` changes one (`provider`, `
 
 `init` offers installed CLIs first. API keys are "advanced (API key, billed per token)". With no CLI installed it does not pick an API provider. A removed local-model key fails with `removed in this version; delete the key`.
 
-Embeddings are always local (fastembed/ONNX, no network after the model downloads once),
-so semantic search, HNSW indexing and traversal cost nothing whatever this is set to.
+Embeddings are always local (fastembed/ONNX, no network after the model downloads once
+per models dir, see [Embedding model](#embedding-model)), so semantic search, HNSW
+indexing and traversal cost nothing whatever this is set to.
 
 The five CLI providers are one implementation. A provider name selects a preset, a set
 of defaults for the `[llm.cli]` keys, and every key can be overridden, so a CLI with no
@@ -175,3 +176,37 @@ CLI's stderr, and so is a JSON envelope that reports its own failure while exiti
 - **The background daemon only sees file-based CLI auth.** It starts with an allowlisted
   environment (`PATH`, `HOME`, …) that excludes API keys. See
   [internals: background work](internals.md#background-work).
+
+## Embedding model
+
+Embeddings use BGE-Small-EN-v1.5 through fastembed (ONNX, 384 dimensions). The model is
+about 127 MB. It downloads on first use, and embedding makes no network calls after
+that. By default every store keeps its own copy in `<store>/models` (`graph/models` in
+the memory directory), so each new store downloads it once.
+
+`RECALL_ECHO_MODELS_DIR` points every store at one shared models dir instead:
+
+```sh
+export RECALL_ECHO_MODELS_DIR=~/.cache/recall-echo/models
+```
+
+Use an absolute path: a relative one resolves against whatever directory each process
+starts in. The dir must be writable only by you, because whoever can write to it decides
+which model every store loads. To share one copy across users, seed it once, make it
+read-only, and set `HF_HUB_OFFLINE=1` for everyone who uses it, so nothing writes to it
+or downloads into it.
+
+The model cache is the first of:
+
+1. `HF_HOME`, when it is set: fastembed reads it in place of the dir recall-echo passes.
+2. `RECALL_ECHO_MODELS_DIR`, when it is set and not empty.
+3. `<store>/models`.
+
+With `HF_HUB_OFFLINE` set to `1`, `true`, `yes` or `on` (any case), a model that is not
+in the cache fails with `HF_HUB_OFFLINE is set and the embedding model is not cached in
+<dir>`, and nothing is downloaded. The hub client ignores that variable, so recall-echo
+checks the cache itself before loading the model.
+
+The detached daemon inherits `RECALL_ECHO_MODELS_DIR`, `HF_HOME`, `HF_HUB_OFFLINE` and
+`HF_ENDPOINT` from the command that starts it, so it uses the same cache as a command
+that embeds in-process.

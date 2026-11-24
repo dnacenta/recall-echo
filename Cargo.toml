@@ -28,6 +28,8 @@ dirs = "6"
 # migration note.
 surrealdb = { version = "3.2", default-features = false }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
+# Cache lookup only (HF_HUB_OFFLINE guard): the same hub crate fastembed uses.
+hf-hub = { version = "0.4.3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "net", "time", "sync", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"

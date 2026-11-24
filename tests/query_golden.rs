@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use recall_echo::config::GraphScoringConfig;
-use recall_echo::graph::embed::FastEmbedder;
+use recall_echo::graph::embed::{models_dir, FastEmbedder};
 use recall_echo::graph::store::{self, Db};
 use recall_echo::graph::types::{
     EntityType, MatchSource, NewEntity, NewEpisode, NewRelationship, QueryOptions, QueryResult,
@@ -82,11 +82,18 @@ const SENSOR_QUERY: &str = "Kalman filter sensor fusion state estimation";
 
 /// One process-wide embedder. The ONNX model is downloaded and loaded once per
 /// test-binary run; `CARGO_TARGET_TMPDIR` keeps the cache out of the per-test
-/// temp dirs so re-runs are offline.
+/// temp dirs so re-runs are offline. With `RECALL_ECHO_MODELS_DIR` set, the
+/// shared models dir is used instead.
 fn embedder() -> &'static FastEmbedder {
     static EMBEDDER: OnceLock<FastEmbedder> = OnceLock::new();
     EMBEDDER.get_or_init(|| {
-        let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fastembed-cache");
+        let target_tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let shared = std::env::var_os("RECALL_ECHO_MODELS_DIR").is_some_and(|dir| !dir.is_empty());
+        let cache_dir = if shared {
+            models_dir(target_tmp)
+        } else {
+            target_tmp.join("fastembed-cache")
+        };
         std::fs::create_dir_all(&cache_dir).expect("failed to create embedder cache dir");
         FastEmbedder::new(&cache_dir).expect("failed to initialize embedder")
     })
@@ -466,6 +473,10 @@ fn borrow_checker_anchor() -> QueryOptions {
 /// three baking entities) must return exactly that set as its top 3, ahead of
 /// every systems-programming, sailing and finance entity in the graph.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_recall_at_k_ordering() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {
@@ -489,6 +500,10 @@ async fn golden_query_recall_at_k_ordering() {
 /// outrank neighbors reached over an old one, and effective confidence — decay
 /// included — is exactly the fraction of the parent's relevance they inherit.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_confidence_weighting_orders_neighbors() {
     let graph = GoldenGraph::seed().await;
     let result = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
@@ -528,6 +543,10 @@ async fn golden_query_confidence_weighting_orders_neighbors() {
 /// both channels — no graph candidate has to out-confidence a base that every
 /// semantic candidate gets for free.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_graph_candidates_earn_the_same_score_terms() {
     let graph = GoldenGraph::seed().await;
     let result = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
@@ -566,6 +585,10 @@ async fn golden_query_graph_candidates_earn_the_same_score_terms() {
 /// is exactly `1 + corroboration_boost * effective_confidence` on the measured
 /// similarity — the measurement stays the base, the graph adds to it.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_graph_corroboration_boosts_a_semantic_hit() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {
@@ -610,6 +633,10 @@ async fn golden_query_graph_corroboration_boosts_a_semantic_hit() {
 /// however absurd the boost, so no entity can run away with the ranking by
 /// being well connected.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_corroboration_is_clamped_at_the_similarity_ceiling() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {
@@ -647,6 +674,10 @@ async fn golden_query_corroboration_is_clamped_at_the_similarity_ceiling() {
 /// tail can never gain hotness, so it can never rise — a feedback loop that
 /// keeps the graph coldest where the graph is doing the work.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_graph_expanded_results_warm_up() {
     let graph = GoldenGraph::seed().await;
 
@@ -677,6 +708,10 @@ async fn golden_query_graph_expanded_results_warm_up() {
 /// Confidence weighting: an edge whose effective confidence has decayed below
 /// `0.1` contributes nothing — its target is not reachable by expansion at all.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_confidence_weighting_drops_dead_edges() {
     let graph = GoldenGraph::seed().await;
     let result = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
@@ -696,6 +731,10 @@ async fn golden_query_confidence_weighting_drops_dead_edges() {
 /// Scoring weights are live: the same graph and the same query produce a rank
 /// flip when the weight vector moves from similarity-only to utility-only.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_scoring_weights_flip_rank() {
     let graph = GoldenGraph::seed().await;
     graph.set_utility(KALMAN_FILTER, 0.0).await;
@@ -744,6 +783,10 @@ async fn golden_query_scoring_weights_flip_rank() {
 /// directions — and stops there: no 2-hop entity and no unconnected entity is
 /// pulled in.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_expansion_pulls_one_hop_neighbors() {
     let graph = GoldenGraph::seed().await;
     let result = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
@@ -777,6 +820,10 @@ async fn golden_query_expansion_pulls_one_hop_neighbors() {
 
 /// `graph_depth = 0` turns the hybrid query into pure semantic search.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_graph_depth_zero_disables_expansion() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {
@@ -797,6 +844,10 @@ async fn golden_query_graph_depth_zero_disables_expansion() {
 /// expands exactly one hop. Pinned so a real multi-hop implementation has to
 /// change this test deliberately.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_graph_depth_above_one_is_still_one_hop() {
     let graph = GoldenGraph::seed().await;
     let one_hop = graph.query(RUST_QUERY, &borrow_checker_anchor()).await;
@@ -825,6 +876,10 @@ async fn golden_query_graph_depth_above_one_is_still_one_hop() {
 /// The entity-type filter is applied to graph-expanded neighbors too, not only
 /// to semantic hits.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_entity_type_filter_applies_to_expanded_neighbors() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {
@@ -851,6 +906,10 @@ async fn golden_query_entity_type_filter_applies_to_expanded_neighbors() {
 
 /// Episode search is opt-in and ranks by its own semantic similarity.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_episodes_are_opt_in() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {
@@ -883,6 +942,10 @@ async fn golden_query_episodes_are_opt_in() {
 
 /// `limit = 0` is not "no results" — it means the documented default of 10.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn golden_query_zero_limit_defaults_to_ten() {
     let graph = GoldenGraph::seed().await;
     let options = QueryOptions {

@@ -3178,6 +3178,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn literal_goes_to_slot() {
         let (_tmp, gm) = open_store().await;
         let fact = setting("9000");
@@ -3214,6 +3218,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn identical_fact_reinforces() {
         let (_tmp, gm) = open_store().await;
         let slot = setting("redis");
@@ -3255,6 +3263,10 @@ mod tests {
     /// holds that session, turn and quote, so neither the slot nor the edge moves.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn retry_of_the_creating_session_does_not_corroborate() {
         let (_tmp, gm) = open_store().await;
         let facts = [setting("redis"), uses_edge()];
@@ -3289,6 +3301,10 @@ mod tests {
     /// sighting adds the assistant weight and one tally.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn assistant_create_then_user_and_assistant_sightings() {
         let (_tmp, gm) = open_store().await;
         let weights = *gm.provenance_weights();
@@ -3496,6 +3512,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn literal_object_edges_become_technology() {
         let (_tmp, gm) = open_store().await;
         let facts = [
@@ -3527,6 +3547,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_missing_binding_drops_one_fact() {
         let (_tmp, gm) = open_store().await;
         let mut blank = setting("9000");
@@ -3690,6 +3714,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn setting_slot_retires_old_value_on_session_date() {
         let (_tmp, gm) = open_store().await;
         write_turns(
@@ -3757,6 +3785,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn replacing_setting_with_echoed_old_value_is_written() {
         let (_tmp, gm) = open_store().await;
         write_turns(
@@ -3809,6 +3841,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_edge_with_details_stores_renders_and_is_masked_when_forgotten() {
         let (_tmp, gm) = open_store().await;
         let project = ProjectIdentity {
@@ -3903,6 +3939,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn live_donor_edge_is_never_attached() {
         let (_tmp, gm) = open_store().await;
         crate::graph::store::define_edge_details(gm.db())
@@ -3948,6 +3988,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn reinforce_path_drops_details() {
         let (_tmp, gm) = open_store().await;
         crate::graph::store::define_edge_details(gm.db())
@@ -3996,6 +4040,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     fn rejected_same_turn_same_role_logs_the_attach() {
         let (stats, logged) = crate::file_lock::capture_stderr(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -4036,6 +4084,10 @@ mod tests {
     /// decision. A keyed setting written beside them is not retired either.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn keyless_settings_with_different_values_both_stay_active() {
         let (_tmp, gm) = open_store().await;
         let fallback = crate::graph::v2::schema::canon_key("");
@@ -4087,6 +4139,10 @@ mod tests {
     /// empty slot does not.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn keyless_setting_with_explicit_replaces_retires_the_named_value() {
         let (_tmp, gm) = open_store().await;
         let fallback = crate::graph::v2::schema::canon_key("");
@@ -4133,6 +4189,10 @@ mod tests {
     /// Keyed settings still retire the previous value of that key.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn keyed_settings_retire_a_changed_value() {
         let (_tmp, gm) = open_store().await;
         let fallback = crate::graph::v2::schema::canon_key("");
@@ -4187,6 +4247,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn key_family_match_retires_sibling_key() {
         let (_tmp, gm) = open_store().await;
         write_session(&gm, "s1", "2026-04-03", &[decided_slot("port", "8080", 1)])
@@ -4210,6 +4274,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn distinct_keys_sharing_a_token_stay_live() {
         let (_tmp, gm) = open_store().await;
         write_session(
@@ -4248,6 +4316,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn uses_never_auto_retires() {
         let (_tmp, gm) = open_store().await;
         write_session(
@@ -4280,6 +4352,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rejected_retires_across_components() {
         let (_tmp, gm) = open_store().await;
         let part = Fact {
@@ -4373,6 +4449,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn replaces_retires_uses_on_the_project_and_its_component() {
         let (_tmp, gm) = open_store().await;
         let part = Fact {
@@ -4431,6 +4511,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn replaces_retires_setting_value_across_predicates() {
         let (_tmp, gm) = open_store().await;
         let mut path = decided_slot("storage_path", "~/.local/share/x/shelf.json", 1);
@@ -4464,6 +4548,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn replaces_without_support_in_turn_is_ignored() {
         let (_tmp, gm) = open_store().await;
         let path = decided_slot("storage_path", "~/.local/share/x/shelf.json", 1);
@@ -4490,6 +4578,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn considered_to_decided_promotion() {
         let (_tmp, gm) = open_store().await;
         let mut considered = decided_slot("port", "8080", 1);
@@ -4534,6 +4626,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn retired_record_is_never_reinforced() {
         let (_tmp, gm) = open_store().await;
         write_session(&gm, "s1", "2026-04-03", &[decided_slot("port", "8080", 1)])
@@ -4568,6 +4664,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn later_turn_does_not_retire_a_fact_from_this_session() {
         let (_tmp, gm) = open_store().await;
         let stats = write_session(
@@ -4629,6 +4729,10 @@ mod tests {
     /// `open`. Writing the session again does not retire it a second time.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn later_fixed_closes_same_session_synthetic_open() {
         let (_tmp, gm) = open_store().await;
         let open = synth("open", 1);
@@ -4661,6 +4765,10 @@ mod tests {
     /// AC2. A later `open` does not close an earlier `fixed` in this session.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn later_open_does_not_close_same_session_fixed() {
         both_live("2026-04-03", [synth("fixed", 1), synth("open", 4)], 0).await;
     }
@@ -4668,6 +4776,10 @@ mod tests {
     /// AC3. Two status entries that cite the same turn both stay live.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn same_turn_status_entries_both_stay_live() {
         both_live("2026-04-03", [synth("open", 2), synth("fixed", 2)], 0).await;
     }
@@ -4675,6 +4787,10 @@ mod tests {
     /// AC4. A `fixed` on a different issue does not close this one.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn different_issue_status_is_not_closed() {
         let (_tmp, gm) = open_store().await;
         let stats = write_session(
@@ -4704,6 +4820,10 @@ mod tests {
     /// A non-synthetic `open` stays live. Removing the provenance check closes it.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn user_open_is_not_closed_by_same_session_fixed() {
         let slots = both_live(
             "2026-04-03",
@@ -4724,6 +4844,10 @@ mod tests {
     /// AC7. An invalid session date counts the close and stamps nothing.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn bad_date_skips_the_same_session_status_close() {
         let slots = both_live("2026-04-11 10:00", [synth("open", 1), synth("fixed", 4)], 1).await;
         assert!(status_slots(&slots)
@@ -4743,6 +4867,10 @@ mod tests {
     /// with the earlier quote that already sits on the closed slot.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn re_run_of_open_fixed_open_does_not_reinforce() {
         let (_tmp, gm) = open_store().await;
         let facts = [synth("open", 1), synth("fixed", 4), synth("open", 6)];
@@ -4769,6 +4897,10 @@ mod tests {
     /// A later session's `open` is a new sighting, so it is stored.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn later_session_open_inserts_a_live_slot() {
         let (_tmp, gm) = open_store().await;
         write_session(&gm, "s1", "2026-04-03", &[synth("open", 1)])
@@ -4796,6 +4928,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn commit_conflict_retries_once_and_retires_once() {
         let (_tmp, gm) = open_store().await;
         write_session(&gm, "s03", "2026-04-03", &[decided_slot("port", "8080", 1)])
@@ -4832,6 +4968,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn commit_conflict_twice_leaves_prior_session() {
         let (_tmp, gm) = open_store().await;
         write_session(&gm, "s03", "2026-04-03", &[decided_slot("port", "8080", 1)])
@@ -4903,6 +5043,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rejected_setting_keeps_a_different_key_with_the_same_value() {
         let (_tmp, gm) = open_store().await;
         let part = Fact {
@@ -4969,6 +5113,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn one_word_replaces_does_not_close_rules_or_preferences() {
         let (_tmp, gm) = open_store().await;
         let mut rule = project_setting(
@@ -5045,6 +5193,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn bad_session_date_skips_retirements_and_still_writes() {
         for date in ["2026-04-11 10:00", ""] {
             let (_tmp, gm) = open_store().await;
@@ -5093,6 +5245,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn case_variants_reinforce_and_marked_values_stay_different() {
         let (_tmp, gm) = open_store().await;
         write_session(
@@ -5179,6 +5335,10 @@ mod tests {
     /// re-reads the entity inside its transaction and keeps that slot.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn retry_rereads_attributes_committed_between_attempts() {
         let (_tmp, gm) = open_store().await;
         write_session(&gm, "s1", "2026-04-03", &[decided_slot("port", "8080", 1)])
@@ -5211,6 +5371,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn live_edge_lookup_is_a_graph_scan_of_one_subject() {
         let (_tmp, gm) = open_store().await;
         write_session(
@@ -5489,6 +5653,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn project_component_part_of_is_in_retirement_scope() {
         let (_tmp, gm) = open_store().await;
         let mut part = raw_edge(
@@ -5568,6 +5736,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rejected_part_of_does_not_widen_scope_when_the_flag_is_on() {
         assert!(
             !undecided_part_of_closes_setting("rejected", true).await,
@@ -5688,6 +5860,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn grounded_part_of_lets_a_project_rejection_close_the_component() {
         let (_tmp, gm) = open_store().await;
         write_project(
@@ -5732,6 +5908,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_stored_technology_is_not_upgraded_or_linked() {
         let (_tmp, gm) = open_store().await;
         write_project(
@@ -5766,6 +5946,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn flag_off_still_links_a_technology_named_as_a_component() {
         let (_tmp, gm) = open_store().await;
         write_project(
@@ -5794,6 +5978,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_foreign_project_edge_is_skipped_and_does_not_close_rows() {
         let (_tmp, gm) = open_store().await;
         write_project(
@@ -5860,6 +6048,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn considered_part_of_stays_open_when_the_guard_skips() {
         let (_tmp, gm) = open_store().await;
         write_project(
@@ -5893,6 +6085,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rejected_part_of_still_closes_the_session_edge() {
         let on = reject_stored_part_of(true, false).await;
         assert!(!on.acme_live, "decided acme edge stayed live: {on:?}");
@@ -5919,6 +6115,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rejected_part_of_still_closes_a_technology_edge() {
         let on = reject_stored_part_of(true, true).await;
         assert!(!on.acme_live, "decided acme edge stayed live: {on:?}");
@@ -6006,6 +6206,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn inverted_part_of_and_uses_swap_are_one_edge() {
         let inverted = kept_component(Predicate::PartOf);
         let uses = kept_component(Predicate::Uses);
@@ -6124,6 +6328,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn punctuation_values_supersede_then_reinforce() {
         assert!(values_equal("|", " | "));
         assert!(!values_equal("|", ";"));
@@ -6177,6 +6385,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn span_symptom_writes_one_bug_and_a_retry_is_idempotent() {
         use crate::conversation::ConversationEntry;
         use crate::graph::ingest::IngestContext;
@@ -6393,6 +6605,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn equal_value_fills_the_key_and_reinforces_without_moving_the_prior() {
         let (_tmp, gm) = open_store().await;
         let weights = crate::graph::ProvenanceWeights::default();
@@ -6477,6 +6693,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn mention_guard_blocks_a_keyed_supersede_only_when_the_switch_is_on() {
         let text = "Use the standard library HTML parser instead of a third-party one.";
         for match_on in [false, true] {
@@ -6521,6 +6741,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn coexistence_guard_keeps_a_listed_value_and_still_allows_a_replacement() {
         let cases = [
             ("Test on runtime 3.4 and 3.5.", false),
@@ -6596,6 +6820,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_edge_target_closes_only_that_edge_id() {
         let (_tmp, gm) = open_store().await;
         let text = "Use LibB instead of LibA for linting.";
@@ -6655,6 +6883,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_closed_target_is_stale_and_the_new_fact_is_still_written() {
         let (_tmp, gm) = open_store().await;
         let text = "Use LibB instead of LibA for linting.";
@@ -6734,6 +6966,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_component_row_in_project_scope_does_not_match_a_project_fact() {
         let (_tmp, gm) = open_store().await;
         let mut part = raw_edge(Predicate::PartOf, "widget", Kind::Component, "app");
@@ -6813,6 +7049,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_row_opened_in_this_session_is_not_a_target_and_was_absent_before_the_write() {
         let (_tmp, gm) = open_store().await;
         let before = snapshot(&gm, "Use LibA for linting.").await;
@@ -6874,6 +7114,10 @@ mod tests {
     /// the new setting has an empty key, so the keyed supersede does not.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_named_setting_replacement_is_blocked_by_mention_when_the_switch_is_on() {
         let text = "Prefer the alpha style today.";
         for match_on in [false, true] {
@@ -6914,6 +7158,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_listed_pair_does_not_retire_on_either_switch() {
         let text = "Test plain and vivid together.";
         for match_on in [false, true] {
@@ -6952,6 +7200,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_named_link_replacement_is_blocked_by_mention_when_the_switch_is_on() {
         let text = "Prefer the alpha style today.";
         for match_on in [false, true] {
@@ -7001,6 +7253,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_named_link_replacement_is_blocked_by_coexistence_when_the_switch_is_on() {
         let text = "Run LibB with LibA.";
         for match_on in [false, true] {
@@ -7045,6 +7301,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_named_replacement_still_retires_when_the_turn_supports_it() {
         for match_on in [false, true] {
             let (_tmp, gm) = open_store().await;
@@ -7115,6 +7375,10 @@ mod tests {
     /// is stored beside it. With the switch off the new row stays unkeyed.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filled_verb_key_does_not_retire_the_live_row() {
         let text = "The writer output renders it as a wall clock stamp.";
         for match_on in [false, true] {
@@ -7164,6 +7428,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filled_key_still_retires_when_the_turn_has_evidence() {
         let cases = [
             "Replace output renders alpha, beta with a wall clock call.",
@@ -7214,6 +7482,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_canonicalised_key_does_not_retire_without_evidence() {
         let text = "The test command is now just check.";
         let (_tmp, gm) = open_store().await;
@@ -7253,6 +7525,10 @@ mod tests {
     /// A recap or a list names the live value and still leaves that row live.
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filled_key_needs_a_cue_not_a_bare_old_value_mention() {
         let cases = [
             (
@@ -7378,6 +7654,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_listed_setting_does_not_supersede_on_either_switch() {
         let turn = "Test on runtime 4.2 and 4.3.";
         for match_on in [false, true] {
@@ -7394,6 +7674,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_listed_replaces_closes_nothing() {
         let turn = "Test on runtime 4.2 and 4.3.";
         for match_on in [false, true] {
@@ -7437,6 +7721,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_listed_edge_is_written_and_closes_nothing() {
         for (text, closes) in [
             ("Lint with LibA, LibB and LibC.", false),
@@ -7491,6 +7779,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_first_listed_setting_is_written() {
         for match_on in [false, true] {
             let turn = "Test on runtime 4.2 and 4.3.";
@@ -7504,6 +7796,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_list_does_not_close_a_row_opened_in_this_session() {
         let (_tmp, gm) = open_store().await;
         let mut opened = decided_slot("runtime_version", "4.2", 0);
@@ -7551,6 +7847,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_dropped_list_member_does_not_promote_its_considered_row() {
         let (_tmp, gm) = open_store().await;
         let mut live = decided_slot("runtime_version", "4.2", 0);
@@ -7586,6 +7886,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_additive_cue_beside_a_change_still_retires() {
         let (stats, slots) =
             listed_against(false, Some("4.2"), "Also upgrade to 4.3.", "4.3", "").await;
@@ -7750,6 +8054,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn derived_from_records_a_unique_mention_and_a_cross_subject_copy() {
         let (_tmp, gm) = open_store().await;
         let both = crate::config::GraphSection {
@@ -7821,6 +8129,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn links_off_persists_nothing_and_defines_no_field() {
         for (consolidate, consolidate_links) in [(false, false), (false, true), (true, false)] {
             let section = crate::config::GraphSection {
@@ -7856,6 +8168,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn links_on_defines_the_edge_field_without_a_list() {
         let (_tmp, gm) = open_store().await;
         let stats = write_linked(
@@ -7883,6 +8199,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn overlapping_labels_record_no_entity_link() {
         let (_tmp, gm) = open_store().await;
         write_linked(
@@ -7938,6 +8258,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn unique_labels_are_capped_at_four() {
         let (_tmp, gm) = open_store().await;
         let names = ["alpha", "bravo", "cedar", "delta", "ember"];
@@ -7980,6 +8304,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn one_label_records_every_edge_and_each_edge_kind_can_be_a_premise() {
         let (_tmp, gm) = open_store().await;
         write_linked(
@@ -8028,6 +8356,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn shared_empty_and_projected_values_follow_the_unique_value_rule() {
         let (_tmp, gm) = open_store().await;
         write_linked(
@@ -8140,6 +8472,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ineligible_rows_do_not_receive_derived_from() {
         let (_tmp, gm) = open_store().await;
         write_linked(
@@ -8208,6 +8544,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn pending_closed_and_undecided_rows_are_not_premises() {
         let (_tmp, gm) = open_store().await;
         write_linked(
@@ -8447,6 +8787,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_fact_can_link_and_an_earlier_fact_is_not_patched() {
         let (_tmp, gm) = open_store().await;
         let stats = write_linked(
@@ -8496,6 +8840,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn reinforcement_does_not_rewrite_derived_from() {
         let (_tmp, gm) = open_store().await;
         write_linked(
@@ -8542,6 +8890,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_write_conflict_retry_recounts_derived_from() {
         let (_tmp, gm) = open_store().await;
         let calls = AtomicU32::new(0);

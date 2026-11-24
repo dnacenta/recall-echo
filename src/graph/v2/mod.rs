@@ -524,6 +524,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn add_entity_on_a_v2_store_accepts_only_a_real_v2_kind() {
         use super::super::types::{EntityType, NewEntity};
 

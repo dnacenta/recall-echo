@@ -4,11 +4,97 @@
 
 //! Text embedding via fastembed (BGE-Small-EN-v1.5, 384 dimensions).
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use super::error::GraphError;
+
+/// Points every store at one shared models dir instead of `<store>/models`.
+const MODELS_DIR_ENV: &str = "RECALL_ECHO_MODELS_DIR";
+
+/// Tokenizer files the embedding crate reads beside the model.
+const TOKENIZER_FILES: [&str; 4] = [
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
+
+/// The hub repo and every file the embedding crate fetches for
+/// BGE-Small-EN-v1.5: the model file, its additional files, the tokenizer.
+fn model_files() -> Option<(String, Vec<String>)> {
+    let info = TextEmbedding::get_model_info(&EmbeddingModel::BGESmallENV15).ok()?;
+    let files = std::iter::once(&info.model_file)
+        .chain(&info.additional_files)
+        .cloned()
+        .chain(TOKENIZER_FILES.iter().map(|file| (*file).to_string()))
+        .collect();
+    Some((info.model_code.clone(), files))
+}
+
+/// The models dir for `store`: `override_dir` when it is non-empty, else
+/// `<store>/models`.
+pub fn resolve_models_dir(store: &Path, override_dir: Option<&OsStr>) -> PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => store.join("models"),
+    }
+}
+
+/// The models dir for `store`, honouring `RECALL_ECHO_MODELS_DIR`.
+///
+/// `HF_HOME`, when set, still wins: the embedding crate reads it in place of
+/// the dir it is given.
+pub fn models_dir(store: &Path) -> PathBuf {
+    resolve_models_dir(store, std::env::var_os(MODELS_DIR_ENV).as_deref())
+}
+
+/// The cache the embedding crate reads for `cache_dir`: `HF_HOME` when it is
+/// set, else `cache_dir`.
+pub(crate) fn effective_cache_dir(cache_dir: &Path) -> PathBuf {
+    resolve_effective_cache_dir(cache_dir, std::env::var("HF_HOME").ok().as_deref())
+}
+
+/// [`effective_cache_dir`] with the `HF_HOME` value passed in.
+fn resolve_effective_cache_dir(cache_dir: &Path, hf_home: Option<&str>) -> PathBuf {
+    hf_home.map_or_else(|| cache_dir.to_path_buf(), PathBuf::from)
+}
+
+/// Whether every model and tokenizer file is in the hub cache at `dir`.
+pub(crate) fn model_cached(dir: &Path) -> bool {
+    let Some((repo_id, files)) = model_files() else {
+        return false;
+    };
+    let repo = hf_hub::Cache::new(dir.to_path_buf()).model(repo_id);
+    files.iter().all(|file| repo.get(file).is_some())
+}
+
+/// The error for an offline run whose cache in `dir` lacks a model or
+/// tokenizer file; `None` when the embedding crate may be called.
+///
+/// The hub client does not honour `HF_HUB_OFFLINE`: handed an empty cache,
+/// it downloads the model anyway.
+pub fn offline_cache_missing(dir: &Path, offline: bool) -> Option<String> {
+    if !offline || model_cached(dir) {
+        return None;
+    }
+    Some(format!(
+        "HF_HUB_OFFLINE is set and the embedding model is not cached in {}",
+        dir.display()
+    ))
+}
+
+/// Whether `HF_HUB_OFFLINE` is `1`, `true`, `yes` or `on` (any case).
+fn hub_offline() -> bool {
+    std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 /// Trait for embedding text into vectors.
 pub trait Embedder: Send + Sync {
@@ -24,6 +110,13 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn new(cache_dir: &Path) -> Result<Self, GraphError> {
+        // The embedding crate reads HF_HOME in place of `cache_dir`, so that
+        // is the cache to check.
+        let effective_dir = effective_cache_dir(cache_dir);
+        if let Some(message) = offline_cache_missing(&effective_dir, hub_offline()) {
+            return Err(GraphError::Embed(message));
+        }
+
         let options = InitOptions::new(EmbeddingModel::BGESmallENV15)
             .with_cache_dir(cache_dir.to_path_buf())
             .with_show_download_progress(true);
@@ -99,5 +192,121 @@ impl Embedder for FastEmbedder {
 
     fn dimensions(&self) -> usize {
         384
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_models_dir_without_an_override_is_the_store_models_dir() {
+        let store = Path::new("/srv/memory/graph");
+        assert_eq!(resolve_models_dir(store, None), store.join("models"));
+    }
+
+    #[test]
+    fn resolve_models_dir_treats_an_empty_override_as_unset() {
+        let store = Path::new("/srv/memory/graph");
+        assert_eq!(
+            resolve_models_dir(store, Some(OsStr::new(""))),
+            store.join("models")
+        );
+    }
+
+    #[test]
+    fn resolve_models_dir_uses_a_non_empty_override() {
+        let store = Path::new("/srv/memory/graph");
+        assert_eq!(
+            resolve_models_dir(store, Some(OsStr::new("/var/cache/models"))),
+            PathBuf::from("/var/cache/models")
+        );
+    }
+
+    #[test]
+    fn offline_cache_missing_is_none_when_not_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(offline_cache_missing(tmp.path(), false), None);
+    }
+
+    #[test]
+    fn offline_cache_missing_names_an_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            offline_cache_missing(tmp.path(), true),
+            Some(format!(
+                "HF_HUB_OFFLINE is set and the embedding model is not cached in {}",
+                tmp.path().display()
+            ))
+        );
+    }
+
+    /// A hub cache layout under `dir` with every model file present and empty.
+    fn write_complete_cache_layout(dir: &Path) {
+        let repo = dir.join("models--Xenova--bge-small-en-v1.5");
+        let commit = "0123456789abcdef";
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), commit).unwrap();
+        for file in model_files().unwrap().1 {
+            let path = repo.join("snapshots").join(commit).join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+    }
+
+    #[test]
+    fn offline_cache_missing_is_none_for_a_complete_cache_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_complete_cache_layout(tmp.path());
+        assert_eq!(offline_cache_missing(tmp.path(), true), None);
+    }
+
+    #[test]
+    fn model_files_are_the_repo_model_and_tokenizer_files() {
+        let (repo, files) = model_files().expect("model info");
+        assert_eq!(repo, "Xenova/bge-small-en-v1.5");
+        assert_eq!(
+            files,
+            [
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_cached_is_false_for_an_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!model_cached(tmp.path()));
+    }
+
+    #[test]
+    fn model_cached_is_false_for_a_dir_with_an_unrelated_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cache.bin"), b"model").unwrap();
+        assert!(!model_cached(tmp.path()));
+    }
+
+    #[test]
+    fn model_cached_is_true_for_a_complete_cache_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_complete_cache_layout(tmp.path());
+        assert!(model_cached(tmp.path()));
+    }
+
+    #[test]
+    fn effective_cache_dir_prefers_hf_home_when_it_is_set() {
+        let cache_dir = Path::new("/srv/memory/graph/models");
+        assert_eq!(
+            resolve_effective_cache_dir(cache_dir, None),
+            cache_dir.to_path_buf()
+        );
+        assert_eq!(
+            resolve_effective_cache_dir(cache_dir, Some("/var/cache/hf")),
+            PathBuf::from("/var/cache/hf")
+        );
     }
 }

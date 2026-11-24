@@ -3875,6 +3875,7 @@ dependencies = [
  "fastembed",
  "flate2",
  "futures",
+ "hf-hub",
  "libc",
  "pulse-system-types",
  "regex",

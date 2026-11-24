@@ -9,6 +9,10 @@ use common::fixtures;
 use common::TestDb;
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn traverse_outgoing_edges() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -30,6 +34,10 @@ async fn traverse_outgoing_edges() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn traverse_no_edges() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -53,6 +61,10 @@ async fn traverse_nonexistent_entity() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn traverse_with_depth_limit() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();

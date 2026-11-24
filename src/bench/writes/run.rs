@@ -3042,6 +3042,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn recovered_items_reach_the_session_report_through_ingest_v2() {
         let on = collect_recovered(true).await;
         let off = collect_recovered(false).await;
@@ -4795,6 +4799,10 @@ mod tests {
     // the graph scan tests on a `--no-default-features` run.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn scripted_run_classifies_every_claim() {
         let script = history();
         let tmp = tempfile::tempdir().unwrap();
@@ -5045,6 +5053,10 @@ mod tests {
     // Later pipeline work updates these counts on purpose.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn linkshelf_scripted_v1_baseline() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/writes/linkshelf/script.toml");
@@ -5172,6 +5184,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn prior_alpha_comes_from_first_sight() {
         let script = corroboration();
         let tmp = tempfile::tempdir().unwrap();
@@ -5413,6 +5429,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn grounded_component_edge_reaches_the_session_report() {
         let (sessions, report) = collect_component_edge(GroundComponentEdges::On).await;
         assert_eq!(sessions.len(), 1, "{sessions:?}");
@@ -5437,6 +5457,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn component_edge_counters_stay_off_the_session_report() {
         let (sessions, report) = collect_component_edge(GroundComponentEdges::Off).await;
         assert_eq!(sessions.len(), 1);
@@ -5523,6 +5547,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn linkshelf_scripted_v2() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/writes/linkshelf/script.toml");
@@ -5710,6 +5738,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn known_facts_context_flag_changes_the_pass1_prompt() {
         use std::sync::Mutex;
 
@@ -5832,6 +5864,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn reported_usage_sums_across_sessions() {
         const INPUT: u64 = 17;
         const OUTPUT: u64 = 4;
@@ -5957,6 +5993,10 @@ mod tests {
     /// Two pass-1 calls, each reporting (3, 1). The retry is billed.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn parse_retry_sums_both_calls_on_the_session_report() {
         struct Retry(AtomicU64);
 
@@ -6010,6 +6050,10 @@ mod tests {
     /// Resolver usage is on the session for a parsed reply and for "nope".
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn resolver_usage_reaches_the_session_report() {
         struct Resolver;
 
@@ -6103,6 +6147,10 @@ mod tests {
     /// consolidation, omits the field. The on-flag is not what decides it.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn consolidate_hold_in_the_report_follows_the_resolved_config() {
         const SCRIPT: &str = "name = \"hold\"\nfacts = []\n\
              [[sessions]]\nid = \"s1\"\ndate = \"2026-03-01T00:00:00Z\"\n\
@@ -6157,6 +6205,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn history_scripted_v2() {
         let script = history();
         let tmp = tempfile::tempdir().unwrap();
@@ -6301,6 +6353,10 @@ mod tests {
     /// counts: each decided setting already names the stored key.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn history_scripted_v2_known_match_reports_match_time() {
         let script = history();
         let tmp = tempfile::tempdir().unwrap();
