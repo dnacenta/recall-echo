@@ -205,6 +205,9 @@ pub(crate) struct WriteCtx<'a> {
     /// Close one earlier setting whose key abbreviates the new key.
     /// Off leaves consolidation unchanged and reads nothing for it.
     pub near_key_on: bool,
+    /// Keep a live `fixed` from another session unless the cited turn reopens it.
+    /// Off leaves the issue-status close unchanged and reads nothing for it.
+    pub open_loops_on: bool,
     /// Characters kept from a known value, and the cut width the replaces closes use.
     /// 80 unless the long-value switch applies.
     pub value_chars: usize,
@@ -252,6 +255,7 @@ impl<'a> WriteCtx<'a> {
             rule_replaces_on: false,
             replaces_prefix_on: false,
             near_key_on: false,
+            open_loops_on: false,
             value_chars: 80,
             alternative_details: Vec::new(),
             alternative_detail_parts: Vec::new(),
@@ -709,6 +713,9 @@ impl<'a> Attempt<'a> {
         fact: &mut Fact,
         subject: &Stored,
     ) -> Result<bool, GraphError> {
+        if self.open_pinned(fact, subject).await? {
+            return Ok(false);
+        }
         let turn = self.cited_turn(fact).to_string();
         self.block = super::enumeration::enumeration_skip(fact, &turn);
         self.held_slots.clear();
@@ -723,6 +730,31 @@ impl<'a> Attempt<'a> {
         }
         self.promote(fact, subject).await?;
         Ok(true)
+    }
+
+    /// With open loops on, an `open` that would close a live `fixed` of this
+    /// issue from another session needs a reopen cue in the cited turn.
+    /// Without one, the `fixed` stays live and the `open` is not stored.
+    async fn open_pinned(&mut self, fact: &Fact, subject: &Stored) -> Result<bool, GraphError> {
+        if !self.ctx.open_loops_on
+            || fact.predicate != Predicate::IssueStatus
+            || fold_value(&fact.object_name) != "open"
+        {
+            return Ok(false);
+        }
+        let Some(stored) = self.ensure_entity(&subject.id).await? else {
+            return Ok(false);
+        };
+        let Ok(slots) = slot_list(&stored.attributes) else {
+            return Ok(false);
+        };
+        let session_id = self.ctx.session_id;
+        let closes_fixed = slots.iter().any(|slot| {
+            supersede_target(slot, fact)
+                && fold_value(slot_str(slot, "value").unwrap_or("")) == "fixed"
+                && !opened_here(slot.get("evidence"), session_id)
+        });
+        Ok(closes_fixed && !has_reopen_cue(self.cited_turn(fact)))
     }
 
     async fn retire_replaced_if_supported(
@@ -2607,6 +2639,26 @@ fn same_session_status_close(slot: &Value, fact: &Fact, session_id: &str) -> boo
     };
     first.get("session").and_then(Value::as_str) == Some(session_id)
         && json_usize(first.get("turn")).is_some_and(|turn| turn < fact.turn)
+}
+
+/// Words that reopen a fixed issue. A restatement such as "still fails" is not one.
+const REOPEN_CUES: &[&str] = &[
+    "reopen",
+    "reopened",
+    "open again",
+    "back to open",
+    "not fixed",
+];
+
+/// `true` when `text` holds a reopen cue as whole words, ignoring case.
+fn has_reopen_cue(text: &str) -> bool {
+    let words = alphanumeric_runs(text);
+    REOPEN_CUES.iter().any(|cue| {
+        let cue: Vec<String> = alphanumeric_runs(cue);
+        words
+            .windows(cue.len())
+            .any(|window| window == cue.as_slice())
+    })
 }
 
 /// This session, turn and quote is already stored on this fact, live or closed.
@@ -4892,6 +4944,178 @@ mod tests {
         let slots = slots_of(&gm, "login fails").await;
         let after: Vec<_> = status_slots(&slots).into_iter().map(fact_counts).collect();
         assert_eq!(after, before);
+    }
+
+    /// One session of status facts. Turn 1 holds `text`.
+    async fn write_status(
+        gm: &GraphMemory,
+        session_id: &str,
+        date: &str,
+        text: &str,
+        facts: &[Fact],
+        open_loops: bool,
+    ) -> WriteStats {
+        let project = ProjectIdentity {
+            name: String::new(),
+            aliases: Vec::new(),
+        };
+        let llm = Quiet;
+        let turns = [Turn {
+            index: 1,
+            role: TurnRole::User,
+            text: text.to_string(),
+        }];
+        let mut ctx = WriteCtx::switches_off(&llm, &project, session_id, date, &turns);
+        ctx.open_loops_on = open_loops;
+        write_facts(gm, &ctx, facts).await.unwrap()
+    }
+
+    /// s1 fixes the login issue. s2 restates it with no fix, in `text`.
+    async fn restate_after_fix(text: &str, open_loops: bool) -> (WriteStats, Vec<Value>) {
+        let (_tmp, gm) = open_store().await;
+        let fixed = write_status(
+            &gm,
+            "s1",
+            "2026-04-02",
+            "The login fix landed.",
+            &[synth("fixed", 1)],
+            open_loops,
+        )
+        .await;
+        assert_eq!(fixed.slots, 1);
+        let stats = write_status(
+            &gm,
+            "s2",
+            "2026-04-03",
+            text,
+            &[synth("open", 1)],
+            open_loops,
+        )
+        .await;
+        (stats, slots_of(&gm, "login fails").await)
+    }
+
+    #[test]
+    fn reopen_cues_are_whole_words_in_any_case() {
+        for text in [
+            "Reopen the login issue.",
+            "The login bug was REOPENED today.",
+            "The login issue is open again.",
+            "Move the login issue Back To Open.",
+            "The login is not fixed: login fails.",
+            "not  fixed",
+        ] {
+            assert!(has_reopen_cue(text), "{text}");
+        }
+        for text in [
+            "The login still fails.",
+            "Login fails again on Safari.",
+            "Reopening the PR now.",
+            "Open the login page again.",
+            "It is fixed, not broken.",
+            "notfixed",
+            "",
+        ] {
+            assert!(!has_reopen_cue(text), "{text}");
+        }
+    }
+
+    /// Flag on: a restatement with no fix and no reopen cue leaves the
+    /// `fixed` live and stores no second `open`.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
+    async fn open_loops_keeps_fixed_on_a_restatement_without_a_cue() {
+        let (stats, slots) = restate_after_fix("The login still fails on Safari.", true).await;
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        assert_eq!(stats.slots, 0);
+        assert_eq!(status_slots(&slots).len(), 1, "{slots:?}");
+        assert_eq!(live_count(&slots, "fixed"), 1);
+        assert_eq!(live_count(&slots, "open"), 0);
+    }
+
+    /// Flag on: an explicit reopen closes `fixed` and writes `open`.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
+    async fn open_loops_reopen_cue_closes_fixed_and_writes_open() {
+        let (stats, slots) =
+            restate_after_fix("Reopen the login issue: login fails again.", true).await;
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        let row = &stats.retirements[0];
+        assert_eq!(row.reason, "superseded");
+        assert_eq!(
+            (row.old_value.as_str(), row.new_value.as_str()),
+            ("fixed", "open")
+        );
+        assert_eq!(live_count(&slots, "open"), 1);
+        assert_eq!(live_count(&slots, "fixed"), 0);
+        let fixed = status_slots(&slots)
+            .into_iter()
+            .find(|slot| slot["value"] == "fixed")
+            .expect("fixed slot");
+        assert_eq!(fixed["ended_by"], "s2:superseded");
+    }
+
+    /// Flag off: the inferred `open` still closes a `fixed` from another session.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
+    async fn open_loops_off_lets_an_inferred_open_close_fixed() {
+        let (stats, slots) = restate_after_fix("The login still fails on Safari.", false).await;
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_eq!(stats.slots, 1);
+        assert_eq!(live_count(&slots, "open"), 1);
+        assert_eq!(live_count(&slots, "fixed"), 0);
+    }
+
+    /// Flag on: a same-session `fixed` still closes the earlier synthetic
+    /// `open`, and a later `open` still stays beside a same-session `fixed`.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
+    async fn open_loops_leaves_same_session_status_closes_alone() {
+        let (_tmp, gm) = open_store().await;
+        let stats = write_status(
+            &gm,
+            "s",
+            "2026-04-03",
+            "The login still fails.",
+            &[synth("open", 1), synth("fixed", 4)],
+            true,
+        )
+        .await;
+        assert_eq!(stats.retirements.len(), 1, "{:?}", stats.retirements);
+        assert_open_closed(&slots_of(&gm, "login fails").await);
+
+        let (_tmp, gm) = open_store().await;
+        let stats = write_status(
+            &gm,
+            "s",
+            "2026-04-03",
+            "The login still fails.",
+            &[synth("fixed", 1), synth("open", 4)],
+            true,
+        )
+        .await;
+        assert!(stats.retirements.is_empty(), "{:?}", stats.retirements);
+        let slots = slots_of(&gm, "login fails").await;
+        assert_eq!(
+            (live_count(&slots, "open"), live_count(&slots, "fixed")),
+            (1, 1)
+        );
     }
 
     /// A later session's `open` is a new sighting, so it is stored.

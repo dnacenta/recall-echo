@@ -374,6 +374,7 @@ pub(crate) async fn extract_session(
         );
         write_ctx.match_on = match_on;
         write_ctx.hold_on = hold_enabled(memory_dir);
+        write_ctx.open_loops_on = open_loops_enabled(memory_dir);
         write_ctx.links_on = links_enabled(memory_dir);
         write_ctx.ground_on = ground_edges;
         write_ctx.components_on = components_enabled(memory_dir);
@@ -557,6 +558,13 @@ fn hold_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .hold_applies()
+}
+
+fn open_loops_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .open_loops
 }
 
 fn links_enabled(memory_dir: &Path) -> bool {
@@ -7075,6 +7083,27 @@ mod tests {
         assert!(!near_key_enabled(dir.path()));
         let encoded = serde_json::to_string(&IngestionReport::default()).unwrap();
         assert!(!encoded.contains("quote_strip_code_cites"), "{encoded}");
+    }
+
+    #[test]
+    fn open_loops_reads_only_its_own_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!open_loops_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nopen_loops = true\n",
+        )
+        .unwrap();
+        assert!(open_loops_enabled(dir.path()));
+        assert!(!recover_turns_enabled(dir.path()));
+        assert!(!value_details_enabled(dir.path()));
+        assert!(!known_match_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nrecover_turns = true\nconsolidate = true\nextract_value_details = true\n",
+        )
+        .unwrap();
+        assert!(!open_loops_enabled(dir.path()));
     }
 
     #[cfg(feature = "embedded")]

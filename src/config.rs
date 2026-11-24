@@ -1052,6 +1052,11 @@ pub struct GraphSection {
         skip_serializing_if = "is_false"
     )]
     pub consolidate_near_key: bool,
+    /// Track open loops on issue records. A restated issue with no fix keeps
+    /// a live `fixed` closed unless the cited turn reopens it.
+    /// Off unless set. Stands alone: it does not turn any other switch on.
+    #[serde(default = "default_open_loops", skip_serializing_if = "is_false")]
+    pub open_loops: bool,
 }
 
 impl Default for GraphSection {
@@ -1099,6 +1104,7 @@ impl Default for GraphSection {
             value_suffix: default_value_suffix(),
             quote_strip_code: default_quote_strip_code(),
             consolidate_near_key: default_consolidate_near_key(),
+            open_loops: default_open_loops(),
         }
     }
 }
@@ -1652,6 +1658,10 @@ fn default_quote_strip_code() -> bool {
 }
 
 fn default_consolidate_near_key() -> bool {
+    false
+}
+
+fn default_open_loops() -> bool {
     false
 }
 
@@ -2218,6 +2228,7 @@ const GRAPH_BOOLS: &[(&str, GraphBoolField)] = &[
     ("graph.value_suffix", flag_value_suffix),
     ("graph.quote_strip_code", flag_quote_strip_code),
     ("graph.consolidate_near_key", flag_consolidate_near_key),
+    ("graph.open_loops", flag_open_loops),
 ];
 
 fn graph_bool_field(key: &str) -> Option<GraphBoolField> {
@@ -2363,6 +2374,10 @@ fn flag_quote_strip_code(graph: &mut GraphSection) -> &mut bool {
 
 fn flag_consolidate_near_key(graph: &mut GraphSection) -> &mut bool {
     &mut graph.consolidate_near_key
+}
+
+fn flag_open_loops(graph: &mut GraphSection) -> &mut bool {
+    &mut graph.open_loops
 }
 
 fn parse_bool(value: &str) -> Result<bool, crate::error::RecallError> {
@@ -5234,6 +5249,65 @@ settle_secs = 300
         assert!(cfg.set_key("graph.consolidate_near_key", "yes").is_err());
         assert!(cfg.graph.as_ref().expect("graph").consolidate_near_key);
         assert!(!cfg.graph.as_ref().expect("graph").quote_strip_code);
+    }
+
+    #[test]
+    fn open_loops_defaults_off_round_trips_and_stands_alone() {
+        assert!(!default_open_loops());
+        assert!(!GraphSection::default().open_loops);
+        let absent: Config = toml::from_str("").expect("empty config");
+        assert!(!absent.graph.unwrap_or_default().open_loops);
+        let rendered_default = toml::to_string(&GraphSection::default()).expect("render default");
+        assert!(!rendered_default.contains("open_loops"));
+
+        let explicit_false: Config =
+            toml::from_str("[graph]\nopen_loops = false\n").expect("parse false");
+        let false_graph = explicit_false.graph.expect("graph");
+        assert!(!false_graph.open_loops);
+        let rendered_false = toml::to_string(&false_graph).expect("render false");
+        assert!(!rendered_false.contains("open_loops"));
+
+        let explicit_true: Config =
+            toml::from_str("[graph]\nopen_loops = true\n").expect("parse true");
+        let true_graph = explicit_true.graph.expect("graph");
+        assert!(true_graph.open_loops);
+        // Nothing else moves: consolidation keeps its default, and the
+        // off-by-default switches stay off.
+        assert!(true_graph.consolidate);
+        assert!(!true_graph.recover_turns);
+        assert!(!true_graph.recover_applies());
+        assert!(!true_graph.known_match);
+        assert!(!true_graph.extract_value_details);
+        assert!(!true_graph.consolidate_near_key);
+        let rendered_true = toml::to_string(&true_graph).expect("render true");
+        assert!(rendered_true.contains("open_loops = true"));
+        assert!(!rendered_true.contains("recover_turns"));
+        let again: GraphSection = toml::from_str(&rendered_true).expect("reparse true");
+        assert!(again.open_loops);
+        assert!(!again.recover_turns);
+
+        let mut cfg = Config::default();
+        cfg.set_key("graph.open_loops", "true").unwrap();
+        let graph = cfg.graph.as_ref().expect("graph");
+        assert!(graph.open_loops);
+        assert!(!graph.recover_turns);
+        assert!(graph.consolidate);
+        let rendered = toml::to_string_pretty(&cfg).expect("render true");
+        assert!(rendered.contains("open_loops = true"));
+        assert!(!rendered.contains("recover_turns"));
+        assert!(!rendered.contains("consolidate ="));
+        let parsed: Config = toml::from_str(&rendered).expect("reparse true");
+        assert!(parsed.graph.expect("graph").open_loops);
+
+        cfg.set_key("graph.open_loops", "false").unwrap();
+        assert!(!cfg.graph.as_ref().expect("graph").open_loops);
+        let cleared = toml::to_string_pretty(&cfg).expect("render cleared");
+        assert!(!cleared.contains("open_loops"));
+        cfg.set_key("graph.open_loops", "true").unwrap();
+        for bad in ["yes", "1", "True", "on", ""] {
+            assert!(cfg.set_key("graph.open_loops", bad).is_err(), "{bad}");
+        }
+        assert!(cfg.graph.as_ref().expect("graph").open_loops);
     }
 
     #[test]
