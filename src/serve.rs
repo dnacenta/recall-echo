@@ -1183,7 +1183,7 @@ pub async fn run(options: ServeOptions) -> Result<(), RecallError> {
         shutdown: Arc::new(ShutdownSignal::new()),
         extraction: Arc::clone(&extraction),
     });
-    warm_embedder(Arc::clone(&graph), Arc::clone(&log));
+    warm_embedder(&graph, Arc::clone(&log));
     let worker = start_background_extraction(&options, &graph, &context, &log);
     let capture = start_background_capture(&options, &graph, &context, &log);
     log.log("ready");
@@ -1268,14 +1268,18 @@ async fn release_store(graph: Arc<GraphMemory>, log: &DaemonLog) {
 /// Skipped unless the model is fully cached where the loader reads it:
 /// warming a cold cache downloads the model, which must stay tied to a request
 /// that actually needs it rather than happening on every daemon start.
-fn warm_embedder(graph: Arc<GraphMemory>, log: Arc<DaemonLog>) {
+///
+/// The task holds only the embedder handle, so a shutdown can release the
+/// store while the model is still loading.
+fn warm_embedder(graph: &GraphMemory, log: Arc<DaemonLog>) {
     let models_dir = embed::models_dir(graph.path());
     if !embed::model_cached(&embed::effective_cache_dir(&models_dir)) {
         return;
     }
+    let embedder = graph.embedder_handle();
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        match graph.embedder() {
+        match embedder.get() {
             Ok(_) => log.log(&format!(
                 "embedder warm in {}ms",
                 started.elapsed().as_millis()
@@ -1612,6 +1616,36 @@ mod tests {
     fn graph_memory_is_shareable_across_tasks() {
         // The daemon hands one Arc<GraphMemory> to every connection task.
         assert_shareable::<GraphMemory>();
+    }
+
+    /// The warm-up holds only the embedder, so the store can be released while
+    /// the model is still loading.
+    #[cfg(feature = "embedded")]
+    #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
+    async fn the_embedder_warm_up_does_not_hold_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("daemon.log");
+        let graph = Arc::new(GraphMemory::open_embedded(tmp.path()).await.unwrap());
+        warm_embedder(&graph, Arc::new(DaemonLog::open(&log_path, false)));
+        assert!(
+            Arc::try_unwrap(graph).is_ok(),
+            "the warm-up task holds the store"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if text.contains("embedder warm in") {
+                break;
+            }
+            assert!(!text.contains("warm-up failed"), "{text}");
+            assert!(Instant::now() < deadline, "no warm-up in the log: {text}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[test]
