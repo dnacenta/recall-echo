@@ -180,7 +180,7 @@ CLI's stderr, and so is a JSON envelope that reports its own failure while exiti
 ## Embedding model
 
 Embeddings use BGE-Small-EN-v1.5 through fastembed (ONNX, 384 dimensions). The model is
-about 134 MB. It downloads on first use, and embedding makes no network calls after
+about 127 MB. It downloads on first use, and embedding makes no network calls after
 that. By default every store keeps its own copy in `<store>/models` (`graph/models` in
 the memory directory), so each new store downloads it once.
 
@@ -189,6 +189,12 @@ the memory directory), so each new store downloads it once.
 ```sh
 export RECALL_ECHO_MODELS_DIR=~/.cache/recall-echo/models
 ```
+
+Use an absolute path: a relative one resolves against whatever directory each process
+starts in. The dir must be writable only by you, because whoever can write to it decides
+which model every store loads. To share one copy across users, seed it once, make it
+read-only, and set `HF_HUB_OFFLINE=1` for everyone who uses it, so nothing writes to it
+or downloads into it.
 
 The model cache is the first of:
 

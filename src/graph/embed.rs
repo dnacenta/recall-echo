@@ -14,15 +14,25 @@ use super::error::GraphError;
 /// Points every store at one shared models dir instead of `<store>/models`.
 const MODELS_DIR_ENV: &str = "RECALL_ECHO_MODELS_DIR";
 
-/// Hub repo and files the embedding crate fetches for BGE-Small-EN-v1.5.
-const MODEL_REPO: &str = "Xenova/bge-small-en-v1.5";
-const MODEL_FILES: [&str; 5] = [
-    "onnx/model.onnx",
+/// Tokenizer files the embedding crate reads beside the model.
+const TOKENIZER_FILES: [&str; 4] = [
     "tokenizer.json",
     "config.json",
     "special_tokens_map.json",
     "tokenizer_config.json",
 ];
+
+/// The hub repo and every file the embedding crate fetches for
+/// BGE-Small-EN-v1.5: the model file, its additional files, the tokenizer.
+fn model_files() -> Option<(String, Vec<String>)> {
+    let info = TextEmbedding::get_model_info(&EmbeddingModel::BGESmallENV15).ok()?;
+    let files = std::iter::once(&info.model_file)
+        .chain(&info.additional_files)
+        .cloned()
+        .chain(TOKENIZER_FILES.iter().map(|file| (*file).to_string()))
+        .collect();
+    Some((info.model_code.clone(), files))
+}
 
 /// The models dir for `store`: `override_dir` when it is non-empty, else
 /// `<store>/models`.
@@ -54,8 +64,11 @@ fn resolve_effective_cache_dir(cache_dir: &Path, hf_home: Option<&str>) -> PathB
 
 /// Whether every model and tokenizer file is in the hub cache at `dir`.
 pub(crate) fn model_cached(dir: &Path) -> bool {
-    let repo = hf_hub::Cache::new(dir.to_path_buf()).model(MODEL_REPO.to_string());
-    MODEL_FILES.iter().all(|file| repo.get(file).is_some())
+    let Some((repo_id, files)) = model_files() else {
+        return false;
+    };
+    let repo = hf_hub::Cache::new(dir.to_path_buf()).model(repo_id);
+    files.iter().all(|file| repo.get(file).is_some())
 }
 
 /// The error for an offline run whose cache in `dir` lacks a model or
@@ -234,7 +247,7 @@ mod tests {
         let commit = "0123456789abcdef";
         std::fs::create_dir_all(repo.join("refs")).unwrap();
         std::fs::write(repo.join("refs").join("main"), commit).unwrap();
-        for file in MODEL_FILES {
+        for file in model_files().unwrap().1 {
             let path = repo.join("snapshots").join(commit).join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
@@ -246,6 +259,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_complete_cache_layout(tmp.path());
         assert_eq!(offline_cache_missing(tmp.path(), true), None);
+    }
+
+    #[test]
+    fn model_files_are_the_repo_model_and_tokenizer_files() {
+        let (repo, files) = model_files().expect("model info");
+        assert_eq!(repo, "Xenova/bge-small-en-v1.5");
+        assert_eq!(
+            files,
+            [
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ]
+        );
     }
 
     #[test]

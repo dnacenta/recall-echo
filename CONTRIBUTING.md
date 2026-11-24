@@ -140,7 +140,7 @@ docs(#2): expand usage examples
 
 ## Testing
 
-Plain `cargo test` is offline: the tests that need the embedding model (about 134 MB)
+Plain `cargo test` is offline: the tests that need the embedding model (about 127 MB)
 are skipped and reported as ignored. To run them, seed a models dir once:
 
 ```
@@ -157,6 +157,10 @@ Set the variable for both the build and the run: `build.rs` reads it at build ti
 decide which tests are ignored, and the tests read it at run time to find the model. If
 `HF_HOME` is set, the model is cached there instead; see
 [the embedding model](docs/configuration.md#embedding-model).
+
+An exported `RECALL_ECHO_MODELS_DIR` turns the embedding tests on for every `cargo test`
+in that shell. Changing or unsetting it rebuilds the crate, because `build.rs` reruns
+when it changes.
 
 ## Code style
 
