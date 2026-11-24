@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["facts", "bugs", "releases"],
+  "properties": {
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["subject", "subject_type", "predicate", "role", "key", "object", "object_type", "status", "replaces", "turn", "quote", "confidence"],
+        "properties": {
+          "subject": {"type": "string"},
+          "subject_type": {"type": "string", "enum": ["project", "component", "technology", "person"]},
+          "predicate": {"type": "string", "enum": ["uses", "part_of", "depends_on", "works_on", "setting", "rule", "prefers"]},
+          "role": {"type": "string", "enum": ["language", "runtime", "package_manager", "framework", "cli_framework", "web_framework", "database", "test_framework", "linter", "formatter", "type_checker", "build_tool", "ci", "hosting", "library", "other", "none"]},
+          "key": {"type": "string"},
+          "object": {"type": "string"},
+          "object_type": {"type": "string", "enum": ["project", "component", "technology", "literal"]},
+          "status": {"type": "string", "enum": ["decided", "considered", "rejected"]},
+          "replaces": {"type": "string"},
+          "turn": {"type": "integer"},
+          "quote": {"type": "string"},
+          "confidence": {"type": "number"}
+        }
+      }
+    },
+    "bugs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symptom", "cause", "fix", "status", "component", "turn", "quote", "confidence"],
+        "properties": {
+          "symptom": {"type": "string"},
+          "cause": {"type": "string"},
+          "fix": {"type": "string"},
+          "status": {"type": "string", "enum": ["open", "fixed", "wont_fix"]},
+          "component": {"type": "string"},
+          "turn": {"type": "integer"},
+          "quote": {"type": "string"},
+          "confidence": {"type": "number"}
+        }
+      }
+    },
+    "releases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "status", "contents", "turn", "quote", "confidence"],
+        "properties": {
+          "version": {"type": "string"},
+          "status": {"type": "string", "enum": ["released", "planned"]},
+          "contents": {"type": "string"},
+          "turn": {"type": "integer"},
+          "quote": {"type": "string"},
+          "confidence": {"type": "number"}
+        }
+      }
+    }
+  }
+}
