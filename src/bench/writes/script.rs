@@ -249,7 +249,8 @@ pub enum EndProvenance {
 /// A question whose answer is assembled from more than one event.
 ///
 /// `needs` must be live and `absent` must not be. Keyword search is scored
-/// separately, over the archives.
+/// separately, over the archives. `answer` is also looked for as an exact
+/// value on the final store and in the recall render.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedQuestion {
@@ -259,6 +260,44 @@ pub struct DerivedQuestion {
     pub needs: Vec<String>,
     #[serde(default)]
     pub absent: Vec<String>,
+    /// How the answer is graded. Defaults to [`QuestionKind::Exact`].
+    #[serde(default)]
+    pub kind: QuestionKind,
+    /// Superseded or rejected values the recall render is scanned for. Only
+    /// valid on a current-value question. Omitted there, it is filled from
+    /// [`FactScript::superseded_pairs`]: the old value of each pair whose new
+    /// fact the question needs, or whose new fact's object is the answer.
+    #[serde(default)]
+    pub stale: Option<Vec<StaleRef>>,
+}
+
+/// How a derived question's answer is graded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    /// One exact value.
+    #[default]
+    Exact,
+    /// The value now in force. Stale values are scanned for as well.
+    CurrentValue,
+}
+
+/// A value that must not steer a current-value answer.
+///
+/// A bare string names a fact, and that fact's object is the value.
+/// `{ text = "..." }` is the value itself.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum StaleRef {
+    Fact(String),
+    Text(StaleText),
+}
+
+/// A literal stale value.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaleText {
+    pub text: String,
 }
 
 impl FactScript {
@@ -268,6 +307,46 @@ impl FactScript {
             .iter()
             .find(|fact| fact.id == id)
             .ok_or_else(|| RecallError::Config(format!("unknown fact '{id}'")))
+    }
+
+    /// The stale values for `question`. Empty unless it is a current-value
+    /// question.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stale_values(
+        &self,
+        question: &DerivedQuestion,
+    ) -> Result<Vec<String>, RecallError> {
+        if question.kind != QuestionKind::CurrentValue {
+            return Ok(Vec::new());
+        }
+        let Some(listed) = &question.stale else {
+            return self.paired_stale(question);
+        };
+        listed
+            .iter()
+            .map(|item| match item {
+                StaleRef::Fact(id) => Ok(self.fact(id)?.object.clone()),
+                StaleRef::Text(text) => Ok(text.text.clone()),
+            })
+            .collect()
+    }
+
+    /// Old values of the pairs whose new fact `question` needs or answers.
+    fn paired_stale(&self, question: &DerivedQuestion) -> Result<Vec<String>, RecallError> {
+        let answer = question.answer.trim().to_lowercase();
+        let mut values: Vec<String> = Vec::new();
+        for pair in &self.superseded_pairs {
+            let new = self.fact(&pair.new)?;
+            let needed = question.needs.contains(&pair.new);
+            if !needed && new.object.trim().to_lowercase() != answer {
+                continue;
+            }
+            let old = &self.fact(&pair.old)?.object;
+            if !values.contains(old) {
+                values.push(old.clone());
+            }
+        }
+        Ok(values)
     }
 }
 
@@ -641,6 +720,28 @@ fn check_questions(script: &FactScript) -> Result<(), RecallError> {
         nonempty_line("answer", &question.answer)?;
         for id in question.needs.iter().chain(question.absent.iter()) {
             script.fact(id)?;
+        }
+        check_stale(script, question)?;
+    }
+    Ok(())
+}
+
+fn check_stale(script: &FactScript, question: &DerivedQuestion) -> Result<(), RecallError> {
+    let Some(listed) = &question.stale else {
+        return Ok(());
+    };
+    if question.kind != QuestionKind::CurrentValue {
+        return Err(invalid(format!(
+            "question '{}' lists stale values but is not a current_value question",
+            question.text
+        )));
+    }
+    for item in listed {
+        match item {
+            StaleRef::Fact(id) => {
+                script.fact(id)?;
+            }
+            StaleRef::Text(text) => nonempty_line("stale text", &text.text)?,
         }
     }
     Ok(())
@@ -1102,6 +1203,215 @@ live = true
             }
         }
         assert_eq!(patterns, 97);
+    }
+
+    /// Two storage settings under different keys, the first replaced by the
+    /// second, a rejected cache setting, and the questions in `questions`.
+    fn question_script(questions: &str) -> String {
+        format!(
+            r#"
+name = "questions"
+
+[[sessions]]
+id = "s1"
+date = "2026-01-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "Keep the shelf in shelf.json."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "path"
+
+[[sessions]]
+id = "s2"
+date = "2026-01-02T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "Move the store to shelf.db and drop the redis cache."
+
+[[sessions.turns.claims]]
+op = "supersede"
+fact = "path"
+replacement = "store"
+
+[[sessions.turns.claims]]
+op = "reject"
+fact = "cache"
+
+[[facts]]
+id = "path"
+subject = "shelf"
+relation = "setting:storage_path"
+object = "shelf.json"
+subject_type = "project"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s2"
+
+[[facts]]
+id = "store"
+subject = "shelf"
+relation = "setting:storage"
+object = "shelf.db"
+subject_type = "project"
+object_type = "concept"
+
+[[facts]]
+id = "cache"
+subject = "shelf"
+relation = "setting:cache"
+object = "redis"
+subject_type = "project"
+object_type = "concept"
+end_state = "rejected"
+
+[[expect]]
+fact = "path"
+live = false
+
+[[expect]]
+fact = "store"
+live = true
+
+[[expect]]
+fact = "cache"
+live = false
+
+[[superseded_pairs]]
+old = "path"
+new = "store"
+retire_in = "s2"
+
+{questions}
+"#
+        )
+    }
+
+    #[test]
+    fn a_question_without_a_kind_is_exact_and_has_no_stale_values() {
+        let script = parse_script(&history()).unwrap();
+        for question in &script.questions {
+            assert_eq!(question.kind, QuestionKind::Exact);
+            assert!(question.stale.is_none());
+            assert!(script.stale_values(question).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn omitted_stale_values_come_from_the_superseded_pairs() {
+        let script = parse_script(&question_script(
+            r#"
+[[questions]]
+text = "where is the shelf stored"
+answer = "shelf.db"
+kind = "current_value"
+needs = ["store"]
+absent = ["path"]
+
+[[questions]]
+text = "what is the store file"
+answer = "Shelf.DB"
+kind = "current_value"
+"#,
+        ))
+        .unwrap();
+        // The pair crosses keys: storage_path to storage. The old value text
+        // is what is scanned for, not the current relation name.
+        let needed = script.stale_values(&script.questions[0]).unwrap();
+        assert_eq!(needed, vec!["shelf.json".to_string()]);
+        let answered = script.stale_values(&script.questions[1]).unwrap();
+        assert_eq!(answered, vec!["shelf.json".to_string()]);
+    }
+
+    #[test]
+    fn listed_stale_values_take_fact_ids_and_literal_text() {
+        let script = parse_script(&question_script(
+            r#"
+[[questions]]
+text = "what backs the shelf"
+answer = "shelf.db"
+kind = "current_value"
+needs = ["store"]
+stale = ["cache", { text = "json file" }]
+
+[[questions]]
+text = "what backs the shelf now"
+answer = "shelf.db"
+kind = "current_value"
+needs = ["store"]
+stale = []
+"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            script.stale_values(&script.questions[0]).unwrap(),
+            vec!["redis".to_string(), "json file".to_string()]
+        );
+        // An empty list is kept: it does not fall back to the pairs.
+        assert!(script
+            .stale_values(&script.questions[1])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_stale_reference_must_name_a_known_fact() {
+        let err = parse_script(&question_script(
+            r#"
+[[questions]]
+text = "what backs the shelf"
+answer = "shelf.db"
+kind = "current_value"
+stale = ["missing"]
+"#,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown fact 'missing'"), "{err}");
+    }
+
+    #[test]
+    fn stale_values_need_a_current_value_question() {
+        let err = parse_script(&question_script(
+            r#"
+[[questions]]
+text = "what backs the shelf"
+answer = "shelf.db"
+stale = ["path"]
+"#,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("current_value"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_stale_entry_or_kind_is_rejected() {
+        for questions in [
+            r#"
+[[questions]]
+text = "what backs the shelf"
+answer = "shelf.db"
+kind = "current_value"
+stale = [{ text = "json", fact = "path" }]
+"#,
+            r#"
+[[questions]]
+text = "what backs the shelf"
+answer = "shelf.db"
+kind = "current_value"
+stale = [{ text = "" }]
+"#,
+            r#"
+[[questions]]
+text = "what backs the shelf"
+answer = "shelf.db"
+kind = "latest"
+"#,
+        ] {
+            assert!(parse_script(&question_script(questions)).is_err());
+        }
     }
 
     fn write_transcript_script(dir: &Path, name: &str, date_line: &str, quote: &str) -> PathBuf {

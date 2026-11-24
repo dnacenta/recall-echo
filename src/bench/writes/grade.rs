@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::script::{
     compile_pattern, Claim, ClaimOp, EndProvenance, EndState, FactScript, ScriptFact,
@@ -384,12 +384,32 @@ fn token_side(values: impl Iterator<Item = Option<u64>>) -> (Option<u64>, Option
     }
 }
 
-/// Keyword search versus the facts a derived question needs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Keyword search versus the facts a derived question needs, and the answer
+/// as an exact value on the store and in the recall render.
+///
+/// The fields after `graph_hit` default when absent, so a report written
+/// before they existed still reads. The stale fields are set on current-value
+/// questions only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionScore {
     pub text: String,
     pub keyword_hit: bool,
     pub graph_hit: bool,
+    /// The answer on a live decided row of the final store, v2 slots included.
+    #[serde(default)]
+    pub store_hit: bool,
+    /// The answer in the first 8,000 characters of the recall render.
+    #[serde(default)]
+    pub recall_hit: bool,
+    /// The answer anywhere in the recall render, which stops at 24,000 characters.
+    #[serde(default)]
+    pub recall_hit_24k: bool,
+    /// A stale value anywhere in the first 8,000 characters of the recall render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_in_budget: Option<bool>,
+    /// A stale value anywhere in the recall render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_in_budget_24k: Option<bool>,
 }
 
 /// The grader's report.
@@ -1253,6 +1273,11 @@ fn questions(
             text: question.text.clone(),
             keyword_hit: *keyword_hit,
             graph_hit: needs_live && absent_clear,
+            store_hit: false,
+            recall_hit: false,
+            recall_hit_24k: false,
+            stale_in_budget: None,
+            stale_in_budget_24k: None,
         });
     }
     Ok(scores)
@@ -2103,9 +2128,32 @@ fn count_of(len: usize) -> u32 {
 mod tests {
     use super::super::script::{
         Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState, ExpectedFact, FactPattern,
-        FactScript, ScriptFact, ScriptSession, ScriptTurn, Speaker, SupersededPair,
+        FactScript, QuestionKind, ScriptFact, ScriptSession, ScriptTurn, Speaker, SupersededPair,
     };
     use super::*;
+
+    #[test]
+    fn a_question_score_without_the_extrinsic_fields_still_reads() {
+        let old: QuestionScore = serde_json::from_str(
+            r#"{"text":"what changed about the host","keyword_hit":true,"graph_hit":false}"#,
+        )
+        .unwrap();
+        assert!(old.keyword_hit && !old.graph_hit);
+        assert!(!old.store_hit && !old.recall_hit && !old.recall_hit_24k);
+        assert_eq!(old.stale_in_budget, None);
+        assert_eq!(old.stale_in_budget_24k, None);
+        let json = serde_json::to_value(&old).unwrap();
+        assert_eq!(json["store_hit"], false);
+        assert!(json.get("stale_in_budget").is_none());
+        let current = QuestionScore {
+            stale_in_budget: Some(false),
+            stale_in_budget_24k: Some(true),
+            ..old
+        };
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["stale_in_budget"], false);
+        assert_eq!(json["stale_in_budget_24k"], true);
+    }
 
     fn weights() -> ProvenanceWeights {
         ProvenanceWeights::default()
@@ -2386,6 +2434,8 @@ mod tests {
                 answer: "oak".into(),
                 needs: vec!["oak".into()],
                 absent: vec!["host".into()],
+                kind: QuestionKind::Exact,
+                stale: None,
             }],
             superseded_pairs: Vec::new(),
             noise: Vec::new(),

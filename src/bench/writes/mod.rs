@@ -15,6 +15,8 @@
 //! call. Loading the embedding model is separate and can download on a fresh
 //! store. Callers that pass a live provider exercise the same grader.
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod extrinsic;
 mod grade;
 mod run;
 mod script;
@@ -34,6 +36,6 @@ pub use run::{
 };
 pub use script::{
     load_script, parse_script, Claim, ClaimOp, DerivedQuestion, EndProvenance, EndState,
-    ExpectedFact, FactPattern, FactScript, NoiseItem, ScriptFact, ScriptSession, ScriptTurn,
-    Speaker, SupersededPair,
+    ExpectedFact, FactPattern, FactScript, NoiseItem, QuestionKind, ScriptFact, ScriptSession,
+    ScriptTurn, Speaker, StaleRef, StaleText, SupersededPair,
 };
