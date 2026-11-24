@@ -697,7 +697,8 @@ pub fn grade_with_pipeline(
     let mut junk_edges = junk(script, final_edges)?;
     wrong_facts.sort();
     junk_edges.sort();
-    let questions = questions(script, final_edges, keyword_hits)?;
+    let final_rows = final_edge_rows(script, sessions)?;
+    let questions = questions(script, final_edges, &final_rows, keyword_hits)?;
     let (input_tokens, input_tokens_per_session) =
         token_side(sessions.iter().map(|session| session.input_tokens));
     let (output_tokens, output_tokens_per_session) =
@@ -764,7 +765,7 @@ pub fn grade_with_pipeline(
         patterns: score_patterns(script, sessions)?,
         consolidate_drops: sum_consolidate_drops(sessions),
         consolidate_hold: false,
-        final_edges: final_edge_rows(script, sessions)?,
+        final_edges: final_rows,
     })
 }
 
@@ -1256,9 +1257,12 @@ fn junk(script: &FactScript, edges: &[ObservedEdge]) -> Result<Vec<JunkEdge>, Re
         .collect())
 }
 
+/// Graph and keyword hits, and the answer on a final row. The recall fields
+/// are filled by the run, which reads the store.
 fn questions(
     script: &FactScript,
     edges: &[ObservedEdge],
+    rows: &[FinalEdge],
     keyword_hits: &[bool],
 ) -> Result<Vec<QuestionScore>, RecallError> {
     let mut scores = Vec::with_capacity(script.questions.len());
@@ -1273,7 +1277,7 @@ fn questions(
             text: question.text.clone(),
             keyword_hit: *keyword_hit,
             graph_hit: needs_live && absent_clear,
-            store_hit: false,
+            store_hit: super::extrinsic::store_hit(rows, &question.answer),
             recall_hit: false,
             recall_hit_24k: false,
             stale_in_budget: None,

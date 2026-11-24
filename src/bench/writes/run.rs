@@ -16,6 +16,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde::Serialize;
 
+use super::extrinsic;
 use super::grade::{
     self, ExtractorLabel, ObservedEdge, SessionObservation, StatusRow, StatusWindow, WriteReport,
 };
@@ -34,6 +35,9 @@ use crate::tags;
 
 const DURATION: &str = "session";
 const SOURCE: &str = "writes";
+/// Where the recall channel copies the store, under the work directory.
+/// Removed once the questions are read.
+const RECALL_COPY: &str = "recall-copy";
 
 /// Where the claims to ingest come from.
 #[derive(Clone, Copy)]
@@ -386,6 +390,8 @@ impl OptOuts {
 /// Ingest `script` into `work_dir` and grade the resulting graph.
 ///
 /// `work_dir` must be missing or empty. The function creates `memory/` under it.
+/// A script with questions also reads them through `recall_query` on a copy
+/// of the final store, made under `recall-copy/` and removed afterwards.
 ///
 /// Session `millis` is ingest time. Model load is measured first and reported
 /// as `setup_millis`, so the first session is not charged for it.
@@ -448,6 +454,8 @@ pub async fn run(
     let setup_millis = u64::try_from(setup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let sessions = collect_sessions(&gm, &memory_dir, &written, &provider, pipeline).await?;
+    // The recall channel copies the store once this connection has closed.
+    drop(gm);
 
     let keyword_hits = script
         .questions
@@ -456,6 +464,16 @@ pub async fn run(
         .collect::<Result<Vec<_>, _>>()?;
     let mut report =
         grade::grade_with_pipeline(script, &sessions, &weights, &keyword_hits, label, pipeline)?;
+    if !script.questions.is_empty() {
+        let queries: Vec<&str> = script
+            .questions
+            .iter()
+            .map(|question| question.text.as_str())
+            .collect();
+        let renders =
+            extrinsic::recall_renders(&memory_dir, &work_dir.join(RECALL_COPY), &queries).await;
+        extrinsic::fill_recall(script, &mut report.questions, &renders)?;
+    }
     // The JSON field follows the config this run resolved, not the CLI on-flag.
     // A missing key stays the default, so a flagless run reports the hold.
     report.consolidate_hold = crate::config::load_from_dir(&memory_dir)
@@ -4883,6 +4901,16 @@ mod tests {
         assert!(report.questions[0].keyword_hit);
         assert!(report.questions[1].graph_hit);
         assert!(report.questions[1].keyword_hit);
+        // v1 keeps both hosts live, and the small store fits the read budget.
+        for question in &report.questions {
+            assert!(question.store_hit, "{question:?}");
+            assert!(
+                question.recall_hit && question.recall_hit_24k,
+                "{question:?}"
+            );
+            assert!(question.stale_in_budget.is_none(), "{question:?}");
+        }
+        assert!(!tmp.path().join(RECALL_COPY).exists());
         assert!(report.patterns.is_none());
         assert!(report
             .sessions

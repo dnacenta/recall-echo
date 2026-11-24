@@ -15,7 +15,6 @@
 //! call. Loading the embedding model is separate and can download on a fresh
 //! store. Callers that pass a live provider exercise the same grader.
 
-#[cfg_attr(not(test), allow(dead_code))]
 mod extrinsic;
 mod grade;
 mod run;

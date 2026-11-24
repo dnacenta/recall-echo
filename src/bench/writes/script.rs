@@ -311,7 +311,6 @@ impl FactScript {
 
     /// The stale values for `question`. Empty unless it is a current-value
     /// question.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stale_values(
         &self,
         question: &DerivedQuestion,
