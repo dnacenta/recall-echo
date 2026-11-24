@@ -138,6 +138,26 @@ feat(#5): add topic file support
 docs(#2): expand usage examples
 ```
 
+## Testing
+
+Plain `cargo test` is offline: the tests that need the embedding model (about 134 MB)
+are skipped and reported as ignored. To run them, seed a models dir once:
+
+```
+RECALL_ECHO_MODELS_DIR=<dir> cargo test --test graph_crud add_and_get_entity_by_name
+```
+
+Then run the whole suite against it, offline:
+
+```
+RECALL_ECHO_MODELS_DIR=<dir> HF_HUB_OFFLINE=1 cargo test
+```
+
+Set the variable for both the build and the run: `build.rs` reads it at build time to
+decide which tests are ignored, and the tests read it at run time to find the model. If
+`HF_HOME` is set, the model is cached there instead; see
+[the embedding model](docs/configuration.md#embedding-model).
+
 ## Code style
 
 - Run `cargo fmt && cargo clippy && cargo test` before submitting — no warnings or test failures
