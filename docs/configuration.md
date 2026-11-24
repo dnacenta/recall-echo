@@ -58,6 +58,7 @@ url = "ws://localhost:8787"   # server mode only
 # consolidate_rule_replaces = false # close one earlier rule that replaces names; off by default, ignored unless consolidate is on
 # known_long_values = false   # show known-fact values up to 200 characters instead of 80; off by default, ignored unless known_facts_context is on
 # drop_generic_uses = false   # drop a decided language-role uses edge and a planned release status; off by default
+# open_loops = false          # track pending items on issue records and list the open ones; off by default; implies nothing
 
 [graph.dedup]
 certain_similarity = 0.92     # at or above: same entity, no model call
@@ -96,6 +97,29 @@ At about 400 characters per entry, the default 5 entries come to roughly 2 KB.
 `recall-echo config show` prints the effective settings and the exact command a CLI
 provider will run. `recall-echo config set KEY VALUE` changes one (`provider`, `model`,
 `api_base`, `llm.cli.*`, `ephemeral.max_entries`, `graph.provenance.*`, …).
+
+## Open loops
+
+`graph.open_loops` is off by default and stands alone: it turns no other switch on,
+including `consolidate` and `recover_turns`. It keeps pending work, unanswered
+questions, promised follow-ups and deferred decisions on the issue records pipeline v2
+already writes, with the same `issue_status` of `open` or `fixed`. With it on:
+
+- **Close pin.** A later session that restates an item with no fix does not reopen a
+  live `fixed`, and does not store a second `open` beside it. The cited turn must say
+  `reopen`, `reopened`, `open again`, `back to open` or `not fixed` (any case, whole
+  words). A restatement such as "the login still fails" is not a reopen. A same-session
+  `open` then `fixed` still closes the `open`. With the flag off, an inferred `open`
+  from a later session still closes a live `fixed`, as before.
+- **Pass 1** gets one more paragraph after the optional ones: report those items as
+  bugs, and give a resolved one a short fix so its status becomes `fixed`. The default
+  prompt and schema are unchanged, and the flag makes no model call of its own.
+- **Open items.** `what-do-you-know` and `recall_overview` list the live `open` items,
+  oldest first. `recall-echo graph open-items` lists them whether or not the flag is on,
+  and `--include-closed` adds the live `fixed` ones. The list is a slot read; it is not
+  part of `recall_query`.
+
+Set it with `recall-echo config set graph.open_loops true`.
 
 ## Providers
 

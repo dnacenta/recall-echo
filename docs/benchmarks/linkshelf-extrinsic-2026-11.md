@@ -99,3 +99,24 @@ superseded pair. On current main the pipeline is expected to leave the old
 value live, so a real run is expected to miss this case. Unit tests keep s2
 cue-free and pin the grader on two synthetic stores, a clean close and one
 with the old value still live. No run is recorded here.
+
+## Open loops (eval case)
+
+`tests/fixtures/writes/open-loops/script.toml` is an eval case for
+`graph.open_loops`. Its gold is issue records keyed the way a v2 store reports
+them: the item, `issue_status`, then `open` or `fixed`. s1 defers a decision
+(never closed), asks a question (answered in s3), promises a follow-up (done in
+s2, reopened in s4 with "Reopen"), reports a bug already fixed, and states a
+sibling setting. s3 also restates the fixed bug with no fix and no reopen word.
+The gold wants `open` live for the deferred decision and the reopened
+follow-up, `fixed` live for the answered question and the bug, no live `open`
+for the bug, and the setting live. Each item has one current-value question
+graded by `graph` and `store`; `store` only looks for the bare value, so it
+hits whenever any item holds that status. Unit tests grade a clean synthetic
+store and one where the restatement reopened the bug, and write the script
+through the v2 writer: with the flag on, `graph open-items` lists only the
+deferred decision and the reopened follow-up; with it off, the bug is listed as
+well. The scripted extractor has no mapping for `issue_status`, so a scripted
+`bench writes` run does not reproduce the gold, and no real run is recorded
+here. Slots are not rendered in `recall_query` yet (#121), so `recall` is
+expected to miss.

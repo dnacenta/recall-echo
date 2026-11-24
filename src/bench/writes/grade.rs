@@ -3066,6 +3066,144 @@ mod tests {
         ));
     }
 
+    fn open_loops() -> FactScript {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/open-loops/script.toml");
+        super::super::script::load_script(&path).unwrap()
+    }
+
+    /// Store rows after each session. A clean store follows the gold. With
+    /// `restatement_reopens`, the s3 restatement closes the fixed login test
+    /// and stores `open`, which is what the write does with the flag off.
+    fn open_loops_sessions(
+        script: &FactScript,
+        restatement_reopens: bool,
+    ) -> Vec<SessionObservation> {
+        let row = |id: &str, live: bool| fact_edge(script, id, live);
+        let after_s1 = vec![
+            row("A-open", true),
+            row("B-open", true),
+            row("C-open", true),
+            row("D-fixed", true),
+            row("S", true),
+        ];
+        let after_s2 = vec![
+            row("A-open", true),
+            row("B-open", true),
+            row("C-open", false),
+            row("C-fixed", true),
+            row("D-fixed", true),
+            row("S", true),
+        ];
+        let mut after_s3 = vec![
+            row("A-open", true),
+            row("B-open", false),
+            row("B-fixed", true),
+            row("C-open", false),
+            row("C-fixed", true),
+            row("D-fixed", !restatement_reopens),
+            row("S", true),
+        ];
+        if restatement_reopens {
+            after_s3.push(row("D-open", true));
+        }
+        // s4 closes the guide's `fixed` and stores a second `open` row.
+        let mut after_s4 = after_s3.clone();
+        for edge in &mut after_s4 {
+            if edge.id == "C-fixed" {
+                edge.live = false;
+            }
+        }
+        after_s4.push(ObservedEdge {
+            id: "C-open#2".into(),
+            ..row("C-open", true)
+        });
+        vec![
+            obs("s1", vec![], after_s1.clone()),
+            obs("s2", after_s1, after_s2.clone()),
+            obs("s3", after_s2, after_s3.clone()),
+            obs("s4", after_s3, after_s4),
+        ]
+    }
+
+    fn grade_open_loops(restatement_reopens: bool) -> WriteReport {
+        let script = open_loops();
+        let sessions = open_loops_sessions(&script, restatement_reopens);
+        grade(
+            &script,
+            &sessions,
+            &weights(),
+            &vec![false; script.questions.len()],
+            ExtractorLabel::Scripted,
+        )
+        .unwrap()
+    }
+
+    fn question_hits(report: &WriteReport) -> Vec<(bool, bool)> {
+        report
+            .questions
+            .iter()
+            .map(|question| (question.graph_hit, question.store_hit))
+            .collect()
+    }
+
+    #[test]
+    fn open_loops_clean_store_meets_every_gold_line() {
+        let report = grade_open_loops(false);
+        assert!(report.wrong_facts.is_empty(), "{:?}", report.wrong_facts);
+        assert!(report.junk_edges.is_empty(), "{:?}", report.junk_edges);
+        assert_eq!(report.operations.create, full(5));
+        assert_eq!(report.operations.supersede, full(3));
+        assert!(
+            report.steps.iter().all(|step| step.matched),
+            "{:?}",
+            report.steps
+        );
+        // Never closed, closed two sessions later, reopened, kept fixed
+        // through a restatement, and the sibling setting.
+        assert_eq!(question_hits(&report), [(true, true); 5]);
+        let patterns = report.patterns.as_ref().expect("pattern section");
+        assert!(patterns.wrong.ids.is_empty(), "{:?}", patterns.wrong);
+        assert!(patterns.premature.ids.is_empty());
+        assert_eq!(
+            patterns.retired.ids,
+            ids(&["B-open->B-fixed", "C-fixed->C-open"])
+        );
+    }
+
+    #[test]
+    fn a_restatement_that_reopens_the_fixed_item_fails_only_that_item() {
+        let report = grade_open_loops(true);
+        assert_eq!(
+            report.wrong_facts,
+            vec![
+                WrongFact {
+                    fact: "D-fixed".into(),
+                    reason: WrongReason::Missing,
+                },
+                WrongFact {
+                    fact: "D-open".into(),
+                    reason: WrongReason::StillLive,
+                },
+            ]
+        );
+        // The login-test question misses in the graph. The store channel
+        // only looks for `fixed`, which the backup schedule still holds.
+        assert_eq!(
+            question_hits(&report),
+            [
+                (true, true),
+                (true, true),
+                (true, true),
+                (false, true),
+                (true, true),
+            ]
+        );
+        // The restatement claimed nothing, so its new row is a false create.
+        assert_eq!(report.operations.create.fp, 1);
+        assert_eq!(report.operations.supersede.tp, 3);
+    }
+
     #[test]
     fn an_unknown_edge_is_junk_and_a_false_create() {
         let user = weights().weight_user;

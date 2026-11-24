@@ -100,7 +100,9 @@ fn text(value: Option<&Value>) -> String {
 mod tests {
     use serde_json::json;
 
+    use super::super::schema::{Fact, Kind, Predicate};
     use super::*;
+    use crate::bench::writes::{Claim, FactScript};
     use crate::graph::GraphMemory;
 
     fn status(value: &str, since: &str, session: &str, turn: u64) -> Value {
@@ -248,5 +250,152 @@ mod tests {
             .await
             .unwrap();
         assert!(open_items(gm.db(), true).await.unwrap().is_empty());
+    }
+
+    /// Fresh names and exact repeats only, so the resolver is never asked.
+    struct NoResolver;
+
+    #[async_trait::async_trait]
+    impl crate::graph::llm::LlmProvider for NoResolver {
+        async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+            panic!("resolver called");
+        }
+    }
+
+    /// An inferred issue status, the way pass 1 writes one.
+    fn issue_status(subject: &str, value: &str, turn: usize, quote: &str) -> Fact {
+        Fact {
+            subject_name: subject.to_string(),
+            subject_kind: Kind::Issue,
+            predicate: Predicate::IssueStatus,
+            role: None,
+            key: String::new(),
+            object_name: value.to_string(),
+            object_kind: None,
+            status: "decided".into(),
+            turn,
+            quote: quote.to_string(),
+            confidence: 0.9,
+            provenance: crate::graph::Provenance::SelfGenerated,
+            replaces: String::new(),
+        }
+    }
+
+    /// The fact a claim leaves in place: the replacement of a supersede,
+    /// otherwise the claimed fact.
+    fn written_fact(script: &FactScript, claim: &Claim, turn: usize, quote: &str) -> Fact {
+        let id = claim.replacement.as_deref().unwrap_or(&claim.fact);
+        let fact = script.fact(id).unwrap();
+        let mut written = issue_status(&fact.subject, &fact.object, turn, quote);
+        if let Some(key) = fact.relation.strip_prefix("setting:") {
+            written.subject_kind = Kind::Project;
+            written.predicate = Predicate::Setting;
+            written.key = key.to_string();
+            written.provenance = crate::graph::Provenance::User;
+        }
+        written
+    }
+
+    /// Write the open-loops fixture session by session. A turn that claims
+    /// nothing but names an item gets the `open` pass 1 infers for a bug with
+    /// no fix.
+    async fn write_open_loops(gm: &GraphMemory, open_loops: bool) {
+        use super::super::input::{ProjectIdentity, Turn, TurnRole};
+        use super::super::write::{write_facts, WriteCtx};
+        use crate::bench::writes::{load_script, Speaker};
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/open-loops/script.toml");
+        let script = load_script(&path).unwrap();
+        let items: Vec<&str> = script
+            .facts
+            .iter()
+            .filter(|fact| fact.relation == "issue_status")
+            .map(|fact| fact.subject.as_str())
+            .collect();
+        let project = ProjectIdentity {
+            name: "timber".into(),
+            aliases: Vec::new(),
+        };
+        let llm = NoResolver;
+        for session in &script.sessions {
+            let turns: Vec<Turn> = session
+                .turns
+                .iter()
+                .enumerate()
+                .map(|(index, turn)| Turn {
+                    index,
+                    role: match turn.role {
+                        Speaker::User => TurnRole::User,
+                        Speaker::Assistant => TurnRole::Assistant,
+                    },
+                    text: turn.text.clone(),
+                })
+                .collect();
+            let mut facts = Vec::new();
+            for (index, turn) in session.turns.iter().enumerate() {
+                for claim in &turn.claims {
+                    facts.push(written_fact(&script, claim, index, &turn.text));
+                }
+                if turn.claims.is_empty() {
+                    if let Some(item) = items.iter().find(|item| turn.text.contains(**item)) {
+                        facts.push(issue_status(item, "open", index, &turn.text));
+                    }
+                }
+            }
+            let mut ctx = WriteCtx::new(&llm, &project, &session.id, &session.date, &turns);
+            ctx.open_loops_on = open_loops;
+            write_facts(gm, &ctx, &facts).await.unwrap();
+        }
+    }
+
+    fn names(items: &[OpenItem]) -> Vec<(&str, &str)> {
+        items
+            .iter()
+            .map(|item| (item.name.as_str(), item.status.as_str()))
+            .collect()
+    }
+
+    /// The fixture through the writer. With the flag on, only the item never
+    /// closed and the reopened one are open, oldest first.
+    #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
+    async fn the_open_loops_fixture_lists_only_the_never_closed_and_reopened_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        write_open_loops(&gm, true).await;
+        assert_eq!(
+            names(&open_items(gm.db(), false).await.unwrap()),
+            [("image cache size", "open"), ("migration guide", "open")]
+        );
+        assert_eq!(
+            names(&open_items(gm.db(), true).await.unwrap()),
+            [
+                ("image cache size", "open"),
+                ("flaky login test", "fixed"),
+                ("backup schedule", "fixed"),
+                ("migration guide", "open"),
+            ]
+        );
+
+        // With the flag off, the restatement closes the fixed login test.
+        let tmp = tempfile::tempdir().unwrap();
+        let gm = GraphMemory::open_embedded(&tmp.path().join("graph"))
+            .await
+            .unwrap();
+        write_open_loops(&gm, false).await;
+        assert_eq!(
+            names(&open_items(gm.db(), false).await.unwrap()),
+            [
+                ("image cache size", "open"),
+                ("flaky login test", "open"),
+                ("migration guide", "open"),
+            ]
+        );
     }
 }
