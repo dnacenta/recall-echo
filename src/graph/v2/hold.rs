@@ -223,7 +223,7 @@ pub(crate) async fn consider(
             }
             return;
         }
-        let removed = match take_pending(gm, new_ref).await {
+        let removed = match take_pending(gm, new_ref, decided_in(ctx)).await {
             Ok(Some(value)) => value,
             Ok(None) => {
                 report.hold.errors += 1;
@@ -292,10 +292,19 @@ pub(crate) async fn consider(
     open.push(hold.clone());
 }
 
+/// The session a released edge records, when the component old-value switch applies.
+pub(crate) fn decided_in<'c>(ctx: &WriteCtx<'c>) -> Option<&'c str> {
+    ctx.component_old_value_on.then_some(ctx.session_id)
+}
+
 /// Remove `pending` and return the object that was stored there.
+///
+/// `decided_in` is stored on an edge as the session it was released in.
+/// `None` leaves the edge as it was apart from `pending`.
 pub(crate) async fn take_pending(
     gm: &GraphMemory,
     reference: &str,
+    decided_in: Option<&str>,
 ) -> Result<Option<Value>, GraphError> {
     if let Some((entity, index)) = split_slot(reference) {
         entity_slot(entity)?;
@@ -314,11 +323,23 @@ pub(crate) async fn take_pending(
         return Ok(changed.then_some(removed).flatten());
     }
     edge_record(reference)?;
-    let mut response = gm
-        .db()
-        .query("UPDATE type::record($id) SET pending = NONE WHERE pending != NONE RETURN BEFORE")
-        .bind(("id", reference.to_string()))
-        .await?;
+    let mut response = if let Some(session) = decided_in {
+        super::super::store::define_decided_in(gm.db()).await?;
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET pending = NONE, decided_in = $decided_in WHERE pending != NONE RETURN BEFORE",
+            )
+            .bind(("id", reference.to_string()))
+            .bind(("decided_in", session.to_string()))
+            .await?
+    } else {
+        gm.db()
+            .query(
+                "UPDATE type::record($id) SET pending = NONE WHERE pending != NONE RETURN BEFORE",
+            )
+            .bind(("id", reference.to_string()))
+            .await?
+    };
     let cleared: Vec<Value> = deserialize_take(&mut response, 0)?;
     Ok(cleared.into_iter().next().and_then(|row| {
         let pending = row.get("pending").cloned()?;

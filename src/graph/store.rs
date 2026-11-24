@@ -388,6 +388,17 @@ pub(crate) async fn define_edge_details(db: &Surreal<Db>) -> Result<(), GraphErr
     Ok(())
 }
 
+/// Optional session in which an edge's hold was released.
+///
+/// Callers run this only when the component old-value switch applies. An off
+/// store never gains the field, and there is no version bump or backfill.
+pub(crate) async fn define_decided_in(db: &Surreal<Db>) -> Result<(), GraphError> {
+    db.query("DEFINE FIELD IF NOT EXISTS decided_in ON relates_to TYPE option<string>")
+        .await?
+        .check()?;
+    Ok(())
+}
+
 /// What one migration pass did. Both counts are zero on an already current
 /// store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

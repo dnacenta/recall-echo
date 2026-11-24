@@ -420,7 +420,7 @@ async fn run_main(
                 continue;
             }
             let taken = if pair.hold {
-                confirm_held(gm, &anchors, &loaded, pair, report).await
+                confirm_held(gm, ctx, &anchors, &loaded, pair, report).await
             } else {
                 None
             };
@@ -5583,6 +5583,7 @@ fn ref_of(row: &Row) -> String {
 
 async fn confirm_held(
     gm: &GraphMemory,
+    ctx: &WriteCtx<'_>,
     anchors: &[Anchor],
     loaded: &Loaded,
     pair: &Pair,
@@ -5593,7 +5594,7 @@ async fn confirm_held(
         return None;
     };
     let reference = ref_of(&loaded.rows[index]);
-    match super::hold::take_pending(gm, &reference).await {
+    match super::hold::take_pending(gm, &reference, super::hold::decided_in(ctx)).await {
         Ok(Some(pending)) => Some(pending),
         Ok(None) => {
             report.hold.errors += 1;
@@ -5794,21 +5795,31 @@ async fn maybe_old_value(
         return Ok(None);
     }
     let retire = retire_snap(gm, ctx, rows).await?;
-    let first_part = read_first_parts(gm, retire.project_id.as_deref()).await?;
+    let first_part = read_first_parts(gm, retire.project_id.as_deref(), ctx.session_id).await?;
     Ok(Some(OldValueSnap { retire, first_part }))
 }
 
 async fn read_first_parts(
     gm: &GraphMemory,
     project_id: Option<&str>,
+    session: &str,
 ) -> Result<BTreeMap<String, String>, GraphError> {
     note_post_read();
     let mut response = gm.db().query(OPEN_PARTS_FIRST).await?;
     let rows: Vec<Value> = deserialize_take(&mut response, 0)?;
-    Ok(first_part_map(&rows, project_id))
+    Ok(first_part_map(&rows, project_id, session))
 }
 
-fn first_part_map(rows: &[Value], project_id: Option<&str>) -> BTreeMap<String, String> {
+/// The session each component's decided `part_of` the project first counted in.
+///
+/// Two rows keep the earlier one in the order the session helpers use: any
+/// other session comes before `session`. Two earlier sessions keep the smaller
+/// id, so row order does not change the result.
+fn first_part_map(
+    rows: &[Value],
+    project_id: Option<&str>,
+    session: &str,
+) -> BTreeMap<String, String> {
     let mut first_part = BTreeMap::new();
     let Some(project_id) = project_id else {
         return first_part;
@@ -5820,11 +5831,28 @@ fn first_part_map(rows: &[Value], project_id: Option<&str>) -> BTreeMap<String, 
         if link.to_id != project_id || !decided_link(&link) {
             continue;
         }
-        first_part
+        let first = decided_session(row);
+        let kept = first_part
             .entry(link.from_id)
-            .or_insert_with(|| first_evidence_session(row));
+            .or_insert_with(|| first.clone());
+        if part_order(&first, session) < part_order(kept, session) {
+            *kept = first;
+        }
     }
     first_part
+}
+
+/// The session a decided row first counted in: its release from a hold,
+/// else its first evidence item.
+fn decided_session(row: &Value) -> String {
+    match row.get("decided_in").and_then(Value::as_str) {
+        Some(session) if !session.is_empty() => session.to_string(),
+        _ => first_evidence_session(row),
+    }
+}
+
+fn part_order<'a>(first: &'a str, session: &str) -> (bool, &'a str) {
+    (first == session, first)
 }
 
 async fn maybe_takeover(
@@ -6655,7 +6683,7 @@ const OPEN_PARTS: &str = "\
 SELECT in, out, status, pending FROM relates_to \
 WHERE rel_type = 'part_of' AND valid_until = NONE";
 const OPEN_PARTS_FIRST: &str = "\
-SELECT in, out, status, pending, evidence FROM relates_to \
+SELECT in, out, status, pending, evidence, decided_in FROM relates_to \
 WHERE rel_type = 'part_of' AND valid_until = NONE";
 const OPEN_USES: &str = "\
 SELECT id, in, out.name AS object, status, pending, evidence FROM relates_to \
@@ -7947,25 +7975,29 @@ fn push_late_old_value(
     session: &str,
     seen: &mut OldValueSeen,
 ) {
-    for entity in &snap.retire.entities {
-        if !linked_this_session(entity, snap, session) {
+    for slot in &project.slots {
+        if !earlier_closed_setting(slot, session) {
             continue;
         }
-        let components = [entity];
-        for slot in &project.slots {
-            if !earlier_closed_setting(slot, session) {
-                continue;
-            }
-            close_old_value_components(
-                plan,
-                &snap.retire,
-                project,
-                slot,
-                session,
-                &components,
-                seen,
-            );
+        // One call per setting, so the cap counts every component it reaches.
+        let components: Vec<&RetireEntity> = snap
+            .retire
+            .entities
+            .iter()
+            .filter(|entity| linked_this_session(entity, snap, session))
+            .collect();
+        if components.is_empty() {
+            continue;
         }
+        close_old_value_components(
+            plan,
+            &snap.retire,
+            project,
+            slot,
+            session,
+            &components,
+            seen,
+        );
     }
 }
 
@@ -12549,7 +12581,7 @@ mod tests {
         .await;
         let edges = uses_edges(&gm).await;
         let id = id_text(edge_named(&edges, "canvas").get("id"));
-        assert!(super::super::hold::take_pending(&gm, &id)
+        assert!(super::super::hold::take_pending(&gm, &id, None)
             .await
             .unwrap()
             .is_none());
@@ -12925,7 +12957,7 @@ mod tests {
             .unwrap();
         let entity = conflicts.rsplit_once('#').unwrap().0;
         let new_ref = format!("{entity}#{index}");
-        let taken = super::super::hold::take_pending(&gm, &new_ref)
+        let taken = super::super::hold::take_pending(&gm, &new_ref, None)
             .await
             .unwrap()
             .expect("pending object");
@@ -25053,6 +25085,223 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.starts_with("consolidate old value:")));
+    }
+
+    fn two_component_copies() -> Vec<Fact> {
+        let mut facts = Vec::new();
+        for component in ["store", "cache"] {
+            for key in ["storage_one", "storage_two"] {
+                facts.push(setting_of(component, key, "JSON archive", "decided"));
+            }
+        }
+        facts
+    }
+
+    fn old_value_counts(report: &IngestionReport) -> (Option<u32>, Option<u32>) {
+        (
+            report.consolidate.component_old_value_closes,
+            report.consolidate.component_old_value_overflow,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_caps_across_components_like_the_same_session_path() {
+        let overflow = vec!["consolidate old value overflow: app:storage | 4 targets".to_string()];
+
+        let (_tmp, gm) = open().await;
+        let mut early = vec![
+            project_setting("storage", "JSON store", "decided"),
+            part_link("store", "app", Kind::Project),
+            part_link("cache", "app", Kind::Project),
+        ];
+        early.extend(two_component_copies());
+        commit_app(&gm, "s1", "2026-04-01", &early).await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        let (same, same_lines, _) = finish_old_value(&gm, true, false, false, false).await;
+        assert_eq!(old_value_counts(&same), (None, Some(1)));
+        assert_eq!(same_lines, overflow);
+
+        let (_tmp, gm) = open().await;
+        let mut early = vec![project_setting("storage", "JSON store", "decided")];
+        early.extend(two_component_copies());
+        commit_app(&gm, "s1", "2026-04-01", &early).await;
+        commit_app(
+            &gm,
+            "s3",
+            "2026-04-03",
+            &[project_setting("storage", "SQLite", "decided")],
+        )
+        .await;
+        commit_app(
+            &gm,
+            "s5",
+            "2026-04-05",
+            &[
+                part_link("store", "app", Kind::Project),
+                part_link("cache", "app", Kind::Project),
+            ],
+        )
+        .await;
+        let (late, late_lines, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+        for component in ["store", "cache"] {
+            let rows = slots(&gm, component).await;
+            for key in ["storage_one", "storage_two"] {
+                assert!(ended_key(&rows, key).is_none(), "{component} {key}");
+            }
+        }
+        assert_eq!(old_value_counts(&late), old_value_counts(&same));
+        assert_eq!(late_lines, overflow);
+    }
+
+    async fn part_row(gm: &GraphMemory, name: &str) -> Value {
+        let id = entity_id(gm, name).await;
+        let mut response = gm
+            .db()
+            .query(
+                "SELECT id, evidence, decided_in FROM relates_to \
+                 WHERE rel_type = 'part_of' AND in = type::record($id)",
+            )
+            .bind(("id", id))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        rows.into_iter().next().expect("part_of")
+    }
+
+    async fn hold_part_of(gm: &GraphMemory, name: &str, since: &str) -> String {
+        let app = entity_id(gm, "app").await;
+        let mut response = gm
+            .db()
+            .query(
+                "UPDATE relates_to SET valid_until = type::datetime($until), ended_by = 's2:rejected' \
+                 WHERE rel_type = 'uses' AND in = type::record($id) AND out.name = 'Redis' \
+                 RETURN AFTER",
+            )
+            .bind(("id", app))
+            .bind(("until", "2026-04-02T00:00:00Z"))
+            .await
+            .unwrap();
+        let closed: Vec<Value> = deserialize_take(&mut response, 0).unwrap();
+        let conflict = id_text(closed.first().expect("closed use").get("id"));
+        let part = id_text(part_row(gm, name).await.get("id"));
+        gm.db()
+            .query("UPDATE type::record($id) SET pending = $pending")
+            .bind(("id", part.clone()))
+            .bind(("pending", json!({"since": since, "conflicts": conflict})))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        part
+    }
+
+    async fn commit_app_old_value(gm: &GraphMemory, session: &str, date: &str, facts: &[Fact]) {
+        let project = app_project(&[]);
+        let turns = [turn("stored")];
+        let mut ctx = WriteCtx::new(&Quiet, &project, session, date, &turns);
+        ctx.component_old_value_on = true;
+        write_facts(gm, &ctx, facts).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_value_late_link_counts_a_held_part_of_from_its_release_session() {
+        for via_write in [true, false] {
+            let (_tmp, gm) = open().await;
+            commit_app(
+                &gm,
+                "s1",
+                "2026-04-01",
+                &[
+                    project_setting("storage", "JSON store", "decided"),
+                    storage_path(),
+                    json_use("store", Kind::Component),
+                    use_of("app", Kind::Project, "Redis", "decided"),
+                ],
+            )
+            .await;
+            commit_app(
+                &gm,
+                "s3",
+                "2026-04-03",
+                &[project_setting("storage", "SQLite", "decided")],
+            )
+            .await;
+            commit_app(
+                &gm,
+                "s4",
+                "2026-04-04",
+                &[part_link("store", "app", Kind::Project)],
+            )
+            .await;
+            let part = hold_part_of(&gm, "store", "s4").await;
+            let (held, held_lines, _) = finish_old_value_at(&gm, "s4", "2026-04-04").await;
+            assert!(ended_key(&slots(&gm, "store").await, "storage_path").is_none());
+            assert!(use_ended_by(&find_use(&gm, "store", "JSON").await).is_none());
+            assert_eq!(old_value_counts(&held), (None, None), "{via_write}");
+            assert!(held_lines.iter().all(|line| !line.contains("old value")));
+
+            if via_write {
+                commit_app_old_value(
+                    &gm,
+                    "s5",
+                    "2026-04-05",
+                    &[part_link("store", "app", Kind::Project)],
+                )
+                .await;
+            } else {
+                assert!(super::super::hold::take_pending(&gm, &part, Some("s5"))
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+            let row = part_row(&gm, "store").await;
+            assert_eq!(row["evidence"][0]["session"], "s4", "{via_write}");
+            assert_eq!(row["decided_in"], "s5", "{via_write}");
+
+            let (released, _, _) = finish_old_value_at(&gm, "s5", "2026-04-05").await;
+            assert_eq!(
+                ended_key(&slots(&gm, "store").await, "storage_path"),
+                Some("s5:component_old_value"),
+                "{via_write}"
+            );
+            assert_eq!(
+                use_ended_by(&find_use(&gm, "store", "JSON").await),
+                Some("s5:component_old_value")
+            );
+            assert_eq!(old_value_counts(&released), (Some(2), None), "{via_write}");
+
+            let (later, _, _) = finish_old_value_at(&gm, "s6", "2026-04-06").await;
+            assert_eq!(old_value_counts(&later), (None, None), "{via_write}");
+        }
+    }
+
+    #[test]
+    fn first_part_map_keeps_one_first_session_in_either_row_order() {
+        let row = |first: &str| {
+            json!({
+                "in": "entity:store",
+                "out": "entity:app",
+                "status": "decided",
+                "evidence": [{"session": first, "turn": 0, "quote": "store is part of app"}],
+            })
+        };
+        for session in ["s5", "s6"] {
+            let forward = [row("s2"), row("s5")];
+            let backward = [row("s5"), row("s2")];
+            let kept = super::first_part_map(&forward, Some("entity:app"), session);
+            let again = super::first_part_map(&backward, Some("entity:app"), session);
+            assert_eq!(kept.get("entity:store").map(String::as_str), Some("s2"));
+            assert_eq!(kept, again, "{session}");
+        }
+        let forward = [row("s5"), row("s5")];
+        let kept = super::first_part_map(&forward, Some("entity:app"), "s5");
+        assert_eq!(kept.get("entity:store").map(String::as_str), Some("s5"));
     }
 
     const CUT_OFF: &str =
