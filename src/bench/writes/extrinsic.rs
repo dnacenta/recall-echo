@@ -231,14 +231,14 @@ async fn restore_access_counts(
 }
 
 /// Copy the store under `memory_dir` to `copy` once its last connection has
-/// closed: `graph/surreal/`, the run's config, and the embedding model.
+/// closed: `graph/surreal/`, the run's config, and the embedding cache.
 async fn copy_closed_store(memory_dir: &Path, copy: &Path) -> Result<(), RecallError> {
     let graph = memory_dir.join("graph");
     let surreal = graph.join("surreal");
     let lock = take_lock(&surreal).await?;
     let copy_graph = copy.join("graph");
     copy_tree(&surreal, &copy_graph.join("surreal"))?;
-    share_models(&graph.join("models"), &copy_graph.join("models"))?;
+    share_cache(&graph.join("models"), &copy_graph.join("models"))?;
     let config = crate::config::config_path(memory_dir);
     if config.is_file() {
         fs::copy(&config, crate::config::config_path(copy))?;
@@ -285,22 +285,22 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Point the copy at the embedding model the run already loaded.
+/// Point the copy at the embedding cache the run already filled.
 #[cfg(unix)]
-fn share_models(models: &Path, to: &Path) -> std::io::Result<()> {
-    if !models.is_dir() {
+fn share_cache(cache: &Path, to: &Path) -> std::io::Result<()> {
+    if !cache.is_dir() {
         return Ok(());
     }
-    std::os::unix::fs::symlink(fs::canonicalize(models)?, to)
+    std::os::unix::fs::symlink(fs::canonicalize(cache)?, to)
 }
 
-/// Copy the embedding model the run already loaded.
+/// Copy the embedding cache the run already filled.
 #[cfg(not(unix))]
-fn share_models(models: &Path, to: &Path) -> std::io::Result<()> {
-    if !models.is_dir() {
+fn share_cache(cache: &Path, to: &Path) -> std::io::Result<()> {
+    if !cache.is_dir() {
         return Ok(());
     }
-    copy_tree(models, to)
+    copy_tree(cache, to)
 }
 
 /// The first `max` characters of `text`.
@@ -560,6 +560,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn recall_reads_leave_the_graded_store_and_each_other_alone() {
         use super::super::run::{
             run, Consolidate, ConsolidateComponents, ConsolidateKeyRename, ConsolidateLinks,

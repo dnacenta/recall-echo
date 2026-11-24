@@ -1413,6 +1413,76 @@ kind = "latest"
         }
     }
 
+    #[test]
+    fn linkshelf_questions_come_from_gold_facts() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/linkshelf/script.toml");
+        let script = load_script(&path).unwrap();
+        assert_eq!(script.questions.len(), 9);
+        let object = |id: &str| script.fact(id).unwrap().object.clone();
+        // One current-value question per superseded pair: the new object is
+        // the answer, and the old object is filled in as the stale value.
+        let current: Vec<_> = script
+            .questions
+            .iter()
+            .filter(|question| question.kind == QuestionKind::CurrentValue)
+            .collect();
+        assert_eq!(current.len(), script.superseded_pairs.len());
+        for pair in &script.superseded_pairs {
+            let question = current
+                .iter()
+                .find(|question| question.needs == std::slice::from_ref(&pair.new))
+                .unwrap_or_else(|| panic!("no question needs {}", pair.new));
+            assert_eq!(question.absent, std::slice::from_ref(&pair.old));
+            assert_eq!(question.answer, object(&pair.new));
+            assert!(question.stale.is_none());
+            assert_eq!(
+                script.stale_values(question).unwrap(),
+                vec![object(&pair.old)]
+            );
+        }
+        // Every answer is the gold object of a fact the question names.
+        for question in &script.questions {
+            assert!(
+                question
+                    .needs
+                    .iter()
+                    .chain(&question.absent)
+                    .any(|id| object(id) == question.answer),
+                "{}",
+                question.text
+            );
+        }
+        // Two stable settings, never replaced, and one refused value.
+        let exact: Vec<_> = script
+            .questions
+            .iter()
+            .filter(|question| question.kind == QuestionKind::Exact)
+            .collect();
+        assert_eq!(exact.len(), 3);
+        let stable: Vec<_> = exact
+            .iter()
+            .filter(|question| !question.needs.is_empty())
+            .collect();
+        assert_eq!(stable.len(), 2);
+        for question in &stable {
+            for id in &question.needs {
+                assert_eq!(script.fact(id).unwrap().end_state, EndState::Live);
+                assert!(script
+                    .superseded_pairs
+                    .iter()
+                    .all(|pair| pair.old != *id && pair.new != *id));
+            }
+        }
+        let refused: Vec<_> = exact
+            .iter()
+            .filter(|question| question.needs.is_empty())
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].absent, ["F42"]);
+        assert_eq!(script.fact("F42").unwrap().end_state, EndState::Rejected);
+    }
+
     fn write_transcript_script(dir: &Path, name: &str, date_line: &str, quote: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(

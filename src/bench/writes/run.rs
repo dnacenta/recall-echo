@@ -5163,6 +5163,59 @@ mod tests {
         assert_eq!(patterns.premature.count, 0);
         assert_eq!(patterns.noise_hits.count, 0);
         assert_eq!(patterns.unmatched.count, 0);
+        // v1 keeps every old value live, so every answer is on the store and
+        // every stale value is too. The read path finds the value only when an
+        // entity named by it is returned, or a fragment says it verbatim.
+        assert_eq!(
+            question_rows(&report.questions),
+            vec![
+                (
+                    "where does linkshelf store its bookmarks",
+                    [false, false, true, false, false],
+                    Some([true, true])
+                ),
+                (
+                    "how does linkshelf store tags",
+                    [false, false, true, true, true],
+                    Some([false, false])
+                ),
+                (
+                    "which formatter does linkshelf use",
+                    [false, false, true, false, false],
+                    Some([true, true])
+                ),
+                (
+                    "what is the linkshelf test command",
+                    [false, false, true, false, false],
+                    Some([true, true])
+                ),
+                (
+                    "which port does linkshelf serve listen on",
+                    [false, true, true, true, true],
+                    Some([true, true])
+                ),
+                (
+                    "which http client does linkshelf use to fetch titles",
+                    [false, false, true, false, false],
+                    Some([true, true])
+                ),
+                (
+                    "which python version does linkshelf use",
+                    [true, true, true, true, true],
+                    None
+                ),
+                (
+                    "what is the linkshelf title fetch timeout",
+                    [true, true, true, true, true],
+                    None
+                ),
+                (
+                    "which retry library does linkshelf depend on",
+                    [false, false, true, false, false],
+                    None
+                ),
+            ]
+        );
         assert!(report.sessions.iter().all(|session| {
             session.consolidate.is_blank()
                 && serde_json::to_value(session)
@@ -5706,6 +5759,93 @@ mod tests {
         assert_eq!(store.open_and_fixed, vec!["fetch encoding".to_string()]);
         assert_eq!(pred("release_status"), 2);
         assert_eq!(pred("release_contents"), 2);
+
+        // Storage, tags and the http client are current only in a v2 slot.
+        // Today's query render prints entity abstracts and fragments, not
+        // slots, so the store channel hits and the recall channel does not.
+        // That gap belongs to the read path, not to this grader.
+        assert_eq!(
+            question_rows(&report.questions),
+            vec![
+                (
+                    "where does linkshelf store its bookmarks",
+                    [true, false, true, false, false],
+                    Some([false, false])
+                ),
+                (
+                    "how does linkshelf store tags",
+                    [true, false, true, false, false],
+                    Some([false, false])
+                ),
+                (
+                    "which formatter does linkshelf use",
+                    [true, false, true, false, false],
+                    Some([true, true])
+                ),
+                (
+                    "what is the linkshelf test command",
+                    [false, false, false, false, false],
+                    Some([true, true])
+                ),
+                (
+                    "which port does linkshelf serve listen on",
+                    [false, true, false, true, true],
+                    Some([true, true])
+                ),
+                (
+                    "which http client does linkshelf use to fetch titles",
+                    [true, false, true, false, false],
+                    Some([false, false])
+                ),
+                (
+                    "which python version does linkshelf use",
+                    [true, true, true, true, true],
+                    None
+                ),
+                (
+                    "what is the linkshelf title fetch timeout",
+                    [true, true, true, true, true],
+                    None
+                ),
+                (
+                    "which retry library does linkshelf depend on",
+                    [true, false, false, false, false],
+                    None
+                ),
+            ]
+        );
+        let slot_only = report
+            .final_edges
+            .iter()
+            .find(|row| row.object == script.questions[0].answer)
+            .expect("the storage slot");
+        assert!(slot_only.live && slot_only.id.contains("|setting|storage|"));
+    }
+
+    /// Graph, keyword, store, recall in 8k and recall in 24k, then the stale
+    /// pair (8k, 24k) on a current-value question.
+    type QuestionRow<'a> = (&'a str, [bool; 5], Option<[bool; 2]>);
+
+    fn question_rows(questions: &[grade::QuestionScore]) -> Vec<QuestionRow<'_>> {
+        questions
+            .iter()
+            .map(|question| {
+                (
+                    question.text.as_str(),
+                    [
+                        question.graph_hit,
+                        question.keyword_hit,
+                        question.store_hit,
+                        question.recall_hit,
+                        question.recall_hit_24k,
+                    ],
+                    question
+                        .stale_in_budget
+                        .zip(question.stale_in_budget_24k)
+                        .map(|(budget, sidecar)| [budget, sidecar]),
+                )
+            })
+            .collect()
     }
 
     #[cfg(feature = "embedded")]
