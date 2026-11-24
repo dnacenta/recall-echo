@@ -22,7 +22,7 @@ use std::path::Path;
 use crate::error::RecallError;
 use crate::graph::edge_view::EdgeView;
 use crate::graph::inspect::{
-    ConfidenceSummary, MemoryOverview, TopicEntity, TopicReport, DOUBTFUL_CONFIDENCE,
+    ConfidenceSummary, MemoryOverview, OpenItem, TopicEntity, TopicReport, DOUBTFUL_CONFIDENCE,
     STRONG_CONFIDENCE,
 };
 use crate::graph::types::MatchSource;
@@ -108,6 +108,7 @@ pub fn render_overview(overview: &MemoryOverview) -> String {
         return out;
     }
 
+    write_open_items(&mut out, overview.open_items.as_deref());
     write_groups(&mut out, overview);
     write_confidence(&mut out, &overview.confidence);
     write_edge_section(&mut out, "Least certain", &overview.uncertain, None);
@@ -125,6 +126,52 @@ pub fn render_overview(overview: &MemoryOverview) -> String {
         out,
         "\n  {DIM}Wrong about something? recall-echo graph correct \"<name>\" --wrong{RESET}"
     );
+    out
+}
+
+/// The overview's open items. Absent when `graph.open_loops` is off.
+fn write_open_items(out: &mut String, items: Option<&[OpenItem]>) {
+    let Some(items) = items else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "\n  {BOLD}Open items{RESET} {DIM}(oldest first){RESET}"
+    );
+    if items.is_empty() {
+        let _ = writeln!(out, "    {DIM}None open.{RESET}");
+        return;
+    }
+    for item in items {
+        write_open_item(out, item, "    ");
+    }
+}
+
+fn write_open_item(out: &mut String, item: &OpenItem, indent: &str) {
+    let _ = writeln!(
+        out,
+        "{indent}{} {DIM}— {} since {} ({} turn {}){RESET}",
+        item.name, item.status, item.since, item.session, item.turn
+    );
+}
+
+/// What `graph open-items` prints. It lists open items, oldest first, and
+/// closed ones too when they were asked for.
+#[must_use]
+pub fn render_open_items(items: &[OpenItem], include_closed: bool) -> String {
+    let heading = if include_closed {
+        "Open and closed items"
+    } else {
+        "Open items"
+    };
+    let mut out = format!("{BOLD}{heading}{RESET} {DIM}(oldest first){RESET}\n\n");
+    if items.is_empty() {
+        let _ = writeln!(out, "  {DIM}None.{RESET}");
+        return out;
+    }
+    for item in items {
+        write_open_item(&mut out, item, "  ");
+    }
     out
 }
 
@@ -350,7 +397,60 @@ mod tests {
             confidence: ConfidenceSummary::default(),
             uncertain: Vec::new(),
             self_reinforced: Vec::new(),
+            open_items: None,
         }
+    }
+
+    fn open_item(name: &str, status: &str, since: &str) -> OpenItem {
+        OpenItem {
+            id: format!("entity:{name}"),
+            name: name.into(),
+            status: status.into(),
+            since: since.into(),
+            session: "s1".into(),
+            turn: 2,
+        }
+    }
+
+    #[test]
+    fn open_items_appear_only_when_the_overview_carries_them() {
+        let off = render_overview(&overview_with(one_group(), stats(4, 0, 1)));
+        assert!(!off.contains("Open items"), "{off}");
+
+        let mut on = overview_with(one_group(), stats(4, 0, 1));
+        on.open_items = Some(vec![
+            open_item("login fails", "open", "2026-03-01"),
+            open_item("search times out", "open", "2026-03-02"),
+        ]);
+        let text = render_overview(&on);
+        assert!(text.contains("Open items"), "{text}");
+        let login = text.find("login fails").expect("login");
+        let search = text.find("search times out").expect("search");
+        assert!(login < search, "oldest first: {text}");
+        assert!(text.contains("open since 2026-03-01"), "{text}");
+
+        on.open_items = Some(Vec::new());
+        let none = render_overview(&on);
+        assert!(none.contains("Open items"), "{none}");
+        assert!(none.contains("None open."), "{none}");
+    }
+
+    #[test]
+    fn the_open_items_list_names_closed_ones_only_when_asked() {
+        let open = render_open_items(&[open_item("login fails", "open", "2026-03-01")], false);
+        assert!(open.contains("Open items"), "{open}");
+        assert!(!open.contains("closed"), "{open}");
+        assert!(open.contains("login fails"), "{open}");
+        let both = render_open_items(
+            &[
+                open_item("login fails", "open", "2026-03-01"),
+                open_item("export drops rows", "fixed", "2026-03-03"),
+            ],
+            true,
+        );
+        assert!(both.contains("Open and closed items"), "{both}");
+        assert!(both.contains("fixed since 2026-03-03"), "{both}");
+        assert!(render_open_items(&[], false).contains("None."));
     }
 
     fn one_group() -> Vec<TypeGroup> {

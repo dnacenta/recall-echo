@@ -163,7 +163,7 @@ model, so there is no per-command model reload, and it exits after
   the tail of `graph/daemon.log`. A store locked by a foreign process is retried with
   backoff, then reported as `store locked`, never a raw lock panic.
 - **Admin commands take the store exclusively.** `graph init`, `gc`, `extract`,
-  `ingest-all`, `pipeline status`/`flow`/`stale`, `vigil-sync` and `decay-report` take an
+  `ingest-all`, `pipeline status`/`flow`/`stale`, `vigil-sync`, `decay-report` and `open-items` take an
   admin lock beside the socket, stop the daemon and run in-process. A command arriving
   meanwhile waits instead of starting a daemon, and the lock is released only after the
   store is closed, so there is exactly one owner at every instant.

@@ -118,6 +118,7 @@ fn memory_overview() -> MemoryOverview {
         },
         uncertain: vec![edge_view("PREFERS", 0.31, 0)],
         self_reinforced: vec![edge_view("USES", 0.88, 23)],
+        open_items: None,
     }
 }
 
@@ -558,6 +559,8 @@ async fn recall_overview_reports_the_content_and_its_uncertainty() {
         text.contains("kept out of the confidence above"),
         "the tally means nothing without the explanation: {text}"
     );
+    // The daemon sends no open items while `graph.open_loops` is off.
+    assert!(!text.contains("Open items"), "{text}");
 }
 
 #[tokio::test]

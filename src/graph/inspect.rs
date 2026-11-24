@@ -57,6 +57,26 @@ pub struct MemoryOverview {
     /// The relationships carrying the most self-authored corroboration —
     /// where memory may be agreeing with itself.
     pub self_reinforced: Vec<EdgeView>,
+    /// Issue records still open, oldest first. `None` unless
+    /// `graph.open_loops` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_items: Option<Vec<OpenItem>>,
+}
+
+/// One issue record whose live status is listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenItem {
+    pub id: String,
+    /// The issue's name.
+    pub name: String,
+    /// `open`, or `fixed` when closed items were asked for.
+    pub status: String,
+    /// Date of the session that recorded this status.
+    pub since: String,
+    /// Session of the status's first evidence.
+    pub session: String,
+    /// Turn of the status's first evidence.
+    pub turn: u64,
 }
 
 /// One entity type, and the strongest entities in it.
@@ -166,6 +186,7 @@ pub async fn overview(
         confidence: confidence_summary(db).await?,
         uncertain,
         self_reinforced,
+        open_items: None,
     })
 }
 

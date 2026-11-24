@@ -86,15 +86,26 @@ pub(crate) const PASS1_SYSTEM_BARE: &str = PASS1_SYSTEM.split_at(bare_end()).0;
 /// Details stay inside the fact that owns them. One source line, two leading newlines.
 const DETAIL_SENTENCES: &str = "\n\nKeep the details that make a fact exact inside that fact's value, never as a separate fact: numbers and counts, a measured value next to its limit, versions, identifiers, the file, script or test that carries it out, the exact class or API used, and a short reason when the turn you cite gives one. A rule says them in its own sentence. A setting puts them after its value in one pair of parentheses, for example `90 (audit needs a quarter of history)`. Never add a rule or any other fact only to explain or repeat a setting. Never repeat the old value inside the new one; the old value goes only in `replaces`. Use only details stated in the turn you cite, and keep every value under 200 characters. The do-not-extract list above still applies to whole facts; it does not remove details from a fact you keep.";
 
-/// System text when value details are on. The consts stay unchanged.
-fn pass1_system_text(known_on: bool) -> String {
+/// Open loops go in the bugs section. One source line, two leading newlines.
+const OPEN_LOOP_SENTENCES: &str = "\n\nAlso put open loops in the bugs section, in the same shape: pending work, unanswered questions, promised follow-ups and deferred decisions. symptom = the item in a few words, using the same words each time it comes up; cause = \"\"; component = the affected part or the project name. Leave fix \"\" while the item is still pending. When a later turn says it is done, answered, dropped or superseded, give it again with a short fix that says how, for example `answered: keep the default`.";
+
+/// System text when value details or open loops are on. The consts stay unchanged.
+fn pass1_system_text(value_details: bool, known_on: bool, open_loops: bool) -> String {
     let mut text = String::with_capacity(
-        PASS1_SYSTEM_BARE.len() + DETAIL_SENTENCES.len() + KNOWN_SENTENCES.len(),
+        PASS1_SYSTEM_BARE.len()
+            + DETAIL_SENTENCES.len()
+            + KNOWN_SENTENCES.len()
+            + OPEN_LOOP_SENTENCES.len(),
     );
     text.push_str(PASS1_SYSTEM_BARE);
-    text.push_str(DETAIL_SENTENCES);
+    if value_details {
+        text.push_str(DETAIL_SENTENCES);
+    }
     if known_on {
         text.push_str(KNOWN_SENTENCES);
+    }
+    if open_loops {
+        text.push_str(OPEN_LOOP_SENTENCES);
     }
     text
 }
@@ -245,9 +256,10 @@ pub(crate) async fn extract_session(
     let known_on = known_facts_context_enabled(memory_dir);
     let ground_edges = ground_component_edges_enabled(memory_dir);
     let match_on = known_match_enabled(memory_dir);
+    let open_loops = open_loops_enabled(memory_dir);
     let system_text;
-    let system = if value_details {
-        system_text = pass1_system_text(known_on);
+    let system = if value_details || open_loops {
+        system_text = pass1_system_text(value_details, known_on, open_loops);
         system_text.as_str()
     } else if known_on {
         PASS1_SYSTEM
@@ -374,6 +386,7 @@ pub(crate) async fn extract_session(
         );
         write_ctx.match_on = match_on;
         write_ctx.hold_on = hold_enabled(memory_dir);
+        write_ctx.open_loops_on = open_loops_enabled(memory_dir);
         write_ctx.links_on = links_enabled(memory_dir);
         write_ctx.ground_on = ground_edges;
         write_ctx.components_on = components_enabled(memory_dir);
@@ -557,6 +570,13 @@ fn hold_enabled(memory_dir: &Path) -> bool {
         .graph
         .unwrap_or_default()
         .hold_applies()
+}
+
+fn open_loops_enabled(memory_dir: &Path) -> bool {
+    crate::config::load_from_dir(memory_dir)
+        .graph
+        .unwrap_or_default()
+        .open_loops
 }
 
 fn links_enabled(memory_dir: &Path) -> bool {
@@ -7077,6 +7097,27 @@ mod tests {
         assert!(!encoded.contains("quote_strip_code_cites"), "{encoded}");
     }
 
+    #[test]
+    fn open_loops_reads_only_its_own_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!open_loops_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nopen_loops = true\n",
+        )
+        .unwrap();
+        assert!(open_loops_enabled(dir.path()));
+        assert!(!recover_turns_enabled(dir.path()));
+        assert!(!value_details_enabled(dir.path()));
+        assert!(!known_match_enabled(dir.path()));
+        std::fs::write(
+            dir.path().join(".recall-echo.toml"),
+            "[graph]\nrecover_turns = true\nconsolidate = true\nextract_value_details = true\n",
+        )
+        .unwrap();
+        assert!(!open_loops_enabled(dir.path()));
+    }
+
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
@@ -8315,14 +8356,210 @@ mod tests {
 
     #[test]
     fn value_details_system_text_matches_the_golden_and_removes_back_to_bare() {
-        let on = pass1_system_text(false);
+        let on = pass1_system_text(true, false, false);
         assert_eq!(on, VALUE_DETAILS_GOLDEN);
         assert_eq!(on, format!("{PASS1_SYSTEM_BARE}{DETAIL_SENTENCES}"));
-        let known = pass1_system_text(true);
+        let known = pass1_system_text(true, true, false);
         assert_eq!(known, format!("{on}{KNOWN_SENTENCES}"));
         assert_eq!(on.replacen(DETAIL_SENTENCES, "", 1), PASS1_SYSTEM_BARE);
         assert_eq!(known.replacen(DETAIL_SENTENCES, "", 1), PASS1_SYSTEM);
         assert_eq!(PASS1_SYSTEM_BARE, SYSTEM_BEFORE_KNOWN_BLOCK);
+    }
+
+    /// `PASS1_SYSTEM` and `PASS1_JSON_SCHEMA` as they were on main at a811988.
+    const SYSTEM_ON_MAIN: &str =
+        include_str!("../../../tests/fixtures/pass1/system-main-a811988.txt");
+    const SCHEMA_ON_MAIN: &str =
+        include_str!("../../../tests/fixtures/pass1/schema-main-a811988.json");
+
+    #[test]
+    fn default_prompt_and_schema_are_byte_identical_to_main() {
+        assert_eq!(PASS1_SYSTEM.as_bytes(), SYSTEM_ON_MAIN.as_bytes());
+        assert_eq!(PASS1_JSON_SCHEMA.as_bytes(), SCHEMA_ON_MAIN.as_bytes());
+        assert!(!PASS1_SYSTEM.contains(OPEN_LOOP_SENTENCES.trim()));
+    }
+
+    #[test]
+    fn open_loop_sentences_come_last_and_only_with_the_flag() {
+        let addendum = OPEN_LOOP_SENTENCES.trim();
+        for value_details in [false, true] {
+            for known_on in [false, true] {
+                let off = pass1_system_text(value_details, known_on, false);
+                assert!(!off.contains(addendum), "{value_details} {known_on}");
+                let on = pass1_system_text(value_details, known_on, true);
+                assert_eq!(on, format!("{off}{OPEN_LOOP_SENTENCES}"));
+            }
+        }
+        assert_eq!(
+            pass1_system_text(false, false, true),
+            format!("{PASS1_SYSTEM_BARE}{OPEN_LOOP_SENTENCES}")
+        );
+        assert_eq!(
+            pass1_system_text(false, true, true),
+            format!("{PASS1_SYSTEM}{OPEN_LOOP_SENTENCES}")
+        );
+        assert_eq!(
+            pass1_system_text(true, true, true),
+            format!("{PASS1_SYSTEM_BARE}{DETAIL_SENTENCES}{KNOWN_SENTENCES}{OPEN_LOOP_SENTENCES}")
+        );
+        // One source line after the two leading newlines.
+        assert!(OPEN_LOOP_SENTENCES.starts_with("\n\n"));
+        assert!(!OPEN_LOOP_SENTENCES[2..].contains('\n'));
+        for phrase in [
+            "pending work",
+            "unanswered questions",
+            "promised follow-ups",
+            "deferred decisions",
+            "done, answered, dropped or superseded",
+            "short fix",
+        ] {
+            assert!(OPEN_LOOP_SENTENCES.contains(phrase), "{phrase}");
+        }
+    }
+
+    /// The bug's own status is not stored. A kept fix is `fixed`; no fix,
+    /// including the model's `fixed` or `wont_fix`, is `open`.
+    #[test]
+    fn bug_status_is_still_inferred_from_the_fix() {
+        let turns = vec![
+            Turn {
+                index: 0,
+                role: TurnRole::User,
+                text: "We still owe a decision on the retention window.".into(),
+            },
+            Turn {
+                index: 1,
+                role: TurnRole::User,
+                text: "The retention window is answered: keep the default.".into(),
+            },
+        ];
+        let pending = "a decision on the retention window";
+        let answered = "retention window is answered: keep the default";
+        for (model_status, fix, turn, quote, stored) in [
+            ("open", "", 0, pending, "open"),
+            ("fixed", "", 0, pending, "open"),
+            ("wont_fix", "", 0, pending, "open"),
+            ("open", "keep the default", 1, answered, "fixed"),
+            ("fixed", "keep the default", 1, answered, "fixed"),
+            ("wont_fix", "keep the default", 1, answered, "fixed"),
+        ] {
+            let reply = serde_json::json!({
+                "facts": [],
+                "bugs": [{
+                    "symptom": "retention window",
+                    "cause": "",
+                    "fix": fix,
+                    "status": model_status,
+                    "component": "",
+                    "turn": turn,
+                    "quote": quote,
+                    "confidence": 0.9
+                }],
+                "releases": []
+            });
+            let mut report = IngestionReport::default();
+            let facts = facts_from_reply(
+                reply.as_object().expect("object"),
+                &session(turns.clone()),
+                &mut report,
+            );
+            let status: Vec<&Fact> = facts
+                .iter()
+                .filter(|fact| fact.predicate == Predicate::IssueStatus)
+                .collect();
+            assert_eq!(status.len(), 1, "{model_status} {fix:?} {:?}", report.drops);
+            assert_eq!(status[0].object_name, stored, "{model_status} {fix:?}");
+            assert_eq!(status[0].provenance, Provenance::SelfGenerated);
+            assert_eq!(status[0].subject_name, "retention window");
+        }
+    }
+
+    /// The flag reaches the provider as the addendum and nothing else. A
+    /// scripted provider stands in; nothing is sent anywhere.
+    #[cfg(feature = "embedded")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_loops_adds_only_the_addendum_to_the_sent_prompt() {
+        use std::sync::Mutex;
+
+        use crate::graph::llm::Completion;
+
+        struct Capture {
+            system: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for Capture {
+            async fn complete(&self, _: &str, _: &str, _: u32) -> Result<String, GraphError> {
+                Err(GraphError::Llm("plain complete was called".into()))
+            }
+
+            async fn complete_structured_chat(
+                &self,
+                system: &str,
+                _: &[Message],
+                _: &Value,
+                _: u32,
+            ) -> Result<Completion, GraphError> {
+                self.system.lock().expect("system").push(system.to_string());
+                Ok(Completion::unmeasured(
+                    r#"{"facts":[],"bugs":[],"releases":[]}"#,
+                ))
+            }
+        }
+
+        async fn sent(config: &str) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("tidepool");
+            std::fs::create_dir_all(&cwd).unwrap();
+            input::write_turns_sidecar(
+                dir.path(),
+                1,
+                "s",
+                "2026-01-02",
+                Some(cwd.to_str().unwrap()),
+                &[crate::conversation::ConversationEntry::UserMessage(
+                    "We still owe a decision on the retention window.".into(),
+                )],
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(".recall-echo.toml"), config).unwrap();
+            let gm = GraphMemory::open_embedded(&dir.path().join("graph"))
+                .await
+                .unwrap();
+            let provider = Capture {
+                system: Mutex::new(Vec::new()),
+            };
+            extract_session(
+                &gm,
+                dir.path(),
+                1,
+                &IngestContext::new("s", Some(1)),
+                &provider,
+            )
+            .await
+            .unwrap();
+            provider.system.into_inner().expect("system")
+        }
+
+        let base = "[graph]\nconsolidate = false\nknown_facts_context = false\n";
+        assert_eq!(sent(base).await, [PASS1_SYSTEM_BARE]);
+        assert_eq!(
+            sent(&format!("{base}open_loops = true\n")).await,
+            [format!("{PASS1_SYSTEM_BARE}{OPEN_LOOP_SENTENCES}")]
+        );
+        assert_eq!(
+            sent(&format!("{base}extract_value_details = true\n")).await,
+            [pass1_system_text(true, false, false)]
+        );
+        assert_eq!(
+            sent(&format!(
+                "{base}extract_value_details = true\nopen_loops = true\n"
+            ))
+            .await,
+            [format!(
+                "{PASS1_SYSTEM_BARE}{DETAIL_SENTENCES}{OPEN_LOOP_SENTENCES}"
+            )]
+        );
     }
 
     #[test]
@@ -9089,8 +9326,8 @@ mod tests {
         assert_eq!(off_system, PASS1_SYSTEM_BARE);
         assert_eq!(forms_system, PASS1_SYSTEM_BARE);
         assert_eq!(off_user, forms_user);
-        assert_eq!(details_system, pass1_system_text(false));
-        assert_eq!(both_system, pass1_system_text(false));
+        assert_eq!(details_system, pass1_system_text(true, false, false));
+        assert_eq!(both_system, pass1_system_text(true, false, false));
         assert_eq!(
             details_system.replacen(DETAIL_SENTENCES, "", 1),
             PASS1_SYSTEM_BARE

@@ -469,6 +469,15 @@ impl GraphMemory {
         inspect::overview(&self.db, stats, per_type).await
     }
 
+    /// Issue records whose live status is `open`, oldest first. Reads only.
+    /// `include_closed` adds the live `fixed` ones.
+    pub async fn open_items(
+        &self,
+        include_closed: bool,
+    ) -> Result<Vec<inspect::OpenItem>, GraphError> {
+        v2::open_items::open_items(&self.db, include_closed).await
+    }
+
     /// What the graph holds about one subject, over the ordinary hybrid query.
     pub async fn about(
         &self,

@@ -714,6 +714,12 @@ enum GraphCommands {
         #[arg(long)]
         all: bool,
     },
+    /// List issue records whose live status is open, oldest first. Reads only.
+    OpenItems {
+        /// Also list closed items (a live `fixed` status)
+        #[arg(long)]
+        include_closed: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1082,6 +1088,9 @@ fn main() {
                             }
                             GraphCommands::DecayReport { entity, all } => {
                                 graph_cli::decay_report(&memory_dir, entity.as_deref(), all).await
+                            }
+                            GraphCommands::OpenItems { include_closed } => {
+                                graph_cli::open_items(&memory_dir, include_closed).await
                             }
                             GraphCommands::Pipeline { command } => match command {
                                 PipelineCommands::Sync { docs_dir } => {
@@ -1940,6 +1949,26 @@ mod tests {
                 Some(PathBuf::from("/srv/pulse")),
                 "{before:?}"
             );
+        }
+    }
+
+    #[test]
+    fn graph_open_items_parses_with_and_without_closed_items() {
+        for (argv, expected) in [
+            (&["recall-echo", "graph", "open-items"][..], false),
+            (
+                &["recall-echo", "graph", "open-items", "--include-closed"][..],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("parse open-items");
+            match cli.command.expect("command") {
+                Commands::Graph {
+                    command: GraphCommands::OpenItems { include_closed },
+                    ..
+                } => assert_eq!(include_closed, expected, "{argv:?}"),
+                _ => panic!("graph open-items"),
+            }
         }
     }
 

@@ -1735,6 +1735,217 @@ kind = "latest"
         assert!(!has_phrase("The client timeout is 120 seconds.", "12"));
     }
 
+    fn open_loops() -> FactScript {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/writes/open-loops/script.toml");
+        load_script(&path).unwrap()
+    }
+
+    /// The words that may reopen a fixed item, as the writer reads them.
+    const REOPEN_CUES: &[&str] = &[
+        "reopen",
+        "reopened",
+        "open again",
+        "back to open",
+        "not fixed",
+    ];
+
+    fn reopen_cues(text: &str) -> Vec<&'static str> {
+        REOPEN_CUES
+            .iter()
+            .copied()
+            .filter(|cue| has_phrase(text, cue))
+            .collect()
+    }
+
+    #[test]
+    fn open_loops_fixture_declares_its_gold() {
+        let script = open_loops();
+        assert_eq!(script.name, "open-loops");
+        assert_eq!(script.project.as_deref(), Some("timber"));
+        let ids: Vec<&str> = script.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["s1", "s2", "s3", "s4"]);
+        assert!(script
+            .sessions
+            .iter()
+            .all(|session| session.transcript.is_none() && !session.turns.is_empty()));
+
+        let live: Vec<(&str, bool)> = script
+            .expect
+            .iter()
+            .map(|expected| (expected.fact.as_str(), expected.live))
+            .collect();
+        assert_eq!(
+            live,
+            [
+                ("A-open", true),
+                ("B-open", false),
+                ("B-fixed", true),
+                ("C-open", true),
+                ("C-fixed", false),
+                ("D-fixed", true),
+                ("D-open", false),
+                ("S", true),
+            ]
+        );
+        let state = |id: &str| script.fact(id).unwrap().end_state;
+        assert_eq!(state("A-open"), EndState::Live);
+        assert_eq!(state("B-open"), EndState::Superseded);
+        assert_eq!(state("B-fixed"), EndState::Live);
+        assert_eq!(state("C-open"), EndState::Live);
+        assert_eq!(state("C-fixed"), EndState::Superseded);
+        assert_eq!(state("D-fixed"), EndState::Live);
+        assert_eq!(state("D-open"), EndState::Rejected);
+        assert_eq!(state("S"), EndState::Live);
+        assert_eq!(
+            script.fact("B-open").unwrap().superseded_in.as_deref(),
+            Some("s3")
+        );
+        assert_eq!(
+            script.fact("C-fixed").unwrap().superseded_in.as_deref(),
+            Some("s4")
+        );
+        assert_eq!(
+            script.superseded_pairs,
+            vec![
+                SupersededPair {
+                    old: "B-open".into(),
+                    new: "B-fixed".into(),
+                    retire_in: "s3".into(),
+                },
+                SupersededPair {
+                    old: "C-fixed".into(),
+                    new: "C-open".into(),
+                    retire_in: "s4".into(),
+                },
+            ]
+        );
+
+        // Every item is an issue status, `open` or `fixed`. The sibling is a setting.
+        for fact in script.facts.iter().filter(|fact| fact.id != "S") {
+            assert_eq!(fact.relation, "issue_status", "{}", fact.id);
+            assert_eq!(fact.subject_type, "case", "{}", fact.id);
+            let value = fact.id.rsplit('-').next().unwrap();
+            assert_eq!(fact.object, value, "{}", fact.id);
+        }
+        let sibling = script.fact("S").unwrap();
+        assert_eq!(
+            (sibling.relation.as_str(), sibling.object.as_str()),
+            ("setting:upload_limit", "25 MB")
+        );
+
+        // One current-value question per item and one for the setting.
+        let asked: Vec<(&str, Vec<&str>, Vec<&str>)> = script
+            .questions
+            .iter()
+            .map(|question| {
+                assert_eq!(
+                    question.kind,
+                    QuestionKind::CurrentValue,
+                    "{}",
+                    question.text
+                );
+                (
+                    question.answer.as_str(),
+                    question.needs.iter().map(String::as_str).collect(),
+                    question.absent.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("open", vec!["A-open"], vec![]),
+                ("fixed", vec!["B-fixed"], vec!["B-open"]),
+                ("open", vec!["C-open"], vec!["C-fixed"]),
+                ("fixed", vec!["D-fixed"], vec!["D-open"]),
+                ("25 MB", vec!["S"], vec![]),
+            ]
+        );
+        let stale: Vec<Vec<String>> = script
+            .questions
+            .iter()
+            .map(|question| script.stale_values(question).unwrap())
+            .collect();
+        assert_eq!(
+            stale,
+            [
+                vec![],
+                vec!["open".to_string()],
+                vec!["fixed".to_string()],
+                vec!["open".to_string()],
+                vec![],
+            ]
+        );
+    }
+
+    #[test]
+    fn open_loops_cores_tell_every_fact_apart() {
+        let script = open_loops();
+        let lines: Vec<String> = script
+            .facts
+            .iter()
+            .map(|fact| format!("{} | {} | {}", fact.subject, fact.relation, fact.object))
+            .collect();
+        for fact in &script.facts {
+            let pattern = fact.pattern.as_ref().expect("every fact has a match");
+            let core: Vec<regex::Regex> = pattern
+                .core_all
+                .iter()
+                .map(|source| compile_pattern(source).unwrap())
+                .collect();
+            for (other, line) in script.facts.iter().zip(&lines) {
+                let hit = core.iter().all(|regex| regex.is_match(line));
+                assert_eq!(hit, other.id == fact.id, "{} core on '{line}'", fact.id);
+            }
+        }
+    }
+
+    #[test]
+    fn open_loops_reopens_only_where_the_gold_reopens() {
+        let script = open_loops();
+        let turns: Vec<(&str, &ScriptTurn)> = script
+            .sessions
+            .iter()
+            .flat_map(|session| {
+                session
+                    .turns
+                    .iter()
+                    .map(move |turn| (session.id.as_str(), turn))
+            })
+            .collect();
+        for (session, turn) in &turns {
+            let reopens = turn
+                .claims
+                .iter()
+                .any(|claim| claim.op == ClaimOp::Supersede && claim.fact == "C-fixed");
+            assert_eq!(
+                !reopen_cues(&turn.text).is_empty(),
+                reopens,
+                "{session}: {}",
+                turn.text
+            );
+        }
+        // The s3 restatement names the fixed item, claims nothing, and states
+        // no fix.
+        let (_, restated) = turns
+            .iter()
+            .find(|(session, turn)| *session == "s3" && turn.claims.is_empty())
+            .expect("restatement");
+        let item = &script.fact("D-fixed").unwrap().subject;
+        assert!(has_phrase(&restated.text, item), "{}", restated.text);
+        for word in ["fix", "fixed", "pinned", "done", "answered", "resolved"] {
+            assert!(
+                !has_phrase(&restated.text, word),
+                "{word}: {}",
+                restated.text
+            );
+        }
+        assert!(reopen_cues("The login is NOT fixed.") == ["not fixed"]);
+        assert!(reopen_cues("Move it back to  open.") == ["back to open"]);
+        assert!(reopen_cues("Reopening the guide.").is_empty());
+    }
+
     fn write_transcript_script(dir: &Path, name: &str, date_line: &str, quote: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(

@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 use crate::graph::edge_view::EdgeView;
-use crate::graph::inspect::{MemoryOverview, DOUBTFUL_CONFIDENCE, STRONG_CONFIDENCE};
+use crate::graph::inspect::{MemoryOverview, OpenItem, DOUBTFUL_CONFIDENCE, STRONG_CONFIDENCE};
 use crate::graph::traverse::format_traversal;
 use crate::graph::types::{
     EntityDetail, EpisodeSearchResult, GraphStats, MatchSource, QueryResult, ScoredEntity,
@@ -234,6 +234,10 @@ pub fn overview(overview: &MemoryOverview) -> String {
         return budget(out);
     }
 
+    if let Some(items) = &overview.open_items {
+        write_open_items(&mut out, items);
+    }
+
     for group in &overview.groups {
         let _ = writeln!(out, "\n{} ({}):", group.entity_type, group.count);
         for entity in &group.top {
@@ -285,6 +289,22 @@ pub fn overview(overview: &MemoryOverview) -> String {
     );
 
     budget(out)
+}
+
+/// Issue records still open, oldest first. Only present when `graph.open_loops` is on.
+fn write_open_items(out: &mut String, items: &[OpenItem]) {
+    if items.is_empty() {
+        out.push_str("\nOpen items: none.\n");
+        return;
+    }
+    out.push_str("\nOpen items (oldest first):\n");
+    for item in items {
+        let _ = writeln!(
+            out,
+            "- {} — {} since {} ({} turn {})",
+            item.name, item.status, item.since, item.session, item.turn
+        );
+    }
 }
 
 fn write_edge_list(out: &mut String, heading: &str, edges: &[EdgeView], note: &str) {
@@ -689,6 +709,48 @@ mod tests {
         let text = status(&stats);
         assert!(text.contains("By type: project 9, tool 3."), "{text}");
         assert!(text.contains("1 conversation episode."), "{text}");
+    }
+
+    #[test]
+    fn overview_lists_open_items_only_when_they_are_sent() {
+        let mut snapshot = MemoryOverview {
+            stats: GraphStats {
+                entity_count: 3,
+                relationship_count: 0,
+                episode_count: 1,
+                ..Default::default()
+            },
+            groups: Vec::new(),
+            confidence: Default::default(),
+            uncertain: Vec::new(),
+            self_reinforced: Vec::new(),
+            open_items: None,
+        };
+        let off = overview(&snapshot);
+        assert!(!off.contains("Open items"), "{off}");
+
+        let item = |name: &str, since: &str| OpenItem {
+            id: format!("entity:{name}"),
+            name: name.into(),
+            status: "open".into(),
+            since: since.into(),
+            session: "s1".into(),
+            turn: 0,
+        };
+        snapshot.open_items = Some(vec![
+            item("login fails", "2026-03-01"),
+            item("search times out", "2026-03-02"),
+        ]);
+        let on = overview(&snapshot);
+        assert!(on.contains("Open items (oldest first):"), "{on}");
+        assert!(
+            on.contains("- login fails — open since 2026-03-01 (s1 turn 0)"),
+            "{on}"
+        );
+        assert!(on.find("login fails") < on.find("search times out"), "{on}");
+
+        snapshot.open_items = Some(Vec::new());
+        assert!(overview(&snapshot).contains("Open items: none."));
     }
 
     #[test]

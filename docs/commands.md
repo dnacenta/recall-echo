@@ -83,11 +83,13 @@ recall-echo graph traverse ENTITY    DFS with cycle detection, edge confidence s
     --depth N --type-filter T        default depth 2; edges under 0.1 are hidden
 recall-echo graph status             entity, relationship and episode counts
 recall-echo graph decay-report       stored vs effective confidence; --entity, --all
+recall-echo graph open-items         issue records still open, oldest first; --include-closed
 ```
 
 Without `--about`, `what-do-you-know` also lists the relationships it is least sure of and
 the ones it believes largely because it kept repeating them (`self×N`, the coherence
-tally, deliberately kept out of confidence).
+tally, deliberately kept out of confidence). With `graph.open_loops` on, it lists the
+open items before the entity groups; see [configuration](configuration.md#open-loops).
 
 ## Correcting
 

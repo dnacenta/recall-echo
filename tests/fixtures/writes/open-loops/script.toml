@@ -1,0 +1,269 @@
+# Open loops: an eval case for `graph.open_loops`, not a benchmark.
+# Four items and one setting, on issue records keyed the way a v2 store
+# reports them: the item name, `issue_status`, then `open` or `fixed`.
+#   image cache size     deferred in s1, never closed: `open` stays live.
+#   backup schedule      asked in s1, answered in s3: `fixed` is live.
+#   migration guide      promised in s1, done in s2, reopened in s4: `open` is live.
+#   flaky login test     fixed in s1, restated in s3 with no fix and no reopen
+#                        word: with the flag on, `fixed` stays live and no
+#                        `open` is stored beside it.
+# The upload limit is a sibling setting every session must leave live.
+name = "open-loops"
+project = "timber"
+cwd = "/work/timber"
+
+[[sessions]]
+id = "s1"
+date = "2026-02-01T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "Deferred for timber: we will decide the image cache size after the load test."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "A-open"
+
+[[sessions.turns]]
+role = "user"
+text = "Unanswered question for timber: should the backup schedule be nightly or weekly?"
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "B-open"
+
+[[sessions.turns]]
+role = "user"
+text = "I will write the timber migration guide as a follow-up."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "C-open"
+
+[[sessions.turns]]
+role = "user"
+text = "The flaky login test is fixed: we pinned the clock in its setup."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "D-fixed"
+
+[[sessions.turns]]
+role = "user"
+text = "The timber upload limit is 25 MB."
+
+[[sessions.turns.claims]]
+op = "create"
+fact = "S"
+
+[[sessions]]
+id = "s2"
+date = "2026-02-02T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The migration guide is done: it is in docs/migrate.md."
+
+[[sessions.turns.claims]]
+op = "supersede"
+fact = "C-open"
+replacement = "C-fixed"
+
+[[sessions]]
+id = "s3"
+date = "2026-02-03T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "The backup schedule question is answered: backups run nightly."
+
+[[sessions.turns.claims]]
+op = "supersede"
+fact = "B-open"
+replacement = "B-fixed"
+
+# A restatement: no fix and no reopen word. It claims nothing.
+[[sessions.turns]]
+role = "user"
+text = "The flaky login test came up in the review."
+
+[[sessions]]
+id = "s4"
+date = "2026-02-04T00:00:00Z"
+
+[[sessions.turns]]
+role = "user"
+text = "Reopen the migration guide item: it lacks the rollback steps."
+
+[[sessions.turns.claims]]
+op = "supersede"
+fact = "C-fixed"
+replacement = "C-open"
+
+[[facts]]
+id = "A-open"
+subject = "image cache size"
+relation = "issue_status"
+object = "open"
+subject_type = "case"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["image\\W+cache|cache\\W+size", "\\bopen\\s*$"]
+
+[[facts]]
+id = "B-open"
+subject = "backup schedule"
+relation = "issue_status"
+object = "open"
+subject_type = "case"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s3"
+[facts.match]
+core_all = ["backup\\W+schedule|\\bbackups?\\b", "\\bopen\\s*$"]
+
+[[facts]]
+id = "B-fixed"
+subject = "backup schedule"
+relation = "issue_status"
+object = "fixed"
+subject_type = "case"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["backup\\W+schedule|\\bbackups?\\b", "\\bfixed\\s*$"]
+
+[[facts]]
+id = "C-open"
+subject = "migration guide"
+relation = "issue_status"
+object = "open"
+subject_type = "case"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["migration\\W+guide", "\\bopen\\s*$"]
+
+[[facts]]
+id = "C-fixed"
+subject = "migration guide"
+relation = "issue_status"
+object = "fixed"
+subject_type = "case"
+object_type = "concept"
+end_state = "superseded"
+superseded_in = "s4"
+[facts.match]
+core_all = ["migration\\W+guide", "\\bfixed\\s*$"]
+
+[[facts]]
+id = "D-fixed"
+subject = "flaky login test"
+relation = "issue_status"
+object = "fixed"
+subject_type = "case"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["flaky\\W+login|login\\W+test", "\\bfixed\\s*$"]
+
+# What a fix-less restatement must not leave live.
+[[facts]]
+id = "D-open"
+subject = "flaky login test"
+relation = "issue_status"
+object = "open"
+subject_type = "case"
+object_type = "concept"
+end_state = "rejected"
+[facts.match]
+core_all = ["flaky\\W+login|login\\W+test", "\\bopen\\s*$"]
+
+[[facts]]
+id = "S"
+subject = "timber"
+relation = "setting:upload_limit"
+object = "25 MB"
+subject_type = "project"
+object_type = "concept"
+end_state = "live"
+[facts.match]
+core_all = ["upload", "\\b25\\s*mb\\b"]
+
+[[expect]]
+fact = "A-open"
+live = true
+
+[[expect]]
+fact = "B-open"
+live = false
+
+[[expect]]
+fact = "B-fixed"
+live = true
+
+[[expect]]
+fact = "C-open"
+live = true
+
+[[expect]]
+fact = "C-fixed"
+live = false
+
+[[expect]]
+fact = "D-fixed"
+live = true
+
+[[expect]]
+fact = "D-open"
+live = false
+
+[[expect]]
+fact = "S"
+live = true
+
+[[superseded_pairs]]
+old = "B-open"
+new = "B-fixed"
+retire_in = "s3"
+
+[[superseded_pairs]]
+old = "C-fixed"
+new = "C-open"
+retire_in = "s4"
+
+[[questions]]
+text = "what is the status of the image cache size decision"
+answer = "open"
+kind = "current_value"
+needs = ["A-open"]
+stale = []
+
+[[questions]]
+text = "what is the status of the backup schedule question"
+answer = "fixed"
+kind = "current_value"
+needs = ["B-fixed"]
+absent = ["B-open"]
+
+[[questions]]
+text = "what is the status of the migration guide"
+answer = "open"
+kind = "current_value"
+needs = ["C-open"]
+absent = ["C-fixed"]
+
+[[questions]]
+text = "what is the status of the flaky login test"
+answer = "fixed"
+kind = "current_value"
+needs = ["D-fixed"]
+absent = ["D-open"]
+stale = ["D-open"]
+
+[[questions]]
+text = "what is the timber upload limit"
+answer = "25 MB"
+kind = "current_value"
+needs = ["S"]
