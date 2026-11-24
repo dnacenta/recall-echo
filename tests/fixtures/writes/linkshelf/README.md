@@ -23,12 +23,15 @@ described in `script.toml`:
 - 6 superseded pairs (`old` must be retired in `retire_in` or later, never earlier).
 - 7 noise items (chit-chat, undecided ideas, transient tool output) that must not be stored
   as decided or current facts.
+- 9 derived questions: one current-value question per superseded pair, 2 stable settings and
+  1 refused value. Each answer is a gold object. They are graded on the store and on what
+  `recall_query` returns; see `docs/benchmarks/linkshelf-extrinsic-2026-11.md`.
 
 ## Files
 
 | path | what |
 |---|---|
-| `script.toml` | The fact script: transcript sessions with claims, facts with `end_state` and regex `match` patterns, superseded pairs, noise. |
+| `script.toml` | The fact script: transcript sessions with claims, facts with `end_state` and regex `match` patterns, superseded pairs, noise, derived questions. |
 | `sessions/sNN.jsonl` | The 14 transcripts. User text `content` is a plain string; assistant messages and tool results are block lists. `script.toml` points here. |
 | `sessions-blocks/sNN.jsonl` | The same 14 sessions with every message `content` as a list of blocks (`{"type": "text"}`, `tool_use`, `tool_result`). |
 

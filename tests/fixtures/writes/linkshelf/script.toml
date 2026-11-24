@@ -1262,3 +1262,69 @@ live = true
 [[expect]]
 fact = "F46"
 live = true
+
+# Derived questions, answered through the recall read path as well as the
+# store. Each answer is the gold object of the fact it needs. A current-value
+# question omits `stale`, so its stale value is the old object of its pair.
+# The question text was written once from the relation name; it is not tuned
+# against any score.
+
+[[questions]]
+text = "where does linkshelf store its bookmarks"
+answer = "SQLite at ~/.local/share/linkshelf/shelf.db with WAL mode"
+kind = "current_value"
+needs = ["F14"]
+absent = ["F04"]
+
+[[questions]]
+text = "how does linkshelf store tags"
+answer = "tags table plus bookmark_tags join table"
+kind = "current_value"
+needs = ["F15"]
+absent = ["F09"]
+
+[[questions]]
+text = "which formatter does linkshelf use"
+answer = "ruff for formatting and linting (ruff format, ruff check)"
+kind = "current_value"
+needs = ["F22"]
+absent = ["F10"]
+
+[[questions]]
+text = "what is the linkshelf test command"
+answer = "just test = uv run pytest -q --cov=linkshelf --cov-fail-under=85"
+kind = "current_value"
+needs = ["F33"]
+absent = ["F05"]
+
+[[questions]]
+text = "which port does linkshelf serve listen on"
+answer = "8765"
+kind = "current_value"
+needs = ["F35"]
+absent = ["F26"]
+
+[[questions]]
+text = "which http client does linkshelf use to fetch titles"
+answer = "httpx AsyncClient"
+kind = "current_value"
+needs = ["F38"]
+absent = ["F27"]
+
+# Stable settings: never replaced.
+[[questions]]
+text = "which python version does linkshelf use"
+answer = "3.12"
+needs = ["F01"]
+
+[[questions]]
+text = "what is the linkshelf title fetch timeout"
+answer = "5 seconds"
+needs = ["F28"]
+
+# Unanswerable: the dependency was tried and removed. `answer` is the refused
+# value, so a store or recall hit here means memory still offers it.
+[[questions]]
+text = "which retry library does linkshelf depend on"
+answer = "tenacity as a dependency (tried and removed)"
+absent = ["F42"]
