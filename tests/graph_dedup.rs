@@ -225,6 +225,10 @@ impl LlmProvider for MeteredModel {
 // ── The three bands ──────────────────────────────────────────────────────
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn an_empty_graph_creates_without_a_model_call() {
     let fixture = Fixture::new().await;
 
@@ -244,6 +248,10 @@ async fn an_empty_graph_creates_without_a_model_call() {
 /// The cheapest duplicate there is: the same string. It never reaches the
 /// embedding search, let alone the model.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn the_same_name_and_type_merges_without_a_model_call() {
     let fixture = Fixture::new().await;
     fixture
@@ -275,6 +283,10 @@ async fn the_same_name_and_type_merges_without_a_model_call() {
 /// Re-reading an archive must not grow the entity it describes — and must not
 /// pay a model to say so.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_repeat_of_what_is_stored_is_skipped_without_a_model_call() {
     let fixture = Fixture::new().await;
     fixture
@@ -300,6 +312,10 @@ async fn a_repeat_of_what_is_stored_is_skipped_without_a_model_call() {
 /// A name shared across kinds is not a shared identity: the event is not the
 /// project, so the bands, not the name, decide.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn the_same_name_under_a_different_type_is_not_a_name_match() {
     let fixture = Fixture::new().await;
     fixture
@@ -331,6 +347,10 @@ async fn the_same_name_under_a_different_type_is_not_a_name_match() {
 /// clears the old 0.7 gate, and a candidate that is nothing like it. The old
 /// gate escalated; the similarity band does not.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_hot_but_unrelated_entity_no_longer_buys_a_model_call() {
     let fixture = Fixture::new().await;
     fixture
@@ -377,6 +397,10 @@ async fn a_hot_but_unrelated_entity_no_longer_buys_a_model_call() {
 /// The middle band is the one thing worth paying for, and it costs exactly one
 /// call. Thresholds are pinned so every neighbour lands in it.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn the_ambiguous_band_costs_exactly_one_model_call() {
     let fixture =
         Fixture::with_dedup_config("certain_similarity = 1.0\nreview_similarity = 0.0\n").await;
@@ -409,6 +433,10 @@ async fn the_ambiguous_band_costs_exactly_one_model_call() {
 
 /// However large the store, the prompt stays the same size.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn the_candidate_set_handed_to_the_model_is_capped() {
     let fixture = Fixture::with_dedup_config(
         "certain_similarity = 1.0\nreview_similarity = 0.0\nmax_candidates = 2\n",
@@ -452,6 +480,10 @@ const EXTRACTION: &str = r#"{"entities": [{"name": "Biscuit", "type": "person",
 /// Ingest reports what dedup cost. Re-ingesting the same archive must cost
 /// nothing at all: every candidate is already in the store under its own name.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn ingest_reports_dedup_resolved_without_a_model() {
     let fixture = Fixture::new().await;
     let model = ScriptedModel::new(EXTRACTION, r#"{"decision": "skip", "reason": "dup"}"#);
@@ -484,6 +516,10 @@ async fn ingest_reports_dedup_resolved_without_a_model() {
 /// A second ingest that is given a model still extracts, and does not store
 /// another copy of a chunk that is already there.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_second_ingest_with_a_model_extracts_without_a_second_copy() {
     let fixture = Fixture::new().await;
     let model = ScriptedModel::new(EXTRACTION, r#"{"decision": "skip", "reason": "dup"}"#);
@@ -516,6 +552,10 @@ async fn a_second_ingest_with_a_model_extracts_without_a_second_copy() {
 /// A provider that reports usage is believed instead of guessed at: the run's
 /// bill is measured, and the length heuristic contributes nothing.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn ingest_bills_reported_usage_instead_of_the_estimate() {
     let fixture = Fixture::new().await;
     let model = MeteredModel {
@@ -544,6 +584,10 @@ async fn ingest_bills_reported_usage_instead_of_the_estimate() {
 /// The other half: a provider that reports nothing is estimated, and the two
 /// numbers never blur into one.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn ingest_estimates_only_what_no_provider_measured() {
     let fixture = Fixture::new().await;
     let model = ScriptedModel::new(EXTRACTION, r#"{"decision": "skip", "reason": "dup"}"#);
@@ -562,6 +606,10 @@ async fn ingest_estimates_only_what_no_provider_measured() {
 
 /// And when a candidate does land in the ambiguous band, the counter says so.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn ingest_counts_the_candidates_that_needed_a_model() {
     let fixture =
         Fixture::with_dedup_config("certain_similarity = 1.0\nreview_similarity = 0.0\n").await;
@@ -605,6 +653,10 @@ const DRIFTING_EXTRACTION: &str = r#"{"entities": [
 /// not found": the skipped duplicate kept its own name, and the lookup was
 /// case-sensitive. Only the endpoint that never existed is still a warning.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn relationship_endpoints_follow_dedup_and_ignore_case() {
     let fixture = Fixture::new().await;
     fixture
@@ -664,6 +716,10 @@ async fn relationship_endpoints_follow_dedup_and_ignore_case() {
 
 /// An endpoint stored by an earlier archive, named in another case, is found.
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn an_endpoint_stored_earlier_is_found_in_any_case() {
     let fixture = Fixture::new().await;
     fixture

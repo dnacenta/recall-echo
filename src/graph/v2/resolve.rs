@@ -1370,6 +1370,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn tier_name_and_kind() {
         let (_tmp, gm) = open_store().await;
         let llm = Reply::new("nope");
@@ -1389,6 +1393,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn tier_alias_any_kind() {
         let (_tmp, gm) = open_store().await;
         let llm = Reply::new("nope");
@@ -1415,6 +1423,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn tier_name_any_kind_upgrades_kind() {
         let (_tmp, gm) = open_store().await;
         let llm = Reply::new("nope");
@@ -1455,6 +1467,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn project_never_absorbs_component() {
         let (_tmp, gm) = open_store().await;
         let llm = Reply::new("nope");
@@ -1479,6 +1495,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn resolver_answer_outside_candidates_is_ignored() {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
@@ -1547,6 +1567,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn no_similar_candidate_skips_the_resolver() {
         let (_tmp, gm) = open_store().await;
         let llm = Reply::new("nope");
@@ -1564,6 +1588,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn resolver_garbage_still_writes_the_fact() {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
@@ -1583,6 +1611,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn alias_retry_keeps_the_prior() {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
@@ -1659,6 +1691,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn resolver_provider_error_still_writes_the_fact() {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
@@ -1685,6 +1721,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn rejected_proposal_is_on_the_write_report() {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();
@@ -1721,6 +1761,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn alias_resolves_after_reopening_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("graph");
@@ -1754,6 +1798,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn project_identity_aliases_are_seeded_once() {
         let (_tmp, gm) = open_store().await;
         let llm = Reply::new("nope");
@@ -1776,6 +1824,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn resolver_match_upgrades_kind() {
         let (_tmp, gm) = open_store().await;
         let project = empty_project();

@@ -3356,6 +3356,10 @@ mod tests {
     /// fixture is generated once and then compared byte for byte.
     #[cfg(feature = "bench")]
     #[test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     fn bench_writes_switches_match_the_golden() {
         let cases = switch_cases();
         assert_eq!(cases.len(), 34);

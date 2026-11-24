@@ -3144,6 +3144,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn swapped_replaces_is_cleared_and_retires_nothing() {
         let turn = "We use the export command instead of csv";
         let turns = vec![Turn {
@@ -4295,6 +4299,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn separator_and_space_quotes_are_one_evidence_item() {
         let text = "if the deploy fails we keep rolling back to the last release";
         let stored = "rolling back to the last release";
@@ -4412,6 +4420,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn overlap_does_not_corroborate_the_creating_session() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -4999,6 +5011,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn fallback_bug_write_is_idempotent() {
         let cause = "the TTL was ignored by the reader, so expired rows were served";
         let fix = "I changed the reader to check expires_at on read";
@@ -5294,6 +5310,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn known_match_does_not_change_the_request_or_read_before_the_provider() {
         use std::sync::Mutex;
 
@@ -5450,6 +5470,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_stored_cross_key_value_keeps_replaces_the_cited_turn_does_not_name() {
         use crate::graph::llm::Completion;
 
@@ -5801,6 +5825,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn an_empty_extraction_still_settles_a_pending_hold() {
         empty_extraction_confirms_pending(&hold_config(false)).await;
         empty_extraction_confirms_pending(&hold_config(true)).await;
@@ -5859,6 +5887,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filtered_restatement_still_confirms_a_pending_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -5906,6 +5938,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filtered_restatement_still_drops_a_reasserted_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -5952,6 +5988,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filtered_restatement_leaves_an_ambiguous_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -6001,6 +6041,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_filtered_restatement_does_not_open_a_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -6035,6 +6079,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_restatement_is_dropped_instead_of_linked() {
         let tmp = tempfile::tempdir().unwrap();
         let memory = tmp.path();
@@ -7031,6 +7079,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn scripted_pair_writes_the_setting_without_a_rule() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -7192,6 +7244,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn known_match_after_the_session_pass_fills_the_surviving_setting() {
         use crate::graph::llm::Completion;
 
@@ -7464,6 +7520,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn ac_k5_k8_k9_known_key_binding_follows_the_shown_rows_and_the_prompt() {
         use std::sync::Mutex;
 
@@ -7641,6 +7701,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn shown_rows_are_ranked_when_known_context_and_match_are_on() {
         use std::sync::Mutex;
 
@@ -7939,6 +8003,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_extract_drops_the_forgotten_value_and_keeps_a_new_one() {
         let dir = tempfile::tempdir().expect("temp");
         let memory = dir.path();
@@ -7991,6 +8059,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_later_extract_skips_any_value_of_a_forgotten_slot() {
         let dir = tempfile::tempdir().expect("temp");
         let memory = dir.path();
@@ -8100,6 +8172,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_session_drops_one_language_use_and_one_planned_release() {
         const TURN: &str =
             "Harbor uses Zig. Ship v2.0 next month with the shelf. Keep the shelf labeled.";
@@ -8881,6 +8957,10 @@ mod tests {
 
     #[cfg(feature = "embedded")]
     #[test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     fn value_details_and_key_forms_apply_alone_and_together() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Mutex;

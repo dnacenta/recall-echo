@@ -1588,6 +1588,10 @@ mod store_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn flag_on_lists_misses_and_leaves_the_store_matching_flag_off() {
         let (_off_dir, off_gm, off) = open_and_extract(false).await;
         let (_on_dir, on_gm, on) = open_and_extract(true).await;
@@ -1617,6 +1621,10 @@ mod store_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_failed_store_read_lists_nothing_and_the_session_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         plant(dir.path(), true);
@@ -1642,6 +1650,10 @@ mod store_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn a_live_edge_object_is_read_with_the_slot_values() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("tidepool");
@@ -1730,6 +1742,10 @@ mod store_tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(embed_tests),
+        ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+    )]
     async fn flag_off_recovery_ignores_a_malformed_forget_file() {
         let dir = tempfile::tempdir().unwrap();
         plant(dir.path(), true);

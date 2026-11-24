@@ -197,6 +197,10 @@ fn normalize_date_time_parses_locomo_strings() {
 /// Uses no LLM so the graph layer only creates episodes (still requires a
 /// SurrealKV store, which the test sets up under a temp dir).
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn ingest_writes_archives_with_session_dates() {
     let tmp = tempfile::tempdir().unwrap();
     let pulse_root = tmp.path();

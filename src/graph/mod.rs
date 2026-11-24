@@ -38,6 +38,7 @@ pub mod vigil_sync;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use confidence::{Provenance, ProvenanceWeights};
 use embed::{FastEmbedder, LazyEmbedder};
@@ -87,7 +88,9 @@ enum StampCache {
 /// The main entry point for graph memory operations.
 pub struct GraphMemory {
     db: Surreal<Db>,
-    embedder: LazyEmbedder,
+    /// Shared so the daemon's warm-up can load the model without holding
+    /// the store.
+    embedder: Arc<LazyEmbedder>,
     path: PathBuf,
     scoring: crate::config::GraphScoringConfig,
     provenance: confidence::ProvenanceWeights,
@@ -135,9 +138,9 @@ impl GraphMemory {
             eprintln!("recall-echo: {}", migration.summary());
         }
 
-        let models_dir = path.join("models");
+        let models_dir = embed::models_dir(path);
         std::fs::create_dir_all(&models_dir)?;
-        let embedder = LazyEmbedder::new(&models_dir);
+        let embedder = Arc::new(LazyEmbedder::new(&models_dir));
 
         let graph_config = load_graph_section(path);
 
@@ -195,7 +198,7 @@ impl GraphMemory {
             database: graph_section.database,
         };
 
-        let models_dir = path.join("models");
+        let models_dir = embed::models_dir(path);
         let mut gm = Self::connect(&server_config, &models_dir).await?;
         gm.scoring = scoring;
         gm.provenance = provenance;
@@ -215,7 +218,7 @@ impl GraphMemory {
         }
 
         std::fs::create_dir_all(models_dir)?;
-        let embedder = LazyEmbedder::new(models_dir);
+        let embedder = Arc::new(LazyEmbedder::new(models_dir));
 
         Ok(Self {
             db,
@@ -318,6 +321,11 @@ impl GraphMemory {
     #[allow(dead_code)]
     pub(crate) fn embedder(&self) -> Result<&FastEmbedder, GraphError> {
         self.embedder.get()
+    }
+
+    /// A handle to the lazy embedder that does not keep the store alive.
+    pub(crate) fn embedder_handle(&self) -> Arc<LazyEmbedder> {
+        Arc::clone(&self.embedder)
     }
 
     // --- Entity CRUD ---

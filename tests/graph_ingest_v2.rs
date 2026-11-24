@@ -15,6 +15,10 @@ use recall_echo::graph::{GraphMemory, IngestContext, PipelineVersion};
 use recall_echo::serve_client;
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_clean_repeat_ingest_still_skips_without_calls() {
     let dir = tempfile::tempdir().expect("temp");
     let memory = dir.path().join("memory");

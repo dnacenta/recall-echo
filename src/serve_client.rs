@@ -68,6 +68,12 @@ const DAEMON_ENV_ALLOWLIST: &[&str] = &[
     "https_proxy",
     "http_proxy",
     "no_proxy",
+    // Paths and switches, not credentials: the daemon resolves the same
+    // models dir as the in-process path.
+    "RECALL_ECHO_MODELS_DIR", // shared models dir
+    "HF_HOME",                // model cache the embedding crate prefers
+    "HF_HUB_OFFLINE",         // no model download when the cache is empty
+    "HF_ENDPOINT",            // where a model download goes
 ];
 
 /// `sockaddr_un.sun_path` is 108 bytes on Linux; stay well inside it.
@@ -1085,6 +1091,21 @@ mod tests {
             assert!(
                 !DAEMON_ENV_ALLOWLIST.contains(&secret),
                 "{secret} must not reach the detached daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn the_daemon_environment_keeps_the_models_dir_settings() {
+        for key in [
+            "RECALL_ECHO_MODELS_DIR",
+            "HF_HOME",
+            "HF_HUB_OFFLINE",
+            "HF_ENDPOINT",
+        ] {
+            assert!(
+                DAEMON_ENV_ALLOWLIST.contains(&key),
+                "{key} must reach the detached daemon"
             );
         }
     }

@@ -12,6 +12,10 @@ use recall_echo::graph::gc::GcConfig;
 use recall_echo::graph::types::NewRelationship;
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn gc_dry_run_no_mutations() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -48,6 +52,10 @@ async fn gc_dry_run_no_mutations() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn gc_execute_removes_low_confidence_relationship() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -92,6 +100,10 @@ async fn gc_execute_removes_low_confidence_relationship() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn gc_protects_pipeline_entities() {
     let db = TestDb::new().await;
 

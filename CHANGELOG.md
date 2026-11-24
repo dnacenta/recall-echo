@@ -22,10 +22,14 @@ changes a user has to know about before upgrading.
 - `graph.consolidate_component_takeover`, default off. With `graph.consolidate` also on, consolidation can close one project `uses` edge when a component of that project starts using a different tool for the same job. The job is a shared word in a setting or rule cited with each tool. The close is rule-only and makes no model call. `component_takeover_closes` and `component_takeover_ambiguous` are omitted from the report when unset. `bench writes --consolidate-component-takeover` turns the flag on for one run. With the flag off, config, reports and output stay as they are.
 - `graph.lasting_forget`, default off. With it on, a confirmed `graph correct --forget` still deletes the graph row and also records the decision in `memory/forgotten.jsonl` until `graph correct --unforget`. Matching later writes are skipped (`forgotten_skips`, omitted from reports when zero) and reads replace the forgotten value with `[forgotten]`. With the flag off, forget stays a hard delete and the file is not read or written.
 - `graph.slot_forget`, default off. With `graph.lasting_forget` also on, `graph correct <subject> <REL> --forget` (no value) deletes every live value of that subject and relation or key and records one `kind: "slot"` row until `graph correct <subject> <REL> --unforget`. Any later value of that slot is skipped (`forgotten_skips`) and reads show `[forgotten]`. An exact-value unforget does not clear the slot. `bench writes --slot-forget` writes the key for one run and does not turn lasting forget on. With `slot_forget` off, forget stays the exact-value behaviour and a leftover slot row is ignored.
+- `RECALL_ECHO_MODELS_DIR`. Set to a non-empty absolute path, every store keeps the embedding model in that one dir instead of `<store>/models`, so the model downloads once per dir rather than once per store. `HF_HOME`, when set, still takes precedence. With the variable unset, paths stay as they are.
 
 ### Changed
 
 - `graph.alternative_details` is on unless `alternative_details = false`. A rewrite keeps that false and leaves a true value out. A config that omits the key picks up the new default. `bench writes --no-alternative-details` writes the opt-out for one run. `bench writes --alternative-details` is still accepted and writes the key true.
+- `HF_HUB_OFFLINE=1` (or `true`, `yes`, `on`) with an uncached embedding model now fails with `HF_HUB_OFFLINE is set and the embedding model is not cached in <dir>` instead of downloading the model.
+- The detached daemon now inherits `HF_HOME`, `RECALL_ECHO_MODELS_DIR`, `HF_HUB_OFFLINE` and `HF_ENDPOINT`, so it uses the same model cache as a command that embeds in-process. A daemon started with `HF_HOME` set used to ignore it and download into `<store>/models`.
+- Tests that need the embedding model are ignored unless `RECALL_ECHO_MODELS_DIR` is set when they are built, so a plain `cargo test` downloads nothing.
 
 ## [5.1.0] — 2026-11-17
 

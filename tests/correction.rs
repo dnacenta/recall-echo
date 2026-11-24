@@ -711,6 +711,10 @@ async fn a_confirmed_entity_forget_records_the_name_and_every_edge() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn unforget_without_yes_writes_nothing_and_yes_deactivates_one_fact() {
     let fixture = Fixture::new();
     enable_lasting(&fixture.memory_dir);
@@ -1199,6 +1203,10 @@ async fn a_missing_value_still_needs_three_names_when_slot_forget_is_off() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn a_confirmed_slot_forget_deletes_every_value_and_writes_one_record() {
     let fixture = Fixture::new();
     enable_slot(&fixture.memory_dir);

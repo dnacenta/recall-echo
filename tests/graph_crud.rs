@@ -13,6 +13,10 @@ use common::TestDb;
 use recall_echo::graph::types::EntityType;
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn add_and_get_entity_by_name() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -34,6 +38,10 @@ async fn get_nonexistent_entity_returns_none() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn add_relationship_between_entities() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -57,6 +65,10 @@ async fn relationship_requires_existing_entities() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn stats_counts_entities_and_relationships() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
@@ -75,6 +87,10 @@ async fn stats_counts_entities_and_relationships() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(embed_tests),
+    ignore = "embeds: set RECALL_ECHO_MODELS_DIR to a seeded models dir"
+)]
 async fn duplicate_entity_name_is_handled() {
     let db = TestDb::new().await;
     let entities = fixtures::simple_entities();
